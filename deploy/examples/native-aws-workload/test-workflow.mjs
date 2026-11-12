@@ -34,6 +34,38 @@ test('example checks have no cloud authority or deployment operation', () => {
   )
 })
 
+test('both Terraform roots and provider locks are checked', () => {
+  for (const root of [
+    'deploy/examples/native-aws-workload',
+    'deploy/examples/native-aws-workload/retained',
+  ]) {
+    assert.ok(
+      workflow.includes(
+        `terraform -chdir=${root} init -backend=false -input=false -lockfile=readonly`
+      )
+    )
+    assert.ok(workflow.includes(`terraform -chdir=${root} validate`))
+  }
+  assert.match(workflow, /fmt -check -recursive/)
+  assert.match(
+    workflow,
+    /git diff --exit-code -- deploy\/examples\/native-aws-workload\/\.terraform\.lock\.hcl deploy\/examples\/native-aws-workload\/retained\/\.terraform\.lock\.hcl/
+  )
+})
+
+test('AWS envelope verification runs and lints in native Rust CI', () => {
+  for (const name of ['test.yml', 'format.yml']) {
+    const rustWorkflow = fs.readFileSync(
+      new URL(`../../../.github/workflows/${name}`, import.meta.url),
+      'utf8'
+    )
+    assert.match(
+      rustWorkflow,
+      /--test template_build_digest --test aws_example_config/
+    )
+  }
+})
+
 test('only immutable actions and nonpersistent checkout credentials are used', () => {
   for (const match of workflow.matchAll(/\buses:\s*([^\s#]+)/g))
     assert.match(match[1], /^[A-Za-z0-9_.\/-]+@[0-9a-f]{40}$/)

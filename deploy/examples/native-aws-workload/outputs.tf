@@ -11,6 +11,11 @@ output "deployment_policy" {
   }
 }
 
+output "ec_task_policy_json" {
+  description = "Plan-known scoped DynamoDB allow document for the separately owned task permissions boundary. Explicit denies in boundaries, SCPs or endpoint policies still apply."
+  value       = jsonencode(local.ec_task_policy)
+}
+
 output "draft_status" {
   description = "False means no AWS workload may be applied. The operator must destroy this workload manually."
   value = {
@@ -20,7 +25,7 @@ output "draft_status" {
     geo                                 = local.geo_enabled ? { phase = local.geo_phase } : null
     manual_shutdown_required            = true
     config_envelope_transport_sha256    = sha256(local.envelope_text)
-    external_inputs_retained_on_destroy = ["Supplied Secrets Manager secret versions", "ACM certificates", "Route53 hosted zone", "Published images", "Separately bootstrapped remote state/operator authority"]
+    external_inputs_retained_on_destroy = ["Retained DynamoDB table and allocator rows", "Supplied Secrets Manager secret versions", "ACM certificates", "Route53 hosted zone", "Published images", "Separately bootstrapped remote state/operator authority"]
   }
 }
 

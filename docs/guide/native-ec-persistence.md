@@ -2,7 +2,9 @@
 
 The native Axum adapter can use dedicated DynamoDB or celld EC persistence. Build with `aws-dynamodb-ec` or `celld-ec` and select the provider explicitly in published `[ec.storage]` configuration. This is separate from ordinary byte KV and from immutable AppConfig or secret snapshots. A local database file on an ephemeral ECS volume is not a substitute for retained identity state.
 
-Persistence does not grant consent. Keep the shared EC consent, bot, browser-navigation and withdrawal rules intact. A request can be eligible for an auction but ineligible for an EC. Missing qualifying consent in a jurisdiction that requires it must still prevent EC issuance. Consent capture and CMP integration are separate work.
+Persistence does not grant consent. Keep the shared EC consent, bot, browser-navigation and withdrawal rules intact. A request can be eligible for an auction but ineligible for an EC. Missing qualifying consent in a jurisdiction that requires it must still prevent EC issuance. The operator owns genuine CMP signal transport; an empty integrations table is not necessarily a runtime defect.
+
+The unified AWS example at `deploy/examples/native-aws-workload/README.md` combines the retained table and disposable Fargate workload. Its ordered setup covers input ownership, two locked state keys, retained `ec_storage` handoff, operator TOML, matching CLI envelope export and workload inputs. Operational deployment belongs in a separate, access-controlled deployer repository. Neither deployer access nor AWS credentials are needed to read the example or run its local checks.
 
 ```mermaid
 flowchart TD
@@ -28,26 +30,19 @@ Native admin EC management and lookup remain unsupported and require separate en
 
 ## Build and select the backend
 
-From the repository root, add the EC feature to the features your native image already needs:
-
-```sh
-docker build --platform linux/amd64 \
-  --build-arg TRUSTED_SERVER__GIT_VERSION="$(git rev-parse HEAD)" \
-  --build-arg NATIVE_FEATURES=aws-appconfig-agent,aws-secrets-manager,aws-dynamodb-ec \
-  -t trusted-server-native-ec:local .
-```
-
-This command is an operator example, not evidence of a qualified image. Rebuild the final runtime image from the new binary and record its source, dependency and image digests. A historical AppConfig/Secrets Manager image qualification does not cover EC persistence merely because a provider was added to published configuration.
+The unified AWS example requires a final Axum image built with `aws-appconfig-agent,aws-secrets-manager,geo-cloudfront,aws-dynamodb-ec`, including the TS-owned runtime wrapper in `deploy/runtime/native-aws/README.md`. Image production is separate from provisioning. Record the final image's source, dependency and image digests. A historical AppConfig/Secrets Manager image qualification does not cover EC persistence merely because a provider was added to published configuration. Nonroot/read-only execution, writable volume ownership and bounded cold AppConfig Agent startup still need qualification.
 
 Publish the non-secret selection in the existing Trusted Server app-config BlobEnvelope, through the same `ts config push`/AppConfig publication path used for other settings:
 
 ```toml
 [ec.storage]
 provider = "dynamodb"
-region = "us-east-1"
+region = "eu-west-2"
 table = "example-retained-ec"
 namespace = "example-staging"
 ```
+
+For the AWS example, copy the retained root's `ec_storage` output into this TOML and pass that same object to the workload root. Export with the matching source revision's TS CLI and `--no-env`. AppConfig receives the exact inner `BlobEnvelope` string, not the CLI's outer local map. Terraform checks shape, publisher and exact storage agreement but publishes the original text; it must not reserialize config or calculate the envelope checksum.
 
 Region, table and namespace are required. Preserve the exact existing table and namespace when migrating. Use the same region as the table; unrelated `AWS_REGION` values do not select the EC region. No provider or default binding is inferred on native. An ordinary KV declaration does not enable EC persistence. Selected-provider preparation must succeed before readiness. An error never permits fallback to memory, another provider or an unbacked cookie.
 
@@ -60,6 +55,18 @@ Older binaries reject the new section. Deploy a compatible binary before publish
 The provider uses the standard AWS workload credential chain. In ECS, the application uses the task role. Keep credential values out of deployment inputs, logs, Terraform and container environment. The execution role still handles image pull, logs and task startup secrets, not application DynamoDB calls. Without a local-test selection, production preparation ignores configured endpoint overrides and uses the regional AWS endpoint. Local-only acceptance can set `local_endpoint = "http://127.0.0.1:8000"` inside `[ec.storage]`. This seam accepts only loopback HTTP with an explicit port and root path, bypasses the AWS config and credential chain, and uses dummy credentials. Never set it in a deployed task. In-process fixtures can also inject a client through the test preparation API.
 
 The table is a single-region base table. Do not add Global Tables or route writes to different regions and assume the same CAS guarantees. A single namespace partition and generation counter can become hot; `PAY_PER_REQUEST` is not a throughput qualification.
+
+## Browser hostname and consent transport
+
+The example's `publisher.domain = "publisher.example.com"` yields an EC cookie domain of `.publisher.example.com`. Browsing at `https://ts-demo.example.com` rejects that cookie because the response URL is outside the cookie domain. EC uses `publisher.domain`, not `publisher.cookie_domain`. `X-Forwarded-Host` changes server-side request interpretation, not the browser's cookie-domain check.
+
+The existing Terraform constraints require distinct publisher and demo hostnames. This documentation does not change the example values or validations. The operator must supply a supported cookie-compatible hostname arrangement within those constraints, or use the existing publisher-preserving browser proxy so the visible URL remains on the publisher while its upstream connects to the demo endpoint. With protected CloudFront, `preserve_publisher_hostname` opts into the fixed publisher forwarding identity for that proxy mode. It does not itself change the browser URL or make demo-host cookies valid.
+
+The runtime already extracts and enforces standard consent signals, including TCF, GPP, US Privacy and GPC. Existing publisher CMP transport may be sufficient without a TS integration. An empty integrations table neither proves transport is missing nor proves it works. The operator must provide genuine signals and verify the initial decision, updates and withdrawal on the chosen browser path. Do not add fabricated consent, relax policy, or infer consent from protected geography.
+
+Existing Sourcepoint GPP capture can mirror its supported signals and send scoped updates through `POST /_ts/consent`. That is an example of an existing transport, not a generic TCF bridge or a prescription to add Sourcepoint or another CMP integration. Verify the selected CMP and jurisdiction rather than assuming all standards share that update path.
+
+Browser acceptance must inspect the visible URL, rejected-cookie diagnostics, stored `ts-ec` and its return on the next eligible request. Then verify genuine initial/no-consent behavior, a real CMP update reaching the server, and withdrawal producing durable tombstones and browser-cookie expiry. A `Set-Cookie` response header, a changed CMP UI or synthetic local consent alone is insufficient. See the browser hostname and consent qualification checklist in `deploy/examples/native-aws-workload/README.md`.
 
 ## Celld conditional records
 
@@ -102,7 +109,7 @@ Missing prerequisites fail instead of silently skipping this selected check. Fix
 
 ## Table and namespace ownership
 
-The separate examples unit provides `deploy/examples/native-ec-dynamodb/`. This self-contained Terraform example creates a retained table and attaches exact-table permissions to a supplied task role. It does not create or deploy an ECS service.
+The unified example's `deploy/examples/native-aws-workload/retained/` root creates the retained table and exports `ec_storage`. It neither depends on nor attaches policies to a task role. The parent workload root creates its own role and attaches the exact-table, partition-scoped policy. Removing the workload must not remove the table or leave a retained-state reference to the deleted task role.
 
 | Item                | Required layout or owner                                                                                                |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -138,22 +145,24 @@ The runtime needs the following permissions on the exact table ARN:
 
 No task permission is needed for `Scan`, `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, index creation or table deletion. Table creation and TTL configuration belong to the infrastructure operator. The allocator does not require `GetItem`. The example uses separate row and allocator statements, so ordinary identity deletion cannot delete the allocator through this policy. IAM partition scoping does not enforce a particular `sk` or stop a compromised task from modifying permitted rows.
 
-The public native-demo design has two relevant policy layers. Its task inline policy grants runtime reads. The retained bootstrap task boundary has an explicit `Deny` with `NotAction` based on a read-action ceiling that excludes DynamoDB. Adding an inline allow alone still fails.
+The workload's task inline policy and the externally owned permission boundary are separate layers. A boundary with an explicit `Deny`/`NotAction` read-action ceiling that excludes DynamoDB still denies the calls after an inline allow is attached.
 
-Before any deployment, the boundary and workload owners must review both changes:
+Before any deployment, the boundary and workload owners must review both layers:
 
-1. Extend the task boundary's action ceiling with only the six required DynamoDB actions. Also add constrained boundary allows for the exact table and the two reviewed partitions. Preserve existing unrelated restrictions. An action-ceiling edit alone does not grant permission.
-2. Add the equivalent exact-table, partition-scoped allow to the application's task inline policy. Review all effective denies, including organization and endpoint policies, with the actual task credentials.
+1. Review the boundary's action ceiling and constrained allows for only these six DynamoDB actions on the exact table and two partitions. Preserve unrelated restrictions. An action-ceiling edit alone does not grant permission.
+2. Review the workload root's exact-table, partition-scoped inline policy and all effective denies, including organization and endpoint policies, with the actual task credentials.
 
-The example's `task_policy_json` is the constrained allow input for that review, not a replacement boundary document. Do not replace the boundary, add administrator access, remove explicit denies indiscriminately, or move the application calls to the execution role. No execution-role change is needed. Existing Secrets Manager-only KMS statements do not authorize unrelated KMS use. The example uses default service-managed DynamoDB encryption and adds no task KMS calls; a customer-managed key needs a separate review.
+The workload output `ec_task_policy_json` is a plan-known scoped allow document for that review, not a replacement boundary. Do not replace the boundary, add administrator access, remove explicit denies indiscriminately, or move application calls to the execution role. No DynamoDB execution-role change is needed. Existing Secrets Manager-only KMS statements do not authorize unrelated KMS use. DynamoDB uses default encryption at rest with an AWS-owned key here, with no new task KMS permissions. A customer-managed key is deferred and needs separate review.
 
 ## Retained infrastructure, disposable workload
 
-Keep the EC Terraform root in its own retained state, separate from the service's disposable run state. Give it a unique locked backend key and an accountable retention owner. The example enables table deletion protection and Terraform `prevent_destroy`. Neither replaces a backup, retention or erasure policy.
+Keep the nested EC Terraform root in its own retained state, separate from the service's disposable workload state. Both roots use S3 lockfile locking and require the operator to explicitly supply stable installation/workload-specific backend keys. For illustration only, `example-staging/retained.tfstate` and `example-staging/workload.tfstate` are distinct keys for one installation, not defaults. The retained key must differ from the workload key, and neither may reuse another environment's state. Backend bucket/region, encryption, versioning and access controls belong to the state owner. The retained root enables table deletion protection and Terraform `prevent_destroy`. Neither replaces a backup, retention or erasure policy.
 
 Existing disposable-workload writers, manifests, inventory and cleanup code must not be assumed to know about DynamoDB. Provision this retained root through a separately reviewed operator path. Do not quietly add a retained table to automated disposable cleanup. If that ownership model changes, review creation grants, manifests, inventory, state and destruction together.
 
-Stopping or replacing an ECS task must leave EC state available. Keep the selected backend live while issued identities and withdrawal obligations exist. Disabling it is not a safe persistence rollback; qualify a rollback that preserves those obligations before changing provider selection. Before deleting the task role, remove or transfer the retained root's policy attachment. Identity erasure, namespace retirement, backups and table removal require their own reviewed procedure. Never reset the generation allocator as part of routine row cleanup.
+Stopping or replacing an ECS task must leave EC state available. Keep the selected backend live while issued identities and withdrawal obligations exist. Disabling it is not a safe persistence rollback; qualify a rollback that preserves those obligations before changing provider selection. The workload owns its role and policy attachment; retained state has no task-role dependency. Identity erasure, namespace retirement, backups and table removal require their own reviewed procedure. Never reset the generation allocator as part of routine row cleanup.
+
+Application configuration and secrets are immutable startup snapshots. Rolling back an ECS task does not roll back the shared latest AppConfig document. The operator must manually reconcile compatible image/config/secret versions and retained storage selection; rollback automation is not provided. The example's single stop-first task also permits update downtime.
 
 The workload still needs working regional HTTPS access to DynamoDB. This guide does not require a new NAT gateway or endpoint without checking the existing routing and endpoint policies. A read-only application root and ephemeral bindings volume can stay unchanged; neither stores the identity graph.
 
@@ -179,4 +188,8 @@ Before authorizing a deployment, retain evidence for the rebuilt image and these
 - Existing route exclusions and consent rules. Health, static assets, preflight and rejected authentication must not mint identities. Missing qualifying consent must remain blocked. Synthetic local consent fixtures are not live-browser consent acceptance.
 - The actual final image's provider selection, non-root/read-only execution, startup, readiness, normal HTTPS trust and shutdown behavior, plus affected Fastly/WASM compatibility after shared EC changes.
 
-After separate AWS authorization, qualify the real task role with its retained boundary and inline policy. Prove allowed operations on the reviewed table/partitions and denial elsewhere, allocator retention, logical TTL and persistence across task replacement. Separately verify a real browser request carrying genuine qualifying consent. Do not relax privacy configuration or fabricate a live signal to make that acceptance pass.
+After separate AWS authorization, qualify the real task role with its retained boundary and inline policy. Prove allowed operations on the reviewed table/partitions and denial elsewhere, allocator retention, logical TTL and persistence across task replacement. Separately verify cookie acceptance and genuine initial/update/withdrawal CMP transport through the selected browser path. Do not relax privacy configuration or fabricate a live signal to make that acceptance pass.
+
+## Deferred production considerations
+
+PITR/backups and restore qualification, alarms, HA, autoscaling, private networking/NAT/endpoints, WAF, customer-managed keys, IPv6, image automation, bidder/partner integrations, signing/admin/S2S additions and rollback automation remain deferred. Backup choices must preserve allocator continuity and account for erasure obligations. Capacity, clock behavior, recovery and regional access need operator evidence before a production design can rely on them. These are considerations for separately approved work, not infrastructure or runtime additions in this example.

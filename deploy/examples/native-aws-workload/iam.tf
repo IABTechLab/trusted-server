@@ -1,4 +1,39 @@
 locals {
+  # Plan-known so the external boundary owner can review the same scoped
+  # DynamoDB allows without depending on generated AppConfig resource IDs.
+  ec_table_arn = "arn:aws:dynamodb:${var.ec_storage.region}:${var.aws_account_id}:table/${var.ec_storage.table}"
+  ec_task_policy = {
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ValidateExactEcTable"
+        Effect   = "Allow"
+        Action   = ["dynamodb:DescribeTable"]
+        Resource = local.ec_table_arn
+      },
+      {
+        Sid      = "IdentityRowsOnly"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Resource = local.ec_table_arn
+        Condition = {
+          "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["ec:${var.ec_storage.namespace}"] }
+          Null                        = { "dynamodb:LeadingKeys" = "false" }
+        }
+      },
+      {
+        Sid      = "AllocateGenerationsOnly"
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem"]
+        Resource = local.ec_table_arn
+        Condition = {
+          "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["ec-allocator:${var.ec_storage.namespace}"] }
+          Null                        = { "dynamodb:LeadingKeys" = "false" }
+        }
+      }
+    ]
+  }
+
   task_assume_role = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -88,7 +123,7 @@ resource "aws_iam_role_policy" "task" {
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = sort(distinct([for ref in values(var.application_secrets) : ref.arn]))
       }
-    ], local.kms_read_statement)
+    ], local.kms_read_statement, local.ec_task_policy.Statement)
   })
   depends_on = [terraform_data.draft_gate]
 }

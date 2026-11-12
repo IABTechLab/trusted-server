@@ -8,7 +8,8 @@ terraform {
     }
   }
 
-  # Provision this backend separately. Never reuse another workload's state.
+  # Supply a separately provisioned bucket, workload-specific key and region
+  # at init. Never reuse retained/ state or another workload's state.
   backend "s3" {
     encrypt      = true
     use_lockfile = true
@@ -39,7 +40,7 @@ resource "terraform_data" "draft_gate" {
     }
     precondition {
       condition     = local.envelope_valid
-      error_message = "Supply a CLI BlobEnvelope with version 1, a SHA-256 checksum field and the selected publisher domain. Trusted Server validates application policy."
+      error_message = "Supply a CLI BlobEnvelope with version 1, a SHA-256 checksum field, the selected publisher domain and ec.storage exactly matching ec_storage. Trusted Server validates application policy and checksum."
     }
   }
 }

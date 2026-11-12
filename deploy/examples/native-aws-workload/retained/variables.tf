@@ -30,8 +30,3 @@ variable "owner" {
     error_message = "An accountable retention owner is required."
   }
 }
-
-variable "task_role_name" {
-  description = "Existing ECS application task role name. Not the execution role. Boundary review is required separately."
-  type        = string
-}

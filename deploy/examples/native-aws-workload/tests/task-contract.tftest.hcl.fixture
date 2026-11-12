@@ -41,6 +41,13 @@ variables {
   application_image    = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   agent_image          = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   config_envelope_file = "example-envelope.json"
+  geo_front_door       = null
+  ec_storage = {
+    provider  = "dynamodb"
+    region    = "eu-west-2"
+    table     = "example-retained-ec"
+    namespace = "example-staging"
+  }
   application_secrets = {
     handler_password = {
       arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-handler-AbCdEf"
@@ -115,6 +122,59 @@ run "task_contract" {
   assert {
     condition     = aws_iam_role.execution.permissions_boundary == var.runtime_boundaries.execution && aws_iam_role.task.permissions_boundary == var.runtime_boundaries.task
     error_message = "Workload roles must retain the exact approved bootstrap permission ceilings."
+  }
+}
+
+run "scoped_dynamodb_task_policy" {
+  command = plan
+
+  assert {
+    condition = jsondecode(output.ec_task_policy_json) == jsondecode(<<-JSON
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ValidateExactEcTable",
+            "Effect": "Allow",
+            "Action": ["dynamodb:DescribeTable"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec"
+          },
+          {
+            "Sid": "IdentityRowsOnly",
+            "Effect": "Allow",
+            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
+            "Condition": {
+              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec:example-staging"]},
+              "Null": {"dynamodb:LeadingKeys": "false"}
+            }
+          },
+          {
+            "Sid": "AllocateGenerationsOnly",
+            "Effect": "Allow",
+            "Action": ["dynamodb:UpdateItem"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
+            "Condition": {
+              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec-allocator:example-staging"]},
+              "Null": {"dynamodb:LeadingKeys": "false"}
+            }
+          }
+        ]
+      }
+    JSON
+    )
+    error_message = "The exported boundary document must be plan-known and restrict each DynamoDB action to its exact table and partition."
+  }
+
+  assert {
+    condition = jsonencode([
+      for statement in jsondecode(aws_iam_role_policy.task.policy).Statement : statement
+      if startswith(statement.Action[0], "dynamodb:")
+      ]) == jsonencode(jsondecode(output.ec_task_policy_json).Statement) && !anytrue([
+      for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement :
+      anytrue([for action in statement.Action : startswith(action, "dynamodb:")])
+    ])
+    error_message = "Only the task role may receive exactly the exported DynamoDB allows, never the execution role."
   }
 }
 
