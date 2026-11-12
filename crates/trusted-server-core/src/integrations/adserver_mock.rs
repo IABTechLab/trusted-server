@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{Method, header};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap};
@@ -377,7 +377,8 @@ impl AdServerMockProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when the mediation response body is not valid JSON.
+    /// Returns an error when the mediation response has a non-success HTTP status,
+    /// its body cannot be read within the response limit, or it is not valid JSON.
     async fn parse_response_inner(
         &self,
         response: PlatformResponse,
@@ -387,9 +388,19 @@ impl AdServerMockProvider {
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
 
+        // OpenRTB signals an empty auction with a bodiless 204, and the bidder
+        // providers already treat it that way. Keep it a final mediation no-bid.
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(AuctionResponse::no_bid("adserver_mock", response_time_ms));
+        }
+
         if !response.status().is_success() {
-            log::warn!("AdServer Mock returned non-success: {}", response.status());
-            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "AdServer Mock returned non-success HTTP {}",
+                    response.status()
+                ),
+            }));
         }
 
         // collect_response_bounded caps memory from misbehaving providers.
