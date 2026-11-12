@@ -173,11 +173,11 @@ marks the record contract and geo as supported.
   load test at the target page-load rate with provider refreshes (A5 sets the
   rate) shows no throttling. State: #1536 puts every row under one partition
   key and updates one allocator item per insert.
-- **AX-5 Published production image.** The published, attested image runs the
-  production server. Accept: `gh attestation verify` passes for the image, and
-  its entrypoint starts the production server with `STOPSIGNAL SIGTERM`. State:
-  #1543 publishes the dev-server image (`STOPSIGNAL SIGINT`); #1539 builds the
-  production image without publishing it.
+- **AX-5 Production image.** An image built from source runs the production
+  server. Accept: its entrypoint starts the production server with
+  `STOPSIGNAL SIGTERM`. Publishing and attesting the image are outside this
+  design (DEC-19). State: #1539 builds the production image; #1543 publishes
+  the dev-server image (`STOPSIGNAL SIGINT`).
 - **AX-6 Reference infrastructure.** The reference stack wires the DynamoDB
   table, port 443 egress for vendor APIs, a readiness check that fails when a
   dependency is down, JSON logs, two or more tasks and an example rate-based
@@ -545,6 +545,8 @@ part.
   serves pages that Trusted Server proxies; that install would also need the
   script served without the page proxy.
 - Conformance with the SharedID Edge specification.
+- Binary attestation and package publishing (#1449, #1463, #1543). They
+  continue on their own track at lower priority (DEC-19).
 - An Akamai adapter.
 
 ## Decisions
@@ -586,14 +588,18 @@ Decided:
 - **DEC-6 Base for the Axum line** (user, 2026-11-12). Forward-port the RC
   line to main rather than back-port the provider stack to it, which conflicts
   in 13 to 23 files. #1531 restacks on #1506 for A1 and #1532 on #1531 for
-  #1529. The image and Terraform units (#1539, #1538, #1540) restack on #1543,
-  which publishes the image. #1536 and #1537 are not restacked: their
+  #1529. The image and Terraform units (#1539, #1538, #1540) restack on #1531,
+  where they apply cleanly. #1536 and #1537 are not restacked: their
   Axum-only stores, store selection and wiring give way to EZI-2b, T6 and
   T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
 - **DEC-18 JA4 when available** (user, 2026-11-12). ID-7 relies on a trusted
   JA4 where the adapter supplies one; without one, record creation is not
   blocked. JA4 is EdgeZero's abstraction (EZI-3), never read by Trusted
   Server from a header or a platform SDK.
+- **DEC-19 Attestation and packaging excluded** (user, 2026-11-12). Binary
+  attestation and package publishing (#1449, #1463, #1543) are not part of
+  this work and carry lower priority. The MVP builds the production image
+  from source (AX-5) without publishing or attesting it.
 - **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
   important identity providers, get `mirror_enabled`, and the MVP's provider
   and mirror checks (T11, A10) use them.
@@ -729,3 +735,7 @@ The user then decided DEC-18: ID-7 relies on a trusted JA4 where one exists and
 otherwise does not block, and JA4 is an EdgeZero abstraction. Axum's JA4
 therefore needs the trusted proxy header that IABTechLab/edgezero#469's draft
 defers to its section 13.1, which the plan asks to ship in R2.
+
+The user then excluded attestation and packaging (DEC-19): AX-5 keeps only the
+source-built production image, #1449 and #1543 leave the plan, and the image
+and Terraform units restack on #1531 instead of #1543.
