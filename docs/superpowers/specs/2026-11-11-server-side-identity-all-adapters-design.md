@@ -574,6 +574,14 @@ Decided:
   IABTechLab/edgezero#439 chain and the EZI tickets. Trusted Server main pins
   its revisions (R1, R1b, R2) instead of waiting for an EdgeZero release, and
   repins to a released tag once EdgeZero publishes one.
+- **DEC-6 Base for the Axum line** (user, 2026-11-12). Forward-port the RC
+  line to main rather than back-port the provider stack to it, which conflicts
+  in 13 to 23 files. #1531 restacks on #1506 for A1 and #1532 on #1531 for
+  #1529. The image and Terraform units (#1539, #1538, #1540) restack on #1543,
+  which publishes the image. #1536 and #1537 are not restacked: their
+  Axum-only stores, store selection and wiring give way to EZI-2b, T6 and
+  T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route
+  (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
 - **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
   important identity providers, get `mirror_enabled`, and the MVP's provider
   and mirror checks (T11, A10) use them.
@@ -583,14 +591,6 @@ Decided:
   feature is built once and works on every adapter, delivered in DEC-4's
   order. Shared logic lives in Trusted Server core; a platform capability an
   adapter lacks is an EdgeZero ask, never code in one adapter crate (SH-5).
-
-Proposed and assumed by the plan until confirmed:
-
-- **DEC-6 Base for the Axum line.** Forward-port the RC line to main by
-  restacking its units on #1506 (proposed), rather than back-port the provider
-  stack to the RC line. Applying each provider stack to the RC tag from its
-  main fork point conflicts in 13 to 23 files. The store path follows DEC-3.
-  Blocks A1, A2, A4, A6, A7.
 
 Open:
 
@@ -707,3 +707,8 @@ The user then made the DynamoDB and celld adapters available to every adapter,
 with native stores only on their own platform: EZI-2b builds them over
 EdgeZero's outbound HTTP, EZI-2c and EZI-2s run them on Cloudflare and Spin,
 and DEC-8 now picks each of those platforms' default store.
+
+The user then decided DEC-6. Rechecking the restack against DEC-3 and DEC-16
+showed that #1536 and #1537 are mostly Axum-only stores and wiring, so A2 is a
+new pull request on T21 and T6 that takes their tests, and that the image unit
+belongs on #1543, with which it shares `.dockerignore`.
