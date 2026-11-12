@@ -123,6 +123,7 @@ follows DEC-4: Fastly, Axum, Cloudflare, Spin.
 | After-response work                                                           | Supported (after send)                                               | EZI-1, drained on SIGTERM                                                  | EZI-1 over `waitUntil`                                                                                                                                              | Unsupported. DEC-14 picks before-response or skip                                                                                                                                                                       |
 | Rate limiter                                                                  | Supported (Edge Rate Limiting)                                       | EZI-5, in-memory per task, shared counter with more than one task (DEC-11) | EZI-5, backend per DEC-11                                                                                                                                           | EZI-5, backend per DEC-11                                                                                                                                                                                               |
 | Geo with region                                                               | Supported                                                            | CloudFront headers (A4, IABTechLab/edgezero#439)                           | Country only today; region needs EZI-4                                                                                                                              | None; needs EZI-4                                                                                                                                                                                                       |
+| TLS fingerprint (JA4)                                                         | Supported (Fastly SDK); EZI-3 accessor                               | EZI-3 from a trusted CloudFront hop                                        | EZI-3 accessor, or absent                                                                                                                                           | EZI-3 accessor, or absent                                                                                                                                                                                               |
 | Trusted client IP                                                             | Supported                                                            | IABTechLab/edgezero#409                                                    | `cf-connecting-ip`; EZI-3 accessor                                                                                                                                  | TCP peer; EZI-3 accessor                                                                                                                                                                                                |
 
 Cloudflare and Spin move to Supported only when EZI-2 and EZI-4 deliver for
@@ -238,8 +239,10 @@ marks the record contract and geo as supported.
   not browsers, on every supported adapter. Accept: a scripted client with a
   browser User-Agent and no browser TLS fingerprint creates no record. State:
   Fastly checks only that a JA4 exists plus a browser User-Agent platform; the
-  RC's Axum checks only the User-Agent, with request filters; Cloudflare and
-  Spin create no records yet.
+  RC's Axum checks only the User-Agent, with request filters, because it has
+  no trusted JA4 (EZI-3); Cloudflare and Spin create no records yet. CloudFront
+  sends JA4 to the origin only in the `CloudFront-Viewer-JA4-Fingerprint`
+  header, which an origin request policy must forward.
 - **ID-8 Body EIDs keep being saved.** EIDs sent in the `/auction` body are
   saved to the record. Accept: on each supported adapter a body EID is in the
   record after the request. State: main saves them on Fastly; the provider
@@ -362,7 +365,8 @@ marks the record contract and geo as supported.
 
 Behavior and acceptance only. EZI IDs are distinct from #1506's EZ-n
 requirement IDs. Each ask is split by platform, in DEC-4 order: the Fastly
-and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
+and Axum parts ship in R1, R1b and R2 and never wait on a Cloudflare or Spin
+part.
 
 - **EZI-1 After-response work.** A task registered during a request runs after
   the response is delivered, bounded in time. Accept: on Fastly and Axum the
@@ -384,9 +388,12 @@ and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
   meets the EZI-2a contract or reports `KvError::Unsupported` (DEC-8). Accept:
   the contract suite passes, or startup on that platform rejects identity
   configuration.
-- **EZI-3 Trusted client IP.** One accessor returns the trusted client IP on
-  every adapter, Fastly and Axum first. Accept: the same accessor works on
-  each adapter as its part lands.
+- **EZI-3 Trusted client metadata.** One accessor returns the trusted client
+  IP, and one the JA4 fingerprint where a trusted provider supplies it
+  (IABTechLab/edgezero#283), on every adapter, Fastly and Axum first. Axum
+  reads JA4 only from a trusted CloudFront hop. Accept: the same accessors work
+  on each adapter as its part lands, and a JA4 header from an untrusted peer
+  reads as absent.
 - **EZI-4 Geo with region on Cloudflare and Spin.** `ctx.geo()` gives country
   and region there, or a capability error. Fastly keeps its existing geo and
   Axum uses CloudFront geo from IABTechLab/edgezero#439. Accept: a US request
@@ -395,11 +402,12 @@ and Axum parts ship in R1 and R2 and never wait on a Cloudflare or Spin part.
   in-memory and shared-counter backends for Axum, then Cloudflare and Spin
   backends per DEC-11. Accept: a contract test passes per backend.
 - **EZI-6 Releases.** R1 contains IABTechLab/edgezero#275 through
-  IABTechLab/edgezero#439 plus EZI-2a and EZI-2b. R2 contains the Fastly and
-  Axum parts of EZI-1, EZI-3 and EZI-5. Together R1 and R2 cover Fastly and
-  Axum. R3 contains the Cloudflare parts of EZI-1 to EZI-5, and R4 the Spin
-  parts. Accept: each tag exists and Trusted Server main pins it; R1 and R2
-  contain no Cloudflare or Spin part.
+  IABTechLab/edgezero#439, so Axum production serving does not wait for the
+  record contract. R1b contains EZI-2a and EZI-2b. R2 contains the Fastly and
+  Axum parts of EZI-1, EZI-3 and EZI-5. Together R1, R1b and R2 cover Fastly
+  and Axum. R3 contains the Cloudflare parts of EZI-1 to EZI-5, and R4 the Spin
+  parts. Accept: each tag exists and Trusted Server main pins it; R1, R1b and
+  R2 contain no Cloudflare or Spin part.
 
 ## Configuration
 
@@ -463,7 +471,7 @@ Decided:
 - **DEC-1 Cutover** (user, 2026-11-11). #1506 is the EdgeZero cutover. #1527
   closes once #1506 covers its tests.
 - **DEC-2 MVP** (user, 2026-11-12). Fastly and Axum are the MVP: plan waves 0
-  to 10. Cloudflare, Spin and the decision-gated work follow it.
+  to 9. Cloudflare, Spin and the decision-gated work follow it.
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends.
 - **DEC-4 Platform order** (user, 2026-11-12). Fastly, then Axum, then
@@ -488,14 +496,16 @@ Proposed and assumed by the plan until confirmed:
 Open:
 
 - **DEC-8 Cloudflare and Spin store.** Which EdgeZero store meets the record
-  contract there, per [Platform support](#platform-support). Blocks T8 and T9.
+  contract there, per [Platform support](#platform-support). Blocks EZI-2c,
+  EZI-2s, R3, T8 and T9.
 - **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
-  shared by everyone behind one IP. Blocks enabling LiveRamp in #1488.
+  shared by everyone behind one IP. Blocks enabling LiveRamp in #1488, and
+  #1245.
 - **DEC-10 Mirror partners.** Which partners get `mirror_enabled`. Blocks T14.
-- **DEC-11 Rate limiter key and backend, and the Axum task count.** Blocks T10
-  and A7.
+- **DEC-11 Rate limiter key and backend, and the Axum task count.** Blocks
+  EZI-5, EZI-5c, EZI-5s, T10 and A7.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
-  going out as `user.id`. No ticket until decided.
+  going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
 - **DEC-14 Spin after-response work.** Run it before the response, or skip it.
   Blocks T9.
@@ -535,3 +545,13 @@ re-parent the EdgeZero issues it moves (35), and WB-3's no-write case must
 require a consistent `<name>_cst` (36). No blocking finding. The revision after
 it addresses all eight; round 3 is pending, and the PR stays in draft until a
 round finds nothing blocking.
+
+### Ticket audit, 2026-11-12
+
+At the user's request, an audit of every plan ticket's order, priority, size
+and MVP need, with each blocker checked against code at the PR heads. In the
+spec, EZI-3 adds JA4, because ID-7 cannot pass on Axum without it, and ID-7's
+state and the platform table say so; EZI-6 moves the record contract into R1b,
+so A1 no longer waits for it; DEC-2's MVP is plan waves 0 to 9; and DEC-8,
+DEC-9, DEC-11 and DEC-12 list every ticket they block. The plan's changes are
+listed in the PR conversation.
