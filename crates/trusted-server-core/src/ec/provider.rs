@@ -171,16 +171,27 @@ impl<'cookie> From<Option<Vec<ProviderEid<'cookie>>>> for CookieRead<'cookie> {
 /// The request's `Cookie` header, lent to providers that read their own
 /// first-party cookies.
 ///
+/// It also carries the request time, so a provider judges a cookie's stated
+/// expiry against the navigation's one clock reading rather than its own.
 /// Its `Debug` output names the cookies but never prints their values.
-#[derive(Clone, Copy, Default)]
-pub struct RequestCookies<'a>(&'a str);
+#[derive(Clone, Copy)]
+pub struct RequestCookies<'a> {
+    header: &'a str,
+    now: UnixSeconds,
+}
+
+impl Default for RequestCookies<'_> {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
 
 impl core::fmt::Debug for RequestCookies<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_list()
             .entries(
-                self.0
+                self.header
                     .split(';')
                     .filter_map(|pair| pair.split_once('='))
                     .map(|(name, _)| name.trim()),
@@ -193,7 +204,24 @@ impl<'a> RequestCookies<'a> {
     /// Wraps a `Cookie` header value (pairs separated by `;`).
     #[must_use]
     pub fn new(header: &'a str) -> Self {
-        Self(header)
+        Self {
+            header,
+            now: UnixSeconds::new(0),
+        }
+    }
+
+    /// The same cookies, read at request time `now`.
+    ///
+    /// The coordinator sets it before handing the cookies to a provider.
+    #[must_use]
+    pub fn at(self, now: UnixSeconds) -> Self {
+        Self { now, ..self }
+    }
+
+    /// The request time the cookies are read at.
+    #[must_use]
+    pub fn now(&self) -> UnixSeconds {
+        self.now
     }
 
     /// Returns the first non-empty value of cookie `name`, undecoded and
@@ -215,7 +243,7 @@ impl<'a> RequestCookies<'a> {
     where
         'a: 'name,
     {
-        self.0
+        self.header
             .split(';')
             .filter_map(|pair| pair.split_once('='))
             .filter(move |(key, _)| key.trim() == name)
@@ -289,6 +317,8 @@ pub struct LookupInput<'a> {
     /// The request's cookies, for a vendor first-party cookie a lookup
     /// sends as input.
     pub cookies: RequestCookies<'a>,
+    /// Request time; providers use it instead of reading the clock.
+    pub now: UnixSeconds,
     /// Always `None` in V1.
     pub hashed_email: Option<&'a HashedEmail>,
 }

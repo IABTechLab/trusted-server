@@ -46,8 +46,7 @@ use error_stack::{Report, ResultExt as _};
 use http::header::{CONTENT_TYPE, ORIGIN};
 use http::{HeaderMap, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
-use trusted_server_core::ec::current_timestamp;
-use trusted_server_core::ec::eid_types::SourceDomain;
+use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
     CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
     ProviderCapabilities, ProviderCommon, ProviderConfigError, ProviderEid, ProviderError,
@@ -63,9 +62,9 @@ use crate::common::{
     is_usable_id, join_section_ids, percent_decoded,
 };
 
-/// Formats the current time as the RFC 3339 `ts` the `/gs/v2` fetch requires.
-fn request_timestamp() -> Result<String, Report<ProviderError>> {
-    let now = i64::try_from(current_timestamp()).change_context(ProviderError::Request)?;
+/// Formats the request time as the RFC 3339 `ts` the `/gs/v2` fetch requires.
+fn request_timestamp(now: UnixSeconds) -> Result<String, Report<ProviderError>> {
+    let now = i64::try_from(now.get()).change_context(ProviderError::Request)?;
     DateTime::<Utc>::from_timestamp(now, 0)
         .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
         .ok_or_else(|| Report::new(ProviderError::Request).attach("current time is out of range"))
@@ -362,7 +361,7 @@ impl IdentityProvider for Id5Provider {
             gpp_string: consent.raw_gpp_string.as_deref(),
             gpp_sid: consent.gpp_section_ids.as_deref().map(join_section_ids),
             tml: &origin,
-            ts: request_timestamp()?,
+            ts: request_timestamp(lookup.now)?,
             ua: lookup.client.user_agent,
             ip: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
             ipv6: routable_ip.filter(IpAddr::is_ipv6).map(|ip| ip.to_string()),
@@ -529,6 +528,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = provider
@@ -580,6 +580,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = provider
@@ -607,6 +608,7 @@ mod tests {
             current: OwnedEntries::empty(),
             cookies: RequestCookies::default(),
             hashed_email: None,
+            now: trusted_server_core::ec::eid_types::UnixSeconds::new(1_700_000_000),
         };
 
         let request = provider
