@@ -1,7 +1,8 @@
 # Server-to-Server EID Collection — Design Spec
 
 **Date:** 2026-10-30
-**Status:** Implemented by PR A (#1487); reviewed (see the review log)
+**Status:** PR A (#1487) implements PR1 to PR4, PR B (#1489) PR5 and PR6;
+reviewed (see the review log)
 **Source of intent:** the S2S EID collection requirements document, kept
 outside this repository (sections referenced as "R§n")
 
@@ -99,8 +100,8 @@ Reviewers should check these; each follows from a decision above.
   `GET` on the publisher-proxy route with `Sec-Fetch-Dest: document` and
   `Sec-Fetch-Mode: navigate`, and its `Sec-Purpose` header, if any, has no
   `prefetch` token. Requests without Fetch Metadata never write. A navigation
-  whose final response is a redirect (3xx) does not write; the redirect target
-  is the page load. This is stricter than the existing `is_navigation_request`
+  whose final response is a 301, 302, 303, 307 or 308 redirect does not write;
+  the redirect target is the page load. A `304` keeps the permit. This is stricter than the existing `is_navigation_request`
   (which falls back to `Accept: text/html`); that helper keeps its other uses,
   and the write permit uses the stricter test.
 - **Integration-proxy EC minting stops (D1).** Integration-proxy requests can no
@@ -239,7 +240,7 @@ Exactly one of these, chosen from the request snapshot:
 | --------------------------------------- | ----------------------------------------------------------------------------- |
 | Consent withdrawn, live row             | No page-load write; the tombstone follows §3.1. No lookups, no ingest.        |
 | Row tombstoned, no fresh consent        | None. No lookups. Nothing served.                                             |
-| New EC (or orphaned EC being recovered) | Create the row with browser ingest + valid provider results.                  |
+| New EC (or orphaned EC being recovered) | Create the row with browser ingest. No lookups: the EC has no row yet (§8.1). |
 | Returning EC, something changed         | CAS update with browser ingest + valid provider results; expired UIDs pruned. |
 | Returning EC, nothing changed           | None.                                                                         |
 
@@ -367,7 +368,7 @@ pub struct ProviderId(Arc<str>);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, derive_more::Display)]
 pub struct SourceDomain(Arc<str>);
 
-/// A non-empty UID of at most [`MAX_UID_LENGTH`] bytes.
+/// A non-empty UID of at most [`MAX_STORED_UID_LENGTH`] (1024) bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, derive_more::Display)]
 #[serde(try_from = "String")]
 pub struct UidValue(Box<str>);
@@ -1017,8 +1018,9 @@ bodies are capped at 64 KiB.
 
 The navigation path depends on the `IdentityCoordinator` trait, generic over
 the coordinator and the transport. The trait covers the coordinator's whole
-surface on a navigation: start lookups, collect them, plan the single row
-change, and build the mirror. Its production implementation is
+surface on a navigation: start lookups and collect them (PR B adds the mirror).
+It does not plan the row change: the free function `write_plan::plan_write`
+merges the results and plans it. Its production implementation is
 `ProviderCoordinator<P>`. Tests of coordinator rules (validation, merge,
 mirror) run `ProviderCoordinator` with test providers and a test transport; a
 fake `IdentityCoordinator` is used only for navigation wiring tests, where
@@ -1029,8 +1031,8 @@ those rules are not under test.
 ///
 /// Implementations own eligibility, consent, destination checks, the shared
 /// time budget, validation, merging and mirror encoding. Providers never see
-/// KV, cookies, HTTP or the clock. Implementations never write KV: they return
-/// the change and the caller spends the [`PageLoadWrite`] permit.
+/// KV, cookies, HTTP or the clock. Implementations never write KV: the caller
+/// plans the change with `plan_write` and spends the [`PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -1139,12 +1141,14 @@ pub enum SkipReason {
 /// `PartnerIdUpdate` (today `pub(crate)` in `ec::kv`) becomes `pub` so this
 /// public trait input does not leak a private type.
 pub struct WritePlanInput<'a> {
+    pub ec_id: &'a str,
     pub snapshot: &'a EcKvSnapshot,
-    pub consent: &'a ConsentContext,
     pub new_entry: Option<&'a KvEntry>,
     /// Updates from `ts-eids` and `sharedId`, already reduced by today's rules.
     pub browser_ingest: &'a [PartnerIdUpdate],
     pub lookups: &'a LookupResults,
+    /// For provider ownership.
+    pub registry: &'a PartnerRegistry,
     pub now: UnixSeconds,
 }
 
@@ -1196,7 +1200,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
 ```
 
 `rate_limit_per_hour` is not a new traffic control: it carries over pull sync's
-existing per-EC, per-partner hourly limit (PR5), which needs the `RateLimiter`
+existing per-EC-hash, per-partner hourly limit (PR5), which needs the `RateLimiter`
 state that pure providers cannot hold. Operators may also set it per provider
 with the optional `rate_limit_per_hour` config field (§12.1), for example to
 bound repeat lookups for sources a provider never resolves; it is unset by
@@ -1239,13 +1243,14 @@ counted by reason.
 | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | EID      | `source` normalizes to a source this provider claims in config; otherwise dropped.                                                                                                           |
 | EID      | `inserter`/`matcher` at most 255 bytes; `mm` within OpenRTB values; `ext` a JSON object of at most 1 KiB. EID-level fields are dropped (not the entry) when `eid_level_fields` is `Ignored`. |
-| UID      | `id` non-empty after trimming and at most `MAX_UID_LENGTH` (1024) bytes; `ext` a JSON object of at most 1 KiB.                                                                               |
+| UID      | `id` non-empty after trimming and at most `MAX_STORED_UID_LENGTH` (1024) bytes; `ext` a JSON object of at most 1 KiB.                                                                        |
+| Both     | An `ext` (EID or UID) nests at most 32 levels deep; otherwise it is invalid as above.                                                                                                        |
 | UID      | Refresh `state` non-empty and at most 2048 bytes, with a stated `from`; otherwise the refresh state is dropped and the UID kept. `from` is resolved like `exp`.                              |
 | UID      | `atype` missing is filled from the source's `openrtb_atype`.                                                                                                                                 |
 | UID      | `exp`, when present, must be greater than now; otherwise dropped.                                                                                                                            |
 | Counts   | Entries beyond `max_eids`, or UIDs beyond `max_uids_per_eid`, are dropped from the end.                                                                                                      |
 | Dedupe   | UIDs with the same (`source`, `id`) keep the first occurrence, as in §11.1.                                                                                                                  |
-| Row size | If the merged row would exceed 16 KiB serialized, new provider UIDs are dropped in reverse provider-config order, last UID first, until it fits.                                             |
+| Row size | See §12.3 for rows over 16 KiB serialized. This navigation's provider UIDs are dropped, last source and last UID first, until the row without its browser UIDs fits.                         |
 
 An EID entry left with no UIDs is dropped. A response that cannot be parsed at
 all is a failure for that provider; other providers and browser input are
@@ -1289,8 +1294,10 @@ the same batch are processed as today.
 A disabled provider makes no outbound requests and is not considered for
 eligibility, and its sources stop being provider-owned. UIDs it wrote earlier
 keep serving until `exp`, or until replaced or removed; once pruned, browser
-ingest may fill the source again. Other providers and client-side collection
-are unaffected.
+ingest may fill the source again. Its `tcf_vendor_id` still gates egress of
+every ID for its sources, stored or sent by the browser, so disabling a
+provider never releases its UIDs without that vendor's consent. Removing the
+provider's entry does drop that gate (#1548). Other providers are unaffected.
 
 ## 9. KV write counting, failure and retry
 
@@ -1299,7 +1306,7 @@ are unaffected.
 The write limit is enforced by types. A navigation receives a
 `NavigationPermit`; it becomes a `PageLoadWrite` only when the final response
 is not a redirect; the write consumes it. Neither type is `Clone` or
-`Copy`, `classify` is `pub(crate)` and called once by the router, and
+`Copy`, `classify` is called once, by the publisher-proxy route only, and
 `commit_page_load` consumes the permit, so a navigation cannot write twice and
 no other request can write at all.
 
@@ -1508,15 +1515,14 @@ examples use placeholders.
 Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
 `http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_no_row`, `skipped_consent`,
 `skipped_not_due`, `skipped_input`, `skipped_rate_limited`, `skipped_opted_out`,
-`destination_rejected`; plus counts of
-entries and UIDs kept and dropped by reason. The page-load write emits no
+`destination_rejected`; plus the totals of UIDs kept and dropped. The page-load write emits no
 outcome label in PR A: a skipped write is logged with its error (a conflict,
 an existing row or a store error), and an update without a generation is
 logged as `no_generation`. A navigation that runs the after-response phase
 (§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`
-or `failed`. Logs include the
-provider ID, source, counts and durations, and the EC ID only in its existing
-truncated form. Raw UIDs, EID values and encrypted envelopes are never logged.
+or `failed`. The outcome log holds the provider ID, the outcome and the kept
+and dropped totals; other logs hold the EC ID only in its existing truncated
+form. Raw UIDs, EID values and encrypted envelopes are never logged.
 
 ### 12.3 Compatibility and rollout
 
@@ -1530,11 +1536,20 @@ PR A changes behaviour that operators and integrators can observe:
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
   until a later navigation finds its row.
-- **Browser EIDs.** `/auction` and page-bids no longer write browser EIDs; the
-  next navigation ingests them.
+- **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
+  `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
+  ingests those cookies.
+- **Withdrawal.** The EC cookie is expired only once every tombstone is
+  written or the row is proven absent; while a tombstone fails, the cookie is
+  kept so the next request retries. On main the cookie was expired first.
+- **Vendor consent.** On Fastly, a provider's `tcf_vendor_id` gates every ID
+  of its sources at egress, browser-supplied ones included, and keeps doing so
+  while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
-  reports `row_full`; a row written before the cap is trimmed only when a
-  write also carries a real change.
+  reports `row_full`. A row written before the cap is trimmed only when a
+  write also carries a real change: its largest stored records are dropped
+  first, so the change that triggered the write still lands. A provider
+  refresh that no longer fits keeps the record it would replace.
 - **Fastly snapshot.** The final auction snapshot may wait up to 1 ms per
   partially received body and reads on into a response whose headers arrived
   by the cutoff.
@@ -1552,11 +1567,10 @@ PR A changes behaviour that operators and integrators can observe:
 
 The work below is delivered as two pull requests:
 
-- **PR A** — the work units PR1, PR2 and PR3, plus the PR4 batch-sync
-  `provider_owned` rejection, on top of the merged platform PR #1433, which
-  provides the deadline-bounded `select_until` that `PlatformLookupTransport`
-  uses.
-- **PR B** — the work units PR4, PR5 and PR6, stacked on PR A.
+- **PR A** — the work units PR1 to PR4, on top of the merged platform PR
+  #1433, which provides the deadline-bounded `select_until` that
+  `PlatformLookupTransport` uses.
+- **PR B** — the work units PR5 and PR6, stacked on PR A.
 
 PR A alone keeps the old post-send pull-sync write as a separate channel
 (§9), as it is on main; PR A registers no provider kind, so no provider write
@@ -1586,9 +1600,10 @@ request the units are separate, ordered commits so they stay reviewable.
 ## 14. Acceptance scenarios
 
 1. **First navigation, consent granted.** No EC. One provider is enabled and
-   due. The provider answers within budget. → One KV create holding the
-   provider UIDs (with owner and `exp`) and browser-ingested UIDs; the EC cookie
-   and mirror are set on the response; the provider is called once.
+   due. → One KV create holding the browser-ingested UIDs; the EC cookie is
+   set; the provider is not called (§8.1). The next navigation finds the row,
+   calls the provider once and writes its UIDs (with owner and `exp`) in one
+   CAS update; the mirror is set on that response.
 2. **One write per page load.** A navigation is followed by three `/auction`
    calls, one `/_ts/page-bids` call and two integration-proxy calls, all
    carrying new `ts-eids` content. → At most one KV write, on the navigation.
@@ -1682,9 +1697,9 @@ Reviewer findings and resolutions:
   out of the blob; non-provider writers stay at 512 bytes.
 - Unknown kinds skipped silently, duplicate provider IDs, deeply nested `ext`,
   batch sync aborting on a full row, minted ECs sent to vendors: fixed.
-- Negative caching, a maximum provider UID lifetime, after-response retry,
-  lenient readers and client EIDs after an opt-out: deferred to follow-up
-  issues.
+- Negative caching (#1547), a maximum provider UID lifetime (#1548),
+  after-response retry (#1553), lenient readers (#1554) and client EIDs after
+  an opt-out (#1555): deferred to follow-up issues.
 
 ### Round 2 (2026-11-10/11, PR #1487 at 889159cd6)
 
@@ -1698,3 +1713,20 @@ Reviewer findings and resolutions:
 - Disabled providers keep their vendor-consent gate on stored UIDs; `ext`
   nesting bounded to 32 levels; raw client IP passed to providers.
 - Spec drift corrected (§5.3, §6.3, §7, §8.4, §9.2, §12, §13).
+
+### Round 3 (2026-11-12, PR #1487 at 4e7a6e02b)
+
+- Size cap: round 2's fix was incomplete. A row over the cap that gains an ID
+  now loses its largest stored records first, so the added ID lands; this
+  navigation's provider UIDs compete with the stored row only, and a refresh
+  that no longer fits keeps the record it replaces (§8.2, §12.3).
+- A remembered opt-out clears only sources the row still stores, so the
+  after-response path skips its re-read once they are gone.
+- Orphan lookup retargeting removed: dispatch never looks up an EC without a
+  row. Such lookups are counted as `skipped_no_row` (§12.2).
+- Client-EID vendor filter tested at both auction call sites; main's direct
+  tombstone tests restored.
+- Remaining drift corrected (§3.1, §5.3, §6.2, §8.1.2, §8.2, §8.6, §9.1,
+  §12.2, §12.3, §13.1, §14). Round 2's "Spec drift corrected" missed these.
+- Deferred: deploy validation per adapter and kind (#1552), a full-row pull
+  sync loop (#1551).
