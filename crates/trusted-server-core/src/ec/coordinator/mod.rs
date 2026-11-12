@@ -2692,7 +2692,7 @@ mod tests {
             },
         ]);
         let config: IdentityProviderConfig = toml::from_str(&format!(
-            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\", \"{SECOND_SOURCE}\"]\n"
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\", \"{SECOND_SOURCE}\"]\nrate_limit_per_hour = 1\n"
         ))
         .expect("should parse config");
         let partners: Vec<EcPartner> = ["ids.example.com", SECOND_SOURCE]
@@ -2745,59 +2745,108 @@ mod tests {
         );
     }
 
+    /// Plans the row change a navigation's results make, as finalize does.
+    fn planned_change(
+        snapshot: &EcKvSnapshot,
+        results: &LookupResults,
+    ) -> Option<crate::ec::page_load::RowChange> {
+        let partners: Vec<EcPartner> = ["ids.example.com", SECOND_SOURCE]
+            .into_iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        crate::ec::write_plan::plan_write(&crate::ec::write_plan::WritePlanInput {
+            ec_id: EC_ID,
+            snapshot,
+            new_entry: None,
+            browser_ingest: &[],
+            lookups: results,
+            registry: &registry,
+            now: UnixSeconds::new(1000),
+        })
+    }
+
+    /// Outcomes of a lookup that stores nothing, with a label for messages.
+    fn failed_outcomes() -> [(&'static str, Reply, bool); 5] {
+        [
+            ("404", not_found_reply, false),
+            ("timeout", timeout_reply, false),
+            ("502", server_error_reply, false),
+            ("invalid", invalid_reply, false),
+            ("rate-limited", ok_reply, true),
+        ]
+    }
+
     #[test]
     fn an_unchanged_cookie_is_not_rewritten_while_another_source_is_due() {
+        // Arrange: the row holds the cookie's UID; the second source is due.
         let coordinator = two_source_coordinator(|provider| provider);
-        let replies: [Reply; 4] = [
-            not_found_reply,
-            timeout_reply,
-            server_error_reply,
-            invalid_reply,
-        ];
+        let snapshot = held_snapshot("c-1");
 
-        for reply in replies {
-            let transport = CannedTransport::new(reply);
+        for (label, reply, limited) in failed_outcomes() {
+            for cookies in ["vendor_id=c-1", ""] {
+                let transport = CannedTransport::new(reply);
 
-            let results = run(&coordinator, &transport, &held_snapshot("c-1"), &granting());
+                // Act
+                let results = run_with_cookies(
+                    &coordinator,
+                    &transport,
+                    &snapshot,
+                    &granting(),
+                    &Limiter(limited),
+                    cookies,
+                );
 
-            assert_eq!(
-                transport.sent.borrow().len(),
-                1,
-                "should still look up the second source"
-            );
-            let lookup = results.iter().next().expect("should report the provider");
-            assert!(
-                lookup.entries.is_empty(),
-                "should not rewrite the cookie UID the row already holds: {:?}",
-                lookup.status
-            );
+                // Assert
+                assert!(
+                    planned_change(&snapshot, &results).is_none(),
+                    "should plan no write for {label} with cookies `{cookies}`: {:?}",
+                    only_status(&results)
+                );
+            }
         }
     }
 
     #[test]
     fn a_failed_refresh_keeps_the_held_refresh_state() {
-        let coordinator = cookie_coordinator();
-        let replies: [Reply; 3] = [timeout_reply, server_error_reply, invalid_reply];
+        // Arrange: the held UID's refresh is due and the cookie repeats it.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("rate_limit_per_hour = 1"),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let snapshot = snapshot_holding(refreshable_record(900));
 
-        for reply in replies {
-            let transport = CannedTransport::new(reply);
+        for (label, reply, limited) in failed_outcomes() {
+            for cookies in ["vendor_id=p-1", ""] {
+                let transport = CannedTransport::new(reply);
 
-            let results = run_with_cookies(
-                &coordinator,
-                &transport,
-                &snapshot_holding(refreshable_record(900)),
-                &granting(),
-                &Limiter(false),
-                "vendor_id=p-1",
-            );
+                // Act
+                let results = run_with_cookies(
+                    &coordinator,
+                    &transport,
+                    &snapshot,
+                    &granting(),
+                    &Limiter(limited),
+                    cookies,
+                );
 
-            assert_eq!(transport.sent.borrow().len(), 1, "should send the refresh");
-            let lookup = results.iter().next().expect("should report the provider");
-            assert!(
-                lookup.entries.is_empty(),
-                "should not replace the held record after a failed refresh: {:?}",
-                lookup.status
-            );
+                // Assert
+                let lookup = results.iter().next().expect("should report the provider");
+                assert!(
+                    lookup.entries.is_empty(),
+                    "should not replace the held record after {label}: {:?}",
+                    lookup.status
+                );
+                assert!(
+                    planned_change(&snapshot, &results).is_none(),
+                    "should plan no write that drops the refresh state for {label} with cookies `{cookies}`"
+                );
+            }
         }
     }
 
