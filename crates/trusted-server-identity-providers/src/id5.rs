@@ -18,7 +18,10 @@
 //! writes (`[settings.lockr]`, default key `id5id`). A cookie holding the ID5 fetch response JSON
 //! (plain or percent-encoded) is parsed exactly like a lookup response, and
 //! a bare ID string becomes one UID on the first source with agent type 1
-//! and the default TTL. The response `signature` is never stored. A
+//! and the default TTL. A reply's non-empty `signature` is kept as the
+//! UIDs' private refresh state, due a tenth of their TTL before they
+//! expire, and sent back as `s` in the next fetch so ID5 can return the
+//! same ID, as Prebid's ID5 module does. A
 //! percent-encoded JSON cookie is decoded and its entries, `ext` objects
 //! included, are copied out of the decoded text. A cookie that yields no
 //! usable UID is ignored and the lookup runs as usual. A cookie holding
@@ -50,8 +53,8 @@ use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
     CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
     ProviderCapabilities, ProviderCommon, ProviderConfigError, ProviderEid, ProviderError,
-    ProviderKind, ProviderRequest, ProviderResponse, ProviderUid, RequestCookies, SourceCapability,
-    SourceInput,
+    ProviderExpiry, ProviderKind, ProviderRefresh, ProviderRequest, ProviderResponse, ProviderUid,
+    RequestCookies, SourceCapability, SourceInput,
 };
 use url::Url;
 
@@ -200,6 +203,9 @@ struct FetchBody<'a> {
     ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ipv6: Option<String>,
+    /// The previous reply's `signature`, which lets ID5 return the same ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s: Option<&'a str>,
 }
 
 /// The top-level reply; each field is parsed separately so one bad shape
@@ -214,6 +220,8 @@ struct FetchReply<'body> {
     cache_control: Option<&'body RawValue>,
     #[serde(default, borrow)]
     ext: Option<&'body RawValue>,
+    #[serde(default, borrow)]
+    signature: Option<&'body RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +269,16 @@ impl Id5Provider {
             .and_then(|cache| cache.max_age_sec)
             .map(Duration::from_secs);
         let expiry = bounded_expiry(max_age);
+        let signature = reply
+            .signature
+            .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
+            .filter(|signature| !signature.is_empty());
+        let refresh = || {
+            signature.as_ref().map(|signature| ProviderRefresh {
+                state: signature.clone(),
+                from: refresh_from(expiry),
+            })
+        };
 
         let entries: BTreeMap<String, &'body RawValue> = reply
             .ids
@@ -277,6 +295,9 @@ impl Id5Provider {
                 (!eid.uids.is_empty()).then(|| eid.into_provider_eid(expiry))
             })
             .collect();
+        for uid in eids.iter_mut().flat_map(|eid| eid.uids.iter_mut()) {
+            uid.refresh = refresh();
+        }
         let primary = self.primary_source().as_str();
         let has_primary = eids.iter().any(|eid| eid.source == primary);
         let universal_uid = reply
@@ -302,7 +323,7 @@ impl Id5Provider {
                     atype: Some(1),
                     ext: link_type.map(Cow::Owned),
                     expiry,
-                    refresh: None,
+                    refresh: refresh(),
                 }],
             });
         }
@@ -375,6 +396,12 @@ impl IdentityProvider for Id5Provider {
             ua: lookup.client.user_agent,
             ip: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
             ipv6: routable_ip.filter(IpAddr::is_ipv6).map(|ip| ip.to_string()),
+            s: lookup
+                .current
+                .iter()
+                .flat_map(|(_, eid)| eid.uids())
+                .find_map(|uid| uid.refresh())
+                .map(|refresh| refresh.state.as_str()),
         };
         let body = serde_json::to_vec(&body).change_context(ProviderError::Request)?;
         let mut headers = HeaderMap::new();
@@ -467,9 +494,22 @@ fn owned<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
                 atype: uid.atype,
                 ext: uid.ext.map(|ext| Cow::Owned(ext.into_owned())),
                 expiry: uid.expiry,
-                refresh: None,
+                refresh: uid.refresh.map(|refresh| ProviderRefresh {
+                    state: Cow::Owned(refresh.state.into_owned()),
+                    from: refresh.from,
+                }),
             })
             .collect(),
+    }
+}
+
+/// When a UID that expires at `expiry` is refreshed: a tenth of its TTL
+/// early, so the refresh runs while the UID and its signature are still
+/// stored.
+fn refresh_from(expiry: ProviderExpiry) -> ProviderExpiry {
+    match expiry {
+        ProviderExpiry::After(ttl) => ProviderExpiry::After(ttl - ttl / 10),
+        other => other,
     }
 }
 
@@ -483,6 +523,8 @@ mod tests {
     use http::StatusCode;
     use serde_json::json;
     use trusted_server_core::consent::types::ConsentContext;
+    use trusted_server_core::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
+    use trusted_server_core::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvRefresh, KvUid};
     use trusted_server_core::ec::provider::{
         ClientSignals, OwnedEntries, ProviderExpiry, build_kind,
     };
@@ -516,6 +558,108 @@ mod tests {
                 context: None,
             })
             .expect("should parse response")
+    }
+
+    #[test]
+    fn keeps_the_reply_signature_as_refresh_state() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let body = json!({
+            "universal_uid": "id5-example",
+            "signature": "signature-example",
+            "cache_control": { "max_age_sec": 36_000 },
+        })
+        .to_string();
+
+        let outcome = respond(&*provider, &headers, body.as_bytes());
+
+        let LookupOutcome::Found(eids) = outcome else {
+            panic!("should find the ID5 ID");
+        };
+        let refresh = eids[0].uids[0]
+            .refresh
+            .as_ref()
+            .expect("should keep the signature as refresh state");
+        assert_eq!(
+            refresh.state, "signature-example",
+            "should store the signature"
+        );
+        assert!(
+            matches!(refresh.from, ProviderExpiry::After(ttl) if ttl == Duration::from_secs(32_400)),
+            "should refresh a tenth of the TTL before the UID expires"
+        );
+    }
+
+    #[test]
+    fn keeps_no_refresh_state_without_a_signature() {
+        let provider = provider();
+        let headers = HeaderMap::new();
+        let body = json!({ "universal_uid": "id5-example", "signature": "" }).to_string();
+
+        let outcome = respond(&*provider, &headers, body.as_bytes());
+
+        let LookupOutcome::Found(eids) = outcome else {
+            panic!("should find the ID5 ID");
+        };
+        assert!(
+            eids[0].uids[0].refresh.is_none(),
+            "should keep no refresh state for an empty signature"
+        );
+    }
+
+    #[test]
+    fn sends_the_stored_signature_as_s() {
+        // Arrange
+        let uid = KvUid::new(
+            UidValue::try_from("id5-example".to_owned()).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("id5")),
+            Expiry::At(UnixSeconds::new(1_800_000_000)),
+        )
+        .with_refresh(KvRefresh {
+            state: "signature-example".to_owned(),
+            from: UnixSeconds::new(1_700_000_000),
+        });
+        let record = KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1_700_000_000),
+        )
+        .expect("should keep the live uid");
+        let mut entry = KvEntry::tombstone(1);
+        entry.consent.ok = true;
+        entry.ids.insert("id5.example.com".to_owned(), record);
+        let sources = [SourceDomain::try_from("id5.example.com").expect("should build source")];
+        let owner = ProviderId::new("id5");
+        let consent = ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &sources,
+            current: OwnedEntries::new(Some(&entry), &sources, &owner),
+            cookies: RequestCookies::default(),
+            hashed_email: None,
+            now: UnixSeconds::new(1_700_000_000),
+        };
+
+        // Act
+        let request = provider()
+            .build_request(&lookup)
+            .expect("should build request");
+
+        // Assert
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("should send JSON");
+        assert_eq!(
+            body.get("s"),
+            Some(&json!("signature-example")),
+            "should send the previous signature as s"
+        );
     }
 
     #[test]
@@ -867,7 +1011,7 @@ mod tests {
                 true,
                 Duration::from_secs(7200)
             )],
-            "should parse the reply like a lookup response and never store the signature"
+            "should parse the reply like a lookup response"
         );
     }
 
