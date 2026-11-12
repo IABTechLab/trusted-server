@@ -94,19 +94,28 @@ impl Drop for ChildHandle {
         if self.process_group {
             // Give the owned group's signal handlers time to exit, such as
             // Playwright closing its browsers, before escalating the group.
+            let group = self.child.id() as libc::pid_t;
             unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGTERM);
+                libc::killpg(group, libc::SIGTERM);
             }
             let deadline = Instant::now() + Duration::from_secs(3);
+            let mut group_exited = false;
             while Instant::now() < deadline {
-                let group_exists = unsafe { libc::killpg(self.child.id() as libc::pid_t, 0) == 0 };
-                if !group_exists {
+                // An unreaped leader still counts as a group member on Linux,
+                // so reap it before probing. Only ESRCH means the group is gone.
+                let _ = self.child.try_wait();
+                let probe = unsafe { libc::killpg(group, 0) };
+                if probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    group_exited = true;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+            if !group_exited {
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
             }
         }
         let _ = self.child.kill();
