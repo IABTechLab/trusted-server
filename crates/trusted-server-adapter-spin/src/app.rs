@@ -27,7 +27,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
+use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -87,14 +87,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
     let config_key = default_config_key();
-    let config_store =
-        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
-            .map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: "failed to open Spin Trusted Server config store".to_string(),
-            })
-            .attach(error.to_string())
-        })?;
+    let config_store = SpinConfigStore::for_label(config_store_name.as_ref().to_owned());
     let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
     let config_adapter = ConfigStoreHandleAdapter(config_handle);
     let raw_envelope = config_adapter
@@ -293,8 +286,8 @@ fn parse_client_addr(raw: &str) -> Option<IpAddr> {
 // which rejects a relative path. Rebuilding an absolute URI from the trusted
 // scheme+host lets those handlers validate the signed target instead of failing
 // with "Invalid URL".
-pub(crate) fn normalize_spin_request(req: &mut Request) {
-    sanitize_forwarded_headers(req);
+pub(crate) fn normalize_spin_request(req: &mut edgezero_core::http::RequestParts) {
+    trusted_server_core::http_util::sanitize_forwarded_header_map(&mut req.headers);
 
     // Strip any client-supplied `x-forwarded-for`. Spin exposes no trusted
     // upstream forwarded-for chain — the only trusted client IP comes from the
@@ -302,7 +295,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // inbound `x-forwarded-for` to origins and Prebid copies it into its outbound
     // headers, so leaving it would let a Spin client spoof the IP seen by
     // downstream services while `device.ip` uses the trusted runtime address.
-    req.headers_mut().remove("x-forwarded-for");
+    req.headers.remove("x-forwarded-for");
 
     // Re-derive the trusted client IP from the *last* `spin-client-addr` header
     // and overwrite `SpinRequestContext`, which `build_runtime_services` reads
@@ -313,26 +306,23 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // hashing, `/auction` `device.ip`, and integration `X-Forwarded-For` consume.
     // Selecting the last occurrence pins the value to the trusted runtime one.
     let trusted_client_addr = req
-        .headers()
+        .headers
         .get_all("spin-client-addr")
         .iter()
         .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(parse_client_addr);
     let trusted_full_url = req
-        .headers()
+        .headers
         .get_all("spin-full-url")
         .iter()
         .next_back()
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    SpinRequestContext::insert(
-        req,
-        SpinRequestContext {
-            client_addr: trusted_client_addr,
-            full_url: trusted_full_url.clone(),
-        },
-    );
+    req.extensions.insert(SpinRequestContext {
+        client_addr: trusted_client_addr,
+        full_url: trusted_full_url.clone(),
+    });
 
     // Spin's WASI HTTP bridge copies synthetic `spin-client-addr` and
     // `spin-full-url` headers onto the core request. They are runtime metadata,
@@ -340,7 +330,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // values are captured into `SpinRequestContext` above; remove every copy here
     // so the shared publisher/integration handlers neither forward them to
     // publisher origins nor mistake them for client-controlled input.
-    req.headers_mut().remove("spin-client-addr");
+    req.headers.remove("spin-client-addr");
 
     // Spin's WASI HTTP bridge appends its synthetic `spin-full-url` *after* the
     // original client headers, so when duplicate names are present the trusted
@@ -350,7 +340,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // by publisher HTML rewriting, integration URL rewriting, and request
     // signing. Select the last occurrence as the trusted authority, then strip
     // every copy so none reach publisher origins or the shared handlers.
-    req.headers_mut().remove("spin-full-url");
+    req.headers.remove("spin-full-url");
     let Some((scheme, host)) = trusted_full_url
         .as_deref()
         .and_then(scheme_host_from_spin_url)
@@ -360,31 +350,30 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     let Ok(origin) = InboundOrigin::parse(&scheme, &host, OriginSource::RuntimeUri) else {
         return;
     };
-    req.extensions_mut()
-        .insert(RuntimeRequestOrigin::new(origin));
+    req.extensions.insert(RuntimeRequestOrigin::new(origin));
 
     // Always set Host from the trusted spin-full-url rather than preserving any
     // incoming value. Spin's WASI HTTP bridge does not normally surface the
     // incoming Host header (without it extract_request_host() returns "" and
     // classify_response_route falls back to BufferedUnmodified, skipping the HTML
     // processor), but when a Host *is* present it is client-controllable. Keeping
-    // it while rebuilding req.uri() from the spin-full-url host below would let the
+    // it while rebuilding req.uri from the spin-full-url host below would let the
     // shared RequestInfo path (publisher HTML rewriting, integration URL rewriting,
-    // signing context) read one host while handlers parsing req.uri() see another.
+    // signing context) read one host while handlers parsing req.uri see another.
     // Overriding from the single trusted authority keeps both consistent.
     if let Ok(hval) = HeaderValue::from_str(&host) {
-        req.headers_mut().insert(header::HOST, hval);
+        req.headers.insert(header::HOST, hval);
     }
 
     // Promote the path-only URI to an absolute one so the shared first-party
-    // proxy/click/sign handlers can parse `req.uri()` as a full URL.
+    // proxy/click/sign handlers can parse `req.uri` as a full URL.
     let path_and_query = req
-        .uri()
+        .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_string());
     if let Ok(uri) = format!("{scheme}://{host}{path_and_query}").parse() {
-        *req.uri_mut() = uri;
+        req.uri = uri;
     }
 }
 
@@ -551,16 +540,16 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
+    fn routes() -> Result<RouterService, EdgeError> {
         let state = match build_state() {
             Ok(s) => s,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
+                return Ok(startup_error_router(e));
             }
         };
 
-        build_router(&state)
+        Ok(build_router(&state))
     }
 }
 
@@ -617,7 +606,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                let req = ctx.into_request()?;
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
             }
@@ -629,7 +618,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                ctx.body_bytes(
+                    trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES,
+                )
+                .await?;
+                let req = ctx.into_request()?;
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
             }
@@ -652,7 +645,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let admin_eids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let req = ctx.into_request();
+                let req = ctx.into_request()?;
                 let result = PartnerRegistry::from_config(&s.settings.ec.partners)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
@@ -665,12 +658,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
+                ctx.body_bytes(trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE)
+                    .await?;
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let mut req = ctx.into_request();
+                let mut req = ctx.into_request()?;
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                         &s.settings,
@@ -703,7 +698,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let mut req = ctx.into_request();
+                let mut req = ctx.into_request()?;
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                         &s.settings,
@@ -739,7 +734,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                let req = ctx.into_request()?;
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -752,7 +747,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                let req = ctx.into_request()?;
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -765,7 +760,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                if ctx.method() == Method::POST {
+                    ctx.body_bytes(trusted_server_core::proxy::SIGN_MAX_BODY_BYTES)
+                        .await?;
+                }
+                let req = ctx.into_request()?;
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -782,7 +781,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
+                if ctx.method() == Method::POST {
+                    ctx.body_bytes(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES)
+                        .await?;
+                }
+                let req = ctx.into_request()?;
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
                         .await
@@ -798,7 +801,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -981,7 +984,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     }
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &edgezero_core::http::RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -993,7 +996,7 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         return TraceMetadata { client_info, geo };
     }
     let client_ip = request
-        .headers()
+        .headers
         .get_all("spin-client-addr")
         .iter()
         .next_back()
@@ -1011,6 +1014,13 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn normalize_spin_request(request: &mut Request) {
+        let original = std::mem::replace(request, Request::new(edgezero_core::body::Body::empty()));
+        let (mut parts, body) = original.into_parts();
+        super::normalize_spin_request(&mut parts);
+        *request = Request::from_parts(parts, body);
+    }
 
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(
@@ -1054,6 +1064,16 @@ mod tests {
                 })
                 .collect();
         settings
+    }
+
+    #[test]
+    fn named_sign_route_buffers_guarded_streamed_json_under_its_existing_cap() {
+        let settings = trusted_server_core::test_support::named_route_inputs::sign_settings();
+        let router = TrustedServerApp::routes_with_settings(settings)
+            .expect("should build streamed-input routes");
+        futures::executor::block_on(
+            trusted_server_core::test_support::named_route_inputs::assert_sign_inputs(&router),
+        );
     }
 
     #[test]

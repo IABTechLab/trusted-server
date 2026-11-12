@@ -155,6 +155,7 @@ fn legacy_admin_alias_denied() -> Response {
 async fn execute_handler<F, Fut>(
     state: Arc<AppState>,
     ctx: RequestContext,
+    body_limit: Option<usize>,
     handler: F,
 ) -> Result<Response, EdgeError>
 where
@@ -162,7 +163,12 @@ where
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
     let services = state.services_for_request(&ctx);
-    let mut req = ctx.into_request();
+    if ctx.method() == Method::POST
+        && let Some(limit) = body_limit
+    {
+        ctx.body_bytes(limit).await?;
+    }
+    let mut req = ctx.into_request()?;
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -284,6 +290,7 @@ fn fallback_handler(
         Box::pin(execute_handler(
             state,
             ctx,
+            None,
             |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
         ))
     }
@@ -453,6 +460,21 @@ fn named_route_handler(
         Box::pin(execute_handler(
             state,
             ctx,
+            match handler {
+                NamedRouteHandler::VerifySignature => {
+                    Some(trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES)
+                }
+                NamedRouteHandler::Auction => {
+                    Some(trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE)
+                }
+                NamedRouteHandler::FirstPartySign => {
+                    Some(trusted_server_core::proxy::SIGN_MAX_BODY_BYTES)
+                }
+                NamedRouteHandler::FirstPartyProxyRebuild => {
+                    Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES)
+                }
+                _ => None,
+            },
             move |state, services, req| async move {
                 match handler {
                     NamedRouteHandler::TrustedServerDiscovery => {
@@ -619,16 +641,16 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
+    fn routes() -> Result<RouterService, EdgeError> {
         let state = match build_state() {
             Ok(s) => s,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
+                return Ok(startup_error_router(e));
             }
         };
 
-        build_router(&state)
+        Ok(build_router(&state))
     }
 }
 
@@ -725,7 +747,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     router.build()
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &edgezero_core::http::RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -738,7 +760,9 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
     }
     TraceMetadata {
         client_info: ClientInfo {
-            client_ip: AxumRequestContext::get(request)
+            client_ip: request
+                .extensions
+                .get::<AxumRequestContext>()
                 .and_then(|context| context.remote_addr)
                 .map(|peer| peer.ip()),
             ..ClientInfo::default()

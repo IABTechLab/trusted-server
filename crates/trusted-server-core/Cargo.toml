@@ -76,6 +76,7 @@ temp-env = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 tempfile = { workspace = true }
 
 [build-dependencies]

@@ -1,28 +1,44 @@
-//! Local runtime fixture exercising the production HTTP client implementation.
+//! Local fixture using the production request-local EdgeZero client and driver.
+#![cfg(all(feature = "spin", target_arch = "wasm32"))]
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[path = "../../src/platform.rs"]
-mod platform;
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use std::time::Duration;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::platform::{PlatformHttpClient as _, PlatformHttpRequest};
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-#[spin_sdk::http_service]
-async fn handle(request: spin_sdk::http::Request) -> Result<String, spin_sdk::http::Error> {
-    let result = exercise(&request.uri().to_string())
-        .await
-        .map_err(|error| format!("{error:?}"))?;
-    Ok(result)
+use edgezero_core::app::Hooks;
+use edgezero_core::body::Body;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::Response;
+use edgezero_core::router::RouterService;
+use trusted_server_core::platform::{
+    AuctionTargetId, EdgeZeroHttpClient, PlatformError, PlatformHttpRequest,
+};
+
+struct DeadlineFixture;
+
+impl Hooks for DeadlineFixture {
+    fn routes() -> Result<RouterService, EdgeError> {
+        Ok(RouterService::builder()
+            .get("/", |context: RequestContext| async move {
+                exercise(context)
+                    .await
+                    .map(|result| Response::new(Body::from(result)))
+                    .map_err(|_| EdgeError::bad_gateway("deadline fixture exchange fails"))
+            })
+            .build())
+    }
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-async fn exercise(
-    uri: &str,
-) -> Result<String, error_stack::Report<trusted_server_core::platform::PlatformError>> {
+#[spin_sdk::http_service]
+async fn handle(
+    request: spin_sdk::http::Request,
+) -> Result<edgezero_adapter_spin::SpinResponse, spin_sdk::http::Error> {
+    edgezero_adapter_spin::run_app::<DeadlineFixture>(request)
+        .await
+        .map_err(|_| spin_sdk::http::Error::from("deadline fixture dispatch fails"))
+}
+
+async fn exercise(context: RequestContext) -> Result<String, error_stack::Report<PlatformError>> {
+    let uri = context.uri().to_string();
     let parameter = |name: &str| {
         uri.split_once('?').and_then(|(_, query)| {
             query
@@ -41,10 +57,10 @@ async fn exercise(
         .expect("should supply origin delay")
         .parse()
         .expect("should parse origin delay");
-    let client = platform::SpinPlatformHttpClient;
+    let client = EdgeZeroHttpClient::for_request(&context, AuctionTargetId::Spin);
     let request = edgezero_core::http::request_builder()
         .uri(upstream)
-        .body(edgezero_core::body::Body::empty())
+        .body(Body::empty())
         .expect("should construct fixture request");
     let started = web_time::Instant::now();
     let pending = client
@@ -64,7 +80,12 @@ async fn exercise(
                 );
                 "complete"
             }
-            Err(error) if format!("{error:?}").contains("length limit exceeded") => {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<EdgeError>(),
+                    Some(EdgeError::ResponseTooLarge { .. })
+                ) =>
+            {
                 assert_eq!(
                     result.failed_backend_name.as_deref(),
                     Some("fixture"),

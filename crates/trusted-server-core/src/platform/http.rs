@@ -75,6 +75,18 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot preserve streaming response bodies should return an
     /// error rather than silently buffering large asset responses.
     pub stream_response: bool,
+    /// Maximum encoded outbound upload size.
+    pub max_request_body_bytes: u64,
+    /// Explicit upstream response ceiling, independent of streaming selection.
+    ///
+    /// Absent limits retain the target's buffered default and do not add a stream cap.
+    pub max_response_body_bytes: Option<u64>,
+    /// Original absolute request budget, when supplied by a caller.
+    pub deadline: Option<edgezero_core::time::Deadline>,
+    /// Explicit total transport budget, including response body reads.
+    ///
+    /// When absent, the SDK applies its own timeout/deadline contract.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl PlatformHttpRequest {
@@ -87,7 +99,37 @@ impl PlatformHttpRequest {
             image_optimizer: None,
             cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
+            max_request_body_bytes: edgezero_core::outbound::DEFAULT_OUTBOUND_REQUEST_BODY_BYTES,
+            max_response_body_bytes: None,
+            deadline: None,
+            timeout: None,
         }
+    }
+
+    /// Sets the response byte ceiling without changing streaming selection.
+    #[must_use]
+    pub fn with_response_limit(mut self, max_bytes: u64) -> Self {
+        self.max_response_body_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Sets the complete transport budget.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets an absolute deadline without restarting the caller's budget.
+    #[must_use]
+    pub fn with_deadline(
+        mut self,
+        deadline: edgezero_core::time::Deadline,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.deadline = Some(deadline);
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Attach Image Optimizer metadata to the request.

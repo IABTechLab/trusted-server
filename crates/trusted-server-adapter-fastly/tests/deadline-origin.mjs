@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
+import { gzipSync } from 'node:zlib'
 
 const execute = promisify(execFile)
 const interruption = new AbortController()
@@ -67,6 +68,17 @@ async function serveOrigin(request, response) {
       response.end()
       return
     }
+    if (request.url === '/gzip') {
+      const body = gzipSync(Buffer.from('fast'))
+      response.writeHead(200, { 'Content-Length': body.length, 'Content-Encoding': 'gzip' })
+      response.end(body)
+      return
+    }
+    if (request.url === '/failed') {
+      request.socket.destroy()
+      return
+    }
+    if (request.url === '/slow-origin') await pause(100)
     if (request.url === '/stalled') await pause(2000)
     if (request.url === '/trickle') {
       response.writeHead(200, { 'Content-Length': 100 })
@@ -107,8 +119,10 @@ async function main() {
     const config = join(directory, 'fastly.toml')
     await writeFile(
       config,
-      '[local_server.backends.deadline_origin]\n' +
-        `url = "http://127.0.0.1:${server.address().port}"\n`
+      '[local_server.config_stores.deadline_fixture]\n' +
+        'format = "inline-toml"\n' +
+        '[local_server.config_stores.deadline_fixture.contents]\n' +
+        `origin = "http://127.0.0.1:${server.address().port}"\n`
     )
     const environment = { ...process.env }
     if (existsSync('/etc/ssl/cert.pem'))
@@ -120,7 +134,7 @@ async function main() {
         '-C',
         config,
         binary,
-        'platform::deadline::tests::network_',
+        'platform::outbound_tests::network_',
         '--ignored',
         '--nocapture',
       ],

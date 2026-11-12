@@ -24,14 +24,11 @@ spin = ["edgezero-adapter-spin/spin"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-brotli = { workspace = true }
 bytes = { workspace = true }
 edgezero-adapter-spin = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
-flate2 = { workspace = true }
 futures = { workspace = true }
-http-body-util = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
 trusted-server-core = { workspace = true }

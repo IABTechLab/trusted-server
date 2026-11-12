@@ -2,9 +2,9 @@
 //!
 //! These DTOs describe the closed image transformation set that Trusted Server
 //! attaches to an outbound asset proxy request. They intentionally avoid Fastly
-//! SDK types so the profile-table logic can stay in core while the Fastly
-//! adapter remains responsible for translating metadata into
-//! `fastly::image_optimizer::ImageOptimizerOptions`.
+//! SDK types. The shared HTTP bridge translates them into
+//! [`edgezero_core::outbound::OutboundImageOptimizerOptions`], which the
+//! `EdgeZero` Fastly adapter applies.
 //!
 //! Unsupported adapters should reject requests carrying this metadata rather
 //! than silently dropping transformations.
@@ -55,10 +55,9 @@ impl PlatformImageOptimizerRegion {
 
 /// Platform-neutral Image Optimizer options for an upstream request.
 ///
-/// Core code stores only a closed transformation set here. The Fastly adapter is
-/// responsible for translating these values to SDK-specific
-/// `ImageOptimizerOptions`, while adapters without Image Optimizer support
-/// should reject requests carrying this metadata.
+/// Core code stores a closed transformation set here. The shared HTTP bridge
+/// translates it into [`edgezero_core::outbound::OutboundImageOptimizerOptions`].
+/// Unsupported targets reject the metadata rather than dropping it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformImageOptimizerOptions {
     /// Image Optimizer processing region understood by the target adapter.

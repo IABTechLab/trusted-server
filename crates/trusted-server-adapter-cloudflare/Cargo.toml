@@ -38,7 +38,6 @@ worker = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
-js-sys = { workspace = true }
 worker = { workspace = true }
 
 [dev-dependencies]

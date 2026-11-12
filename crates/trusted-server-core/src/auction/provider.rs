@@ -94,8 +94,8 @@ pub trait AuctionProvider: Send + Sync {
     /// an immediate response for a legitimate outcome that requires no HTTP call.
     /// The orchestrator handles waiting for and parsing pending responses.
     /// Outbound auction and mediator requests must use
-    /// [`PlatformHttpRequest::with_cache_bypass`]: they carry personalized data,
-    /// and Fastly requires this marker for deadline-bounded collection.
+    /// [`PlatformHttpRequest::with_cache_bypass`]: personalized bids must not
+    /// be replayed from an intermediary cache.
     ///
     /// # Errors
     ///
@@ -223,6 +223,20 @@ pub(crate) enum GenericOpenRtbParseState {
     },
 }
 
+/// Per-launch policy and resources for one routed provider request.
+pub(crate) struct RoutedProviderDispatch<'a> {
+    /// Remaining logical auction budget used in the request payload.
+    pub(crate) logical_budget_ms: u32,
+    /// Existing adapter-specific transport phase cap.
+    pub(crate) transport_timeout_ms: u32,
+    /// Optional auction-local signer.
+    pub(crate) signer: Option<&'a RequestSigner>,
+    /// Request-local platform services.
+    pub(crate) services: &'a RuntimeServices,
+    /// Backend names already owned by another provider in this auction.
+    pub(crate) reserved_backend_names: &'a mut HashSet<String>,
+}
+
 impl GenericOpenRtbProvider {
     pub(crate) fn new(plan: ProviderPlan) -> Self {
         Self { plan }
@@ -266,20 +280,19 @@ impl GenericOpenRtbProvider {
     /// execution context here, while this method reuses
     /// [`ProviderRequestOutcome`] and [`ProviderParseState`] for the existing
     /// request/parse token boundary.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the internal driver keeps routed inputs, both budgets, signer, services, and collision state explicit"
-    )]
     pub(crate) async fn request_bids_routed(
         &self,
         input: &ProviderAuctionInput,
         routed: &RoutedAuction,
-        logical_budget_ms: u32,
-        transport_timeout_ms: u32,
-        signer: Option<&RequestSigner>,
-        services: &RuntimeServices,
-        reserved_backend_names: &mut HashSet<String>,
+        dispatch: RoutedProviderDispatch<'_>,
     ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+        let RoutedProviderDispatch {
+            logical_budget_ms,
+            transport_timeout_ms,
+            signer,
+            services,
+            reserved_backend_names,
+        } = dispatch;
         let signing_params = SigningParams::new(
             input.common_request().id.clone(),
             input.common_request().publisher.domain.clone(),

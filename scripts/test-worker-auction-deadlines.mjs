@@ -10,6 +10,7 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
+import { gzipSync } from 'node:zlib'
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -115,6 +116,12 @@ const origin = http.createServer(async (request, response) => {
   try {
     if (request.url === '/headers') {
       await delay(700, undefined, { signal: cancellation.signal })
+    }
+    if (request.url === '/gzip') {
+      const body = gzipSync(Buffer.from('okay'))
+      response.writeHead(200, { 'Content-Length': String(body.length), 'Content-Encoding': 'gzip' })
+      response.end(body)
+      return
     }
     if (request.url === '/large') {
       const body = Buffer.alloc(8 * 1024 * 1024 + 1)
@@ -253,11 +260,12 @@ allowed_outbound_hosts = ["http://127.0.0.1:*"]
     ['/headers', 80, 0, 'timeout', 350],
     ['/body', 80, 0, 'timeout', 350],
     ['/headers', 80, 200, 'timeout', 500],
+    ['/gzip', 1000, 0, 'complete', 1500],
   ]
   if (adapter === 'spin') cases.push(['/large', 2000, 0, 'oversized', 2500])
   assert.equal(
     cases.length,
-    adapter === 'spin' ? 5 : 4,
+    adapter === 'spin' ? 6 : 5,
     'should exercise every runtime case'
   )
   for (const [endpoint, budget, originDelay, expected, maximum] of cases) {

@@ -3,18 +3,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use edgezero_core::PreDispatchRequest;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::ingress::RequestIngress;
 use edgezero_core::router::PreDispatchHook;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Response, StatusCode};
 use trusted_server_js::trace_assets::trace_asset;
 
 use super::actions::action_response;
 use super::routes::{TraceRoute, state_response};
 use super::shell::render_setup_shell;
 use super::{TraceCookies, TracePreflight, inspect_cookies, preflight, project_request_context};
-use crate::forwarder::prepare_trusted_forwarder;
+use crate::forwarder::prepare_trusted_forwarder_parts;
 use crate::integrations::gpt_diagnostics::{
     GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig, GptDiagnosticsRequestDecision,
 };
@@ -87,9 +88,10 @@ pub struct TraceMetadata {
     pub geo: Option<GeoInfo>,
 }
 
-type MetadataSupplier = dyn Fn(&Request<Body>) -> TraceMetadata + Send + Sync;
+type MetadataSupplier = dyn Fn(&edgezero_core::http::RequestParts) -> TraceMetadata + Send + Sync;
 
 /// Intercept the trace namespace before ordinary router lookup and middleware.
+#[derive(Clone)]
 pub struct TracePreDispatchHook {
     settings: Arc<Settings>,
     metadata: Arc<MetadataSupplier>,
@@ -117,7 +119,7 @@ impl TracePreDispatchHook {
 impl PreDispatchHook for TracePreDispatchHook {
     async fn handle(
         &self,
-        request: &mut Request<Body>,
+        request: &mut PreDispatchRequest,
     ) -> Result<Option<Response<Body>>, EdgeError> {
         self.handle_with_clock(request, Utc::now).await
     }
@@ -126,15 +128,15 @@ impl PreDispatchHook for TracePreDispatchHook {
 impl TracePreDispatchHook {
     async fn handle_with_clock(
         &self,
-        request: &mut Request<Body>,
+        request: &mut PreDispatchRequest,
         clock: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<Option<Response<Body>>, EdgeError> {
         // Resolve before origin preparation removes headers that may also be
         // configured as client-IP credentials. Retain only the authenticated IP.
         let forwarded_client_ip =
             authenticated_client_ip(request.headers(), self.settings.trusted_client_ip.as_ref());
-        prepare_trusted_forwarder(request, &self.settings);
-        let dispatch = match preflight(&self.settings, request) {
+        prepare_trusted_forwarder_parts(request.parts_mut(), &self.settings);
+        let dispatch = match preflight(&self.settings, request.parts_mut()) {
             TracePreflight::NotTrace => {
                 let enabled = self
                     .settings
@@ -187,7 +189,7 @@ impl TracePreDispatchHook {
                         geo: None,
                     }
                 } else {
-                    let mut metadata = (self.metadata)(request);
+                    let mut metadata = (self.metadata)(request.parts());
                     if let Some(client_ip) = forwarded_client_ip {
                         if metadata.client_info.client_ip != Some(client_ip) {
                             // Runtime geolocation describes the forwarder when
@@ -253,7 +255,7 @@ mod tests {
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
-    use http::{HeaderValue, Method, StatusCode, header};
+    use http::{HeaderValue, Method, Request, StatusCode, header};
     use serde_json::json;
 
     use crate::redacted::Redacted;
@@ -261,6 +263,57 @@ mod tests {
     use crate::trace::TraceTerminalResponse;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct OrdinaryResponse;
+
+    struct ObservedHook {
+        hook: TracePreDispatchHook,
+        clock: DateTime<Utc>,
+        observed: Arc<std::sync::Mutex<Option<edgezero_core::http::RequestParts>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for ObservedHook {
+        async fn handle(
+            &self,
+            request: &mut PreDispatchRequest,
+        ) -> Result<Option<Response<Body>>, EdgeError> {
+            let response = self.hook.handle_with_clock(request, || self.clock).await;
+            *self.observed.lock().expect("should lock observed head") =
+                Some(request.parts().clone());
+            response
+        }
+    }
+
+    fn run_hook(
+        hook: &TracePreDispatchHook,
+        request: &mut Request<Body>,
+        clock: Option<DateTime<Utc>>,
+    ) -> Result<Option<Response<Body>>, EdgeError> {
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let router = RouterService::builder()
+            .pre_dispatch_hook_arc(Arc::new(ObservedHook {
+                hook: hook.clone(),
+                clock: clock.unwrap_or_else(Utc::now),
+                observed: Arc::clone(&observed),
+            }))
+            .route("/{*rest}", Method::GET, |_context: RequestContext| async {
+                let mut response = Response::new(Body::empty());
+                response.extensions_mut().insert(OrdinaryResponse);
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let incoming = std::mem::replace(request, Request::new(Body::empty()));
+        let response = block_on(router.oneshot(incoming))?;
+        let parts = observed
+            .lock()
+            .expect("should lock observed head")
+            .take()
+            .expect("should observe the protected pre-dispatch head");
+        *request = Request::from_parts(parts, Body::empty());
+        Ok((response.extensions().get::<OrdinaryResponse>().is_none()).then_some(response))
+    }
 
     fn hook(enabled: bool, calls: Arc<AtomicUsize>) -> TracePreDispatchHook {
         let mut settings = create_test_settings();
@@ -357,7 +410,7 @@ mod tests {
                 .header("x-ts-forwarder-auth", "fictional-client-secret-0123456789")
                 .body(Body::empty())
                 .expect("should build setup request");
-            let response = block_on(hook.handle(&mut request))
+            let response = run_hook(&hook, &mut request, None)
                 .expect("should dispatch trace")
                 .expect("should intercept setup");
             let bytes = response
@@ -400,7 +453,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("should construct a preflight request");
             let _response =
-                block_on(hook.handle(&mut request)).expect("should complete local preflight");
+                run_hook(&hook, &mut request, None).expect("should complete local preflight");
             assert!(
                 !request.headers().contains_key("x-ts-forwarder-auth"),
                 "should sanitize credentials before any preflight return"
@@ -425,7 +478,7 @@ mod tests {
                 .uri("/_ts/trace")
                 .body(Body::empty())
                 .expect("should construct a shell request");
-            let response = block_on(hook.handle_with_clock(&mut request, || clock))
+            let response = run_hook(&hook, &mut request, Some(clock))
                 .expect("should dispatch the trace shell")
                 .expect("should intercept the shell");
             assert_eq!(
@@ -481,7 +534,7 @@ mod tests {
                 .uri(path)
                 .body(Body::empty())
                 .expect("should build trace request");
-            let response = block_on(hook.handle(&mut request))
+            let response = run_hook(&hook, &mut request, None)
                 .expect("should return local policy response")
                 .expect("should intercept namespace before lookup");
             assert_eq!(
@@ -527,7 +580,7 @@ mod tests {
             .uri("/_ts/trace")
             .body(Body::empty())
             .expect("should build disabled request");
-        let response = block_on(hook.handle(&mut request))
+        let response = run_hook(&hook, &mut request, None)
             .expect("should produce local response")
             .expect("should reserve disabled namespace");
         assert_eq!(
@@ -563,7 +616,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("should build ordinary request");
             assert!(
-                block_on(hook.handle(&mut request))
+                run_hook(&hook, &mut request, None)
                     .expect("should continue ordinary dispatch")
                     .is_none(),
                 "should continue ordinary requests"
@@ -686,7 +739,7 @@ mod tests {
                 );
             }
             let _ =
-                block_on(hook.handle(&mut request)).expect("should continue ordinary navigation");
+                run_hook(&hook, &mut request, None).expect("should continue ordinary navigation");
             let gate = *request
                 .extensions()
                 .get::<TraceCaptureGate>()

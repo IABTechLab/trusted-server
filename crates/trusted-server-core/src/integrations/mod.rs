@@ -186,8 +186,9 @@ pub(crate) async fn collect_body_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match body.into_stream() {
+        Err(body) => {
+            let bytes = body.into_bytes().expect("should retain the buffered body");
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::RequestTooLarge {
                     message: format!(
@@ -198,7 +199,7 @@ pub(crate) async fn collect_body_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        Ok(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {
@@ -246,8 +247,9 @@ pub(crate) async fn collect_response_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match body.into_stream() {
+        Err(body) => {
+            let bytes = body.into_bytes().expect("should retain the buffered body");
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::Integration {
                     integration: integration.to_string(),
@@ -259,7 +261,7 @@ pub(crate) async fn collect_response_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        Ok(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {

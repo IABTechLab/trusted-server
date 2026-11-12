@@ -2,11 +2,10 @@
 
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::ingress::RequestIngress;
-use futures::StreamExt as _;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header};
 use url::Url;
 
-use crate::forwarder::{PublicOrigin, public_origin};
+use crate::forwarder::{PublicOrigin, public_origin_parts};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsCookieAction;
 
 use super::routes::TraceRoute;
@@ -25,7 +24,7 @@ const FETCH_SITE_HEADER: HeaderName = HeaderName::from_static("sec-fetch-site");
 /// skips empty chunks and stops on the first nonempty chunk or read error;
 /// it does not allocate a body buffer or introduce a transport deadline.
 pub(crate) async fn action_response(
-    request: &mut Request<EdgeBody>,
+    request: &edgezero_core::PreDispatchRequest,
     route: TraceRoute,
 ) -> Response<EdgeBody> {
     let (action, cookie_action) = match route {
@@ -38,15 +37,19 @@ pub(crate) async fn action_response(
             != Some(action)
         || single_header(request.headers(), FETCH_SITE_HEADER).map(HeaderValue::as_bytes)
             != Some(b"same-origin".as_slice())
-        || !matches_trusted_origin(request)
+        || !matches_trusted_origin(request.parts())
     {
         return failure(StatusCode::FORBIDDEN);
     }
     if !accepts_empty_framing(request.headers()) {
         return failure(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let body = std::mem::replace(request.body_mut(), EdgeBody::empty());
-    if let Some(status) = empty_body_rejection(body).await {
+    if let Err(error) = request.body_bytes(0).await {
+        let status = match error.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::REQUEST_TIMEOUT => StatusCode::REQUEST_TIMEOUT,
+            _ => StatusCode::BAD_REQUEST,
+        };
         return failure(status);
     }
     let Some(cookie) = cookie_action.set_cookie_header() else {
@@ -75,9 +78,9 @@ fn single_header(headers: &HeaderMap, name: HeaderName) -> Option<&HeaderValue> 
     fields.next().is_none().then_some(value)
 }
 
-fn matches_trusted_origin(request: &Request<EdgeBody>) -> bool {
+fn matches_trusted_origin(request: &edgezero_core::http::RequestParts) -> bool {
     let Some(trusted) = request
-        .extensions()
+        .extensions
         .get::<RequestIngress>()
         .and_then(RequestIngress::origin)
     else {
@@ -86,31 +89,31 @@ fn matches_trusted_origin(request: &Request<EdgeBody>) -> bool {
     let Some(expected) = canonical_authority_origin(trusted.scheme(), trusted.authority()) else {
         return false;
     };
-    let Some(origin) = single_header(request.headers(), header::ORIGIN)
+    let Some(origin) = single_header(&request.headers, header::ORIGIN)
         .and_then(|origin| core::str::from_utf8(origin.as_bytes()).ok())
         .and_then(canonical_origin)
     else {
         return false;
     };
     let public_expected =
-        public_origin(request).map_or_else(|| expected.clone(), PublicOrigin::serialized);
+        public_origin_parts(request).map_or_else(|| expected.clone(), PublicOrigin::serialized);
     // Public origin authorizes the browser. The received URI and Host must
     // still agree with immutable transport ingress below.
     if origin != public_expected
         || request
-            .uri()
+            .uri
             .scheme_str()
             .is_some_and(|scheme| !scheme.eq_ignore_ascii_case(trusted.scheme()))
     {
         return false;
     }
-    let authority = request.uri().authority();
+    let authority = request.uri.authority();
     if authority.is_some_and(|authority| {
         canonical_authority_origin(trusted.scheme(), authority.as_str()).as_ref() != Some(&expected)
     }) {
         return false;
     }
-    match single_header(request.headers(), header::HOST) {
+    match single_header(&request.headers, header::HOST) {
         Some(host) => {
             core::str::from_utf8(host.as_bytes())
                 .ok()
@@ -118,8 +121,8 @@ fn matches_trusted_origin(request: &Request<EdgeBody>) -> bool {
                 .as_ref()
                 == Some(&expected)
         }
-        None if request.headers().contains_key(header::HOST) => false,
-        None => request.uri().scheme().is_some() && authority.is_some(),
+        None if request.headers.contains_key(header::HOST) => false,
+        None => request.uri.scheme().is_some() && authority.is_some(),
     }
 }
 
@@ -183,28 +186,12 @@ fn accepts_empty_framing(headers: &HeaderMap) -> bool {
         && length.as_bytes().iter().all(|byte| *byte == b'0')
 }
 
-async fn empty_body_rejection(body: EdgeBody) -> Option<StatusCode> {
-    match body {
-        EdgeBody::Once(bytes) if bytes.is_empty() => None,
-        EdgeBody::Once(_) => Some(StatusCode::PAYLOAD_TOO_LARGE),
-        EdgeBody::Stream(mut stream) => {
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) if bytes.is_empty() => {}
-                    Ok(_) => return Some(StatusCode::PAYLOAD_TOO_LARGE),
-                    Err(_) => return Some(StatusCode::BAD_REQUEST),
-                }
-            }
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::io;
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::task::Poll;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -220,7 +207,9 @@ mod tests {
 
     use crate::settings::{Handler, Settings};
     use crate::test_support::tests::create_test_settings;
-    use crate::trace::{TracePreflight, TraceTerminalResponse, inspect_cookies, preflight};
+    use crate::trace::{
+        TraceMetadata, TracePreDispatchHook, TraceTerminalResponse, inspect_cookies,
+    };
 
     fn settings(enabled: bool, auth: bool) -> Settings {
         let mut settings = create_test_settings();
@@ -265,15 +254,18 @@ mod tests {
         request
     }
 
-    fn respond(settings: &Settings, mut request: Request<EdgeBody>) -> Response<EdgeBody> {
-        match preflight(settings, &mut request) {
-            TracePreflight::Response(response) => response,
-            TracePreflight::Ready(context) => {
-                let response = block_on(super::super::action_response(&mut request, context.route));
-                context.respond(response)
-            }
-            TracePreflight::NotTrace => panic!("should preflight every exact action route locally"),
-        }
+    fn respond(settings: &Settings, request: Request<EdgeBody>) -> Response<EdgeBody> {
+        let hook = TracePreDispatchHook::new(
+            Arc::new(settings.clone()),
+            Arc::new(|_| TraceMetadata {
+                client_info: crate::platform::ClientInfo::default(),
+                geo: None,
+            }),
+        );
+        let router = edgezero_core::router::RouterService::builder()
+            .pre_dispatch_hook_arc(Arc::new(hook))
+            .build();
+        block_on(router.oneshot(request)).expect("should dispatch the protected trace action")
     }
 
     fn private_error(response: Response<EdgeBody>, expected: StatusCode) {
@@ -937,7 +929,7 @@ mod tests {
         let polls = Rc::new(Cell::new(0));
         let captured = Rc::clone(&polls);
         let mut request = request("end");
-        *request.body_mut() = EdgeBody::from_stream(stream::poll_fn(
+        *request.body_mut() = EdgeBody::from_external_stream(stream::poll_fn(
             move |_| -> Poll<Option<Result<Bytes, io::Error>>> {
                 captured.set(captured.get() + 1);
                 Poll::Ready(Some(match captured.get() {

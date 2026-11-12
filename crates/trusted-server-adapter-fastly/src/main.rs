@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_adapter_fastly::delivery::FastlyRequestDelivery;
+use edgezero_adapter_fastly::request::send_request_with_registries_and_hooks;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
-use edgezero_core::response::IntoResponse;
+use edgezero_core::response_egress::{ResponseEgressBodyKind, ResponseEgressOutcome};
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
@@ -23,7 +23,7 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
@@ -32,6 +32,8 @@ use trusted_server_core::version_header::{apply_git_version_header, git_version_
 mod app;
 mod backend;
 mod compat;
+#[cfg(test)]
+mod delivery_tests;
 mod ec_kv;
 mod esi_assembly;
 mod logging;
@@ -108,10 +110,12 @@ fn main() {
             // `run_custom` completes the callback's SDK result exactly once.
             // The callback sends its own response and returns `()`, so there
             // is no error for the SDK to turn into a second response.
-            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+            if let Err(error) = edgezero_adapter_fastly::lifecycle::run_custom(
                 FastlyRequest::from_client(),
                 |request, sandbox: &mut Sandbox| handle_request(request, sandbox, &mut startup),
-            );
+            ) {
+                log::error!("Fastly request delivery failed: {error}");
+            }
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
@@ -137,8 +141,8 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             .with_timeout(limits.timeout),
         |request, sandbox: &mut Sandbox| {
             counters.observe(sandbox, |sandbox| {
-                handle_request(request, sandbox, &mut startup);
-            });
+                handle_request(request, sandbox, &mut startup)
+            })
         },
     );
 
@@ -148,6 +152,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
         counters.requests(),
         counters.attempts()
     );
+    if let Err(error) = summary.into_result() {
+        log::error!("Fastly serving terminated after delivery failure: {error}");
+    }
 }
 
 #[cfg(not(feature = "reusable-sandbox"))]
@@ -157,15 +164,19 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
 
 /// Handles one request end to end, sending its own response.
 ///
-/// Returns `()` rather than a response so the streaming publisher path can
-/// call [`fastly::Response::stream_to_client`] itself. The SDK's
-/// `HandlerResult` impl for `()` treats that as already sent.
+/// Routed transmission belongs to the RC. A terminal error stops the SDK
+/// callback without asking it to render a second response. Raw probes remain
+/// explicit app-build-free exceptions.
 ///
 /// Every non-panicking path through this function must send exactly once. In a
 /// reused sandbox the SDK refuses to wait for the next request until the
 /// current one is complete, so a missed send stalls the loop rather than
 /// merely dropping one response.
-fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut StartupDiagnostics) {
+fn handle_request(
+    req: FastlyRequest,
+    sandbox: &mut Sandbox,
+    startup: &mut StartupDiagnostics,
+) -> Result<(), fastly::Error> {
     // The framework counts the callback before invoking it, including early
     // returns, so this is already this request's 1-based ordinal.
     let ordinal = sandbox.requests();
@@ -176,7 +187,7 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
     if !trace_path && let Some(response) = health_response(&req) {
         response.send_to_client();
-        return;
+        return Ok(());
     }
 
     // Marked complete only once installation succeeds, so a failed install is
@@ -203,7 +214,7 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
 
-    edgezero_main(req, sandbox, ordinal, &request_id, trace_path);
+    edgezero_main(req, sandbox, ordinal, &request_id, trace_path)
 }
 
 /// Builds the counters snapshot response.
@@ -332,7 +343,7 @@ fn edgezero_main(
     ordinal: u64,
     request_id: &str,
     trace_path: bool,
-) {
+) -> Result<(), fastly::Error> {
     let runtime_stores = RuntimeStoreConfig::logical();
 
     // Short-circuit the sandbox counters probe before app construction. It must
@@ -354,7 +365,7 @@ fn edgezero_main(
                     .send_to_client();
             }
         }
-        return;
+        return Ok(());
     }
 
     // Short-circuit the JA4 debug probe before app construction. Must run here
@@ -375,7 +386,7 @@ fn edgezero_main(
                     .send_to_client();
             }
         }
-        return;
+        return Ok(());
     }
 
     let config_store =
@@ -386,7 +397,7 @@ fn edgezero_main(
                 FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_body_text_plain("Internal Server Error")
                     .send_to_client();
-                return;
+                return Ok(());
             }
         };
 
@@ -400,24 +411,34 @@ fn edgezero_main(
     // permanent error mode, and the next callback retries construction.
     let failed_build = sandbox
         .initialize(|| {
-            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+            let (app, state) = match TrustedServerApp::build_app_with_state(&runtime_stores) {
+                Ok(built) => built,
+                Err(error) => return Err(Err(error)),
+            };
             match state {
                 Some(state) => Ok(RetainedApp { app, state }),
-                None => Err(app),
+                None => Err(Ok(Box::new(app))),
             }
         })
         .err();
 
     let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
         match (failed_build.as_ref(), sandbox.state()) {
-            (Some(app), _) => (app, None),
+            (Some(Ok(app)), _) => (app.as_ref(), None),
+            (Some(Err(error)), _) => {
+                log::error!("failed to configure Fastly application: {error}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return Ok(());
+            }
             (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
             (None, None) => {
                 log::error!("no application available after initialization");
                 FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_body_text_plain("Internal Server Error")
                     .send_to_client();
-                return;
+                return Ok(());
             }
         };
 
@@ -478,148 +499,139 @@ fn edgezero_main(
     let client_ip = client_info.client_ip;
     let device_signals = (!trace_path).then(|| derive_device_signals(&req));
 
-    // Dispatch directly through the EdgeZero router without an intermediate
-    // fastly::Response conversion. That preserves duplicate header values such
-    // as multiple Set-Cookie headers.
-    let mut response = match into_core_request(req) {
-        Ok(mut core_req) => {
+    // The SDK callback exclusively borrows the sandbox, so this bounded observer
+    // belongs to one dispatch at a time. Only the RC's terminal report establishes
+    // whether the application body, rather than a fallback, was delivered.
+    if let Some(state) = app_state.as_ref() {
+        state.delivery_observation.reset();
+    }
+    let delivery = send_request_with_registries_and_hooks(
+        app,
+        TrustedServerApp::stores(),
+        req,
+        |_request, extensions| {
             if let Some(forwarder) = forwarder {
-                core_req.extensions_mut().insert(forwarder);
+                extensions.insert(forwarder);
             }
-            core_req.extensions_mut().insert(config_store);
-            if let Some(device_signals) = device_signals {
-                core_req.extensions_mut().insert(device_signals);
+            extensions.insert(config_store);
+            if let Some(signals) = device_signals {
+                extensions.insert(signals);
             }
-            core_req.extensions_mut().insert(client_info);
-            match futures::executor::block_on(app.router().oneshot(core_req)) {
-                Ok(response) => response,
-                Err(error) => edge_error_response(error),
+            extensions.insert(client_info);
+        },
+        |response| {
+            if response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some()
+            {
+                return None;
             }
-        }
-        Err(e) => {
-            log::error!("EdgeZero request conversion failed: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
+            let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
+            let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
+            let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+            let settings = settings_snapshot.clone().or_else(|| {
+                load_settings_from_config_store(&runtime_stores)
+                    .ok()
+                    .map(Arc::new)
+            });
 
-    if response
-        .extensions()
-        .get::<TraceTerminalResponse>()
-        .is_some()
-    {
-        // Trace responses keep their exact hardened headers; no sandbox counters.
-        send_response_to_client(response, None);
-        return;
-    }
-
-    // Pop response extensions before the Fastly conversion, which drops them.
-    let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
-    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
-    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
-
-    if !take_finalize_sentinel(&mut response) {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
-                }
-                Err(e) => {
-                    log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
-                    // The compiled-in version needs no settings, so a deploy that cannot
-                    // load its config still reports which build is serving.
-                    apply_git_version_header(&mut response);
+            if !take_finalize_sentinel(response) {
+                if let Some(settings) = settings.as_deref() {
+                    apply_entry_point_finalize_headers(settings, response, client_ip);
+                } else {
+                    apply_git_version_header(response);
                 }
             }
-        }
-    }
-
-    if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
-    }
-
-    if let Some(mut ec_state) = ec_state {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            // Fastly's entry-point hooks are synchronous, and its KV SDK
-            // completes I/O through blocking hostcalls. Keep this bridge here,
-            // never in native or worker executors.
-            match futures::executor::block_on(apply_edgezero_ec_finalize(
-                settings,
-                &mut ec_state,
-                &mut response,
-            )) {
-                Ok(partner_registry) => {
-                    send_edgezero_response(
-                        response,
-                        request_filter_effects.as_ref(),
-                        counters.as_ref(),
-                    );
-                    futures::executor::block_on(run_edgezero_pull_sync_after_send(
-                        settings,
-                        &partner_registry,
-                        &ec_state,
-                    ));
-                    return;
-                }
-                Err(e) => {
-                    log::error!(
-                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                    );
-                }
+            if let Some(policy) = asset_cache_policy {
+                policy.apply_after_route_finalization(response, EdgeCacheHeader::SurrogateControl);
             }
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
+            let pull_sync = match (ec_state, settings) {
+                (Some(mut ec_state), Some(settings)) => {
                     match futures::executor::block_on(apply_edgezero_ec_finalize(
                         &settings,
                         &mut ec_state,
-                        &mut response,
+                        response,
                     )) {
-                        Ok(partner_registry) => {
-                            send_edgezero_response(
-                                response,
-                                request_filter_effects.as_ref(),
-                                counters.as_ref(),
-                            );
-                            futures::executor::block_on(run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
-                            ));
-                            return;
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                            );
+                        Ok(registry) => Some((settings, registry, ec_state)),
+                        Err(error) => {
+                            log::error!("EdgeZero EC finalization failed: {error:?}");
+                            None
                         }
                     }
                 }
-                Err(e) => {
-                    log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
-                }
+                _ => None,
+            };
+            apply_terminal_response_effects(response, request_filter_effects.as_ref());
+            if let Some(counters) = counters.as_ref() {
+                attach_sandbox_counters(response, counters);
+            }
+            pull_sync
+        },
+    );
+
+    match delivery {
+        FastlyRequestDelivery::Routed { state, delivery } => {
+            if let Some(error) = delivery.error() {
+                return Err(fastly::Error::msg(error.message()));
+            }
+            if let Some((settings, registry, ec_state)) = state
+                && app_state
+                    .as_ref()
+                    .is_some_and(|state| state.delivery_observation.completed())
+            {
+                futures::executor::block_on(run_edgezero_pull_sync_after_send(
+                    &settings, &registry, &ec_state,
+                ));
             }
         }
+        FastlyRequestDelivery::Detached(delivery) => {
+            if let Some(error) = delivery.error() {
+                return Err(fastly::Error::msg(error.message()));
+            }
+        }
+        FastlyRequestDelivery::NoAttempt(failure) => {
+            log::error!(
+                "Fastly request has no response attempt: {}",
+                failure.message()
+            );
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body_text_plain("Internal Server Error")
+                .send_to_client();
+        }
+        FastlyRequestDelivery::Aborted => {
+            return Err(fastly::Error::msg("ingress policy aborts the response"));
+        }
+        _ => {
+            return Err(fastly::Error::msg(
+                "unsupported Fastly delivery disposition",
+            ));
+        }
     }
-
-    send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
+    Ok(())
 }
 
-fn edge_error_response(error: EdgeError) -> HttpResponse {
-    log::error!("EdgeZero router returned error: {error:?}");
-    match error.into_response() {
-        Ok(response) => response,
-        Err(error) => {
-            log::error!("failed to convert EdgeZero error into response: {error:?}");
-            edgezero_core::http::response_builder()
-                .status(edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(EdgeBody::from("Internal Server Error"))
-                .expect("should build EdgeZero error response")
-        }
+/// Bounded terminal fact for the serial SDK sandbox callback.
+#[derive(Clone, Default)]
+pub(crate) struct DeliveryObservation(Arc<std::sync::atomic::AtomicBool>);
+
+impl DeliveryObservation {
+    fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn completed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl edgezero_core::response_egress::ResponseEgressObserver for DeliveryObservation {
+    fn complete(&self, report: &edgezero_core::response_egress::ResponseEgressReport) {
+        self.0.store(
+            report.body_kind == ResponseEgressBodyKind::Application
+                && report.outcome == ResponseEgressOutcome::Completed,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -719,74 +731,6 @@ where
         }
     };
     Some((context, kv))
-}
-
-/// Sends a finalized `EdgeZero` response to the client.
-///
-/// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
-/// client stream so large asset and publisher-origin responses do not
-/// materialize in the Wasm heap.
-fn send_edgezero_response(
-    mut response: HttpResponse,
-    request_filter_effects: Option<&RequestFilterEffects>,
-    counters: Option<&SandboxCounters>,
-) {
-    apply_terminal_response_effects(&mut response, request_filter_effects);
-
-    send_response_to_client(response, counters);
-}
-
-/// Sends a response, attaching sandbox counters first when supplied.
-fn send_response_to_client(mut response: HttpResponse, counters: Option<&SandboxCounters>) {
-    // Captured before the body is consumed so post-commitment failures can be
-    // matched back to the response that carried these counters.
-    let counter_context = counters.map_or_else(String::new, |counters| {
-        format!(
-            " [instance={} ordinal={} request={}]",
-            instance_id(),
-            counters.ordinal,
-            counters.request_id
-        )
-    });
-
-    // Before headers commit, including before `stream_to_client` below.
-    if let Some(counters) = counters.as_ref() {
-        attach_sandbox_counters(&mut response, counters);
-    }
-
-    let (parts, body) = response.into_parts();
-
-    match body {
-        EdgeBody::Stream(_) => {
-            let skeleton = compat::to_fastly_response_skeleton(HttpResponse::from_parts(
-                parts,
-                EdgeBody::empty(),
-            ));
-            let mut streaming_body = skeleton.stream_to_client();
-            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
-                        // Also post-commitment: same attribution as the
-                        // streaming failure below.
-                        log::error!(
-                            "failed to finish EdgeZero streaming body{counter_context}: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // After commitment: log and stop. Returning an error here
-                    // would let the SDK attempt a second response. Counters
-                    // already went out with the headers, so the failure is
-                    // tagged with the same identity for reconciliation.
-                    log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
-                    drop(streaming_body);
-                }
-            }
-        }
-        once => {
-            compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
-        }
-    }
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -967,7 +911,7 @@ mod tests {
             .expect("should configure trace");
         settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
             .expect("should configure trace protection"));
-        let mut request = edgezero_core::http::request_builder()
+        let request = edgezero_core::http::request_builder()
             .uri("https://publisher.example.com/_ts/trace/assets/v1.js")
             .header(
                 "authorization",
@@ -979,8 +923,9 @@ mod tests {
             )
             .body(EdgeBody::empty())
             .expect("should build protected asset request");
+        let (mut request_head, _) = request.into_parts();
         let trusted_server_core::trace::TracePreflight::Ready(dispatch) =
-            trusted_server_core::trace::preflight(&settings, &mut request)
+            trusted_server_core::trace::preflight(&settings, &mut request_head)
         else {
             panic!("should accept protected fixed asset");
         };
@@ -1002,20 +947,10 @@ mod tests {
             &original,
             "should bypass every ordinary trace finalizer and preserve protected digest"
         );
-        let native = compat::to_fastly_response(response);
-        assert_eq!(
-            native.get_header("etag").map(HeaderValue::as_bytes),
-            original.get("etag").map(HeaderValue::as_bytes),
-            "should preserve strong ETag through native conversion"
-        );
-        assert!(
-            native.get_header("set-cookie").is_none(),
-            "should never acquire an operator cookie"
-        );
     }
 
     #[test]
-    fn trace_dispatch_terminal_actions_errors_and_head_preserve_native_contract() {
+    fn trace_dispatch_terminal_actions_errors_and_head_preserve_terminal_contract() {
         let mut settings = test_settings();
         settings
             .integrations
@@ -1121,10 +1056,12 @@ mod tests {
                 ));
             }
             let mut response = futures::executor::block_on(
-                edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
+                edgezero_core::router::RouterService::builder()
+                    .pre_dispatch_hook(hook.clone())
+                    .build()
+                    .oneshot(request),
             )
-            .expect("should build local trace response")
-            .expect("should intercept reserved request");
+            .expect("should intercept reserved request through the protected router");
             assert_eq!(
                 response.status(),
                 expected,
@@ -1138,26 +1075,20 @@ mod tests {
                 &original,
                 "should bypass hostile ordinary finalizers for every terminal response"
             );
-            let mut native = compat::to_fastly_response(response);
-            for (name, value) in &original {
-                assert_eq!(
-                    native.get_header(name.as_str()).map(HeaderValue::as_bytes),
-                    Some(value.as_bytes()),
-                    "should preserve complete trace headers through native conversion"
-                );
-            }
             assert_eq!(
-                native
-                    .get_headers()
-                    .filter(|(name, _)| name.as_str() == "set-cookie")
+                response
+                    .headers()
+                    .get_all(edgezero_core::http::header::SET_COOKIE)
+                    .iter()
                     .count(),
                 usize::from(action.is_some()),
                 "should emit only one deliberate action cookie and none on reads or errors"
             );
             if head {
-                assert!(
-                    native.take_body_bytes().is_empty(),
-                    "should preserve bodyless trace HEAD through native conversion"
+                assert_eq!(
+                    response.body().as_bytes(),
+                    Some(b"".as_slice()),
+                    "should retain a bodyless trace HEAD"
                 );
             }
         }
@@ -1204,7 +1135,8 @@ mod tests {
         ] {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
-            let core = into_core_request(req).expect("should convert the native request");
+            let core = edgezero_adapter_fastly::request::into_core_request(req)
+                .expect("should convert the native request");
 
             assert_eq!(
                 is_trace_path(core.uri().path()),

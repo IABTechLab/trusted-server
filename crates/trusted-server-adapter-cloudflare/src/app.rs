@@ -266,6 +266,7 @@ type BoxedHandlerFuture = Pin<Box<dyn Future<Output = Result<Response, EdgeError
 
 fn make_handler<F, Fut>(
     state: Arc<AppState>,
+    body_limit: Option<usize>,
     f: F,
 ) -> impl Fn(RequestContext) -> BoxedHandlerFuture + Clone + 'static
 where
@@ -277,7 +278,12 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = s.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            if ctx.method() == Method::POST
+                && let Some(limit) = body_limit
+            {
+                ctx.body_bytes(limit).await?;
+            }
+            let mut req = ctx.into_request()?;
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
                 &mut req,
@@ -447,16 +453,16 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
+    fn routes() -> Result<RouterService, EdgeError> {
         let state = match build_state() {
             Ok(s) => s,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
+                return Ok(startup_error_router(e));
             }
         };
 
-        build_router(&state)
+        Ok(build_router(&state))
     }
 }
 
@@ -513,7 +519,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -613,15 +619,19 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
                 "/.well-known/trusted-server.json",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, services, req| async move {
                     handle_trusted_server_discovery(&s.settings, &services, req)
                 }),
             )
             .post(
                 "/verify-signature",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_verify_signature(&s.settings, &services, req)
-                }),
+                make_handler(
+                    Arc::clone(&state),
+                    Some(trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES),
+                    |s, services, req| async move {
+                        handle_verify_signature(&s.settings, &services, req)
+                    },
+                ),
             )
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
@@ -654,53 +664,61 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // adapter serves the real handler.
             .get(
                 "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, _services, req| async move {
                     let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
             .post(
                 "/auction",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    // Build the geo-aware EC context so the auction consent gate
-                    // sees the caller's jurisdiction — `EcContext::default()`
-                    // fails it closed for consented users.
-                    let mut ec_context = build_ec_context(&s.settings, &services, &req);
-                    handle_auction(
-                        &s.settings,
-                        &s.orchestrator,
-                        None,
-                        None,
-                        &mut ec_context,
-                        &services,
-                        req,
-                    )
-                    .await
-                }),
+                make_handler(
+                    Arc::clone(&state),
+                    Some(trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE),
+                    |s, services, req| async move {
+                        // Build the geo-aware EC context so the auction consent gate
+                        // sees the caller's jurisdiction — `EcContext::default()`
+                        // fails it closed for consented users.
+                        let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                        handle_auction(
+                            &s.settings,
+                            &s.orchestrator,
+                            None,
+                            None,
+                            &mut ec_context,
+                            &services,
+                            req,
+                        )
+                        .await
+                    },
+                ),
             )
             .get(
                 "/first-party/proxy",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, services, req| async move {
                     handle_first_party_proxy(&s.settings, &services, req).await
                 }),
             )
             .get(
                 "/first-party/click",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, services, req| async move {
                     handle_first_party_click(&s.settings, &services, req).await
                 }),
             )
             .get(
                 "/first-party/sign",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, services, req| async move {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
                 }),
             )
             .post(
                 "/first-party/sign",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_first_party_proxy_sign(&s.settings, &services, req).await
-                }),
+                make_handler(
+                    Arc::clone(&state),
+                    Some(trusted_server_core::proxy::SIGN_MAX_BODY_BYTES),
+                    |s, services, req| async move {
+                        handle_first_party_proxy_sign(&s.settings, &services, req).await
+                    },
+                ),
             )
             // GET serves the click guard's navigation fallback: the creative
             // iframe is an opaque origin (sandbox without `allow-same-origin`),
@@ -708,15 +726,19 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // for a 302 instead.
             .get(
                 "/first-party/proxy-rebuild",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
+                make_handler(Arc::clone(&state), None, |s, services, req| async move {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
             )
             .post(
                 "/first-party/proxy-rebuild",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
-                }),
+                make_handler(
+                    Arc::clone(&state),
+                    Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES),
+                    |s, services, req| async move {
+                        handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                    },
+                ),
             );
 
         // SPA re-auction endpoint, registered on the canonical path and on the
@@ -728,29 +750,35 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // `X-TSJS-Page-Bids` gate stays trustworthy — an alias that let the
         // preflight fall through to a permissive origin would reopen exactly
         // the cross-site hole the canonical path closes.
-        let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
-            let mut ec_context = build_ec_context(&s.settings, &services, &req);
-            let auction = AuctionDispatch {
-                integration_registry: &s.registry,
-                orchestrator: &s.orchestrator,
-                slots: s.settings.creative_opportunity_slots(),
-                registry: None,
-            };
-            handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req).await
-        });
-        let page_bids_preflight =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(page_bids_preflight_denied())
-            });
+        let page_bids = make_handler(
+            Arc::clone(&state),
+            Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES),
+            |s, services, req| async move {
+                let mut ec_context = build_ec_context(&s.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
+                    orchestrator: &s.orchestrator,
+                    slots: s.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req).await
+            },
+        );
+        let page_bids_preflight = make_handler(
+            Arc::clone(&state),
+            Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES),
+            |_s, _services, _req| async move { Ok(page_bids_preflight_denied()) },
+        );
         for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
             router = router.route(path, Method::GET, page_bids.clone());
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
         }
 
-        let cache_purge_unsupported =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(cache_purge_not_supported())
-            });
+        let cache_purge_unsupported = make_handler(
+            Arc::clone(&state),
+            Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES),
+            |_s, _services, _req| async move { Ok(cache_purge_not_supported()) },
+        );
         for method in publisher_fallback_methods() {
             router = router.route(
                 "/_ts/admin/cache/purge",
@@ -759,10 +787,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             );
         }
 
-        let legacy_admin_deny =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(legacy_admin_alias_denied())
-            });
+        let legacy_admin_deny = make_handler(
+            Arc::clone(&state),
+            Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES),
+            |_s, _services, _req| async move { Ok(legacy_admin_alias_denied()) },
+        );
         for method in publisher_fallback_methods() {
             router = router.route(
                 "/admin/keys/rotate",
@@ -781,7 +810,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     }
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &edgezero_core::http::RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -793,12 +822,12 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         return TraceMetadata { client_info, geo };
     }
     let client_ip = request
-        .headers()
+        .headers
         .get("cf-connecting-ip")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
     let geo = request
-        .headers()
+        .headers
         .get("cf-ipcountry")
         .and_then(|value| value.to_str().ok())
         .filter(|country| *country != "XX")

@@ -44,7 +44,7 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
-const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+pub const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -708,11 +708,11 @@ mod tests {
         StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::test_support::PreDispatchHookTestExt as _;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use edgezero_core::router::PreDispatchHook as _;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1247,7 +1247,7 @@ mod tests {
             Arc::clone(&settings),
             Arc::new(|_| panic!("should not load API setup metadata")),
         )
-        .handle(&mut request)
+        .handle_request(&mut request)
         .await
         .expect("should freeze trace gate");
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
@@ -1349,7 +1349,7 @@ mod tests {
                 Arc::clone(&settings),
                 Arc::new(|_| panic!("should not load API setup metadata")),
             )
-            .handle(&mut request)
+            .handle_request(&mut request)
             .await
             .expect("should freeze cookie gate");
             let response = handle_auction(
@@ -1473,7 +1473,7 @@ mod tests {
             Arc::new(|_| panic!("should not load setup metadata on API capture")),
         );
         assert!(
-            hook.handle(&mut request)
+            hook.handle_request(&mut request)
                 .await
                 .expect("should freeze API cookies")
                 .is_none(),

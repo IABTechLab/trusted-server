@@ -1471,7 +1471,7 @@ mod tests {
             assert_eq!(success.status(), StatusCode::OK);
             assert_eq!(streaming_stub.recorded_stream_response_flags(), vec![true]);
             assert!(
-                matches!(success.body(), EdgeBody::Stream(_)),
+                success.body().is_stream(),
                 "streaming-capable clients should preserve the origin response stream"
             );
             let streamed_body = success
