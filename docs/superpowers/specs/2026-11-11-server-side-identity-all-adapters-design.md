@@ -266,7 +266,11 @@ marks the record contract and geo as supported.
   consents after the page loads gets an EC on that page view instead of the
   next navigation. A plain `GET` answers Prebid's SharedID `pixelUrl` with an
   empty response; the script's call gets JSON with the SharedID and the EIDs
-  the record holds, which the script merges into Prebid. The route mints
+  the record holds, which the script merges into Prebid. The script also calls
+  it on every later CMP consent change, sending Sourcepoint's GPP string where
+  the page uses Sourcepoint, so a withdrawal expires `ts-ec`, the SharedID
+  cookie and the mirror cookie and tombstones the record in that response
+  instead of on the next navigation. The route mints
   nothing for a cross-site caller or a client ID-7 refuses, and every response
   carries `Cache-Control: no-store`; a rate limit on it waits with ID-6
   (DEC-15). It is served from the page's own host, which
@@ -275,10 +279,12 @@ marks the record contract and geo as supported.
   Accept: on Fastly and Axum, a consented same-site call with no `ts-ec`
   creates the record and sets `ts-ec` and the SharedID cookie in that
   response; the JSON call returns the record's IDs; a cross-site `Origin` and a
-  scripted client mint nothing; an unchanged
-  returning reader gets no `Set-Cookie`. State: on main only a real-browser
+  scripted client mint nothing; a withdrawal sent to it expires the
+  identity cookies and tombstones the record; an unchanged returning reader gets
+  no `Set-Cookie`. State: on main only a real-browser
   navigation through the publisher proxy mints an EC, and no such route
-  exists.
+  exists. #1535 (RC line) posts Sourcepoint's GPP string to a separate
+  `/_ts/consent` route, wired into each adapter's router.
 
 ### SH: Shared state passed the right way
 
@@ -557,6 +563,11 @@ Decided:
   IABTechLab/edgezero#439 chain and the EZI tickets. Trusted Server main pins
   its revisions (R1, R1b, R2) instead of waiting for an EdgeZero release, and
   repins to a released tag once EdgeZero publishes one.
+- **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
+  important identity providers, get `mirror_enabled`, and the MVP's provider
+  and mirror checks (T11, A10) use them.
+- **DEC-17 celld in the MVP** (user, 2026-11-12). EZI-2b delivers both the
+  DynamoDB and the celld provider before R1b.
 - **DEC-16 One implementation for every adapter** (user, 2026-11-12). Every
   feature is built once and works on every adapter, delivered in DEC-4's
   order. Shared logic lives in Trusted Server core; a platform capability an
@@ -577,9 +588,7 @@ Open:
   EZI-2s, R3, T8 and T9.
 - **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
   shared by everyone behind one IP. Blocks enabling LiveRamp in #1488, and
-  #1245.
-- **DEC-10 Mirror partners.** Which partners get `mirror_enabled`. It gates
-  turning the mirror on for a partner in a deployment, not a ticket.
+  #1245. LiveRamp is in the MVP (DEC-10), so this is needed before launch.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
   going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
@@ -670,3 +679,9 @@ The user then decided DEC-5: EdgeZero keeps an integration branch for the
 unreleased work, and Trusted Server main pins its revisions instead of waiting
 for a release. AX-7 allows those revisions, EZI-6 calls R1 to R4 integration
 points, and A1 no longer waits on a decision for its pin.
+
+The user then kept celld in the MVP (DEC-17), named ID5 and LiveRamp as the
+mirrored providers (DEC-10), which makes DEC-9 a launch need, and required
+#1535's Sourcepoint consent sync. ID-9's route now also takes later consent
+changes, so #1535's separate per-adapter `/_ts/consent` route folds into it
+(T19, T20).
