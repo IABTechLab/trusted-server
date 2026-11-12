@@ -455,7 +455,7 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
         })
     })?;
     // Pull-sync partners run as providers too; a source claimed by both would
-    // fail the coordinator build on every request.
+    // fail the coordinator build at startup.
     for config in ec.identity_providers.iter().filter(|config| config.enabled) {
         if let Some(source) = config.sources.iter().find(|source| {
             partners

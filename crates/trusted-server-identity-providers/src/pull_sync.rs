@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use error_stack::Report;
 use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
+use trusted_server_core::ec::kv_types::MAX_UID_LENGTH;
 use trusted_server_core::ec::provider::{
     EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities,
     ProviderCommon, ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind,
@@ -119,6 +120,18 @@ impl IdentityProvider for PullSyncProvider {
         let Some(uid) = body.uid.filter(|uid| !uid.trim().is_empty()) else {
             return Ok(LookupOutcome::NoMatch);
         };
+        // Pull sync ran before identity providers existed, so its UIDs keep
+        // the legacy 512-byte limit: an older build rejects a row holding a
+        // longer UID whole, which would break rollback for every deployment
+        // that already pulls.
+        if uid.len() > MAX_UID_LENGTH {
+            log::warn!(
+                "Pull sync: partner '{}' returned a UID over {MAX_UID_LENGTH} bytes ({}), ignoring it",
+                self.source.as_str(),
+                uid.len()
+            );
+            return Ok(LookupOutcome::NoMatch);
+        }
         Ok(LookupOutcome::Found(vec![ProviderEid {
             source: Cow::Owned(self.source.as_str().to_owned()),
             inserter: None,
@@ -238,5 +251,33 @@ mod tests {
             "should treat an empty UID as no match"
         );
         assert!(invalid.is_err(), "should reject invalid JSON");
+    }
+
+    #[test]
+    fn ignores_a_uid_over_the_legacy_limit() {
+        let provider = provider();
+        let headers = http::HeaderMap::new();
+        let at_limit = serde_json::json!({ "uid": "a".repeat(MAX_UID_LENGTH) }).to_string();
+        let over_limit = serde_json::json!({ "uid": "a".repeat(MAX_UID_LENGTH + 1) }).to_string();
+        let respond = |body: &[u8]| {
+            provider
+                .parse_response(ProviderResponse {
+                    status: http::StatusCode::OK,
+                    headers: &headers,
+                    body,
+                    context: None,
+                })
+                .map(|outcome| matches!(outcome, LookupOutcome::Found(_)))
+                .expect("should parse")
+        };
+
+        assert!(
+            respond(at_limit.as_bytes()),
+            "should keep a UID at the legacy limit"
+        );
+        assert!(
+            !respond(over_limit.as_bytes()),
+            "should ignore a UID an older build could not load"
+        );
     }
 }

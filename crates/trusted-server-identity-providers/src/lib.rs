@@ -81,7 +81,8 @@ fn excludes_where_gdpr_applies(kind: &str, source: &str) -> bool {
 }
 
 /// Builds the partner registry, marking the sources claimed by enabled
-/// providers (including pull-sync partners) as provider-owned.
+/// configured providers as provider-owned. A pull-sync partner's source is
+/// not marked, so browser ingest and batch sync still fill it.
 ///
 /// The sources any configured provider, enabled or disabled, excludes where
 /// GDPR applies are marked too, so the UIDs already stored for them are

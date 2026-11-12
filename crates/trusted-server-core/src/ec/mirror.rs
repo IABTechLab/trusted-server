@@ -37,9 +37,8 @@ impl MirrorValue {
 /// Builds the mirror from the row as it stands after this navigation.
 ///
 /// Holds live, provider-written UIDs of partners with both
-/// `bidstream_enabled` and `mirror_enabled` whose owning provider's TCF vendor
-/// consent is not denied, in
-/// partner config order, as unpadded base64url JSON
+/// `bidstream_enabled` and `mirror_enabled` while no TCF vendor gating the
+/// source is denied consent, in partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
@@ -62,7 +61,8 @@ pub fn build_mirror(
     };
     let mut mirror = MirrorBuilder::default();
     // A partner opts in with `mirror_enabled`, and a UID never reaches the
-    // page while its owning provider's TCF vendor consent is denied, as it
+    // page while a TCF vendor gating its source (that of any configured
+    // provider claiming it, enabled or disabled) is denied consent, as it
     // never reaches the bidstream (`KvEntry::live_eids`).
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
@@ -417,6 +417,59 @@ mod tests {
         assert!(
             matches!(granted, MirrorCookie::Set(_)),
             "should mirror the UID once the vendor has consent"
+        );
+    }
+
+    #[test]
+    fn withholds_uids_while_a_disabled_providers_vendor_lacks_consent() {
+        // Arrange: enabled provider `new` (vendor 7) owns the source that
+        // disabled provider `old` (vendor 42) claimed, so both vendors gate it.
+        let entry = row(vec![uid("live", Expiry::Never)]);
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            serde_json::from_value(json!({
+                "name": "ids", "source_domain": "ids.example.com",
+                "bidstream_enabled": true, "mirror_enabled": true
+            }))
+            .expect("should build partner"),
+        ];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"new\"\nkind = \"k\"\ntcf_vendor_id = 7\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"old\"\nkind = \"k\"\nenabled = false\ntcf_vendor_id = 42\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let now = UnixSeconds::new(1000);
+
+        // Act
+        let owner_only = build_mirror(
+            Some(&entry),
+            &consent_granting_vendors(vec![7]),
+            &registry,
+            now,
+        );
+        let both = build_mirror(
+            Some(&entry),
+            &consent_granting_vendors(vec![7, 42]),
+            &registry,
+            now,
+        );
+
+        // Assert
+        assert_eq!(
+            owner_only,
+            MirrorCookie::Expire,
+            "should withhold the source while the disabled provider's vendor lacks consent"
+        );
+        assert!(
+            matches!(both, MirrorCookie::Set(_)),
+            "should mirror the source once every gating vendor has consent"
         );
     }
 

@@ -93,7 +93,7 @@ pub fn ec_finalize_response(
 ///
 /// Where the mirror cannot be rebuilt (non-navigations, or a navigation
 /// without a readable row), a carried mirror is expired when the request
-/// denies TCF vendor consent to the owning provider of any mirrored partner.
+/// denies TCF vendor consent to a vendor gating any mirrored partner it holds.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
@@ -139,7 +139,8 @@ fn apply_mirror(
 }
 
 /// Whether the request carries a mirror that holds UIDs of a mirrored partner
-/// whose owning provider's TCF vendor is denied, so those UIDs must no longer
+/// with a denied gating TCF vendor (that of any configured provider claiming
+/// its source, enabled or disabled), so those UIDs must no longer
 /// reach the page.
 ///
 /// A carried value that does not decode as a mirror may hold anything, so it
