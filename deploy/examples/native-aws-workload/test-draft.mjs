@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const terraform = process.env.TERRAFORM_BIN || "terraform";
 const data = path.resolve(root, process.env.TF_DATA_DIR || ".terraform");
-const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ts-terraform-contract-"));
+const temporary = fs.mkdtempSync(
+  path.join(os.tmpdir(), "ts-terraform-contract-"),
+);
 const sourceFiles = [
   "config.tf",
   "ecs.tf",
@@ -598,7 +600,10 @@ try {
       /command\s*=\s*apply/,
       "offline validation checks must not apply even mocked workload",
     );
-    fs.writeFileSync(path.join(fixture, "tests/validation.tftest.hcl"), validation);
+    fs.writeFileSync(
+      path.join(fixture, "tests/validation.tftest.hcl"),
+      validation,
+    );
     for (const file of sourceFiles)
       assert.equal(
         fs.readFileSync(path.join(fixture, file), "utf8"),
@@ -682,6 +687,65 @@ try {
   run(["test", "-no-color"], retained, retainedEnv);
   console.log(
     "PASS retained table-only layout, protected lifetime and storage outputs",
+  );
+
+  // Bootstrap uses the same credential-free mirror and unchanged source-copy
+  // boundary. Its local backend and any operator migration override stay unused.
+  const bootstrapRoot = path.join(root, "bootstrap");
+  const bootstrap = path.join(temporary, "bootstrap");
+  fs.mkdirSync(path.join(bootstrap, "tests"), { recursive: true });
+  const bootstrapSources = [
+    "main.tf",
+    "outputs.tf",
+    "terraform.tf",
+    "variables.tf",
+  ];
+  assert.deepEqual(
+    fs
+      .readdirSync(bootstrapRoot)
+      .filter(
+        (name) =>
+          (name.endsWith(".tf") || name.endsWith(".tf.json")) &&
+          name !== "backend_override.tf",
+      )
+      .sort(),
+    bootstrapSources,
+    "bootstrap mock checks accept only reviewed public Terraform sources",
+  );
+  for (const file of [...bootstrapSources, ".terraform.lock.hcl"])
+    fs.copyFileSync(path.join(bootstrapRoot, file), path.join(bootstrap, file));
+  const bootstrapTest = fs.readFileSync(
+    path.join(bootstrapRoot, "tests/bootstrap.tftest.hcl"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    bootstrapTest,
+    /command\s*=\s*apply/,
+    "bootstrap offline checks must not apply even mocked resources",
+  );
+  fs.writeFileSync(
+    path.join(bootstrap, "tests/bootstrap.tftest.hcl"),
+    bootstrapTest,
+  );
+  const bootstrapEnv = {
+    TF_DATA_DIR: path.join(bootstrap, ".terraform"),
+    TF_CLI_CONFIG_FILE: cliConfig,
+  };
+  run(
+    [
+      "init",
+      "-backend=false",
+      "-input=false",
+      "-lockfile=readonly",
+      "-no-color",
+    ],
+    bootstrap,
+    bootstrapEnv,
+  );
+  run(["validate", "-no-color"], bootstrap, bootstrapEnv);
+  run(["test", "-no-color"], bootstrap, bootstrapEnv);
+  console.log(
+    "PASS bootstrap ownership, state settings, single DNS validation record and empty secret containers",
   );
 
   console.log(

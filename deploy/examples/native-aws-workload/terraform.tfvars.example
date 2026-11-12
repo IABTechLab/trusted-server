@@ -11,7 +11,8 @@ publisher_hostname = "publisher.example.com"
 preserve_publisher_hostname = false
 route53_zone_id             = "Z0000000000000"
 certificate_arn             = "arn:aws:acm:eu-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000"
-reviewer_ipv4_cidrs         = ["203.0.113.0/24"]
+# Unused with CloudFront. These CIDRs do not restrict CloudFront viewers.
+reviewer_ipv4_cidrs         = []
 application_image           = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 agent_image                 = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 config_envelope_file        = "example-envelope.json"
@@ -43,11 +44,13 @@ application_secrets = {
     arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
     version_id = "33333333333333333333333333333333"
   }
+  browser_forwarder_secret = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-forwarder-AbCdEf"
+    version_id = "55555555555555555555555555555555"
+  }
 }
-runtime_boundaries = {
-  execution = "arn:aws:iam::000000000000:policy/native-demo/review-example/execution-boundary"
-  task      = "arn:aws:iam::000000000000:policy/native-demo/review-example/task-boundary"
-}
+# Set existing task/execution boundary ARNs only if your organisation requires them.
+runtime_boundaries = null
 agent_token = {
   arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-agent-AbCdEf"
   version_id = "44444444444444444444444444444444"

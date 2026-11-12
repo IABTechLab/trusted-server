@@ -66,5 +66,15 @@ src/*.html
 /crates/js/
 /crates/integration-tests/
 
+# Operator-owned AWS deployment inputs and state
+/deploy/examples/native-aws-workload/**/.terraform/
+/deploy/examples/native-aws-workload/**/terraform.tfstate*
+/deploy/examples/native-aws-workload/**/.terraform.tfstate.lock.info
+/deploy/examples/native-aws-workload/**/*.tfplan
+/deploy/examples/native-aws-workload/**/*.tfvars
+/deploy/examples/native-aws-workload/**/*.tfvars.json
+/deploy/examples/native-aws-workload/**/*.backend.hcl
+/deploy/examples/native-aws-workload/**/backend_override.tf
+
 # Documentation proposal workflow scratch space
 /.docs-proposal/

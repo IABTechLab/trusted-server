@@ -61,6 +61,10 @@ variables {
       arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
       version_id = "33333333333333333333333333333333"
     }
+    browser_forwarder_secret = {
+      arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-forwarder-AbCdEf"
+      version_id = "55555555555555555555555555555555"
+    }
   }
   runtime_boundaries = {
     execution = "arn:aws:iam::000000000000:policy/native-demo/review-example/execution-boundary"
@@ -90,6 +94,25 @@ run "public_https_plans_with_valid_envelope" {
     condition     = local.envelope_valid
     error_message = "Public ingress must retain the envelope contract."
   }
+}
+
+run "reject_empty_direct_ingress" {
+  command = plan
+  variables {
+    reviewer_ipv4_cidrs = []
+  }
+  expect_failures = [var.reviewer_ipv4_cidrs]
+}
+
+run "reject_identical_permission_boundaries" {
+  command = plan
+  variables {
+    runtime_boundaries = {
+      execution = "arn:aws:iam::000000000000:policy/example-boundary"
+      task      = "arn:aws:iam::000000000000:policy/example-boundary"
+    }
+  }
+  expect_failures = [var.runtime_boundaries]
 }
 
 run "reject_other_broad_ingress_ranges" {

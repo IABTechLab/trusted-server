@@ -1,4 +1,4 @@
-# Fictional, reference-only configuration. Replace with a reviewed audit output.
+# Fictional EC-only publisher-proxy configuration. Review for your publisher.
 # Generate the AppConfig BlobEnvelope with the existing TS CLI, not Terraform.
 [publisher]
 domain = "publisher.example.com"
@@ -23,3 +23,17 @@ namespace = "example-staging"
 path = '^/(?:$|[^h]|h(?:$|[^e])|he(?:$|[^a])|hea(?:$|[^l])|heal(?:$|[^t])|healt(?:$|[^h])|health.)'
 username = "reviewer"
 password = "handler_password"
+
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "browser_forwarder_secret"
+
+[integrations.sourcepoint]
+enabled = true
+rewrite_sdk = false
+
+[auction]
+enabled = false
+
+[integrations.prebid]
+enabled = false

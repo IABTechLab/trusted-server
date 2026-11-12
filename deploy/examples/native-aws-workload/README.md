@@ -1,12 +1,15 @@
 # Native AWS workload example
 
-One example combines retained DynamoDB EC storage with an Axum workload on Fargate, AppConfig, Secrets Manager, an ALB and protected CloudFront Geo. The main fictional tfvars select CloudFront at `dns-cutover`; explicit `geo_front_door = null` selects Geo Off. The retained table and disposable workload have separate Terraform roots and separate locked state keys.
+One example combines retained DynamoDB EC storage with an Axum workload on Fargate, AppConfig, Secrets Manager, an ALB and protected CloudFront Geo. Start with the [deployment walkthrough](DEPLOYMENT.md). It provisions prerequisites through the new [`bootstrap/`](bootstrap/) root, then the retained table and workload through their separate roots and locked state keys. The main fictional tfvars select CloudFront at `dns-cutover`; explicit `geo_front_door = null` selects Geo Off.
 
 This is a deployment reference, not evidence that an AWS account, final application image or public ingress has been qualified. Use your approved deployment credentials and infrastructure workflow. The separate, access-controlled deployer is optional; it is not required to apply this example or run its offline checks. Obtain the account owner's authorization before applying or destroying resources.
 
 ```mermaid
 flowchart TD
-    Retained[Retained Terraform root] --> Table[Regional DynamoDB EC table]
+    Bootstrap[Bootstrap Terraform root] --> Prerequisites[State bucket, ECR, DNS, certificates and empty secrets]
+    Prerequisites --> Retained[Retained Terraform root]
+    Prerequisites --> Workload
+    Retained --> Table[Regional DynamoDB EC table]
     Retained --> Binding[Non-secret ec_storage handoff]
     Binding --> TOML[Operator-owned app-config TOML]
     TOML --> CLI[Matching TS CLI produces exact BlobEnvelope]
@@ -27,12 +30,13 @@ Without CloudFront, explicit reviewer CIDRs govern ALB ingress. The application 
 
 ## Roots and input ownership
 
-| Path           | Ownership and lifetime                                                                                                                                                       |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `retained/`    | Retained owner creates the table and exports `ec_storage`. No task role, policy attachment or workload-state dependency.                                                     |
-| This directory | Workload owner creates the task role, attaches its scoped DynamoDB policy, and configures ECS, ingress and AppConfig. Workload removal must leave the retained table intact. |
+| Path           | Ownership and lifetime                                                                                                                                                                          |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bootstrap/`   | Owns the state bucket, ECR repository, evaluation DNS zone or existing-zone binding, regional/viewer certificates, validation CNAME and empty secret containers. It never stores secret values. |
+| `retained/`    | Retained owner creates the table and exports `ec_storage`. No task role, policy attachment or workload-state dependency.                                                                        |
+| This directory | Workload owner creates the task role, attaches its scoped DynamoDB policy, and configures ECS, ingress and AppConfig. Workload removal must leave the retained table intact.                    |
 
-Both roots use S3 lockfile locking, but neither supplies a backend key. The operator must explicitly supply stable installation/workload-specific keys, the separately owned bucket and backend region through the approved operator path. For illustration only, one installation could use `example-staging/retained.tfstate` and `example-staging/workload.tfstate`. Retained and workload keys must differ. Never reuse another environment's keys or point both roots at one key. Keep state encrypted, versioned, access-controlled and locked.
+The retained and workload roots use S3 lockfile locking, but neither supplies a backend key. Bootstrap outputs separate backend configurations for all three roots. Its first apply uses private local state because the bucket does not exist yet; [migrate that state to S3](bootstrap/README.md) after creation. The operator must keep the backend files and state identities stable. For illustration only, one installation could use `example-staging/retained.tfstate` and `example-staging/workload.tfstate`. Retained and workload keys must differ. Never reuse another environment's keys or point both roots at one key. Keep state encrypted, versioned, access-controlled and locked.
 
 | Input                                                                                      | Responsible owner                                                                                                                         |
 | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -45,7 +49,7 @@ Both roots use S3 lockfile locking, but neither supplies a backend key. The oper
 | Task/execution permission boundaries                                                       | Boundary owner reviews effective permissions; the workload's `ec_task_policy_json` is a scoped allow document, not a replacement boundary |
 | Certificates, hosted zone, reviewer access, CloudFront credentials and routing phase       | Ingress owner, with separate live TLS/DNS/admission qualification                                                                         |
 
-The example creates no operator role, protected state bucket, permission boundary, certificate, hosted zone or image build/publisher. Fictional tfvars, reserved documentation client CIDRs and placeholder image digests are not deployable inputs. The Agent image placeholder is not a verified official image. Never publish credentials, actual tfvars, state, saved plans, licensed data or private qualification records.
+Bootstrap creates the state bucket, ECR repository, certificates, DNS validation records, empty secret containers and, unless an existing zone is supplied, a dedicated evaluation hosted zone. It does not build/publish an image, grant consent, seed secret values or change external parent DNS. Permission boundaries are optional organisation-owned inputs, not mandatory fictional resources. Fictional tfvars, reserved documentation client CIDRs and placeholder image digests are not deployable inputs. The Agent image placeholder is not a verified official image. Never publish credentials, actual tfvars, state, saved plans, licensed data or private qualification records.
 
 There is no unconditional draft or approval gate. The AppConfig hosted-configuration resource checks envelope shape, publisher binding and exact agreement with `ec_storage` before publication. The CLI/runtime still owns application semantics and checksum validation. Account authorization, final-image/nonroot-volume behavior and live ingress acceptance are operator checks, not hardcoded Terraform blockers. Successful planning does not prove those runtime checks passed.
 
@@ -55,14 +59,15 @@ SSO, an assumed role or another approved credential source may be used. `Adminis
 
 The deployment principal needs the following capabilities for its selected resources, including provider read/list calls, tagging, updates and deliberate workload cleanup:
 
-| Scope | Required capability |
-| --- | --- |
-| Terraform state | List the selected S3 state prefixes; read/write the retained and workload state objects; read/write/delete their `.tflock` objects. Include applicable state-key KMS permissions. State-object deletion is not needed for the default workspace. |
-| Retained root | Create/read/update/tag the exact DynamoDB table and its TTL/protection settings. EC row reads/writes belong to the runtime task role, not the retained provisioner. Table retirement is separate. |
-| Workload networking and compute | Manage the installation's VPC, subnets, routes, security groups, ALB/listeners/targets, ECS cluster/task definitions/services and log group. |
-| Configuration and ingress | Manage its AppConfig resources, CloudFront distribution/cache/origin-request policies and the evaluation DNS record; read the CloudFront managed prefix list and existing certificate/zone metadata as needed. |
-| IAM | Manage only the installation's task/execution roles and inline policies, apply the supplied boundaries and pass those two roles to `ecs-tasks.amazonaws.com`. Do not grant unrestricted `iam:PassRole`. First use of ECS/ALB may also require their service-linked roles to be created by the account owner or a suitably restricted bootstrap principal. |
-| Image publication, if this principal also builds/pushes | ECR login, upload, image publication and digest lookup for the selected existing repository. This is separate from Terraform's workload permissions. |
+| Scope                                                   | Required capability                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Terraform state                                         | List the selected S3 state prefixes; read/write the retained and workload state objects; read/write/delete their `.tflock` objects. Include applicable state-key KMS permissions. State-object deletion is not needed for the default workspace.                                                                                                          |
+| Bootstrap root                                          | Manage the installation's S3 state bucket/settings, ECR repository, ACM certificates, DNS validation records, optional evaluation zone and empty Secrets Manager containers. Secret-value seeding is a separate operator operation.                                                                                                                       |
+| Retained root                                           | Create/read/update/tag the exact DynamoDB table and its TTL/protection settings. EC row reads/writes belong to the runtime task role, not the retained provisioner. Table retirement is separate.                                                                                                                                                         |
+| Workload networking and compute                         | Manage the installation's VPC, subnets, routes, security groups, ALB/listeners/targets, ECS cluster/task definitions/services and log group.                                                                                                                                                                                                              |
+| Configuration and ingress                               | Manage its AppConfig resources, CloudFront distribution/cache/origin-request policies and the evaluation DNS record; read the CloudFront managed prefix list and existing certificate/zone metadata as needed.                                                                                                                                            |
+| IAM                                                     | Manage only the installation's task/execution roles and inline policies, apply the supplied boundaries and pass those two roles to `ecs-tasks.amazonaws.com`. Do not grant unrestricted `iam:PassRole`. First use of ECS/ALB may also require their service-linked roles to be created by the account owner or a suitably restricted bootstrap principal. |
+| Image publication, if this principal also builds/pushes | ECR login, upload, image publication and digest lookup for the selected existing repository. This is separate from Terraform's workload permissions.                                                                                                                                                                                                      |
 
 Scope writes to installation resource ARNs, DNS names, prefixes and supported tag conditions. Some discovery APIs do not support resource scoping. The exact action-level policy depends on the selected account, provider calls and resources; this is a capability checklist, not a tested universal least-privilege policy. No broad `service:*` grant is implied by a table row. Plan-only/read-only access cannot perform a first deployment.
 
@@ -72,7 +77,7 @@ See [S3 backend permissions](https://developer.hashicorp.com/terraform/language/
 
 ## Ordered configuration handoff
 
-These steps describe input preparation and ownership. Cloud provisioning and state reads require a separately authorized operator workflow; the commands here are local only.
+These steps explain configuration ownership. Follow the [deployment walkthrough](DEPLOYMENT.md) for the ordered bootstrap, DNS, secret seeding, build, retained and workload commands. Review saved plans before applying them.
 
 ### 1. Agree the retained reservation
 
@@ -134,7 +139,7 @@ AppConfig consumes that inner `BlobEnvelope` document, not the outer local map o
 
 The workload owner supplies the same `ec_storage` object and sets `config_envelope_file` to the exact CLI export. The workload checks envelope shape, publisher binding and exact `ec.storage` agreement, then publishes the original envelope text unchanged to AppConfig. It attaches exact-table/partition-scoped DynamoDB permissions to its own application task role. The retained root never attaches a policy to that role.
 
-Review `ec_task_policy_json` with the boundary owner. An existing task boundary with an explicit deny excluding DynamoDB still denies the calls despite an inline allow. Review its action ceiling and constrained allows, plus organization and endpoint policy denies. Do not remove a boundary, grant administrator access or move application calls to the execution role. The execution role retains image-pull, logs and startup-secret responsibilities.
+By default, `runtime_boundaries = null` creates no permission boundaries. If your organisation requires them, supply its existing execution/task policy ARNs and review `ec_task_policy_json` with the boundary owner. An existing task boundary with an explicit deny excluding DynamoDB still denies the calls despite an inline allow. Review its action ceiling and constrained allows, plus organization and endpoint policy denies. Do not remove a boundary, grant administrator access or move application calls to the execution role. The execution role retains image-pull, logs and startup-secret responsibilities.
 
 The main `terraform.tfvars.example` selects protected CloudFront at `dns-cutover`. The `staged` and `origin-enabled` phases are also modeled; they are not an automated safe rollout or rollback procedure. An explicit `geo_front_door = null` selects the alternate Geo Off path. Both paths require their own live ingress and browser acceptance checks.
 
@@ -158,7 +163,7 @@ The current fixtures use `publisher.example.com` and `ts-demo.example.com`. A re
 
 Existing Terraform constraints require different publisher and demo hostnames. This example does not change those values or validations. The operator must supply an approved cookie-compatible hostname configuration within existing constraints, or use the existing publisher-preserving browser proxy. In that proxy session the browser stays on the publisher URL while the proxy connects to the demo endpoint and rewrites the upstream Host. With CloudFront, `preserve_publisher_hostname = true` fixes `X-Forwarded-Host` to the configured publisher for this mode. It does not change browser origin, aliases, certificates, ALB Host/credential admission, Geo trust or no-shared-cache policy. Ordinary demo-host browsing retains the default `false` and is not proof of EC cookie acceptance.
 
-Consent runtime already extracts and enforces standard signals, including TCF, GPP, US Privacy and GPC. An empty `[integrations]` table is not necessarily a bug. An existing publisher CMP may already transport genuine signals. It is not evidence that transport works either. The operator owns genuine CMP signal transport for the selected browser path; this example adds no CMP integration and never fabricates consent or relaxes policy. The existing Sourcepoint GPP capture and `POST /_ts/consent` update path are a scoped example, not a generic TCF bridge or proof that another CMP's updates reach the server.
+Consent runtime already extracts and enforces standard signals, including TCF, GPP, US Privacy and GPC. The EC-only fixture enables Sourcepoint capture with SDK rewriting disabled, disables auctions/Prebid and authenticates the publisher-origin browser proxy through its own fourth application-secret reference. It does not install a CMP or prove that the publisher transports genuine signals. The operator owns that check; this example never fabricates consent or relaxes policy. The existing Sourcepoint GPP capture and `POST /_ts/consent` update path are a scoped example, not a generic TCF bridge or proof that another CMP's updates reach the server.
 
 In separately authorized browser acceptance, retain evidence for:
 
@@ -183,11 +188,14 @@ terraform -chdir=deploy/examples/native-aws-workload init -backend=false -input=
 terraform -chdir=deploy/examples/native-aws-workload validate
 terraform -chdir=deploy/examples/native-aws-workload/retained init -backend=false -input=false -lockfile=readonly
 terraform -chdir=deploy/examples/native-aws-workload/retained validate
+terraform -chdir=deploy/examples/native-aws-workload/bootstrap init -backend=false -input=false -lockfile=readonly
+terraform -chdir=deploy/examples/native-aws-workload/bootstrap validate
+node --test deploy/examples/native-aws-workload/bootstrap/test-bootstrap.mjs
 env -u NODE_OPTIONS -u NODE_PATH node deploy/examples/native-aws-workload/test-draft.mjs
-node --test deploy/examples/native-aws-workload/test-workflow.mjs
+node --test deploy/examples/native-aws-workload/test-workflow.mjs deploy/examples/native-aws-workload/test-operator-guide.mjs
 ```
 
-Backend-disabled initialization prepares provider tooling, not a live backend or AWS resources; it may need a provider download or an existing local mirror. When using an external `TF_DATA_DIR`, pass the same absolute directory to initialization and the helper. The helper copies an explicit public-file allowlist into disposable roots, strips inherited credentials/provider configuration, and uses a filesystem-only provider mirror. It never reads operator overrides, real state or private tfvars. Its mocked plans use unchanged Terraform source copies and cover the retained root, valid workload plans, main CloudFront tfvars, explicit Geo Off, invalid envelopes, storage mismatches, scoped IAM and routing phases. No qualification-blocker source patching is needed and no cloud resource is applied.
+Backend-disabled initialization prepares provider tooling, not a live backend or AWS resources; it may need a provider download or an existing local mirror. When using an external `TF_DATA_DIR`, pass the same absolute directory to initialization and the helper. The helper copies an explicit public-file allowlist into disposable roots, strips inherited credentials/provider configuration, and uses a filesystem-only provider mirror. It never reads operator overrides, real state or private tfvars. Its mocked plans use unchanged Terraform source copies and cover bootstrap ownership, both new/existing DNS-zone paths, the retained root, valid workload plans, main CloudFront tfvars, explicit Geo Off, optional/supplied boundaries, invalid envelopes, storage mismatches, scoped IAM and routing phases. The operator-guide checks parse shell and Node snippets without executing provisioning commands. No qualification-blocker source patching is needed and no cloud resource is applied.
 
 Separately, with the repository's pinned Rust/Node toolchains, the Linux host target and build dependencies installed, check both committed envelopes through the actual runtime config loader:
 
@@ -201,6 +209,6 @@ The offline workflow has read-only repository permissions and no Environment, OI
 
 ## Retirement and deferred production work
 
-The named operator owns ongoing charges, image updates, deliberate shutdown and manual reconciliation. Deletion is explicit, not expiry. Workload teardown removes its role/policy attachment, not the retained table. The retained owner separately approves namespace retirement, identity erasure, allocator continuity and eventual table removal. `prevent_destroy` and deletion protection are not backups and do not prevent authorized task-row deletion. Externally supplied state infrastructure, boundaries, certificates, zones and application secrets remain independently owned. Logs follow their selected retention/deletion setting; external audit records survive workload teardown.
+The named operator owns ongoing charges, image updates, deliberate shutdown and manual reconciliation. Deletion is explicit, not expiry. Workload teardown removes its role/policy attachment, not the retained table. The retained owner separately approves namespace retirement, identity erasure, allocator continuity and eventual table removal. `prevent_destroy` and deletion protection are not backups and do not prevent authorized task-row deletion. Bootstrap-owned state infrastructure, ECR images, certificates, DNS and secret containers have a separate lifetime from the workload and table. Existing zones and organisation boundaries remain externally owned. Migrate bootstrap state back to private local storage before retiring its bucket. Secret containers use Secrets Manager's recovery window; retained data and secret values require deliberate retirement. Logs follow their selected retention/deletion setting; external audit records survive workload teardown.
 
 PITR/backups and restore qualification, alarms, HA, autoscaling, private networking/NAT/endpoints, WAF, customer-managed encryption keys, IPv6, image automation, bidder/partner integrations, signing/admin/S2S additions and rollback automation are deferred. Review retention/erasure and allocator continuity before choosing backups; capacity and failure behavior before adding replicas or tasks; routing and endpoint policies before changing egress; and trust/consent boundaries before adding integrations. None of those production measures is implemented or qualified by this example.
