@@ -1416,6 +1416,7 @@ mod tests {
       }
       var slots = []
       var armed = false
+      var registryReads = 0
       // Model a metadata read slower than the shared settle budget, while
       // staying below the individual CDP operation timeout.
       if (location.hash === '#slow-title') {
@@ -1434,10 +1435,8 @@ mod tests {
               // The budget-floor test observes read count, independently of
               // the real timer exercised by the other fixture users.
               if (location.hash === '#poll-driven') {
-                if (!armed) {
-                  armed = true
-                  return [firstSlot]
-                }
+                registryReads += 1
+                if (registryReads <= 2) return [firstSlot]
                 return [firstSlot, secondSlot]
               }
               if (!armed) {
@@ -2259,8 +2258,9 @@ mod tests {
         for scroll in [false, true] {
             let fixture = gpt_fixture_server(BATCHED_GPT_FIXTURE);
             let mut url = fixture.url().clone();
-            // A second read exposes the second batch without racing a browser
-            // timer against the polling deadline on busy runners.
+            // Expose the second batch on the third read. The second-read case
+            // puts its dwell exactly on the deadline, where timer granularity
+            // can legitimately let it finish without a partial-evidence warning.
             url.set_fragment(Some("poll-driven"));
             // A quiet window equal to the maximum cannot finish inside that
             // maximum, so the initial settle spends the entire shared budget.

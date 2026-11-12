@@ -552,10 +552,9 @@ impl RecordedRequest {
             .collect();
         actual.sort();
         expected.sort();
-        assert_eq!(
-            actual, expected,
-            "should send {} {} with exactly the expected headers",
-            self.method, self.uri
+        assert!(
+            actual == expected,
+            "should send exactly the expected headers without disclosing values"
         );
     }
 }
@@ -1214,6 +1213,54 @@ mod tests {
             .body()
             .as_bytes()
             .expect("should buffer the response body")
+    }
+
+    #[test]
+    fn header_assertions_compare_exactly_without_disclosing_values() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &uri("/headers"),
+            ScriptedReply::status(StatusCode::OK),
+        );
+        let request = get("/headers")
+            .header("authorization", "Bearer example-secret")
+            .expect("should add the example authorization header")
+            .header("x-example", "one")
+            .expect("should add the example header");
+        block_on(client.http_client().send(request)).expect("should record the request");
+        let recorded = client.requests();
+        let request = &recorded[0];
+        request.assert_headers(&[
+            ("X-Example", "one"),
+            ("Authorization", "Bearer example-secret"),
+        ]);
+
+        for expected in [
+            vec![("authorization", "Bearer example-secret")],
+            vec![
+                ("authorization", "Bearer example-secret"),
+                ("x-example", "one"),
+                ("x-extra", "two"),
+            ],
+            vec![
+                ("authorization", "Bearer other-example"),
+                ("x-example", "one"),
+            ],
+        ] {
+            let failure = std::panic::catch_unwind(|| request.assert_headers(&expected))
+                .expect_err("should reject missing, extra and mismatched headers");
+            let message = failure
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied())
+                .expect("should carry a string assertion diagnostic");
+            assert!(
+                message == "should send exactly the expected headers without disclosing values",
+                "should report a header mismatch without request data"
+            );
+        }
     }
 
     #[test]
