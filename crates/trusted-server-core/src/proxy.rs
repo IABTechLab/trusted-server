@@ -5827,6 +5827,23 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
         assert_eq!(body, b"optimized", "should forward the complete asset body");
+        assert_eq!(
+            sent_methods(&client),
+            vec![Method::HEAD, Method::GET],
+            "should preflight S3 with HEAD before the optimized GET"
+        );
+        assert_eq!(
+            client
+                .requests()
+                .iter()
+                .map(|sent| sent.cache_policy)
+                .collect::<Vec<_>>(),
+            vec![
+                OutboundCachePolicy::Bypass,
+                OutboundCachePolicy::PlatformDefault
+            ],
+            "signed HEAD preflight must bypass the cache without disabling Image Optimizer GET caching"
+        );
     }
 
     #[test]
