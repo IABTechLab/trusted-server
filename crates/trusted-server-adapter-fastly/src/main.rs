@@ -22,8 +22,10 @@ use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::platform::ClientInfo;
 use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -316,12 +318,11 @@ fn retained_app(sandbox: &Sandbox) -> Result<&RetainedApp, EdgeError> {
 
 /// Runs the native request work, sends the request through `EdgeZero`, and handles its delivery.
 ///
-/// The native work reads what only the SDK request exposes, before `EdgeZero`
-/// converts it: the trusted forwarder, the resolved client IP, TLS metadata,
-/// and device signals. `prepare` moves them into the request extensions, with
-/// the telemetry queue and this request's synthesized headers. `finalize`
-/// takes over the post-routing steps. Post-delivery work runs only after a
-/// committed application body.
+/// The native work, [`ClientRequestValues::read`], reads what only the SDK
+/// request exposes before `EdgeZero` converts it. `prepare` moves those values
+/// into the request extensions, with the telemetry queue and this request's
+/// synthesized headers. `finalize` takes over the post-routing steps.
+/// Post-delivery work runs only after a committed application body.
 fn serve(
     mut req: FastlyRequest,
     retained: &RetainedApp,
@@ -329,69 +330,14 @@ fn serve(
     trace_path: bool,
 ) {
     let settings = retained.state.settings.as_ref();
-    let trusted_client_ip = settings.trusted_client_ip.as_ref();
-
-    // Preserve the public origin before native sanitation removes its source
-    // fields. The frozen decision carries no authentication material.
-    let forwarder = compat::capture_fastly_forwarder(&mut req, settings);
-
-    // Resolve the trusted client IP, then strip client-spoofable forwarded
-    // headers before dispatch. One call keeps resolution ahead of the
-    // sanitization that removes the headers it reads.
-    let resolved_client_ip = if trace_path {
-        resolve_client_ip(&req, req.get_client_ip_addr(), trusted_client_ip)
-    } else {
-        compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip)
-    };
-
-    if !trace_path {
-        // Re-inject a trusted TLS scheme signal after sanitization has stripped any
-        // client-sent fastly-ssl header. Setting it from Fastly's native TLS
-        // metadata here is authoritative. detect_request_scheme in http_util checks
-        // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
-        if req.get_tls_protocol().ok().flatten().is_some()
-            || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
-        {
-            req.set_header("fastly-ssl", "1");
-        }
-
-        // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
-        // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
-        req.remove_header("x-ts-tls-protocol");
-        req.remove_header("x-ts-tls-cipher");
-        if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
-            req.set_header("x-ts-tls-protocol", proto);
-        }
-        if let Some(cipher) = req
-            .get_tls_cipher_openssl_name()
-            .ok()
-            .flatten()
-            .map(str::to_owned)
-        {
-            req.set_header("x-ts-tls-cipher", cipher);
-        }
-    }
-
-    // These accessors only return real values on the client request, so they
-    // are read here and carried in the request extensions for
-    // build_per_request_services and EC bot classification.
-    let client_info = client_info_from_request(&req, resolved_client_ip);
-    let device_signals = (!trace_path).then(|| derive_device_signals(&req));
-    // The request's one geo lookup. It serves the synthesized headers and
-    // `finalize` here, and, from the request extensions, the finalize
-    // middleware, the trace metadata and the per-request services.
-    let request_geo = RequestGeo::lookup_once(client_info.client_ip);
+    let values = ClientRequestValues::read(&mut req, settings, trace_path);
+    // The request's one geo lookup serves `finalize` here and, from the
+    // request extensions, every later step that uses geo.
+    let request_geo = values.request_geo.clone();
     let queue = TelemetryQueue::default();
 
     let prepare = |_req: &mut FastlyRequest, extensions: &mut Extensions| {
-        extensions.insert(forwarder);
-        if let Some(device_signals) = device_signals {
-            extensions.insert(device_signals);
-        }
-        extensions.insert(client_info);
-        extensions.insert(queue.clone());
-        extensions.insert(per_request_synthesized_headers(settings, request_geo.geo()));
-        extensions.insert(request_geo.clone());
+        values.prepare(extensions, settings, &queue);
     };
     let inputs = FinalizeInputs {
         settings,
@@ -408,6 +354,100 @@ fn serve(
     handle_delivery(delivery, counters, |state| {
         run_post_delivery(state, &queue, settings, &counters.log_context());
     });
+}
+
+/// What the native work reads from the SDK client request before `EdgeZero` converts it.
+///
+/// Only the client request exposes the trusted forwarder, the resolved client
+/// IP, TLS metadata, and device signals.
+struct ClientRequestValues {
+    forwarder: ForwarderPreparation,
+    client_info: ClientInfo,
+    device_signals: Option<DeviceSignals>,
+    /// The geo lookup for `client_info`'s client IP.
+    request_geo: RequestGeo,
+}
+
+impl ClientRequestValues {
+    /// Reads the client request's values and sanitizes `req` for dispatch.
+    ///
+    /// A trace path keeps its forwarded and TLS headers, and reads no device
+    /// signals.
+    fn read(req: &mut FastlyRequest, settings: &Settings, trace_path: bool) -> Self {
+        let trusted_client_ip = settings.trusted_client_ip.as_ref();
+
+        // Preserve the public origin before native sanitation removes its source
+        // fields. The frozen decision carries no authentication material.
+        let forwarder = compat::capture_fastly_forwarder(req, settings);
+
+        // Resolve the trusted client IP, then strip client-spoofable forwarded
+        // headers before dispatch. One call keeps resolution ahead of the
+        // sanitization that removes the headers it reads.
+        let resolved_client_ip = if trace_path {
+            resolve_client_ip(req, req.get_client_ip_addr(), trusted_client_ip)
+        } else {
+            compat::resolve_and_sanitize_client_ip(req, trusted_client_ip)
+        };
+
+        if !trace_path {
+            // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+            // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+            // metadata here is authoritative. detect_request_scheme in http_util checks
+            // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
+            if req.get_tls_protocol().ok().flatten().is_some()
+                || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+            {
+                req.set_header("fastly-ssl", "1");
+            }
+
+            // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
+            // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
+            req.remove_header("x-ts-tls-protocol");
+            req.remove_header("x-ts-tls-cipher");
+            if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
+                req.set_header("x-ts-tls-protocol", proto);
+            }
+            if let Some(cipher) = req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_owned)
+            {
+                req.set_header("x-ts-tls-cipher", cipher);
+            }
+        }
+
+        // These accessors only return real values on the client request, so they
+        // are read here and carried in the request extensions for
+        // build_per_request_services and EC bot classification.
+        let client_info = client_info_from_request(req, resolved_client_ip);
+        let device_signals = (!trace_path).then(|| derive_device_signals(req));
+        // The request's one geo lookup, for the resolved client IP. The
+        // synthesized headers, `finalize`, the finalize middleware, the trace
+        // metadata and the per-request services all read it.
+        let request_geo = RequestGeo::lookup_once(client_info.client_ip);
+        Self {
+            forwarder,
+            client_info,
+            device_signals,
+            request_geo,
+        }
+    }
+
+    /// Moves the values into `extensions`, with `queue` and the request's synthesized headers.
+    fn prepare(self, extensions: &mut Extensions, settings: &Settings, queue: &TelemetryQueue) {
+        extensions.insert(self.forwarder);
+        if let Some(device_signals) = self.device_signals {
+            extensions.insert(device_signals);
+        }
+        extensions.insert(self.client_info);
+        extensions.insert(queue.clone());
+        extensions.insert(per_request_synthesized_headers(
+            settings,
+            self.request_geo.geo(),
+        ));
+        extensions.insert(self.request_geo);
+    }
 }
 
 /// What the `finalize` step reads besides the routed response.
@@ -749,8 +789,11 @@ mod tests {
     use edgezero_core::pre_dispatch::PreDispatchRequest;
     use edgezero_core::router::{PreDispatchHook, RouterService};
     use fastly::mime;
+    use std::net::{IpAddr, Ipv4Addr};
+
     use trusted_server_core::integrations::HeaderMutation;
-    use trusted_server_core::platform::ClientInfo;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedClientIpConfig;
     use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::trace::TracePreDispatchHook;
 
@@ -1224,6 +1267,43 @@ mod tests {
                 "should warn once about the skipped operator entry for the {label} request"
             );
         }
+    }
+
+    #[test]
+    fn client_request_values_carry_the_trusted_client_ip_to_client_info_and_geo() {
+        let mut settings = test_settings();
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-trusted-client-ip".to_owned(),
+            auth_header: "x-trusted-client-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+        });
+        let trusted = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut req = FastlyRequest::get("https://publisher.example/article");
+        req.set_header("x-trusted-client-ip", "192.0.2.1");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+        assert_ne!(
+            req.get_client_ip_addr(),
+            Some(trusted),
+            "test precondition: the peer IP should differ from the authenticated one"
+        );
+
+        let values = ClientRequestValues::read(&mut req, &settings, false);
+        let mut extensions = Extensions::new();
+        values.prepare(&mut extensions, &settings, &TelemetryQueue::default());
+
+        assert_eq!(
+            extensions.get::<ClientInfo>().map(|info| info.client_ip),
+            Some(Some(trusted)),
+            "should carry the authenticated client IP in ClientInfo"
+        );
+        assert_eq!(
+            extensions.get::<RequestGeo>().map(RequestGeo::client_ip),
+            Some(Some(trusted)),
+            "should look up geo for the authenticated client IP, not the peer"
+        );
     }
 
     #[test]

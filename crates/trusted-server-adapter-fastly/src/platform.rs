@@ -250,6 +250,12 @@ impl RequestGeo {
     pub(crate) fn geo(&self) -> Option<&GeoInfo> {
         self.geo.as_ref()
     }
+
+    /// The client IP the lookup ran for.
+    #[cfg(test)]
+    pub(crate) fn client_ip(&self) -> Option<IpAddr> {
+        self.client_ip
+    }
 }
 
 impl PlatformGeo for RequestGeo {
