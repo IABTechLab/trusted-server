@@ -45,9 +45,11 @@ numbers.
 IABTechLab/auctioneer#8. This cut is its first scope item. #840 tracks the
 wider EdgeZero migration.
 
-Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`.
-`edgezero:<path>:<line>` is EdgeZero at H. `edgezero@5ea8d93c:` is PR 275's
-head on 2026-11-08. `edgezero@v0.0.11:` is the current pin.
+Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
+`ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
+adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
+EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b` is
+the cut's pin, and `v0.0.11` is the base's pin.
 
 ## Problem
 
@@ -510,8 +512,10 @@ cache make no HTTP calls.
 - The Fastly state builder keeps today's startup bound of 160 provider
   backends. It replaces the call at
   `crates/trusted-server-adapter-fastly/src/app.rs:225` with core's
-  `validate_fastly_backend_bound` (`plan.rs:455`). The limits 200 and 40 live
-  beside it in core (`crates/trusted-server-core/src/auction/plan.rs:21-23`).
+  `validate_fastly_backend_bound`
+  (`ts@82bc0aeda:crates/trusted-server-core/src/auction/plan.rs:455`). The
+  limits 200 and 40 live beside it in core
+  (`ts@82bc0aeda:crates/trusted-server-core/src/auction/plan.rs:21-24`).
   It counts distinct tuples of provider scheme, host, port, and configured
   timeout, because each tuple is at most one EdgeZero backend configuration.
   The count can only overstate. EdgeZero keys identity on the timer rung, so
@@ -519,10 +523,10 @@ cache make no HTTP calls.
   Bidders set no host override, and the connect timeout is constant.
   The predicted-name collision check (`plan.rs:451-464`) goes, because EdgeZero
   owns names. The Cloudflare and Spin tests that rejected the plan became
-  `cloudflare_and_spin_load_multi_provider_plan`
-  (`crates/trusted-server-adapter-cloudflare/src/app.rs:941`,
-  `crates/trusted-server-adapter-spin/src/app.rs:1105`), which assert that the
-  plan loads. The `validate_for_target` tests (`plan.rs:695-830`) and the four
+  `startup_loads_multi_provider_plan` in each crate
+  (`ts@82bc0aeda:crates/trusted-server-adapter-cloudflare/src/app.rs:867`,
+  `ts@82bc0aeda:crates/trusted-server-adapter-spin/src/app.rs:1068`), which
+  assert that the plan loads. The `validate_for_target` tests (`plan.rs:695-830`) and the four
   target-descriptor tests (`platform.rs` in each adapter) are deleted.
 - `canonicalize_transport_timeout_ms`, the backend-name prediction and
   uniqueness checks (`provider.rs:310-344`), and `reserved_backend_names` are
@@ -904,7 +908,7 @@ finish before it does. Neither delays the client, which already has its
 response. Each extends the sandbox's lifetime, as pull sync does today.
 
 One outer `futures::executor::block_on` in `run_post_delivery`
-(`crates/trusted-server-adapter-fastly/src/post_delivery.rs:45-61`) drives
+(`ts@82bc0aeda:crates/trusted-server-adapter-fastly/src/post_delivery.rs:45-61`) drives
 both items, which await their sends inside it. That call is safe only here.
 Inside the helper, dispatch already runs under `block_on`
 (`edgezero:crates/edgezero-adapter-fastly/src/request.rs:427-431`), and nesting
@@ -1053,7 +1057,7 @@ missing config store now fails settings load and surfaces as an assembly error.
 
 The `finalize` hook calls
 `finalize_response(&mut Response, &FinalizeInputs) -> Option<FinalizeState>`
-(`crates/trusted-server-adapter-fastly/src/main.rs:414-479`).
+(`ts@82bc0aeda:crates/trusted-server-adapter-fastly/src/main.rs:472-519`).
 `FinalizeInputs { settings, geo, counters }` carries the settings, the
 request's one geo lookup, and the sandbox counters. It takes over today's
 post-routing steps, all synchronous:
@@ -1242,7 +1246,7 @@ These rules now apply on all four adapters.
 **Stripped fields.** Egress removes `Connection` and the fields it names,
 `Transfer-Encoding`, `Keep-Alive`, `TE`, `Upgrade`, `Proxy-Connection`,
 `Proxy-Authenticate`, `Proxy-Authorization`, and `HTTP2-Settings`
-(`response_egress_framing.rs:320-358`). A malformed `Connection` value, such as
+(`edgezero@14a6ca8b:crates/edgezero-core/src/response_egress_framing.rs:320-358`). A malformed `Connection` value, such as
 a token that is not a field name (for example `x example`), is not stripped.
 It is a framing error and a 500 before commit
 (`response_egress_framing.rs:320-335`). Since EdgeZero `e65394a1`, egress
@@ -2299,7 +2303,7 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    be converted gets the native 500, if Viceroy can deliver one (EZ-17
    criterion 7). The reuse leg is
    `missing_config_blob_gets_500_then_recovers_in_same_sandbox`
-   (`crates/trusted-server-adapter-fastly/src/app.rs:2110`), which runs without
+   (`ts@82bc0aeda:crates/trusted-server-adapter-fastly/src/app.rs:2107`), which runs without
    a feature gate. Assembly from a linked store with no app config blob fails,
    and EdgeZero's assembly error answers 500, today's startup status (EZ-22
    criterion 9's text says 503), with an EdgeZero JSON body and no
