@@ -2009,7 +2009,8 @@ The run:
    confirms the follow-ups in D19 as present, so their criteria join the gate
    (EZ-Q1.6), with the Trusted Server legs in the table below. Reuse mode is
    not adopted in production. EZ-22 criterion 9 still joins the gate, because
-   CI builds the `reusable-sandbox` feature.
+   test 9 proves it without a feature gate: its reuse leg runs one `Sandbox`
+   through a failed and then a successful assembly on every `cargo test-fastly`.
 5. None of these steps gates the merge or production deploys (D5). A failed
    leg goes to EdgeZero on PR 275, and Trusted Server takes the fix at its next
    repin.
@@ -2047,7 +2048,7 @@ records the repaired-versus-stock disposition under G4-FASTLY-POLICY
 | EZ-18 | Criterion 6 on Viceroy, through the response diff. Publisher HEAD and 304 follow D20                                                                                | Criteria 3 and 6 on hosted Fastly. HEAD, 204, and 304 follow D20                                                                                         |                                                  |
 | EZ-19 | Criterion 6 on Viceroy (test 11)                                                                                                                                    |                                                                                                                                                          |                                                  |
 | EZ-20 | Criterion 5 on Viceroy, through the response diff                                                                                                                   |                                                                                                                                                          |                                                  |
-| EZ-22 | Criterion 9 on Viceroy with the `reusable-sandbox` feature (test 9), with today's 500, not 503, for the missing blob. Criterion 10 deferred (D19)                   |                                                                                                                                                          |                                                  |
+| EZ-22 | Criterion 9 on Viceroy (test 9), with today's 500, not 503, for the missing blob. Criterion 10 deferred (D19)                                                       |                                                                                                                                                          |                                                  |
 | EZ-23 | Criterion 13 on the Axum test server (test 19)                                                                                                                      |                                                                                                                                                          |                                                  |
 | EZ-Q1 | The five consumer reviews (step 5)                                                                                                                                  |                                                                                                                                                          |                                                  |
 
