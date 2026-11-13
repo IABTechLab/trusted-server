@@ -751,7 +751,7 @@ mod tests {
     use fastly::mime;
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::platform::ClientInfo;
-    use trusted_server_core::test_support::logging::WarningCapture;
+    use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::trace::TracePreDispatchHook;
 
     use crate::delivery::tests::{committed, committed_then_failed};
@@ -1201,7 +1201,7 @@ mod tests {
                 FastlyRequest::new(FastlyMethod::TRACE, "https://publisher.example.com/"),
             ),
         ] {
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
             let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
                 request,
                 |_req, extensions| {
@@ -1215,7 +1215,7 @@ mod tests {
             handle_delivery(delivery, &counters, |_state| {});
 
             let skipped = capture
-                .take()
+                .take_warnings()
                 .into_iter()
                 .filter(|warning| warning.message.contains("`connection`"))
                 .count();

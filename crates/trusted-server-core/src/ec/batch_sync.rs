@@ -313,7 +313,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::body_read::{body_read_failure_cases, streamed_over};
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -514,7 +514,7 @@ mod tests {
             let writer = MockWriter::new(vec![]);
             let (req, expectation) = case.into_request(authorized_batch_builder());
 
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
             let outcome = futures::executor::block_on(handle_batch_sync_with_writer(
                 &writer, &registry, &limiter, req,
             ));
@@ -526,8 +526,11 @@ mod tests {
                 expectation.name()
             );
             if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
-                let levels: Vec<log::Level> =
-                    capture.take().iter().map(|record| record.level).collect();
+                let levels: Vec<log::Level> = capture
+                    .take_all()
+                    .iter()
+                    .map(|record| record.level)
+                    .collect();
                 assert_eq!(
                     levels,
                     [log::Level::Warn],

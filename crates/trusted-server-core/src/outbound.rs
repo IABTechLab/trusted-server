@@ -287,7 +287,7 @@ mod tests {
 
     use super::*;
     use crate::error::IntoHttpResponse as _;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::scripted_client::ScriptedHttpClient;
 
     const BOTH_SOURCES: [OutboundRequestSource; 2] = [
@@ -530,7 +530,7 @@ mod tests {
             phase: ProviderFailurePhase::Send,
             cause: FastlyFailureCause::ConnectionRefused,
         };
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         let _report = outbound_error(
             EdgeError::bad_gateway_with_detail(
@@ -542,8 +542,13 @@ mod tests {
             OutboundRequestSource::Internal,
         );
 
-        let warnings = capture.take();
-        assert_eq!(warnings.len(), 1, "should log one warning per failure");
+        let warnings = capture.take_all();
+        assert_eq!(warnings.len(), 1, "should log one record per failure");
+        assert_eq!(
+            warnings[0].level,
+            log::Level::Warn,
+            "should log the failure at warn"
+        );
         let message = &warnings[0].message;
         assert!(
             message.contains(&format!("{detail:?}")),

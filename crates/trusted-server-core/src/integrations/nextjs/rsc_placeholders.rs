@@ -808,14 +808,14 @@ mod tests {
         use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
         use crate::integrations::IntegrationRegistry;
         use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-        use crate::test_support::logging::WarningCapture;
+        use crate::test_support::logging::LogCapture;
         use crate::test_support::nextjs_auction;
         use serde_json::json;
         use std::io::Cursor;
 
-        fn fallback_messages(warnings: &WarningCapture) -> Vec<String> {
+        fn fallback_messages(warnings: &LogCapture) -> Vec<String> {
             warnings
-                .take()
+                .take_warnings()
                 .into_iter()
                 .filter(|warning| {
                     matches!(
@@ -830,7 +830,7 @@ mod tests {
 
         #[test]
         fn document_fallback_warns_once_without_publisher_source() {
-            let warnings = WarningCapture::start();
+            let warnings = LogCapture::start();
             let document = IntegrationDocumentState::default();
             let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
             rewriter.rewrite(

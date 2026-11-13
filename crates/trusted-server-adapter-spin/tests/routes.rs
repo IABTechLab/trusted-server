@@ -21,7 +21,7 @@ use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::insert_outbound_client;
-use trusted_server_core::test_support::logging::WarningCapture;
+use trusted_server_core::test_support::logging::LogCapture;
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
@@ -1263,11 +1263,11 @@ async fn spin_ignores_host_override_with_warning() {
     let mut settings = test_settings();
     settings.publisher.origin_host_header_override =
         Some("www.test-publisher.example.com".to_owned());
-    let capture = WarningCapture::start();
+    let capture = LogCapture::start();
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should keep serving a config that sets the override");
     assert!(
-        capture.take().iter().any(|warning| {
+        capture.take_warnings().iter().any(|warning| {
             warning.message.contains("origin_host_header_override")
                 && warning.message.contains("ignored on Spin")
         }),

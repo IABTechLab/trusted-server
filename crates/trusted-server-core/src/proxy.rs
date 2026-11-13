@@ -2017,7 +2017,7 @@ mod tests {
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
     use crate::test_support::body_read::body_read_failure_cases;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::scripted_client::{
         ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -6302,7 +6302,7 @@ mod tests {
             default: 150,
             when_missing: Default::default(),
         });
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         let sent = single_asset_request(
             &image_optimizer_settings(profile_set),
@@ -6312,7 +6312,7 @@ mod tests {
         );
 
         sent.assert_transport(asset_get_transport());
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
         assert!(
             warnings
                 .iter()

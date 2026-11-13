@@ -24058,7 +24058,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     #[test]
     fn html_finalization_client_cancellation_drops_work_and_warns_for_auction_once() {
-        let warnings = crate::test_support::logging::WarningCapture::start();
+        let warnings = crate::test_support::logging::LogCapture::start();
         let settings = Arc::new(crate::publisher::allow_eof_test_settings(
             create_test_settings(),
         ));
@@ -24128,7 +24128,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             "should drop the callback when the reader disconnects"
         );
         let cancellation_warnings = warnings
-            .take()
+            .take_warnings()
             .into_iter()
             .filter(|warning| {
                 warning
@@ -29024,7 +29024,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         };
 
         use crate::outbound::{PUBLISHER_UPLOAD_BYTES, STREAMED_TIMEOUT, streamed};
-        use crate::test_support::logging::WarningCapture;
+        use crate::test_support::logging::LogCapture;
         use crate::test_support::scripted_client::ExpectedTransport;
 
         /// Origin of the scope control, which uses no publisher settings.
@@ -29542,7 +29542,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 HeaderValue::from_bytes(b"session=example-caf\xe9")
                     .expect("should build a non-UTF-8 cookie value"),
             );
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
 
             let response = fixture
                 .buffered(request, CAP)
@@ -29559,11 +29559,11 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 !forwarded.headers.contains_key(header::COOKIE),
                 "should reach the origin with no Cookie field"
             );
-            let warnings = capture.take();
+            let warnings = capture.take_all();
             assert!(
-                warnings
-                    .iter()
-                    .any(|warning| warning.message.contains("cookie")),
+                warnings.iter().any(|warning| {
+                    warning.level == log::Level::Warn && warning.message.contains("cookie")
+                }),
                 "should warn that the cookie field was dropped"
             );
             assert!(
@@ -29584,10 +29584,10 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 }))
                 .expect("should build a readthrough creative opportunities config"),
             );
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
             settings.warn_ignored_origin_readthrough();
             assert!(
-                capture.take().iter().any(|warning| {
+                capture.take_warnings().iter().any(|warning| {
                     warning.message.contains("origin_readthrough_enabled")
                         && warning.message.contains("ignored")
                 }),

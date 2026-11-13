@@ -207,7 +207,7 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
-    use trusted_server_core::test_support::logging::WarningCapture;
+    use trusted_server_core::test_support::logging::LogCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -259,12 +259,12 @@ mod tests {
     fn warns_once_about_a_skipped_operator_entry() {
         let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
         let mut response = empty_response();
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         apply_finalize_headers(&settings, false, &mut response);
 
         let skipped = capture
-            .take()
+            .take_warnings()
             .into_iter()
             .filter(|warning| warning.message.contains("`connection`"))
             .count();

@@ -206,7 +206,7 @@ pub(crate) mod tests {
     use trusted_server_core::auction::telemetry::AuctionEventRow;
     use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::redacted::Redacted;
-    use trusted_server_core::test_support::logging::WarningCapture;
+    use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -470,7 +470,7 @@ pub(crate) mod tests {
         );
         let mut unbuildable = enabled_config();
         unbuildable.api_host = "api tinybird.example.com".to_owned();
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         clock.drive(send_queued_batches(
             &client.http_client(),
@@ -485,10 +485,13 @@ pub(crate) mod tests {
             &" [request=example]",
         ));
 
-        let warnings = capture.take();
+        let warnings = capture.take_all();
         let typed = warnings
             .iter()
-            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
+            .filter(|warning| {
+                warning.level == log::Level::Warn
+                    && warning.message.starts_with("Outbound request failed with")
+            })
             .count();
         assert_eq!(
             typed, 2,
@@ -500,9 +503,10 @@ pub(crate) mod tests {
         ] {
             assert!(
                 warnings.iter().any(|warning| {
-                    warning
-                        .message
-                        .starts_with("Tinybird telemetry send failed:")
+                    warning.level == log::Level::Warn
+                        && warning
+                            .message
+                            .starts_with("Tinybird telemetry send failed:")
                         && warning.message.contains(step)
                         && warning.message.ends_with(" [request=example]")
                 }),

@@ -635,7 +635,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
     use crate::test_support::body_read::body_read_failure_cases;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use http::{HeaderName, HeaderValue, Method};
 
     #[test]
@@ -1632,12 +1632,12 @@ mod tests {
             let (request, expectation) =
                 case.into_request(http::Request::builder().uri("https://example.com/"));
             let (parts, body) = request.into_parts();
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
 
             let report = read_body(&parts.headers, body).expect_err("should reject the body");
             let response = http_error(&report);
 
-            let records = capture.take();
+            let records = capture.take_all();
             drop(capture);
             let name = expectation.name();
             let expected = expectation.expected();

@@ -271,7 +271,7 @@ mod tests {
     use edgezero_core::http::response_builder;
 
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
@@ -705,12 +705,12 @@ mod tests {
         let mut response = response_builder()
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         apply_response_headers_with_cache_privacy(&settings, &mut response);
-        let applying = capture.take();
+        let applying = capture.take_all();
         warn_skipped_operator_response_headers(&settings);
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
 
         assert!(
             applying.is_empty(),

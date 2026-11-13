@@ -825,7 +825,7 @@ mod tests {
 
     use crate::ec::kv::TombstoneOutcome;
     use crate::settings::EcPartner;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -1095,14 +1095,17 @@ mod tests {
                 ScriptedReply::error(EdgeError::bad_gateway("beta provider text")),
             );
         let context = PullSyncContext { ec_id, snapshot };
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
-        let warnings = capture.take();
+        let warnings = capture.take_all();
         let typed = warnings
             .iter()
-            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
+            .filter(|warning| {
+                warning.level == log::Level::Warn
+                    && warning.message.starts_with("Outbound request failed with")
+            })
             .count();
         assert_eq!(
             typed, 3,
@@ -1115,7 +1118,8 @@ mod tests {
         ] {
             assert!(
                 warnings.iter().any(|warning| {
-                    warning.message.starts_with("Pull sync failed:")
+                    warning.level == log::Level::Warn
+                        && warning.message.starts_with("Pull sync failed:")
                         && warning.message.contains(step)
                 }),
                 "should log the report for `{step}`"

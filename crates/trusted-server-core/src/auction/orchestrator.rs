@@ -4073,15 +4073,19 @@ mod tests {
 
     #[tokio::test]
     async fn mock_mediator_non_success_status_is_a_processing_failure() {
-        let warnings = crate::test_support::logging::WarningCapture::start();
+        let warnings = crate::test_support::logging::LogCapture::start();
         run_mock_mediator_response(503, &serde_json::json!({"seatbid": []}), 1.0).await;
-        let warnings = warnings.take();
+        let warnings = warnings.take_all();
         assert!(
-            warnings.iter().any(|warning| warning.message.starts_with(
-                "Mediator 'adserver_mock' response processing failed; using local ranking:"
-            ) && warning
-                .message
-                .contains("AdServer Mock returned non-success HTTP 503")),
+            warnings
+                .iter()
+                .any(|warning| warning.level == log::Level::Warn
+                    && warning.message.starts_with(
+                        "Mediator 'adserver_mock' response processing failed; using local ranking:"
+                    )
+                    && warning
+                        .message
+                        .contains("AdServer Mock returned non-success HTTP 503")),
             "should fail mediator response processing on a non-success HTTP status"
         );
         assert!(
@@ -4190,10 +4194,10 @@ mod tests {
 
     #[tokio::test]
     async fn mediator_error_status_response_logs_local_ranking_fallback() {
-        let warnings = crate::test_support::logging::WarningCapture::start();
+        let warnings = crate::test_support::logging::LogCapture::start();
         run_mediated_provider_auction(Arc::new(ErrorStatusMediator), None, 1.0).await;
         assert!(
-            warnings.take().iter().any(|warning| warning.message
+            warnings.take_warnings().iter().any(|warning| warning.message
                 == "Mediator 'error-status-mediator' reported an error response; using local ranking"),
             "should warn when an error-status mediator response falls back to local ranking"
         );

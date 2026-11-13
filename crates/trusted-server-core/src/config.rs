@@ -749,7 +749,7 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -884,7 +884,7 @@ formats = [{ width = 300, height = 250 }]
 
     #[test]
     fn public_origin_diagnostics_emit_once_per_boundary_and_validation_is_silent() {
-        let capture = crate::test_support::logging::WarningCapture::start();
+        let capture = crate::test_support::logging::LogCapture::start();
         for (origin, expected_warnings) in [
             (None, 1),
             (Some("HTTP://FOREIGN.EXAMPLE:8080"), 2),
@@ -896,11 +896,12 @@ formats = [{ width = 300, height = 250 }]
             settings.publisher.public_origin = origin.map(str::to_owned);
             let constructed = TrustedServerAppConfig::new(settings)
                 .expect("should construct config with advisory-only origin diagnostics");
-            let warnings = capture.take();
+            let warnings = capture.take_all();
             assert_eq!(warnings.len(), expected_warnings);
             assert!(
                 warnings.iter().all(|warning| {
-                    warning.target == module_path!().trim_end_matches("::tests")
+                    warning.level == log::Level::Warn
+                        && warning.target == module_path!().trim_end_matches("::tests")
                         && !warning.message.contains("FOREIGN")
                         && !warning.message.contains("foreign.example")
                 }),
@@ -912,7 +913,7 @@ formats = [{ width = 300, height = 250 }]
             let deserialized: TrustedServerAppConfig = serde_json::from_value(data.clone())
                 .expect("should deserialize config with advisory-only origin diagnostics");
             assert_eq!(
-                capture.take().len(),
+                capture.take_warnings().len(),
                 warnings.len(),
                 "should emit once on deserialization too"
             );
@@ -931,7 +932,7 @@ formats = [{ width = 300, height = 250 }]
                 );
             }
             assert!(
-                capture.take().is_empty(),
+                capture.take_all().is_empty(),
                 "should not log during repeated validation"
             );
         }
@@ -1745,12 +1746,12 @@ password = "production-admin-password-32-bytes"
     #[test]
     fn runtime_ignores_certificate_check_false_with_warning() {
         let mut settings = valid_settings();
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
         validate_settings_for_runtime(&settings)
             .expect("should accept the default certificate check at runtime");
         assert!(
             !capture
-                .take()
+                .take_all()
                 .iter()
                 .any(|warning| warning.message.contains("proxy.certificate_check")),
             "should not warn when certificate_check keeps its default"
@@ -1760,7 +1761,7 @@ password = "production-admin-password-32-bytes"
         validate_settings_for_runtime(&settings)
             .expect("should keep serving a config that sets certificate_check = false");
 
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
         assert!(
             warnings.iter().any(|warning| {
                 warning.message.contains("proxy.certificate_check")
@@ -2349,12 +2350,12 @@ password = "production-admin-password-32-bytes"
         settings
             .integrations
             .insert("prebdi".to_owned(), serde_json::json!({ "enabled": true }));
-        let capture = crate::test_support::logging::WarningCapture::start();
+        let capture = crate::test_support::logging::LogCapture::start();
 
         validate_settings_for_runtime(&settings)
             .expect("should keep starting with an unknown stored integration ID");
 
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
         assert!(
             warnings
                 .iter()
