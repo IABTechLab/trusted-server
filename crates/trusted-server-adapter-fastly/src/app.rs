@@ -146,7 +146,10 @@ use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_f
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers};
+use crate::middleware::{
+    AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers,
+    warn_unsynthesizable_operator_response_headers,
+};
 use crate::platform::{
     FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
 };
@@ -212,6 +215,9 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
+    // Each request's synthesized set leaves these entries out at debug, so
+    // they warn here, once per sandbox.
+    warn_unsynthesizable_operator_response_headers(&settings);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 

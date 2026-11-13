@@ -1265,9 +1265,12 @@ entries whose names EZ-19.5 forbids are left out. This meets EZ-19 criterion 6.
 `SynthesizedResponseHeaders::new` (`response_headers.rs:70`) rejects a set over
 32 field values or 4096 bytes (`:6-9`), or one with a value outside visible
 ASCII and interior tabs (`:13-14`, `:97-108`), such as a geo city with accents.
-`prepare` leaves out each such geo or operator value with a warning before it
-builds the set, as the geo headers already skip invalid values one by one
-(`crates/trusted-server-core/src/geo.rs:51-59`). Only a bounds failure then
+`prepare` leaves out each such geo or operator value before it builds the
+set, as the geo headers already skip invalid values one by one
+(`crates/trusted-server-core/src/geo.rs:51-59`). It logs that at debug, because
+the routed response still carries the value and the set is built for every
+request. An unportable operator value warns once instead, when the sandbox
+loads its settings. Only a bounds failure then
 falls back to the version headers alone, with the error category logged at
 warn. Axum, Cloudflare, and Spin have no per-request hook and keep the
 app-level set.
