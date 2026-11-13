@@ -1872,6 +1872,7 @@ password = "production-admin-password-32-bytes"
             "Proxy-Connection",
             "Proxy-Authenticate",
             "Proxy-Authorization",
+            "HTTP2-Settings",
         ] {
             let mut settings = valid_settings();
             settings

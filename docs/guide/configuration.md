@@ -1007,10 +1007,11 @@ Edit TOML, validate, and push again for those changes.
 - Debugging identifiers
 - CORS headers (if needed)
 
-**Rejected names**: Response egress owns message framing, so these ten names
+**Rejected names**: Response egress owns message framing, so these eleven names
 cannot be set here: `Trailer`, `Content-Length`, and the hop-by-hop fields
 `Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding`, `Upgrade`,
-`Proxy-Connection`, `Proxy-Authenticate`, and `Proxy-Authorization`. Names
+`Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, and
+`HTTP2-Settings`. Names
 match case-insensitively. `ts config validate` and `ts config push` reject an
 entry with any of them. A live config that predates the rule keeps loading, and
 each request skips such an entry with one warning that names it.

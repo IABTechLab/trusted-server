@@ -32,7 +32,7 @@ const INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL: &str = "private, max-age=60";
 /// `Trailer`, frames the body itself, and strips the hop-by-hop fields. A
 /// `Connection` value also removes the fields it names, and a malformed one
 /// fails the response with a 500 before commit.
-const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 10] = [
+const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 11] = [
     "trailer",
     "content-length",
     "connection",
@@ -43,6 +43,7 @@ const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 10] = [
     "proxy-connection",
     "proxy-authenticate",
     "proxy-authorization",
+    "http2-settings",
 ];
 
 /// Whether `name` is an operator response header that Trusted Server never sends.
@@ -691,6 +692,7 @@ mod tests {
             "Proxy-Connection",
             "Proxy-Authenticate",
             "Proxy-Authorization",
+            "HTTP2-Settings",
         ];
         let mut entries: Vec<(&str, &str)> = forbidden
             .iter()
