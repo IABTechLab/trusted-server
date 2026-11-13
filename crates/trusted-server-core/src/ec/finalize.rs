@@ -88,12 +88,13 @@ pub fn ec_finalize_response(
 /// its value differs from the one the request carried, so responses that
 /// leave the mirror as it was stay free of `Set-Cookie` and keep their
 /// cacheability. An unchanged mirror is therefore not re-extended; once it
-/// lapses, the next navigation sets it again. When the row could not be read
-/// authoritatively (KV failure), the mirror is left untouched.
+/// lapses, the next navigation sets it again.
 ///
 /// Where the mirror cannot be rebuilt (non-navigations, or a navigation
 /// without a readable row), a carried mirror is expired when the request
-/// denies TCF vendor consent to a vendor gating any mirrored partner it holds.
+/// denies TCF vendor consent to a vendor gating any mirrored partner it holds,
+/// or when a provider excludes such a partner's source on this GDPR visit;
+/// otherwise it is left untouched.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
@@ -111,7 +112,8 @@ fn apply_mirror(
         )
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
-        // provider whose TCF vendor consent is now denied.
+        // provider whose TCF vendor consent is now denied or whose source is
+        // excluded on this GDPR visit.
         MirrorCookie::Expire
     } else {
         if navigation {
