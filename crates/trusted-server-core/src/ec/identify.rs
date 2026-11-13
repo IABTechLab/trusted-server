@@ -99,9 +99,11 @@ pub fn handle_identify(
             } else {
                 // Extract only this partner's first live entry. A
                 // provider-owned source is withheld while its owner lacks TCF
-                // vendor consent, as in the bidstream.
+                // vendor consent, and a source a provider excludes where GDPR
+                // applies is withheld for a GDPR visitor, as in the bidstream.
                 let now = UnixSeconds::new(current_timestamp());
-                let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent());
+                let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent())
+                    || partner.excluded_for(ec_context.consent());
                 eid = entry
                     .ids
                     .get(&partner.source_domain)
@@ -844,6 +846,35 @@ mod tests {
         assert_eq!(
             granted["uid"], "live",
             "should return the UID with the owner's vendor consent"
+        );
+    }
+
+    #[test]
+    fn handle_identify_withholds_a_source_excluded_where_gdpr_applies() {
+        let mut registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        assert!(
+            registry.exclude_where_gdpr_applies("ssp.example.com"),
+            "should mark the source excluded where GDPR applies"
+        );
+        let record = || provider_record("live", Expiry::Never);
+        let non_regulated = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+
+        let gdpr = identify_body_with(record(), &registry, consent_granting_vendors(vec![1]));
+        let elsewhere = identify_body_with(record(), &registry, non_regulated);
+
+        assert!(
+            gdpr.get("uid").is_none() && gdpr.get("eid").is_none(),
+            "should withhold the excluded source from a GDPR visitor"
+        );
+        assert_eq!(
+            elsewhere["uid"], "live",
+            "should return the source outside GDPR"
         );
     }
 
