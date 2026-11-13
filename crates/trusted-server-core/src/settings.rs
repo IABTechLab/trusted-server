@@ -64,6 +64,21 @@ pub struct Publisher {
     #[serde(default)]
     #[validate(custom(function = validate_host_header_override))]
     pub origin_host_header_override: Option<String>,
+    /// Optional request header that carries the client IP to `origin_url`.
+    ///
+    /// Trusted Server strips client-spoofable forwarding headers such as
+    /// `Fastly-Client-IP` before routing, so an origin whose WAF rules, logging,
+    /// or geolocation read one of them would otherwise receive no client
+    /// address. When set, every publisher-origin request carries this header
+    /// with the client IP Trusted Server resolved, replacing any client-supplied
+    /// copy. Behind a fronting CDN, configure [`TrustedClientIpConfig`] as well;
+    /// without it the resolved address is the CDN node, not the reader.
+    ///
+    /// Skipped from serialization while unset for the same rollback reason as
+    /// [`Self::allow_async_html_finish`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = validate_origin_client_ip_header))]
+    pub origin_client_ip_header: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -149,6 +164,7 @@ impl Default for Publisher {
             origin_url: String::default(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -270,6 +286,7 @@ impl Publisher {
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     public_origin: None,
     ///     origin_host_header_override: None,
+    ///     origin_client_ip_header: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     ///     html_finalization_timeout_ms: 5000,
@@ -4032,6 +4049,31 @@ fn parse_public_origin(value: &str) -> Result<Url, ValidationError> {
     Ok(parsed)
 }
 
+/// Accepts the standard CDN client-IP headers, `x-forwarded-for`, or another
+/// `x-` header that Trusted Server does not reserve for its own use.
+fn validate_origin_client_ip_header(value: &str) -> Result<(), ValidationError> {
+    let header = http::HeaderName::from_bytes(value.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_origin_client_ip_header"))?;
+    let name = header.as_str();
+    let allowed = matches!(
+        name,
+        "fastly-client-ip" | "true-client-ip" | "x-forwarded-for"
+    ) || (name.starts_with("x-")
+        && !name.starts_with("x-ts-")
+        && !INTERNAL_HEADERS.contains(&name));
+    if !allowed {
+        let mut err = ValidationError::new("unsafe_origin_client_ip_header");
+        err.message = Some(
+            "origin_client_ip_header must be fastly-client-ip, true-client-ip, x-forwarded-for, \
+             or an x- header that Trusted Server does not reserve"
+                .into(),
+        );
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
     if let Err(reason) = validate_host_header_override_value(value) {
         let mut err = ValidationError::new("invalid_host_header_override");
@@ -6591,6 +6633,74 @@ origin_host_header_overide = "www.example.com""#,
         }
     }
 
+    fn settings_with_origin_client_ip_header(
+        header: &str,
+    ) -> Result<Settings, Report<TrustedServerError>> {
+        let toml_str = crate_test_settings_str().replace(
+            r#"origin_url = "https://origin.test-publisher.com""#,
+            &format!(
+                "origin_url = \"https://origin.test-publisher.com\"\norigin_client_ip_header = {header:?}"
+            ),
+        );
+        Settings::from_toml(&toml_str)
+    }
+
+    #[test]
+    fn origin_client_ip_header_defaults_to_unset_and_stays_out_of_serialized_config() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let serialized =
+            serde_json::to_value(&settings.publisher).expect("should serialize publisher");
+
+        assert_eq!(
+            settings.publisher.origin_client_ip_header, None,
+            "should leave the origin client IP header unset by default"
+        );
+        assert!(
+            serialized.get("origin_client_ip_header").is_none(),
+            "should omit the unset field so older binaries can read the blob"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_origin_client_ip_headers() {
+        for header in [
+            "fastly-client-ip",
+            "Fastly-Client-IP",
+            "true-client-ip",
+            "x-forwarded-for",
+            "x-real-ip",
+        ] {
+            let settings = settings_with_origin_client_ip_header(header)
+                .unwrap_or_else(|err| panic!("should accept {header:?}: {err:?}"));
+            assert_eq!(
+                settings.publisher.origin_client_ip_header.as_deref(),
+                Some(header),
+                "should keep the configured header name"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_origin_client_ip_headers() {
+        for header in [
+            "",
+            "bad header",
+            "host",
+            "cookie",
+            "forwarded",
+            "x-ts-ec",
+            "x-ts-client-ip-auth",
+            "x-geo-country",
+        ] {
+            assert!(
+                settings_with_origin_client_ip_header(header).is_err(),
+                "origin_client_ip_header {header:?} should fail validation"
+            );
+        }
+    }
+
     #[test]
     fn integration_parse_errors_hide_invalid_values() {
         for enabled in [true, false] {
@@ -7426,6 +7536,7 @@ source_domain = "partner.example.com"
             origin_url: "https://origin.example.com:8080".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7440,6 +7551,7 @@ source_domain = "partner.example.com"
             origin_url: "https://origin.example.com".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7454,6 +7566,7 @@ source_domain = "partner.example.com"
             origin_url: "http://localhost:9090".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7468,6 +7581,7 @@ source_domain = "partner.example.com"
             origin_url: "localhost:9090".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7482,6 +7596,7 @@ source_domain = "partner.example.com"
             origin_url: "http://192.168.1.1:8080".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7496,6 +7611,7 @@ source_domain = "partner.example.com"
             origin_url: "http://[::1]:8080".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7512,6 +7628,7 @@ source_domain = "partner.example.com"
             origin_url: "https://origin.example.com:8443".to_string(),
             public_origin: None,
             origin_host_header_override: None,
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
@@ -7529,6 +7646,7 @@ source_domain = "partner.example.com"
             origin_url: "https://origin.example.com".to_string(),
             public_origin: None,
             origin_host_header_override: Some("www.example.com".to_string()),
+            origin_client_ip_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),

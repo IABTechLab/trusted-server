@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add opt-in `publisher.origin_client_ip_header`, which sends the resolved client IP to the publisher origin in the named header (for example `fastly-client-ip`), replacing any client-supplied copy. Trusted Server strips inbound `Fastly-Client-IP` as spoofable, so origins whose WAF rules, logging, or geolocation read that header otherwise receive no client address on Trusted Server traffic. Pair it with `[trusted_client_ip]` behind a fronting CDN. See [Effect on origin requests](docs/guide/fastly.md#effect-on-origin-requests).
 - Add Phase 1 attested release binaries: the Fastly wasm and the `ts` CLI for Linux x86-64 and macOS (ARM64 and x86-64), with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification and a GNU glibc 2.34 startup check. Reproducibility, other adapters and the custom verifier remain later work; production publication requires maintainer settings.
 
 ### Changed

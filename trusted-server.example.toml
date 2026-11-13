@@ -71,6 +71,10 @@ public_origin = "https://ads.example.com"
 proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.
 # origin_host_header_override = "www.example.com"
+# Optional: send the resolved client IP to origin_url in this header. Trusted
+# Server strips client-supplied Fastly-Client-IP, so set this when the origin's
+# WAF, logs, or geolocation read it. Pair with [trusted_client_ip] behind a CDN.
+# origin_client_ip_header = "fastly-client-ip"
 # Optional: max bytes buffered when a response is post-processed in full (HTML
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
