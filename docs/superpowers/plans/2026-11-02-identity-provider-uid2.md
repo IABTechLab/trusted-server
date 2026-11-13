@@ -21,7 +21,7 @@
 - One EID for the single configured source, one UID with `atype = 3`.
 - From the identity cookie: `ProviderExpiry::At(identity_expires)`; the coordinator's validation drops an expired token.
 - From the raw token cookie: `bounded_expiry(None)`, the shared default TTL.
-- Refresh state `from = refresh_from`; the source becomes due then, and is refreshed once due, also while the cookie repeats the stored token (a cookie repeating the held token is not rewritten, so a failed refresh keeps the held refresh state). A refresh is due only while the token is still live, so a failing refresh stops at its expiry; `rate_limit_per_hour` also bounds it. An `optout` reply removes the stored token.
+- Refresh state `from = refresh_from`; the source becomes due then, and is refreshed once due, also while the cookie repeats the stored token (a cookie repeating the held token is not rewritten, so a failed refresh keeps the held refresh state). The refresh also runs after the advertising token expires, since UID2's refresh token outlives it; a failing refresh is retried on later navigations, bounded only by `rate_limit_per_hour`. Stopping at `refresh_expires` or after repeated failures is a possible follow-up; `refresh_expires` is not read today. An `optout` reply removes the stored token.
 
 ## Lockr
 

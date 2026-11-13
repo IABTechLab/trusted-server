@@ -945,7 +945,9 @@ opt-out is forgotten. An opt-out read from the vendor's cookies is not
 remembered, because the cookies are read again on every navigation.
 
 Some kinds keep private refresh state with a UID, such as a vendor refresh
-token, and refresh it server side once it is due, while the UID is still live.
+token, and refresh it server side once it is due, also after the UID expires
+while the state is still held. A failing refresh is retried on later
+navigations, bounded only by `rate_limit_per_hour`.
 Refresh state is never served, mirrored, forwarded or shown: the admin view
 shows it as `[redacted]`. Kinds without a vendor server may generate an ID into
 the EC row when the cookies hold none; no cookie is set.

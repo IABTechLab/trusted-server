@@ -279,9 +279,12 @@ never write. They do not receive a permit, so the write API cannot be called
   Vendor cookies are read first on every navigation; a usable cookie ID is
   used instead of a refresh request. Refresh state that is empty, over 2048
   bytes or has no stated time is dropped and the UID is kept.
-- A UID is refresh-due only while it is still live. A failing refresh is
-  therefore retried at most until the UID expires, and the provider's
-  `rate_limit_per_hour` also bounds it.
+- Once a UID expires its source is due like any source without a live UID,
+  and its refresh state is still passed to the provider, so a refresh can
+  still run: a vendor refresh token may outlive the UID (UID2's does). A
+  failing refresh keeps the state and is retried on later navigations;
+  only the provider's `rate_limit_per_hour` bounds the retries, and the
+  state is dropped when the expired UID is pruned on the next write.
 - A refresh reply may report an opt-out (`LookupOutcome::OptedOut`). It is
   handled like a cookie opt-out: the provider's sources are cleared from the
   row.
