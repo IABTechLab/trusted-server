@@ -466,8 +466,10 @@ fn prepare_after_response_lookups(
 
 /// Starts identity-provider lookups for a permitted publisher navigation.
 ///
-/// Returns `None` when no provider is enabled, the request has no EC or one
-/// minted on this request, or the identity graph is unavailable.
+/// Returns `None` when no provider is enabled, the request has no EC, or the
+/// identity graph is unavailable. For an EC minted on this request only
+/// providers that do not send the EC ID are dispatched, against the row this
+/// navigation will create.
 async fn dispatch_identity_lookups(
     state: &AppState,
     services: &RuntimeServices,
@@ -476,11 +478,6 @@ async fn dispatch_identity_lookups(
 ) -> Option<IdentityLookups> {
     let coordinator = Arc::clone(state.page_identity.as_ref()?);
     let graph = ec.kv_graph.as_ref()?;
-    // An EC minted on this request has no row yet and may never be issued,
-    // so it is not sent to vendors; a later navigation looks it up.
-    if ec.ec_context.ec_generated() {
-        return None;
-    }
     let ec_id = ec.ec_context.ec_value()?.to_owned();
     if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
         let snapshot = graph.load_snapshot(&ec_id);
@@ -496,6 +493,7 @@ async fn dispatch_identity_lookups(
             &LookupContext {
                 ec_id: &ec_id,
                 snapshot: ec.ec_context.kv_snapshot(),
+                minted_entry: ec.ec_context.pending_entry(),
                 consent: ec.ec_context.consent(),
                 client: ClientSignals {
                     ip: signals.client_ip,
@@ -2979,11 +2977,16 @@ mod tests {
     }
 
     /// Looks up `ids.example.com` and returns the response body as its UID.
-    struct EchoProvider(ProviderCapabilities);
+    /// The flag is whether its request carries the EC ID.
+    struct EchoProvider(bool, ProviderCapabilities);
 
     impl IdentityProvider for EchoProvider {
         fn capabilities(&self) -> &ProviderCapabilities {
-            &self.0
+            &self.1
+        }
+
+        fn sends_ec_id(&self) -> bool {
+            self.0
         }
 
         fn build_request(
@@ -3036,6 +3039,10 @@ mod tests {
     /// An app state that runs the echo provider in the page or the
     /// after-response phase.
     fn identity_fixture(after_response: bool) -> AfterResponseFixture {
+        identity_fixture_with(after_response, true)
+    }
+
+    fn identity_fixture_with(after_response: bool, sends_ec_id: bool) -> AfterResponseFixture {
         let provider_config: IdentityProviderConfig = toml::from_str(
             "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
         )
@@ -3057,17 +3064,20 @@ mod tests {
                     .expect("should build registry"),
             )
         };
-        let provider: Box<dyn IdentityProvider> = Box::new(EchoProvider(ProviderCapabilities {
-            sources: Box::new([SourceCapability {
-                source: SourceDomain::try_from("ids.example.com").expect("should parse source"),
-                input: SourceInput::Anonymous,
-            }]),
-            shape: EidShape {
-                max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
-                max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
-                eid_level_fields: EidLevelFields::Preserved,
+        let provider: Box<dyn IdentityProvider> = Box::new(EchoProvider(
+            sends_ec_id,
+            ProviderCapabilities {
+                sources: Box::new([SourceCapability {
+                    source: SourceDomain::try_from("ids.example.com").expect("should parse source"),
+                    input: SourceInput::Anonymous,
+                }]),
+                shape: EidShape {
+                    max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                    max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                    eid_level_fields: EidLevelFields::Preserved,
+                },
             },
-        }));
+        ));
         let coordinator = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config, provider)],
             Arc::clone(&partners),
@@ -3192,7 +3202,7 @@ mod tests {
         let fixture = identity_fixture(false);
 
         // Act
-        let (ec_state, dispatched, _) =
+        let (ec_state, _, _) =
             finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
 
         // Assert
@@ -3200,7 +3210,35 @@ mod tests {
             ec_state.ec_context.ec_value().is_some(),
             "should mint an EC"
         );
-        assert!(!dispatched, "should not send a newly minted EC to vendors");
+        let ec_id = ec_state.ec_context.ec_value().expect("should mint an EC");
+        assert_eq!(
+            owned_uid(&fixture, ec_id),
+            None,
+            "should not send a newly minted EC to a provider that sends the EC ID"
+        );
+    }
+
+    #[test]
+    fn page_phase_lookups_write_a_minted_ec_row_for_a_provider_without_the_ec_id() {
+        // Arrange
+        let fixture = identity_fixture_with(false, false);
+
+        // Act
+        let (ec_state, dispatched, _) =
+            finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        let ec_id = ec_state
+            .ec_context
+            .ec_value()
+            .expect("should mint an EC")
+            .to_owned();
+        assert!(dispatched, "should dispatch page-phase lookups");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the write that creates the row"
+        );
     }
 
     fn owned_uid(fixture: &AfterResponseFixture, ec_id: &str) -> Option<String> {

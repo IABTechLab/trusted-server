@@ -910,10 +910,12 @@ share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
-Lookups run only for an EC whose row already exists (an EC minted on this
-navigation is looked up on the next one), only when consent allows EID
+Lookups run only for an EC whose row already exists, only when consent allows EID
 persistence, and, when `tcf_vendor_id` is set and TCF applies to the request,
-only with TCF vendor consent for that vendor. The same vendor consent gates
+only with TCF vendor consent for that vendor. On the navigation that mints an EC, the
+page-phase lookups of providers whose requests do not carry the EC ID run too,
+and their results go into the write that creates the row; providers that send
+the EC ID are looked up on the next navigation. The same vendor consent gates
 egress of the provider's `sources`, even while the provider is disabled: while
 it is withheld, every ID for those sources, whether a provider stored it or the
 browser sent it in `ts-eids` or the `/auction` body, is left out of auction

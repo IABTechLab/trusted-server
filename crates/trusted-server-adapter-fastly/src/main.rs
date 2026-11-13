@@ -795,6 +795,7 @@ pub(crate) fn run_after_response_lookups(
         &LookupContext {
             ec_id: &lookups.ec_id,
             snapshot: &snapshot,
+            minted_entry: None,
             consent: ec_state.ec_context.consent(),
             client: ClientSignals {
                 ip: lookups.client_ip,

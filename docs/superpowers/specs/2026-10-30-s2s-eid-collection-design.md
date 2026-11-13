@@ -239,13 +239,13 @@ browser             TS (navigation)                          providers   KV
 
 Exactly one of these, chosen from the request snapshot:
 
-| Situation                               | Write                                                                         |
-| --------------------------------------- | ----------------------------------------------------------------------------- |
-| Consent withdrawn, live row             | No page-load write; the tombstone follows §3.1. No lookups, no ingest.        |
-| Row tombstoned, no fresh consent        | None. No lookups. Nothing served.                                             |
-| New EC (or orphaned EC being recovered) | Create the row with browser ingest. No lookups: the EC has no row yet (§8.1). |
-| Returning EC, something changed         | CAS update with browser ingest + valid provider results; expired UIDs pruned. |
-| Returning EC, nothing changed           | None.                                                                         |
+| Situation                               | Write                                                                                        |
+| --------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Consent withdrawn, live row             | No page-load write; the tombstone follows §3.1. No lookups, no ingest.                       |
+| Row tombstoned, no fresh consent        | None. No lookups. Nothing served.                                                            |
+| New EC (or orphaned EC being recovered) | Create the row with browser ingest + results of providers that do not send the EC ID (§8.1). |
+| Returning EC, something changed         | CAS update with browser ingest + valid provider results; expired UIDs pruned.                |
+| Returning EC, nothing changed           | None.                                                                                        |
 
 ### 5.4 Later requests in the same page load
 
@@ -922,6 +922,10 @@ The coordinator owns, for every provider:
 1. **Eligibility.** Provider enabled; the EC's row exists and is not
    tombstoned (an EC minted on this navigation, or a cookie EC with no row, is
    not sent to vendors); at least one due source; sources needing `HashedEmail` removed.
+   A provider whose request does not carry the EC ID (`sends_ec_id` is
+   `false`) also runs for an EC minted on this navigation, against the row the
+   navigation will create: its results go into that create, and a failed or
+   colliding create drops them, having exposed no EC. The default is `true`.
 2. **Consent.** The existing EID-persistence check passes, and the provider's
    `tcf_vendor_id`, when configured, has vendor consent in the effective TCF
    string. A failure skips that provider only, before any request is built.
@@ -1603,10 +1607,12 @@ request the units are separate, ordered commits so they stay reviewable.
 ## 14. Acceptance scenarios
 
 1. **First navigation, consent granted.** No EC. One provider is enabled and
-   due. → One KV create holding the browser-ingested UIDs; the EC cookie is
-   set; the provider is not called (§8.1). The next navigation finds the row,
-   calls the provider once and writes its UIDs (with owner and `exp`) in one
-   CAS update; the mirror is set on that response.
+   due. → If the provider does not send the EC ID, it is called within
+   `identity_budget_ms` and one KV create holds the browser-ingested UIDs and
+   its UIDs (with owner and `exp`); the EC cookie is set. If it sends the EC
+   ID, it is not called (§8.1): the next navigation finds the row, calls it
+   once and writes its UIDs in one CAS update; the mirror is set on that
+   response.
 2. **One write per page load.** A navigation is followed by three `/auction`
    calls, one `/_ts/page-bids` call and two integration-proxy calls, all
    carrying new `ts-eids` content. → At most one KV write, on the navigation.
