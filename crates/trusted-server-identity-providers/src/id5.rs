@@ -33,8 +33,9 @@
 //! The request follows ID5's server-side client (its Prebid Server module):
 //! `gpp_sid` is sent comma-joined, the client IP goes in `ip` (IPv4) or
 //! `ipv6`, `provider` names who operates the integration (`provider_name`,
-//! default the publisher domain), `domain` is the publisher domain and
-//! `origin` is `trusted-server`. The field names for the client IP and user
+//! default the publisher domain), `domain` is the publisher domain,
+//! `origin` is `trusted-server` and `v` is the crate version, without which
+//! ID5 rejects the fetch. The field names for the client IP and user
 //! agent should be confirmed with ID5 for each partner account.
 
 use std::borrow::Cow;
@@ -76,6 +77,10 @@ fn request_timestamp(now: UnixSeconds) -> Result<String, Report<ProviderError>> 
 /// Names this integration to ID5 in `origin`, as ID5's Prebid Server module
 /// sends `pbs-java`.
 const INTEGRATION_ORIGIN: &str = "trusted-server";
+
+/// The integration version sent to ID5 as `v`; the fetch endpoint rejects a
+/// request without one.
+const INTEGRATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The UID ID5 returns for a visitor who opted out.
 const OPTED_OUT_UID: &str = "0";
@@ -187,6 +192,7 @@ struct FetchBody<'a> {
     provider: &'a str,
     domain: &'a str,
     origin: &'static str,
+    v: &'static str,
     gdpr: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     gdpr_consent: Option<&'a str>,
@@ -398,6 +404,7 @@ impl IdentityProvider for Id5Provider {
                 .unwrap_or(lookup.publisher_domain),
             domain: lookup.publisher_domain,
             origin: INTEGRATION_ORIGIN,
+            v: INTEGRATION_VERSION,
             gdpr: u8::from(consent.gdpr_applies),
             gdpr_consent: consent.raw_tc_string.as_deref(),
             us_privacy: consent.raw_us_privacy.as_deref(),
@@ -750,7 +757,12 @@ mod tests {
             body["origin"], "trusted-server",
             "should name the integration"
         );
-        for legacy in ["o", "v", "tml", "nbPage"] {
+        assert_eq!(
+            body["v"],
+            env!("CARGO_PKG_VERSION"),
+            "should send the integration version ID5 requires"
+        );
+        for legacy in ["o", "tml", "nbPage"] {
             assert!(body.get(legacy).is_none(), "should not send `{legacy}`");
         }
         let ts = body["ts"].as_str().expect("should send a ts string");
