@@ -986,8 +986,8 @@ impl AuctionOrchestrator {
     /// Sends the mediator after the bidder batch, bounded by the auction deadline.
     ///
     /// Returns `None`, so the caller ranks bids locally, when the deadline has
-    /// passed, or the mediator fails, times out, or returns an unparsable
-    /// response.
+    /// passed, or the mediator fails, times out, returns a response it cannot
+    /// process (such as a non-success HTTP status), or reports an error status.
     async fn run_mediator(
         &self,
         mediator: &dyn AuctionProvider,
@@ -1075,6 +1075,8 @@ impl AuctionOrchestrator {
                 None => trace.observe_failure(observation),
             }
         }
+        // An error status is not a mediation decision, however the provider
+        // reports it, so it falls back to local ranking like other failures.
         if mediated
             .as_ref()
             .is_some_and(|response| response.status == BidStatus::Error)
@@ -1083,8 +1085,9 @@ impl AuctionOrchestrator {
                 "Mediator '{}' reported an error response; using local ranking",
                 mediator.provider_name()
             );
+            return None;
         }
-        mediated.filter(|response| response.status != BidStatus::Error)
+        mediated
     }
 
     /// Check if orchestrator is enabled.
@@ -1206,7 +1209,7 @@ async fn settle_recorded_slots(
     }
 }
 
-/// Parses a mediator response, logging and dropping a parse failure.
+/// Parses a mediator response, logging and dropping a processing failure.
 async fn parse_mediator_response(
     mediator: &dyn AuctionProvider,
     response: OutboundResponse,
@@ -1302,7 +1305,6 @@ mod tests {
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
-
     use crate::auction::telemetry::{
         AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     };
@@ -3920,45 +3922,45 @@ mod tests {
         );
     }
 
+    /// Endpoint of the [`AdServerMockProvider`] mediator in the fallback tests.
+    const MOCK_MEDIATOR_ENDPOINT: &str = "https://mediator.example/mediate";
+
     async fn run_mock_mediator_response(
-        split: bool,
         status: u16,
         body: &serde_json::Value,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
         let body = serde_json::to_vec(body).expect("should serialize mediator response");
-        run_raw_mock_mediator_response(split, status, body, floor).await
+        run_raw_mock_mediator_response(status, body, floor).await
     }
 
     async fn run_raw_mock_mediator_response(
-        split: bool,
         status: u16,
         body: Vec<u8>,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
         let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
             enabled: true,
-            endpoint: "https://mediator.example/mediate".to_string(),
+            endpoint: MOCK_MEDIATOR_ENDPOINT.to_string(),
             timeout_ms: 500,
             ..AdServerMockConfig::default()
         }));
-        run_mediated_provider_auction(split, mediator, Some((status, body)), floor).await
+        run_mediated_provider_auction(mediator, Some((status, body)), floor).await
     }
 
     /// Runs a planned auction whose single provider returns bids at 1.5 and 2.0.
     ///
-    /// `mediator_http` is the stubbed mediator HTTP reply, or `None` for a
+    /// `mediator_http` is the scripted mediator HTTP reply, or `None` for a
     /// mediator that answers without HTTP.
     async fn run_mediated_provider_auction(
-        split: bool,
         mediator: Arc<dyn AuctionProvider>,
         mediator_http: Option<(u16, Vec<u8>)>,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
         let clock = TestClock::new();
-        let http = ScriptedHttpClient::new(&clock);
+        let client = ScriptedHttpClient::new(&clock);
         respond_planned(
-            &http,
+            &client,
             200,
             serde_json::to_vec(&serde_json::json!({
                 "seatbid": [{"seat": "provider-seat", "bid": [
@@ -3971,9 +3973,9 @@ mod tests {
             .expect("should serialize provider bids"),
         );
         if let Some((status, body)) = mediator_http {
-            respond(&http, "https://mediator.example/mediate", status, body);
+            respond(&client, MOCK_MEDIATOR_ENDPOINT, status, body);
         }
-        let services = build_services_with_outbound_client(&http, &clock);
+        let services = build_services_with_outbound_client(&client, &clock);
         let plan = AuctionPlan::compile(planned_config(
             &[("provider-a", RoutingMode::AllEligible)],
             false,
@@ -3991,36 +3993,21 @@ mod tests {
             services: &services,
         };
 
-        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
-        let result = if split {
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("should dispatch the provider before mediation");
-            };
-            orchestrator
-                .collect_dispatched_auction(dispatched, &services, &context)
-                .await
-        } else {
-            orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("should complete auction with mock mediation")
-        };
+        let result = planned_orchestrator(plan, Some(mediator))
+            .run_auction(&request, &context)
+            .await
+            .expect("should complete auction with mock mediation");
 
         (request, result)
     }
 
-    async fn assert_mediator_non_success_falls_back(split: bool) {
+    #[tokio::test]
+    async fn mediator_non_success_status_falls_back_to_local_ranking() {
         for status in [302, 400, 503] {
             for floor in [1.0, 3.0] {
-                let (request, result) = run_mock_mediator_response(
-                    split,
-                    status,
-                    &serde_json::json!({"seatbid": []}),
-                    floor,
-                )
-                .await;
+                let (request, result) =
+                    run_mock_mediator_response(status, &serde_json::json!({"seatbid": []}), floor)
+                        .await;
                 let expected_winner = if floor < 2.0 { Some("higher") } else { None };
                 assert_eq!(
                     result
@@ -4028,7 +4015,7 @@ mod tests {
                         .get("fictional-slot")
                         .and_then(|bid| bid.bid_id.as_deref()),
                     expected_winner,
-                    "should rank provider bids locally with floors after HTTP {status} (split={split})"
+                    "should rank provider bids locally with floors after HTTP {status}"
                 );
                 assert_eq!(
                     result.provider_responses[0].bids.len(),
@@ -4082,68 +4069,75 @@ mod tests {
                         (Some(1.5), Some(0)),
                         (Some(2.0), Some(u8::from(expected_winner.is_some()))),
                     ],
-                    "should mark only the selected provider bid as winning after HTTP {status} (split={split})"
+                    "should mark only the selected provider bid as winning after HTTP {status}"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn mediator_non_success_status_falls_back_to_local_ranking() {
-        assert_mediator_non_success_falls_back(false).await;
-    }
-
-    #[tokio::test]
-    async fn planned_executor_mediator_non_success_status_falls_back_locally() {
-        assert_mediator_non_success_falls_back(true).await;
+    async fn mock_mediator_non_success_status_is_a_processing_failure() {
+        let warnings = crate::test_support::logging::WarningCapture::start();
+        run_mock_mediator_response(503, &serde_json::json!({"seatbid": []}), 1.0).await;
+        let warnings = warnings.take();
+        assert!(
+            warnings.iter().any(|warning| warning.message.starts_with(
+                "Mediator 'adserver_mock' response processing failed; using local ranking:"
+            ) && warning
+                .message
+                .contains("AdServer Mock returned non-success HTTP 503")),
+            "should fail mediator response processing on a non-success HTTP status"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.message.contains("reported an error response")),
+            "should not report a non-success HTTP status as an error-status mediation response"
+        );
     }
 
     #[tokio::test]
     async fn mock_mediator_success_and_no_bid_remain_authoritative() {
-        for split in [false, true] {
-            for has_winner in [false, true] {
-                let body = if has_winner {
-                    serde_json::json!({"seatbid": [{"seat": "provider-a", "bid": [{
-                        "id": "mediated", "impid": "fictional-slot", "price": 1.75,
-                        "adm": "<div>mediated</div>", "w": 300, "h": 250
-                    }]}]})
-                } else {
-                    serde_json::json!({"seatbid": []})
-                };
-                let (_, result) = run_mock_mediator_response(split, 200, &body, 1.0).await;
-                assert!(
-                    result.mediator_response.is_some(),
-                    "should preserve a valid mediation result, including no-bid"
-                );
-                assert_eq!(
-                    result
-                        .winning_bids
-                        .get("fictional-slot")
-                        .and_then(|bid| bid.bid_id.as_deref()),
-                    if has_winner { Some("mediated") } else { None },
-                    "should honor the mediator decision instead of the higher local bid"
-                );
-            }
+        for has_winner in [false, true] {
+            let body = if has_winner {
+                serde_json::json!({"seatbid": [{"seat": "provider-a", "bid": [{
+                    "id": "mediated", "impid": "fictional-slot", "price": 1.75,
+                    "adm": "<div>mediated</div>", "w": 300, "h": 250
+                }]}]})
+            } else {
+                serde_json::json!({"seatbid": []})
+            };
+            let (_, result) = run_mock_mediator_response(200, &body, 1.0).await;
+            assert!(
+                result.mediator_response.is_some(),
+                "should preserve a valid mediation result, including no-bid"
+            );
+            assert_eq!(
+                result
+                    .winning_bids
+                    .get("fictional-slot")
+                    .and_then(|bid| bid.bid_id.as_deref()),
+                if has_winner { Some("mediated") } else { None },
+                "should honor the mediator decision instead of the higher local bid"
+            );
         }
     }
 
     #[tokio::test]
     async fn mock_mediator_no_content_is_a_final_no_bid() {
-        for split in [false, true] {
-            let (_, result) = run_raw_mock_mediator_response(split, 204, Vec::new(), 1.0).await;
-            assert_eq!(
-                result
-                    .mediator_response
-                    .as_ref()
-                    .map(|response| response.status.clone()),
-                Some(BidStatus::NoBid),
-                "should record a bodiless HTTP 204 as a mediation no-bid (split={split})"
-            );
-            assert!(
-                result.winning_bids.is_empty(),
-                "should keep the mediator's no-bid instead of ranking provider bids (split={split})"
-            );
-        }
+        let (_, result) = run_raw_mock_mediator_response(204, Vec::new(), 1.0).await;
+        assert_eq!(
+            result
+                .mediator_response
+                .as_ref()
+                .map(|response| response.status.clone()),
+            Some(BidStatus::NoBid),
+            "should record a bodiless HTTP 204 as a mediation no-bid"
+        );
+        assert!(
+            result.winning_bids.is_empty(),
+            "should keep the mediator's no-bid instead of ranking provider bids"
+        );
     }
 
     struct ErrorStatusMediator;
@@ -4180,53 +4174,33 @@ mod tests {
 
     #[tokio::test]
     async fn mediator_error_status_response_falls_back_to_local_ranking() {
-        for split in [false, true] {
-            for floor in [1.0, 3.0] {
-                let (_, result) = run_mediated_provider_auction(
-                    split,
-                    Arc::new(ErrorStatusMediator),
-                    None,
-                    floor,
-                )
-                .await;
-                assert!(
-                    result.mediator_response.is_none(),
-                    "should treat an error-status mediator response as failed mediation (split={split})"
-                );
-                assert_eq!(
-                    result
-                        .winning_bids
-                        .get("fictional-slot")
-                        .and_then(|bid| bid.bid_id.as_deref()),
-                    if floor < 2.0 { Some("higher") } else { None },
-                    "should rank provider bids locally with floors (split={split}, floor={floor})"
-                );
-            }
+        for floor in [1.0, 3.0] {
+            let (_, result) =
+                run_mediated_provider_auction(Arc::new(ErrorStatusMediator), None, floor).await;
+            assert!(
+                result.mediator_response.is_none(),
+                "should treat an error-status mediator response as failed mediation"
+            );
+            assert_eq!(
+                result
+                    .winning_bids
+                    .get("fictional-slot")
+                    .and_then(|bid| bid.bid_id.as_deref()),
+                if floor < 2.0 { Some("higher") } else { None },
+                "should rank provider bids locally with floors (floor={floor})"
+            );
         }
     }
 
     #[tokio::test]
     async fn mediator_error_status_response_logs_local_ranking_fallback() {
-        for (split, expected) in [
-            (
-                false,
-                "Mediator 'error-status-mediator' reported an error response; using local ranking",
-            ),
-            (
-                true,
-                "Mediator 'error-status-mediator' reported an error response; using local ranking",
-            ),
-        ] {
-            let warnings = crate::test_support::logging::WarningCapture::start();
-            run_mediated_provider_auction(split, Arc::new(ErrorStatusMediator), None, 1.0).await;
-            assert!(
-                warnings
-                    .take()
-                    .iter()
-                    .any(|warning| warning.message == expected),
-                "should warn when an error-status mediator response falls back to local ranking (split={split})"
-            );
-        }
+        let warnings = crate::test_support::logging::WarningCapture::start();
+        run_mediated_provider_auction(Arc::new(ErrorStatusMediator), None, 1.0).await;
+        assert!(
+            warnings.take().iter().any(|warning| warning.message
+                == "Mediator 'error-status-mediator' reported an error response; using local ranking"),
+            "should warn when an error-status mediator response falls back to local ranking"
+        );
     }
 
     #[tokio::test]

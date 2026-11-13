@@ -6,6 +6,7 @@ use edgezero_adapter_axum::diagnostics::NativeIngressMetadata;
 use edgezero_core::error::EdgeError;
 use edgezero_core::geo::{GeoOutcome, GeoStatus};
 use error_stack::Report;
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformError, PlatformGeo, PlatformKvStore, RuntimeServices,
 };
@@ -106,12 +107,7 @@ pub fn build_runtime_services(
     static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
         std::sync::OnceLock::new();
 
-    let outbound_client = ctx
-        .http_client()
-        .ok_or_else(|| {
-            EdgeError::internal(std::io::Error::other("request has no outbound client"))
-        })?
-        .with_proxy_marker(false);
+    let outbound_client = request_outbound_client(ctx)?;
 
     Ok(RuntimeServices::builder()
         .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))

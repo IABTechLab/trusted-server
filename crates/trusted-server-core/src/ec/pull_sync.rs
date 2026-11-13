@@ -20,7 +20,10 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::consent::allows_eid_persistence;
-use crate::outbound::{BUFFERED_TIMEOUT, buffered, outbound_request};
+use crate::error::TrustedServerError;
+use crate::outbound::{
+    BUFFERED_TIMEOUT, OutboundRequestSource, buffered, outbound_error, outbound_request,
+};
 use crate::settings::Settings;
 
 use super::generation::{ec_hash, is_valid_ec_id};
@@ -238,9 +241,12 @@ pub async fn dispatch_pull_sync(
         let request = match pull_request(&request_url, token.expose()) {
             Ok(request) => request,
             Err(err) => {
-                log::warn!(
-                    "Pull sync: failed to build request for partner '{}': {err:?}",
-                    partner.source_domain
+                log_pull_failure(
+                    err,
+                    format!(
+                        "request for partner '{}' could not be built",
+                        partner.source_domain
+                    ),
                 );
                 continue;
             }
@@ -367,6 +373,20 @@ fn pull_request(url: &Url, token: &str) -> Result<OutboundRequest, EdgeError> {
     ))
 }
 
+/// Logs one failed pull-sync step at warn, through [`outbound_error`].
+///
+/// `outbound_error` logs the failure's status, kind, budget source, and
+/// provider detail, never the error's message, which can hold provider text
+/// or a URL. This then logs the report with the `failed` step.
+fn log_pull_failure(error: EdgeError, failed: String) {
+    let report = outbound_error(
+        error,
+        TrustedServerError::EdgeCookie { message: failed },
+        OutboundRequestSource::Internal,
+    );
+    log::warn!("Pull sync failed: {report:?}");
+}
+
 /// Sends the queued `group` and collects the UIDs its partners answer with.
 ///
 /// The group ends [`PULL_SYNC_GROUP_CUTOFF`] after it starts. A partner that
@@ -388,12 +408,9 @@ async fn send_pull_group(
     let slots = match client.send_all_until(requests, cutoff).await {
         Ok(results) => results.into_parts().0,
         Err(failure) => {
-            log::warn!(
-                "Pull sync: partner group failed with {} ({})",
-                failure.error().status(),
-                failure.error().kind()
-            );
-            failure.into_parts().1
+            let (error, slots) = failure.into_parts();
+            log_pull_failure(error, "partner group failed".to_owned());
+            slots
         }
     };
 
@@ -402,11 +419,7 @@ async fn send_pull_group(
             OutboundCollectedSlot::Resolved(result) => match result.outcome {
                 Ok(response) => response,
                 Err(err) => {
-                    log::warn!(
-                        "Pull sync: request failed for partner '{source_domain}' with {} ({})",
-                        err.status(),
-                        err.kind()
-                    );
+                    log_pull_failure(err, format!("request for partner '{source_domain}' failed"));
                     continue;
                 }
             },
@@ -438,10 +451,9 @@ async fn extract_pull_uid(response: OutboundResponse, source_domain: &str) -> Op
     let body = match response.into_bytes_bounded(MAX_PULL_RESPONSE_BYTES).await {
         Ok(body) => body,
         Err(err) => {
-            log::warn!(
-                "Pull sync: failed to read the response from partner '{source_domain}' with {} ({})",
-                err.status(),
-                err.kind()
+            log_pull_failure(
+                err,
+                format!("response from partner '{source_domain}' could not be read"),
             );
             return None;
         }
@@ -813,8 +825,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::ec::kv::TombstoneOutcome;
-    use crate::error::TrustedServerError;
     use crate::settings::EcPartner;
+    use crate::test_support::logging::WarningCapture;
     use crate::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -1106,6 +1118,70 @@ mod tests {
         assert!(
             !entry.ids.contains_key("beta.example.com"),
             "should drop the partner that answered after the cutoff"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_failures_log_through_outbound_error() {
+        let mut settings = create_test_settings();
+        // One partner per group, so the failing batch ends only its own group.
+        settings.ec.pull_sync_concurrency = 1;
+        let mut unbuildable = pull_enabled_ec_partner("gamma.example.com");
+        unbuildable.ts_pull_token = Some(Redacted::new("outbound\ntoken".to_owned()));
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+            unbuildable,
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client
+            .respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::failing_batch(EdgeError::bad_gateway("alpha provider text")),
+            )
+            .respond_to(
+                Method::GET,
+                &pull_url("beta.example.com"),
+                ScriptedReply::error(EdgeError::bad_gateway("beta provider text")),
+            );
+        let context = PullSyncContext { ec_id, snapshot };
+        let capture = WarningCapture::start();
+
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        let warnings = capture.take();
+        let typed = warnings
+            .iter()
+            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
+            .count();
+        assert_eq!(
+            typed, 3,
+            "should log the group failure, the request failure, and the build failure through outbound_error"
+        );
+        for step in [
+            "partner group failed",
+            "request for partner 'beta.example.com' failed",
+            "request for partner 'gamma.example.com' could not be built",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.message.starts_with("Pull sync failed:")
+                        && warning.message.contains(step)
+                }),
+                "should log the report for `{step}`"
+            );
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains("provider text")),
+            "should keep the provider text out of the logs"
         );
     }
 
