@@ -154,6 +154,8 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
             // The client sent the body too slowly; the detail stays in the logs.
             Self::RequestTimeout { .. } => "Request timeout".to_string(),
+            // The client sent too large a body; the limit stays in the logs.
+            Self::RequestTooLarge { .. } => "Request payload too large".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged by http_error.
             _ => "An internal error occurred".to_string(),
@@ -504,6 +506,15 @@ mod tests {
             error.user_message(),
             "Request timeout",
             "should keep the timeout detail out of the client message"
+        );
+
+        let error = TrustedServerError::RequestTooLarge {
+            message: "body exceeds the 65536-byte limit".into(),
+        };
+        assert_eq!(
+            error.user_message(),
+            "Request payload too large",
+            "should name the 413 cause and keep the limit out of the client message"
         );
     }
 
