@@ -628,6 +628,37 @@ mod tests {
     }
 
     #[test]
+    fn partner_registry_marks_a_liveintent_uid2_source_spelled_differently() {
+        // Arrange: `liveintent` names the UID2 source in upper case with a
+        // trailing dot, which building the provider accepts.
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.partners.push(
+            toml::from_str(
+                "name = \"uidapi.com\"\nsource_domain = \"uidapi.com\"\nbidstream_enabled = true",
+            )
+            .expect("should parse partner"),
+        );
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"liveintent\"\nkind = \"liveintent\"\nenabled = false\n\
+                 sources = [\"UIDAPI.COM.\"]",
+            )
+            .expect("should parse liveintent"),
+        );
+
+        // Act
+        let registry = partner_registry(&settings.ec).expect("should build partner registry");
+
+        // Assert
+        assert!(
+            registry
+                .get("uidapi.com")
+                .is_some_and(|partner| partner.excluded_where_gdpr_applies),
+            "should mark the UID2 source despite its spelling"
+        );
+    }
+
+    #[test]
     fn rejects_an_unknown_collect_timing() {
         toml::from_str::<IdentityProviderConfig>(
             "id = \"sharedid\"\nkind = \"sharedid\"\ncollect = \"later\"",
