@@ -341,8 +341,11 @@ pass to browsers, and Trusted Server never reads it on JSON calls, so one
 setting covers both cases (EZ-7). Production code installs no client in router
 state, which would override the adapter default
 (`edgezero:crates/edgezero-core/src/router.rs:410-416`). Tests on the Axum test
-server do, so no real transport starts (EZ-23.7). The exception is test 19's
-bodiless GET, which supplies EdgeZero's Axum client.
+server do, so no real transport starts (EZ-23.7). Two exceptions start real
+transport. Test 19's bodiless GET supplies EdgeZero's Axum client. The CLI
+proxy fixture (`crates/trusted-server-cli/tests/proxy_trusted_server.rs`)
+installs no router-state client, so the adapter's default client reaches its
+loopback origin and TLS relay.
 
 #### 2.2 Settings every request carries
 
