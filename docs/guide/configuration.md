@@ -1062,7 +1062,9 @@ row, as long as it does not send the EC ID to the vendor. The one exception is
 `liveramp` with an `endpoint`: its envelope lookup sends the EC ID as its
 Custom ID, so it is not run until the next navigation, even for its cookie
 reads. Without an `endpoint`, `liveramp` only reads cookies and runs on the
-first page view like the others. Kinds without a server call read their
+first page view like the others. Partner pull sync (an `[[ec.partners]]` entry
+with `pull_sync_enabled`) sends the EC ID to the partner, so it also waits for
+the next navigation. Kinds without a server call read their
 first-party cookie, so on the first page view their IDs come only from that
 cookie. In practice the first page's own auction carries no provider IDs;
 they reach bid requests from the next page load.
