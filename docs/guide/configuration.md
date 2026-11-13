@@ -911,12 +911,17 @@ share the `identity_budget_ms` budget, and are collected before the response is
 finalized. Results go into the navigation's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
-Lookups run only for an EC whose row already exists, only when consent allows EID
-persistence, and, when `tcf_vendor_id` is set and TCF applies to the request,
-only with TCF vendor consent for that vendor. On the navigation that mints an EC, the
-page-phase lookups of providers whose requests do not carry the EC ID run too,
-and their results go into the write that creates the row; providers that send
-the EC ID are looked up on the next navigation. The same vendor consent gates
+Lookups run only when consent allows EID persistence, and, when
+`tcf_vendor_id` is set and TCF applies to the request, only with TCF vendor
+consent for that vendor. They run for an EC whose row already exists, with one
+exception: on the navigation that mints an EC, the page-phase lookups of
+providers whose requests do not carry the EC ID (each provider kind declares
+this) run against the row the navigation creates, whose consent gates them, and
+their results go into the write that creates the row. If that create fails or
+loses to another writer, their results are dropped. Providers that send the EC
+ID, and `after_response` lookups, wait for the next navigation. The page's own
+auction starts before lookups are collected, so it never carries provider IDs
+for a newly minted EC; they reach auctions from the next page load. The same vendor consent gates
 egress of the provider's `sources`, even while the provider is disabled: while
 it is withheld, every ID for those sources, whether a provider stored it or the
 browser sent it in `ts-eids` or the `/auction` body, is left out of auction
@@ -1014,8 +1019,8 @@ no sources, when a source has no `[[ec.partners]]` entry, when two enabled
 providers claim the same source, or when its `id` is empty or shared with
 another enabled provider. `identity_budget_ms` must be 1–1000 and
 `identity_after_response_budget_ms` 1–5000. Deploy validation also rejects an
-empty `secrets.token` key name, and, because this release registers no
-provider kind, any enabled provider. A disabled provider's `secrets.token` is
+empty `secrets.token` key name and any enabled provider whose `kind` this
+build does not include. A disabled provider's `secrets.token` is
 not resolved.
 
 ::: warning Rollback
@@ -1033,6 +1038,105 @@ enabled provider of a registered kind, so a provider-specific setting error
 `custom_id_namespace`) fails the command before deploy. At runtime the same
 error would disable every identity provider for each request, with an error
 log.
+
+#### Provider kinds
+
+This build includes the kinds below. Use the endpoint, sources and TCF vendor
+ID each vendor gives you; `trusted-server.example.toml` has a commented example
+of each.
+
+| `kind`       | Server call                                 | First page view | Default `cookie_names`      | Lockr | `atype` | Kept for                                                      |
+| ------------ | ------------------------------------------- | --------------- | --------------------------- | ----- | ------- | ------------------------------------------------------------- |
+| `id5`        | Fetch (`/gs/v2`) when no cookie holds an ID | Yes             | `id5id`                     | Yes   | 1       | Reply's `cache_control.max_age_sec`, else 24 hours (1 h–30 d) |
+| `liveintent` | Identity exchange                           | Yes             | `_lc2_fpi` (sent as `duid`) | No    | 3       | Reply's `Expires`, else 24 hours (1 h–30 d)                   |
+| `liveramp`   | Optional envelope lookup by Custom ID       | No              | `_lr_env`, `idl_env`        | Yes   | 3       | 15 days                                                       |
+| `connectid`  | None                                        | Yes             | `connectId`                 | No    | 3       | Cookie's `lastSynced` + `ttl`, at most 14 days                |
+| `uid2`       | Optional token refresh                      | Yes             | `__uid2_advertising_token`  | Yes   | 3       | Token's `identity_expires`, else 24 hours                     |
+| `sharedid`   | None                                        | Yes             | `_sharedid`, `_pubcid`      | No    | 1       | 24 hours; a generated ID 30 days                              |
+| `criteo`     | None                                        | Yes             | `cto_bidid`                 | No    | 1       | 24 hours                                                      |
+| `unifiedid`  | None                                        | Yes             | `pbjs-unifiedid`            | No    | 1       | 24 hours                                                      |
+
+**First page view.** Every kind except `liveramp` runs on the navigation that
+mints the EC, within `identity_budget_ms`, and its results go into the write
+that creates the row: none of them sends the EC ID to the vendor. `liveramp`
+can send the EC ID as its Custom ID, so it is not run until the next
+navigation, even for its cookie reads. Kinds without a server call read their
+first-party cookie, so on the first page view their IDs come only from that
+cookie. In practice the first page's own auction carries no provider IDs;
+they reach bid requests from the next page load.
+
+**Lockr.** The `id5`, `liveramp` and `uid2` kinds accept
+`[ec.identity_providers.settings.lockr]` (`enabled`, `cookie_names`), read
+after the vendor's own cookies and never where GDPR applies. The other kinds
+reject that table.
+
+**Opt-out.** An `id5` cookie or fetch reply whose ID is `0`, a `liveramp`
+lookup answered `204`, a `uid2` `optout` identity or refresh reply, and
+SharedID's `_pubcid_optout` cookie report an opt-out: the provider's stored
+UIDs are removed. Yahoo keeps the ConnectID opt-out in local storage, which the
+server cannot see, so a `connectId` cookie left after an opt-out is still read
+until it expires.
+
+**GDPR.** UID2 is not offered where GDPR applies: `uid2` is skipped there and
+the row's UIDs for its source are removed, and a `liveintent` provider neither
+resolves nor keeps the `uid2` attribute (`uidapi.com`).
+
+##### `id5`
+
+Settings: `partner_id` (required), `provider_name` (default the publisher
+domain), `cookie_names`, `lockr`. When no ID5 cookie holds a usable ID, it
+posts to ID5's server-side fetch endpoint (`/gs/v2`) with `partner`,
+`provider`, `domain` (the publisher domain), `origin` (`trusted-server`), `v`
+(the Trusted Server version; ID5 rejects a fetch without it), `gdpr`,
+`gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ts`,
+`ua`, the client IP in `ip` or `ipv6` (routable addresses only), and `s`, the
+signature of the previous reply. The EC ID is never sent. A reply's `ids` are
+stored as given; a legacy `universal_uid` goes to the first configured source.
+The reply's signature is kept privately and the IDs are refreshed a tenth of
+their TTL before they expire. A cookie holding a fetch reply or a bare ID is
+used instead of a fetch.
+
+##### `liveintent`
+
+Settings: `publisher_id`, `distributor_id`, `resolve` (default `["nonId"]`),
+`cookie_names`. Sends the first present first-party cookie as `duid` with the
+consent and network signals; no hashed email. Each `resolve` attribute is
+stored under LiveIntent's fixed source for it, which must be in `sources` (see
+the example config for the list). Without a `distributor_id` LiveIntent
+returns only `nonId`. Its Trade Desk ID (`thetradedesk`) is stored with
+`atype` 1.
+
+##### `liveramp`
+
+Settings: `cookie_names`, `placement_id`, `custom_id_namespace`, `lockr`.
+Reads the RampID envelope from `_lr_env` (LiveRamp ATS) or `idl_env`
+(Prebid's identityLink). With an `endpoint` (LiveRamp's
+`/api/identity/v2/envelope`), a visitor without an envelope cookie is looked
+up by Custom ID: the full EC ID as `<custom_id_namespace>:<id>`, with the
+placement ID, consent and visitor IP. Both settings are required with an
+endpoint. LiveRamp resolves a Custom ID only through a mapping file the
+publisher sends it; Trusted Server sends no login or hashed email.
+
+##### `connectid`, `sharedid`, `criteo`, `unifiedid`
+
+Cookie-only kinds: no endpoint and no server call; each takes exactly one
+source. `connectid` reads Yahoo's `connectId` JSON cookie. `sharedid` reads
+Prebid's `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
+cookie or stored ID it stores a random UUID in the row only (no cookie is
+set). Leave `generate` off unless Prebid keeps its opt-out in the
+`_pubcid_optout` cookie. `criteo` reads Prebid's `cto_bidid`,
+percent-decoded. `unifiedid` reads the `TDID` field of Prebid's
+`pbjs-unifiedid` cookie and stores it with UID `ext` `{"rtiPartner":"TDID"}`.
+
+##### `uid2`
+
+Settings: `identity_cookie_name` (default `__uid_2`), `cookie_names`, `lockr`.
+Reads the UID2 SDK's `__uid_2` identity, then Prebid's
+`__uid2_advertising_token`, then Lockr cookies. Both clients keep the token in
+localStorage by default, which the server never sees: enable cookie storage.
+With an `endpoint` (the operator's `/v2/token/refresh`), the cookie's refresh
+token is kept privately and the token is refreshed server side from
+`refresh_from`, with no API key or email. Tokens are never generated.
 
 ### Field Details
 

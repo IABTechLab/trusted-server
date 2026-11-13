@@ -56,7 +56,8 @@ sequenceDiagram
     alt First Visit (no EC cookie)
         Note over TS: Phase 2: Routing (organic only)<br/>generate_if_needed()
         TS->>TS: HMAC-SHA256(IP) + random suffix
-        TS->>KV: Create entry (consent, geo, device)
+        Note over TS: Page-phase identity lookups for providers<br/>that do not send the EC ID
+        TS->>KV: Create entry (consent, geo, device, provider IDs)
         Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
         TS-->>B: Response + Set-Cookie: ts-ec=...
     else Return Visit (EC cookie present)
@@ -183,7 +184,7 @@ The `sharedId` cookie follows a similar path but is written directly by Prebid's
 
 Cookie persistence runs only on top-level publisher navigations: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` in `Sec-Purpose`. `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
 
-Each navigation makes at most one conditional page-load write, which carries browser ingest and page-phase identity-provider results together. If another writer wins, the navigation's changes are dropped without a re-read; a later navigation offers them again. Two writes sit outside that rule: a consent withdrawal's tombstone is written on any request that carries the EC cookie, with bounded retries, and `collect = "after_response"` identity providers make one follow-up write after the response is sent. Batch sync and pull sync write through their own channels.
+Each navigation makes at most one conditional page-load write, which carries browser ingest and page-phase identity-provider results together. If another writer wins, the navigation's changes are dropped without a re-read; a later navigation offers them again. Two writes sit outside that rule: a consent withdrawal's tombstone is written on any request that carries the EC cookie, with bounded retries, and `collect = "after_response"` identity providers make one follow-up write after the response is sent. On the navigation that mints an EC, the page-load write is the one that creates the row; it carries only the results of providers whose requests do not carry the EC ID, and if the create fails those results are dropped. Other providers are first looked up on the next navigation, and the first page's own auction carries no provider IDs. See [Identity providers](/guide/configuration#identity-providers). Batch sync and pull sync write through their own channels.
 
 Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser-supplied EID, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
