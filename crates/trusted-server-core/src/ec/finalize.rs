@@ -463,8 +463,9 @@ async fn finalize_unusable_consent(
     // Compute once for the authoritative identity-graph tombstones.
     let ids_to_withdraw = withdrawal_ec_ids(ec_context);
 
-    // The identity-graph tombstone is the authoritative withdrawal marker
-    // for subsequent EC behavior.
+    // The identity-graph tombstone is the authoritative withdrawal marker.
+    // A consent-update acknowledgment must reflect failed/unavailable writes.
+    let mut withdrawal_failed = !ids_to_withdraw.is_empty() && kv.is_none();
     if let Some(graph) = kv {
         for ec_id in &ids_to_withdraw {
             // The graph hands back the post-withdrawal snapshot rather than
@@ -483,6 +484,7 @@ async fn finalize_unusable_consent(
             // consented. Report every failure, including the non-active cookie
             // ID whose outcome is not retained on the request context.
             if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                withdrawal_failed = true;
                 log::warn!(
                     "EC withdrawal tombstone failed for '{}': the identity-graph row may \
                      still be live with consent granted",
@@ -493,6 +495,9 @@ async fn finalize_unusable_consent(
                 ec_context.set_kv_snapshot(outcome);
             }
         }
+    }
+    if withdrawal_failed {
+        super::consent_update::mark_reconciliation_failed(response);
     }
 }
 

@@ -256,6 +256,61 @@ fn axum_main_exits_non_zero_when_settings_fail() {
     );
 }
 
+#[tokio::test]
+async fn consent_route_rejects_other_methods_and_foreign_origins_locally() {
+    // CONNECT is registered defensively, but HTTP authority-form targets cannot
+    // address this path. Core's method tests cover its application rejection.
+    assert_route_registered("CONNECT", "/_ts/consent");
+    let server = TestServer::with_test_settings().await;
+    for method in ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "TRACE"] {
+        assert_route_registered(method, "/_ts/consent");
+        let response = send(server.request(method, "/_ts/consent")).await;
+        assert_eq!(
+            response.status().as_u16(),
+            405,
+            "should reject {method} locally"
+        );
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(response.headers()["allow"], "POST");
+    }
+    let response = send(
+        server
+            .request("POST", "/_ts/consent")
+            .header("origin", "https://foreign.example.com")
+            .header("content-type", "application/json")
+            .body(r#"{"gppString":null,"applicableSections":[]}"#),
+    )
+    .await;
+    assert_eq!(
+        response.status().as_u16(),
+        403,
+        "should reject a foreign origin"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    server.assert_no_outbound_requests();
+}
+
+#[tokio::test]
+async fn consent_route_without_storage_is_unavailable_and_does_not_mint() {
+    let server = TestServer::with_test_settings().await;
+    let origin = format!("http://{}", server.server.address());
+    let response = send(
+        server
+            .request("POST", "/_ts/consent")
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(r#"{"gppString":null,"applicableSections":[]}"#),
+    )
+    .await;
+    assert_eq!(
+        response.status().as_u16(),
+        503,
+        "should not acknowledge unavailable storage"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    server.assert_no_outbound_requests();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aps_profile_serves_renderer_through_adapter_fallback() {
     let mut settings = test_settings();
@@ -299,6 +354,7 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
+        ("POST", "/_ts/consent"),
         // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
         // paths are spelled out as literals rather than referencing
         // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
