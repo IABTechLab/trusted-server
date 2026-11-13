@@ -476,7 +476,11 @@ impl Hooks for TrustedServerApp {
 
     fn routes() -> Result<RouterService, EdgeError> {
         // Every startup failure answers 503 with a generic message, so the
-        // logged report never reaches an anonymous caller.
+        // report never reaches an anonymous caller. It is logged at error, but
+        // production Spin builds drop it: `EdgeZero`'s Spin `init_logger`
+        // installs no backend, and Trusted Server installs one only in its
+        // `test-utils` fixture builds. It becomes observable once `EdgeZero`
+        // installs a backend, which is asked of it on PR 275.
         let state = build_state().map_err(|report| {
             log::error!("{report:?}");
             EdgeError::service_unavailable("Service Unavailable")

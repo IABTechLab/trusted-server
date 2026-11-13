@@ -15,6 +15,13 @@ This row is the canonical status summary. Cloudflare has no
 `/health` route and supports multiple auction providers. When startup fails,
 every route answers 500 with EdgeZero's JSON error body.
 
+Production Worker builds install no `log` backend. EdgeZero's Cloudflare
+`init_logger` installs none, and Trusted Server leaves that to EdgeZero, so the
+startup report and every warning are dropped. They are not observable until
+EdgeZero's `init_logger` installs a backend, which Trusted Server has asked for
+on
+[EdgeZero PR 275](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880).
+
 ## Verify the complete local handoff
 
 Install the Wrangler version pinned in `.tool-versions`, then run:

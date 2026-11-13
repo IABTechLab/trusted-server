@@ -1474,7 +1474,8 @@ and stay.
 - Spin ignores `origin_host_header_override` today and sends the URI authority
   (`platform.rs:449-456`). Whether WASI hosts forbid an explicit `Host` is
   unverified (EZ-13). H's Spin client rejects any override, so Spin's settings
-  load ignores the setting with a warning (D9).
+  load ignores the setting with a warning (D9). Production Spin builds drop
+  that warning until EdgeZero installs a log backend (section 9).
 - At H, Spin's client could send every buffered request body, bidder JSON
   included, chunked with no `Content-Length`. Another reviewer raised this as
   an open question on PR 275. At `14a6ca8b` the client sets `Content-Length`
@@ -1562,7 +1563,21 @@ backend (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:977-1023`).
 Trusted Server keeps `owns_logging` false. Its Fastly and Axum loggers already
 admit target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
-log once (`app.rs:113-146`). Each outbound failure logs one line: the site
+log once (`app.rs:113-146`).
+
+On Cloudflare and Spin, EdgeZero's `init_logger` installs no backend
+(`edgezero:crates/edgezero-adapter-cloudflare/src/lib.rs:86`, `:94`,
+`edgezero:crates/edgezero-adapter-spin/src/lib.rs:139`), and Trusted Server
+installs one only in its `test-utils` fixture builds. Production Cloudflare and
+Spin builds therefore drop every log record, as they do today. The startup
+report and every warning this spec names on those adapters, such as the Spin
+`origin_host_header_override` warning, are not observable until EdgeZero's
+`init_logger` installs a backend. Installing one is EdgeZero's job, so Trusted
+Server adds no logger of its own and asks EdgeZero for one on PR 275 (Open
+EdgeZero defects at H). `scripts/smoke-spin.sh`, which reads the startup
+diagnostic from the component's stderr, fails until then.
+
+Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
 or partner, and that rendering prints the budget source and
 `provider_failure_detail()` (`error.rs:490`). The helper itself does not log,
@@ -1921,6 +1936,8 @@ checked against head `1467e28a`. Trusted Server adds no workaround for them:
 
 - A streamed Spin upload goes out chunked and loses its declared
   `Content-Length` (2.5).
+- Cloudflare and Spin install no `log` backend, so their warnings and startup
+  report are dropped (section 9).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).

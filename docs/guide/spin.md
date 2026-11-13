@@ -15,6 +15,14 @@ providers. When startup fails, every route, `/health` included, answers 503
 with a generic `Service Unavailable` error, and the full report goes only to
 the log.
 
+Production Spin builds install no `log` backend. EdgeZero's Spin
+`init_logger` installs none, and Trusted Server leaves that to EdgeZero, so
+the startup report and every warning, such as the ignored
+`publisher.origin_host_header_override`, are dropped. They are not observable
+until EdgeZero's `init_logger` installs a backend, which Trusted Server has
+asked for on
+[EdgeZero PR 275](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880).
+
 ## Prerequisites
 
 Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
@@ -62,7 +70,9 @@ variables:
 It first launches `spin up` before config is pushed, then relaunches it while
 omitting each variable independently. Every publisher request must return 503,
 and the controlled config or variable delta must identify the intended missing
-input. A generic degraded response cannot satisfy the check.
+input. A generic degraded response cannot satisfy the check. The smoke reads
+that diagnostic from the component's stderr, so this step fails until
+EdgeZero's Spin `init_logger` installs a log backend.
 
 The final non-health publisher request must return 200, retain the stub-origin
 sentinel, rewrite its origin URL to the Spin listener, and omit the original
