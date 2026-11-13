@@ -150,6 +150,29 @@ async fn canonical_not_found_carries_x_ts_version() {
     );
 }
 
+/// A handler `Err` still passes through the finalize middleware.
+///
+/// `dispatch_ingress` installs no outbound client, so the auction handler
+/// fails before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_error_carries_x_ts_version() {
+    let response = dispatch_through_app(Method::POST, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should answer the failed Spin handler with 500"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the handler error response"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
     let response = dispatch_through_app(Method::TRACE, "/auction").await;

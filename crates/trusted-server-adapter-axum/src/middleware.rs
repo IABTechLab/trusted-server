@@ -7,7 +7,7 @@ use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::error::http_error;
+use trusted_server_core::error::{handler_error_response, http_error};
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
 
@@ -76,7 +76,10 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let mut response = next.run(ctx).await?;
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => handler_error_response(error)?,
+        };
         apply_finalize_headers(&self.settings, &mut response);
         Ok(response)
     }
@@ -352,6 +355,46 @@ mod tests {
             levels,
             [log::Level::Error],
             "should log the configuration error once, at error"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_adds_version_header_to_a_handler_error() {
+        let version = trusted_server_core::constants::TS_GIT_VERSION
+            .expect("should compile a git version into the test build");
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings_with_response_headers(vec![])));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Err::<Response, EdgeError>(EdgeError::internal(std::io::Error::other(
+                "example handler failure",
+            )))
+        });
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should render the handler error as a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer the handler error with its status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(version),
+            "should add x-ts-version to the handler error response"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && !record.message.contains("example handler failure")
+            ),
+            "should log the handler error once, without its message"
         );
     }
 
