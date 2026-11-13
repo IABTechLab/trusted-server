@@ -7,6 +7,7 @@ use common::ec::CookieVaryingOrigin;
 use common::runtime::{
     RuntimeEnvironment, RuntimeProcess, TestError, origin_port, wasm_binary_path,
 };
+use common::trace_boundary::{TraceRuntime, with_trace_runtime};
 use environments::{RUNTIME_ENVIRONMENTS, ReadyCheckOptions, wait_for_http_ready};
 use error_stack::ResultExt as _;
 use frameworks::scenarios::EcScenario;
@@ -20,6 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use testcontainers::runners::SyncRunner as _;
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
+use trusted_server_core::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
 /// Initialize the logger once for the test binary.
 ///
@@ -1808,7 +1810,6 @@ impl OriginRuntime {
     ///
     /// Panics when the runtime's artifact or CLI is missing or it never becomes ready.
     fn serve(self, envelope: &str, check: impl FnOnce(&str)) {
-        use common::trace_boundary::{TraceRuntime, with_trace_runtime};
         match self {
             Self::Axum => {
                 let process = environments::axum::AxumDevServer
@@ -2391,13 +2392,7 @@ impl trusted_server_core::streaming_processor::StreamProcessor for IdentityProce
 }
 
 /// Decodes `bytes` coded with `compression` through Trusted Server's own codec.
-fn decode(
-    bytes: &[u8],
-    compression: trusted_server_core::streaming_processor::Compression,
-) -> Vec<u8> {
-    use trusted_server_core::streaming_processor::{
-        Compression, PipelineConfig, StreamingPipeline,
-    };
+fn decode(bytes: &[u8], compression: Compression) -> Vec<u8> {
     let mut decoded = Vec::new();
     StreamingPipeline::new(
         PipelineConfig {
@@ -2487,7 +2482,6 @@ const RANGE_LENGTH: usize = 100;
 
 #[test]
 fn encoded_fixtures_decode_to_their_plain_bodies() {
-    use trusted_server_core::streaming_processor::Compression;
     assert_eq!(
         (
             decode(PASSTHROUGH_HTML_GZIP, Compression::Gzip),
