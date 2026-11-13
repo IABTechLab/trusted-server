@@ -755,6 +755,7 @@ mod tests {
     use edgezero_core::router::{PreDispatchHook, RouterService};
     use fastly::mime;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::test_support::logging::WarningCapture;
     use trusted_server_core::trace::TracePreDispatchHook;
 
     use crate::delivery::tests::{committed, committed_then_failed};
@@ -1171,6 +1172,60 @@ mod tests {
             post_delivery, 2,
             "should run post-delivery work after each committed application body, the one that failed after commitment included"
         );
+    }
+
+    #[test]
+    fn skipped_operator_header_warns_once_per_request() {
+        let mut settings = test_settings();
+        settings
+            .response_headers
+            .insert("connection".to_owned(), "x example".to_owned());
+        let mut sandbox = Sandbox::default();
+        sandbox
+            .initialize(|| assemble_app(Ok(settings.clone()), &""))
+            .expect("should assemble the app");
+        let retained = retained_app(&sandbox).expect("should retain the app");
+        let counters = SandboxCounters::capture(&sandbox, 1, "request-example");
+        let inputs = FinalizeInputs {
+            settings: &settings,
+            geo: None,
+            counters: &counters,
+        };
+
+        // A routed response, which the finalize middleware finalizes, and a
+        // canonical 405, which only the entry point's finalize step reaches.
+        for (label, request) in [
+            (
+                "routed",
+                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
+            ),
+            (
+                "canonical 405",
+                FastlyRequest::new(FastlyMethod::TRACE, "https://publisher.example.com/"),
+            ),
+        ] {
+            let capture = WarningCapture::start();
+            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
+                request,
+                |_req, extensions| {
+                    extensions.insert(per_request_synthesized_headers(&settings, None));
+                    extensions.insert(RequestGeo::default());
+                },
+                |response: &mut HttpResponse| finalize_response(response, &inputs),
+                committed,
+            );
+            handle_delivery(delivery, &counters, |_state| {});
+
+            let skipped = capture
+                .take()
+                .into_iter()
+                .filter(|warning| warning.message.contains("`connection`"))
+                .count();
+            assert_eq!(
+                skipped, 1,
+                "should warn once about the skipped operator entry for the {label} request"
+            );
+        }
     }
 
     #[test]
