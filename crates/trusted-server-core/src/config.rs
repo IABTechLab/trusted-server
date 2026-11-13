@@ -345,27 +345,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
-    reject_providers_without_a_kind(&settings.ec)?;
     Ok(())
-}
-
-/// Rejects every enabled identity provider at deploy time.
-///
-/// This release registers no provider kind, so every runtime refuses to start
-/// with an enabled provider. Rejecting it here keeps a config push from
-/// taking a running service down. The provider-kind PR replaces this with a
-/// check of the registered kinds and the target adapter.
-fn reject_providers_without_a_kind(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
-    match ec.identity_providers.iter().find(|config| config.enabled) {
-        Some(config) => Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "ec.identity_providers: provider `{}` is enabled, but this release registers no \
-                 provider kinds; set `enabled = false`",
-                config.id
-            ),
-        })),
-        None => Ok(()),
-    }
 }
 
 /// Runs Trusted Server runtime validation after secret references are resolved.
@@ -1630,16 +1610,11 @@ gam_network_id = "99999"
     }
 
     #[test]
-    fn deploy_validation_rejects_an_enabled_provider_while_no_kind_is_registered() {
+    fn deploy_validation_accepts_an_enabled_provider() {
         let settings = settings_with_identity_provider(serde_json::json!({}));
 
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject an enabled provider at deploy time");
-
-        assert!(
-            err.to_string().contains("registers no provider kinds"),
-            "should explain why the provider is rejected: {err:?}"
-        );
+        validate_settings_for_deploy(&settings)
+            .expect("should accept an enabled provider; the CLI builds its kind");
     }
 
     #[test]

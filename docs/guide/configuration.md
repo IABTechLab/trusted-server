@@ -923,10 +923,11 @@ stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
 the EID-persistence purposes alone, so set it for any provider that has a TCF
 vendor ID.
 
-Identity providers run only on Fastly. This release registers no provider kind,
-so `ts config validate`, `push` and `diff` reject an enabled provider; keep
-`enabled = false` until a kind ships. The Axum, Cloudflare and Spin adapters
-refuse to start when an enabled provider is configured. On Fastly, an enabled
+Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
+build every enabled provider and reject one whose `kind` or `settings` is
+invalid. They do not know the target adapter: the Axum, Cloudflare and Spin
+adapters refuse to start when an enabled provider is configured, so do not push
+an enabled provider to those services. On Fastly, an enabled
 provider whose `kind` this build does not include, or whose `settings` its kind
 rejects, also fails startup. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
@@ -976,9 +977,6 @@ source_domain = "ids.example.com"
 [[ec.identity_providers]]
 id = "example-provider"
 kind = "example-kind"
-# This release registers no provider kind; an enabled provider fails deploy
-# validation and startup.
-enabled = false
 endpoint = "https://ids.example.com/v1/lookup"
 allowed_domains = ["ids.example.com"]
 sources = ["ids.example.com"]
