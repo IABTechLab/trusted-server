@@ -227,7 +227,7 @@ pull_sync_concurrency = 3
 # exactly one source; use the one LiveRamp gives you. Supports the Lockr
 # capability. Optional server lookup: with an `endpoint` (LiveRamp's ATS
 # envelope API, `/api/identity/v2/envelope`), a visitor without an envelope
-# cookie is looked up by Custom ID: the stable part of the EC ID, sent as
+# cookie is looked up by Custom ID: the full EC ID, sent as
 # `<custom_id_namespace>:<id>` with the visitor IP and consent. LiveRamp must
 # enable Custom ID for `placement_id` and approve the publisher origin; both
 # settings are required with an endpoint. LiveRamp resolves a Custom ID only

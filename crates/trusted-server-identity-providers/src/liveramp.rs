@@ -11,7 +11,7 @@
 //!
 //! With an `endpoint` (`LiveRamp`'s ATS envelope API, path
 //! `/api/identity/v2/envelope`), a visitor without an envelope cookie is looked up server side by Custom ID (`it=15`): the
-//! stable part of the EC ID, sent as `iv=<custom_id_namespace>:<id>` with
+//! full EC ID, sent as `iv=<custom_id_namespace>:<id>` with
 //! the placement ID, consent strings, the publisher `Origin` and the
 //! visitor's IP in `X-Forwarded-For`, as a server-to-server call
 //! (`atype=3`). `LiveRamp` must enable Custom ID for the placement, and it
@@ -234,7 +234,6 @@ impl IdentityProvider for LiveRampProvider {
             .ok_or_else(|| {
                 Report::new(ProviderError::Request).attach("liveramp needs a routable client IP")
             })?;
-        let stable_id = lookup.ec_id.split('.').next().unwrap_or(lookup.ec_id);
         let consent = lookup.consent;
         let mut url = envelope_lookup.endpoint.clone();
         {
@@ -244,7 +243,7 @@ impl IdentityProvider for LiveRampProvider {
                 .append_pair("it", CUSTOM_ID_TYPE)
                 .append_pair(
                     "iv",
-                    &format!("{}:{stable_id}", envelope_lookup.custom_id_namespace),
+                    &format!("{}:{}", envelope_lookup.custom_id_namespace, lookup.ec_id),
                 )
                 .append_pair("atype", SERVER_TO_SERVER);
             if let Some(tc_string) = &consent.raw_tc_string {
@@ -650,14 +649,14 @@ mod tests {
             pairs(&[
                 ("pid", "14"),
                 ("it", "15"),
-                ("iv", "ana-example:abc123"),
+                ("iv", "ana-example:abc123.suffix"),
                 ("atype", "3"),
                 ("ct", "4"),
                 ("cv", "CP_example"),
                 ("gpp", "DBA_example"),
                 ("gpp_sid", "2"),
             ]),
-            "should send the stable EC ID as the Custom ID with consent"
+            "should send the full EC ID as the Custom ID with consent"
         );
         assert_eq!(
             request.headers.get(ORIGIN).map(HeaderValue::as_bytes),
