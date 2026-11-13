@@ -3513,24 +3513,6 @@ impl Settings {
         Ok(())
     }
 
-    /// Warns that a live `creative_opportunities.origin_readthrough_enabled = true` is ignored.
-    ///
-    /// Origin readthrough is unavailable: the publisher origin is always fetched
-    /// with the ad-stack bypass or the platform default cache policy, as if the
-    /// setting were `false`. Validation rejects the setting, and a config that
-    /// predates the rejection keeps serving.
-    pub fn warn_ignored_origin_readthrough(&self) {
-        if self
-            .creative_opportunities
-            .as_ref()
-            .is_some_and(|config| config.origin_readthrough_enabled == Some(true))
-        {
-            log::warn!(
-                "creative_opportunities.origin_readthrough_enabled = true is ignored; origin readthrough is unavailable. Remove the setting before the next config push"
-            );
-        }
-    }
-
     /// Returns compiled creative opportunity slots when template delivery is enabled.
     #[must_use]
     pub fn creative_opportunity_slots(

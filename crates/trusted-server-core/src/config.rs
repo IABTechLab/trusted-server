@@ -350,7 +350,7 @@ pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
     warn_ignored_certificate_check(settings);
-    settings.warn_ignored_origin_readthrough();
+    warn_ignored_origin_readthrough(settings);
     for id in unknown_integration_ids(settings) {
         log::warn!(
             "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
@@ -461,6 +461,23 @@ fn warn_ignored_certificate_check(settings: &Settings) {
     if !settings.proxy.certificate_check {
         log::warn!(
             "proxy.certificate_check = false is ignored; origin TLS is always verified. Remove the setting before the next config push"
+        );
+    }
+}
+
+/// Warns that a live `creative_opportunities.origin_readthrough_enabled = true` is ignored.
+///
+/// Origin readthrough is unavailable: the publisher origin is always fetched
+/// with the ad-stack bypass or the platform default cache policy, as if the
+/// setting were `false`. A config that predates the rejection keeps serving.
+fn warn_ignored_origin_readthrough(settings: &Settings) {
+    if settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(|config| config.origin_readthrough_enabled == Some(true))
+    {
+        log::warn!(
+            "creative_opportunities.origin_readthrough_enabled = true is ignored; origin readthrough is unavailable. Remove the setting before the next config push"
         );
     }
 }
@@ -1768,6 +1785,42 @@ password = "production-admin-password-32-bytes"
                     && warning.message.contains("ignored")
             }),
             "should warn that certificate_check = false is ignored"
+        );
+    }
+
+    #[test]
+    fn runtime_ignores_origin_readthrough_with_warning() {
+        let mut settings = valid_settings();
+        let capture = LogCapture::start();
+        validate_settings_for_runtime(&settings)
+            .expect("should accept a config without origin readthrough at runtime");
+        assert!(
+            !capture
+                .take_all()
+                .iter()
+                .any(|record| record.message.contains("origin_readthrough_enabled")),
+            "should not warn when origin readthrough is unset"
+        );
+
+        settings.creative_opportunities = Some(
+            serde_json::from_value(serde_json::json!({
+                "gam_network_id": "12345",
+                "origin_readthrough_enabled": true,
+            }))
+            .expect("should build a readthrough creative opportunities config"),
+        );
+        validate_settings_for_runtime(&settings)
+            .expect("should keep serving a config that enables origin readthrough");
+
+        let warnings = capture.take_warnings();
+        assert!(
+            warnings.iter().any(|warning| {
+                warning
+                    .message
+                    .contains("creative_opportunities.origin_readthrough_enabled")
+                    && warning.message.contains("ignored")
+            }),
+            "should warn that origin readthrough is ignored"
         );
     }
 

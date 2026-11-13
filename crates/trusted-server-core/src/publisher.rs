@@ -29575,7 +29575,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
 
         #[tokio::test]
-        async fn runtime_treats_readthrough_as_false_with_warning() {
+        async fn runtime_treats_readthrough_as_false() {
             let mut settings = create_test_settings();
             settings.creative_opportunities = Some(
                 serde_json::from_value(serde_json::json!({
@@ -29583,15 +29583,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                     "origin_readthrough_enabled": true,
                 }))
                 .expect("should build a readthrough creative opportunities config"),
-            );
-            let capture = LogCapture::start();
-            settings.warn_ignored_origin_readthrough();
-            assert!(
-                capture.take_warnings().iter().any(|warning| {
-                    warning.message.contains("origin_readthrough_enabled")
-                        && warning.message.contains("ignored")
-                }),
-                "should warn that origin readthrough is ignored"
             );
             let fixture = OriginFixture::new(settings);
             fixture.reply(
