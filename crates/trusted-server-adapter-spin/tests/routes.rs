@@ -12,8 +12,11 @@
 use edgezero_adapter_spin::SPIN_PLATFORM;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
-use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
+use edgezero_core::http::{
+    HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+};
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
@@ -22,6 +25,7 @@ use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::insert_outbound_client;
 use trusted_server_core::test_support::logging::LogCapture;
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
@@ -1215,63 +1219,44 @@ fn publisher_get(path: &str) -> Request {
         .expect("should build publisher request")
 }
 
-/// An identity HTML document exactly `len` bytes long.
-fn html_document(len: usize) -> Vec<u8> {
-    let mut document = b"<html><body>".to_vec();
-    document.resize(len - b"</body></html>".len(), b'a');
-    document.extend_from_slice(b"</body></html>");
-    document
+/// Sends a publisher GET for `path` that accepts gzip through `router`, with
+/// `origin` as its outbound client.
+async fn fetch_publisher(router: RouterService, origin: &ScriptedHttpClient, path: &str) -> Served {
+    let mut request = publisher_get(path);
+    request
+        .headers_mut()
+        .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    Served::from_router_response(route_to_origin(router, request, origin).await)
 }
 
-/// Asserts that an origin body of [`SPIN_INPUT_CAP`] bytes is served and one
-/// byte more fails with 502 before egress.
-async fn assert_spin_input_cap(content_type: &str, body: fn(usize) -> Vec<u8>) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_spin() {
     let origin = ScriptedHttpClient::new(&TestClock::new());
-    for (path, len) in [
-        ("/at-cap", SPIN_INPUT_CAP),
-        ("/over-cap", SPIN_INPUT_CAP + 1),
-    ] {
-        origin.respond_to(
-            Method::GET,
-            &format!("{ORIGIN}{path}"),
-            ScriptedReply::status(StatusCode::OK)
-                .header("content-type", content_type)
-                .body(body(len)),
-        );
-    }
 
-    let at_cap = route_to_origin(test_router(), publisher_get("/at-cap"), &origin).await;
-    assert_eq!(
-        at_cap.status(),
-        StatusCode::OK,
-        "should serve a {content_type} body at the cap"
-    );
-    let served = at_cap
-        .into_body()
-        .into_bytes()
-        .expect("should buffer the at-cap body");
-    assert!(
-        served.len() >= SPIN_INPUT_CAP,
-        "should serve the whole {content_type} body at the cap, got {} bytes",
-        served.len()
-    );
-
-    let over_cap = route_to_origin(test_router(), publisher_get("/over-cap"), &origin).await;
-    assert_eq!(
-        over_cap.status(),
-        StatusCode::BAD_GATEWAY,
-        "should fail a {content_type} body one byte over the cap with 502"
-    );
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        SPIN_INPUT_CAP,
+        ResponseDecoding::Original,
+        |path| fetch_publisher(test_router(), &origin, path),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_body_at_cap_passes_and_one_over_fails_502_spin() {
-    assert_spin_input_cap("application/octet-stream", |len| vec![b'x'; len]).await;
-}
+async fn processed_output_keeps_its_own_bound_spin() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identity_html_at_cap_passes_and_one_over_fails_502_spin() {
-    assert_spin_input_cap("text/html", html_document).await;
+    publisher_input_cap::assert_output_bound(&origin, |path| {
+        fetch_publisher(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build router from output-bound settings"),
+            &origin,
+            path,
+        )
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

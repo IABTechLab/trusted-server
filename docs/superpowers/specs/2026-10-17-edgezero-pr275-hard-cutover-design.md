@@ -2299,20 +2299,37 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
     outbound scope" from `attach`. This pins the construction rule, not just
     the outcome.
 21. **Publisher input caps (2.5).** On Axum, Cloudflare, and Spin,
-    `buffer_publisher_response_async` returns raw `Buffered` responses with
-    buffered bodies. With `max_buffered_body_bytes` at its 16 MiB
-    default, each adapter's `cap` holds for every classification:
-    - A raw body at `cap` passes. One byte over it fails with 502 before
-      egress, and so does a source error mid-body.
-    - Identity HTML that is processed passes at `cap` and fails with 502 before
-      egress one byte over it: 10 MiB on Cloudflare and 8 MiB on Spin.
-    - Gzip HTML whose encoded size is under `cap` but whose decoded size
-      exceeds it fails with 502 before egress.
-    - The processed output still fails at its own `max_buffered_body_bytes`
-      cap when a rewrite grows past it.
-      Gap: coverage is partial. Axum covers only the raw case. The decoded size
-      over `cap` is tested only on Cloudflare and in core, a source error
-      mid-body only in core, and no test covers a raw `Buffered` body at `cap`.
+    `buffer_publisher_response_async` collects every classification before
+    egress. One matrix, `test_support::publisher_input_cap`, runs through each
+    adapter's handler and finalizer: Axum's over loopback HTTP, and
+    Cloudflare's and Spin's through the router. With
+    `max_buffered_body_bytes` at its 16 MiB default, `cap` is 16 MiB on Axum,
+    10 MiB on Cloudflare, and 8 MiB on Spin:
+    - A raw body at `cap` is served byte for byte, and one byte over it fails
+      with 502 before egress. Both raw routes are covered: a 200 that cannot be
+      processed takes `ResponseRoute::PassThrough`, and a 404 that cannot be
+      processed takes `ResponseRoute::BufferedUnmodified`.
+    - A source error after part of the body fails with 502 before egress on
+      both raw routes and on processed HTML, and none of the partial body is
+      served.
+    - Identity HTML and gzip HTML that decode to `cap` bytes are processed with
+      every origin byte kept, and one decoded byte more fails with 502 before
+      egress. The over-cap gzip page is far under `cap` encoded, so only its
+      decoded size fails it. A gzip raw body is capped once decoded on
+      Cloudflare (`Decode`), and is relayed in its coding on Axum and Spin
+      (`Original`). A gzip raw body whose encoded bytes exceed `cap` fails with
+      502 though it decodes under `cap`, because the origin request caps the
+      encoded bytes too.
+    - The pages link to the origin, and the rewrite shortens each link by more
+      than the injected markup adds. The at-cap page therefore processes to
+      fewer than `cap` bytes, and only the input cap can fail the longer one.
+    - The processed output keeps its own bound. With `max_buffered_body_bytes`
+      at 64 KiB, a page one byte under it fails with 502 once the injected
+      markup grows it past the bound, and a raw body of the same length is
+      relayed.
+
+    Fastly streams the response with no input cap, so test 21 does not apply
+    there.
 
 Fastly differences items 16 and 17 are EdgeZero ingress and forwarding
 behavior. No Trusted Server test covers them.

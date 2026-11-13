@@ -15,14 +15,14 @@ use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_adapter_axum::test_utils::AxumTestServer;
 use edgezero_core::app::App;
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
-use trusted_server_core::test_support::scripted_client::{
-    ScriptedHttpClient, ScriptedReply, TestClock,
-};
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
+use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -149,6 +149,37 @@ impl TestServer {
     /// Serves the router built from the default test settings.
     async fn with_test_settings() -> Self {
         Self::start(test_settings()).await
+    }
+
+    /// Sends a publisher GET for `path` on the test publisher host that
+    /// accepts gzip, and reads the whole response.
+    async fn fetch_publisher(&self, path: &str) -> Served {
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.request("GET", path)
+                .header("host", "test-publisher.example.com")
+                .header("accept-encoding", "gzip")
+                .send(),
+        )
+        .await
+        .expect("should answer promptly")
+        .expect("should respond");
+        let status = response.status().as_u16();
+        let content_encoding = response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .expect("should read the publisher body")
+            .to_vec();
+        Served {
+            status,
+            content_encoding,
+            body,
+        }
     }
 
     /// Starts a request for `path` on the served app.
@@ -1311,34 +1342,27 @@ async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
     server.assert_no_outbound_requests();
 }
 
-/// Origin of [`test_settings`].
-const ORIGIN: &str = "https://origin.test-publisher.example.com";
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_axum() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    let server = TestServer::with_origin(test_settings(), origin.clone()).await;
+
+    // Axum's cap is `max_buffered_body_bytes` alone, 16 MiB by default.
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        test_settings().publisher.max_buffered_body_bytes,
+        ResponseDecoding::Original,
+        |path| server.fetch_publisher(path),
+    )
+    .await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_body_at_cap_passes_and_one_over_fails_502_axum() {
-    // Axum's cap is `max_buffered_body_bytes` alone, 16 MiB by default.
-    let cap = test_settings().publisher.max_buffered_body_bytes;
+async fn processed_output_keeps_its_own_bound_axum() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
     let origin = ScriptedHttpClient::new(&TestClock::new());
-    for (path, len) in [("/at-cap.bin", cap), ("/over-cap.bin", cap + 1)] {
-        origin.respond_to(
-            edgezero_core::http::Method::GET,
-            &format!("{ORIGIN}{path}"),
-            ScriptedReply::status(edgezero_core::http::StatusCode::OK)
-                .header("content-type", "application/octet-stream")
-                .body(vec![b'x'; len]),
-        );
-    }
-    let server = TestServer::with_origin(test_settings(), origin).await;
+    let server = TestServer::with_origin(settings, origin.clone()).await;
 
-    let at_cap = send(server.request("GET", "/at-cap.bin")).await;
-    assert_eq!(at_cap.status(), 200, "should serve a raw body at the cap");
-    let body = at_cap.bytes().await.expect("should read the at-cap body");
-    assert_eq!(body.len(), cap, "should serve every byte at the cap");
-
-    let over_cap = send(server.request("GET", "/over-cap.bin")).await;
-    assert_eq!(
-        over_cap.status(),
-        502,
-        "should fail a raw body one byte over the cap with 502 before egress"
-    );
+    publisher_input_cap::assert_output_bound(&origin, |path| server.fetch_publisher(path)).await;
 }
