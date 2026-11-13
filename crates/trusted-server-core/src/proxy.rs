@@ -5,9 +5,9 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::error::EdgeError;
 use edgezero_core::ingress::RequestIngress;
 use edgezero_core::outbound::{
-    OutboundFollowFailure, OutboundImageOptimizerOptions, OutboundRedirectAction,
-    OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest, OutboundResponse,
-    ResponseDecoding,
+    OutboundCachePolicy, OutboundFollowFailure, OutboundImageOptimizerOptions,
+    OutboundRedirectAction, OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest,
+    OutboundResponse, ResponseDecoding,
 };
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -1006,7 +1006,7 @@ fn apply_asset_origin_auth(
 ///
 /// A `GET` streams its response under the 60 s streamed timeout. Any other method,
 /// the S3 `HEAD` preflight included, buffers its response under the 15 s buffered
-/// timeout. Both keep the origin's content coding and the default cache policy,
+/// timeout. Both keep the origin's content coding and the selected cache policy,
 /// and `image_optimizer` options go on the request as given.
 ///
 /// `outbound_headers` may carry the signer's `Host` input. `EdgeZero` drops that
@@ -1023,6 +1023,7 @@ async fn send_asset_origin_request(
     target_url: &url::Url,
     outbound_headers: &http::HeaderMap,
     image_optimizer: Option<OutboundImageOptimizerOptions>,
+    cache_policy: OutboundCachePolicy,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let failed = || TrustedServerError::Proxy {
         message: "Failed to proxy asset request".to_string(),
@@ -1030,6 +1031,7 @@ async fn send_asset_origin_request(
     let mut request = outbound_request(method.clone(), target_url.as_str())
         .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
     *request.headers_mut() = outbound_headers.clone();
+    request = request.cache_policy(cache_policy);
     if let Some(options) = image_optimizer {
         request = request.image_optimizer(options);
     }
@@ -1099,8 +1101,16 @@ async fn preflight_s3_origin_for_image_optimizer(
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
-    let head_response =
-        send_asset_origin_request(services, &Method::HEAD, target_url, &head_headers, None).await?;
+    // A cache miss must not change HEAD to GET after SigV4 signing.
+    let head_response = send_asset_origin_request(
+        services,
+        &Method::HEAD,
+        target_url,
+        &head_headers,
+        None,
+        OutboundCachePolicy::Bypass,
+    )
+    .await?;
     let head_status = head_response.response().status();
     if head_status.is_success() || head_status == StatusCode::NOT_MODIFIED {
         return Ok(None);
@@ -1116,8 +1126,15 @@ async fn preflight_s3_origin_for_image_optimizer(
 
     let mut get_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
-    let mut response =
-        send_asset_origin_request(services, &Method::GET, target_url, &get_headers, None).await?;
+    let mut response = send_asset_origin_request(
+        services,
+        &Method::GET,
+        target_url,
+        &get_headers,
+        None,
+        OutboundCachePolicy::Bypass,
+    )
+    .await?;
     strip_asset_proxy_response_headers(response.response_mut());
     response.apply_no_store_private_policy();
 
@@ -1201,12 +1218,23 @@ pub async fn handle_asset_proxy_request(
         apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
+    // Raw signed HEAD must reach the origin unchanged. Image Optimizer requests
+    // keep normal caching because Fastly pass would disable optimization.
+    let cache_policy = if req.method() == Method::HEAD
+        && image_optimizer.is_none()
+        && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
+    {
+        OutboundCachePolicy::Bypass
+    } else {
+        OutboundCachePolicy::PlatformDefault
+    };
     let mut response = send_asset_origin_request(
         services,
         req.method(),
         &target_url,
         &outbound_headers,
         image_optimizer,
+        cache_policy,
     )
     .await?;
     strip_asset_proxy_response_headers(response.response_mut());
@@ -5784,7 +5812,10 @@ mod tests {
                 vec![S3_OBJECT, S3_OBJECT],
                 "should strip transform query from both S3 requests"
             );
-            requests[0].assert_transport(asset_head_transport());
+            requests[0].assert_transport(ExpectedTransport {
+                cache_policy: OutboundCachePolicy::Bypass,
+                ..asset_head_transport()
+            });
             requests[1].assert_image_optimizer_transport(transport, &medium_profile_options());
         }
     }
@@ -5885,8 +5916,14 @@ mod tests {
             vec![Method::HEAD, Method::GET],
             "should fetch S3 error body after failed HEAD preflight"
         );
-        requests[0].assert_transport(asset_head_transport());
-        requests[1].assert_transport(asset_get_transport());
+        requests[0].assert_transport(ExpectedTransport {
+            cache_policy: OutboundCachePolicy::Bypass,
+            ..asset_head_transport()
+        });
+        requests[1].assert_transport(ExpectedTransport {
+            cache_policy: OutboundCachePolicy::Bypass,
+            ..asset_get_transport()
+        });
     }
 
     #[test]
@@ -5935,6 +5972,96 @@ mod tests {
             vec![Method::HEAD],
             "should answer a HEAD from its failed preflight alone"
         );
+    }
+
+    #[test]
+    fn asset_proxy_preserves_upstream_signed_s3_raw_cache_rules() {
+        for case in [
+            "svg",
+            "svgz",
+            "rewritten_svg",
+            "debug",
+            "disabled_io",
+            "absent_io",
+        ] {
+            for (method, signed) in [
+                (Method::HEAD, true),
+                (Method::GET, true),
+                (Method::HEAD, false),
+                (Method::GET, false),
+            ] {
+                let (_clock, client, services) = scripted_services();
+                let mut route = test_s3_image_optimizer_route();
+                let (path, query, origin_path) = match case {
+                    "svg" => ("logo.svg", "?profile=medium", "logo.svg"),
+                    "svgz" => ("logo.svgz", "?profile=medium", "logo.svgz"),
+                    "rewritten_svg" => {
+                        route.path_pattern = Some("^/\\.images/(.*)\\.png$".to_owned());
+                        route.target_path = Some("/.images/$1.svg".to_owned());
+                        ("logo.png", "?profile=medium", "logo.svg")
+                    }
+                    "debug" => ("foo.jpg", "?profile=medium&_io_debug=1", "foo.jpg"),
+                    "disabled_io" => {
+                        route
+                            .image_optimizer
+                            .as_mut()
+                            .expect("should configure IO")
+                            .enabled = false;
+                        ("foo.jpg", "?profile=medium", "foo.jpg")
+                    }
+                    _ => {
+                        route.image_optimizer = None;
+                        ("foo.jpg", "", "foo.jpg")
+                    }
+                };
+                if !signed {
+                    route.auth = None;
+                }
+                let origin_query = if route.origin_query_policy() == OriginQueryPolicy::Preserve {
+                    query
+                } else {
+                    ""
+                };
+                client.respond_to(
+                    method.clone(),
+                    &format!(
+                        "https://examplebucket.s3.example.com/.images/{origin_path}{origin_query}"
+                    ),
+                    ScriptedReply::status(StatusCode::OK),
+                );
+                let request = build_http_request(
+                    method.clone(),
+                    format!("https://www.example.com/.images/{path}{query}"),
+                );
+                let response = futures::executor::block_on(handle_asset_proxy_request(
+                    &image_optimizer_settings(test_profile_set()),
+                    &services,
+                    request,
+                    &route,
+                ))
+                .expect("should preserve the upstream raw asset behavior");
+                assert_eq!(
+                    response.cache_policy(),
+                    AssetProxyCachePolicy::OriginControlled
+                );
+                let requests = client.requests();
+                assert_eq!(requests.len(), 1, "should not preflight a raw {case} asset");
+                assert_eq!(requests[0].method, method);
+                assert!(
+                    requests[0].image_optimizer.is_none(),
+                    "should not attach IO for {case}"
+                );
+                assert_eq!(
+                    requests[0].cache_policy,
+                    if signed && method == Method::HEAD {
+                        OutboundCachePolicy::Bypass
+                    } else {
+                        OutboundCachePolicy::PlatformDefault
+                    },
+                    "should retain signed HEAD bypass without disabling raw GET or unsigned HEAD caching for {case}"
+                );
+            }
+        }
     }
 
     /// Proxies `uri` through `route` and returns the one origin request it sent.

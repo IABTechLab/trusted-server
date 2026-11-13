@@ -329,7 +329,7 @@ fn test_ec_lifecycle_fastly() {
 
     // Verify the post-cutover router is active before route-level scenarios.
     common::ec::assert_edgezero_entry_point(&process.base_url)
-        .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
+        .expect("should answer TRACE with a router-level 405 carrying the version headers");
 
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
@@ -1005,6 +1005,15 @@ fn origin_request_path(request: &OriginRequest) -> &str {
     request.path.split('?').next().unwrap_or_default()
 }
 
+/// The path and query of a signed `href` from `/first-party/sign`.
+///
+/// The route answers with an absolute URL on `publisher.public_origin`, which
+/// need not be the runtime's listener, so callers resend it to their own base URL.
+fn signed_href_path_and_query(href: &str) -> String {
+    let url = url::Url::parse(href).expect("should return an absolute signed href");
+    url[url::Position::BeforePath..url::Position::AfterQuery].to_owned()
+}
+
 /// Signs `target` through the binary's `/first-party/sign` route and fetches
 /// the first-party proxy URL it returns.
 fn fetch_signed_proxy_url(
@@ -1025,9 +1034,9 @@ fn fetch_signed_proxy_url(
         .as_str()
         .expect("should return the first-party proxy href");
     client
-        .get(href)
+        .get(format!("{base_url}{}", signed_href_path_and_query(href)))
         .send()
-        .expect("should fetch the absolute first-party proxy URL")
+        .expect("should send the first-party proxy request")
 }
 
 #[test]
@@ -2740,7 +2749,7 @@ fn first_party_proxy_html_creative_keeps_br_fastly() {
                 .as_str()
                 .expect("should return the first-party proxy href");
             let response = client
-                .get(href)
+                .get(format!("{base_url}{}", signed_href_path_and_query(href)))
                 .header("accept-encoding", "br")
                 .send()
                 .expect("should fetch the proxied creative");
@@ -2862,16 +2871,7 @@ fn realistic_first_party_proxy_request_is_admitted(
     let href = signed["href"]
         .as_str()
         .expect("should return the first-party proxy href");
-    let serving_origin = reqwest::Url::parse(base_url).expect("should parse the serving origin");
-    let proxy_url = serving_origin
-        .join(href)
-        .expect("should resolve the signed first-party proxy URL");
-    assert_eq!(
-        proxy_url.origin(),
-        serving_origin.origin(),
-        "should sign a first-party URL at the configured serving origin"
-    );
-    let mut request = client.get(proxy_url);
+    let mut request = client.get(format!("{base_url}{}", signed_href_path_and_query(href)));
     for index in 0..REALISTIC_HEADER_COUNT {
         request = request.header(
             format!("x-example-{index:02}"),

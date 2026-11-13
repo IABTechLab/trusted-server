@@ -27,7 +27,9 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
 };
 use trusted_server_core::edge_app::synthesized_response_headers;
+use trusted_server_core::error::http_error;
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::response_privacy::warn_skipped_operator_response_headers;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::version_header::apply_git_version_header;
 
@@ -108,12 +110,12 @@ impl Middleware for FinalizeResponseMiddleware {
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
 /// - `Err(report)` → internal error; log and convert to an HTTP response via
-///   [`crate::app::http_error`] using the error's documented status code.
+///   [`http_error`] using the error's documented status code.
 ///
 /// # Errors
 ///
 /// When [`enforce_basic_auth`] returns an error report, converts it to an HTTP
-/// response via [`crate::app::http_error`] (preserving the error's status code)
+/// response via [`http_error`] (preserving the error's status code)
 /// so that [`FinalizeResponseMiddleware`] can still inject standard TS headers
 /// before the response reaches the client.
 pub struct AuthMiddleware {
@@ -135,7 +137,7 @@ impl Middleware for AuthMiddleware {
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
+                return Ok(http_error(&report));
             }
         }
 
@@ -193,6 +195,9 @@ pub(crate) fn resolve_geo_for_response<'geo>(
 /// 5. `settings.response_headers` — operator-configured overrides, except the
 ///    cache-controlling headers are skipped on uncacheable (`private`/`no-store`)
 ///    responses so operators cannot re-enable shared caching for per-user payloads
+///
+/// Operator entries that are never sent are skipped without a log here.
+/// [`per_request_synthesized_headers`] warns about them once per request.
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_info: Option<&GeoInfo>,
@@ -271,10 +276,15 @@ pub(crate) fn version_synthesized_headers(service_version: Option<&str>) -> Head
 /// not portable, such as a geo city with accents, is left out with a warning.
 /// When the rest still exceeds the set's bounds, only
 /// [`version_synthesized_headers`] remain, and the bound is logged.
+///
+/// The entry point builds this set once for every request, so it also warns
+/// about each operator entry the finalize headers skip. [`apply_finalize_headers`]
+/// skips them silently, so a routed response does not warn a second time.
 pub(crate) fn per_request_synthesized_headers(
     settings: &Settings,
     geo: Option<&GeoInfo>,
 ) -> SynthesizedResponseHeaders {
+    warn_skipped_operator_response_headers(settings);
     let mut finalized = Response::new(Body::empty());
     apply_finalize_headers(settings, geo, &mut finalized);
     let mut fields = HeaderMap::new();
