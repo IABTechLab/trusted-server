@@ -2,7 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -16,13 +16,14 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -37,15 +38,13 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
 
 use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::build_runtime_services;
+use crate::startup::NativeStoreSnapshot;
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -57,25 +56,6 @@ pub struct AppState {
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
     services: Option<RuntimeServices>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
-        &AxumPlatformConfigStore,
-        &AxumPlatformSecretStore,
-        &store_name,
-        &config_key,
-        &trusted_server_core::settings_data::default_secret_store_name(),
-    )?;
-    build_state_with_settings(settings)
 }
 
 /// Build the application state from explicit settings.
@@ -588,12 +568,26 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let state = build_state().map_err(|report| {
-            log::error!("{report:?}");
-            startup_error(&report)
-        })?;
+        // The prepared-store initializer installs the complete router before listening.
+        Ok(RouterService::builder().build())
+    }
 
-        Ok(router_builder(&state).build())
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+            kv: None,
+        }
+    }
+
+    fn owns_logging() -> bool {
+        true
     }
 }
 
@@ -677,6 +671,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let forwarder_settings = Arc::clone(&state.settings);
 
     let mut router = RouterService::builder()
+        .with_state(Arc::new(NativeStoreSnapshot::empty()))
         .received_head_preparer(move |headers, extensions| {
             if extensions
                 .get::<trusted_server_core::forwarder::ForwarderPreparation>()

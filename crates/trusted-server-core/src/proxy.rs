@@ -3,6 +3,7 @@ use crate::http_util::{
 };
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::error::EdgeError;
+use edgezero_core::ingress::RequestIngress;
 use edgezero_core::outbound::{
     OutboundCachePolicy, OutboundFollowFailure, OutboundImageOptimizerOptions,
     OutboundRedirectAction, OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest,
@@ -1472,21 +1473,20 @@ pub async fn handle_first_party_proxy_sign(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
     let req_url = req.uri().to_string();
-    // Capture the request's own scheme before the body is consumed: a
-    // protocol-relative sign target inherits it.
-    //
-    // Prefer the authenticated public scheme, then the URI's explicit scheme
-    // for direct requests, and fall back to runtime ingress/TLS metadata. Avoid
-    // using the parsed request target: origin-form URIs — what browsers send and the Axum
-    // adapter forwards verbatim — have no scheme of their own, so parsing would
-    // hand back the placeholder base's `https` and make an HTTP dev server sign
-    // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = match crate::forwarder::public_origin(req.extensions())
-        .map(|origin| origin.scheme.clone())
-        .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
-    {
-        Some(scheme) => scheme,
-        None => RequestInfo::from_request(&req, _services.client_info())?.scheme,
+    // Managed ingress owns origin evidence, including an explicitly unavailable
+    // origin. A raw absolute target must not fill that gap. RequestInfo keeps
+    // authenticated publisher forwarding ahead of transport/TLS facts.
+    // Only legacy callers without ingress metadata use an explicit URI scheme.
+    let request_scheme = if req.extensions().get::<RequestIngress>().is_some() {
+        RequestInfo::from_request(&req, _services.client_info())?.scheme
+    } else {
+        match crate::forwarder::public_origin(req.extensions())
+            .map(|origin| origin.scheme.clone())
+            .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
+        {
+            Some(scheme) => scheme,
+            None => RequestInfo::from_request(&req, _services.client_info())?.scheme,
+        }
     };
 
     let payload = if method == Method::POST {
@@ -2045,6 +2045,10 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
     use edgezero_core::outbound::{
         OutboundCachePolicy, OutboundCropFocus, OutboundImageFormat, OutboundImageOptimizerOptions,
         OutboundImageOptimizerRegion, OutboundResizeFilter, ResponseDecoding, ResponseMode,
@@ -2640,6 +2644,43 @@ mod tests {
                 assert!(
                     json.contains(&format!("\"base\":\"{expected}://cdn.example/asset.js\"")),
                     "request `{uri}` should sign a {expected} target: {json}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn checked_ingress_proxy_sign_overrides_absolute_request_target_scheme() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            for (wire_scheme, transport_scheme, checked_scheme) in [
+                ("https", Some("http"), "http"),
+                ("http", Some("https"), "https"),
+                ("https", None, "http"),
+            ] {
+                let body = serde_json::json!({ "url": "//cdn.example/asset.js" });
+                let mut req = build_http_post_json_request(
+                    format!("{wire_scheme}://edge.example/first-party/sign"),
+                    &body,
+                );
+                let origin = transport_scheme.map(|scheme| {
+                    InboundOrigin::parse(scheme, "edge.example", OriginSource::TransportBinding)
+                        .expect("should validate the adapter-owned origin")
+                });
+                req.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    origin,
+                    HeaderFidelity::default(),
+                ));
+                let response = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect("should sign using checked ingress metadata");
+                let json = response_body_string(response);
+                assert!(
+                    json.contains(&format!(
+                        "\"base\":\"{checked_scheme}://cdn.example/asset.js\""
+                    )),
+                    "should not let an absolute request target override checked transport: {json}"
                 );
             }
         });

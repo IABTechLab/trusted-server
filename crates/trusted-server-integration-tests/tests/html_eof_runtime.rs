@@ -276,18 +276,19 @@ impl<'a> Harness<'a> {
         match adapter {
             "axum" => {
                 command = self.command(artifact);
-                command.env("PORT", port.to_string()).env(
-                    "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
-                    envelope,
-                );
-                for (key, value) in config::SECRETS {
-                    command.env(
-                        format!(
-                            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_{}",
-                            key.to_uppercase()
-                        ),
-                        value,
+                command
+                    .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
+                    .env("EDGEZERO__ADAPTER__PORT", port.to_string())
+                    .env(
+                        "EDGEZERO__ADAPTER__CONFIG_DIR",
+                        self.workspace.join(".edgezero"),
+                    )
+                    .env(
+                        "EDGEZERO__ADAPTER__DATA_DIR",
+                        self.workspace.join(".edgezero"),
                     );
+                for (key, value) in config::SECRETS {
+                    command.env(format!("EDGEZERO__SECRETS__{}", key.to_uppercase()), value);
                 }
             }
             "cloudflare" => {

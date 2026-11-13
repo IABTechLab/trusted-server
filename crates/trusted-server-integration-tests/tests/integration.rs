@@ -2176,8 +2176,10 @@ fn axum_invalid_ingress_variable_fails_startup() {
     let envelope = common::config::integration_app_config_envelope(origin_port())
         .expect("should build the integration app config");
     let port = environments::find_available_port().expect("should reserve a port");
-    let mut child = environments::axum::AxumDevServer
+    let (mut command, _workspace) = environments::axum::AxumDevServer
         .command(&envelope, port)
+        .expect("should prepare isolated native config");
+    let mut child = command
         .env("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT", "0")
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
