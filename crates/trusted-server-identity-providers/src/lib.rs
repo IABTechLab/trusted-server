@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn only_liveramp_sends_the_ec_id() {
+    fn only_liveramp_with_an_endpoint_sends_the_ec_id() {
         for (kind, endpoint, sources, settings) in [
             (
                 "id5",
@@ -344,6 +344,12 @@ mod tests {
                 json!({ "resolve": ["nonId"] }),
             ),
             ("liveramp", None, json!(["liveramp.example.com"]), json!({})),
+            (
+                "liveramp",
+                Some("https://lr.example.com/api/identity/v2/envelope"),
+                json!(["liveramp.example.com"]),
+                json!({ "placement_id": 1, "custom_id_namespace": "ns-example" }),
+            ),
             (
                 "connectid",
                 None,
@@ -360,11 +366,12 @@ mod tests {
                 json!({}),
             ),
         ] {
+            let has_endpoint = endpoint.is_some();
             let config: IdentityProviderConfig = serde_json::from_value(json!({
                 "id": kind,
                 "kind": kind,
                 "endpoint": endpoint,
-                "allowed_domains": ["id5.example.com", "li.example.com"],
+                "allowed_domains": ["id5.example.com", "li.example.com", "lr.example.com"],
                 "sources": sources,
                 "settings": settings,
             }))
@@ -375,8 +382,8 @@ mod tests {
 
             assert_eq!(
                 built.sends_ec_id(),
-                kind == "liveramp",
-                "should send the EC ID only from LiveRamp, checked {kind}"
+                kind == "liveramp" && has_endpoint,
+                "should send the EC ID only from LiveRamp with an endpoint, checked {kind} (endpoint: {has_endpoint})"
             );
         }
     }

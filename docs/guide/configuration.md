@@ -1044,22 +1044,24 @@ This build includes the kinds below. Use the endpoint, sources and TCF vendor
 ID each vendor gives you; `trusted-server.example.toml` has a commented example
 of each.
 
-| `kind`       | Server call                                 | First page view | Default `cookie_names`      | Lockr | `atype` | Kept for                                                      |
-| ------------ | ------------------------------------------- | --------------- | --------------------------- | ----- | ------- | ------------------------------------------------------------- |
-| `id5`        | Fetch (`/gs/v2`) when no cookie holds an ID | Yes             | `id5id`                     | Yes   | 1       | Reply's `cache_control.max_age_sec`, else 24 hours (1 h–30 d) |
-| `liveintent` | Identity exchange                           | Yes             | `_lc2_fpi` (sent as `duid`) | No    | 3       | Reply's `Expires`, else 24 hours (1 h–30 d)                   |
-| `liveramp`   | Optional envelope lookup by Custom ID       | No              | `_lr_env`, `idl_env`        | Yes   | 3       | 15 days                                                       |
-| `connectid`  | None                                        | Yes             | `connectId`                 | No    | 3       | Cookie's `lastSynced` + `ttl`, at most 14 days                |
-| `uid2`       | Optional token refresh                      | Yes             | `__uid2_advertising_token`  | Yes   | 3       | Token's `identity_expires`, else 24 hours                     |
-| `sharedid`   | None                                        | Yes             | `_sharedid`, `_pubcid`      | No    | 1       | 24 hours; a generated ID 30 days                              |
-| `criteo`     | None                                        | Yes             | `cto_bidid`                 | No    | 1       | 24 hours                                                      |
-| `unifiedid`  | None                                        | Yes             | `pbjs-unifiedid`            | No    | 1       | 24 hours                                                      |
+| `kind`       | Server call                                 | First page view    | Default `cookie_names`      | Lockr | `atype` | Kept for                                                      |
+| ------------ | ------------------------------------------- | ------------------ | --------------------------- | ----- | ------- | ------------------------------------------------------------- |
+| `id5`        | Fetch (`/gs/v2`) when no cookie holds an ID | Yes                | `id5id`                     | Yes   | 1       | Reply's `cache_control.max_age_sec`, else 24 hours (1 h–30 d) |
+| `liveintent` | Identity exchange                           | Yes                | `_lc2_fpi` (sent as `duid`) | No    | 3       | Reply's `Expires`, else 24 hours (1 h–30 d)                   |
+| `liveramp`   | Optional envelope lookup by Custom ID       | Without `endpoint` | `_lr_env`, `idl_env`        | Yes   | 3       | 15 days                                                       |
+| `connectid`  | None                                        | Yes                | `connectId`                 | No    | 3       | Cookie's `lastSynced` + `ttl`, at most 14 days                |
+| `uid2`       | Optional token refresh                      | Yes                | `__uid2_advertising_token`  | Yes   | 3       | Token's `identity_expires`, else 24 hours                     |
+| `sharedid`   | None                                        | Yes                | `_sharedid`, `_pubcid`      | No    | 1       | 24 hours; a generated ID 30 days                              |
+| `criteo`     | None                                        | Yes                | `cto_bidid`                 | No    | 1       | 24 hours                                                      |
+| `unifiedid`  | None                                        | Yes                | `pbjs-unifiedid`            | No    | 1       | 24 hours                                                      |
 
-**First page view.** Every kind except `liveramp` runs on the navigation that
-mints the EC, within `identity_budget_ms`, and its results go into the write
-that creates the row: none of them sends the EC ID to the vendor. `liveramp`
-can send the EC ID as its Custom ID, so it is not run until the next
-navigation, even for its cookie reads. Kinds without a server call read their
+**First page view.** Every kind runs on the navigation that mints the EC,
+within `identity_budget_ms`, and its results go into the write that creates the
+row, as long as it does not send the EC ID to the vendor. The one exception is
+`liveramp` with an `endpoint`: its envelope lookup sends the EC ID as its
+Custom ID, so it is not run until the next navigation, even for its cookie
+reads. Without an `endpoint`, `liveramp` only reads cookies and runs on the
+first page view like the others. Kinds without a server call read their
 first-party cookie, so on the first page view their IDs come only from that
 cookie. In practice the first page's own auction carries no provider IDs;
 they reach bid requests from the next page load.
