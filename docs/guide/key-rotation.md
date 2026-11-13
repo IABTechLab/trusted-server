@@ -244,7 +244,34 @@ You should see a JWKS response with your public keys.
 
 ## Rotating Keys
 
-### Using the Rotation Endpoint
+### Using the `ts` CLI (Recommended)
+
+`ts keys rotate` calls the rotation endpoint for you. It reads the admin
+password from `TRUSTED_SERVER_ADMIN_PASSWORD`, never from a flag, so the
+password stays out of shell history and `ps` output. `--service` must be an
+HTTPS base URL (plain HTTP is accepted only for loopback development), and
+`--username` defaults to `admin`.
+
+```bash
+# Read the password without echoing it
+read -rs TRUSTED_SERVER_ADMIN_PASSWORD && export TRUSTED_SERVER_ADMIN_PASSWORD
+
+# Let Trusted Server generate a date-based key ID
+ts keys rotate --service https://edge.example.com
+
+# Or supply a custom key ID
+ts keys rotate --service https://edge.example.com --kid production-2024-q1
+```
+
+The command prints the new kid, the previous kid and the active kids. A
+refused rotation (for example an invalid kid) exits non-zero and prints the
+server's `error` field.
+
+### Using the Rotation Endpoint with curl
+
+Use curl only when the `ts` CLI is unavailable. Add your admin Basic-auth
+credentials to each request; prefer a `--netrc-file` over `-u user:password`
+so the password does not land in shell history.
 
 **Endpoint**: `POST /_ts/admin/keys/rotate`
 
@@ -360,7 +387,25 @@ Deactivate old keys after:
 3. No more requests using the old key
 4. Old signatures no longer need verification
 
-### Deactivation Endpoint
+### Using the `ts` CLI (Recommended)
+
+```bash
+# Remove from active rotation but keep in storage
+ts keys deactivate --service https://edge.example.com --kid ts-2024-01-15
+
+# Delete permanently; asks for confirmation first
+ts keys deactivate --service https://edge.example.com --kid ts-2024-01-15 --delete
+```
+
+`--delete` removes the key from storage for good, so the command asks before
+sending. A run whose stdin or stderr is not a terminal (CI, cron, or stderr
+redirected to a log) must pass `--yes` alongside `--delete`, or the command
+refuses. The command prints the deactivated kid,
+whether it was deleted and the remaining active kids. The server's refusals —
+an invalid kid, deactivating the current kid, deactivating the last active key
+— exit non-zero with the server's `error` message.
+
+### Deactivation Endpoint with curl
 
 **Endpoint**: `POST /_ts/admin/keys/deactivate`
 

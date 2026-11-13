@@ -54,6 +54,9 @@ enum Command {
     Deploy(DeployArgs),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
+    /// Request-signing key rotation through a deployed service's admin routes.
+    #[command(subcommand)]
+    Keys(crate::commands::keys::KeysCommand),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
@@ -188,6 +191,16 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Keys(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::keys::run(
+                command,
+                &mut crate::commands::keys::TerminalConfirm,
+                &mut out,
+            )
+            .map(|()| RunOutcome::Success)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();
