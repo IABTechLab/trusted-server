@@ -157,7 +157,7 @@ Close.
 | 3    | IABTechLab/edgezero#463                                                                                                                                | P1  | Merge            | Rebased                                                                                                                                                           | IABTechLab/edgezero#422, IABTechLab/edgezero#439                                                         |
 | 3    | EZ EZI-4a                                                                                                                                              | P1  | New              | Axum geo bound from EdgeZero's manifest                                                                                                                           | PR IABTechLab/edgezero#439                                                                               |
 | 3    | IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283                                                                                | P1  | Move             | Fastly and Axum ClientInfo; JA4                                                                                                                                   | EZI-3; IABTechLab/edgezero#397                                                                           |
-| 3    | TS #1553, #1246                                                                                                                                        | P2  | Move             | After-response CAS retry; Lockr IDs to KV                                                                                                                         | PR #1487                                                                                                 |
+| 3    | TS #1553                                                                                                                                               | P2  | Move             | After-response CAS retry                                                                                                                                          | PR #1487                                                                                                 |
 | 4    | TS #1489                                                                                                                                               | P1  | PR fix, Merge    | Cap mirrored-ID expiry                                                                                                                                            | #1488                                                                                                    |
 | 4    | EZ EZI-2b                                                                                                                                              | P1  | New              | DynamoDB and celld providers on Axum                                                                                                                              | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#463                     |
 | 4    | EZ R2, R2b                                                                                                                                             | P1  | Release          | R2: EZI-1 for Fastly and Axum; R2b: EZI-3, ClientInfo, JA4 and Axum's geo binding                                                                                 | EZI-1 (R2); EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-4a (R2b) |
@@ -172,6 +172,7 @@ Close.
 | 5    | TS T15                                                                                                                                                 | P1  | New              | Identity-only tsjs                                                                                                                                                | PR #1489                                                                                                 |
 | 5    | TS A9, #1141                                                                                                                                           | P2  | New, Move        | `TRUSTED_SERVER__` guard; local config handoff                                                                                                                    | A1                                                                                                       |
 | 5    | TS #1551                                                                                                                                               | P2  | Move             | Pull sync on a full row                                                                                                                                           | PR #1489                                                                                                 |
+| 5    | TS #1567                                                                                                                                               | P2  | Move             | Provider EIDs in the server-side auction, delivered by PRs #1487 to #1489; replaces #1246                                                                         | PR #1489                                                                                                 |
 | 5    | TS #1527, #1528, #1523, #1533, #1534                                                                                                                   | P2  | Close            | Tests moved to #1506; A1 on #1531; RC copies of #1525 and #1526                                                                                                   | #1506, A1                                                                                                |
 | 6    | TS T6                                                                                                                                                  | P1  | New              | Shared record backend, Fastly first                                                                                                                               | R1b, #1522                                                                                               |
 | 6    | TS T11, T12, T13                                                                                                                                       | P1  | New              | Providers checked with ID5; abuse protection; SharedID creation and write-back, all in the shared app                                                             | T21, R2 (T11 also PR #1487); R2b (T12); T3, PR #1488 (T13)                                               |
@@ -352,20 +353,20 @@ New:
 
 Existing, moved under #1558:
 
-| Issue | Title                                                                       | Type (set)  | Size | Pri | Blocked by       | Blocks |
-| ----- | --------------------------------------------------------------------------- | ----------- | ---- | --- | ---------------- | ------ |
-| #1522 | Make shared EC persistence awaitable (delivered by PR #1526)                | Task (keep) | M    | P1  | none             | T6     |
-| #1549 | Do not send a cookie EC with no row as `user.id`                            | Bug (keep)  | S    | P2  | PR #1487; DEC-12 | none   |
-| #1553 | Retry an after-response write that loses its CAS                            | Task (keep) | S    | P2  | PR #1487         | none   |
-| #1551 | Stop pull sync from re-calling a partner for a row that is full             | Bug (keep)  | S    | P2  | PR #1489         | none   |
-| #1555 | Client and browser EIDs for provider-owned sources after a provider opt-out | Bug (keep)  | S    | P2  | PR #1488         | none   |
-| #1556 | Certificate checks on identity backends                                     | Bug (keep)  | XS   | P2  | #1507            | none   |
-| #1518 | Verify EdgeZero geolocation adoption in EC and auction consent paths        | Task (keep) | M    | P2  | R3               | none   |
-| #1233 | Stop forwarding `ts-ec` to static creative assets                           | Task (keep) | S    | P2  | none             | none   |
-| #1432 | `ts ec show` and `ts ec eids` (delivered by PR #1503)                       | Task (keep) | S    | P2  | none             | none   |
-| #1245 | Spec for non-browser LiveRamp sync                                          | Task        | S    | P3  | DEC-9            | none   |
-| #1246 | Write Lockr IDs to the KV store                                             | Task (keep) | M    | P2  | PR #1487         | none   |
-| #1192 | Reduce Fastly adapter per-request fixed cost                                | Task (keep) | M    | P2  | #1507            | none   |
+| Issue | Title                                                                       | Type (set)   | Size | Pri | Blocked by              | Blocks |
+| ----- | --------------------------------------------------------------------------- | ------------ | ---- | --- | ----------------------- | ------ |
+| #1522 | Make shared EC persistence awaitable (delivered by PR #1526)                | Task (keep)  | M    | P1  | none                    | T6     |
+| #1549 | Do not send a cookie EC with no row as `user.id`                            | Bug (keep)   | S    | P2  | PR #1487; DEC-12        | none   |
+| #1553 | Retry an after-response write that loses its CAS                            | Task (keep)  | S    | P2  | PR #1487                | none   |
+| #1551 | Stop pull sync from re-calling a partner for a row that is full             | Bug (keep)   | S    | P2  | PR #1489                | none   |
+| #1555 | Client and browser EIDs for provider-owned sources after a provider opt-out | Bug (keep)   | S    | P2  | PR #1488                | none   |
+| #1556 | Certificate checks on identity backends                                     | Bug (keep)   | XS   | P2  | #1507                   | none   |
+| #1518 | Verify EdgeZero geolocation adoption in EC and auction consent paths        | Task (keep)  | M    | P2  | R3                      | none   |
+| #1233 | Stop forwarding `ts-ec` to static creative assets                           | Task (keep)  | S    | P2  | none                    | none   |
+| #1432 | `ts ec show` and `ts ec eids` (delivered by PR #1503)                       | Task (keep)  | S    | P2  | none                    | none   |
+| #1245 | Spec for non-browser LiveRamp sync                                          | Task         | S    | P3  | DEC-9                   | none   |
+| #1567 | Collect identity provider EIDs server-side for the server-side auction      | Story (keep) | M    | P2  | PRs #1487, #1488, #1489 | none   |
+| #1192 | Reduce Fastly adapter per-request fixed cost                                | Task (keep)  | M    | P2  | #1507                   | none   |
 
 Not moved:
 
@@ -374,6 +375,8 @@ Not moved:
   merges.
 - #1507 delivers the cutover and stays under #1505; it blocks A1, T4, T5,
   T21, #1192 and #1556.
+- #1246 leaves #1558: #1567 replaces it, and PRs #1487, #1488 and #1489
+  deliver #1567.
 - Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310
   once PR #1488 merges; #1189, which `56a19229f` (#1157) fixed on main.
 - #1556 needs only a regression test: #1506 rejects
@@ -418,6 +421,9 @@ re-checks each item at the PR's current head before posting.
   that intended, so the comment argues against that spec line. Send lookups
   through EdgeZero's `HttpClient`: #1506 deletes `platform/http.rs`, and its
   `outbound_client().start_batch_until` has the same start-then-gather shape.
+  In the body, write `Part of #1567` in place of `Closes #1567` and drop
+  #1246, which #1567 replaces: this PR targets main, so merging it would close
+  #1567 before #1488 and #1489 land.
 - **#1489 at `d3780ba13` (WB-4).** Cap every mirrored ID's expiry at 30 days
   where the mirror is built (`mirror.rs:236-247`), not in validation, because
   SID-5 keeps SharedID `Never` in the record. An unstated expiry still becomes
@@ -425,7 +431,8 @@ re-checks each item at the PR's current head before posting.
   production source (`pull_sync.rs:145`), and such IDs reach the cookie with no
   `exp` under a one-year `Max-Age`. The 30-day clamp on stated expiries comes
   from #1488. Answer its open threads, including the one on `any_due` skipping
-  cookie-read opt-outs.
+  cookie-read opt-outs. In the body, drop #1246: #1567, which this PR closes,
+  replaces it.
 - **#1566 at `117a58e0e` (SID-1, SID-3, SID-5, ID-2, SH-5).** Move `0a2a00aaf`
   (SharedID name, source and retention) and `0c13d4272` (drops the blanket
   provider rejection) into #1488. Rebuild the Axum part on T21's shared app and
@@ -440,7 +447,9 @@ re-checks each item at the PR's current head before posting.
   blanket `reject_providers_without_a_kind` (`config.rs:348`) makes
   `ts config validate`, `push` and `diff` reject every enabled provider. SID-6
   holds for the provider path. LiveRamp's Custom ID waits on DEC-9, which gates
-  enabling LiveRamp, not this merge. Answer its open threads.
+  enabling LiveRamp, not this merge. Answer its open threads. In the body,
+  write `Part of #1567` in place of `Closes #1567` and drop #1246, which #1567
+  replaces: only #1489, the last PR of the stack, closes #1567.
 - **#1531 at `88a6ba596` (AX-1, AX-2, AX-7), which carries A1 in place of
   #1528.** It now targets #1506's branch but forks from main with its own
   cutover rebuild (`82d7e3be8`) and the RC tag pin, so 15 files conflict with
@@ -708,8 +717,9 @@ Post one `CREATOR:` comment per PR with its Part C item and its ticket, with
 `Part of #<ticket>` for #1532 to #1529, #1526 to #1522, #1506 to #1507, #1531
 to A1, #1536, #1537 and #1566 to A2, #1535 to T19 and T20, #1539 and #1538 to
 A6, and #1540 to A7. Use `Blocks #<ticket>` for the provider stack, as
-Part B's Blocked by cells say: #1487 blocks T11, #1246, #1549 and #1553;
-#1488 blocks T3, T13, T22 and #1555; and #1489 blocks T2, T15, T21 and #1551.
+Part B's Blocked by cells say: #1487 blocks T11, #1549, #1553 and #1567;
+#1488 blocks T3, T13, T22, #1555 and #1567; and #1489 blocks T2, T15, T21,
+#1551 and #1567.
 #1525 and #1541 get their Part C item with no ticket; #1503 has no item. For
 proposed closures, ask the author; do not close another author's PR.
 Expected: one comment URL per PR.
