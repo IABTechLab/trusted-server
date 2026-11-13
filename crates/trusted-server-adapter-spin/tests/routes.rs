@@ -1,10 +1,10 @@
-//! Smoke tests for the Spin adapter route wiring.
+//! Route tests for the Spin adapter.
 //!
-//! Runs on the host target (no Spin runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! Spin runtime bindings or outbound network calls. Tests with business logic
-//! that depends on external stores assert routing only; deterministic auth and
-//! method gates assert exact status codes.
+//! Runs on the host target (no Spin runtime), so Spin runtime bindings are not
+//! exercised. Every outbound call goes through a scripted client, so nothing
+//! reaches the network. Tests with business logic that depends on external
+//! stores assert routing only; deterministic auth and method gates assert exact
+//! status codes.
 
 // Test crates may buffer bodies with `Body::into_bytes`.
 #![allow(clippy::disallowed_methods)]

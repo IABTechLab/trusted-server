@@ -1,8 +1,9 @@
-//! Smoke tests for the Cloudflare adapter route wiring.
+//! Route tests for the Cloudflare adapter.
 //!
-//! Runs on the host target (no Workers runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! the platform layer or outbound network calls.
+//! Runs on the host target (no Workers runtime). Covers route registration,
+//! middleware, auth, and the publisher origin's input cap and decoding. Every
+//! outbound call goes through a scripted client, so nothing reaches the
+//! network.
 
 // Test crates may buffer bodies with `Body::into_bytes`.
 #![allow(clippy::disallowed_methods)]
