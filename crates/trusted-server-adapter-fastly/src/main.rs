@@ -795,6 +795,7 @@ mod tests {
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
     use trusted_server_core::test_support::logging::LogCapture;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
     use trusted_server_core::trace::TracePreDispatchHook;
 
     use crate::delivery::tests::{committed, committed_then_failed};
@@ -1406,7 +1407,7 @@ mod tests {
         let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
-            &crate::tinybird::tests::test_services(),
+            &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");

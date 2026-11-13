@@ -277,12 +277,13 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn test_services() -> RuntimeServices {
+    /// Services whose outbound requests go through `client`.
+    pub(crate) fn test_services(client: &ScriptedHttpClient) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(FastlyPlatformConfigStore::read_only()))
             .secret_store(Arc::new(FastlyPlatformSecretStore::read_only()))
             .kv_store(Arc::new(UnavailableKvStore))
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .outbound_client(client.http_client())
             .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
@@ -345,13 +346,17 @@ pub(crate) mod tests {
 
     #[test]
     fn sink_queues_ndjson_with_the_full_user_agent_and_sends_nothing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
-        futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(vec![test_row()])),
-        )
+        futures::executor::block_on(sink.emit_auction_events(
+            &test_services(&client),
+            AuctionEventBatch::new(vec![test_row()]),
+        ))
         .expect("should queue the batch");
+
+        client.assert_no_requests();
 
         let bodies = queue.take();
         let [body] = bodies.as_slice() else {
@@ -366,26 +371,31 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_batch_queues_nothing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
         futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(Vec::new())),
+            sink.emit_auction_events(&test_services(&client), AuctionEventBatch::new(Vec::new())),
         )
         .expect("should ignore the empty batch");
 
+        client.assert_no_requests();
         assert!(queue.take().is_empty(), "should queue no empty batch");
     }
 
     #[test]
     fn sink_rejects_a_row_count_oversize_before_queueing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
         let rows = vec![test_row(); TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH + 1];
 
         let result = futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(rows)),
+            sink.emit_auction_events(&test_services(&client), AuctionEventBatch::new(rows)),
         );
+
+        client.assert_no_requests();
 
         assert!(
             result.is_err(),

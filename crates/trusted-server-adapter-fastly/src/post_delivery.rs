@@ -172,14 +172,17 @@ mod tests {
     }
 
     /// A queue holding the NDJSON the queueing sink wrote for one auction, and that body.
-    fn queue_with_one_auction() -> (TelemetryQueue, String) {
+    ///
+    /// The sink emits through services built on `client`, so a test can show
+    /// that queueing sent nothing.
+    fn queue_with_one_auction(client: &ScriptedHttpClient) -> (TelemetryQueue, String) {
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
         let batch = AuctionEventBatch::new(vec![test_row()]);
         let body = batch
             .to_ndjson(enabled_config().max_body_bytes)
             .expect("should serialize the auction's telemetry");
-        futures::executor::block_on(sink.emit_auction_events(&test_services(), batch))
+        futures::executor::block_on(sink.emit_auction_events(&test_services(client), batch))
             .expect("should queue the auction's telemetry");
         (queue, body)
     }
@@ -194,12 +197,9 @@ mod tests {
             ScriptedReply::status(StatusCode::ACCEPTED),
         );
         let settings = settings_with_tinybird();
-        let (queue, body) = queue_with_one_auction();
+        let (queue, body) = queue_with_one_auction(&client);
 
-        assert!(
-            client.requests().is_empty(),
-            "should send nothing while the request is still being served"
-        );
+        client.assert_no_requests();
         handle_delivery(routed_delivery(committed), &counters(), |_state| {
             clock.drive(post_delivery_work(
                 None,
@@ -231,7 +231,7 @@ mod tests {
         let client = ScriptedHttpClient::forbidding();
         let clock = TestClock::new();
         let settings = settings_with_tinybird();
-        let (queue, _body) = queue_with_one_auction();
+        let (queue, _body) = queue_with_one_auction(&client);
         let run = |_state| {
             clock.drive(post_delivery_work(
                 None,
@@ -264,7 +264,7 @@ mod tests {
             EVENTS_URI,
             ScriptedReply::status(StatusCode::ACCEPTED),
         );
-        let (queue, body) = queue_with_one_auction();
+        let (queue, body) = queue_with_one_auction(&client);
 
         clock.drive(post_delivery_work(
             None,
@@ -375,9 +375,13 @@ mod tests {
             region: None,
             asn: None,
         };
-        let mut ec_context =
-            EcContext::read_from_request_with_geo(settings, &request, &test_services(), Some(&geo))
-                .expect("should read the reader's EC context");
+        let mut ec_context = EcContext::read_from_request_with_geo(
+            settings,
+            &request,
+            &test_services(&ScriptedHttpClient::forbidding()),
+            Some(&geo),
+        )
+        .expect("should read the reader's EC context");
         let kv = require_identity_graph(settings).expect("should open the local identity store");
         ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()));
         FinalizeState {
@@ -409,7 +413,7 @@ mod tests {
                 ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"example-partner-uid"}"#),
             );
         let settings = pull_sync_settings();
-        let (queue, _body) = queue_with_one_auction();
+        let (queue, _body) = queue_with_one_auction(&client);
         let state = returning_reader_state(&settings);
 
         // The origin aborted after the page head was committed.

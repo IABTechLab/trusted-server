@@ -1705,7 +1705,8 @@ mod tests {
         let queue = TelemetryQueue::default();
         let mut request = empty_request(Method::GET, "/article");
         request.extensions_mut().insert(queue.clone());
-        let context = context_with_client(request, ScriptedHttpClient::forbidding().http_client());
+        let client = ScriptedHttpClient::forbidding();
+        let context = context_with_client(request, client.http_client());
 
         let services = build_per_request_services(&state, &context)
             .expect("should build per-request services");
@@ -1714,6 +1715,8 @@ mod tests {
             AuctionEventBatch::new(vec![crate::tinybird::tests::test_row()]),
         ))
         .expect("should queue the batch");
+
+        client.assert_no_requests();
 
         assert!(
             services.auction_telemetry_sink().is_enabled(),
