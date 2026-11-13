@@ -116,6 +116,16 @@ pub trait IdentityProvider: Send + Sync {
     fn keeps_fresher_stored_uids(&self) -> bool {
         false
     }
+
+    /// Whether this provider's request carries the EC ID.
+    ///
+    /// A provider that does not send it may run on the navigation that mints
+    /// the EC, before the EC's row exists: a failed row write then exposes
+    /// nothing. The default is `true`, so a provider runs on a minted EC only
+    /// when it opts out.
+    fn sends_ec_id(&self) -> bool {
+        true
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -139,6 +149,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
         (**self).generate(lookup)
+    }
+
+    fn sends_ec_id(&self) -> bool {
+        (**self).sends_ec_id()
     }
 
     fn read_request_cookies<'cookie>(

@@ -369,6 +369,59 @@ mod tests {
     }
 
     #[test]
+    fn only_liveramp_sends_the_ec_id() {
+        for (kind, endpoint, sources, settings) in [
+            (
+                "id5",
+                Some("https://id5.example.com/gs/v2"),
+                json!(["id5.example.com"]),
+                json!({ "partner_id": 1234 }),
+            ),
+            (
+                "liveintent",
+                Some("https://li.example.com/idex"),
+                json!(["liveintent.com"]),
+                json!({ "resolve": ["nonId"] }),
+            ),
+            ("liveramp", None, json!(["liveramp.example.com"]), json!({})),
+            (
+                "connectid",
+                None,
+                json!(["connectid.example.com"]),
+                json!({}),
+            ),
+            ("uid2", None, json!(["uid2.example.com"]), json!({})),
+            ("sharedid", None, json!(["sharedid.example.com"]), json!({})),
+            ("criteo", None, json!(["criteo.example.com"]), json!({})),
+            (
+                "unifiedid",
+                None,
+                json!(["unifiedid.example.com"]),
+                json!({}),
+            ),
+        ] {
+            let config: IdentityProviderConfig = serde_json::from_value(json!({
+                "id": kind,
+                "kind": kind,
+                "endpoint": endpoint,
+                "allowed_domains": ["id5.example.com", "li.example.com"],
+                "sources": sources,
+                "settings": settings,
+            }))
+            .expect("should parse provider config");
+
+            let built = build(&config, &ProviderSecrets::default())
+                .unwrap_or_else(|error| panic!("should build {kind}: {error:?}"));
+
+            assert_eq!(
+                built.sends_ec_id(),
+                kind == "liveramp",
+                "should send the EC ID only from LiveRamp, checked {kind}"
+            );
+        }
+    }
+
+    #[test]
     fn enabled_lockr_rejects_an_empty_cookie_list() {
         let config: IdentityProviderConfig = serde_json::from_value(json!({
             "id": "uid2",

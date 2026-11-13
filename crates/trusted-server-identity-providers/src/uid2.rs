@@ -287,6 +287,12 @@ impl IdentityProvider for Uid2Provider {
         &self.capabilities
     }
 
+    /// The request carries no EC ID, so it may run on the navigation that
+    /// mints the EC.
+    fn sends_ec_id(&self) -> bool {
+        false
+    }
+
     /// UID2 is not offered where GDPR applies, so none of its sources is
     /// collected or kept there.
     fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {

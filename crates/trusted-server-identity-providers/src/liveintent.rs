@@ -261,6 +261,12 @@ impl IdentityProvider for LiveIntentProvider {
         &self.capabilities
     }
 
+    /// The request carries no EC ID, so it may run on the navigation that
+    /// mints the EC.
+    fn sends_ec_id(&self) -> bool {
+        false
+    }
+
     /// UID2 tokens `LiveIntent` resolves are not collected or kept where GDPR
     /// applies, matching the `uid2` provider.
     fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
