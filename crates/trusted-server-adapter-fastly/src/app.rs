@@ -231,15 +231,13 @@ pub(crate) fn build_state_from_settings(
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Prefers the full [`ClientInfo`] captured by the entry point from the original
+/// Uses the [`ClientInfo`] the entry point captured from the original
 /// `FastlyRequest` (TLS protocol/cipher, JA4, H2 fingerprint, and server
-/// hostname/region) and stored in the request extensions — the metadata
+/// hostname/region) and stored in the request extensions: the metadata
 /// integration bot protection (e.g. `DataDome`) serializes, which the
-/// reconstructed `EdgeZero` request cannot expose. Falls back to the client IP
-/// from the dispatch-inserted [`FastlyRequestContext`] when the extension is
-/// absent (e.g. tests that dispatch without the entry point). Scheme detection
-/// continues to rely on the trusted `fastly-ssl` header injected by the entry
-/// point after sanitization.
+/// reconstructed `EdgeZero` request cannot expose. Scheme detection continues
+/// to rely on the trusted `fastly-ssl` header injected by the entry point after
+/// sanitization.
 ///
 /// The outbound client is the one `EdgeZero`'s Fastly request conversion
 /// installs in the request context, with the proxy marker turned off. The
@@ -254,30 +252,25 @@ pub(crate) fn build_state_from_settings(
 /// # Errors
 ///
 /// Returns an internal [`EdgeError`] when the request carries no outbound
-/// client, no [`RequestGeo`], or no telemetry queue while Tinybird is enabled.
+/// client, no [`RequestGeo`], no [`ClientInfo`], or no telemetry queue while
+/// Tinybird is enabled.
 fn build_per_request_services(
     state: &AppState,
     ctx: &RequestContext,
 ) -> Result<RuntimeServices, EdgeError> {
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
-    let client_info = ctx
-        .extensions()
-        .get::<ClientInfo>()
-        .cloned()
-        .unwrap_or_else(|| ClientInfo {
-            client_ip: ctx
-                .extensions()
-                .get::<FastlyRequestContext>()
-                .and_then(|c| c.client_ip),
-            ..ClientInfo::default()
-        });
     let outbound_client = request_outbound_client(ctx)?;
     let request_geo = ctx
         .extensions()
         .get::<RequestGeo>()
         .cloned()
         .ok_or_else(|| EdgeError::internal(std::io::Error::other("request has no geo")))?;
+    let client_info = ctx
+        .extensions()
+        .get::<ClientInfo>()
+        .cloned()
+        .ok_or_else(|| EdgeError::internal(std::io::Error::other("request has no client info")))?;
 
     let mut services = RuntimeServices::builder();
     if state.settings.tinybird.enabled {
@@ -1524,16 +1517,17 @@ mod tests {
     fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
         // `oneshot` skips `EdgeZero`'s request conversion, which installs the
         // adapter's default client, so install one that fails every request.
-        // It also skips the entry point's `prepare`, so add the geo `prepare`
-        // would hold for the request's client IP, without host geo data.
+        // It also skips the entry point's `prepare`, so add the client info and
+        // the geo `prepare` would hold for the request's client IP, without host
+        // geo data.
         insert_outbound_client(
             &mut request,
             HttpClient::with_client(ScriptedHttpClient::forbidding()),
         );
         let client_ip = request
-            .extensions()
-            .get::<ClientInfo>()
-            .and_then(|info| info.client_ip);
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>()
+            .client_ip;
         request
             .extensions_mut()
             .insert(RequestGeo::new(client_ip, None));
@@ -1593,13 +1587,17 @@ mod tests {
 
     /// Wraps `request` in a context that carries `client`, as `EdgeZero`'s Fastly
     /// request conversion installs its default client, and an empty
-    /// [`RequestGeo`], as the entry point inserts one.
+    /// [`RequestGeo`] and the request's [`ClientInfo`] (empty unless the
+    /// caller set one), as the entry point inserts them.
     fn context_with_client(
         mut request: edgezero_core::http::Request,
         client: HttpClient,
     ) -> RequestContext {
         request.extensions_mut().insert(client);
         request.extensions_mut().insert(RequestGeo::default());
+        request
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>();
         RequestContext::new(request, PathParams::default())
     }
 
@@ -1661,6 +1659,26 @@ mod tests {
             error.to_string(),
             "internal error: request has no geo",
             "should name the missing geo"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_a_request_without_client_info() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let mut request = empty_request(Method::GET, "/article");
+        request
+            .extensions_mut()
+            .insert(ScriptedHttpClient::forbidding().http_client());
+        request.extensions_mut().insert(RequestGeo::default());
+        let context = RequestContext::new(request, PathParams::default());
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no client info");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no client info",
+            "should name the missing client info"
         );
     }
 

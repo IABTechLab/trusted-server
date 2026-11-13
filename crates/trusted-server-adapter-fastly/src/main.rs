@@ -750,6 +750,7 @@ mod tests {
     use edgezero_core::router::{PreDispatchHook, RouterService};
     use fastly::mime;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::test_support::logging::WarningCapture;
     use trusted_server_core::trace::TracePreDispatchHook;
 
@@ -1133,6 +1134,7 @@ mod tests {
             let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
                 FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
                 |_req, extensions| {
+                    extensions.insert(ClientInfo::default());
                     extensions.insert(RequestGeo::default());
                 },
                 |response: &mut HttpResponse| {
@@ -1204,6 +1206,7 @@ mod tests {
                 request,
                 |_req, extensions| {
                     extensions.insert(per_request_synthesized_headers(&settings, None));
+                    extensions.insert(ClientInfo::default());
                     extensions.insert(RequestGeo::default());
                 },
                 |response: &mut HttpResponse| finalize_response(response, &inputs),
