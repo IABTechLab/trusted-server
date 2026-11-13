@@ -803,9 +803,13 @@ Accepted differences:
 - `send_asset_origin_request` (`proxy.rs:974-1001`) and
   `handle_asset_proxy_request` build `OutboundRequest::new(method, uri)?` with
   `ASSET_PROXY_FORWARD_HEADERS` (`proxy.rs:90`), `.stream_response()` on the
-  GET, `Original`, the D7 timeouts, and the default cache policy. The S3 HEAD
-  preflight stays buffered, as today (`proxy.rs:1037-1044`), and also sets
-  `Original`. At H, `Decode` leaves a HEAD's encoded `Content-Encoding` and
+  GET, `Original`, the D7 timeouts, and the cache policy the caller passes. The
+  signed S3 HEAD preflight, its raw error-body GET, and a signed raw HEAD
+  without Image Optimizer options pass `Bypass` (#1516, ported in merge
+  `a53f4d04c`), so Fastly's readthrough cache cannot turn a signed HEAD into a
+  GET after signing. Every other asset request passes `PlatformDefault`. The
+  S3 HEAD preflight stays buffered, as today (`proxy.rs:1037-1044`), and also
+  sets `Original`. At H, `Decode` leaves a HEAD's encoded `Content-Encoding` and
   `Content-Length` alone only because EZ-5.9 is not adopted. `Original` keeps
   that metadata stable if EdgeZero adopts it.
 - `asset_origin_host_header` (`proxy.rs:893-916`) stays. It is the signer's
@@ -2028,14 +2032,17 @@ it adds outbound sites or platform-type uses that need porting.
 | #1343 to #1448 stack (55 PRs)                                | 36 heavy, 9 moderate. The worst (#1448, #1390, #1348, #1399) touch the HTTP layer, backend naming, and the Image Optimizer types |
 | #1310 ID5, #1325 and #1437 instream video, #1460 CWV loading | New outbound calls or uses of `StubHttpClient`, `PlatformBackendSpec`, and `BackendNamingPolicy`                                 |
 | #1499 MaxMind geo (base `rc/edgezero-431-demo`)              | Imports `edgezero_adapter_axum::geo`, which H does not have                                                                      |
-| #1516 S3 preflight cache bypass                              | Merges first. The port sets `Bypass` on the signed S3 HEAD and the raw error GET; the optimized GET stays `PlatformDefault`      |
+| #1516 S3 preflight cache bypass                              | Merged, ported in merge `a53f4d04c`. `Bypass` on the S3 HEAD preflight, its raw error GET, and a signed raw HEAD                 |
 
-While the cut was open, #917, #1435, #1504, #1493, and #1455 merged to `main`,
-and the cut's Task 12 merges ported them. #1516 is still open.
+While the cut was open, #917, #1435, #1504, #1493, #1455, and #1516 merged to
+`main`. The cut's Task 12 merges ported the first five, and merge `a53f4d04c`
+ported #1516.
 
-PR #1516 runs on the old API, so the cut's next merge of `main` ports it onto
-`OutboundCachePolicy::Bypass` and keeps the optimized GET's Image Optimizer
-options. EdgeZero `c8fd1939` documents that split
+PR #1516 ran on the old API. Merge `a53f4d04c` ports it onto
+`OutboundCachePolicy::Bypass` for the signed S3 HEAD preflight, its raw
+error-body GET, and a signed raw HEAD without Image Optimizer options. The Image
+Optimizer request keeps `PlatformDefault` and its options (section 2.7).
+EdgeZero `c8fd1939` documents that split
 (`edgezero@14a6ca8b:docs/guide/proxying.md:320-323`).
 
 Issue #1484 asks for multi-provider fan-out on Cloudflare and Spin. The cut
