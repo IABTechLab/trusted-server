@@ -1,0 +1,54 @@
+# Fictional inputs only. Not an apply recipe. Copy to an ignored local tfvars
+# only after approvals; all AWS resources remain behind the hard draft gate.
+run_id             = "review-example"
+owner              = "review-owner"
+aws_account_id     = "000000000000"
+aws_region         = "eu-west-2"
+availability_zones = ["eu-west-2a", "eu-west-2b"]
+demo_hostname      = "ts-demo.example.com"
+publisher_hostname = "publisher.example.com"
+# CloudFront only. Opt in for a publisher-origin browser proxy, not demo-host browsing.
+preserve_publisher_hostname = false
+route53_zone_id             = "Z0000000000000"
+certificate_arn             = "arn:aws:acm:eu-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+reviewer_ipv4_cidrs         = ["203.0.113.0/24"]
+application_image           = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image                 = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+config_envelope_file        = "example-envelope.json"
+# Copy the ec_storage output from the separately initialized retained/ root.
+ec_storage = {
+  provider  = "dynamodb"
+  region    = "eu-west-2"
+  table     = "example-retained-ec"
+  namespace = "example-staging"
+}
+# Fictional private origin credential and reviewed ranges. Replace before use.
+geo_front_door = {
+  rollout_phase                 = "dns-cutover"
+  viewer_certificate_arn        = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+  origin_credential_header_name = "x-fictional-origin-check"
+  origin_credential_value       = "fictional_only_00000000000000000000000000000000"
+  cloudfront_ipv4_cidrs         = ["192.0.2.0/24", "198.51.100.0/24"]
+}
+application_secrets = {
+  handler_password = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-handler-AbCdEf"
+    version_id = "11111111111111111111111111111111"
+  }
+  publisher_proxy_secret = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-proxy-AbCdEf"
+    version_id = "22222222222222222222222222222222"
+  }
+  ec_passphrase = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
+    version_id = "33333333333333333333333333333333"
+  }
+}
+runtime_boundaries = {
+  execution = "arn:aws:iam::000000000000:policy/native-demo/review-example/execution-boundary"
+  task      = "arn:aws:iam::000000000000:policy/native-demo/review-example/task-boundary"
+}
+agent_token = {
+  arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-agent-AbCdEf"
+  version_id = "44444444444444444444444444444444"
+}

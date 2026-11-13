@@ -1,0 +1,241 @@
+mock_provider "aws" {
+  override_during = plan
+
+  mock_resource "aws_appconfig_application" {
+    override_during = plan
+    defaults        = { id = "app1234" }
+  }
+  mock_resource "aws_appconfig_environment" {
+    override_during = plan
+    defaults        = { environment_id = "env1234" }
+  }
+  mock_resource "aws_appconfig_configuration_profile" {
+    override_during = plan
+    defaults        = { configuration_profile_id = "cfg1234" }
+  }
+  mock_resource "aws_appconfig_hosted_configuration_version" {
+    override_during = plan
+    defaults        = { version_number = 1 }
+  }
+  mock_resource "aws_appconfig_deployment" {
+    override_during = plan
+    defaults        = { deployment_number = 1 }
+  }
+  mock_resource "aws_cloudwatch_log_group" {
+    override_during = plan
+    defaults        = { arn = "arn:aws:logs:eu-west-2:000000000000:log-group:/trusted-server/review/review-example" }
+  }
+}
+
+variables {
+  run_id               = "review-example"
+  owner                = "review-owner"
+  aws_account_id       = "000000000000"
+  aws_region           = "eu-west-2"
+  availability_zones   = ["eu-west-2a", "eu-west-2b"]
+  demo_hostname        = "ts-demo.example.com"
+  publisher_hostname   = "publisher.example.com"
+  route53_zone_id      = "Z0000000000000"
+  certificate_arn      = "arn:aws:acm:eu-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+  reviewer_ipv4_cidrs  = ["203.0.113.0/24"]
+  application_image    = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  agent_image          = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  config_envelope_file = "example-envelope.json"
+  geo_front_door       = null
+  ec_storage = {
+    provider  = "dynamodb"
+    region    = "eu-west-2"
+    table     = "example-retained-ec"
+    namespace = "example-staging"
+  }
+  application_secrets = {
+    handler_password = {
+      arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-handler-AbCdEf"
+      version_id = "11111111111111111111111111111111"
+    }
+    publisher_proxy_secret = {
+      arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-proxy-AbCdEf"
+      version_id = "22222222222222222222222222222222"
+    }
+    ec_passphrase = {
+      arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
+      version_id = "33333333333333333333333333333333"
+    }
+  }
+  runtime_boundaries = {
+    execution = "arn:aws:iam::000000000000:policy/native-demo/review-example/execution-boundary"
+    task      = "arn:aws:iam::000000000000:policy/native-demo/review-example/task-boundary"
+  }
+  agent_token = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-agent-AbCdEf"
+    version_id = "44444444444444444444444444444444"
+  }
+}
+
+run "task_contract" {
+  command = plan
+
+  assert {
+    condition     = local.tags.Lifecycle == "manual" && output.draft_status.manual_shutdown_required && terraform_data.draft_gate.input == { run_id = var.run_id }
+    error_message = "Keep the manual tag and shutdown declaration stable, with only run_id in the gate input."
+  }
+
+  assert {
+    condition     = var.auction_egress == null && length(aws_vpc_security_group_egress_rule.auction) == 0
+    error_message = "Absent auction egress must preserve the existing network rules."
+  }
+
+  assert {
+    condition = (
+      local.containers[0].readonlyRootFilesystem &&
+      local.containers[0].user == "10001:10001" &&
+      local.containers[0].mountPoints[0].containerPath == "/run/trusted-server" &&
+      local.containers[1].readonlyRootFilesystem &&
+      local.containers[1].secrets[0].valueFrom == local.containers[0].secrets[0].valueFrom
+    )
+    error_message = "Task bootstrap must be read-only/non-root with the reviewed writable path and matching Agent token reference."
+  }
+  assert {
+    condition = (
+      !contains([for env in local.containers[1].environment : env.name], "BACKUP_DIRECTORY") &&
+      !contains([for env in local.containers[1].environment : env.name], "MANIFEST") &&
+      local.containers[0].dependsOn[0].condition == "START" &&
+      length(local.containers[1].portMappings) == 0
+    )
+    error_message = "Agent must have no disk fallback, fabricated health dependency or exposed port."
+  }
+  assert {
+    condition = alltrue([for container in local.containers :
+      length(container.linuxParameters.capabilities.add) == 0 &&
+      length(container.systemControls) == 0 && length(container.volumesFrom) == 0
+    ]) && length(local.containers[1].mountPoints) == 0
+    error_message = "Render ECS empty arrays explicitly so a refreshed task definition does not restart for a phase-only change."
+  }
+  assert {
+    condition     = length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && aws_ecs_service.review[0].deployment_maximum_percent == 100 && aws_ecs_service.review[0].deployment_minimum_healthy_percent == 0
+    error_message = "The review workload must retain the one-task, stop-first scheduler policy; this does not prove process-drain fencing."
+  }
+  assert {
+    condition     = local.application_environment.TS_REVIEW_CONFIG_TRANSPORT_SHA256 == sha256(local.envelope_text) && contains([for env in jsondecode(aws_ecs_task_definition.review.container_definitions)[0].environment : env.name], "TS_REVIEW_APPCONFIG_DEPLOYMENT")
+    error_message = "The rendered task definition must carry config release identity so a changed config cannot silently reuse an immutable snapshot."
+  }
+  assert {
+    condition     = aws_iam_role.execution.permissions_boundary == var.runtime_boundaries.execution && aws_iam_role.task.permissions_boundary == var.runtime_boundaries.task
+    error_message = "Workload roles must retain the exact approved bootstrap permission ceilings."
+  }
+}
+
+run "scoped_dynamodb_task_policy" {
+  command = plan
+
+  assert {
+    condition = jsondecode(output.ec_task_policy_json) == jsondecode(<<-JSON
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ValidateExactEcTable",
+            "Effect": "Allow",
+            "Action": ["dynamodb:DescribeTable"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec"
+          },
+          {
+            "Sid": "IdentityRowsOnly",
+            "Effect": "Allow",
+            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
+            "Condition": {
+              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec:example-staging"]},
+              "Null": {"dynamodb:LeadingKeys": "false"}
+            }
+          },
+          {
+            "Sid": "AllocateGenerationsOnly",
+            "Effect": "Allow",
+            "Action": ["dynamodb:UpdateItem"],
+            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
+            "Condition": {
+              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec-allocator:example-staging"]},
+              "Null": {"dynamodb:LeadingKeys": "false"}
+            }
+          }
+        ]
+      }
+    JSON
+    )
+    error_message = "The exported boundary document must be plan-known and restrict each DynamoDB action to its exact table and partition."
+  }
+
+  assert {
+    condition = jsonencode([
+      for statement in jsondecode(aws_iam_role_policy.task.policy).Statement : statement
+      if startswith(statement.Action[0], "dynamodb:")
+      ]) == jsonencode(jsondecode(output.ec_task_policy_json).Statement) && !anytrue([
+      for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement :
+      anytrue([for action in statement.Action : startswith(action, "dynamodb:")])
+    ])
+    error_message = "Only the task role may receive exactly the exported DynamoDB allows, never the execution role."
+  }
+}
+
+run "customer_managed_keys" {
+  command = plan
+  variables {
+    secrets_kms_key_arns = ["arn:aws:kms:eu-west-2:000000000000:key/00000000-0000-0000-0000-000000000000"]
+  }
+  assert {
+    condition     = anytrue([for statement in jsondecode(aws_iam_role_policy.task.policy).Statement : contains(statement.Action, "kms:Decrypt")]) && anytrue([for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement : contains(statement.Action, "kms:Decrypt")])
+    error_message = "Supplied customer-managed keys must be usable through both runtime and execution policies."
+  }
+}
+
+run "public_https_network_contract" {
+  command = plan
+  variables {
+    reviewer_ipv4_cidrs = ["0.0.0.0/0"]
+  }
+  override_resource {
+    target          = aws_security_group.alb
+    override_during = plan
+    values          = { id = "sg-0123456789abcdef0" }
+  }
+  assert {
+    condition     = aws_vpc_security_group_ingress_rule.reviewers["0.0.0.0/0"].from_port == 443 && aws_vpc_security_group_ingress_rule.reviewers["0.0.0.0/0"].to_port == 443 && aws_vpc_security_group_ingress_rule.reviewers["0.0.0.0/0"].ip_protocol == "tcp"
+    error_message = "Public ALB ingress must expose only HTTPS; application authentication belongs to TS."
+  }
+  assert {
+    condition     = aws_vpc_security_group_ingress_rule.alb_to_task.from_port == 8787 && aws_vpc_security_group_ingress_rule.alb_to_task.referenced_security_group_id == aws_security_group.alb.id && length(local.containers[1].portMappings) == 0
+    error_message = "Public HTTPS must not expose the task or Agent ports."
+  }
+}
+
+run "optional_noindex_configuration_passes_through" {
+  command = plan
+  variables {
+    reviewer_ipv4_cidrs  = ["0.0.0.0/0"]
+    config_envelope_file = "example-noindex-envelope.json"
+  }
+  assert {
+    condition     = local.envelope_valid && aws_appconfig_hosted_configuration_version.review.content == file(var.config_envelope_file)
+    error_message = "Optional application indexing/authentication policy must pass through as exact CLI bytes."
+  }
+  assert {
+    condition     = length(aws_lb_listener_rule.publisher.condition) == 1 && anytrue([for rule_condition in aws_lb_listener_rule.publisher.condition : try(toset(one(rule_condition.host_header).values) == toset([var.publisher_hostname, var.demo_hostname]), false)])
+    error_message = "Both direct demo browsing and the publisher proxy must work without a client-supplied X-Forwarded-Host."
+  }
+  assert {
+    condition     = one(one(aws_lb_listener.https.default_action).fixed_response).status_code == "404"
+    error_message = "Unconfigured Host names must still fail closed."
+  }
+}
+
+run "public_registry_no_private_ecr_policy" {
+  command = plan
+  variables {
+    application_image = "public.ecr.aws/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+  assert {
+    condition     = length(local.private_ecr_arns) == 0 && !anytrue([for statement in jsondecode(aws_iam_role_policy.execution.policy).Statement : contains(statement.Action, "ecr:GetAuthorizationToken")])
+    error_message = "Public-only images must not grant unused private ECR authorization."
+  }
+}

@@ -260,9 +260,10 @@ impl IntegrationEndpoint {
 ///
 /// `Send + Sync` bounds are required so trait objects can be stored in
 /// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
-/// request context. The `?Send` on the async methods is intentional — see the
-/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
-/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// request context. The `?Send` on the async methods is intentional:
+/// [`edgezero_core::body::Body`] wraps a `LocalBoxStream`, which is `!Send` for
+/// wasm32 compatibility, so the futures that carry request bodies cannot be
+/// `Send`. On wasm32 these bounds are compatible because the runtime is
 /// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
@@ -794,6 +795,9 @@ pub struct ProxyDispatchInput<'a> {
     pub path: &'a str,
     pub settings: &'a Settings,
     pub kv: Option<&'a KvIdentityGraph>,
+    /// Whether this adapter permits identity generation on integration routes.
+    /// Native keeps issuance on publisher navigations, not static JS proxies.
+    pub allow_generation: bool,
     pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
@@ -1029,6 +1033,7 @@ impl IntegrationRegistry {
             path,
             settings,
             kv,
+            allow_generation,
             ec_context,
             services,
             mut req,
@@ -1037,14 +1042,12 @@ impl IntegrationRegistry {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+            if allow_generation && is_navigation_request(&req) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv).await {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
-                log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
-                );
+                log::debug!("EC generation skipped for integration proxy (path={path})",);
             }
 
             // Remove any caller-supplied EC header rather than forwarding it.
@@ -1842,6 +1845,7 @@ mod tests {
             path: "/integrations/test/echo",
             settings: &settings,
             kv: None,
+            allow_generation: true,
             ec_context: &mut ec_context,
             services: &noop_services(),
             req,
@@ -2199,6 +2203,7 @@ mod tests {
             path: "/integrations/test/ec",
             settings: &settings,
             kv: None,
+            allow_generation: true,
             ec_context: &mut ec_context,
             services: &services,
             req,
@@ -2249,6 +2254,7 @@ mod tests {
             path: "/integrations/test/ec",
             settings: &settings,
             kv: None,
+            allow_generation: true,
             ec_context: &mut ec_context,
             services: &services,
             req,
@@ -2298,6 +2304,7 @@ mod tests {
             path: "/integrations/test/ec",
             settings: &settings,
             kv: None,
+            allow_generation: true,
             ec_context: &mut ec_context,
             services: &services,
             req,
@@ -2344,6 +2351,7 @@ mod tests {
             path: "/integrations/test/ec",
             settings: &settings,
             kv: None,
+            allow_generation: true,
             ec_context: &mut ec_context,
             services: &services,
             req,

@@ -27,7 +27,6 @@ pub(crate) fn create_test_auction_context<'a>(
         settings,
         request,
         timeout_ms,
-        transport_timeout_ms: timeout_ms,
         provider_responses: None,
         services,
     }
@@ -105,12 +104,14 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
             user_agent: Some("Fictional Browser".to_string()),
             ip: Some("192.0.2.10".to_string()),
             geo: Some(GeoInfo {
-                city: "Example City".to_string(),
+                city: Some("Example City".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 12.34,
-                longitude: 56.78,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 12.34,
+                    longitude: 56.78,
+                }),
+                metro_code: Some(501),
                 region: Some("CA".to_string()),
                 asn: None,
             }),

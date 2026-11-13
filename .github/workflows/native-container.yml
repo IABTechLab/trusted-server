@@ -1,0 +1,45 @@
+name: Native RC container
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .tool-versions
+      - rust-toolchain.toml
+      - Cargo.toml
+      - Cargo.lock
+      - edgezero.toml
+      - .cargo/**
+      - crates/trusted-server-adapter-axum/**
+      - crates/trusted-server-core/**
+      - crates/trusted-server-js/**
+      - crates/trusted-server-openrtb*/**
+      - scripts/test-native-container.mjs
+      - .github/workflows/native-container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-provider-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        run: |
+          version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Build local-provider image
+        run: docker build --build-arg TRUSTED_SERVER__GIT_VERSION="${{ github.sha }}" -t ts-rc-local:test .
+      - name: Check real TS routes, startup rejection and drain
+        run: node scripts/test-native-container.mjs ts-rc-local:test

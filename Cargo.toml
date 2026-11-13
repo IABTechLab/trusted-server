@@ -56,17 +56,17 @@ cssparser = "0.36"
 derive_more = { version = "2.0", features = ["display", "error"] }
 directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
-edgezero-cli = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11" }
-edgezero-core = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.11", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
+edgezero-cli = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2" }
+edgezero-core = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
+edgezero-store-celld = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false }
 env_logger = "0.11"
 error-stack = "0.6"
 esi = "0.7.2"
 fastly = "0.13"
-fastly-sys = "0.13.1"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
@@ -85,7 +85,6 @@ hyper = "1"
 hyper-util = "0.1"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
-js-sys = "0.3"
 libc = "0.2"
 log = "0.4.29"
 log-fastly = "0.13"
@@ -108,7 +107,7 @@ serde_yaml_ng = "0.10"
 sha2 = "0.11"
 similar = "2.7"
 simple_logger = "5"
-spin-sdk = { version = "~7.0", default-features = false, features = ["http", "key-value", "variables"] }
+spin-sdk = { version = "=7.0.0", git = "https://github.com/stackpop/spin-rust-sdk.git", rev = "6c59ed5b4fcb377072763aee0b27a3abdd8edb72", default-features = false, features = ["http", "key-value", "variables"] }
 subtle = "2.6"
 temp-env = "0.3.6"
 tempfile = "3.24"
@@ -118,7 +117,6 @@ tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time
 tokio-rustls = "0.26"
 toml = "1.1"
 toml_edit = "0.23.10"
-tower = "0.4"
 tracing = "0.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-js = { path = "crates/trusted-server-js" }

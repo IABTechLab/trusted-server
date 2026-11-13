@@ -1,39 +1,64 @@
-//! Cross-adapter parity tests: Axum vs Cloudflare vs Spin in-process.
+//! Cross-adapter parity tests: Axum vs Cloudflare vs Spin on host.
 //!
-//! Sends identical requests to all host-runnable adapters and asserts that:
+//! Each adapter's app is assembled from shared test settings under its own
+//! platform metadata, with its production `configure` policies, and served on
+//! `EdgeZero`'s Axum test server over loopback TCP. Every request therefore
+//! passes the same ingress, admission, and egress as production Axum. A
+//! scripted client that fails every request sits in router state, so no real
+//! `EdgeZero` transport starts. Provider request contexts are absent, as the
+//! test server documents.
+//!
+//! The suite sends identical requests to all host-runnable adapters and asserts that:
 //! - Response status codes match
 //! - Critical headers (X-Geo-Info-Available, WWW-Authenticate on 401) match
 //!
 //! Fastly parity is verified via cargo test-fastly + Viceroy in CI.
 
-// Both adapters define `TrustedServerApp` — alias both to avoid name collision.
-// axum::http re-exports from the `http` crate, so HeaderMap types are identical.
-use error_stack::Report;
-use std::sync::Arc;
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
+// All three adapters define `TrustedServerApp`, so alias each to avoid name collisions.
+// reqwest and axum::http re-export the `http` crate, so HeaderMap types are identical.
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use trusted_server_core::platform::{
-    PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, PlatformSelectResult,
-};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use trusted_server_core::platform::HttpClient;
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
-use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use base64::Engine as _;
+use edgezero_adapter_axum::AXUM_PLATFORM;
+use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::outbound::AxumOutboundClient;
+use edgezero_adapter_axum::request::into_core_request;
+use edgezero_adapter_axum::test_utils::AxumTestServer;
+use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
+use edgezero_adapter_spin::SPIN_PLATFORM;
+use edgezero_core::app::App;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
-use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
+use trusted_server_core::constants::{HEADER_X_TS_VERSION, TS_GIT_VERSION};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 /// Shared test settings for all adapters.
 ///
 /// The settings baked into the binaries contain placeholder secrets that
-/// `get_settings()` rejects by design, so all routers are built through
-/// their `routes_with_settings` testing seams from this known-good config.
+/// `get_settings()` rejects by design, so every app and router here is built
+/// from this known-good config through an adapter testing seam:
+/// `routes_with_settings_and_outbound_client` for served apps,
+/// `routes_with_settings` for route-table checks, and
+/// `routes_with_settings_and_services` for fixed-service fixtures.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -58,12 +83,6 @@ fn test_settings() -> Settings {
     .expect("should parse parity test settings")
 }
 
-/// Build the Axum adapter router from the shared test settings.
-fn axum_router() -> RouterService {
-    AxumApp::routes_with_settings(test_settings())
-        .expect("should build Axum router from parity test settings")
-}
-
 /// Build the Cloudflare adapter router from the shared test settings.
 fn cf_router() -> RouterService {
     CloudflareApp::routes_with_settings(test_settings())
@@ -76,50 +95,123 @@ fn spin_router() -> RouterService {
         .expect("should build Spin router from parity test settings")
 }
 
+/// A host-runnable adapter whose app the parity suite serves.
+#[derive(Clone, Copy)]
+enum Adapter {
+    Axum,
+    Cloudflare,
+    Spin,
+}
+
+impl Adapter {
+    /// Assembles this adapter's app from `settings` under its own platform
+    /// metadata, with `client` in router state.
+    fn app(self, settings: Settings, client: HttpClient) -> App {
+        match self {
+            Self::Axum => App::from_router::<AxumApp>(
+                AxumApp::routes_with_settings_and_outbound_client(settings, client)
+                    .expect("should build the Axum router from parity test settings"),
+                AXUM_PLATFORM,
+            ),
+            Self::Cloudflare => App::from_router::<CloudflareApp>(
+                CloudflareApp::routes_with_settings_and_outbound_client(settings, client)
+                    .expect("should build the Cloudflare router from parity test settings"),
+                CLOUDFLARE_PLATFORM,
+            ),
+            Self::Spin => App::from_router::<SpinApp>(
+                SpinApp::routes_with_settings_and_outbound_client(settings, client)
+                    .expect("should build the Spin router from parity test settings"),
+                SPIN_PLATFORM,
+            ),
+        }
+        .expect("should assemble the app with its production policies")
+    }
+}
+
+/// Serves `app` on `EdgeZero`'s Axum test server at a free loopback port.
+///
+/// The app reads no `EdgeZero` store: its settings are injected, so no store
+/// is attached.
+async fn serve(app: App) -> AxumTestServer {
+    let config = AxumDevServerConfig {
+        addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        enable_ctrl_c: false,
+        ..AxumDevServerConfig::default()
+    };
+    AxumTestServer::start(AxumDevServer::with_config(app, config))
+        .await
+        .expect("should start the Axum test server")
+}
+
+/// Sends one request over TCP to `adapter`'s app and returns (status, headers, body bytes).
+///
+/// Each call serves a fresh app built from the shared test settings, with a
+/// script that fails every outbound request in router state.
+async fn send(
+    adapter: Adapter,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (u16, HeaderMap, bytes::Bytes) {
+    let server = serve(adapter.app(
+        test_settings(),
+        HttpClient::with_client(ScriptedHttpClient::forbidding()),
+    ))
+    .await;
+    // No proxy and no redirect following: the tests assert on exactly what
+    // the listener sends.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build the test HTTP client");
+    let method =
+        reqwest::Method::from_bytes(method.as_bytes()).expect("should parse the test method");
+    let mut request = client.request(method, format!("http://{}{uri}", server.address()));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    if let Some(body) = body {
+        request = request.body(body.to_owned());
+    }
+    let response = tokio::time::timeout(Duration::from_secs(10), request.send())
+        .await
+        .expect("should answer promptly")
+        .expect("should respond");
+    let status = response.status().as_u16();
+    let response_headers = response.headers().clone();
+    let response_body = response
+        .bytes()
+        .await
+        .expect("should read the response body");
+    server
+        .shutdown()
+        .await
+        .expect("should stop the Axum test server");
+    (status, response_headers, response_body)
+}
+
+/// Header that marks a request body as JSON.
+const JSON_CONTENT_TYPE: (&str, &str) = ("content-type", "application/json");
+
+/// Header carrying the shared test settings' admin credentials.
+const ADMIN_AUTHORIZATION: (&str, &str) = ("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==");
+
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
-    let req = AxumRequest::builder()
-        .method("GET")
-        .uri(uri)
-        .body(AxumBody::empty())
-        .expect("should build GET request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let (s, h, _) = send(Adapter::Axum, "GET", uri, &[], None).await;
+    (s, h)
+}
+
+/// Send a GET request to the Axum adapter and return (status, headers, body bytes).
+async fn axum_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
+    send(Adapter::Axum, "GET", uri, &[], None).await
 }
 
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(axum_router());
-    let req = AxumRequest::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(AxumBody::from(body.to_owned()))
-        .expect("should build POST request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body_bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .expect("should collect body")
-        .to_bytes();
-    (status, headers, body_bytes)
+    send(Adapter::Axum, "POST", uri, &[JSON_CONTENT_TYPE], Some(body)).await
 }
 
 /// Convenience wrapper for tests that don't need body.
@@ -130,30 +222,25 @@ async fn axum_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Cloudflare adapter and return (status, headers).
 async fn cf_get(uri: &str) -> (u16, HeaderMap) {
-    let router = cf_router();
-    let req = request_builder()
-        .method("GET")
-        .uri(uri)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build GET request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let (s, h, _) = cf_get_body(uri).await;
+    (s, h)
+}
+
+/// Send a GET request to the Cloudflare adapter and return (status, headers, body bytes).
+async fn cf_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
+    send(Adapter::Cloudflare, "GET", uri, &[], None).await
 }
 
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = cf_router();
-    let req = request_builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build POST request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
-    (status, headers, body_bytes)
+    send(
+        Adapter::Cloudflare,
+        "POST",
+        uri,
+        &[JSON_CONTENT_TYPE],
+        Some(body),
+    )
+    .await
 }
 
 /// Convenience wrapper for tests that don't need body.
@@ -164,17 +251,7 @@ async fn cf_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Spin adapter and return (status, headers, body bytes).
 async fn spin_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = spin_router();
-    let req = request_builder()
-        .method("GET")
-        .uri(uri)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build GET request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
-    (status, headers, body_bytes)
+    send(Adapter::Spin, "GET", uri, &[], None).await
 }
 
 /// Send a GET request to the Spin adapter and return (status, headers).
@@ -185,18 +262,7 @@ async fn spin_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Spin adapter and return (status, headers, body bytes).
 async fn spin_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = spin_router();
-    let req = request_builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build POST request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    let status = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
-    (status, headers, body_bytes)
+    send(Adapter::Spin, "POST", uri, &[JSON_CONTENT_TYPE], Some(body)).await
 }
 
 /// Convenience wrapper for tests that don't need body.
@@ -211,109 +277,62 @@ async fn spin_post_with_headers(
     body: &str,
     extra_headers: &[(&str, &str)],
 ) -> (u16, HeaderMap) {
-    let router = spin_router();
-    let mut builder = request_builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json");
-    for (name, value) in extra_headers {
-        builder = builder.header(*name, *value);
-    }
-    let req = builder
-        .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build POST request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let headers: Vec<(&str, &str)> = std::iter::once(JSON_CONTENT_TYPE)
+        .chain(extra_headers.iter().copied())
+        .collect();
+    let (s, h, _) = send(Adapter::Spin, "POST", uri, &headers, Some(body)).await;
+    (s, h)
+}
+
+/// Send an authorized JSON request to `adapter` and return (status, headers).
+async fn authorized_json(
+    adapter: Adapter,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, HeaderMap) {
+    let (s, h, _) = send(
+        adapter,
+        method,
+        uri,
+        &[ADMIN_AUTHORIZATION, JSON_CONTENT_TYPE],
+        Some(body),
+    )
+    .await;
+    (s, h)
 }
 
 /// Send an authorized JSON request to the Axum adapter and return (status, headers).
 async fn axum_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
-    let req = AxumRequest::builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(body.to_owned()))
-        .expect("should build authorized JSON request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    authorized_json(Adapter::Axum, method, uri, body).await
 }
 
 /// Send an authorized JSON request to the Cloudflare adapter and return (status, headers).
 async fn cf_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
-    let router = cf_router();
-    let req = request_builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build authorized JSON request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    authorized_json(Adapter::Cloudflare, method, uri, body).await
 }
 
 /// Send an authorized JSON request to the Spin adapter and return (status, headers).
 async fn spin_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
-    let router = spin_router();
-    let req = request_builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build authorized JSON request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    authorized_json(Adapter::Spin, method, uri, body).await
 }
 
 /// Send an OPTIONS request to the Axum adapter and return (status, headers).
 async fn axum_options(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
-    let req = AxumRequest::builder()
-        .method("OPTIONS")
-        .uri(uri)
-        .body(AxumBody::empty())
-        .expect("should build OPTIONS request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let (s, h, _) = send(Adapter::Axum, "OPTIONS", uri, &[], None).await;
+    (s, h)
 }
 
 /// Send an OPTIONS request to the Cloudflare adapter and return (status, headers).
 async fn cf_options(uri: &str) -> (u16, HeaderMap) {
-    let router = cf_router();
-    let req = request_builder()
-        .method("OPTIONS")
-        .uri(uri)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build OPTIONS request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let (s, h, _) = send(Adapter::Cloudflare, "OPTIONS", uri, &[], None).await;
+    (s, h)
 }
 
 /// Send an OPTIONS request to the Spin adapter and return (status, headers).
 async fn spin_options(uri: &str) -> (u16, HeaderMap) {
-    let router = spin_router();
-    let req = request_builder()
-        .method("OPTIONS")
-        .uri(uri)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build OPTIONS request");
-    let resp = router.oneshot(req).await.expect("should respond");
-    (resp.status().as_u16(), resp.headers().clone())
+    let (s, h, _) = send(Adapter::Spin, "OPTIONS", uri, &[], None).await;
+    (s, h)
 }
 
 // ---------------------------------------------------------------------------
@@ -341,46 +360,10 @@ async fn discovery_route_body_is_json_parity() {
     // return an error body. Assert that whichever body type each returns (JSON or
     // not) is consistent: if the Cloudflare adapter returns valid JSON then the
     // Axum adapter must also return valid JSON for the same route.
-    use http_body_util::BodyExt as _;
     use serde_json::Value;
 
-    let (axum_status, axum_body_bytes) = {
-        let mut svc = EdgeZeroAxumService::new(axum_router());
-        let req = AxumRequest::builder()
-            .method("GET")
-            .uri("/.well-known/trusted-server.json")
-            .body(AxumBody::empty())
-            .expect("should build GET request");
-        let resp = svc
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(req)
-            .await
-            .expect("should respond");
-        let status = resp.status().as_u16();
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .expect("should collect body")
-            .to_bytes();
-        (status, body)
-    };
-
-    let (cf_status, cf_body_bytes) = {
-        let router = cf_router();
-        let req = request_builder()
-            .method("GET")
-            .uri("/.well-known/trusted-server.json")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build GET request");
-        let resp = router.oneshot(req).await.expect("should respond");
-        let status = resp.status().as_u16();
-        let body = resp.into_body().into_bytes().unwrap_or_default();
-        (status, body)
-    };
-
+    let (axum_status, _, axum_body_bytes) = axum_get_body("/.well-known/trusted-server.json").await;
+    let (cf_status, _, cf_body_bytes) = cf_get_body("/.well-known/trusted-server.json").await;
     let (spin_status, _, spin_body_bytes) = spin_get_body("/.well-known/trusted-server.json").await;
 
     // This endpoint serves a static config document, so the bodies must be
@@ -1021,12 +1004,266 @@ async fn admin_cache_purge_rejects_credential_forwarding_methods() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Production ingress on the Axum test server (EZ-23 criterion 13)
+// ---------------------------------------------------------------------------
+
+/// Environment variables that route reqwest's outbound requests through a proxy.
+const PROXY_VARIABLES: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn axum_test_server_parity_rejects_9000_byte_target_with_414() {
+    // Trusted Server keeps EdgeZero's default 8192-byte request-target limit,
+    // so a 9000-byte target fails admission on every app before any route runs.
+    let target = format!("/{}", "a".repeat(8999));
+    assert_eq!(
+        target.len(),
+        9000,
+        "should build a 9000-byte request target"
+    );
+
+    let (axum_status, axum_headers) = axum_get(&target).await;
+    let (cf_status, cf_headers) = cf_get(&target).await;
+    let (spin_status, spin_headers) = spin_get(&target).await;
+
+    for (adapter, status, headers) in [
+        ("Axum", axum_status, axum_headers),
+        ("Cloudflare", cf_status, cf_headers),
+        ("Spin", spin_status, spin_headers),
+    ] {
+        assert_eq!(
+            status, 414,
+            "{adapter} should reject a 9000-byte request target with 414"
+        );
+        // The assembled app renders the rejection under its production
+        // policies, so it carries Trusted Server's synthesized headers. A
+        // bare router dispatch would answer 414 without them.
+        assert_eq!(
+            headers
+                .get(HEADER_X_TS_VERSION)
+                .and_then(|value| value.to_str().ok()),
+            TS_GIT_VERSION,
+            "{adapter} should add the synthesized x-ts-version to its 414"
+        );
+    }
+}
+
+#[test]
+fn bodiless_get_with_unread_stream_reaches_origin_without_body() {
+    // EdgeZero's Axum client honors the proxy variables, and so does the Axum
+    // app's publisher client. Unset them for this test only, through the
+    // harness's process-wide environment lock.
+    temp_env::with_vars_unset(PROXY_VARIABLES, || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("should build the test runtime")
+            .block_on(assert_bodiless_get_reaches_origin_without_body());
+    });
+}
+
+/// Forwards a bodiless GET whose inbound body is an unread stream and checks
+/// that the origin received no body.
+async fn assert_bodiless_get_reaches_origin_without_body() {
+    let origin = RecordingOrigin::start().await;
+    let mut settings = test_settings();
+    settings.publisher.origin_url = format!("http://{}", origin.address);
+    // EdgeZero's own Axum client goes in router state instead of a script, and
+    // the publisher forward runs through it.
+    // `bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin`
+    // proves the router-state client is the one that carries the forward.
+    let client = HttpClient::with_client(
+        AxumOutboundClient::try_new().expect("should build EdgeZero's Axum outbound client"),
+    );
+    let server = serve(Adapter::Axum.app(settings, client)).await;
+
+    // A chunked body that holds only its terminating chunk is bodiless, but
+    // the listener learns that only by reading it, so the app receives the
+    // body as an unread stream.
+    let response = send_raw(
+        server.address(),
+        "GET / HTTP/1.1\r\nHost: test-publisher.example.com\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "should relay the origin's 200, got: {response}"
+    );
+
+    let records = origin.records();
+    assert_eq!(records.len(), 1, "should reach the origin exactly once");
+    let record = &records[0];
+    assert_eq!(record.method, http::Method::GET, "should forward a GET");
+    assert!(
+        record.body.is_empty(),
+        "should forward no request body, got {} bytes",
+        record.body.len()
+    );
+    assert!(
+        !record.headers.contains_key(http::header::TRANSFER_ENCODING),
+        "should forward no Transfer-Encoding, got {:?}",
+        record.headers.get(http::header::TRANSFER_ENCODING)
+    );
+    // EZ-1 allows a bodiless forward to carry `Content-Length: 0`, though it
+    // should not, so the header must be absent or zero.
+    let content_length = record.headers.get(http::header::CONTENT_LENGTH);
+    assert!(
+        content_length.is_none_or(|value| value == "0"),
+        "should forward no Content-Length or `Content-Length: 0`, got {content_length:?}"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("should stop the Axum test server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin() {
+    let origin = RecordingOrigin::start().await;
+    let mut settings = test_settings();
+    settings.publisher.origin_url = format!("http://{}", origin.address);
+    let server = serve(Adapter::Axum.app(
+        settings,
+        HttpClient::with_client(ScriptedHttpClient::forbidding()),
+    ))
+    .await;
+
+    // The forbidding script fails the forward wherever it ends, so the request
+    // leaves only through the router-state client and never succeeds.
+
+    let response = send_raw(
+        server.address(),
+        "GET / HTTP/1.1\r\nHost: test-publisher.example.com\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+    )
+    .await;
+
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .expect("should answer with an HTTP status line");
+    assert!(
+        !(200..300).contains(&status),
+        "should fail the forward inside the router-state client, got: {response}"
+    );
+    assert!(
+        origin.records().is_empty(),
+        "should never reach the loopback origin through another client"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("should stop the Axum test server");
+}
+
+/// What the loopback origin received for one request.
+#[derive(Clone)]
+struct OriginRecord {
+    method: http::Method,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+}
+
+/// A loopback origin that answers every request with 200 and records what it received.
+struct RecordingOrigin {
+    address: SocketAddr,
+    records: Arc<Mutex<Vec<OriginRecord>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingOrigin {
+    /// Binds `127.0.0.1:0` and starts serving.
+    async fn start() -> Self {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&records);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = axum::body::to_bytes(body, 1024 * 1024)
+                    .await
+                    .expect("should read the origin request body");
+                recorder
+                    .lock()
+                    .expect("should lock the origin records")
+                    .push(OriginRecord {
+                        method: parts.method,
+                        headers: parts.headers,
+                        body,
+                    });
+                (
+                    [(http::header::CONTENT_TYPE, "text/plain")],
+                    "example origin",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind the loopback origin");
+        let address = listener
+            .local_addr()
+            .expect("should read the loopback origin address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("should serve the loopback origin");
+        });
+        Self {
+            address,
+            records,
+            task,
+        }
+    }
+
+    /// Returns every request received so far, in arrival order.
+    fn records(&self) -> Vec<OriginRecord> {
+        self.records
+            .lock()
+            .expect("should lock the origin records")
+            .clone()
+    }
+}
+
+impl Drop for RecordingOrigin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Writes `request` to a fresh connection to `address` and returns everything the server sends
+/// before it closes the connection.
+async fn send_raw(address: SocketAddr, request: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("should connect to the Axum test server");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("should write the raw request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("should close the connection promptly")
+        .expect("should read the raw response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 /// A known non-regulated location permits the fixture's server-side auction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_buffers_nextjs_auction_output() {
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let settings = nextjs_auction::settings();
-    let services = nextjs_auction::services(Arc::clone(&client));
+    let services = nextjs_auction::services(&client);
     let routers = [
         (
             "Axum",
@@ -1152,74 +1389,72 @@ async fn adapter_buffers_nextjs_auction_output() {
     }
 }
 
-#[derive(Default)]
+/// Scripted publisher origin and EOF lookup for the HTML finalization parity case.
+///
+/// Every request queues its own answer as the script records it: the lookup
+/// approves or fails, and every other request gets the example document.
 struct TerminalFixtureOrigin {
-    lookup_calls: AtomicUsize,
-    saw_range: AtomicUsize,
-    fail_lookup: bool,
+    clock: TestClock,
+    client: ScriptedHttpClient,
+    lookup_calls: Arc<AtomicUsize>,
+    saw_range: Arc<AtomicUsize>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for TerminalFixtureOrigin {
-    async fn send(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        let (content_type, body) = if request.request.uri().host() == Some("lookup.example.com") {
-            tokio::task::yield_now().await;
-            let payload = request
-                .request
-                .into_body()
-                .into_bytes()
-                .expect("should send a bounded fixture payload");
-            let payload: serde_json::Value = serde_json::from_slice(&payload)
-                .expect("should encode completed-document metadata");
-            assert_eq!(
-                payload["complete"], true,
-                "should observe the EOF sentinel before I/O"
-            );
-            assert_eq!(
-                payload["sha256"]
-                    .as_str()
-                    .expect("should hash transformed HTML")
-                    .len(),
-                64,
-                "should send a complete digest"
-            );
-            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_lookup {
-                return Err(Report::new(PlatformError::HttpClient));
+impl TerminalFixtureOrigin {
+    fn new(fail_lookup: bool) -> Self {
+        let clock = TestClock::new();
+        let script = ScriptedHttpClient::new(&clock);
+        let rearm = script.clone();
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let saw_range = Arc::new(AtomicUsize::new(0));
+        let (lookups, ranges) = (Arc::clone(&lookup_calls), Arc::clone(&saw_range));
+        let client = script.with_request_observer(move |request| {
+            let uri = request.uri.to_string();
+            if request.uri.host() == Some("lookup.example.com") {
+                let payload: serde_json::Value = serde_json::from_slice(&request.body)
+                    .expect("should encode completed-document metadata");
+                assert_eq!(
+                    payload["complete"], true,
+                    "should observe the EOF sentinel before I/O"
+                );
+                assert_eq!(
+                    payload["sha256"]
+                        .as_str()
+                        .expect("should hash transformed HTML")
+                        .len(),
+                    64,
+                    "should send a complete digest"
+                );
+                lookups.fetch_add(1, Ordering::SeqCst);
+                let reply = if fail_lookup {
+                    ScriptedReply::error(EdgeError::bad_gateway("example lookup failure"))
+                } else {
+                    ScriptedReply::status(http::StatusCode::OK)
+                        .header("content-type", "text/plain")
+                        .header("cache-control", "public, max-age=60")
+                        .body("EXAMPLE_APPROVED")
+                };
+                rearm.respond_to(request.method.clone(), &uri, reply);
+            } else {
+                if request.headers.contains_key(http::header::RANGE) {
+                    ranges.fetch_add(1, Ordering::SeqCst);
+                }
+                rearm.respond_to(
+                    request.method.clone(),
+                    &uri,
+                    ScriptedReply::status(http::StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .header("cache-control", "public, max-age=60")
+                        .body("<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->"),
+                );
             }
-            ("text/plain", "EXAMPLE_APPROVED")
-        } else {
-            if request.request.headers().contains_key(http::header::RANGE) {
-                self.saw_range.fetch_add(1, Ordering::SeqCst);
-            }
-            (
-                "text/html",
-                "<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->",
-            )
-        };
-        Ok(PlatformResponse::new(
-            http::Response::builder()
-                .status(200)
-                .header("content-type", content_type)
-                .header("cache-control", "public, max-age=60")
-                .body(edgezero_core::body::Body::from(body))
-                .expect("should build an example upstream response"),
-        ))
-    }
-    async fn send_async(
-        &self,
-        _: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
-    }
-    async fn select(
-        &self,
-        _: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        });
+        Self {
+            clock,
+            client,
+            lookup_calls,
+            saw_range,
+        }
     }
 }
 
@@ -1233,14 +1468,8 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
         settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
         "enabled": enabled, "lookup_url": format!("https://lookup.example.com/{case}"), "transport_timeout_ms": 1000,
     })).expect("should enable the fictional terminal consumer");
-        let client = Arc::new(TerminalFixtureOrigin {
-            lookup_calls: AtomicUsize::new(0),
-            saw_range: AtomicUsize::new(0),
-            fail_lookup: case == "failed",
-        });
-        let services = nextjs_auction::services_with_http_client(
-            Arc::clone(&client) as Arc<dyn PlatformHttpClient>
-        );
+        let client = TerminalFixtureOrigin::new(case == "failed");
+        let services = nextjs_auction::services_with_outbound_client(&client.client, &client.clock);
         let routers = [
             (
                 "Axum",
@@ -1356,11 +1585,107 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
     }
 }
 
+/// A TCF v2 `euconsent-v2` cookie that grants Purpose 1.
+///
+/// The test server has no geo source, so the jurisdiction is unknown and the
+/// server-side auction needs Purpose 1. The construction matches the
+/// integration suite's consent cookie, which lives in another test binary.
+fn tcf_purpose_one_cookie() -> String {
+    let mut bits = [0_u8; 29];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("should have a current fixture clock")
+        .as_millis()
+        / 100;
+    for (offset, width, value) in [
+        (0, 6, 2),
+        (6, 36, now),
+        (42, 36, now),
+        (108, 6, 4),
+        (114, 6, 13),
+        (152, 1, 1),
+    ] {
+        for index in 0..width {
+            if value & (1 << (width - index - 1)) != 0 {
+                bits[(offset + index) / 8] |= 1 << (7 - (offset + index) % 8);
+            }
+        }
+    }
+    format!(
+        "euconsent-v2={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bits)
+    )
+}
+
+/// Only Fastly sends Tinybird telemetry: the other adapters keep the no-op
+/// sink, so an auction with Tinybird enabled makes no Events API request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn axum_cloudflare_and_spin_send_no_telemetry() {
+    let mut settings = nextjs_auction::settings();
+    settings.tinybird.enabled = true;
+    settings.tinybird.api_host = "api.tinybird.example.com".to_owned();
+    settings.tinybird.auction_token_secret = Some(trusted_server_core::redacted::Redacted::new(
+        "example-append-token".to_owned(),
+    ));
+
+    for (name, adapter) in [
+        ("Axum", Adapter::Axum),
+        ("Cloudflare", Adapter::Cloudflare),
+        ("Spin", Adapter::Spin),
+    ] {
+        let scripted = ScriptedHttpClient::new(&TestClock::new());
+        let server = serve(adapter.app(settings.clone(), scripted.http_client())).await;
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("should build the test HTTP client")
+            .post(format!("http://{}/auction", server.address()))
+            .header("cookie", tcf_purpose_one_cookie())
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "adUnits": [{
+                        "code": "fixture-slot",
+                        "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("should answer the auction");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("should answer with the auction's JSON");
+        server
+            .shutdown()
+            .await
+            .expect("should stop the Axum test server");
+
+        assert_eq!(status, 200, "{name} should complete the auction");
+        assert_eq!(
+            body["ext"]["orchestrator"]["providers"], 1,
+            "{name} should run the auction, which emits its telemetry rows: {body}"
+        );
+        let requested: Vec<String> = scripted
+            .requests()
+            .iter()
+            .map(|request| request.uri.to_string())
+            .collect();
+        assert!(
+            !requested.iter().any(|uri| uri.contains("tinybird")),
+            "{name} should send no Tinybird request: {requested:?}"
+        );
+    }
+}
+
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod trace_parity {
     use std::net::IpAddr;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1376,10 +1701,9 @@ mod trace_parity {
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::platform::{
-        BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
-        PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-        PlatformSelectResult, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+        ClientInfo, GeoInfo, HttpClient, PlatformConfigStore, PlatformError, PlatformGeo,
+        PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+        UnavailableKvStore,
     };
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedForwarderConfig;
@@ -1387,13 +1711,38 @@ mod trace_parity {
 
     use super::*;
 
-    struct ForbiddenLifecycle;
+    /// Platform services that fail the test when a trace or forwarder request reaches them.
+    ///
+    /// Its outbound client is a forbid-mode script, which fails each request instead of
+    /// panicking. Each test checks [`ForbiddenLifecycle::script`] at its end, so the test
+    /// fails if any outbound request was sent.
+    struct ForbiddenLifecycle {
+        outbound: ScriptedHttpClient,
+    }
 
+    impl ForbiddenLifecycle {
+        fn new() -> Self {
+            Self {
+                outbound: ScriptedHttpClient::forbidding(),
+            }
+        }
+
+        fn outbound_client(&self) -> HttpClient {
+            self.outbound.http_client()
+        }
+
+        /// Returns a handle on the script that records every outbound request.
+        fn script(&self) -> ScriptedHttpClient {
+            self.outbound.clone()
+        }
+    }
+
+    #[async_trait(?Send)]
     impl PlatformConfigStore for ForbiddenLifecycle {
         fn get(&self, _store: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
             panic!("should not read trace config per request");
         }
-        fn put(
+        async fn put(
             &self,
             _store: &StoreId,
             _key: &str,
@@ -1401,10 +1750,11 @@ mod trace_parity {
         ) -> Result<(), Report<PlatformError>> {
             panic!("should not write trace config");
         }
-        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             panic!("should not delete trace config");
         }
     }
+    #[async_trait(?Send)]
     impl PlatformSecretStore for ForbiddenLifecycle {
         fn get_bytes(
             &self,
@@ -1413,7 +1763,7 @@ mod trace_parity {
         ) -> Result<Vec<u8>, Report<PlatformError>> {
             panic!("should not read trace secrets");
         }
-        fn create(
+        async fn create(
             &self,
             _store: &StoreId,
             _key: &str,
@@ -1421,22 +1771,8 @@ mod trace_parity {
         ) -> Result<(), Report<PlatformError>> {
             panic!("should not write trace secrets");
         }
-        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
             panic!("should not delete trace secrets");
-        }
-    }
-    impl PlatformBackend for ForbiddenLifecycle {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            panic!("should not resolve trace backends");
-        }
-        fn predict_name(
-            &self,
-            _spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            panic!("should not predict trace backends");
-        }
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            panic!("should not register trace backends");
         }
     }
     #[async_trait(?Send)]
@@ -1468,27 +1804,6 @@ mod trace_parity {
         }
     }
     #[async_trait(?Send)]
-    impl PlatformHttpClient for ForbiddenLifecycle {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            panic!("should not contact trace origin");
-        }
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            panic!("should not launch trace auctions");
-        }
-        async fn select(
-            &self,
-            _requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            panic!("should not collect trace auctions");
-        }
-    }
-    #[async_trait(?Send)]
     impl AuctionTelemetrySink for ForbiddenLifecycle {
         fn is_enabled(&self) -> bool {
             panic!("should not inspect trace auction telemetry");
@@ -1515,23 +1830,26 @@ mod trace_parity {
             );
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Some(GeoInfo {
-                city: String::new(),
+                city: None,
                 country: "GB".to_owned(),
-                continent: String::new(),
-                latitude: 0.0,
-                longitude: 0.0,
-                metro_code: 0,
+                continent: None,
+                coordinates: None,
+                metro_code: None,
                 region: Some("EX".to_owned()),
                 asn: Some(64512),
             }))
         }
     }
 
+    /// Trace routers for each adapter over shared forbidden-lifecycle services, with the
+    /// script that records their outbound requests.
+    type ForbiddenRouters = (Vec<(&'static str, RouterService)>, ScriptedHttpClient);
+
     fn routers(
         enabled: bool,
         auth_pattern: Option<&str>,
         calls: Arc<AtomicUsize>,
-    ) -> Vec<(&'static str, RouterService)> {
+    ) -> ForbiddenRouters {
         routers_with_client(
             enabled,
             auth_pattern,
@@ -1549,7 +1867,7 @@ mod trace_parity {
         auth_pattern: Option<&str>,
         calls: Arc<AtomicUsize>,
         client_ip: Option<IpAddr>,
-    ) -> Vec<(&'static str, RouterService)> {
+    ) -> ForbiddenRouters {
         let mut settings = test_settings();
         settings
             .integrations
@@ -1561,13 +1879,14 @@ mod trace_parity {
         if let Some(pattern) = auth_pattern {
             settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":pattern,"username":"example-user","password":"example-password"})).expect("should insert trace auth rule"));
         }
-        let forbidden = Arc::new(ForbiddenLifecycle);
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
+        let script = forbidden.script();
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
-            .backend(forbidden.clone())
-            .http_client(forbidden.clone())
+            .outbound_client(forbidden.outbound_client())
+            .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
             .geo(Arc::new(CountingGeo(calls)))
             .client_info(ClientInfo {
@@ -1575,7 +1894,7 @@ mod trace_parity {
                 ..ClientInfo::default()
             })
             .build();
-        routers_with_services(settings, services)
+        (routers_with_services(settings, services), script)
     }
 
     fn routers_with_services(
@@ -1607,7 +1926,8 @@ mod trace_parity {
     #[tokio::test]
     async fn trace_dispatch_parity_missing_client_ip_skips_geo() {
         let calls = Arc::new(AtomicUsize::new(0));
-        for (adapter, router) in routers_with_client(true, None, Arc::clone(&calls), None) {
+        let (adapters, outbound) = routers_with_client(true, None, Arc::clone(&calls), None);
+        for (adapter, router) in adapters {
             let response = RouterService::oneshot(
                 &router,
                 request_builder()
@@ -1628,6 +1948,7 @@ mod trace_parity {
             0,
             "should not synthesize a geo lookup without trusted client IP"
         );
+        outbound.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1656,7 +1977,8 @@ mod trace_parity {
                     },
                 ),
             ] {
-                for (adapter, router) in routers(enabled, pattern, Arc::clone(&calls)) {
+                let (adapters, outbound) = routers(enabled, pattern, Arc::clone(&calls));
+                for (adapter, router) in adapters {
                     let request = request_builder()
                         .method("EXAMPLE-METHOD")
                         .uri(path)
@@ -1688,6 +2010,7 @@ mod trace_parity {
                         "{adapter} should not write rejected cookies"
                     );
                 }
+                outbound.assert_no_requests();
             }
         }
         assert_eq!(
@@ -1700,7 +2023,8 @@ mod trace_parity {
     #[tokio::test]
     async fn trace_dispatch_parity_read_only_setup_and_verified_assets() {
         let calls = Arc::new(AtomicUsize::new(0));
-        for (adapter, router) in routers(true, None, Arc::clone(&calls)) {
+        let (adapters, outbound) = routers(true, None, Arc::clone(&calls));
+        for (adapter, router) in adapters {
             for (method, path, expected_calls) in [
                 (Method::HEAD, "/_ts/trace", 0),
                 (Method::GET, "/_ts/trace/state", 0),
@@ -1776,6 +2100,7 @@ mod trace_parity {
                 }
             }
         }
+        outbound.assert_no_requests();
     }
 
     fn trusted_server_js_asset(path: &str) -> &'static [u8] {
@@ -1787,7 +2112,8 @@ mod trace_parity {
     #[tokio::test]
     async fn trace_dispatch_parity_stream_actions_preserve_cookie_policy_and_separate_state() {
         let calls = Arc::new(AtomicUsize::new(0));
-        for (adapter, router) in routers(true, None, Arc::clone(&calls)) {
+        let (adapters, outbound) = routers(true, None, Arc::clone(&calls));
+        for (adapter, router) in adapters {
             for action in ["enable", "end"] {
                 let mut request = request_builder()
                     .method("POST")
@@ -1797,7 +2123,7 @@ mod trace_parity {
                     .header("sec-fetch-site", "same-origin")
                     .header("x-ts-trace-action", action)
                     .header("cookie", "__Host-ts-console=1, unrelated=value")
-                    .body(edgezero_core::body::Body::from_stream(
+                    .body(edgezero_core::body::Body::from_external_stream(
                         futures_trace_empty_stream(),
                     ))
                     .expect("should build no-content-type streamed action");
@@ -1875,6 +2201,7 @@ mod trace_parity {
             0,
             "should not lookup metadata for actions or state"
         );
+        outbound.assert_no_requests();
     }
 
     const FORWARDER_HEADER: &str = "x-example-forwarder-key";
@@ -1923,24 +2250,26 @@ mod trace_parity {
         request
     }
 
-    fn forwarder_trace_routers(settings: Settings) -> Vec<(&'static str, RouterService)> {
-        let forbidden = Arc::new(ForbiddenLifecycle);
+    fn forwarder_trace_routers(settings: Settings) -> ForbiddenRouters {
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
+        let script = forbidden.script();
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden.clone())
             .kv_store(forbidden.clone())
-            .backend(forbidden.clone())
-            .http_client(forbidden.clone())
+            .outbound_client(forbidden.outbound_client())
+            .clock(TestClock::new().monotonic_clock())
             .auction_telemetry_sink(forbidden)
             .geo(Arc::new(CountingGeo(Arc::new(AtomicUsize::new(0)))))
             .client_info(ClientInfo::default())
             .build();
-        routers_with_services(settings, services)
+        (routers_with_services(settings, services), script)
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_trace_actions_use_public_origin() {
-        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+        let (adapters, outbound) = forwarder_trace_routers(forwarder_settings());
+        for (adapter, router) in adapters {
             for action in ["enable", "end"] {
                 let mut request = forwarded_request(&format!("/_ts/trace/{action}"));
                 request.headers_mut().insert(
@@ -1986,18 +2315,24 @@ mod trace_parity {
                 );
             }
         }
+        outbound.assert_no_requests();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trusted_forwarder_axum_boundary_requires_transport_binding() {
-        let router = AxumApp::routes_with_settings(forwarder_settings())
-            .expect("should build native Axum forwarded routes");
-        let mut service = EdgeZeroAxumService::new(router);
+        let outbound = ScriptedHttpClient::forbidding();
+        let router = AxumApp::routes_with_settings_and_outbound_client(
+            forwarder_settings(),
+            HttpClient::with_client(outbound.clone()),
+        )
+        .expect("should build native Axum forwarded routes");
         for duplicate in [false, true] {
             let request = forwarded_request("/_ts/trace/enable");
             let (mut parts, _) = request.into_parts();
             // Without the private binding from a real HTTP listener, the SDK
             // must leave transport origin unavailable even for an absolute URI.
+            // Every request on the Axum test server carries that binding, so
+            // this case converts through the SDK's public request converter.
             parts.extensions.remove::<RequestIngress>();
             if duplicate {
                 parts.headers.append(
@@ -2005,13 +2340,12 @@ mod trace_parity {
                     http::HeaderValue::from_static(FORWARDER_SECRET),
                 );
             }
-            let response = service
-                .ready()
+            let request = into_core_request(AxumRequest::from_parts(parts, AxumBody::empty()))
                 .await
-                .expect("should ready native Axum service")
-                .call(AxumRequest::from_parts(parts, AxumBody::empty()))
+                .expect("should convert the native Axum request");
+            let response = RouterService::oneshot(&router, request)
                 .await
-                .expect("should convert and dispatch forwarded action");
+                .expect("should dispatch forwarded action");
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
@@ -2022,11 +2356,13 @@ mod trace_parity {
                 "should not mutate cookies without transport binding"
             );
         }
+        outbound.assert_no_requests();
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_rejects_untrusted_and_ambiguous_actions() {
-        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+        let (adapters, outbound) = forwarder_trace_routers(forwarder_settings());
+        for (adapter, router) in adapters {
             for case in [
                 "missing-auth",
                 "wrong-auth",
@@ -2117,13 +2453,15 @@ mod trace_parity {
                 );
             }
         }
+        outbound.assert_no_requests();
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_default_config_keeps_transport_authority() {
         let mut settings = forwarder_settings();
         settings.trusted_forwarder = None;
-        for (adapter, router) in forwarder_trace_routers(settings) {
+        let (adapters, outbound) = forwarder_trace_routers(settings);
+        for (adapter, router) in adapters {
             for origin in [PUBLIC_ORIGIN, "http://upstream.example.com:8080"] {
                 let mut request = forwarded_request("/_ts/trace/enable");
                 request.headers_mut().insert(
@@ -2144,11 +2482,13 @@ mod trace_parity {
                 );
             }
         }
+        outbound.assert_no_requests();
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_preserves_cookie_fidelity() {
-        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+        let (adapters, outbound) = forwarder_trace_routers(forwarder_settings());
+        for (adapter, router) in adapters {
             for (preservation, expected) in [
                 (Preservation::Unknown, false),
                 (Preservation::Preserved, true),
@@ -2199,93 +2539,68 @@ mod trace_parity {
                 );
             }
         }
+        outbound.assert_no_requests();
     }
 
-    struct ForwarderOrigin {
-        base: RuntimeServices,
-        requests: Mutex<Vec<(String, HeaderMap)>>,
-    }
+    /// Geo lookup that knows no location.
+    struct NoGeo;
 
-    impl PlatformBackend for ForwarderOrigin {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            self.base.backend().naming_policy()
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            self.base.backend().predict_name(spec)
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.base.backend().ensure(spec)
-        }
-    }
-
-    impl PlatformGeo for ForwarderOrigin {
-        fn lookup(&self, ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-            self.base.geo().lookup(ip)
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl PlatformHttpClient for ForwarderOrigin {
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.requests
-                .lock()
-                .expect("should lock recorded origin requests")
-                .push((
-                    request.request.uri().to_string(),
-                    request.request.headers().clone(),
-                ));
-            if request.request.uri().host() == Some("vendor.example.com") {
-                return Ok(PlatformResponse::new(
-                    http::Response::builder()
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(edgezero_core::body::Body::from(
-                            serde_json::json!({"example":true}).to_string(),
-                        ))
-                        .expect("should answer fictional vendor request"),
-                ));
-            }
-            self.base.http_client().send(request).await
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            panic!("should not launch auctions from forwarder fixture");
-        }
-
-        async fn select(
-            &self,
-            _requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            panic!("should not collect auctions from forwarder fixture");
+    impl PlatformGeo for NoGeo {
+        fn lookup(&self, _ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            Ok(None)
         }
     }
 
     #[tokio::test]
     async fn trusted_forwarder_parity_proxy_strips_credentials_and_retains_backend_targets() {
-        let origin = Arc::new(ForwarderOrigin {
-            base: nextjs_auction::services(
-                Arc::new(nextjs_auction::NextJsAuctionOrigin::default()),
-            ),
-            requests: Mutex::new(Vec::new()),
+        let forbidden = Arc::new(ForbiddenLifecycle::new());
+        // The publisher origin and the Lockr leg both reach this script. Every
+        // origin request queues the Next.js page for itself as it is recorded,
+        // and the vendor answers once per adapter.
+        let clock = TestClock::new();
+        let script = ScriptedHttpClient::new(&clock);
+        let rearm = script.clone();
+        let upstream = script.with_request_observer(move |request| {
+            if request.uri.host() == Some(nextjs_auction::ORIGIN_HOST) {
+                rearm.respond_to(
+                    request.method.clone(),
+                    &request.uri.to_string(),
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(nextjs_auction::origin_html()),
+                );
+            }
         });
-        let forbidden = Arc::new(ForbiddenLifecycle);
+        for _ in 0..3 {
+            upstream.respond_to(
+                Method::GET,
+                "https://vendor.example.com/example",
+                ScriptedReply::status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(serde_json::json!({"example":true}).to_string()),
+            );
+        }
+        let origin_requests = || {
+            upstream
+                .requests()
+                .into_iter()
+                .filter(|request| request.uri.host() == Some(nextjs_auction::ORIGIN_HOST))
+                .collect::<Vec<_>>()
+        };
+        let vendor_requests = || {
+            upstream
+                .requests()
+                .into_iter()
+                .filter(|request| request.uri.host() == Some("vendor.example.com"))
+                .collect::<Vec<_>>()
+        };
         let services = RuntimeServices::builder()
             .config_store(forbidden.clone())
             .secret_store(forbidden)
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(origin.clone())
-            .http_client(origin.clone())
-            .geo(origin.clone())
+            .outbound_client(upstream.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(NoGeo))
             .client_info(ClientInfo::default())
             .build();
         let mut settings = forwarder_settings();
@@ -2298,11 +2613,8 @@ mod trace_parity {
             .expect("should enable public URL rewriting");
         settings.integrations.insert_config("lockr", &serde_json::json!({"enabled":true,"app_id":"fictional-app","api_endpoint":"https://vendor.example.com","sdk_url":"https://vendor.example.com/sdk.js"})).expect("should configure fictional integration upstream");
         for (adapter, router) in routers_with_services(settings, services) {
-            origin
-                .requests
-                .lock()
-                .expect("should reset recorded origin requests")
-                .clear();
+            let origin_sent = origin_requests().len();
+            let vendor_sent = vendor_requests().len();
             for (method, path, target) in [
                 (
                     Method::GET,
@@ -2368,12 +2680,17 @@ mod trace_parity {
                         "{adapter} should not generate internal transport URLs"
                     );
                 }
-                let requests = origin
-                    .requests
-                    .lock()
-                    .expect("should inspect actual outbound request");
-                let (actual_target, headers) =
-                    requests.last().expect("should reach configured upstream");
+                let (actual_target, headers) = if path.starts_with("/integrations/") {
+                    let request = vendor_requests()
+                        .pop()
+                        .expect("should reach the integration upstream");
+                    (request.uri.to_string(), request.headers)
+                } else {
+                    let request = origin_requests()
+                        .pop()
+                        .expect("should reach configured upstream");
+                    (request.uri.to_string(), request.headers)
+                };
                 assert_eq!(
                     actual_target, target,
                     "{adapter} should keep configured backend target for {method} {path}"
@@ -2393,13 +2710,12 @@ mod trace_parity {
                 );
             }
             assert_eq!(
-                origin
-                    .requests
-                    .lock()
-                    .expect("should count outbound requests")
-                    .len(),
-                3,
-                "{adapter} should dispatch exactly the three intended upstream requests"
+                (
+                    origin_requests().len() - origin_sent,
+                    vendor_requests().len() - vendor_sent
+                ),
+                (2, 1),
+                "{adapter} should dispatch exactly the two publisher and one integration requests"
             );
             for method in [Method::GET, Method::PUT, Method::DELETE, Method::OPTIONS] {
                 let mut request = forwarded_request("/_ts/trace/enable");
@@ -2418,12 +2734,11 @@ mod trace_parity {
                 );
             }
             assert_eq!(
-                origin
-                    .requests
-                    .lock()
-                    .expect("should count requests after early returns")
-                    .len(),
-                3,
+                (
+                    origin_requests().len() - origin_sent,
+                    vendor_requests().len() - vendor_sent
+                ),
+                (2, 1),
                 "{adapter} should keep forwarding credentials away from all upstreams on trace early returns"
             );
         }

@@ -5,7 +5,7 @@
 //! based on price (highest price wins).
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::{OutboundCachePolicy, OutboundResponse, ResponseDecoding};
 use error_stack::{Report, ResultExt};
 use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
@@ -25,12 +25,12 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
 use crate::error::TrustedServerError;
-use crate::integrations::{
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
-};
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+use crate::integrations::UPSTREAM_RTB_MAX_RESPONSE_BYTES;
+use crate::outbound::{OutboundRequestSource, buffered, outbound_error, outbound_request};
 use crate::settings::{IntegrationConfig, Settings};
+
+/// The mediator response cap, the RTB cap that Prebid and APS responses share.
+const MEDIATOR_MAX_RESPONSE_BYTES: u64 = UPSTREAM_RTB_MAX_RESPONSE_BYTES as u64;
 
 // ============================================================================
 // Configuration
@@ -382,13 +382,11 @@ impl AdServerMockProvider {
     /// its body cannot be read within the response limit, or it is not valid JSON.
     async fn parse_response_inner(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         bid_index: &BidIndex,
         dimensions_by_slot: Option<&BidDimensionIndex>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
-
         // OpenRTB signals an empty auction with a bodiless 204, and the bidder
         // providers already treat it that way. Keep it a final mediation no-bid.
         if response.status() == StatusCode::NO_CONTENT {
@@ -404,16 +402,19 @@ impl AdServerMockProvider {
             }));
         }
 
-        // collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            "adserver_mock",
-        )
-        .await
-        .change_context(TrustedServerError::Auction {
-            message: "Failed to read AdServer Mock response body".to_string(),
-        })?;
+        // The request buffered the response under the same cap.
+        let body_bytes = response
+            .into_bytes_bounded(MEDIATOR_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Auction {
+                        message: "Failed to read AdServer Mock response body".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse mediation response".to_string(),
@@ -475,69 +476,37 @@ impl AuctionProvider for AdServerMockProvider {
             serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
                 message: "Failed to serialize mediation request".to_string(),
             })?;
-        let mut req = http::Request::builder()
-            .method(Method::POST)
-            .uri(&endpoint_url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(mediation_body))
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_string(),
-            })?;
-
-        // Set Host header with port to ensure mocktioneer generates correct iframe URLs
-        if let Ok(url) = url::Url::parse(&self.config.endpoint)
-            && let Some(host) = url.host_str()
-        {
-            let host_with_port = if let Some(port) = url.port() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            match header::HeaderValue::from_str(&host_with_port) {
-                Ok(value) => {
-                    req.headers_mut().insert(header::HOST, value);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to build Host header for '{}': {}",
-                        host_with_port,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Uses the auction-scoped canonical transport timeout rather than the
-        // 15 s fixed timeout in ensure_integration_backend, which is for proxy
-        // endpoints. The exact logical budget remains in context.timeout_ms.
-        let backend_name = ensure_integration_backend_with_timeout(
-            context.services,
-            &self.config.endpoint,
-            "adserver_mock",
-            Duration::from_millis(u64::from(context.transport_timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for mediation endpoint: {}",
-                self.config.endpoint
-            ),
+        let target = outbound_request(Method::POST, &endpoint_url).map_err(|error| {
+            outbound_error(
+                error,
+                TrustedServerError::Auction {
+                    message: "Failed to build mediation request".to_string(),
+                },
+                OutboundRequestSource::Internal,
+            )
         })?;
+        // The mediator's own timeout bounds it, and the orchestrator adds the
+        // auction deadline. `EdgeZero` sends the endpoint's authority, port
+        // included, as the Host, which mocktioneer needs for its iframe URLs.
+        let mut mediation_request = buffered(
+            target,
+            Duration::from_millis(u64::from(self.config.timeout_ms)),
+            MEDIATOR_MAX_RESPONSE_BYTES,
+            ResponseDecoding::Decode,
+        )
+        .cache_policy(OutboundCachePolicy::Bypass)
+        .body(mediation_body);
+        mediation_request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
 
-        let pending = context
-            .services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(req, backend_name).with_cache_bypass())
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to send mediation request".to_string(),
-            })?;
-
-        Ok(ProviderRequestOutcome::pending(pending))
+        Ok(ProviderRequestOutcome::ready(mediation_request))
     }
 
     async fn parse_response(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // No auction context available — nurl/burl/ad_id restoration from the
@@ -551,7 +520,7 @@ impl AuctionProvider for AdServerMockProvider {
 
     async fn parse_response_with_context(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
@@ -580,26 +549,6 @@ impl AuctionProvider for AdServerMockProvider {
 
     fn is_enabled(&self) -> bool {
         self.config.enabled
-    }
-
-    fn backend_name(
-        &self,
-        services: &RuntimeServices,
-        transport_timeout_ms: u32,
-    ) -> Option<String> {
-        predict_integration_backend_name(
-            services,
-            &self.config.endpoint,
-            "adserver_mock",
-            Duration::from_millis(u64::from(transport_timeout_ms)),
-        )
-        .inspect_err(|e| {
-            log::error!(
-                "Failed to predict backend name for AdServer Mock endpoint '{}': {e:?}",
-                self.config.endpoint
-            );
-        })
-        .ok()
     }
 }
 

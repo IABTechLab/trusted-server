@@ -6,9 +6,16 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+use trusted_server_core::constants::{
+    HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
+};
+use trusted_server_core::error::http_error;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
+
+use crate::platform::geo_from_outcome;
 
 // ---------------------------------------------------------------------------
 // SanitizeRequestMiddleware
@@ -39,7 +46,7 @@ impl SanitizeRequestMiddleware {
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+            ctx.parts_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -52,8 +59,9 @@ impl Middleware for SanitizeRequestMiddleware {
 
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
-/// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. `X-TS-Version` carries the compiled-in git version. The
+/// Geo headers reflect the same immutable managed outcome used by handlers,
+/// without resolving the provider during finalization. Missing detail is omitted.
+/// `X-TS-Version` carries the compiled-in git version. The
 /// Fastly-specific headers (`X-TS-Fastly-Version`, `X-TS-ENV`) are skipped
 /// because the corresponding env vars are not set in a local dev context.
 ///
@@ -75,8 +83,9 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let geo = geo_from_outcome(ctx.geo());
         let mut response = next.run(ctx).await?;
-        apply_finalize_headers(&self.settings, &mut response);
+        apply_finalize_headers(&self.settings, geo.as_ref(), &mut response);
         Ok(response)
     }
 }
@@ -106,12 +115,12 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
+                return Ok(http_error(&report));
             }
         }
 
@@ -125,18 +134,40 @@ impl Middleware for AuthMiddleware {
 
 /// Applies standard Trusted Server response headers to the given response.
 ///
-/// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted, followed by the compiled-in `X-TS-Version`.
-/// Fastly-specific headers are omitted.
+/// Clear stale upstream geographic headers, then emit only detail present in
+/// the request snapshot. Fastly-specific headers are omitted.
 /// Operator-configured `settings.response_headers` are applied last (with the
 /// shared cookie cache-privacy hardening) and can override any managed header.
-pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
-    response.headers_mut().insert(
+pub(crate) fn apply_finalize_headers(
+    settings: &Settings,
+    geo: Option<&GeoInfo>,
+    response: &mut Response,
+) {
+    for name in [
+        HEADER_X_GEO_CITY,
+        HEADER_X_GEO_COUNTRY,
+        HEADER_X_GEO_CONTINENT,
+        HEADER_X_GEO_COORDINATES,
+        HEADER_X_GEO_METRO_CODE,
+        HEADER_X_GEO_REGION,
         HEADER_X_GEO_INFO_AVAILABLE,
-        HeaderValue::from_static("false"),
-    );
+    ] {
+        response.headers_mut().remove(name);
+    }
+    if let Some(geo) = geo {
+        geo.set_response_headers(response);
+    } else {
+        response.headers_mut().insert(
+            HEADER_X_GEO_INFO_AVAILABLE,
+            HeaderValue::from_static("false"),
+        );
+    }
 
     trusted_server_core::version_header::apply_git_version_header(response);
+
+    // The finalize middleware runs once per request, so each skipped operator
+    // entry warns once.
+    trusted_server_core::response_privacy::warn_skipped_operator_response_headers(settings);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
@@ -164,6 +195,7 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::WarningCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -209,11 +241,34 @@ mod tests {
     }
 
     #[test]
+    fn warns_once_about_a_skipped_operator_entry() {
+        let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
+        let mut response = empty_response();
+        let capture = WarningCapture::start();
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        let skipped = capture
+            .take()
+            .into_iter()
+            .filter(|warning| warning.message.contains("`connection`"))
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "should warn once about the skipped operator entry"
+        );
+        assert!(
+            !response.headers().contains_key("connection"),
+            "should skip the operator entry"
+        );
+    }
+
+    #[test]
     fn sets_geo_unavailable_header() {
         let settings = settings_with_response_headers(vec![]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -231,7 +286,7 @@ mod tests {
             settings_with_response_headers(vec![("X-Geo-Info-Available", "operator-override")]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -248,7 +303,7 @@ mod tests {
         let settings = settings_with_response_headers(vec![("X-Custom-Header", "custom-value")]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -258,6 +313,38 @@ mod tests {
             Some("custom-value"),
             "should apply operator-configured response headers"
         );
+    }
+
+    #[test]
+    fn partial_geo_emits_no_invented_or_stale_detail() {
+        let settings = settings_with_response_headers(vec![]);
+        let mut response = empty_response();
+        response
+            .headers_mut()
+            .insert("x-geo-coordinates", HeaderValue::from_static("0,0"));
+        response
+            .headers_mut()
+            .insert("x-geo-city", HeaderValue::from_static("stale-origin-city"));
+        let geo = GeoInfo::country_region("US", Some("CA".to_owned()));
+        apply_finalize_headers(&settings, Some(&geo), &mut response);
+        assert_eq!(response.headers()["x-geo-info-available"], "true");
+        assert_eq!(response.headers()["x-geo-country"], "US");
+        assert_eq!(response.headers()["x-geo-region"], "CA");
+        for name in [
+            "x-geo-coordinates",
+            "x-geo-city",
+            "x-geo-continent",
+            "x-geo-metro-code",
+        ] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should omit unavailable detail"
+            );
+        }
+        apply_finalize_headers(&settings, None, &mut response);
+        assert_eq!(response.headers()["x-geo-info-available"], "false");
+        assert!(!response.headers().contains_key("x-geo-country"));
+        assert!(!response.headers().contains_key("x-geo-region"));
     }
 
     #[test]
@@ -275,8 +362,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }
@@ -295,7 +382,7 @@ mod tests {
     #[test]
     fn emits_git_version_header() {
         let mut response = empty_response();
-        apply_finalize_headers(&settings_with_response_headers(vec![]), &mut response);
+        apply_finalize_headers(&settings_with_response_headers(vec![]), None, &mut response);
         assert_eq!(
             response
                 .headers()

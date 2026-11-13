@@ -13,8 +13,11 @@ use base64::{
     },
 };
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::OutboundResponse;
+#[cfg(test)]
+use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt};
-use http::header::HeaderValue;
+use http::header::{HeaderMap, HeaderValue};
 use http::{Method, StatusCode, header};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -37,8 +40,10 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::constants::{
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_SOURCEPOINT_TCF, COOKIE_US_PRIVACY,
+};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -48,18 +53,17 @@ use crate::integrations::{
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
-use crate::integrations::{
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
-};
-#[cfg(test)]
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::platform::PlatformHttpRequest;
-use crate::platform::{PlatformResponse, RuntimeServices};
+use crate::outbound::{
+    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
+    outbound_request,
+};
+use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 #[cfg(test)]
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
@@ -532,6 +536,11 @@ pub struct PrebidIntegrationConfig {
     pub timeout_ms: u32,
     #[serde(default)]
     pub debug: bool,
+    /// Opt into the relay's basic-ads soft vendor exception for testing.
+    ///
+    /// Defaults to false. Purpose consent and publisher GVL mappings remain enforced.
+    #[serde(default)]
+    pub relay_soft_vendor_exception: bool,
     #[serde(
         default = "default_script_patterns",
         deserialize_with = "crate::settings::vec_from_seq_or_map"
@@ -574,6 +583,7 @@ impl Default for PrebidIntegrationConfig {
             account_id: None,
             timeout_ms: default_timeout_ms(),
             debug: false,
+            relay_soft_vendor_exception: false,
             script_patterns: default_script_patterns(),
             external_bundle_url: None,
             external_bundle_sha256: None,
@@ -600,6 +610,7 @@ impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
             account_id: config.account_id.clone(),
             timeout_ms: config.timeout_ms,
             debug: config.debug,
+            relay_soft_vendor_exception: false,
             script_patterns: config.script_patterns.clone(),
             external_bundle_url: config.external_bundle_url.clone(),
             external_bundle_sha256: config.external_bundle_sha256.clone(),
@@ -1576,6 +1587,7 @@ struct InjectedPrebidClientConfig<'a> {
     managed_user_ids: Vec<InjectedManagedUserId<'a>>,
     timeout: u32,
     debug: bool,
+    relay_soft_vendor_exception: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     bidders: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1597,6 +1609,7 @@ impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
                 .collect(),
             timeout: config.timeout_ms,
             debug: config.debug,
+            relay_soft_vendor_exception: config.relay_soft_vendor_exception,
             bidders: None,
             server_side_bidders: None,
             client_side_bidders: &config.client_side_bidders,
@@ -2023,7 +2036,7 @@ fn non_empty_override_object(
 #[cfg(test)]
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2041,7 +2054,7 @@ fn copy_request_headers(
 /// Applies the common browser-header and consent-cookie policy for PBS.
 pub(crate) fn apply_prebid_transport_headers(
     from: &PrebidTransportHeaders,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2065,7 +2078,7 @@ fn apply_prebid_header_values(
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
-    to: &mut http::Request<EdgeBody>,
+    to: &mut HeaderMap,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -2075,24 +2088,23 @@ fn apply_prebid_header_values(
         (header::ACCEPT_LANGUAGE, accept_language),
     ] {
         if let Some(value) = value {
-            to.headers_mut().insert(name, value.clone());
+            to.insert(name, value.clone());
         }
     }
 
     if let Some(ip) = client_ip
         && let Ok(value) = HeaderValue::from_str(&ip.to_string())
     {
-        to.headers_mut()
-            .insert(header::HeaderName::from_static("x-forwarded-for"), value);
+        to.insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
     // Rebuild the destination header so no stale or arbitrary cookies survive.
-    to.headers_mut().remove(header::COOKIE);
+    to.remove(header::COOKIE);
     if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
         return;
     }
     if let Some(value) = consent_cookies.header() {
-        to.headers_mut().insert(header::COOKIE, value.clone());
+        to.insert(header::COOKIE, value.clone());
     }
 }
 
@@ -2123,7 +2135,15 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            if *name == COOKIE_SOURCEPOINT_TCF {
+                continue;
+            }
+            let cookie = if *name == COOKIE_EUCONSENT_V2 {
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = cookie else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -2281,11 +2301,10 @@ pub(crate) async fn parse_planned_prebid_response(
     provider_id: &str,
     profile: &PrebidProfilePlan,
     input: &ProviderAuctionInput,
-    response: PlatformResponse,
+    response: OutboundResponse,
     response_time_ms: u64,
     auction_id: &str,
 ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-    let response = response.response;
     let status = response.status();
     let content_type = response
         .headers()
@@ -2937,19 +2956,15 @@ impl PrebidAuctionProvider {
                 ip: d.ip.clone(),
                 geo: d.geo.as_ref().map(|geo| Geo {
                     country: Some(geo.country.clone()),
-                    city: Some(geo.city.clone()),
+                    city: geo.city.clone(),
                     region: geo.region.clone(),
-                    lat: Some(geo.latitude),
-                    lon: Some(geo.longitude),
-                    // DMA/metro code: convert i64 to string for OpenRTB.
-                    // Fastly returns 0 for "no metro code"; negative values
-                    // are not realistic for DMA codes so the > 0 guard is
-                    // sufficient.
-                    metro: if geo.metro_code > 0 {
-                        Some(geo.metro_code.to_string())
-                    } else {
-                        None
-                    },
+                    lat: geo.coordinates.map(|coordinates| coordinates.latitude),
+                    lon: geo.coordinates.map(|coordinates| coordinates.longitude),
+                    // Fastly returns 0 for "no metro code".
+                    metro: geo
+                        .metro_code
+                        .filter(|code| *code > 0)
+                        .map(|code| code.to_string()),
                     r#type: Some(2),
                     ..Default::default()
                 }),
@@ -3219,11 +3234,10 @@ impl PrebidAuctionProvider {
 
     async fn parse_response_inner(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         auction_id: Option<&str>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
         let status = response.status();
         let content_type = response
             .headers()
@@ -3589,60 +3603,47 @@ impl AuctionProvider for PrebidAuctionProvider {
             }
         }
 
-        // Create HTTP request
-        let mut pbs_req = http::Request::builder()
-            .method(http::Method::POST)
-            .uri(self.auction_endpoint_url())
-            .body(EdgeBody::empty())
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to build Prebid request".to_string(),
-            })?;
-        copy_request_headers(
-            context.request,
-            &mut pbs_req,
-            self.config.consent_forwarding,
-            context.services.client_info().client_ip,
-        );
-
         let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
             message: "Failed to serialize Prebid request body".to_string(),
         })?;
+        let target = outbound_request(http::Method::POST, &self.auction_endpoint_url()).map_err(
+            |error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Prebid {
+                        message: "Failed to build Prebid request".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            },
+        )?;
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout proxy endpoints use.
+        let mut pbs_req = buffered(
+            target,
+            Duration::from_millis(u64::from(context.timeout_ms)),
+            DEFAULT_BUFFERED_RESPONSE_BYTES,
+            ResponseDecoding::Decode,
+        )
+        .cache_policy(OutboundCachePolicy::Bypass)
+        .body(pbs_body);
+        copy_request_headers(
+            context.request,
+            pbs_req.headers_mut(),
+            self.config.consent_forwarding,
+            context.services.client_info().client_ip,
+        );
         pbs_req.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
-        // Send request asynchronously with auction-scoped timeout
-        let backend_name = ensure_integration_backend_with_timeout(
-            context.services,
-            &self.config.server_url,
-            "prebid",
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for Prebid Server endpoint: {}",
-                self.config.server_url
-            ),
-        })?;
-        let pending = context
-            .services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(pbs_req, backend_name).with_cache_bypass())
-            .await
-            .change_context(TrustedServerError::Prebid {
-                message: "Failed to send async request to Prebid Server".to_string(),
-            })?;
-
-        Ok(ProviderRequestOutcome::pending(pending))
+        Ok(ProviderRequestOutcome::ready(pbs_req))
     }
 
     async fn parse_response(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         self.parse_response_inner(response, response_time_ms, None)
@@ -3651,7 +3652,7 @@ impl AuctionProvider for PrebidAuctionProvider {
 
     async fn parse_response_with_context(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
@@ -3670,22 +3671,6 @@ impl AuctionProvider for PrebidAuctionProvider {
 
     fn is_enabled(&self) -> bool {
         self.config.enabled
-    }
-
-    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
-        predict_integration_backend_name(
-            services,
-            &self.config.server_url,
-            PREBID_INTEGRATION_ID,
-            Duration::from_millis(u64::from(timeout_ms)),
-        )
-        .inspect_err(|e| {
-            log::error!(
-                "Failed to predict backend name for Prebid server URL '{}': {e:?}",
-                self.config.server_url
-            );
-        })
-        .ok()
     }
 }
 
@@ -3752,19 +3737,25 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
+    use crate::outbound::{
+        BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, REDIRECT_CHAIN_DEADLINE,
+    };
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::platform::test_support::{
-        HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopGeo, NoopHttpClient,
-        NoopSecretStore, StubHttpClient, build_services_with_config_secret_and_http_client,
-        build_services_with_http_client, build_services_with_http_client_and_client_ip,
+        HashMapConfigStore, HashMapSecretStore, build_services_with_config_and_secret,
     };
-    use crate::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
-    };
+
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
+    };
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use bytes::Bytes;
+    use edgezero_core::outbound::{
+        OutboundCachePolicy, OutboundRequest, ResponseDecoding, ResponseMode,
+    };
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
@@ -3866,63 +3857,6 @@ mod tests {
         }
     }
 
-    struct PredictOnlyBackend;
-
-    impl PlatformBackend for PredictOnlyBackend {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok(format!(
-                "predicted_{}_{}_{}_{}",
-                spec.scheme,
-                spec.host,
-                spec.first_byte_timeout.as_millis(),
-                spec.between_bytes_timeout.as_millis()
-            ))
-        }
-
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Ok("unused".to_string())
-        }
-    }
-
-    fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(backend))
-            .http_client(Arc::new(NoopHttpClient))
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo {
-                client_ip: None,
-                tls_protocol: None,
-                tls_cipher: None,
-                ..ClientInfo::default()
-            })
-            .build()
-    }
-
-    #[test]
-    fn prebid_backend_name_delegates_to_platform_backend_prediction() {
-        let provider = PrebidAuctionProvider::new(base_config());
-        let services = services_with_backend(PredictOnlyBackend);
-
-        let backend_name = provider
-            .backend_name(&services, 123)
-            .expect("should predict backend name through platform backend");
-
-        assert_eq!(
-            backend_name, "predicted_https_prebid.example_123_123",
-            "should cap both first-byte and between-bytes timeouts to the auction budget"
-        );
-    }
-
     fn test_sri(algorithm: &str, digest: &[u8]) -> String {
         format!("{algorithm}-{}", TEST_BASE64_STANDARD.encode(digest))
     }
@@ -3961,7 +3895,7 @@ mod tests {
         status: StatusCode,
         content_type: Option<&str>,
         body: impl Into<Vec<u8>>,
-    ) -> PlatformResponse {
+    ) -> OutboundResponse {
         prebid_platform_response_with_body(status, content_type, EdgeBody::from(body.into()))
     }
 
@@ -3969,13 +3903,13 @@ mod tests {
         status: StatusCode,
         content_type: Option<&str>,
         body: EdgeBody,
-    ) -> PlatformResponse {
+    ) -> OutboundResponse {
         let mut builder = http::Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
 
-        PlatformResponse::new(
+        outbound_response(
             builder
                 .body(body)
                 .expect("should build Prebid platform response"),
@@ -4020,12 +3954,8 @@ mod tests {
     }
 
     #[test]
-    fn prebid_provider_uses_platform_http_client_for_bid_request() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+    fn prebid_provider_returns_an_unsent_bid_request() {
+        let services = crate::platform::test_support::noop_services();
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
@@ -4038,7 +3968,6 @@ mod tests {
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
-            transport_timeout_ms: 500,
             provider_responses: None,
             services: &services,
         };
@@ -4046,28 +3975,25 @@ mod tests {
         let outcome =
             futures::executor::block_on(provider.request_bids(&auction_request, &context))
                 .expect("should start request");
-        let ProviderRequestOutcome::Pending { request, .. } = outcome else {
-            panic!("should return a pending Prebid request");
+        let ProviderRequestOutcome::Ready { request, .. } = outcome else {
+            panic!("should return an unsent Prebid request");
         };
 
-        assert!(
-            request.backend_name().is_some(),
-            "should preserve backend correlation"
+        assert_eq!(
+            (request.method(), request.uri().to_string()),
+            (&http::Method::POST, provider.auction_endpoint_url()),
+            "should build one POST to the auction endpoint"
         );
         assert_eq!(
-            stub.recorded_backend_names().len(),
-            1,
-            "should launch one upstream request through PlatformHttpClient"
+            request.into_parts().cache_policy,
+            OutboundCachePolicy::Bypass,
+            "should bypass caches for personalized bid traffic"
         );
     }
 
     #[test]
     fn request_bids_sets_trusted_server_request_host_to_publisher_domain_not_edge_host() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let services = crate::platform::test_support::noop_services();
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
@@ -4085,18 +4011,13 @@ mod tests {
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
-            transport_timeout_ms: 500,
             provider_responses: None,
             services: &services,
         };
 
-        futures::executor::block_on(provider.request_bids(&auction_request, &context))
-            .expect("should start request");
-
-        let bodies = stub.recorded_request_bodies();
-        assert_eq!(bodies.len(), 1, "should send one upstream PBS request");
-        let sent: Json =
-            serde_json::from_slice(&bodies[0]).expect("should parse sent OpenRTB request body");
+        let request = unsent_bid_request(&provider, &auction_request, &context);
+        let sent: Json = serde_json::from_slice(&request_body(request))
+            .expect("should parse sent OpenRTB request body");
         let request_host = sent["ext"]["trusted_server"]["request_host"]
             .as_str()
             .expect("should set ext.trusted_server.request_host");
@@ -4104,6 +4025,29 @@ mod tests {
             request_host, auction_request.publisher.domain,
             "request_host should be the publisher domain, not the edge Host header"
         );
+    }
+
+    /// Runs the provider's `request_bids` and returns the request it built, unsent.
+    fn unsent_bid_request(
+        provider: &PrebidAuctionProvider,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> OutboundRequest {
+        let outcome = futures::executor::block_on(provider.request_bids(request, context))
+            .expect("should build the PBS request");
+        let ProviderRequestOutcome::Ready { request, .. } = outcome else {
+            panic!("should return an unsent PBS request");
+        };
+        request
+    }
+
+    /// The buffered body of an unsent request.
+    fn request_body(request: OutboundRequest) -> Bytes {
+        request
+            .into_parts()
+            .body
+            .into_bytes()
+            .expect("should buffer the PBS request body")
     }
 
     fn create_test_auction_context<'a>(
@@ -5305,7 +5249,7 @@ external_bundle_sri = "sha384-AAAA"
         );
     }
     #[test]
-    fn external_bundle_handler_fetches_and_sanitizes_with_platform_client() {
+    fn external_bundle_handler_fetches_and_sanitizes_the_bundle() {
         futures::executor::block_on(async {
             let sha256 = "a".repeat(64);
             let mut config = base_config();
@@ -5314,20 +5258,19 @@ external_bundle_sri = "sha384-AAAA"
             let mut settings = make_settings();
             settings.proxy.allowed_domains = vec!["assets.example".to_string()];
 
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                200,
-                b"console.log('bundle');".to_vec(),
-                vec![
-                    (header::CONTENT_TYPE.as_str(), "text/html"),
-                    (header::CACHE_CONTROL.as_str(), "private, max-age=0"),
-                    (header::SET_COOKIE.as_str(), "bad=1; Path=/"),
-                    ("x-upstream", "leak"),
-                ],
+            let clock = TestClock::new();
+            let upstream = ScriptedHttpClient::new(&clock);
+            upstream.respond_to(
+                Method::GET,
+                "https://assets.example/prebid/trusted-prebid.js",
+                ScriptedReply::status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE.as_str(), "text/html")
+                    .header(header::CACHE_CONTROL.as_str(), "private, max-age=0")
+                    .header(header::SET_COOKIE.as_str(), "bad=1; Path=/")
+                    .header("x-upstream", "leak")
+                    .body("console.log('bundle');"),
             );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let services = build_services_with_outbound_client(&upstream, &clock);
             let req = http::Request::builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -5373,28 +5316,28 @@ external_bundle_sri = "sha384-AAAA"
                 "should preserve bundle bytes"
             );
 
+            let requests = upstream.requests();
+            assert_eq!(requests.len(), 1, "should make one upstream request");
+            let sent = &requests[0];
             assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://assets.example/prebid/trusted-prebid.js".to_string()],
+                sent.uri.to_string(),
+                "https://assets.example/prebid/trusted-prebid.js",
                 "should fetch the configured external bundle URL without adding EC query params"
             );
-            let recorded_headers = stub.recorded_request_headers();
-            assert_eq!(
-                recorded_headers.len(),
-                1,
-                "should make one upstream request"
-            );
-            assert!(
-                !recorded_headers[0]
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str())),
-                "external bundle fetch should not forward client cookies"
-            );
-            assert!(
-                !recorded_headers[0]
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(header::ACCEPT.as_str())),
-                "external bundle fetch should not forward client headers"
+            // Neither the client's cookies nor its other headers reach the bundle host.
+            sent.assert_headers(&[]);
+            sent.assert_followed_transport(
+                ExpectedTransport {
+                    timeout: BUFFERED_TIMEOUT,
+                    response_mode: ResponseMode::Buffered {
+                        max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+                    },
+                    response_decoding: ResponseDecoding::Original,
+                    cache_policy: OutboundCachePolicy::PlatformDefault,
+                },
+                clock
+                    .monotonic_clock()
+                    .deadline_after(REDIRECT_CHAIN_DEADLINE),
             );
         });
     }
@@ -5472,6 +5415,53 @@ external_bundle_sri = "sha384-AAAA"
             "should omit empty refresh-auction exclusions: {}",
             script
         );
+    }
+
+    #[test]
+    fn planned_registration_injects_relay_soft_vendor_exception() {
+        assert!(
+            !PrebidIntegrationConfig::default().relay_soft_vendor_exception,
+            "should default the relay exception to false"
+        );
+        for configured in [None, Some(false), Some(true)] {
+            let mut settings = make_settings();
+            let mut config = json!({
+                "enabled": true,
+                "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+            });
+            if let Some(value) = configured {
+                config["relay_soft_vendor_exception"] = json!(value);
+            }
+            settings
+                .integrations
+                .insert_config("prebid", &config)
+                .expect("should configure prebid");
+            let plan = crate::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan");
+            let document_state = IntegrationDocumentState::default();
+            let ctx = IntegrationHtmlContext {
+                request_host: "pub.example",
+                request_scheme: "https",
+                origin_host: "origin.example",
+                document_state: &document_state,
+            };
+            for enabled in [true, false] {
+                let registration =
+                    register_for_plan(&settings, &plan.clone().with_enabled(enabled))
+                        .expect("should register prebid")
+                        .expect("should enable prebid");
+                let inserts = registration.head_injectors[0].head_inserts(&ctx);
+                let expected = format!(
+                    r#""relaySoftVendorException":{}"#,
+                    configured.unwrap_or(false)
+                );
+                assert!(
+                    inserts[0].contains(&expected),
+                    "should inject the configured relay exception for {configured:?}: {}",
+                    inserts[0]
+                );
+            }
+        }
     }
 
     #[test]
@@ -5622,6 +5612,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://primary.example.test/openrtb".to_string(),
@@ -5634,6 +5625,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://secondary.example.test/openrtb".to_string(),
@@ -6172,12 +6164,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "Berlin".to_string(),
+                city: Some("Berlin".to_string()),
                 country: "DE".to_string(),
-                continent: "EU".to_string(),
-                latitude: 52.52,
-                longitude: 13.405,
-                metro_code: 0,
+                continent: Some("EU".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 52.52,
+                    longitude: 13.405,
+                }),
+                metro_code: Some(0),
                 region: None,
                 asn: None,
             }),
@@ -6266,12 +6260,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6305,12 +6301,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6739,12 +6737,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: Some("1.2.3.4".to_string()),
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6776,6 +6776,44 @@ external_bundle_sri = "sha384-AAAA"
         assert_eq!(geo.country.as_deref(), Some("US"));
         assert_eq!(geo.city.as_deref(), Some("New York"));
         assert_eq!(geo.region.as_deref(), Some("NY"));
+    }
+
+    #[test]
+    fn to_openrtb_partial_geo_omits_missing_detail_and_preserves_supplied_zero() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+        for coordinates in [
+            None,
+            Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+        ] {
+            let mut auction_request = create_test_auction_request();
+            let mut geo = GeoInfo::country_region("US", Some("CA".to_owned()));
+            geo.coordinates = coordinates;
+            auction_request.device = Some(DeviceInfo {
+                user_agent: None,
+                ip: None,
+                geo: Some(geo),
+            });
+            let openrtb = provider.to_openrtb(
+                &auction_request,
+                &context,
+                None,
+                make_request_info(&context),
+            );
+            let serialized = serde_json::to_value(openrtb).expect("should serialize request");
+            let geo = &serialized["device"]["geo"];
+            let mut expected = serde_json::json!({"country": "US", "region": "CA", "type": 2});
+            if coordinates.is_some() {
+                expected["lat"] = serde_json::json!(0.0);
+                expected["lon"] = serde_json::json!(0.0);
+            }
+            assert_eq!(*geo, expected);
+        }
     }
 
     #[test]
@@ -7590,7 +7628,6 @@ external_bundle_sri = "sha384-AAAA"
             settings: &settings,
             request: &http_req,
             timeout_ms: 1000,
-            transport_timeout_ms: 1000,
             provider_responses: None,
             services: &services,
         };
@@ -9098,6 +9135,7 @@ set = { networkId = 42 }
             providers: BTreeMap::from([(
                 provider_id.clone(),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example/openrtb2/auction".to_string(),
@@ -9581,7 +9619,7 @@ set = { networkId = 42 }
                 ])),
             ),
         ] {
-            let expected_status = response.response.status().as_u16();
+            let expected_status = response.status().as_u16();
             let parsed = futures::executor::block_on(parse_planned_prebid_response(
                 "pbs-instance",
                 &profile,
@@ -9918,7 +9956,7 @@ set = { networkId = 42 }
 
         apply_prebid_transport_headers(
             routed.prebid_transport_headers(),
-            &mut outbound,
+            outbound.headers_mut(),
             ConsentForwardingMode::OpenrtbOnly,
             routed.attested_client_ip(),
         );
@@ -10001,7 +10039,7 @@ set = { networkId = 42 }
                     .headers_mut()
                     .append(header::COOKIE, HeaderValue::from_static("another=secret"));
 
-                copy_request_headers(&inbound, &mut outbound, mode, None);
+                copy_request_headers(&inbound, outbound.headers_mut(), mode, None);
 
                 let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
                     None
@@ -10033,7 +10071,7 @@ set = { networkId = 42 }
                 );
                 let mut outbound = http::Request::new(EdgeBody::empty());
 
-                copy_request_headers(&inbound, &mut outbound, mode, None);
+                copy_request_headers(&inbound, outbound.headers_mut(), mode, None);
 
                 assert!(
                     !outbound.headers().contains_key(header::COOKIE),
@@ -10137,6 +10175,49 @@ set = { networkId = 42 }
     }
 
     #[test]
+    fn sourcepoint_tcf_forwarding_preserves_cmp_precedence_and_consent_only_policy() {
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for (input, selected) in [
+                (
+                    "session=secret; __Host-ts-tcf=bridge",
+                    Some("euconsent-v2=bridge"),
+                ),
+                (
+                    "session=secret; __Host-ts-tcf=bridge; euconsent-v2=publisher",
+                    Some("euconsent-v2=publisher"),
+                ),
+                ("__Host-ts-tcf=bridge; euconsent-v2=", Some("euconsent-v2=")),
+                ("__Host-ts-tcf=bridge; euconsent-v2=bad\\value", None),
+            ] {
+                let from = http::Request::builder()
+                    .header(header::COOKIE, input)
+                    .body(EdgeBody::empty())
+                    .expect("should build the consent selection request");
+                let mut to = http::Request::new(EdgeBody::empty());
+                to.headers_mut()
+                    .insert(header::COOKIE, HeaderValue::from_static("stale=secret"));
+                copy_request_headers(&from, to.headers_mut(), mode, None);
+                let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
+                    None
+                } else {
+                    selected
+                };
+                assert_eq!(
+                    to.headers()
+                        .get(header::COOKIE)
+                        .and_then(|value| value.to_str().ok()),
+                    expected,
+                    "should select the CMP signal without unrelated or private bridge cookies in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn copy_request_headers_replaces_client_supplied_xff_with_attested_ip() {
         let from = http::Request::builder()
             .uri("https://publisher.example.com/")
@@ -10151,7 +10232,7 @@ set = { networkId = 42 }
 
         copy_request_headers(
             &from,
-            &mut to,
+            to.headers_mut(),
             ConsentForwardingMode::Both,
             Some(std::net::IpAddr::from([203, 0, 113, 7])),
         );
@@ -10184,7 +10265,7 @@ set = { networkId = 42 }
             .body(EdgeBody::empty())
             .expect("should build outbound request");
 
-        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None);
+        copy_request_headers(&from, to.headers_mut(), ConsentForwardingMode::Both, None);
 
         assert!(
             !to.headers().contains_key("x-forwarded-for"),
@@ -10229,10 +10310,7 @@ set = { networkId = 42 }
                 None,
             ),
         ] {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(204, Vec::new());
-            let services = build_services_with_http_client_and_client_ip(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            let services = crate::platform::test_support::noop_services_with_client_ip(
                 std::net::IpAddr::from([203, 0, 113, 9]),
             );
             let settings = make_settings();
@@ -10256,17 +10334,17 @@ set = { networkId = 42 }
                 settings: &settings,
                 request: &inbound,
                 timeout_ms: 321,
-                transport_timeout_ms: 321,
                 provider_responses: None,
                 services: &services,
             };
 
-            futures::executor::block_on(provider.request_bids(&auction_request, &context))
-                .expect("should dispatch PBS request");
-
-            let headers = stub.recorded_request_header_bytes();
-            assert_eq!(headers.len(), 1, "should dispatch one request");
-            let headers = &headers[0];
+            let request = unsent_bid_request(&provider, &auction_request, &context);
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect::<Vec<_>>();
+            let headers = &headers;
             assert_eq!(
                 header_value(headers, "referer"),
                 Some(b"https://referrer.example/story?fictional=1".as_slice())
@@ -10286,12 +10364,8 @@ set = { networkId = 42 }
             );
             assert_eq!(header_value(headers, "cookie"), expected_cookie);
 
-            let body = stub
-                .recorded_request_bodies()
-                .into_iter()
-                .next()
-                .expect("should capture PBS request body");
-            let body: Json = serde_json::from_slice(&body).expect("should parse PBS request body");
+            let body: Json = serde_json::from_slice(&request_body(request))
+                .expect("should parse PBS request body");
             assert_eq!(
                 body["site"]["ref"], "https://referrer.example/story?fictional=1",
                 "should place the raw Referer in PBS site.ref as well as forwarding it"
@@ -10318,7 +10392,6 @@ set = { networkId = 42 }
             settings: &settings,
             request: &inbound,
             timeout_ms: 321,
-            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -10351,10 +10424,9 @@ set = { networkId = 42 }
                 .encode([7_u8; 32])
                 .into_bytes(),
         );
-        let signing_services = build_services_with_config_secret_and_http_client(
+        let signing_services = build_services_with_config_and_secret(
             HashMapConfigStore::new(config_data),
             HashMapSecretStore::new(secret_data),
-            Arc::new(NoopHttpClient),
         );
         let signer = RequestSigner::from_services(&signing_services)
             .expect("should load deterministic test signer");

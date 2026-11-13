@@ -7,6 +7,7 @@ use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+use trusted_server_core::error::http_error;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
 
@@ -39,7 +40,7 @@ impl SanitizeRequestMiddleware {
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+            ctx.parts_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -75,7 +76,6 @@ impl FinalizeResponseMiddleware {
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let geo_available = ctx
-            .request()
             .headers()
             .get("cf-ipcountry")
             .and_then(|v| v.to_str().ok())
@@ -113,12 +113,12 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
                 log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
+                return Ok(http_error(&report));
             }
         }
 
@@ -148,6 +148,10 @@ pub(crate) fn apply_finalize_headers(
 
     trusted_server_core::version_header::apply_git_version_header(response);
 
+    // The finalize middleware runs once per request, so each skipped operator
+    // entry warns once.
+    trusted_server_core::response_privacy::warn_skipped_operator_response_headers(settings);
+
     // Cloudflare is a real shared cache: cookie-bearing responses must stay
     // private and operator headers must not re-enable caching for uncacheable
     // per-user payloads.
@@ -175,6 +179,7 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::WarningCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -220,6 +225,29 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         s
+    }
+
+    #[test]
+    fn warns_once_about_a_skipped_operator_entry() {
+        let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
+        let mut response = empty_response();
+        let capture = WarningCapture::start();
+
+        apply_finalize_headers(&settings, false, &mut response);
+
+        let skipped = capture
+            .take()
+            .into_iter()
+            .filter(|warning| warning.message.contains("`connection`"))
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "should warn once about the skipped operator entry"
+        );
+        assert!(
+            !response.headers().contains_key("connection"),
+            "should skip the operator entry"
+        );
     }
 
     #[test]
@@ -306,8 +334,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }

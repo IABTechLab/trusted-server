@@ -59,6 +59,7 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
 use error_stack::{Report, ResultExt};
 use http::header;
 use http::{Method, StatusCode};
@@ -70,14 +71,18 @@ use validator::Validate;
 
 use crate::constants::ENV_FASTLY_IS_STAGING;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::outbound::{
+    BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered,
+    outbound_error, outbound_request,
+};
+use crate::platform::RuntimeServices;
 use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -196,7 +201,7 @@ pub struct DataDomeConfig {
     #[validate(url)]
     pub protection_api_origin: String,
 
-    /// First-byte timeout for Protection API calls, in milliseconds.
+    /// Total timeout for each Protection API call, in milliseconds.
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1, max = 10000))]
     pub timeout_ms: u32,
@@ -620,15 +625,6 @@ impl DataDomeIntegration {
         }
     }
 
-    /// Extract the host from a URL for use in the Host header.
-    fn extract_host(url: &str) -> &str {
-        url.trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or("api-js.datadome.co")
-    }
-
     /// Handle the /tags.js endpoint - fetch and rewrite the `DataDome` SDK.
     async fn handle_tags_js(
         &self,
@@ -639,18 +635,16 @@ impl DataDomeIntegration {
 
         log::info!("[datadome] Fetching tags.js from {}", target_url);
 
-        let backend = Self::backend_name_for_url(services, &target_url)
-            .change_context(Self::error("Invalid SDK URL"))?;
-
-        let sdk_host = Self::extract_host(&self.config.sdk_origin);
-
-        let mut backend_req = http::Request::builder()
-            .method(Method::GET)
-            .uri(&target_url)
-            .header(header::HOST, sdk_host)
-            .header(header::ACCEPT, "application/javascript, */*")
-            .body(EdgeBody::empty())
-            .change_context(Self::error("Failed to build DataDome SDK request"))?;
+        let fetch_failed = || Self::error("Failed to fetch tags.js from DataDome");
+        let mut backend_req = OutboundRequest::get(&target_url)
+            .and_then(|request| request.header(header::ACCEPT, "application/javascript, */*"))
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error("Failed to build DataDome SDK request"),
+                    OutboundRequestSource::Internal,
+                )
+            })?;
 
         // Copy relevant headers from original request
         if let Some(ua) = req.headers().get(header::USER_AGENT) {
@@ -660,32 +654,39 @@ impl DataDomeIntegration {
         }
 
         let backend_resp = services
-            .http_client()
-            .send(PlatformHttpRequest::new(backend_req, backend))
+            .outbound_client()
+            .send(buffered(
+                backend_req,
+                BUFFERED_TIMEOUT,
+                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+                ResponseDecoding::Decode,
+            ))
             .await
-            .change_context(Self::error("Failed to fetch tags.js from DataDome"))?;
+            .map_err(|error| {
+                outbound_error(error, fetch_failed(), OutboundRequestSource::Internal)
+            })?;
 
-        if backend_resp.response.status() != StatusCode::OK {
+        if backend_resp.status() != StatusCode::OK {
             log::warn!(
                 "[datadome] tags.js fetch returned status {}",
-                backend_resp.response.status()
+                backend_resp.status()
             );
-            return Ok(backend_resp.response);
+            return backend_resp.into_response().map_err(|error| {
+                outbound_error(error, fetch_failed(), OutboundRequestSource::Internal)
+            });
         }
 
         // Read and rewrite the script content
         let cors_header = backend_resp
-            .response
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .cloned();
-        let body = collect_response_bounded(
-            backend_resp.response.into_body(),
-            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-            DATADOME_INTEGRATION_ID,
-        )
-        .await
-        .change_context(Self::error("Failed to read DataDome SDK response body"))?;
+        let body = backend_resp
+            .into_bytes_bounded(UPSTREAM_SDK_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                outbound_error(error, fetch_failed(), OutboundRequestSource::Internal)
+            })?;
         let rewritten = self.rewrite_script_content(&String::from_utf8_lossy(&body));
 
         // Build response with caching headers
@@ -728,37 +729,34 @@ impl DataDomeIntegration {
 
         // Use api_origin (api-js.datadome.co) for signal collection requests
         let target_url = self.build_api_url(datadome_path, parts.uri.query());
-        let api_host = Self::extract_host(&self.config.api_origin);
 
         log::info!(
-            "[datadome] Proxying signal request to {} (method: {}, host: {})",
+            "[datadome] Proxying signal request to {} (method: {})",
             target_url,
             parts.method,
-            api_host
         );
 
-        let backend = Self::backend_name_for_url(services, &target_url)
-            .change_context(Self::error("Invalid API URL"))?;
-
         let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
-            let bytes =
-                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DATADOME_INTEGRATION_ID)
-                    .await?;
+            let bytes = read_request_body(&parts.headers, body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };
 
-        let mut backend_req = http::Request::builder()
-            .method(parts.method.clone())
-            .uri(&target_url)
-            .header(header::HOST, api_host)
-            .body(request_body)
-            .change_context(Self::error("Failed to build DataDome API request"))?;
+        let proxy_failed = || Self::error("Failed to proxy signal request to DataDome");
+        let mut backend_req = outbound_request(parts.method.clone(), &target_url)
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error("Failed to build DataDome API request"),
+                    OutboundRequestSource::Internal,
+                )
+            })?
+            .body(request_body);
 
         // Copy relevant headers from the original client request.
         // CONTENT_LENGTH is intentionally omitted: the body is re-materialized
-        // via collect_body_bounded, so its length may differ from the original.
+        // via read_request_body, so its length may differ from the original.
         let headers_to_copy = [
             header::USER_AGENT,
             header::ACCEPT,
@@ -776,17 +774,26 @@ impl DataDomeIntegration {
         }
 
         let backend_resp = services
-            .http_client()
-            .send(PlatformHttpRequest::new(backend_req, backend))
+            .outbound_client()
+            .send(buffered(
+                backend_req,
+                BUFFERED_TIMEOUT,
+                DEFAULT_BUFFERED_RESPONSE_BYTES,
+                ResponseDecoding::Original,
+            ))
             .await
-            .change_context(Self::error("Failed to proxy signal request to DataDome"))?;
+            .map_err(|error| {
+                outbound_error(error, proxy_failed(), OutboundRequestSource::Internal)
+            })?;
 
         log::info!(
             "[datadome] Signal request returned status {}",
-            backend_resp.response.status()
+            backend_resp.status()
         );
 
-        Ok(backend_resp.response)
+        backend_resp
+            .into_response()
+            .map_err(|error| outbound_error(error, proxy_failed(), OutboundRequestSource::Internal))
     }
 
     /// Extract the path portion after the `DataDome` domain from a URL.
@@ -802,13 +809,6 @@ impl DataDomeIntegration {
                 }
             })
             .unwrap_or("/tags.js")
-    }
-
-    fn backend_name_for_url(
-        services: &RuntimeServices,
-        target_url: &str,
-    ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID, None)
     }
 }
 
@@ -1010,10 +1010,16 @@ pub fn register(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
+    use futures::executor::block_on;
 
     use super::*;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::{BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES};
+    use crate::platform::test_support::build_services_with_outbound_client;
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> DataDomeConfig {
@@ -1512,22 +1518,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_host() {
-        assert_eq!(
-            DataDomeIntegration::extract_host("https://api-js.datadome.co"),
-            "api-js.datadome.co"
-        );
-        assert_eq!(
-            DataDomeIntegration::extract_host("https://js.datadome.co/path"),
-            "js.datadome.co"
-        );
-        assert_eq!(
-            DataDomeIntegration::extract_host("http://example.com:8080/path"),
-            "example.com:8080"
-        );
-    }
-
-    #[test]
     fn extract_datadome_path() {
         assert_eq!(
             DataDomeIntegration::extract_datadome_path("https://js.datadome.co/tags.js"),
@@ -1633,33 +1623,158 @@ mod tests {
         }
     }
 
+    fn readback_config() -> DataDomeConfig {
+        DataDomeConfig {
+            sdk_origin: "https://sdk.example.com".to_string(),
+            api_origin: "https://api.example.com".to_string(),
+            ..test_config()
+        }
+    }
+
     #[test]
-    fn datadome_proxy_uses_platform_http_client() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+    fn datadome_tags_js_request_readback() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let target = "https://sdk.example.com/tags.js?key=example";
+        client.respond_to(
+            Method::GET,
+            target,
+            ScriptedReply::status(StatusCode::OK)
+                .header("access-control-allow-origin", "*")
+                .body("var dd = 1;"),
         );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = DataDomeIntegration::new(readback_config());
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/integrations/datadome/tags.js?key=example")
+            .header(header::USER_AGENT, "example-agent")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::COOKIE, "session_id=secret")
+            .body(EdgeBody::empty())
+            .expect("should build tags.js request");
+
+        let response = block_on(integration.handle(&create_test_settings(), &services, req))
+            .expect("should serve tags.js");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*"),
+            "should copy the upstream CORS header"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer the SDK body")
+                .as_ref(),
+            b"var dd = 1;",
+            "should serve the fetched SDK bytes"
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one tags.js request");
+        let tags = &requests[0];
+        assert_eq!(
+            (&tags.method, tags.uri.to_string()),
+            (&Method::GET, target.to_owned()),
+            "should fetch tags.js with the client's query"
+        );
+        tags.assert_headers(&[
+            ("accept", "application/javascript, */*"),
+            ("user-agent", "example-agent"),
+        ]);
+        tags.assert_transport(ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: 16 * 1024 * 1024,
+            },
+            response_decoding: ResponseDecoding::Decode,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
+    }
+
+    #[test]
+    fn datadome_js_api_request_readback() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let target = "https://api.example.com/js/?ddv=1";
+        client.respond_to(
+            Method::POST,
+            target,
+            ScriptedReply::status(StatusCode::OK).body("{}"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = DataDomeIntegration::new(readback_config());
+        let payload = b"jsData=example";
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/integrations/datadome/js/?ddv=1")
+            .header(header::USER_AGENT, "example-agent")
+            .header(header::ACCEPT, "*/*")
+            .header(header::ACCEPT_LANGUAGE, "en")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::CONTENT_LENGTH, payload.len().to_string())
+            .header(header::ORIGIN, "https://publisher.example.com")
+            .header(header::REFERER, "https://publisher.example.com/page")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::COOKIE, "session_id=secret")
+            .body(EdgeBody::from(payload.to_vec()))
+            .expect("should build signal request");
+
+        let response = block_on(integration.handle(&create_test_settings(), &services, req))
+            .expect("should proxy the signal request");
+
+        assert_eq!(response.status(), StatusCode::OK, "should relay the status");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one signal request");
+        let signal = &requests[0];
+        assert_eq!(
+            (&signal.method, signal.uri.to_string(), signal.body.as_ref()),
+            (&Method::POST, target.to_owned(), payload.as_slice()),
+            "should forward the method, path, query, and body"
+        );
+        signal.assert_headers(&[
+            ("user-agent", "example-agent"),
+            ("accept", "*/*"),
+            ("accept-language", "en"),
+            ("accept-encoding", "gzip"),
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("origin", "https://publisher.example.com"),
+            ("referer", "https://publisher.example.com/page"),
+        ]);
+        signal.assert_transport(ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
+    }
+
+    #[test]
+    fn datadome_js_api_body_read_failures_map_to_statuses() {
         let settings = create_test_settings();
         let integration = DataDomeIntegration::new(test_config());
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://publisher.example/integrations/datadome/js/check")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&client, &clock);
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example/integrations/datadome/js/check"),
+            );
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
-            .expect("should proxy request");
+            let outcome = block_on(integration.handle(&settings, &services, req));
 
-        assert_eq!(
-            response.status(),
-            http::StatusCode::OK,
-            "should return stubbed response"
-        );
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should route outbound request through PlatformHttpClient"
-        );
+            expectation.assert_outcome("DataDome /js/", &outcome);
+            client.assert_no_requests();
+        }
     }
 }

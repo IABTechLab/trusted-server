@@ -88,15 +88,18 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 # Secret Store key for the secret used to derive EC identifiers.
 passphrase = "ec_passphrase"
-# KV store that persists EC identity state. This is the physical store name
-# bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
-# logical KV id is `trusted_server_kv`.
-ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Fastly persistence uses this exact physical binding. Provider omission is
+# Fastly-only; native providers require explicit configuration. An ordinary
+# logical KV declaration does not select EC storage. Legacy ec.ec_store remains
+# supported on Fastly, but cannot be combined with this section.
+[ec.storage]
+store = "ec_identity_store"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
@@ -210,8 +213,7 @@ proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
-# Verify TLS certs when proxying to HTTPS origins (default true; false only for
-# local self-signed dev).
+# Must be true. Origin TLS is always verified, and validation rejects false.
 # certificate_check = true
 # Allowlist for first-party proxy signing, initial fetch targets, and redirect
 # targets. Supports exact ("example.com") and wildcard ("*.example.com", also
@@ -530,6 +532,8 @@ auction_timeout_ms = 500
 [integrations.prebid]
 enabled = false
 timeout_ms = 1000
+# Testing opt-in only. Leave false for production consent enforcement.
+relay_soft_vendor_exception = false
 debug = false
 client_side_bidders = []          # bidders running via native Prebid.js adapters
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.

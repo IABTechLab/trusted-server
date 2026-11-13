@@ -63,6 +63,20 @@ jobs:
       - name: Verify jobs pin Node before compiling Rust
         run: node scripts/check-ci-node-pin.mjs
 
+  fastly-response-diff:
+    name: Fastly response diff script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the response comparison
+        run: node --test scripts/fastly-response-diff.test.mjs
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -129,10 +143,10 @@ jobs:
       - name: Run host-target OpenRTB codegen clippy
         run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
-      # The build-digest tests are native-only, so clippy-fastly compiles them
-      # to an empty crate. Lint them on the host.
-      - name: Run host-target core build-digest test clippy
-        run: cargo clippy --package trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest -- -D warnings
+      # These core tests are native-only, so clippy-fastly compiles them
+      # to empty crates. Lint them on the host.
+      - name: Run host-target core build-digest and AWS config test clippy
+        run: cargo clippy --package trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest --test aws_example_config -- -D warnings
 
   format-typescript:
     runs-on: ubuntu-latest

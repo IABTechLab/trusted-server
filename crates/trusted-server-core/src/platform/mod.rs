@@ -9,8 +9,6 @@
 //! - [`PlatformConfigStore`] — key-value config store access
 //! - [`PlatformSecretStore`] — encrypted secret store access
 //! - [`PlatformKvStore`] — (re-exported from `edgezero_core`)
-//! - [`PlatformBackend`] — dynamic backend registration
-//! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
@@ -32,14 +30,8 @@
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
 
-use std::time::Duration;
-
-mod backend_naming;
 mod error;
-mod http;
-mod image_optimizer;
 mod kv;
-mod pending_response;
 mod template_assembly;
 mod template_cache;
 #[cfg(test)]
@@ -48,22 +40,11 @@ mod timer;
 mod traits;
 mod types;
 
-pub use backend_naming::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
-    BackendNamingPolicy, PredictedBackend,
-};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
+pub use edgezero_core::outbound::HttpClient;
+pub use edgezero_core::time::MonotonicClock;
 pub use error::PlatformError;
-pub use http::{
-    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
-};
-pub use image_optimizer::{
-    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
-};
 pub use kv::UnavailableKvStore;
-pub use pending_response::PlatformPendingResponse;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,
@@ -76,14 +57,11 @@ pub use template_cache::{
     UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use timer::PlatformTimer;
-pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use traits::{PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
-    ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
+    ClientInfo, GeoCoordinates, GeoInfo, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,
 };
-
-/// Default first-byte timeout for platform backends.
-pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
@@ -149,8 +127,6 @@ mod tests {
     fn _assert_config_store_object_safe(_: &dyn PlatformConfigStore) {}
     fn _assert_secret_store_object_safe(_: &dyn PlatformSecretStore) {}
     fn _assert_kv_store_object_safe(_: &dyn PlatformKvStore) {}
-    fn _assert_backend_object_safe(_: &dyn PlatformBackend) {}
-    fn _assert_http_client_object_safe(_: &dyn PlatformHttpClient) {}
     fn _assert_geo_object_safe(_: &dyn PlatformGeo) {}
     // Arc<dyn Trait> requires the trait impl to be Send + Sync. The assertion
     // below documents that RuntimeServices itself satisfies those bounds — the
@@ -252,73 +228,114 @@ mod tests {
     }
 
     #[test]
-    fn platform_pending_request_downcasts_and_preserves_backend_name() {
-        let pending = PlatformPendingRequest::new(7_u8).with_backend_name("origin");
-        let pending = pending
-            .downcast::<String>()
-            .expect_err("should reject downcast to the wrong pending type");
-        assert_eq!(
-            pending.backend_name(),
-            Some("origin"),
-            "should preserve backend metadata when downcast fails"
-        );
-
-        let pending = PlatformPendingRequest::new(7_u8).with_backend_name("origin");
-        let value = pending
-            .downcast::<u8>()
-            .expect("should recover the stored pending request type");
-        assert_eq!(value, 7, "should preserve the stored pending request");
-    }
-
-    #[test]
-    fn platform_pending_request_preserves_response_handling_metadata() {
-        let pending = PlatformPendingRequest::new(7_u8)
-            .with_backend_name("origin")
-            .with_response_handling(true, edgezero_core::http::Method::HEAD);
-        let pending = pending
-            .downcast::<String>()
-            .expect_err("should reject downcast to the wrong pending type");
-
-        assert!(
-            pending.stream_response(),
-            "should preserve the streaming response flag"
-        );
-        assert_eq!(
-            pending.request_method(),
-            Some(&edgezero_core::http::Method::HEAD),
-            "should preserve the originating request method"
-        );
-    }
-
-    #[test]
     fn geo_info_coordinates_string_formats_correctly() {
         let geo = GeoInfo {
-            city: "New York".to_owned(),
+            city: Some("New York".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 40.7128,
-            longitude: -74.0060,
-            metro_code: 501,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 40.7128,
+                longitude: -74.0060,
+            }),
+            metro_code: Some(501),
             region: Some("NY".to_owned()),
             asn: None,
         };
 
         assert_eq!(
             geo.coordinates_string(),
-            "40.7128,-74.006",
+            Some("40.7128,-74.006".to_owned()),
             "should format coordinates as lat,lon"
+        );
+    }
+
+    #[test]
+    fn geo_info_full_serialization_preserves_flat_fields() {
+        let original = serde_json::json!({
+            "city": "San Francisco",
+            "country": "US",
+            "continent": "NorthAmerica",
+            "latitude": 37.7749,
+            "longitude": -122.4194,
+            "metro_code": 807,
+            "region": "CA",
+            "asn": 7922
+        });
+        let geo: GeoInfo = serde_json::from_value(original.clone())
+            .expect("should deserialize the existing populated wire format");
+        assert_eq!(
+            geo.coordinates,
+            Some(GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&geo).expect("should serialize geo"),
+            original
+        );
+        assert_eq!(
+            serde_json::to_string(&geo).expect("should serialize full geo"),
+            r#"{"city":"San Francisco","country":"US","continent":"NorthAmerica","latitude":37.7749,"longitude":-122.4194,"metro_code":807,"region":"CA","asn":7922}"#
+        );
+    }
+
+    #[test]
+    fn geo_info_partial_serialization_omits_unavailable_fields() {
+        for region in [None, Some("CA".to_owned())] {
+            let geo = GeoInfo::country_region("US", region.clone());
+            let mut expected = serde_json::json!({"country": "US"});
+            if let Some(region) = region {
+                expected["region"] = serde_json::json!(region);
+            }
+            let serialized = serde_json::to_value(&geo).expect("should serialize partial geo");
+            assert_eq!(serialized, expected);
+            assert_eq!(
+                serde_json::from_value::<GeoInfo>(serialized)
+                    .expect("should deserialize country without coordinates"),
+                geo
+            );
+            assert_eq!(geo.coordinates_string(), None);
+            assert!(!geo.has_metro_code());
+        }
+    }
+
+    #[test]
+    fn geo_info_rejects_incomplete_coordinate_pairs() {
+        for input in [
+            serde_json::json!({"country": "US", "latitude": 0.0}),
+            serde_json::json!({"country": "US", "longitude": 0.0}),
+            serde_json::json!({"country": "US", "latitude": 0.0, "longitude": null}),
+        ] {
+            let error = serde_json::from_value::<GeoInfo>(input)
+                .expect_err("should reject half a coordinate pair");
+            assert!(error.to_string().contains("supplied together"));
+        }
+    }
+
+    #[test]
+    fn geo_info_preserves_supplied_zero_coordinates() {
+        let original = serde_json::json!({"country": "US", "latitude": 0.0, "longitude": 0.0});
+        let geo: GeoInfo = serde_json::from_value(original.clone())
+            .expect("should accept a supplied zero coordinate pair");
+        assert_eq!(geo.coordinates_string().as_deref(), Some("0,0"));
+        assert_eq!(
+            serde_json::to_value(geo).expect("should serialize geo"),
+            original
         );
     }
 
     #[test]
     fn geo_info_has_metro_code_returns_true_for_nonzero() {
         let geo = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 807,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(807),
             region: None,
             asn: None,
         };
@@ -331,12 +348,14 @@ mod tests {
     #[test]
     fn geo_info_has_metro_code_returns_false_for_zero() {
         let geo = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };

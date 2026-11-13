@@ -24,6 +24,89 @@ pub fn integration_app_config_envelope_with_trace(
     app_config_envelope(origin_port, trace, |_| Ok(()))
 }
 
+/// Builds the integration app-config envelope with `proxy.allowed_domains` set.
+///
+/// The first-party proxy then checks its signed target and every redirect hop
+/// against `allowed_domains`.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn proxy_allowlist_app_config_envelope(
+    origin_port: u16,
+    allowed_domains: &[&str],
+) -> TestResult<String> {
+    app_config_envelope(origin_port, false, |table| {
+        let allowed_domains = allowed_domains
+            .iter()
+            .map(|domain| toml::Value::String((*domain).to_owned()))
+            .collect();
+        let mut proxy = toml::Table::new();
+        proxy.insert(
+            "allowed_domains".to_owned(),
+            toml::Value::Array(allowed_domains),
+        );
+        table.insert("proxy".to_owned(), toml::Value::Table(proxy));
+        Ok(())
+    })
+}
+
+/// Builds the integration app-config envelope with two S3 `SigV4` asset routes
+/// to `asset_origin`.
+///
+/// `/.sigv4-assets/` signs plain requests and keeps their query.
+/// `/.sigv4-images/` adds Image Optimizer, so each request first sends a signed
+/// S3 `HEAD` preflight. Both routes sign for `us-east-1` with the
+/// `integration_s3_*` secrets of the Viceroy template.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn sigv4_asset_app_config_envelope(origin_port: u16, asset_origin: &str) -> TestResult<String> {
+    let assets: toml::Table = toml::from_str(&format!(
+        r#"
+[[proxy.asset_routes]]
+prefix = "/.sigv4-assets/"
+origin_url = "{asset_origin}"
+
+[proxy.asset_routes.auth]
+type = "s3_sigv4"
+region = "us-east-1"
+access_key_id = "integration_s3_access_key_id"
+secret_access_key = "integration_s3_secret_access_key"
+
+[[proxy.asset_routes]]
+prefix = "/.sigv4-images/"
+origin_url = "{asset_origin}"
+
+[proxy.asset_routes.auth]
+type = "s3_sigv4"
+region = "us-east-1"
+access_key_id = "integration_s3_access_key_id"
+secret_access_key = "integration_s3_secret_access_key"
+
+[proxy.asset_routes.image_optimizer]
+enabled = true
+region = "us_east"
+profile_set = "sigv4_images"
+
+[image_optimizer.profile_sets.sigv4_images]
+default_profile = "default"
+
+[image_optimizer.profile_sets.sigv4_images.profiles]
+default = "width=640"
+"#
+    ))
+    .map_err(|error| {
+        Report::new(TestError::ConfigGeneration)
+            .attach(format!("invalid SigV4 asset route fixture: {error}"))
+    })?;
+    app_config_envelope(origin_port, false, |table| {
+        table.extend(assets);
+        Ok(())
+    })
+}
+
 /// Builds the integration app-config envelope after `customize` edits the
 /// parsed fixture.
 fn app_config_envelope(
@@ -37,6 +120,9 @@ fn app_config_envelope(
             "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    // This builder supplies native and Cloudflare fixtures. Fastly's generator
+    // reads the shared source separately and keeps its explicit binding.
+    table_mut(&mut table, "ec")?.remove("storage");
     customize(&mut table)?;
     let app_config: TrustedServerAppConfig =
         toml::Value::Table(table).try_into().map_err(|error| {
@@ -93,6 +179,108 @@ pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
         Ok(())
     })?;
     cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
+}
+
+/// One standard `OpenRTB` provider an auction fixture routes every eligible slot to.
+pub struct AuctionBidderFixture {
+    /// Provider ID.
+    pub id: String,
+    /// Provider endpoint, such as a loopback bidder's `http://127.0.0.1:<port>/bid`.
+    pub endpoint: String,
+    /// Configured provider timeout.
+    pub timeout_ms: u32,
+}
+
+/// Builds the integration app-config envelope with the auction enabled over `bidders`.
+///
+/// The fixture's own providers and bidder routes are replaced, so only `bidders` take part.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn auction_app_config_envelope(
+    origin_port: u16,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+) -> TestResult<String> {
+    app_config_envelope(origin_port, false, |table| {
+        enable_auction(table, bidders, auction_timeout_ms)
+    })
+}
+
+/// Enables the auction in `table` over `bidders` alone, with `auction_timeout_ms`.
+fn enable_auction(
+    table: &mut toml::Table,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+) -> TestResult<()> {
+    let mut providers = toml::Table::new();
+    for bidder in bidders {
+        let provider: toml::Table = toml::from_str(&format!(
+            "protocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"{}\"\ntimeout_ms = {}\nrouting = \"all_eligible\"\n",
+            bidder.endpoint, bidder.timeout_ms
+        ))
+        .map_err(|error| {
+            Report::new(TestError::ConfigGeneration)
+                .attach(format!("invalid auction bidder fixture: {error}"))
+        })?;
+        providers.insert(bidder.id.clone(), toml::Value::Table(provider));
+    }
+    let auction = table_mut(table, "auction")?;
+    auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+    auction.insert(
+        "timeout_ms".to_string(),
+        toml::Value::Integer(i64::from(auction_timeout_ms)),
+    );
+    auction.insert("providers".to_string(), toml::Value::Table(providers));
+    auction.remove("bidders");
+    Ok(())
+}
+
+/// Builds [`auction_app_config_envelope`] with server-side ad templates on `path`.
+///
+/// Each slot is a 300x250 creative opportunity on `path`, and navigations to `path` run
+/// their auction with `auction_timeout_ms`.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn navigation_auction_app_config_envelope(
+    origin_port: u16,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+    path: &str,
+    slots: &[&str],
+) -> TestResult<String> {
+    let mut slot_tables = Vec::new();
+    for slot in slots {
+        let slot: toml::Table = toml::from_str(&format!(
+            "id = \"{slot}\"\npage_patterns = [\"{path}\"]\nformats = [{{ width = 300, height = 250 }}]\n"
+        ))
+        .map_err(|error| {
+            Report::new(TestError::ConfigGeneration)
+                .attach(format!("invalid creative opportunity slot fixture: {error}"))
+        })?;
+        slot_tables.push(toml::Value::Table(slot));
+    }
+    app_config_envelope(origin_port, false, |table| {
+        enable_auction(table, bidders, auction_timeout_ms)?;
+        let mut creative_opportunities = toml::Table::new();
+        creative_opportunities.insert(
+            "gam_network_id".to_string(),
+            toml::Value::String("12345".to_owned()),
+        );
+        creative_opportunities.insert(
+            "auction_timeout_ms".to_string(),
+            toml::Value::Integer(i64::from(auction_timeout_ms)),
+        );
+        creative_opportunities.insert("slot".to_string(), toml::Value::Array(slot_tables));
+        table.insert(
+            "creative_opportunities".to_string(),
+            toml::Value::Table(creative_opportunities),
+        );
+        Ok(())
+    })
 }
 
 /// Retargets an existing fixture without changing its policies or secret references.
@@ -176,6 +364,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sigv4_asset_fixture_validates_both_signed_routes() {
+        let envelope: serde_json::Value = serde_json::from_str(
+            &sigv4_asset_app_config_envelope(8888, "https://127.0.0.1:8443")
+                .expect("should generate the SigV4 asset fixture"),
+        )
+        .expect("should parse the SigV4 asset envelope");
+        let routes = envelope["data"]["proxy"]["asset_routes"]
+            .as_array()
+            .expect("should carry the asset routes");
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route["prefix"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("/.sigv4-assets/"), Some("/.sigv4-images/")],
+            "should keep the plain and the Image Optimizer route"
+        );
+        assert_eq!(
+            routes[1]["image_optimizer"]["enabled"], true,
+            "should enable Image Optimizer on the preflight route"
+        );
+    }
+
+    #[test]
     fn trace_browser_fixture_keeps_auctions_and_shared_assembly_disabled() {
         let envelope: serde_json::Value = serde_json::from_str(
             &integration_app_config_envelope_with_trace(8888, true)
@@ -218,6 +431,35 @@ mod tests {
             "should explicitly enable isolated trace fixture"
         );
     }
+    #[test]
+    fn native_and_cloudflare_fixtures_do_not_select_a_fastly_graph() {
+        let native = super::integration_app_config_envelope(8888)
+            .expect("should generate native fixture envelope");
+        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(&native).expect("should parse native envelope");
+        assert!(
+            envelope.data["ec"].get("storage").is_none(),
+            "should retain native unconfigured persistence"
+        );
+        for binding in [
+            super::cloudflare_config_json(8888),
+            super::cloudflare_auction_config_json(8888),
+        ] {
+            let binding: serde_json::Value =
+                serde_json::from_str(&binding.expect("should generate Cloudflare fixture"))
+                    .expect("should parse Cloudflare binding");
+            let encoded = binding[trusted_server_core::config_payload::CONFIG_BLOB_KEY]
+                .as_str()
+                .expect("should contain existing envelope");
+            let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+                serde_json::from_str(encoded).expect("should parse Cloudflare envelope");
+            assert!(
+                envelope.data["ec"].get("storage").is_none(),
+                "should retain Cloudflare unconfigured persistence"
+            );
+        }
+    }
+
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";

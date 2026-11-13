@@ -21,6 +21,7 @@ use http::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 
 use super::auth::authenticate_bearer;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
@@ -37,10 +38,14 @@ const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
 
+/// Maximum request body size accepted before mappings are parsed (2 MB).
+const MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 use super::kv_types::MAX_UID_LENGTH;
 
+#[async_trait::async_trait(?Send)]
 trait BatchSyncWriter {
-    fn upsert_partner_id_if_exists(
+    async fn upsert_partner_id_if_exists(
         &self,
         ec_id: &str,
         partner_id: &str,
@@ -48,14 +53,15 @@ trait BatchSyncWriter {
     ) -> Result<UpsertResult, Report<TrustedServerError>>;
 }
 
+#[async_trait::async_trait(?Send)]
 impl BatchSyncWriter for KvIdentityGraph {
-    fn upsert_partner_id_if_exists(
+    async fn upsert_partner_id_if_exists(
         &self,
         ec_id: &str,
         partner_id: &str,
         uid: &str,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
-        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid)
+        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid).await
     }
 }
 
@@ -108,19 +114,22 @@ struct MappingGroup {
 
 /// Handles `POST /_ts/api/v1/batch-sync`.
 ///
+/// A body over the 2 MB cap is answered with a 413 `body_too_large` response.
+///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] on serialization or KV store failures.
-pub fn handle_batch_sync(
+/// Returns [`TrustedServerError`] on serialization or KV store failures, and
+/// the [`read_request_body`] error when the body read times out or fails.
+pub async fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, req).await
 }
 
-fn handle_batch_sync_with_writer(
+async fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
@@ -141,21 +150,23 @@ fn handle_batch_sync_with_writer(
     }
 
     // 3. Parse body (with size limit to prevent OOM before validation)
-    const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
-        return Ok(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-        ));
-    }
-
-    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_BODY_SIZE {
-        return Ok(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-        ));
-    }
+    let (parts, body) = req.into_parts();
+    let body_bytes = match read_request_body(&parts.headers, body, MAX_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(report)
+            if matches!(
+                report.current_context(),
+                TrustedServerError::RequestTooLarge { .. }
+            ) =>
+        {
+            log::warn!("Rejecting batch sync request: {report:?}");
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+            ));
+        }
+        Err(report) => return Err(report),
+    };
     let body: BatchSyncRequest = serde_json::from_slice(&body_bytes).map_err(|e| {
         Report::new(TrustedServerError::BadRequest {
             message: format!("Invalid request body: {e}"),
@@ -167,7 +178,7 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings).await;
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -185,21 +196,13 @@ fn handle_batch_sync_with_writer(
     json_response(status, &response_body)
 }
 
-fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -> bool {
-    req.headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|content_length| content_length > max_body_size)
-}
-
 /// Validates all mappings, then processes each normalized EC ID once.
 ///
 /// Successful and eligibility outcomes fan out to every valid input in a
 /// group. On infrastructure failure, the failing group and all unprocessed
 /// valid groups are rejected as unavailable; already validated invalid inputs
 /// keep their specific errors. Errors are sorted by original input index.
-fn process_mappings(
+async fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
@@ -244,7 +247,10 @@ fn process_mappings(
 
     let mut accepted = 0;
     for (group_index, group) in groups.iter().enumerate() {
-        match writer.upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid) {
+        match writer
+            .upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid)
+            .await
+        {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += group.indexes.len();
             }
@@ -311,6 +317,8 @@ mod tests {
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
+    use crate::test_support::body_read::{body_read_failure_cases, streamed_over};
+    use crate::test_support::logging::WarningCapture;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -368,8 +376,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl BatchSyncWriter for MockWriter {
-        fn upsert_partner_id_if_exists(
+        async fn upsert_partner_id_if_exists(
             &self,
             ec_id: &str,
             partner_id: &str,
@@ -438,43 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn content_length_exceeds_limit_detects_oversized_header() {
-        let req = Request::builder()
-            .method("POST")
-            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
-            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
-            .header("content-length", "2097153")
-            .body(EdgeBody::from("{}"))
-            .expect("should build test request");
-
-        assert!(
-            content_length_exceeds_limit(&req, 2 * 1024 * 1024),
-            "should reject oversized content-length before reading body"
-        );
-    }
-
-    #[test]
-    fn content_length_exceeds_limit_ignores_missing_or_malformed_header() {
-        let missing = authorized_batch_request("{}");
-        let malformed = Request::builder()
-            .method("POST")
-            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
-            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
-            .header("content-length", "not-a-number")
-            .body(EdgeBody::from("{}"))
-            .expect("should build test request");
-
-        assert!(
-            !content_length_exceeds_limit(&missing, 2 * 1024 * 1024),
-            "missing content-length should fall back to post-read size check"
-        );
-        assert!(
-            !content_length_exceeds_limit(&malformed, 2 * 1024 * 1024),
-            "malformed content-length should fall back to post-read size check"
-        );
-    }
-
-    #[test]
     fn handle_batch_sync_rejects_oversized_content_length_before_body_parse() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
@@ -489,8 +461,10 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -499,8 +473,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_uses_post_read_limit_for_malformed_content_length() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_uses_post_read_limit_for_malformed_content_length() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -515,8 +489,10 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -525,8 +501,90 @@ mod tests {
         );
     }
 
+    /// Returns an authorized batch-sync request builder with no body yet.
+    fn authorized_batch_builder() -> http::request::Builder {
+        Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+    }
+
     #[test]
-    fn process_mappings_returns_multistatus_errors_per_mapping() {
+    fn batch_sync_body_read_failures_map_to_statuses() {
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+
+        for case in body_read_failure_cases(MAX_BODY_SIZE) {
+            let writer = MockWriter::new(vec![]);
+            let (req, expectation) = case.into_request(authorized_batch_builder());
+
+            let capture = WarningCapture::start();
+            let outcome = futures::executor::block_on(handle_batch_sync_with_writer(
+                &writer, &registry, &limiter, req,
+            ));
+
+            expectation.assert_outcome("batch sync", &outcome);
+            assert!(
+                writer.calls().is_empty(),
+                "should not write any mapping for the {} case",
+                expectation.name()
+            );
+            if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                let levels: Vec<log::Level> =
+                    capture.take().iter().map(|record| record.level).collect();
+                assert_eq!(
+                    levels,
+                    [log::Level::Warn],
+                    "should log the {} case once, at warn",
+                    expectation.name()
+                );
+                let response = outcome.expect("should answer an overflow with a response");
+                assert_eq!(
+                    response_json(response),
+                    serde_json::json!({ "error": "body_too_large" }),
+                    "should keep the body_too_large error body for the {} case",
+                    expectation.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_sync_stream_past_declared_length_and_cap_returns_413() {
+        let writer = MockWriter::new(vec![]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        // The declared length is valid and small, so only the bounded read can
+        // stop a stream that runs past both it and the cap.
+        let req = authorized_batch_builder()
+            .header("content-length", "2")
+            .body(streamed_over(MAX_BODY_SIZE))
+            .expect("should build test request");
+
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should reject a stream past its declared length and the cap"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "error": "body_too_large" }),
+            "should keep the body_too_large error body"
+        );
+        assert!(writer.calls().is_empty(), "should not write any mapping");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_returns_multistatus_errors_per_mapping() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let mappings = vec![
             mapping("x", "u1", 1),
@@ -534,7 +592,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
         assert_eq!(errors.len(), 2, "should reject invalid mappings only");
@@ -544,8 +602,8 @@ mod tests {
         assert_eq!(errors[1].reason, REASON_INVALID_PARTNER_UID);
     }
 
-    #[test]
-    fn process_mappings_aborts_on_kv_unavailable() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_aborts_on_kv_unavailable() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
@@ -560,7 +618,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
         assert_eq!(
@@ -579,8 +637,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_rejects_missing_auth() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_missing_auth() {
         let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let limiter = MockRateLimiter {
@@ -593,7 +651,8 @@ mod tests {
             .expect("should build test request");
 
         let response =
-            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
+            futures::executor::block_on(handle_batch_sync(&kv, &registry, &limiter, req))
+                .expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -644,8 +703,8 @@ mod tests {
         assert_eq!(json["errors"][0]["reason"], REASON_INELIGIBLE);
     }
 
-    #[test]
-    fn process_mappings_collapses_missing_and_withdrawn_to_ineligible() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_collapses_missing_and_withdrawn_to_ineligible() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::NotFound),
             Ok(UpsertResult::ConsentWithdrawn),
@@ -657,7 +716,7 @@ mod tests {
             mapping(&withdrawn_ec_id, "uid-2", 101),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
         assert_eq!(errors.len(), 2, "should report both errors");
@@ -668,13 +727,13 @@ mod tests {
         assert_eq!(writer.calls().len(), 2, "should exercise both outcomes");
     }
 
-    #[test]
-    fn process_mappings_fans_out_unchanged_to_group_members() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_fans_out_unchanged_to_group_members() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept every unchanged group member");
         assert!(
@@ -684,8 +743,8 @@ mod tests {
         assert_eq!(writer.calls().len(), 1, "should call once for the group");
     }
 
-    #[test]
-    fn process_mappings_does_not_order_by_timestamp() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_does_not_order_by_timestamp() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![
@@ -693,7 +752,7 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, 2,
@@ -711,8 +770,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_groups_normalized_ids_in_first_occurrence_order() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_groups_normalized_ids_in_first_occurrence_order() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Unchanged)]);
         let ec_id_a = format!("{}.ABC123", "a".repeat(64));
         let ec_id_a_upper = format!("{}.ABC123", "A".repeat(64));
@@ -723,7 +782,7 @@ mod tests {
             mapping(&ec_id_a_upper, "a-last", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 3, "should accept every valid group member");
         assert!(errors.is_empty(), "should report no errors");
@@ -745,15 +804,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_bounds_writer_calls_at_max_batch_size() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_bounds_writer_calls_at_max_batch_size() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = (0..MAX_BATCH_SIZE)
             .map(|index| mapping(&ec_id, &format!("uid-{index}"), index as u64))
             .collect::<Vec<_>>();
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, MAX_BATCH_SIZE,
@@ -771,8 +830,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_keeps_suffix_case_distinct() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_keeps_suffix_case_distinct() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
         let upper_suffix = format!("{}.ABC123", "a".repeat(64));
         let mixed_suffix = format!("{}.AbC123", "a".repeat(64));
@@ -781,7 +840,7 @@ mod tests {
             mapping(&mixed_suffix, "mixed", 2),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept both distinct EC IDs");
         assert!(errors.is_empty(), "should report no errors");
@@ -803,8 +862,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_invalid_duplicate_does_not_replace_last_valid_uid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_invalid_duplicate_does_not_replace_last_valid_uid() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![
@@ -813,7 +872,7 @@ mod tests {
             mapping(&ec_id, "   ", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 2, "should accept valid group members");
         assert_eq!(errors.len(), 1, "should retain the invalid UID error");
@@ -826,8 +885,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_mappings_fans_out_ineligible_outcomes_to_group_members() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_fans_out_ineligible_outcomes_to_group_members() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::NotFound),
             Ok(UpsertResult::ConsentWithdrawn),
@@ -841,7 +900,7 @@ mod tests {
             mapping(&ec_id_b, "b-2", 4),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(accepted, 0, "should reject all ineligible group members");
         assert_eq!(
@@ -861,8 +920,8 @@ mod tests {
         assert_eq!(writer.calls().len(), 2, "should call once per group");
     }
 
-    #[test]
-    fn process_mappings_aborts_by_group_and_preserves_sorted_accounting() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_aborts_by_group_and_preserves_sorted_accounting() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
@@ -882,7 +941,7 @@ mod tests {
             mapping(&ec_id_c, "", 6),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
 
         assert_eq!(
             accepted, 2,
@@ -913,8 +972,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_accepts_every_member_of_a_written_group() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_accepts_every_member_of_a_written_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
@@ -925,12 +984,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return success response");
 
         assert_eq!(
@@ -943,8 +1002,8 @@ mod tests {
         assert_eq!(json["rejected"], 0, "should reject no group members");
     }
 
-    #[test]
-    fn handle_batch_sync_rejects_every_member_of_an_ineligible_group() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_every_member_of_an_ineligible_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
             should_exceed: false,
@@ -955,12 +1014,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return multi-status response");
 
         assert_eq!(
@@ -981,8 +1040,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_reports_validation_errors_without_writer_calls() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_reports_validation_errors_without_writer_calls() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -993,12 +1052,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"invalid","partner_uid":"one","timestamp":1}},{{"ec_id":"{valid_ec_id}","partner_uid":"","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return validation response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);
@@ -1018,8 +1077,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_batch_sync_reports_grouped_infrastructure_failure() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_reports_grouped_infrastructure_failure() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
             Err(Report::new(TrustedServerError::KvStore {
@@ -1038,12 +1097,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"a-first","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"b","timestamp":2}},{{"ec_id":"{ec_id_a}","partner_uid":"a-last","timestamp":3}},{{"ec_id":"{ec_id_c}","partner_uid":"c","timestamp":4}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return infrastructure failure response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);

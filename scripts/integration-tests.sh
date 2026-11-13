@@ -73,7 +73,6 @@ echo "==> Building Axum native binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
 TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY="integration-test-secret-key" \
-TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build -p trusted-server-adapter-axum
 
 echo "==> Generating Viceroy configs..."

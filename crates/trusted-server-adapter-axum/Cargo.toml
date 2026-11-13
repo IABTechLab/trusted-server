@@ -18,23 +18,40 @@ path = "src/lib.rs"
 name = "trusted-server-axum"
 path = "src/main.rs"
 
+[features]
+default = []
+aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
+aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
+aws-dynamodb-ec = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
+geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+celld-ec = ["dep:edgezero-store-celld"]
+
 [dependencies]
 async-trait = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "native-bindings"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
-reqwest = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
-web-time = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+edgezero-store-celld = { workspace = true, features = ["records"], optional = true }
 
 [dev-dependencies]
-trusted-server-core = { workspace = true, features = ["test-utils"] }
 axum = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tower = { workspace = true, features = ["util"] }

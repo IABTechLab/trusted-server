@@ -1,52 +1,125 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+
+use edgezero_core::outbound::HttpClient;
+use edgezero_core::time::MonotonicClock;
 
 use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
-    PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore, PlatformTimer,
+    PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore, PlatformTimer,
 };
 
-/// Geographic information extracted from a request.
-///
-/// Serde derives are required because `GeoInfo` is embedded in
-/// `AuctionRequest`, which is serialised for bid-request payloads.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GeoInfo {
-    /// City name.
-    pub city: String,
-    /// Two-letter country code.
-    pub country: String,
-    /// Continent name.
-    pub continent: String,
+/// A supplied latitude/longitude pair. Neither coordinate implies a default.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GeoCoordinates {
     /// Latitude coordinate.
     pub latitude: f64,
     /// Longitude coordinate.
     pub longitude: f64,
-    /// DMA (Designated Market Area) / metro code.
-    pub metro_code: i64,
-    /// Region code.
+}
+
+/// Geographic information extracted from a request.
+///
+/// Country-only results do not imply city or coordinate precision. Populated
+/// coordinates retain the flat `latitude`/`longitude` JSON fields used in
+/// serialised `AuctionRequest` payloads.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GeoInfo {
+    /// City name, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// Two-letter country code.
+    pub country: String,
+    /// Continent name, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continent: Option<String>,
+    /// Coordinates, available only as a complete pair.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub coordinates: Option<GeoCoordinates>,
+    /// DMA (Designated Market Area) / metro code, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metro_code: Option<i64>,
+    /// Region code, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Autonomous System Number (e.g. `7922` = Comcast).
     /// Used to distinguish home ISP vs. corporate VPN.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub asn: Option<u32>,
 }
 
+impl<'de> serde::Deserialize<'de> for GeoInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialising a flattened Option<GeoCoordinates> directly would
+        // silently discard an incomplete pair as None. Reject that input.
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            city: Option<String>,
+            country: String,
+            continent: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            metro_code: Option<i64>,
+            region: Option<String>,
+            asn: Option<u32>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        let coordinates = match (fields.latitude, fields.longitude) {
+            (Some(latitude), Some(longitude)) => Some(GeoCoordinates {
+                latitude,
+                longitude,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "latitude and longitude must be supplied together",
+                ));
+            }
+        };
+        Ok(Self {
+            city: fields.city,
+            country: fields.country,
+            continent: fields.continent,
+            coordinates,
+            metro_code: fields.metro_code,
+            region: fields.region,
+            asn: fields.asn,
+        })
+    }
+}
+
 impl GeoInfo {
-    /// Returns coordinates as a formatted string `"latitude,longitude"`.
+    /// Construct country and optional region data without inventing detail.
     #[must_use]
-    pub fn coordinates_string(&self) -> String {
-        format!("{},{}", self.latitude, self.longitude)
+    pub fn country_region(country: impl Into<String>, region: Option<String>) -> Self {
+        Self {
+            city: None,
+            country: country.into(),
+            continent: None,
+            coordinates: None,
+            metro_code: None,
+            region,
+            asn: None,
+        }
+    }
+
+    /// Returns supplied coordinates as `"latitude,longitude"`.
+    #[must_use]
+    pub fn coordinates_string(&self) -> Option<String> {
+        self.coordinates
+            .map(|coordinates| format!("{},{}", coordinates.latitude, coordinates.longitude))
     }
 
     /// Checks if a valid metro code is available.
     #[must_use]
     pub fn has_metro_code(&self) -> bool {
-        self.metro_code > 0
+        self.metro_code.is_some_and(|code| code > 0)
     }
 }
 
@@ -123,38 +196,6 @@ impl AsRef<str> for StoreId {
     }
 }
 
-/// Input specification for a dynamic backend.
-///
-/// Passed to [`PlatformBackend::predict_name`] and [`PlatformBackend::ensure`]
-/// to deterministically name and register upstream origins.
-#[derive(Debug, Clone)]
-pub struct PlatformBackendSpec {
-    /// URL scheme.
-    pub scheme: String,
-    /// Hostname of the backend origin.
-    pub host: String,
-    /// Explicit port, or `None` to use the scheme default.
-    pub port: Option<u16>,
-    /// Optional outbound `Host` header override for backend registration.
-    pub host_header_override: Option<String>,
-    /// Whether to verify the TLS certificate.
-    pub certificate_check: bool,
-    /// Maximum time to wait for the first response byte.
-    pub first_byte_timeout: Duration,
-    /// Maximum time to wait between response body bytes.
-    pub between_bytes_timeout: Duration,
-    /// Optional stable discriminator folded into the backend name.
-    ///
-    /// Two callers can target the same origin (scheme, host, port, TLS) with
-    /// the same transport timeout yet need distinct dynamic backends — for
-    /// example two auction providers behind one gateway host. Because the
-    /// auction orchestrator correlates responses back to providers by backend
-    /// name, a shared name would let one provider's response be parsed as
-    /// another's. Setting this to a per-provider/integration identifier keeps
-    /// their names distinct while remaining stable across requests.
-    pub discriminator: Option<String>,
-}
-
 /// Cloneable container of platform services for a single request.
 #[derive(Clone)]
 pub struct RuntimeServices {
@@ -178,10 +219,13 @@ pub struct RuntimeServices {
     /// Defaults to [`super::UnavailableTemplateAssembler`]. Core retains a portable
     /// byte-seam fallback when this service is unavailable or rejects a document.
     pub(crate) template_assembler: Arc<dyn super::PlatformTemplateAssembler>,
-    /// Dynamic backend registration and name prediction.
-    pub(crate) backend: Arc<dyn PlatformBackend>,
-    /// Outbound HTTP client abstraction.
-    pub(crate) http_client: Arc<dyn PlatformHttpClient>,
+    /// `EdgeZero` outbound HTTP client for this request, with the proxy marker off.
+    pub(crate) outbound_client: HttpClient,
+    /// Monotonic clock paired with this request's admitted ingress lifetime.
+    ///
+    /// Outbound deadlines and post-delivery budgets read this clock, so they
+    /// share one clock domain with the outbound client.
+    pub(crate) clock: MonotonicClock,
     /// Geographic information lookup.
     pub(crate) geo: Arc<dyn PlatformGeo>,
     /// Auction telemetry sink.
@@ -206,8 +250,8 @@ impl RuntimeServices {
     ///     .config_store(Arc::new(MyConfigStore))
     ///     .secret_store(Arc::new(MySecretStore))
     ///     .kv_store(kv_store)
-    ///     .backend(Arc::new(MyBackend))
-    ///     .http_client(Arc::new(MyHttpClient))
+    ///     .outbound_client(outbound_client.with_proxy_marker(false))
+    ///     .clock(ctx.monotonic_clock())
     ///     .geo(Arc::new(MyGeo))
     ///     .client_info(client_info)
     ///     .build();
@@ -253,16 +297,16 @@ impl RuntimeServices {
         &*self.template_assembler
     }
 
-    /// Returns the dynamic backend service.
+    /// Returns the request's `EdgeZero` outbound HTTP client.
     #[must_use]
-    pub fn backend(&self) -> &dyn PlatformBackend {
-        &*self.backend
+    pub fn outbound_client(&self) -> &HttpClient {
+        &self.outbound_client
     }
 
-    /// Returns the outbound HTTP client service.
+    /// Returns the monotonic clock paired with this request.
     #[must_use]
-    pub fn http_client(&self) -> &dyn PlatformHttpClient {
-        &*self.http_client
+    pub fn clock(&self) -> &MonotonicClock {
+        &self.clock
     }
 
     /// Returns the platform geo lookup service.
@@ -343,8 +387,8 @@ pub struct RuntimeServicesBuilder {
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
-    backend: Option<Arc<dyn PlatformBackend>>,
-    http_client: Option<Arc<dyn PlatformHttpClient>>,
+    outbound_client: Option<HttpClient>,
+    clock: Option<MonotonicClock>,
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
@@ -359,8 +403,8 @@ impl RuntimeServicesBuilder {
             kv_store: None,
             template_cache: None,
             template_assembler: None,
-            backend: None,
-            http_client: None,
+            outbound_client: None,
+            clock: None,
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
@@ -413,17 +457,20 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the backend implementation.
+    /// Set the request's `EdgeZero` outbound HTTP client.
+    ///
+    /// Adapters pass the client from the request context with the proxy
+    /// marker off.
     #[must_use]
-    pub fn backend(mut self, backend: Arc<dyn PlatformBackend>) -> Self {
-        self.backend = Some(backend);
+    pub fn outbound_client(mut self, outbound_client: HttpClient) -> Self {
+        self.outbound_client = Some(outbound_client);
         self
     }
 
-    /// Set the HTTP client implementation.
+    /// Set the monotonic clock paired with the request.
     #[must_use]
-    pub fn http_client(mut self, http_client: Arc<dyn PlatformHttpClient>) -> Self {
-        self.http_client = Some(http_client);
+    pub fn clock(mut self, clock: MonotonicClock) -> Self {
+        self.clock = Some(clock);
         self
     }
 
@@ -477,12 +524,12 @@ impl RuntimeServicesBuilder {
             template_assembler: self
                 .template_assembler
                 .unwrap_or_else(|| Arc::new(super::UnavailableTemplateAssembler)),
-            backend: self
-                .backend
-                .expect("should set backend before building RuntimeServices"),
-            http_client: self
-                .http_client
-                .expect("should set http_client before building RuntimeServices"),
+            outbound_client: self
+                .outbound_client
+                .expect("should set outbound_client before building RuntimeServices"),
+            clock: self
+                .clock
+                .expect("should set clock before building RuntimeServices"),
             geo: self
                 .geo
                 .expect("should set geo before building RuntimeServices"),

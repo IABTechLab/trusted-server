@@ -302,6 +302,82 @@ mod tests {
     }
 
     #[test]
+    fn received_request_check_matches_only_the_signed_host_path_and_query() {
+        let url = Url::parse("https://assets.example.com:8443/photos/cat%20one.jpg?v=2&b=a%2Fb")
+            .expect("should parse URL");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("assets.example.com:8443"),
+        );
+        let credentials = S3Credentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            session_token: None,
+        };
+        sign_headers(
+            &Method::HEAD,
+            &url,
+            &mut headers,
+            "us-east-1",
+            &credentials,
+            DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z")
+                .expect("should parse fixture date")
+                .with_timezone(&Utc)
+                .into(),
+        )
+        .expect("should sign request");
+        let signed = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("should set authorization header");
+        let amz_date = headers
+            .get("x-amz-date")
+            .and_then(|value| value.to_str().ok())
+            .expect("should set x-amz-date");
+        let recompute = |host: &str, target: &str| {
+            crate::test_support::s3_sigv4_authorization(
+                &Method::HEAD,
+                host,
+                target,
+                amz_date,
+                "us-east-1",
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            )
+            .expect("should recompute the authorization")
+        };
+
+        assert_eq!(
+            recompute(
+                "assets.example.com:8443",
+                "/photos/cat%20one.jpg?v=2&b=a%2Fb"
+            ),
+            signed,
+            "should reproduce the signature for the signed host, path, and query"
+        );
+        for (host, target) in [
+            ("assets.example.com", "/photos/cat%20one.jpg?v=2&b=a%2Fb"),
+            (
+                "assets.example.com:8443",
+                "/photos/cat%20two.jpg?v=2&b=a%2Fb",
+            ),
+            (
+                "assets.example.com:8443",
+                "/photos/cat%20one.jpg?v=3&b=a%2Fb",
+            ),
+        ] {
+            assert_ne!(
+                recompute(host, target),
+                signed,
+                "should not reproduce the signature for {host}{target}"
+            );
+        }
+    }
+
+    #[test]
     fn credentials_debug_redacts_secret_material() {
         let credentials = S3Credentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
