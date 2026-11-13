@@ -1159,8 +1159,11 @@ impl ApsAuctionProvider {
                 geo: device.geo.as_ref().map(|geo| Geo {
                     country: Some(geo.country.clone()),
                     region: geo.region.clone(),
-                    city: Some(geo.city.clone()),
-                    metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
+                    city: geo.city.clone(),
+                    metro: geo
+                        .metro_code
+                        .filter(|code| *code > 0)
+                        .map(|code| code.to_string()),
                     r#type: Some(2),
                     ..Default::default()
                 }),
@@ -2393,6 +2396,41 @@ mod tests {
             serde_json::to_string(&openrtb).expect("should serialize APS request"),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
             "should preserve the complete APS wire shape without a signing extension"
+        );
+    }
+
+    #[test]
+    fn builds_aps_partial_geo_without_missing_detail() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request
+            .device
+            .as_mut()
+            .expect("should have device")
+            .geo = Some(crate::platform::GeoInfo::country_region(
+            "US",
+            Some("CA".to_owned()),
+        ));
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+        let serialized =
+            serde_json::to_value(provider.build_openrtb_request(&auction_request, &context))
+                .expect("should serialize APS request");
+        assert_eq!(
+            serialized["device"]["geo"],
+            json!({"country": "US", "region": "CA", "type": 2}),
+            "should export only the supplied US country and CA region to APS without inventing Geo detail"
         );
     }
 

@@ -351,12 +351,14 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build the reader request");
         let geo = GeoInfo {
-            city: "Tokyo".to_owned(),
+            city: Some("Tokyo".to_owned()),
             country: "JP".to_owned(),
-            continent: "Asia".to_owned(),
-            latitude: 35.6762,
-            longitude: 139.6503,
-            metro_code: 0,
+            continent: Some("Asia".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 35.6762,
+                longitude: 139.6503,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };

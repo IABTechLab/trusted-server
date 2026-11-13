@@ -58,7 +58,10 @@ pub use template_cache::{
 };
 pub use timer::PlatformTimer;
 pub use traits::{PlatformConfigStore, PlatformGeo, PlatformSecretStore};
-pub use types::{ClientInfo, GeoInfo, RuntimeServices, RuntimeServicesBuilder, StoreId, StoreName};
+pub use types::{
+    ClientInfo, GeoCoordinates, GeoInfo, RuntimeServices, RuntimeServicesBuilder, StoreId,
+    StoreName,
+};
 
 #[cfg(test)]
 mod tests {
@@ -227,32 +230,134 @@ mod tests {
     #[test]
     fn geo_info_coordinates_string_formats_correctly() {
         let geo = GeoInfo {
-            city: "New York".to_owned(),
+            city: Some("New York".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 40.7128,
-            longitude: -74.0060,
-            metro_code: 501,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 40.7128,
+                longitude: -74.0060,
+            }),
+            metro_code: Some(501),
             region: Some("NY".to_owned()),
             asn: None,
         };
 
         assert_eq!(
             geo.coordinates_string(),
-            "40.7128,-74.006",
+            Some("40.7128,-74.006".to_owned()),
             "should format coordinates as lat,lon"
+        );
+    }
+
+    #[test]
+    fn geo_info_full_serialization_preserves_flat_fields() {
+        let original = serde_json::json!({
+            "city": "San Francisco",
+            "country": "US",
+            "continent": "NorthAmerica",
+            "latitude": 37.7749,
+            "longitude": -122.4194,
+            "metro_code": 807,
+            "region": "CA",
+            "asn": 7922
+        });
+        let geo: GeoInfo = serde_json::from_value(original.clone())
+            .expect("should deserialize the existing populated wire format");
+        assert_eq!(
+            geo.coordinates,
+            Some(GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            "should deserialize the supplied San Francisco latitude and longitude as a pair"
+        );
+        assert_eq!(
+            serde_json::to_value(&geo).expect("should serialize geo"),
+            original,
+            "should preserve all supplied full Geo fields when serializing to JSON"
+        );
+        assert_eq!(
+            serde_json::to_string(&geo).expect("should serialize full geo"),
+            r#"{"city":"San Francisco","country":"US","continent":"NorthAmerica","latitude":37.7749,"longitude":-122.4194,"metro_code":807,"region":"CA","asn":7922}"#,
+            "should retain the existing flat field order for fully populated Geo JSON"
+        );
+    }
+
+    #[test]
+    fn geo_info_partial_serialization_omits_unavailable_fields() {
+        for region in [None, Some("CA".to_owned())] {
+            let geo = GeoInfo::country_region("US", region.clone());
+            let mut expected = serde_json::json!({"country": "US"});
+            if let Some(region) = region {
+                expected["region"] = serde_json::json!(region);
+            }
+            let serialized = serde_json::to_value(&geo).expect("should serialize partial geo");
+            assert_eq!(
+                serialized, expected,
+                "should serialize only country and the supplied region for partial Geo: {geo:?}"
+            );
+            assert_eq!(
+                serde_json::from_value::<GeoInfo>(serialized)
+                    .expect("should deserialize country without coordinates"),
+                geo,
+                "should round-trip partial US Geo without inventing detail: {geo:?}"
+            );
+            assert_eq!(
+                geo.coordinates_string(),
+                None,
+                "should omit coordinates for partial US Geo: {geo:?}"
+            );
+            assert!(
+                !geo.has_metro_code(),
+                "should report no metro code for partial US Geo: {geo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn geo_info_rejects_incomplete_coordinate_pairs() {
+        for input in [
+            serde_json::json!({"country": "US", "latitude": 0.0}),
+            serde_json::json!({"country": "US", "longitude": 0.0}),
+            serde_json::json!({"country": "US", "latitude": 0.0, "longitude": null}),
+        ] {
+            let error = serde_json::from_value::<GeoInfo>(input)
+                .expect_err("should reject half a coordinate pair");
+            assert!(
+                error.to_string().contains("supplied together"),
+                "should explain that incomplete or null coordinate pairs must be supplied together"
+            );
+        }
+    }
+
+    #[test]
+    fn geo_info_preserves_supplied_zero_coordinates() {
+        let original = serde_json::json!({"country": "US", "latitude": 0.0, "longitude": 0.0});
+        let geo: GeoInfo = serde_json::from_value(original.clone())
+            .expect("should accept a supplied zero coordinate pair");
+        assert_eq!(
+            geo.coordinates_string().as_deref(),
+            Some("0,0"),
+            "should format a supplied zero coordinate pair rather than omit it"
+        );
+        assert_eq!(
+            serde_json::to_value(geo).expect("should serialize geo"),
+            original,
+            "should preserve supplied zero latitude and longitude when serializing Geo"
         );
     }
 
     #[test]
     fn geo_info_has_metro_code_returns_true_for_nonzero() {
         let geo = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 807,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(807),
             region: None,
             asn: None,
         };
@@ -265,12 +370,14 @@ mod tests {
     #[test]
     fn geo_info_has_metro_code_returns_false_for_zero() {
         let geo = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };
