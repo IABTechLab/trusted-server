@@ -420,7 +420,7 @@ fn sanitize_console_cookie(request: &mut Request<EdgeBody>) {
         .iter()
         .any(|value| value.to_str().is_err())
     {
-        log::warn!("dropping non-UTF-8 request header: cookie");
+        log::warn!("dropping non-UTF-8 outbound request header: cookie");
     }
     let retained = request
         .headers()
@@ -514,6 +514,37 @@ mod tests {
             !registry
                 .js_module_ids_deferred()
                 .contains(&GPT_DIAGNOSTICS_INTEGRATION_ID)
+        );
+    }
+
+    #[test]
+    fn non_utf8_cookie_field_is_dropped_with_edgezero_warning() {
+        let mut request = navigation(
+            "https://publisher.example/page",
+            Some("other=value; __Host-ts-console=1"),
+        );
+        request.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"example=caf\xe9")
+                .expect("should build a non-UTF-8 cookie field"),
+        );
+        let capture = crate::test_support::logging::LogCapture::start();
+
+        prepare_request(&settings(true), &mut request).expect("should prepare");
+
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message == "dropping non-UTF-8 outbound request header: cookie"
+            ),
+            "should warn once with EdgeZero's dispatch text"
+        );
+        assert_eq!(
+            request.headers()[header::COOKIE],
+            "other=value",
+            "should keep only the UTF-8 cookies other than the console cookie"
         );
     }
 
