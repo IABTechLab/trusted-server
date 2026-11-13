@@ -1066,7 +1066,7 @@ mod tests {
                 request.budget.deadline.instant(),
                 cutoff,
                 "should bound {} by the group cutoff",
-                request.uri
+                request.method_and_path()
             );
         }
         let (entry, _) = graph

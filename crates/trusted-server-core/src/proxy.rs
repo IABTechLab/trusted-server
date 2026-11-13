@@ -5078,9 +5078,10 @@ mod tests {
                 (false, false)
             };
             assert_eq!(
-                credentials, expected,
+                credentials,
+                expected,
                 "should keep credentials only on same-origin hops, hop {index} to {}",
-                request.uri
+                request.method_and_path()
             );
         }
     }

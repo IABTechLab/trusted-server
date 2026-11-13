@@ -616,9 +616,8 @@ mod tests {
             assert_eq!(
                 request.body.as_ref(),
                 body.as_bytes(),
-                "should send {} {} its config item value as a URL-encoded form",
-                request.method,
-                request.uri
+                "should send {} its config item value as a URL-encoded form",
+                request.method_and_path()
             );
         }
     }

@@ -2053,7 +2053,7 @@ mod tests {
                     ),
                     (OutboundSendMode::Batch, BudgetSource::BatchCutoff, cutoff),
                     "should send {} in the auction batch, capped by its cutoff",
-                    request.uri
+                    request.method_and_path()
                 );
             }
             assert_eq!(
