@@ -59,7 +59,7 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
+use edgezero_core::outbound::ResponseDecoding;
 use error_stack::{Report, ResultExt};
 use http::header;
 use http::{Method, StatusCode};
@@ -636,7 +636,7 @@ impl DataDomeIntegration {
         log::info!("[datadome] Fetching tags.js from {}", target_url);
 
         let fetch_failed = || Self::error("Failed to fetch tags.js from DataDome");
-        let mut backend_req = OutboundRequest::get(&target_url)
+        let mut backend_req = outbound_request(Method::GET, &target_url)
             .and_then(|request| request.header(header::ACCEPT, "application/javascript, */*"))
             .map_err(|error| {
                 outbound_error(
