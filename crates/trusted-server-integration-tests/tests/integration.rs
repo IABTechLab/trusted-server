@@ -1880,6 +1880,61 @@ fn get_root_with_body_returns_400_axum() {
     get_root_with_body_returns_400(IngressRuntime::Axum);
 }
 
+/// A POST whose `Content-Length` is malformed, or repeated with different
+/// values, returns 400 at ingress and never reaches the origin.
+///
+/// The GTM beacon handler no longer checks the field itself, so this pins the
+/// answer where it moved. The integration config leaves GTM off, so both the
+/// beacon path and the form path reach the publisher fallback, which would
+/// forward a well-framed request to the origin.
+fn bad_content_length_returns_400(runtime: IngressRuntime) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::start(origin_port(), ORIGIN_PASS_THROUGH_STATUS);
+    let process = runtime.spawn();
+    // Readiness probes may already have fetched the root page from the origin.
+    let probes = origin.requests().len();
+
+    for path in [
+        "/integrations/google_tag_manager/collect",
+        INGRESS_FORM_PATH,
+    ] {
+        for (framing, length_fields) in [
+            ("malformed", "Content-Length: not-a-number\r\n"),
+            ("duplicate", "Content-Length: 1\r\nContent-Length: 2\r\n"),
+        ] {
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n{length_fields}Connection: close\r\n\r\nab"
+            );
+
+            assert_eq!(
+                raw_request_status(&process.base_url, request.as_bytes()),
+                Some(400),
+                "{runtime:?} should refuse a POST to {path} with a {framing} Content-Length"
+            );
+        }
+    }
+    let forwarded = origin.requests();
+    assert_eq!(
+        forwarded.len(),
+        probes,
+        "{runtime:?} should forward no request with a bad Content-Length to the origin: {:?}",
+        &forwarded[probes..]
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
+fn bad_content_length_returns_400_fastly() {
+    bad_content_length_returns_400(IngressRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires the pre-built trusted-server-axum binary"]
+fn bad_content_length_returns_400_axum() {
+    bad_content_length_returns_400(IngressRuntime::Axum);
+}
+
 /// Serves the shared integration app config on Spin, with the recording origin
 /// on the fixed origin port, and runs `check` against its base URL.
 fn with_spin_ingress(status: u16, check: impl FnOnce(&str, &RecordingOrigin)) {
