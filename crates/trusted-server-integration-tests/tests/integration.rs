@@ -1648,7 +1648,9 @@ fn twelve_bidder_auction_registers_twelve_backends_fastly() {
 
     common::trace_boundary::with_fastly_runtime(&envelope, |base_url, stdout| {
         // Each bidder listens on its own port, so each needs its own backend.
-        // Two auctions show the backends serve every later auction too.
+        // Both auctions run on one configuration with the same budget. Each
+        // callback's observation is its own, so this cannot show that the
+        // second auction reuses the first one's backend names.
         for auction in 1..=2 {
             let response = post_auction(base_url);
             assert_eq!(

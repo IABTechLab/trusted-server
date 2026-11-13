@@ -2162,11 +2162,13 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    bidders on 12 distinct ports (D18), so each bidder needs its own cold
    backend registration (EZ-3 criterion 6). Backend identity leaves out the
    path, so bidders on one port would share a backend. A bid after the
-   cutoff is dropped. The mediator runs after the batch. Two auctions with
-   different remaining budgets each configure and register exactly one backend
-   per bidder in their own callback's observation. The observation is per
-   callback, so it cannot show that the second auction reuses the first one's
-   backend names; that needs reuse mode (EZ-2 criterion 21, deferred).
+   cutoff is dropped. The mediator runs after the batch. Two auctions on one
+   configuration each configure and register exactly one backend per bidder in
+   their own callback's observation. The observation is per callback, so it
+   cannot show that the second auction reuses the first one's backend names;
+   that needs reuse mode (EZ-2 criterion 21, deferred). The scripted client
+   shows that two auctions with different remaining budgets send identical
+   request options.
    Cloudflare and Spin load a
    multi-provider config and run the auction. On Spin, one bidder's provider
    timeout ends before the cutoff while a sibling answers after the cutoff,
