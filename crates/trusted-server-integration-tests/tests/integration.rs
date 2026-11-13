@@ -14,11 +14,12 @@ use frameworks::scenarios::EcScenario;
 use frameworks::{FRAMEWORKS, FrontendFramework};
 use reqwest::header::CONTENT_TYPE;
 use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use testcontainers::runners::SyncRunner as _;
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 use trusted_server_core::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
@@ -479,6 +480,10 @@ struct OriginRequest {
     transfer_encoding: Option<String>,
     /// Every header field, names lowercased, in arrival order.
     headers: Vec<(String, String)>,
+    /// When the request head had arrived.
+    received_at: Instant,
+    /// When the origin began the last write of its answer, once it has.
+    answered_at: Option<Instant>,
 }
 
 impl OriginRequest {
@@ -494,6 +499,15 @@ impl OriginRequest {
 /// Builds the complete HTTP response a [`RecordingOrigin`] sends for one request.
 type OriginResponder = Arc<dyn Fn(&OriginRequest) -> Vec<u8> + Send + Sync>;
 
+/// Builds a [`RecordingOrigin`]'s answer to one request as writes spaced in time.
+type PacedResponder = Arc<dyn Fn(&OriginRequest) -> Vec<OriginWrite> + Send + Sync>;
+
+/// One write of a paced answer: `bytes` go out `delay` after the previous write.
+struct OriginWrite {
+    delay: Duration,
+    bytes: Vec<u8>,
+}
+
 /// Loopback origin that records every request and answers it from a responder.
 ///
 /// Unlike [`common::ec::MinimalOrigin`], it reads the whole request body and
@@ -502,7 +516,7 @@ type OriginResponder = Arc<dyn Fn(&OriginRequest) -> Vec<u8> + Send + Sync>;
 struct RecordingOrigin {
     port: u16,
     requests: Arc<Mutex<Vec<OriginRequest>>>,
-    shutdown_tx: mpsc::Sender<()>,
+    stopping: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -527,41 +541,57 @@ impl RecordingOrigin {
     ///
     /// Panics if the listener cannot be configured.
     fn serve(listener: TcpListener, respond: OriginResponder) -> Self {
+        Self::serve_paced(
+            listener,
+            Arc::new(move |request| {
+                vec![OriginWrite {
+                    delay: Duration::ZERO,
+                    bytes: respond(request),
+                }]
+            }),
+        )
+    }
+
+    /// Serves `listener`, answering each request with the writes `respond`
+    /// builds, each after its delay.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener cannot be configured.
+    fn serve_paced(listener: TcpListener, respond: PacedResponder) -> Self {
         let port = listener
             .local_addr()
             .expect("should read the origin address")
             .port();
-        listener
-            .set_nonblocking(true)
-            .expect("should set listener nonblocking");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
 
+        // The accept blocks rather than polls, so a recorded arrival time is
+        // not late by a polling interval. Drop wakes it with a connection.
         let handle = thread::spawn(move || {
-            while matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let recorded = Arc::clone(&recorded);
-                        let respond = Arc::clone(&respond);
-                        // One thread per connection, so an idle pooled
-                        // connection cannot hold up the next request.
-                        thread::spawn(move || {
-                            serve_origin_connection(stream, respond.as_ref(), &recorded);
-                        });
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
+            for stream in listener.incoming() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                let Ok(stream) = stream else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let respond = Arc::clone(&respond);
+                // One thread per connection, so an idle pooled
+                // connection cannot hold up the next request.
+                thread::spawn(move || {
+                    serve_origin_connection(stream, respond.as_ref(), &recorded);
+                });
             }
         });
 
         Self {
             port,
             requests,
-            shutdown_tx,
+            stopping,
             handle: Some(handle),
         }
     }
@@ -577,17 +607,25 @@ impl RecordingOrigin {
 
 impl Drop for RecordingOrigin {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
-        if let Some(handle) = self.handle.take() {
+        self.stopping.store(true, Ordering::SeqCst);
+        // A connection wakes the blocking accept, which then sees the flag.
+        // Without one the thread would never end, so it is not joined.
+        let woken = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], self.port)),
+            Duration::from_secs(1),
+        )
+        .is_ok();
+        if let Some(handle) = self.handle.take().filter(|_| woken) {
             let _ = handle.join();
         }
     }
 }
 
-/// Reads one request from `stream`, records it, and answers with what `respond` builds.
+/// Reads one request from `stream`, records it, and answers with the writes
+/// `respond` builds.
 fn serve_origin_connection(
     mut stream: TcpStream,
-    respond: &(dyn Fn(&OriginRequest) -> Vec<u8> + Send + Sync),
+    respond: &(dyn Fn(&OriginRequest) -> Vec<OriginWrite> + Send + Sync),
     recorded: &Mutex<Vec<OriginRequest>>,
 ) {
     // Some platforms hand out accepted sockets in the listener's nonblocking
@@ -599,16 +637,34 @@ fn serve_origin_connection(
     {
         return;
     }
-    let Some(request) = read_origin_request(&mut stream) else {
+    let Some(mut request) = read_origin_request(&mut stream) else {
         return;
     };
-    let response = respond(&request);
+    let mut writes = respond(&request);
+    let last = writes.pop().unwrap_or(OriginWrite {
+        delay: Duration::ZERO,
+        bytes: Vec::new(),
+    });
+    for write in writes {
+        thread::sleep(write.delay);
+        if stream
+            .write_all(&write.bytes)
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+    thread::sleep(last.delay);
+    // Recorded before the last write, so a client that has the whole answer
+    // also finds the request recorded.
+    request.answered_at = Some(Instant::now());
     recorded
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(request);
 
-    let _ = stream.write_all(&response);
+    let _ = stream.write_all(&last.bytes);
     let _ = stream.flush();
 }
 
@@ -642,6 +698,7 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
         }
         read_more(stream, &mut received)?;
     };
+    let received_at = Instant::now();
     let head = std::str::from_utf8(&received[..head_end]).ok()?;
     let mut lines = head.split("\r\n");
     let mut request_line = lines.next()?.split(' ');
@@ -688,6 +745,8 @@ fn read_origin_request(stream: &mut TcpStream) -> Option<OriginRequest> {
         content_length: declared_length,
         transfer_encoding,
         headers,
+        received_at,
+        answered_at: None,
     })
 }
 
@@ -2288,8 +2347,11 @@ const NAVIGATION_ORIGIN_DELAY: Duration = Duration::from_millis(700);
 /// The navigation auction's deadline.
 const NAVIGATION_AUCTION_TIMEOUT_MS: u32 = 500;
 
-/// Pre-seeded EC row of the Viceroy template, so the Fastly navigation
-/// preloads an EC snapshot and takes the overlapped path.
+/// Pre-seeded EC row of the Viceroy template.
+///
+/// The Fastly navigation still takes the plain path, not the overlapped one.
+/// Viceroy supplies no JA4 fingerprint, so the bot gate gives the request no
+/// KV graph and no EC snapshot preload runs.
 const NAVIGATION_EC_ID: &str =
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.test05";
 
@@ -2349,6 +2411,55 @@ fn start_slow_navigation_origin() -> RecordingOrigin {
     )
 }
 
+/// The navigation auction config for one bidder per delay in `delays`, each
+/// bidding on its own slot.
+fn navigation_envelope(delays: &[Duration], bidders: &[RecordingOrigin]) -> String {
+    let ids: Vec<String> = delays
+        .iter()
+        .map(|delay| format!("bidder-{}", delay.as_millis()))
+        .collect();
+    let fixtures = loopback_bidder_fixtures(
+        &ids.iter()
+            .zip(bidders)
+            .map(|(id, bidder)| (id.as_str(), bidder, Duration::from_millis(1500)))
+            .collect::<Vec<_>>(),
+    );
+    let slots: Vec<String> = delays
+        .iter()
+        .map(|delay| format!("slot-{}", delay.as_millis()))
+        .collect();
+    common::config::navigation_auction_app_config_envelope(
+        origin_port(),
+        &fixtures,
+        NAVIGATION_AUCTION_TIMEOUT_MS,
+        NAVIGATION_PATH,
+        &slots.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .expect("should build the navigation auction config")
+}
+
+/// Loads [`NAVIGATION_PATH`] as a document navigation that carries consent
+/// and [`NAVIGATION_EC_ID`], and returns the page `runtime` served.
+fn load_navigation(runtime: OriginRuntime, base_url: &str) -> String {
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{base_url}{NAVIGATION_PATH}"))
+        .header(
+            "cookie",
+            format!("{}; ts-ec={NAVIGATION_EC_ID}", tcf_purpose_one_cookie()),
+        )
+        .header("cf-ipcountry", "US")
+        .header("accept", "text/html")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate")
+        .timeout(Duration::from_secs(30))
+        .send()
+        .expect("should load the navigation");
+    let status = response.status().as_u16();
+    let html = response.text().expect("should read the navigation page");
+    assert_eq!(status, 200, "{runtime:?} should serve the page: {html}");
+    html
+}
+
 /// Loads a navigation whose 500 ms auction races bidders at 180, 320, and 600 ms
 /// and an origin whose head arrives at 700 ms (EZ-6).
 fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms(runtime: OriginRuntime) {
@@ -2357,40 +2468,10 @@ fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms(runtime: OriginRunt
     let _origin = start_slow_navigation_origin();
     let delays = [180, 320, 600].map(Duration::from_millis);
     let bidders = delays.map(start_navigation_bidder);
-    let ids = delays.map(|delay| format!("bidder-{}", delay.as_millis()));
-    let fixtures = loopback_bidder_fixtures(
-        &ids.iter()
-            .zip(&bidders)
-            .map(|(id, bidder)| (id.as_str(), bidder, Duration::from_millis(1500)))
-            .collect::<Vec<_>>(),
-    );
-    let slots = delays.map(|delay| format!("slot-{}", delay.as_millis()));
-    let envelope = common::config::navigation_auction_app_config_envelope(
-        origin_port(),
-        &fixtures,
-        NAVIGATION_AUCTION_TIMEOUT_MS,
-        NAVIGATION_PATH,
-        &slots.iter().map(String::as_str).collect::<Vec<_>>(),
-    )
-    .expect("should build the navigation auction config");
+    let envelope = navigation_envelope(&delays, &bidders);
 
     runtime.serve(&envelope, |base_url| {
-        let response = reqwest::blocking::Client::new()
-            .get(format!("{base_url}{NAVIGATION_PATH}"))
-            .header(
-                "cookie",
-                format!("{}; ts-ec={NAVIGATION_EC_ID}", tcf_purpose_one_cookie()),
-            )
-            .header("cf-ipcountry", "US")
-            .header("accept", "text/html")
-            .header("sec-fetch-dest", "document")
-            .header("sec-fetch-mode", "navigate")
-            .timeout(Duration::from_secs(30))
-            .send()
-            .expect("should load the navigation");
-        let status = response.status().as_u16();
-        let html = response.text().expect("should read the navigation page");
-        assert_eq!(status, 200, "{runtime:?} should serve the page: {html}");
+        let html = load_navigation(runtime, base_url);
         for delay in [180, 320].map(Duration::from_millis) {
             assert!(
                 html.contains(&navigation_creative(delay)),
@@ -2433,6 +2514,152 @@ fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_cloudflare() {
 #[ignore = "requires Spin and the current production Spin WASM artifact"]
 fn navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin() {
     navigation_bids_include_180_and_320_ms_and_exclude_600_ms(OriginRuntime::Spin);
+}
+
+/// How far apart the streaming navigation origin writes its body chunks.
+const STREAMED_CHUNK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Body chunks the streaming navigation origin writes after its head.
+const STREAMED_CHUNKS: usize = 10;
+
+/// Marker each streamed body chunk carries.
+const STREAMED_CHUNK: &str = "<p>example streamed chunk</p>";
+
+/// The publisher origin of the streamed-body navigation case.
+///
+/// It answers [`NAVIGATION_PATH`] with its head and the start of the page at
+/// once, then streams [`STREAMED_CHUNKS`] more chunks
+/// [`STREAMED_CHUNK_INTERVAL`] apart, so the body ends about 1 s after the
+/// request arrives. Any other path gets a small page at once.
+fn start_streaming_navigation_origin() -> RecordingOrigin {
+    let listener =
+        TcpListener::bind(("127.0.0.1", origin_port())).expect("should bind the origin port");
+    RecordingOrigin::serve_paced(
+        listener,
+        Arc::new(|request| {
+            if request.path != NAVIGATION_PATH {
+                return vec![OriginWrite {
+                    delay: Duration::ZERO,
+                    bytes: html_response(200, request.method == "HEAD"),
+                }];
+            }
+            let chunk = |text: &str| format!("{:x}\r\n{text}\r\n", text.len()).into_bytes();
+            let mut head = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+            head.extend(chunk(
+                "<html><head><title>Example</title></head><body><main>",
+            ));
+            let mut writes = vec![OriginWrite {
+                delay: Duration::ZERO,
+                bytes: head,
+            }];
+            for index in 1..=STREAMED_CHUNKS {
+                let mut bytes = chunk(STREAMED_CHUNK);
+                if index == STREAMED_CHUNKS {
+                    bytes.extend(chunk("</main></body></html>"));
+                    bytes.extend_from_slice(b"0\r\n\r\n");
+                }
+                writes.push(OriginWrite {
+                    delay: STREAMED_CHUNK_INTERVAL,
+                    bytes,
+                });
+            }
+            writes
+        }),
+    )
+}
+
+/// Milliseconds from `start` to `instant`, negative when `instant` is earlier.
+fn millis_from(start: Instant, instant: Instant) -> i128 {
+    let millis = |duration: Duration| i128::try_from(duration.as_millis()).unwrap_or(i128::MAX);
+    match instant.checked_duration_since(start) {
+        Some(after) => millis(after),
+        None => -millis(start.duration_since(instant)),
+    }
+}
+
+/// A bid that answers while the origin body streams is injected on Viceroy
+/// (EZ-6, spec 2.5 and test 6).
+///
+/// The origin sends its head at once and streams its body for about 1 s,
+/// across the 500 ms auction. The loopback servers record when each request
+/// head arrives and when each answer's last write starts. The origin request
+/// arrives before the 200 ms bidder answers, and every bid request arrives
+/// before the origin body ends, so the origin fetch and the bids overlap. The
+/// 200 ms bid, which comes while the body still streams, is injected. The
+/// 600 ms bid, which comes after the cutoff though the body still streams, is
+/// dropped.
+///
+/// Viceroy supplies no JA4 fingerprint, so this navigation takes the plain
+/// path ([`NAVIGATION_EC_ID`]). The overlapped path's order, origin request
+/// before bid construction, is tested in core with the scripted client.
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn navigation_bid_answered_while_origin_body_streams_is_injected_fastly() {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = start_streaming_navigation_origin();
+    let delays = [200, 600].map(Duration::from_millis);
+    let bidders = delays.map(start_navigation_bidder);
+    let envelope = navigation_envelope(&delays, &bidders);
+
+    OriginRuntime::Fastly.serve(&envelope, |base_url| {
+        let html = load_navigation(OriginRuntime::Fastly, base_url);
+        assert_eq!(
+            html.matches(STREAMED_CHUNK).count(),
+            STREAMED_CHUNKS,
+            "should serve every chunk the origin streamed: {html}"
+        );
+        assert!(
+            html.contains(&navigation_creative(delays[0])),
+            "should inject the bid that answered at 200 ms, while the origin body streamed: {html}"
+        );
+        assert!(
+            !html.contains(&navigation_creative(delays[1])),
+            "should drop the bid that answered after the 500 ms cutoff: {html}"
+        );
+    });
+
+    assert_bidders_received("Fastly", &bidders.iter().collect::<Vec<_>>(), 1);
+    let page = origin
+        .requests()
+        .into_iter()
+        .find(|request| request.path == NAVIGATION_PATH)
+        .expect("should record the navigation's origin request");
+    let body_end = page
+        .answered_at
+        .expect("should record when the origin body ended");
+    let bid_requests = bidders.map(|bidder| bidder.requests().remove(0));
+    let answers = bid_requests.each_ref().map(|bid_request| {
+        bid_request
+            .answered_at
+            .expect("should record when the bidder answered")
+    });
+    for ((delay, bid_request), answered) in delays.iter().zip(&bid_requests).zip(answers) {
+        log::info!(
+            "timeline in ms from the origin request: {} ms bidder got its request at {}, answered at {}, origin body ended at {}",
+            delay.as_millis(),
+            millis_from(page.received_at, bid_request.received_at),
+            millis_from(page.received_at, answered),
+            millis_from(page.received_at, body_end),
+        );
+        assert!(
+            bid_request.received_at < body_end,
+            "should send the {} ms bid request while the origin body still streams: it came {} ms after the body ended",
+            delay.as_millis(),
+            millis_from(body_end, bid_request.received_at),
+        );
+        assert!(
+            answered < body_end,
+            "should get the {} ms bidder's answer while the origin body still streams: it came {} ms after the body ended",
+            delay.as_millis(),
+            millis_from(body_end, answered),
+        );
+    }
+    assert!(
+        page.received_at < answers[0],
+        "should send the origin request while the 200 ms bid is in flight: it came {} ms after the bid",
+        millis_from(answers[0], page.received_at),
+    );
 }
 
 // ---------------------------------------------------------------------------

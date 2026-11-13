@@ -2181,15 +2181,27 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    320 ms and not the one that answered at 600 ms, as EZ-6's Trusted Server
    check states. A batch cutoff built from `ctx.monotonic_clock()` expires on
    time. The two paths differ (2.5):
-   - On Viceroy, a navigation GET that preloads an EC snapshot takes the
+   - On Fastly, a navigation GET that preloads an EC snapshot takes the
      overlapped path. The origin request is dispatched before bid
      construction, bids are collected at the `</body>` hold, and a bid that
      arrives while the origin body streams is observed before the cutoff.
-   - On Axum, workerd, and Spin, which have no KV graph, the plain path
-     dispatches the auction first and sends the origin request while the bids
-     are in flight.
-     Gap: the tests do not assert the Viceroy overlapped-path sub-bullet. The
-     Viceroy leg checks the bid outcome only.
+     Core's `overlapped_navigation_starts_origin_before_ec_lookup` checks that
+     order with the scripted client. The preload needs the KV graph, which the
+     bot gate passes only for a client with a JA4 fingerprint. Stock Viceroy
+     0.21.0 supplies none (its `downstream_tls_ja4` returns no value), so every
+     navigation on Viceroy takes the plain path.
+   - On Axum, workerd, and Spin, which have no KV graph, and on Viceroy, the
+     plain path dispatches the auction first and sends the origin request
+     while the bids are in flight.
+   - On Viceroy,
+     `navigation_bid_answered_while_origin_body_streams_is_injected_fastly`
+     runs against an origin that sends its head at once and streams its body
+     for about 1 s. The loopback servers record when each request head arrives
+     and when each answer's last write starts. The origin request arrives
+     before the 200 ms bidder answers, and every bid request arrives before the
+     origin body ends. The 200 ms bid, which comes while the body streams, is
+     injected. The 600 ms bid, which comes after the cutoff and before the body
+     ends, is dropped.
 7. **Encoded passthrough (EZ-5 criterion 8).** On Viceroy, against origin
    fixtures:
    - A gzip HTML page reaches the client with `Content-Encoding: gzip` and
