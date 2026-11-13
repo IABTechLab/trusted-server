@@ -26,7 +26,7 @@ use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::edge_app::install_edge_policies;
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
@@ -409,7 +409,7 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)
+        install_edge_policies(app, synthesized_response_headers())
     }
 
     fn name() -> &'static str {

@@ -1355,11 +1355,10 @@ impl Hooks for TrustedServerApp {
     /// set for each request with the finalize headers that do not depend on
     /// the response.
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)?;
-        app.set_synthesized_response_headers(version_synthesized_headers(
-            std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
-        ))
-        .map_err(EdgeError::internal)
+        install_edge_policies(
+            app,
+            version_synthesized_headers(std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref()),
+        )
     }
 
     fn name() -> &'static str {
