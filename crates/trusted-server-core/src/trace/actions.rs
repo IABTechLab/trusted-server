@@ -275,7 +275,7 @@ mod tests {
             Arc::new(settings.clone()),
             Arc::new(|_| panic!("should not load setup metadata for an action")),
         );
-        block_on(run_pre_dispatch_hook(hook, request))
+        *block_on(run_pre_dispatch_hook(hook, request))
             .expect_err("should answer every exact action route locally")
     }
 

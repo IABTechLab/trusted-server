@@ -2203,7 +2203,7 @@ mod tests {
             assert_eq!(
                 (
                     mediator_request.connect_timeout,
-                    mediator_request.cache_policy,
+                    mediator_request.cache_policy.clone(),
                     mediator_request.response_decoding,
                     mediator_request.response_mode
                 ),
@@ -2303,7 +2303,7 @@ mod tests {
                     request.timeout,
                     request.connect_timeout,
                     request.deadline.map(|deadline| deadline.instant()),
-                    request.cache_policy,
+                    request.cache_policy.clone(),
                     request.response_decoding,
                     request.response_mode,
                     request.host_authority.clone(),

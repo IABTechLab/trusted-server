@@ -5206,11 +5206,9 @@ mod tests {
     ///
     /// The signed S3 preflight `HEAD`, its raw error-body `GET`, and a signed raw
     /// `HEAD` carry it.
-    fn uncached(transport: ExpectedTransport) -> ExpectedTransport {
-        ExpectedTransport {
-            cache_policy: OutboundCachePolicy::Bypass,
-            ..transport
-        }
+    fn uncached(mut transport: ExpectedTransport) -> ExpectedTransport {
+        transport.cache_policy = OutboundCachePolicy::Bypass;
+        transport
     }
 
     /// Splits an asset response and reads its streamed body.
@@ -5836,7 +5834,7 @@ mod tests {
             client
                 .requests()
                 .iter()
-                .map(|sent| sent.cache_policy)
+                .map(|sent| sent.cache_policy.clone())
                 .collect::<Vec<_>>(),
             vec![
                 OutboundCachePolicy::Bypass,
@@ -6152,6 +6150,87 @@ mod tests {
                 "{method} with signed={signed} should keep readthrough caching"
             );
             requests[0].assert_transport(transport);
+        }
+    }
+
+    #[test]
+    fn asset_proxy_keeps_caching_for_raw_control_routes() {
+        for case in ["svgz", "rewritten_svg", "debug", "disabled_io", "absent_io"] {
+            for (method, signed) in [
+                (Method::GET, true),
+                (Method::HEAD, false),
+                (Method::GET, false),
+            ] {
+                // Existing author tests cover signed and unsigned debug GET.
+                if case == "debug" && method == Method::GET {
+                    continue;
+                }
+                let (_clock, client, services) = scripted_services();
+                let mut route = test_s3_image_optimizer_route();
+                let (path, query, origin_path) = match case {
+                    "svgz" => ("logo.svgz", "?profile=medium", "logo.svgz"),
+                    "rewritten_svg" => {
+                        route.path_pattern = Some("^/\\.images/(.*)\\.png$".to_owned());
+                        route.target_path = Some("/.images/$1.svg".to_owned());
+                        ("logo.png", "?profile=medium", "logo.svg")
+                    }
+                    "debug" => ("foo.jpg", "?profile=medium&_io_debug=1", "foo.jpg"),
+                    "disabled_io" => {
+                        route
+                            .image_optimizer
+                            .as_mut()
+                            .expect("should configure IO")
+                            .enabled = false;
+                        ("foo.jpg", "?profile=medium", "foo.jpg")
+                    }
+                    _ => {
+                        route.image_optimizer = None;
+                        ("foo.jpg", "", "foo.jpg")
+                    }
+                };
+                if !signed {
+                    route.auth = None;
+                }
+                let origin_query = if route.origin_query_policy() == OriginQueryPolicy::Preserve {
+                    query
+                } else {
+                    ""
+                };
+                client.respond_to(
+                    method.clone(),
+                    &format!(
+                        "https://examplebucket.s3.example.com/.images/{origin_path}{origin_query}"
+                    ),
+                    ScriptedReply::status(StatusCode::OK),
+                );
+                let request = build_http_request(
+                    method.clone(),
+                    format!("https://www.example.com/.images/{path}{query}"),
+                );
+                let response = futures::executor::block_on(handle_asset_proxy_request(
+                    &image_optimizer_settings(test_profile_set()),
+                    &services,
+                    request,
+                    &route,
+                ))
+                .expect("should preserve the upstream raw asset behavior");
+                assert_eq!(
+                    response.cache_policy(),
+                    AssetProxyCachePolicy::OriginControlled
+                );
+                let requests = client.requests();
+                assert_eq!(requests.len(), 1, "should not preflight a raw {case} asset");
+                assert_eq!(requests[0].method, method);
+                assert!(
+                    requests[0].image_optimizer.is_none(),
+                    "should not attach IO for {case}"
+                );
+                assert_eq!(
+                    requests[0].cache_policy,
+                    OutboundCachePolicy::PlatformDefault,
+                    "raw GET and unsigned HEAD should retain normal caching for {case}"
+                );
+            }
         }
     }
 

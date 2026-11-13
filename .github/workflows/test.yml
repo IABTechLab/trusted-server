@@ -354,6 +354,9 @@ jobs:
         if: runner.os == 'macOS'
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          # An exact version selects Chrome for Testing, not a snapshot or the desktop DMG.
+          chrome-version: '157.0.8103.78'
 
       - name: cargo test
         if: runner.os == 'Linux'
