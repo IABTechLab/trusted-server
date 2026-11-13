@@ -55,7 +55,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _store: &StoreName,
         _key: &str,
     ) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn put(
@@ -64,7 +64,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn delete(
@@ -72,7 +72,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _store: &StoreId,
         _key: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 }
 
@@ -83,7 +83,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _store: &StoreName,
         _key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn create(
@@ -92,7 +92,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn delete(
@@ -100,7 +100,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _store: &StoreId,
         _key: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 }
 

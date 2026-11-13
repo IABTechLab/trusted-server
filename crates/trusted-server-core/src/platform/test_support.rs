@@ -19,7 +19,7 @@ pub(crate) struct NoopConfigStore;
 #[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _store_name: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn put(
@@ -28,11 +28,11 @@ impl PlatformConfigStore for NoopConfigStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 }
 
@@ -45,7 +45,7 @@ impl PlatformSecretStore for NoopSecretStore {
         _store_name: &StoreName,
         _key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn create(
@@ -54,11 +54,11 @@ impl PlatformSecretStore for NoopSecretStore {
         _name: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 }
 
@@ -87,11 +87,11 @@ impl PlatformConfigStore for HashMapConfigStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 }
 
@@ -124,11 +124,11 @@ impl PlatformSecretStore for HashMapSecretStore {
         _name: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 }
 

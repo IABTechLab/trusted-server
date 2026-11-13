@@ -568,11 +568,11 @@ mod tests {
         }
 
         async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 

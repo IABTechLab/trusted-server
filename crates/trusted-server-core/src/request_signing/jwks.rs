@@ -121,7 +121,7 @@ mod tests {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -129,7 +129,7 @@ mod tests {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 

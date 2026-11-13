@@ -3262,7 +3262,7 @@ mod tests {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -3270,7 +3270,7 @@ mod tests {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -3299,7 +3299,7 @@ mod tests {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -3307,7 +3307,7 @@ mod tests {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -3333,7 +3333,7 @@ mod tests {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -3341,7 +3341,7 @@ mod tests {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
@@ -3363,7 +3363,7 @@ mod tests {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -3371,7 +3371,7 @@ mod tests {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 

@@ -2203,7 +2203,7 @@ mod tests {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -2211,7 +2211,7 @@ mod tests {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 

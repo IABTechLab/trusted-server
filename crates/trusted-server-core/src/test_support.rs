@@ -681,7 +681,7 @@ pub mod nextjs_auction {
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn put(
@@ -690,7 +690,7 @@ pub mod nextjs_auction {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -698,7 +698,7 @@ pub mod nextjs_auction {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -709,7 +709,7 @@ pub mod nextjs_auction {
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<Vec<u8>, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn create(
@@ -718,7 +718,7 @@ pub mod nextjs_auction {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -726,7 +726,7 @@ pub mod nextjs_auction {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
