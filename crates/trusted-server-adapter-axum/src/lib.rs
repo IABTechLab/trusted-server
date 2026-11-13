@@ -6,6 +6,12 @@
 
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
+/// Process-local EC identity store and rate limiter for the Axum dev server.
+pub mod ec_kv;
+/// EC identity lifecycle for publisher navigations.
+mod identity;
+#[cfg(test)]
+mod identity_tests;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.

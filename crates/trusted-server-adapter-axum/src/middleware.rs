@@ -6,9 +6,17 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::proxy::AssetProxyCachePolicy;
+use trusted_server_core::response_privacy::{
+    TerminalPrivateResponse, enforce_private_no_store, enforce_set_cookie_cache_privacy,
+    enforce_uncacheable_cache_privacy,
+};
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace::TraceTerminalResponse;
 
 // ---------------------------------------------------------------------------
 // SanitizeRequestMiddleware
@@ -76,9 +84,44 @@ impl FinalizeResponseMiddleware {
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let mut response = next.run(ctx).await?;
+        let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
+        let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
         apply_finalize_headers(&self.settings, &mut response);
+        if let Some(policy) = asset_cache_policy {
+            policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SMaxageFallback);
+        }
+        apply_terminal_response_effects(&mut response, request_filter_effects.as_ref());
         Ok(response)
     }
+}
+
+/// Applies request-filter effects, then restores privacy invariants.
+///
+/// Mirrors the Fastly entry point: effects may add a per-user `Set-Cookie`
+/// or a private directive after the standard headers ran.
+fn apply_terminal_response_effects(
+    response: &mut Response,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    if response
+        .extensions()
+        .get::<TraceTerminalResponse>()
+        .is_some()
+    {
+        return;
+    }
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
+    if let Some(effects) = request_filter_effects {
+        effects.apply_to_response(response);
+    }
+    if must_remain_private {
+        enforce_private_no_store(response);
+    }
+    enforce_set_cookie_cache_privacy(response);
+    enforce_uncacheable_cache_privacy(response);
 }
 
 // ---------------------------------------------------------------------------
