@@ -118,12 +118,13 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
 };
@@ -271,12 +272,7 @@ fn build_per_request_services(
                 .and_then(|c| c.client_ip),
             ..ClientInfo::default()
         });
-    let outbound_client = ctx
-        .http_client()
-        .ok_or_else(|| {
-            EdgeError::internal(std::io::Error::other("request has no outbound client"))
-        })?
-        .with_proxy_marker(false);
+    let outbound_client = request_outbound_client(ctx)?;
     let request_geo = ctx
         .extensions()
         .get::<RequestGeo>()
@@ -1032,28 +1028,6 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
     if !effects.response_headers.is_empty() {
         response.extensions_mut().insert(effects.clone());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into a plain-text HTTP [`Response`].
-///
-/// Logs the whole report at error, then answers with the root error's status
-/// and its client-safe user message.
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`

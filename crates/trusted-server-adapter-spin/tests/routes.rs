@@ -119,6 +119,16 @@ async fn dispatch_through_app(method: Method, target: &str) -> Response {
     prepared.into_response()
 }
 
+/// Returns the git version compiled into this build.
+///
+/// # Panics
+///
+/// Panics when the build has none, so a version assertion cannot pass on an
+/// absent header.
+fn compiled_git_version() -> &'static str {
+    TS_GIT_VERSION.expect("should compile a git version into the test build")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_not_found_carries_x_ts_version() {
     // The publisher fallback claims every origin-form path, so only an
@@ -135,7 +145,7 @@ async fn canonical_not_found_carries_x_ts_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|value| value.to_str().ok()),
-        TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 404"
     );
 }
@@ -162,7 +172,7 @@ async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|value| value.to_str().ok()),
-        TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 405"
     );
 }

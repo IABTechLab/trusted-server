@@ -6,7 +6,9 @@
 
 use core::error::Error;
 use derive_more::Display;
+use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
+use edgezero_core::http::{HeaderValue, Response, header};
 use error_stack::Report;
 use http::StatusCode;
 
@@ -153,7 +155,7 @@ impl IntoHttpResponse for TrustedServerError {
             // The client sent the body too slowly; the detail stays in the logs.
             Self::RequestTimeout { .. } => "Request timeout".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
-            // Full details are already logged via log::error! in to_error_response.
+            // Full details are already logged by http_error.
             _ => "An internal error occurred".to_string(),
         }
     }
@@ -197,6 +199,45 @@ pub fn startup_error(report: &Report<TrustedServerError>) -> EdgeError {
         StatusCode::BAD_REQUEST => EdgeError::bad_request(message),
         _ => EdgeError::internal(std::io::Error::other(message)),
     }
+}
+
+/// Renders a failed request's [`Report`] as the plain-text error response.
+///
+/// The response answers with the [`IntoHttpResponse::status_code`] of the
+/// report's current context and its client-safe
+/// [`IntoHttpResponse::user_message`]. The whole report is logged once: at
+/// warn when the status is a client error, because the client caused it, and
+/// at error otherwise.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::http::StatusCode;
+/// use error_stack::Report;
+/// use trusted_server_core::error::{TrustedServerError, http_error};
+///
+/// let report = Report::new(TrustedServerError::RequestTooLarge {
+///     message: "example body over the limit".to_owned(),
+/// });
+/// assert_eq!(http_error(&report).status(), StatusCode::PAYLOAD_TOO_LARGE);
+/// ```
+#[must_use]
+pub fn http_error(report: &Report<TrustedServerError>) -> Response {
+    let error = report.current_context();
+    let status = error.status_code();
+    if status.is_client_error() {
+        log::warn!("Error occurred: {report:?}");
+    } else {
+        log::error!("Error occurred: {report:?}");
+    }
+
+    let mut response = Response::new(Body::from(format!("{}\n", error.user_message())));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 #[cfg(test)]
