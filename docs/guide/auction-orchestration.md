@@ -918,7 +918,7 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built or Fastly cannot register its backend, and other providers continue. If every routed provider fails to launch, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
+- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built, Fastly cannot register its backend, or the Spin or Cloudflare adapter cannot prepare the request, and other providers continue. If every routed provider fails to launch, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
 - **No providers configured** — Completes as a no-bid without provider I/O.
 - **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.

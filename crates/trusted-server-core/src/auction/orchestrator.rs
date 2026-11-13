@@ -248,15 +248,19 @@ fn provider_skipped_response(provider_name: &str) -> AuctionResponse {
     )
 }
 
-/// Whether `error` is a failed backend registration, which no request byte
-/// follows.
+/// Whether `error` failed the request before any byte of it left: a failed
+/// backend registration, or a request the adapter could not prepare.
 ///
-/// A registration that runs out of budget stays a timeout.
-fn failed_backend_registration(error: &EdgeError) -> bool {
+/// A launch step that runs out of budget stays a timeout.
+fn failed_to_launch(error: &EdgeError) -> bool {
     !matches!(error, EdgeError::GatewayTimeout { .. })
-        && error
-            .provider_failure_detail()
-            .is_some_and(|detail| detail.phase() == ProviderFailurePhase::BackendRegistration)
+        && error.provider_failure_detail().is_some_and(|detail| {
+            matches!(
+                detail.phase(),
+                ProviderFailurePhase::BackendRegistration
+                    | ProviderFailurePhase::RequestPreparation
+            )
+        })
 }
 
 /// Whole milliseconds in `duration`, saturating.
@@ -730,7 +734,8 @@ impl AuctionOrchestrator {
                 .outbound_client()
                 .start_batch_until(bidder_requests, auction_deadline);
             // Fastly registers every bidder backend while it starts the batch,
-            // so a registration failure is already recorded here.
+            // so a registration failure is already recorded here. A launch
+            // failure an adapter reports later is settled during collection.
             launch_failure_count += settle_recorded_slots(
                 &mut batch,
                 &mut slot_providers,
@@ -1145,7 +1150,7 @@ async fn settle_bidder_slot(
         },
         Err(error) => {
             let timed_out = matches!(error, EdgeError::GatewayTimeout { .. });
-            let launch_failed = failed_backend_registration(&error);
+            let launch_failed = failed_to_launch(&error);
             log_request_failure("Planned provider", provider_name, error);
             let response = if timed_out {
                 provider_timeout_response(provider_name, response_time_ms)
@@ -1169,15 +1174,15 @@ async fn settle_bidder_slot(
 
 /// Settles the bidder slots `batch` has already recorded, without waiting.
 ///
-/// Returns how many of them failed backend registration. A failed batch fails
-/// every later observation too, so collection marks the slots it leaves.
+/// Returns how many of them failed to launch. A failed batch fails every later
+/// observation too, so collection marks the slots it leaves.
 async fn settle_recorded_slots(
     batch: &mut OutboundBatch,
     slots: &mut [Option<BidderSlot>],
     responses: &mut Vec<AuctionResponse>,
     trace: Option<&TraceAuctionCarry>,
 ) -> usize {
-    let mut registration_failures = 0;
+    let mut launch_failures = 0;
     loop {
         match batch.check() {
             Ok(OutboundBatchCheck::Item(item)) => {
@@ -1186,17 +1191,13 @@ async fn settle_recorded_slots(
                     log::warn!("Auction batch reported unknown slot {index}, ignoring");
                     continue;
                 };
-                if result
-                    .outcome
-                    .as_ref()
-                    .is_err_and(failed_backend_registration)
-                {
-                    registration_failures += 1;
+                if result.outcome.as_ref().is_err_and(failed_to_launch) {
+                    launch_failures += 1;
                 }
                 responses.push(settle_bidder_slot(slot, result, trace).await);
             }
             Ok(OutboundBatchCheck::Pending | OutboundBatchCheck::Finished(_)) => {
-                return registration_failures;
+                return launch_failures;
             }
             Err(error) => {
                 let report = outbound_error(
@@ -1207,7 +1208,7 @@ async fn settle_recorded_slots(
                     OutboundRequestSource::Internal,
                 );
                 log::warn!("Auction bidder batch failed as it started: {report:?}");
-                return registration_failures;
+                return launch_failures;
             }
         }
     }
@@ -1298,7 +1299,10 @@ mod tests {
     use base64::Engine as _;
     use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
     use edgezero_core::outbound::{OutboundResponse, ResponseMode};
-    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
+    use edgezero_core::{
+        CloudflareFailureCause, FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase,
+        SpinFailureCause,
+    };
     use http::{Method, StatusCode};
 
     use crate::auction::orchestrator::DispatchAuctionOutcome;
@@ -1564,6 +1568,27 @@ mod tests {
         )
     }
 
+    /// The errors Spin and Cloudflare report when they cannot prepare a
+    /// bidder's request, before any byte of it leaves.
+    fn request_preparation_errors() -> [EdgeError; 2] {
+        [
+            EdgeError::bad_request_with_detail(
+                "Spin rejected an outbound request header",
+                ProviderFailureDetail::Spin {
+                    phase: ProviderFailurePhase::RequestPreparation,
+                    cause: SpinFailureCause::HeaderOther,
+                },
+            ),
+            EdgeError::internal_with_detail(
+                std::io::Error::other("example worker request build failure"),
+                ProviderFailureDetail::Cloudflare {
+                    phase: ProviderFailurePhase::RequestPreparation,
+                    cause: CloudflareFailureCause::Unknown,
+                },
+            ),
+        ]
+    }
+
     /// Compiles one standard provider per `(id, endpoint)`.
     fn launch_plan(providers: &[(&str, &str)]) -> Arc<AuctionPlan> {
         let mut config = planned_config(
@@ -1738,6 +1763,49 @@ mod tests {
                         .and_then(|bid| bid.price),
                     Some(2.0),
                     "{failure:?} should let the bid that arrives after the launch failure win"
+                );
+            }
+        }
+
+        #[test]
+        fn request_preparation_failure_is_a_launch_failure() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            for error in request_preparation_errors() {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                bidders
+                    .respond_to(
+                        Method::POST,
+                        FAILING_BIDDER,
+                        ScriptedReply::error(error).after(Duration::from_millis(10)),
+                    )
+                    .respond_to(
+                        Method::POST,
+                        WINNING_BIDDER,
+                        bid_reply(2.0).after(Duration::from_millis(100)),
+                    );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[("launch-fail", FAILING_BIDDER), ("winner", WINNING_BIDDER)]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction beside the preparation failure");
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        ("winner", None),
+                    ],
+                    "should class a request the adapter could not prepare as a launch failure"
                 );
             }
         }
