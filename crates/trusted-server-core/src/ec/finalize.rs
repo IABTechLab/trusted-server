@@ -140,11 +140,11 @@ fn apply_mirror(
 
 /// Whether the request carries a mirror that holds UIDs of a mirrored partner
 /// with a denied gating TCF vendor (that of any configured provider claiming
-/// its source, enabled or disabled), so those UIDs must no longer
-/// reach the page.
+/// its source, enabled or disabled) or a source excluded where GDPR applies
+/// for this visitor, so those UIDs must no longer reach the page.
 ///
 /// A carried value that does not decode as a mirror may hold anything, so it
-/// counts as holding denied UIDs whenever any mirrored vendor is denied.
+/// counts as holding denied UIDs whenever any mirrored partner is denied.
 fn mirror_vendor_denied(ec_context: &EcContext, registry: &PartnerRegistry) -> bool {
     let Some(value) = ec_context.mirror_cookie() else {
         return false;
@@ -152,7 +152,8 @@ fn mirror_vendor_denied(ec_context: &EcContext, registry: &PartnerRegistry) -> b
     let denied = |partner: &PartnerConfig| {
         partner.bidstream_enabled
             && partner.mirror_enabled
-            && partner.owner_vendor_consent_denied(ec_context.consent())
+            && (partner.owner_vendor_consent_denied(ec_context.consent())
+                || partner.excluded_for(ec_context.consent()))
     };
     if !registry.in_config_order().any(denied) {
         return false;
@@ -2065,18 +2066,35 @@ mod tests {
         kv_read_failed: bool,
         navigation: bool,
     ) -> Response<EdgeBody> {
-        run_mirror_request_with_owner(lookups, mirror, kv_read_failed, navigation, false)
+        run_mirror_request_with_owner(
+            lookups,
+            mirror,
+            kv_read_failed,
+            navigation,
+            MirrorGate::Open,
+        )
     }
 
-    /// Runs a mirror request. With `vendor_denied`, the source's owning
-    /// provider has TCF vendor 9999 and the request's TCF string keeps
-    /// Purposes 1 and 4 but denies that vendor.
+    /// What withholds the mirrored source in [`run_mirror_request_with_owner`].
+    #[derive(Clone, Copy)]
+    enum MirrorGate {
+        /// Nothing withholds the source.
+        Open,
+        /// The source's owning provider has TCF vendor 9999 and the request's
+        /// TCF string keeps Purposes 1 and 4 but denies that vendor.
+        VendorDenied,
+        /// A provider excludes the source where GDPR applies, and the request
+        /// is a GDPR visit granting Purposes 1 and 4.
+        RegionExcluded,
+    }
+
+    /// Runs a mirror request with the source withheld as `gate` says.
     fn run_mirror_request_with_owner(
         lookups: LookupResults,
         mirror: Option<&str>,
         kv_read_failed: bool,
         navigation: bool,
-        vendor_denied: bool,
+        gate: MirrorGate,
     ) -> Response<EdgeBody> {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mirr01");
@@ -2103,11 +2121,20 @@ mod tests {
         let mut partner = make_partner("ids.example.com");
         partner.mirror_enabled = true;
         let mut registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
-        let owner_vendor = if vendor_denied {
-            *ec_context.consent_mut() = consent_granting_vendors(Vec::new());
-            NonZeroU16::new(9999)
-        } else {
-            None
+        let owner_vendor = match gate {
+            MirrorGate::Open => None,
+            MirrorGate::VendorDenied => {
+                *ec_context.consent_mut() = consent_granting_vendors(Vec::new());
+                NonZeroU16::new(9999)
+            }
+            MirrorGate::RegionExcluded => {
+                *ec_context.consent_mut() = consent_granting_vendors(Vec::new());
+                assert!(
+                    registry.exclude_where_gdpr_applies("ids.example.com"),
+                    "should exclude the source"
+                );
+                None
+            }
         };
         registry.mark_provider_owned("ids.example.com", owner_vendor);
         let mut response = empty_response();
@@ -2162,7 +2189,7 @@ mod tests {
             Some("stale"),
             false,
             false,
-            true,
+            MirrorGate::VendorDenied,
         );
 
         let cookies = mirror_cookies(&response);
@@ -2180,7 +2207,7 @@ mod tests {
             Some("stale"),
             true,
             true,
-            true,
+            MirrorGate::VendorDenied,
         );
 
         let cookies = mirror_cookies(&response);
@@ -2323,13 +2350,31 @@ mod tests {
     }
 
     #[test]
+    fn region_exclusion_expires_the_mirror_on_a_non_navigation() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+            MirrorGate::RegionExcluded,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror holding a source excluded where GDPR applies"
+        );
+    }
+
+    #[test]
     fn vendor_withdrawal_without_a_mirror_cookie_emits_nothing() {
         let response = run_mirror_request_with_owner(
             provider_found("ids.example.com"),
             None,
             false,
             false,
-            true,
+            MirrorGate::VendorDenied,
         );
 
         assert!(

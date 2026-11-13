@@ -38,7 +38,8 @@ impl MirrorValue {
 ///
 /// Holds live, provider-written UIDs of partners with both
 /// `bidstream_enabled` and `mirror_enabled` while no TCF vendor gating the
-/// source is denied consent, in partner config order, as unpadded base64url JSON
+/// source is denied consent and no provider excludes it where GDPR applies
+/// for this visitor, in partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
@@ -62,12 +63,14 @@ pub fn build_mirror(
     let mut mirror = MirrorBuilder::default();
     // A partner opts in with `mirror_enabled`, and a UID never reaches the
     // page while a TCF vendor gating its source (that of any configured
-    // provider claiming it, enabled or disabled) is denied consent, as it
-    // never reaches the bidstream (`KvEntry::live_eids`).
+    // provider claiming it, enabled or disabled) is denied consent, or while
+    // a provider excludes its source where GDPR applies, as it never reaches
+    // the bidstream (`KvEntry::live_eids`).
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
             && partner.mirror_enabled
             && !partner.owner_vendor_consent_denied(consent)
+            && !partner.excluded_for(consent)
     }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
             continue;
@@ -417,6 +420,35 @@ mod tests {
         assert!(
             matches!(granted, MirrorCookie::Set(_)),
             "should mirror the UID once the vendor has consent"
+        );
+    }
+
+    #[test]
+    fn withholds_uids_of_a_source_excluded_where_gdpr_applies() {
+        let entry = row(vec![uid("live", Expiry::Never)]);
+        let mut registry = partners(true);
+        assert!(
+            registry.exclude_where_gdpr_applies("ids.example.com"),
+            "should exclude the source"
+        );
+        let now = UnixSeconds::new(1000);
+
+        let gdpr = build_mirror(
+            Some(&entry),
+            &consent_granting_vendors(Vec::new()),
+            &registry,
+            now,
+        );
+        let elsewhere = build_mirror(Some(&entry), &granting(), &registry, now);
+
+        assert_eq!(
+            gdpr,
+            MirrorCookie::Expire,
+            "should not mirror a source excluded where GDPR applies on a GDPR visit"
+        );
+        assert!(
+            matches!(elsewhere, MirrorCookie::Set(_)),
+            "should mirror the source outside GDPR"
         );
     }
 
