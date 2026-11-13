@@ -684,7 +684,7 @@ alike:
 - The origin request sets `.max_encoded_response_bytes(cap)`, so H fails any
   origin body over `cap` whatever its classification. These adapters collect
   before egress, so that failure arrives before the response is committed.
-- Raw `Buffered` and `PassThrough` bodies are collected with
+- Raw `Buffered` bodies, pass-through responses included, are collected with
   `Body::into_bytes_bounded(cap)`.
 - Processed HTML is decoded by Trusted Server's rewrite codec, because the
   origin request uses `Original`. Its cumulative decoded bytes are bounded by
@@ -2277,15 +2277,15 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
     request body.
 20. **Publisher ownership (2.5).** These run with the scripted client behind
     H's real facade and head finishing, for `send` and for `begin` followed by
-    `collect`. Each raw `PublisherResponse` variant (`Buffered`, `PassThrough`,
-    and a 206 range response) attaches its owner once and keeps its bytes when
-    the origin call is constructed inside `owner.run`. A control that
+    `collect`. Each raw `Buffered` response (a pass-through 200, an
+    unprocessable 404, and a 206 range response) attaches its owner once and
+    keeps its bytes when the origin call is constructed inside `owner.run`. A control that
     constructs the call outside the scope gets "response body already owns an
     outbound scope" from `attach`. This pins the construction rule, not just
     the outcome.
 21. **Publisher input caps (2.5).** On Axum, Cloudflare, and Spin,
-    `buffer_publisher_response_async` returns raw `Buffered` and `PassThrough`
-    responses with buffered bodies. With `max_buffered_body_bytes` at its 16 MiB
+    `buffer_publisher_response_async` returns raw `Buffered` responses with
+    buffered bodies. With `max_buffered_body_bytes` at its 16 MiB
     default, each adapter's `cap` holds for every classification:
     - A raw body at `cap` passes. One byte over it fails with 502 before
       egress, and so does a source error mid-body.

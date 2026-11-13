@@ -1,10 +1,12 @@
 //! Publisher response handler.
 //!
-//! Publisher fallback has three delivery modes that must remain explicit at
-//! the API boundary:
-//! - pass-through for non-processable `2xx` content
+//! Publisher fallback has two delivery modes that must remain explicit at the
+//! API boundary:
+//! - unmodified delivery for non-processable content, unsupported encodings,
+//!   and `204/205`
 //! - streamed processing for stream-safe processable responses
-//! - buffered responses for unsupported encodings or `204/205`
+//!
+//! The opt-in shared-template modes add a third: assembling a cached template.
 //!
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
@@ -1606,14 +1608,16 @@ fn create_html_stream_processor_with_document_state(
     Ok(processor)
 }
 
-/// Result of publisher request handling, indicating whether the response body
-/// should be streamed or has already been buffered.
+/// Result of publisher request handling: how the finalizer delivers the response.
 pub enum PublisherResponse {
-    /// Response returned unmodified, ready to send via `send_to_client()`.
+    /// Response returned without rewriting, with its body attached.
     ///
-    /// On streaming adapters the unmodified body may still be a live
-    /// [`EdgeBody::Stream`] (the origin fetch requested streaming before the
-    /// response was classified); it passes through to the client untouched.
+    /// Carries non-processable content, unsupported encodings, `204/205`, and
+    /// range-associated HTML as the origin sent them, and Trusted Server's own
+    /// unprocessed answers such as the 502 for an unexpected origin `304`. The
+    /// streaming finalizer passes the origin stream through, and the buffered
+    /// finalizer collects it under the adapter's input cap. Both drop the body
+    /// of a bodiless response.
     Buffered(Response<EdgeBody>),
     /// Response headers are ready for a streaming response. Covers processable
     /// content on any status (2xx or non-2xx — e.g., branded 404/500 HTML and
@@ -1656,20 +1660,6 @@ pub enum PublisherResponse {
         /// Auction and injection state, same as [`Self::Stream`].
         params: Box<OwnedProcessResponseParams>,
     },
-    /// Non-processable 2xx response (images, fonts, video). The adapter must
-    /// reattach the body via setting the body before returning.
-    /// `finalize_response()` and `send_to_client()` are applied at the outer
-    /// response-dispatch level, not in this arm.
-    ///
-    /// `Content-Length` is preserved — the body is unmodified. Streaming
-    /// adapters reattach the origin body directly so non-processable 2xx bodies
-    /// can pass through without materializing in WASM memory.
-    PassThrough {
-        /// Response with all headers set but body not yet written.
-        response: Response<EdgeBody>,
-        /// Origin body to stream directly to the client.
-        body: EdgeBody,
-    },
 }
 
 /// Routing decision for a proxied response.
@@ -1680,7 +1670,8 @@ pub enum PublisherResponse {
 /// exercise the classifier directly so the gate formula lives in one place.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResponseRoute {
-    /// `2xx` non-processable content (images, fonts, video), not `204/205`.
+    /// `2xx` non-processable content (images, fonts, video), not `204/205`,
+    /// returned unmodified via [`PublisherResponse::Buffered`].
     PassThrough,
     /// Processable content with supported encoding.
     Stream,
@@ -1848,12 +1839,12 @@ enum TemplateStoreOutcome {
 /// dispatched server-side auction before buffering.
 ///
 /// Handles every variant: pipes [`PublisherResponse::Stream`] through the
-/// streaming pipeline into memory and reattaches the raw
-/// [`PublisherResponse::Buffered`] and [`PublisherResponse::PassThrough`]
-/// bodies. With an `input_cap`, raw bodies are collected under it, and the
-/// processed pipeline decodes at most `input_cap` origin bytes, so every
-/// classification is bounded and fails before egress. Without one, which is
-/// Fastly's template-cache miss, raw bodies keep streaming.
+/// streaming pipeline into memory and keeps the raw
+/// [`PublisherResponse::Buffered`] body. With an `input_cap`, raw bodies are
+/// collected under it, and the processed pipeline decodes at most `input_cap`
+/// origin bytes, so every classification is bounded and fails before egress.
+/// Without one, which is Fastly's template-cache miss, raw bodies keep
+/// streaming.
 ///
 /// The processed output is capped by `settings.publisher.max_buffered_body_bytes`
 /// (16 MiB by default), so processable origin responses cannot grow the buffer
@@ -2122,11 +2113,6 @@ pub async fn buffer_publisher_response_async(
                 http::HeaderValue::from(assembled.len() as u64),
             );
             *response.body_mut() = EdgeBody::from(assembled);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            collect_raw_body(&mut response, input_cap).await?;
             Ok(response)
         }
     }
@@ -2702,12 +2688,6 @@ pub async fn publisher_response_into_streaming_response(
                 }
             };
             *response.body_mut() = EdgeBody::from_stream(stream);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            if response_carries_body(method, response.status()) {
-                *response.body_mut() = body;
-            }
             Ok(response)
         }
         PublisherResponse::Stream {
@@ -4983,12 +4963,10 @@ fn origin_fetch_error(error: EdgeError) -> Report<TrustedServerError> {
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
-/// - [`PublisherResponse::PassThrough`] — non-processable `2xx` content
-/// - [`PublisherResponse::Stream`] — processable content with supported
+/// - [`PublisherResponse::Stream`]: processable content with supported
 ///   encodings and no full-document buffering requirement
-/// - [`PublisherResponse::Buffered`] — unsupported encodings, non-`2xx`
-///   unprocessable content, `204/205`, or HTML that requires full-document
-///   post-processing
+/// - [`PublisherResponse::Buffered`]: non-processable content, unsupported
+///   encodings, `204/205`, or range-associated HTML, unmodified
 ///
 /// The response travels with the [`OutboundScopeOwner`] of its outbound work:
 /// the dispatched auction batch and the origin body. The owner is created
@@ -6088,9 +6066,7 @@ pub async fn handle_publisher_request(
                 )
                 .await;
             }
-            let (parts, body) = response.into_parts();
-            let response = Response::from_parts(parts, EdgeBody::empty());
-            PublisherResponse::PassThrough { response, body }
+            PublisherResponse::Buffered(response)
         }
         ResponseRoute::BufferedUnmodified => {
             // Unsupported or unprocessable responses must bypass rewriting
@@ -8918,15 +8894,13 @@ mod tests {
 
         let ok = result.is_ok();
         let body_is_stream = result.as_ref().ok().is_some_and(|response| match response {
-            PublisherResponse::PassThrough { body, .. } => body.is_stream(),
             PublisherResponse::Buffered(response) => response.body().is_stream(),
             PublisherResponse::Stream { body, .. } => body.is_stream(),
             PublisherResponse::AssembleTemplate { response, .. } => response.body().is_stream(),
         });
         let response_is_private = result.as_ref().ok().is_some_and(|response| {
             let headers = match response {
-                PublisherResponse::PassThrough { response, .. }
-                | PublisherResponse::Stream { response, .. }
+                PublisherResponse::Stream { response, .. }
                 | PublisherResponse::AssembleTemplate { response, .. }
                 | PublisherResponse::Buffered(response) => response.headers(),
             };
@@ -18753,8 +18727,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should build request");
 
         let (response, _owner) = run_publisher_proxy(&settings, &services, request).await;
-        let PublisherResponse::PassThrough { response, .. } = response else {
-            panic!("should pass through non-HTML asset response");
+        let PublisherResponse::Buffered(response) = response else {
+            panic!("should return the non-HTML asset response unmodified");
         };
 
         assert_eq!(
@@ -18777,8 +18751,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
 
     fn proxy_response_headers(response: &PublisherResponse) -> &header::HeaderMap {
         match response {
-            PublisherResponse::PassThrough { response, .. }
-            | PublisherResponse::Stream { response, .. }
+            PublisherResponse::Stream { response, .. }
             | PublisherResponse::AssembleTemplate { response, .. }
             | PublisherResponse::Buffered(response) => response.headers(),
         }
@@ -19058,8 +19031,8 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should build request");
 
         let (response, _owner) = run_publisher_proxy(&settings, &services, request).await;
-        let PublisherResponse::PassThrough { mut response, .. } = response else {
-            panic!("should pass through non-HTML asset response");
+        let PublisherResponse::Buffered(mut response) = response else {
+            panic!("should return the non-HTML asset response unmodified");
         };
         crate::response_privacy::apply_response_headers_with_cache_privacy(
             &settings,
@@ -19120,7 +19093,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             PublisherResponse::Stream { response, .. } | PublisherResponse::Buffered(response) => {
                 response
             }
-            PublisherResponse::PassThrough { .. } | PublisherResponse::AssembleTemplate { .. } => {
+            PublisherResponse::AssembleTemplate { .. } => {
                 panic!("should classify HTML response for processing")
             }
         };
@@ -19398,8 +19371,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             match response {
                 PublisherResponse::Buffered(response)
                 | PublisherResponse::Stream { response, .. }
-                | PublisherResponse::AssembleTemplate { response, .. }
-                | PublisherResponse::PassThrough { response, .. } => response.into_parts().0,
+                | PublisherResponse::AssembleTemplate { response, .. } => response.into_parts().0,
             }
         }
 
@@ -20185,8 +20157,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 // Assert
                 let response = match response {
                     PublisherResponse::Buffered(response) => response,
-                    PublisherResponse::PassThrough { .. }
-                    | PublisherResponse::Stream { .. }
+                    PublisherResponse::Stream { .. }
                     | PublisherResponse::AssembleTemplate { .. } => {
                         panic!("unexpected origin 304 should return a buffered response")
                     }
@@ -20275,9 +20246,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             // Assert
             let response = match response {
                 PublisherResponse::Buffered(response) => response,
-                PublisherResponse::PassThrough { .. }
-                | PublisherResponse::Stream { .. }
-                | PublisherResponse::AssembleTemplate { .. } => {
+                PublisherResponse::Stream { .. } | PublisherResponse::AssembleTemplate { .. } => {
                     panic!("noneligible origin 304 should remain buffered")
                 }
             };
@@ -20385,10 +20354,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         let (publisher_response, _owner) = run_publisher_proxy(&settings, &services, req).await;
         let response = match publisher_response {
             PublisherResponse::Buffered(r) => r,
-            PublisherResponse::PassThrough { mut response, body } => {
-                *response.body_mut() = body;
-                response
-            }
             PublisherResponse::Stream { response, .. }
             | PublisherResponse::AssembleTemplate { response, .. } => response,
         };
@@ -21671,40 +21636,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         assert_eq!(
             classify_response_route(StatusCode::OK, "text/html", "gzip", ""),
             ResponseRoute::BufferedUnmodified,
-        );
-    }
-
-    #[test]
-    fn pass_through_preserves_body_and_content_length() {
-        let image_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
-
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/png")
-            .header(header::CONTENT_LENGTH, image_bytes.len() as u64)
-            .body(EdgeBody::from(image_bytes.clone()))
-            .expect("should build test response");
-
-        // Simulate PassThrough: take body then reattach
-        let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
-        // Body is unmodified — Content-Length stays correct
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .expect("should have content-length"),
-            "4096",
-            "Content-Length should be preserved for pass-through"
-        );
-
-        // Reattach and verify body content
-        *response.body_mut() = body;
-        let (_, final_body) = response.into_parts();
-        let output = final_body.into_bytes().unwrap_or_default();
-        assert_eq!(
-            output, image_bytes,
-            "pass-through should preserve body byte-for-byte"
         );
     }
 
@@ -26365,47 +26296,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         );
     }
 
-    /// Pass-through dispatch contract: the adapter treats `PublisherResponse::PassThrough`
-    /// by reattaching the origin body unchanged and letting Fastly emit it.
-    /// Simulate that step and assert byte identity plus Content-Length
-    /// preservation. Distinct from `pass_through_preserves_body_and_content_length`
-    /// which only tests the header preservation; this one walks the full
-    /// take-then-reattach pattern the adapter uses.
-    #[test]
-    fn publisher_response_pass_through_reattach_preserves_bytes() {
-        // Simulate a 2xx image/png response: Body::from(bytes), take_body(),
-        // then set_body(body). `classify_response_route` already picks
-        // PassThrough for this combination; this covers the adapter's
-        // reattachment half of the contract.
-        let image_bytes: Vec<u8> = (0..=127).cycle().take(2048).collect();
-
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/png")
-            .header(header::CONTENT_LENGTH, image_bytes.len() as u64)
-            .body(EdgeBody::from(image_bytes.clone()))
-            .expect("should build test response");
-
-        // Mirror adapter: take body, then reattach.
-        let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
-        *response.body_mut() = body;
-
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .expect("content-length should survive"),
-            "2048"
-        );
-        let (_, final_body) = response.into_parts();
-        let round_trip = final_body.into_bytes().unwrap_or_default();
-        assert_eq!(
-            round_trip, image_bytes,
-            "pass-through reattach must preserve bytes exactly"
-        );
-    }
-
     /// Streaming dispatch contract: HTML with a registered stream processor
     /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
@@ -30150,11 +30040,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         }
                         .expect("should fetch the raw origin response");
                         assert!(
-                            matches!(
-                                published.0,
-                                PublisherResponse::PassThrough { .. }
-                                    | PublisherResponse::Buffered(_)
-                            ),
+                            matches!(published.0, PublisherResponse::Buffered(_)),
                             "should classify {path} as a raw variant"
                         );
 

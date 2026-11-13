@@ -936,19 +936,6 @@ async fn dispatch_fallback(
     attach_dispatch_extensions(response, ec, effects)
 }
 
-/// Returns `true` when an asset response should carry a (streamed) body.
-///
-/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
-/// representation length in their `Content-Length` header while carrying no
-/// body. Attaching the origin stream would either contradict that header or
-/// stream bytes a client does not expect, so those responses drop the stream and
-/// keep the origin's `Content-Length` untouched.
-fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
-    *method != Method::HEAD
-        && status != StatusCode::NO_CONTENT
-        && status != StatusCode::NOT_MODIFIED
-}
-
 /// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
 /// `route_request` asset branch.
 ///
@@ -960,10 +947,10 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// asset responses.
 ///
 /// Like legacy `route_request`, asset bodies are streamed straight to the client
-/// with no cap: the origin stream is attached to the response, and `EdgeZero`'s
-/// response delivery commits the headers and pumps the body chunk by chunk. The
-/// origin stream is left untouched here, so large images never materialize in
-/// the Wasm heap.
+/// with no cap: the response keeps the origin stream, and `EdgeZero`'s response
+/// delivery commits the headers and pumps the body chunk by chunk, so large
+/// images never materialize in the Wasm heap. A `HEAD`, 204, or 304 carries an
+/// empty body and keeps the origin's `Content-Length`.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -973,23 +960,10 @@ async fn dispatch_asset_fallback(
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
-    let method = req.method().clone();
-
     match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
         Ok(asset_response) => {
             let cache_policy = asset_response.cache_policy();
-            let (mut response, stream_body) = asset_response.into_response_and_body();
-
-            // Attach the origin stream so delivery streams it to the
-            // client. HEAD and bodiless statuses (204, 304) advertise the origin
-            // Content-Length but carry no body, so their stream is dropped to
-            // preserve that header and avoid a length/body mismatch.
-            if let Some(body) = stream_body
-                && asset_response_carries_body(&method, response.status())
-            {
-                *response.body_mut() = body;
-            }
-
+            let mut response = asset_response.into_response();
             response.extensions_mut().insert(cache_policy);
             attach_request_filter_effects(&mut response, effects);
             response
@@ -2298,30 +2272,6 @@ mod tests {
         assert!(
             !super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
             "OPTIONS should fall through to the publisher/integration fallback"
-        );
-    }
-
-    #[test]
-    fn asset_response_carries_body_preserves_bodiless_content_length() {
-        // GET/200 buffers a body and recomputes Content-Length.
-        assert!(
-            super::asset_response_carries_body(&Method::GET, StatusCode::OK),
-            "a GET 200 asset response should carry a buffered body"
-        );
-        // HEAD advertises the origin representation length with no body — the
-        // recomputed (zero) length must not overwrite it.
-        assert!(
-            !super::asset_response_carries_body(&Method::HEAD, StatusCode::OK),
-            "HEAD asset responses must preserve the origin Content-Length"
-        );
-        // Bodiless statuses keep their origin metadata regardless of method.
-        assert!(
-            !super::asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
-            "204 responses must preserve the origin Content-Length"
-        );
-        assert!(
-            !super::asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
-            "304 responses must preserve the origin Content-Length"
         );
     }
 

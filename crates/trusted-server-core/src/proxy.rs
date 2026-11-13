@@ -135,39 +135,27 @@ impl AssetProxyCachePolicy {
 }
 
 /// Asset proxy response plus metadata needed by the outer router.
+///
+/// The response keeps the origin body: a stream for a `GET` that carries one,
+/// and an empty body for a `HEAD`, 204, or 304.
 pub struct AssetProxyResponse {
     response: Response<EdgeBody>,
-    stream_body: Option<EdgeBody>,
     cache_policy: AssetProxyCachePolicy,
 }
 
 impl AssetProxyResponse {
-    fn new(
-        response: Response<EdgeBody>,
-        stream_body: Option<EdgeBody>,
-        cache_policy: AssetProxyCachePolicy,
-    ) -> Self {
+    fn origin_controlled(response: Response<EdgeBody>) -> Self {
         Self {
             response,
-            stream_body,
-            cache_policy,
+            cache_policy: AssetProxyCachePolicy::OriginControlled,
         }
     }
 
-    fn origin_controlled(response: Response<EdgeBody>) -> Self {
-        Self::new(response, None, AssetProxyCachePolicy::OriginControlled)
-    }
-
-    fn origin_controlled_stream(response: Response<EdgeBody>, stream_body: EdgeBody) -> Self {
-        Self::new(
-            response,
-            Some(stream_body),
-            AssetProxyCachePolicy::OriginControlled,
-        )
-    }
-
     fn no_store_private(response: Response<EdgeBody>) -> Self {
-        Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+        Self {
+            response,
+            cache_policy: AssetProxyCachePolicy::NoStorePrivate,
+        }
     }
 
     fn response(&self) -> &Response<EdgeBody> {
@@ -194,10 +182,10 @@ impl AssetProxyResponse {
         self.cache_policy
     }
 
-    /// Consume this wrapper and return the response headers plus optional stream body.
+    /// Consume this wrapper and return the response with its body.
     #[must_use]
-    pub fn into_response_and_body(self) -> (Response<EdgeBody>, Option<EdgeBody>) {
-        (self.response, self.stream_body)
+    pub fn into_response(self) -> Response<EdgeBody> {
+        self.response
     }
 }
 
@@ -1052,15 +1040,7 @@ async fn send_asset_origin_request(
         .await
         .and_then(OutboundResponse::into_response)
         .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
-    let (parts, body) = response.into_parts();
-    Ok(if body.is_stream() {
-        AssetProxyResponse::origin_controlled_stream(
-            Response::from_parts(parts, EdgeBody::empty()),
-            body,
-        )
-    } else {
-        AssetProxyResponse::origin_controlled(Response::from_parts(parts, body))
-    })
+    Ok(AssetProxyResponse::origin_controlled(response))
 }
 
 fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
@@ -1122,7 +1102,7 @@ async fn preflight_s3_origin_for_image_optimizer(
 
     if request_method == Method::HEAD {
         // The preflight buffers its bodiless HEAD, so no stream comes back.
-        let (mut response, _stream_body) = head_response.into_response_and_body();
+        let mut response = head_response.into_response();
         strip_asset_proxy_response_headers(&mut response);
         apply_no_store_cache_control(&mut response);
         return Ok(Some(AssetProxyResponse::no_store_private(response)));
@@ -5213,14 +5193,16 @@ mod tests {
         }
     }
 
-    /// Splits an asset response and reads its streamed body.
+    /// Reads an asset response's streamed body, returning the response without it.
     fn streamed_asset(asset_response: AssetProxyResponse) -> (Response<EdgeBody>, Vec<u8>) {
-        let (response, stream_body) = asset_response.into_response_and_body();
-        let body = stream_body.expect("should keep the asset body");
+        let (parts, body) = asset_response.into_response().into_parts();
         assert!(body.is_stream(), "should keep the asset body as a stream");
         let bytes = futures::executor::block_on(body.into_bytes_bounded(1024 * 1024))
             .expect("should stream the asset body");
-        (response, bytes.to_vec())
+        (
+            Response::from_parts(parts, EdgeBody::empty()),
+            bytes.to_vec(),
+        )
     }
 
     #[test]
@@ -5730,17 +5712,20 @@ mod tests {
             "https://www.example.com/.images/foo.jpg?profile=medium",
         );
 
-        let (response, stream_body) = futures::executor::block_on(handle_asset_proxy_request(
+        let response = futures::executor::block_on(handle_asset_proxy_request(
             &settings,
             &services,
             req,
             &image_optimizer_route(),
         ))
         .expect("should proxy optimized asset HEAD")
-        .into_response_and_body();
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK, "should relay the HEAD");
-        assert!(stream_body.is_none(), "should buffer the bodiless HEAD");
+        assert!(
+            !response.body().is_stream(),
+            "should buffer the bodiless HEAD"
+        );
         let requests = client.requests();
         assert_eq!(requests.len(), 1, "should send one HEAD");
         requests[0]
@@ -5944,14 +5929,14 @@ mod tests {
                 AssetProxyCachePolicy::NoStorePrivate,
                 "S3 HEAD {status} should carry a typed no-store policy"
             );
-            let (response, stream_body) = asset_response.into_response_and_body();
+            let response = asset_response.into_response();
             assert_eq!(
                 response.status(),
                 status,
                 "S3 HEAD {status} should keep the origin status"
             );
             assert!(
-                stream_body.is_none(),
+                !response.body().is_stream(),
                 "S3 HEAD {status} should be answered without a body stream"
             );
             assert_eq!(
@@ -6078,9 +6063,9 @@ mod tests {
                     AssetProxyCachePolicy::OriginControlled,
                     "{case} HEAD should keep the origin cache policy for a {delivery} origin reply"
                 );
-                let (response, stream_body) = asset_response.into_response_and_body();
+                let response = asset_response.into_response();
                 assert!(
-                    stream_body.is_none(),
+                    !response.body().is_stream(),
                     "{case} HEAD should be answered without a body stream for a {delivery} origin reply"
                 );
                 assert_eq!(
