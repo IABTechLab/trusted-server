@@ -3128,6 +3128,43 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_over_a_fully_held_row_plans_no_write() {
+        // Arrange: every source holds a live UID, yet `any_due` still
+        // dispatches the configured provider so it can read its cookies.
+        let coordinator = cookie_coordinator();
+        let snapshot = held_snapshot("c-1");
+        assert!(
+            coordinator.any_due(snapshot.entry_for(EC_ID), UnixSeconds::new(1000)),
+            "should dispatch the configured provider"
+        );
+
+        for cookies in ["vendor_id=c-1", ""] {
+            let transport = CannedTransport::new(ok_reply);
+
+            // Act
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &snapshot,
+                &granting(),
+                &Limiter(false),
+                cookies,
+            );
+
+            // Assert
+            assert!(
+                planned_change(&snapshot, &results).is_none(),
+                "should plan no write with cookies `{cookies}`: {:?}",
+                only_status(&results)
+            );
+            assert!(
+                transport.sent.borrow().is_empty(),
+                "should send no lookup with cookies `{cookies}`"
+            );
+        }
+    }
+
+    #[test]
     fn a_failed_refresh_keeps_the_held_refresh_state() {
         // Arrange: the held UID's refresh is due and the cookie repeats it.
         let coordinator = coordinator_with(RegisteredProvider::new(
