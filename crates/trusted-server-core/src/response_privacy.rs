@@ -184,10 +184,9 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 /// configured `Set-Cookie` combined with public edge-cache headers cannot
 /// produce a shared-cacheable cookie-bearing response.
 ///
-/// Invalid header names/values are logged and skipped rather than panicking, so
-/// a misconfigured operator header can never take down a request. So are
-/// `Trailer`, `Content-Length`, and the hop-by-hop fields, which validation
-/// rejects but a config that predates the rejection can still carry.
+/// The entries [`warn_skipped_operator_response_headers`] reports are skipped
+/// here without a log, so a misconfigured operator header never takes down a
+/// request and a request that applies the headers twice still warns once.
 pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: &mut Response) {
     enforce_set_cookie_cache_privacy(response);
 
@@ -195,33 +194,15 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     enforce_uncacheable_cache_privacy(response);
 
     for (key, value) in &settings.response_headers {
-        if is_forbidden_operator_response_header(key) {
-            log::warn!(
-                "Skipping configured response header `{key}`: framing and hop-by-hop fields belong to response egress"
-            );
+        let Ok((name, value)) = operator_response_header(key, value) else {
             continue;
-        }
+        };
         if response_is_uncacheable
-            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || is_edge_cache_header_name(key))
+            && (name == header::CACHE_CONTROL || is_edge_cache_header_name(name.as_str()))
         {
             continue;
         }
-        let header_name = match HeaderName::from_bytes(key.as_bytes()) {
-            Ok(name) => name,
-            Err(_) => {
-                log::warn!("Skipping invalid configured response header name {key}");
-                continue;
-            }
-        };
-        let header_value = match HeaderValue::from_str(value) {
-            Ok(value) => value,
-            Err(_) => {
-                log::warn!("Skipping invalid configured response header value for {key}");
-                continue;
-            }
-        };
-        response.headers_mut().insert(header_name, header_value);
+        response.headers_mut().insert(name, value);
     }
 
     enforce_uncacheable_cache_privacy(response);
@@ -231,6 +212,55 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     // pre-apply pass could not see. Re-run the downgrade so the final response
     // can never pair Set-Cookie with shared cacheability.
     enforce_set_cookie_cache_privacy(response);
+}
+
+/// Logs one warning for each configured response header that
+/// [`apply_response_headers_with_cache_privacy`] skips.
+///
+/// `Trailer`, `Content-Length`, and the hop-by-hop fields are skipped because
+/// response egress owns them, and an invalid name or value because it cannot be
+/// sent. Validation rejects them all, but a config that predates the rejection
+/// can still carry them. Each adapter calls this once per request, so a skipped
+/// entry warns once however often the request applies the operator headers.
+pub fn warn_skipped_operator_response_headers(settings: &Settings) {
+    for (key, value) in &settings.response_headers {
+        match operator_response_header(key, value) {
+            Ok(_) => {}
+            Err(SkippedOperatorHeader::Forbidden) => log::warn!(
+                "Skipping configured response header `{key}`: framing and hop-by-hop fields belong to response egress"
+            ),
+            Err(SkippedOperatorHeader::InvalidName) => {
+                log::warn!("Skipping invalid configured response header name {key}");
+            }
+            Err(SkippedOperatorHeader::InvalidValue) => {
+                log::warn!("Skipping invalid configured response header value for {key}");
+            }
+        }
+    }
+}
+
+/// Why a configured response header entry is never sent.
+enum SkippedOperatorHeader {
+    /// A framing or hop-by-hop field, which response egress owns.
+    Forbidden,
+    /// A name that is not a valid header name.
+    InvalidName,
+    /// A value that is not a valid header value.
+    InvalidValue,
+}
+
+/// Parses the configured response header entry `key: value`, or says why it is skipped.
+fn operator_response_header(
+    key: &str,
+    value: &str,
+) -> Result<(HeaderName, HeaderValue), SkippedOperatorHeader> {
+    if is_forbidden_operator_response_header(key) {
+        return Err(SkippedOperatorHeader::Forbidden);
+    }
+    let name =
+        HeaderName::from_bytes(key.as_bytes()).map_err(|_| SkippedOperatorHeader::InvalidName)?;
+    let value = HeaderValue::from_str(value).map_err(|_| SkippedOperatorHeader::InvalidValue)?;
+    Ok((name, value))
 }
 
 #[cfg(test)]
@@ -649,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_operator_framing_and_hop_by_hop_entries_with_warning() {
+    fn skips_operator_framing_and_hop_by_hop_entries_and_warns_once_each() {
         let forbidden = [
             "Trailer",
             "Content-Length",
@@ -667,6 +697,8 @@ mod tests {
             .map(|name| (*name, "example-value"))
             .collect();
         entries.push(("x-example", "example-value"));
+        entries.push(("x example", "example-value"));
+        entries.push(("x-invalid-value", "example\nvalue"));
         let settings = settings_with_response_headers(&entries);
         let mut response = response_builder()
             .body(edgezero_core::body::Body::empty())
@@ -674,20 +706,46 @@ mod tests {
         let capture = WarningCapture::start();
 
         apply_response_headers_with_cache_privacy(&settings, &mut response);
-
+        let applying = capture.take();
+        warn_skipped_operator_response_headers(&settings);
         let warnings = capture.take();
+
+        assert!(
+            applying.is_empty(),
+            "should skip the entries without logging while applying them"
+        );
         for name in forbidden {
             assert!(
                 !response.headers().contains_key(name),
                 "should skip the operator {name} entry"
             );
-            assert!(
+            assert_eq!(
                 warnings
                     .iter()
-                    .any(|warning| warning.message.contains(&format!("`{name}`"))),
-                "should warn that the operator {name} entry is skipped"
+                    .filter(|warning| warning.message.contains(&format!("`{name}`")))
+                    .count(),
+                1,
+                "should warn once that the operator {name} entry is skipped"
             );
         }
+        assert!(
+            !response.headers().contains_key("x-invalid-value"),
+            "should skip the operator entry with an invalid value"
+        );
+        for message in [
+            "Skipping invalid configured response header name x example",
+            "Skipping invalid configured response header value for x-invalid-value",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.message == message),
+                "should warn `{message}`"
+            );
+        }
+        assert_eq!(
+            warnings.len(),
+            forbidden.len() + 2,
+            "should warn about the skipped entries only"
+        );
         assert_eq!(
             response
                 .headers()

@@ -7530,7 +7530,6 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-
     fn publisher_default_max_buffered_body_bytes_matches_config_default() {
         // The manual `Default` impl must agree with the serde default applied
         // when the key is omitted from TOML, so programmatic `Publisher::default()`

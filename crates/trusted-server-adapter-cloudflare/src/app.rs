@@ -27,7 +27,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
@@ -39,7 +39,7 @@ use trusted_server_core::proxy::{
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
     PublisherResponse, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -305,14 +305,6 @@ where
 /// publisher origin moved to `EdgeZero`'s client.
 const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Returns the origin input cap: the smaller of the publisher buffer setting
-/// and [`PUBLISHER_ORIGIN_INPUT_BYTES`].
-fn publisher_input_cap(settings: &Settings) -> u64 {
-    u64::try_from(settings.publisher.max_buffered_body_bytes)
-        .unwrap_or(u64::MAX)
-        .min(PUBLISHER_ORIGIN_INPUT_BYTES)
-}
-
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
 /// Delegates to the shared [`buffer_publisher_response_async`], which collects
@@ -341,25 +333,6 @@ async fn resolve_publisher_response(
     .await?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
     Ok(response)
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 fn admin_key_management_not_supported() -> Response {
@@ -605,7 +578,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
-                let input_cap = publisher_input_cap(&state.settings);
+                let input_cap = publisher_input_cap(&state.settings, PUBLISHER_ORIGIN_INPUT_BYTES);
                 match handle_publisher_request(
                     &state.settings,
                     &services,

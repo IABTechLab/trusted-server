@@ -160,6 +160,7 @@ pub async fn handle_auction(
                 TrustedServerError::RequestTooLarge { .. }
             ) =>
         {
+            log::warn!("Rejecting auction request: {report:?}");
             return auction_body_too_large_response();
         }
         Err(report) => return Err(report),
@@ -711,6 +712,7 @@ mod tests {
         noop_services,
     };
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::WarningCapture;
     use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
     use crate::test_support::tests::{
         crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
@@ -2201,6 +2203,7 @@ mod tests {
                         .uri("https://test-publisher.example/auction"),
                 );
 
+                let capture = WarningCapture::start();
                 let outcome = handle_auction(
                     &settings,
                     &orchestrator,
@@ -2214,6 +2217,14 @@ mod tests {
 
                 expectation.assert_outcome("/auction", &outcome);
                 if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                    let levels: Vec<log::Level> =
+                        capture.take().iter().map(|record| record.level).collect();
+                    assert_eq!(
+                        levels,
+                        [log::Level::Warn],
+                        "should log the {} case once, at warn",
+                        expectation.name()
+                    );
                     let response = outcome.expect("should answer an overflow with a response");
                     assert_eq!(
                         response
