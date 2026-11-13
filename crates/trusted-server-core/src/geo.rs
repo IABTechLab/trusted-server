@@ -21,7 +21,9 @@ impl GeoInfo {
     /// Sets geo information headers on the response.
     ///
     /// Adds available geographic fields and `x-geo-info-available: true`.
-    /// Missing fields never produce empty headers or default coordinates.
+    /// Optional fields set to `None` are omitted. Supplied empty city values
+    /// and zero coordinates are emitted as supplied. Metro codes are emitted
+    /// only when positive, and invalid header values are skipped.
     pub fn set_response_headers(&self, response: &mut Response<EdgeBody>) {
         let headers = response.headers_mut();
         // An origin response may already carry geo headers. Missing request
@@ -240,21 +242,31 @@ mod tests {
             sample_geo_info().set_response_headers(&mut response);
             geo.set_response_headers(&mut response);
             let headers = response.headers();
-            assert_eq!(headers[HEADER_X_GEO_COUNTRY], "US");
-            assert_eq!(headers[HEADER_X_GEO_INFO_AVAILABLE], "true");
+            assert_eq!(
+                headers[HEADER_X_GEO_COUNTRY], "US",
+                "should retain the US country header for partial geography with region {region:?}"
+            );
+            assert_eq!(
+                headers[HEADER_X_GEO_INFO_AVAILABLE], "true",
+                "should mark partial US geography available with region {region:?}"
+            );
             for name in [
                 HEADER_X_GEO_CITY,
                 HEADER_X_GEO_CONTINENT,
                 HEADER_X_GEO_COORDINATES,
                 HEADER_X_GEO_METRO_CODE,
             ] {
-                assert!(!headers.contains_key(name));
+                assert!(
+                    !headers.contains_key(name),
+                    "should remove unavailable detail headers from partial US geography with region {region:?}"
+                );
             }
             assert_eq!(
                 headers
                     .get(HEADER_X_GEO_REGION)
                     .map(|value| value.to_str().expect("should be valid header")),
-                region.as_deref()
+                region.as_deref(),
+                "should emit only the supplied region for partial US geography with region {region:?}"
             );
         }
     }
@@ -268,7 +280,11 @@ mod tests {
         });
         let mut response = build_response();
         geo.set_response_headers(&mut response);
-        assert_eq!(response.headers()[HEADER_X_GEO_COORDINATES], "0,0");
+        assert_eq!(
+            response.headers()[HEADER_X_GEO_COORDINATES],
+            "0,0",
+            "should emit a supplied zero coordinate pair rather than treat it as unavailable"
+        );
     }
 
     #[test]

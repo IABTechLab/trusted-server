@@ -2430,7 +2430,8 @@ mod tests {
                 .expect("should serialize APS request");
         assert_eq!(
             serialized["device"]["geo"],
-            json!({"country": "US", "region": "CA", "type": 2})
+            json!({"country": "US", "region": "CA", "type": 2}),
+            "should export only the supplied US country and CA region to APS without inventing Geo detail"
         );
     }
 

@@ -257,14 +257,39 @@ mod tests {
             .lookup(None)
             .expect("should read second snapshot")
             .expect("should retain GB");
-        assert_eq!(us.country, "US");
-        assert_eq!(us.region.as_deref(), Some("CA"));
-        assert_eq!(gb.country, "GB");
-        assert_eq!(gb.region, None);
-        assert_eq!(us.coordinates, None);
-        assert_eq!(us.city, None);
-        assert_eq!(us.continent, None);
-        assert_eq!(us.metro_code, None);
+        assert_eq!(
+            us.country, "US",
+            "should retain the first request's US country"
+        );
+        assert_eq!(
+            us.region.as_deref(),
+            Some("CA"),
+            "should retain the first request's CA subdivision"
+        );
+        assert_eq!(
+            gb.country, "GB",
+            "should retain the second request's GB country independently"
+        );
+        assert_eq!(
+            gb.region, None,
+            "should not reuse CA for the country-only GB request"
+        );
+        assert_eq!(
+            us.coordinates, None,
+            "should not invent coordinates for the US/CA snapshot"
+        );
+        assert_eq!(
+            us.city, None,
+            "should not invent a city for the US/CA snapshot"
+        );
+        assert_eq!(
+            us.continent, None,
+            "should not invent a continent for the US/CA snapshot"
+        );
+        assert_eq!(
+            us.metro_code, None,
+            "should not invent a metro code for the US/CA snapshot"
+        );
         assert_eq!(
             first
                 .lookup(Some(
@@ -289,7 +314,8 @@ mod tests {
                     provider: GeoProviderId::cloudfront(),
                     status,
                 })
-                .is_none()
+                .is_none(),
+                "should omit geography for selected unavailable or error outcomes"
             );
         }
         let mut request = request_builder()

@@ -347,7 +347,8 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
     assert!(
         health
             .to_ascii_lowercase()
-            .contains("x-geo-info-available: false")
+            .contains("x-geo-info-available: false"),
+        "should report unavailable Geo on the initial health request without country headers"
     );
     let headers = "CloudFront-Viewer-Country: us\r\nCloudFront-Viewer-Country-Region: ca\r\nx-origin-test-removal: fixture-origin-credential\r\n";
     for (path, status) in [
@@ -363,9 +364,18 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
             response.starts_with(&format!("HTTP/1.1 {status}")),
             "should preserve route status: {response}"
         );
-        assert!(lower.contains("x-geo-info-available: true"));
-        assert!(lower.contains("x-geo-country: us"));
-        assert!(lower.contains("x-geo-region: ca"));
+        assert!(
+            lower.contains("x-geo-info-available: true"),
+            "should mark managed US/CA Geo available on {path}"
+        );
+        assert!(
+            lower.contains("x-geo-country: us"),
+            "should retain the managed US country on {path}"
+        );
+        assert!(
+            lower.contains("x-geo-region: ca"),
+            "should retain the managed CA region on {path}"
+        );
         for absent in [
             "x-geo-coordinates:",
             "x-geo-city:",
@@ -383,8 +393,14 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
     let gb = server
         .get_with_headers("/health", "CloudFront-Viewer-Country: GB\r\n")
         .expect("should process another country");
-    assert!(gb.to_ascii_lowercase().contains("x-geo-country: gb"));
-    assert!(!gb.to_ascii_lowercase().contains("x-geo-region:"));
+    assert!(
+        gb.to_ascii_lowercase().contains("x-geo-country: gb"),
+        "should use the independent GB request's country"
+    );
+    assert!(
+        !gb.to_ascii_lowercase().contains("x-geo-region:"),
+        "should not reuse the earlier CA region for a country-only GB request"
+    );
     for headers in [
         "",
         "CloudFront-Viewer-Country: UK\r\n",
@@ -397,9 +413,13 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
         assert!(
             response
                 .to_ascii_lowercase()
-                .contains("x-geo-info-available: false")
+                .contains("x-geo-info-available: false"),
+            "should report unavailable Geo for missing or invalid country headers {headers:?}"
         );
-        assert!(!response.to_ascii_lowercase().contains("x-geo-country:"));
+        assert!(
+            !response.to_ascii_lowercase().contains("x-geo-country:"),
+            "should not emit a country for missing or invalid country headers {headers:?}"
+        );
     }
 }
 
@@ -429,13 +449,34 @@ fn admitted_body_error_keeps_managed_geo_without_losing_framework_status() {
         reqwest::StatusCode::PAYLOAD_TOO_LARGE,
         "should retain framework payload limit status"
     );
-    assert_eq!(response.headers()["x-geo-info-available"], "true");
-    assert_eq!(response.headers()["x-geo-country"], "US");
-    assert_eq!(response.headers()["x-geo-region"], "CA");
-    assert!(!response.headers().contains_key("x-origin-test-removal"));
+    assert_eq!(
+        response.headers()["x-geo-info-available"],
+        "true",
+        "should retain available managed Geo on the oversized-body error"
+    );
+    assert_eq!(
+        response.headers()["x-geo-country"],
+        "US",
+        "should retain the managed US country on the oversized-body error"
+    );
+    assert_eq!(
+        response.headers()["x-geo-region"],
+        "CA",
+        "should retain the managed CA region on the oversized-body error"
+    );
+    assert!(
+        !response.headers().contains_key("x-origin-test-removal"),
+        "should omit the origin credential header from the oversized-body error response"
+    );
     let body = response.text().expect("should read framework error");
-    assert!(!body.contains("fixture-error-credential"));
-    assert!(!body.contains("x-origin-test-removal"));
+    assert!(
+        !body.contains("fixture-error-credential"),
+        "should not expose the fixture credential value in the oversized-body error"
+    );
+    assert!(
+        !body.contains("x-origin-test-removal"),
+        "should not expose the credential header name in the oversized-body error"
+    );
 }
 
 #[test]
@@ -453,9 +494,13 @@ fn nonmatching_real_socket_peer_cannot_supply_geo() {
     assert!(
         response
             .to_ascii_lowercase()
-            .contains("x-geo-info-available: false")
+            .contains("x-geo-info-available: false"),
+        "should report unavailable Geo when the real socket peer does not match the protected CIDR"
     );
-    assert!(!response.to_ascii_lowercase().contains("x-geo-country:"));
+    assert!(
+        !response.to_ascii_lowercase().contains("x-geo-country:"),
+        "should not accept US country headers or a forged forwarded peer from an untrusted socket"
+    );
 }
 
 #[test]

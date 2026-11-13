@@ -632,8 +632,14 @@ mod tests {
             "should populate continent"
         );
         let coordinates = info.coordinates.expect("should populate coordinate pair");
-        assert_eq!(coordinates.latitude, 40.71);
-        assert_eq!(coordinates.longitude, -74.01);
+        assert_eq!(
+            coordinates.latitude, 40.71,
+            "should retain the supplied cf-iplatitude value"
+        );
+        assert_eq!(
+            coordinates.longitude, -74.01,
+            "should retain the supplied cf-iplongitude value"
+        );
     }
 
     #[test]
@@ -696,7 +702,11 @@ mod tests {
             .lookup(None)
             .expect("should look up geo")
             .expect("should have country");
-        assert_eq!(info, GeoInfo::country_region("US", None));
+        assert_eq!(
+            info,
+            GeoInfo::country_region("US", None),
+            "should project a country-only US header without inventing optional Geo detail"
+        );
     }
 
     #[test]
@@ -726,9 +736,17 @@ mod tests {
                 .lookup(None)
                 .expect("should look up geo")
                 .expect("should have country");
-            assert_eq!(info.coordinates.is_some(), has_coordinates);
+            assert_eq!(
+                info.coordinates.is_some(),
+                has_coordinates,
+                "should require both parseable coordinates for latitude {latitude:?} and longitude {longitude:?}"
+            );
             if has_coordinates {
-                assert_eq!(info.coordinates_string().as_deref(), Some("0,0"));
+                assert_eq!(
+                    info.coordinates_string().as_deref(),
+                    Some("0,0"),
+                    "should preserve supplied zero coordinates for latitude {latitude:?} and longitude {longitude:?}"
+                );
             }
         }
     }

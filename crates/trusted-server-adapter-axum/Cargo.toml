@@ -26,6 +26,7 @@ geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
 
 [dependencies]
 async-trait = { workspace = true }
+derive_more = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "native-bindings"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }

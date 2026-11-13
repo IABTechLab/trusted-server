@@ -6705,9 +6705,21 @@ external_bundle_sri = "sha384-AAAA"
             Some("501"),
             "should set metro (DMA code)"
         );
-        assert_eq!(geo.country.as_deref(), Some("US"));
-        assert_eq!(geo.city.as_deref(), Some("New York"));
-        assert_eq!(geo.region.as_deref(), Some("NY"));
+        assert_eq!(
+            geo.country.as_deref(),
+            Some("US"),
+            "should export the supplied US country to Prebid"
+        );
+        assert_eq!(
+            geo.city.as_deref(),
+            Some("New York"),
+            "should export the supplied New York city to Prebid"
+        );
+        assert_eq!(
+            geo.region.as_deref(),
+            Some("NY"),
+            "should export the supplied NY region to Prebid"
+        );
     }
 
     #[test]
@@ -6744,7 +6756,10 @@ external_bundle_sri = "sha384-AAAA"
                 expected["lat"] = serde_json::json!(0.0);
                 expected["lon"] = serde_json::json!(0.0);
             }
-            assert_eq!(*geo, expected);
+            assert_eq!(
+                *geo, expected,
+                "should export only supplied US/CA Geo detail to Prebid with coordinates {coordinates:?}"
+            );
         }
     }
 

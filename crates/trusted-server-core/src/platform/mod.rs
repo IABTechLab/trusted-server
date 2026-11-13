@@ -268,15 +268,18 @@ mod tests {
             Some(GeoCoordinates {
                 latitude: 37.7749,
                 longitude: -122.4194,
-            })
+            }),
+            "should deserialize the supplied San Francisco latitude and longitude as a pair"
         );
         assert_eq!(
             serde_json::to_value(&geo).expect("should serialize geo"),
-            original
+            original,
+            "should preserve all supplied full Geo fields when serializing to JSON"
         );
         assert_eq!(
             serde_json::to_string(&geo).expect("should serialize full geo"),
-            r#"{"city":"San Francisco","country":"US","continent":"NorthAmerica","latitude":37.7749,"longitude":-122.4194,"metro_code":807,"region":"CA","asn":7922}"#
+            r#"{"city":"San Francisco","country":"US","continent":"NorthAmerica","latitude":37.7749,"longitude":-122.4194,"metro_code":807,"region":"CA","asn":7922}"#,
+            "should retain the existing flat field order for fully populated Geo JSON"
         );
     }
 
@@ -289,14 +292,25 @@ mod tests {
                 expected["region"] = serde_json::json!(region);
             }
             let serialized = serde_json::to_value(&geo).expect("should serialize partial geo");
-            assert_eq!(serialized, expected);
+            assert_eq!(
+                serialized, expected,
+                "should serialize only country and the supplied region for partial Geo: {geo:?}"
+            );
             assert_eq!(
                 serde_json::from_value::<GeoInfo>(serialized)
                     .expect("should deserialize country without coordinates"),
-                geo
+                geo,
+                "should round-trip partial US Geo without inventing detail: {geo:?}"
             );
-            assert_eq!(geo.coordinates_string(), None);
-            assert!(!geo.has_metro_code());
+            assert_eq!(
+                geo.coordinates_string(),
+                None,
+                "should omit coordinates for partial US Geo: {geo:?}"
+            );
+            assert!(
+                !geo.has_metro_code(),
+                "should report no metro code for partial US Geo: {geo:?}"
+            );
         }
     }
 
@@ -309,7 +323,10 @@ mod tests {
         ] {
             let error = serde_json::from_value::<GeoInfo>(input)
                 .expect_err("should reject half a coordinate pair");
-            assert!(error.to_string().contains("supplied together"));
+            assert!(
+                error.to_string().contains("supplied together"),
+                "should explain that incomplete or null coordinate pairs must be supplied together"
+            );
         }
     }
 
@@ -318,10 +335,15 @@ mod tests {
         let original = serde_json::json!({"country": "US", "latitude": 0.0, "longitude": 0.0});
         let geo: GeoInfo = serde_json::from_value(original.clone())
             .expect("should accept a supplied zero coordinate pair");
-        assert_eq!(geo.coordinates_string().as_deref(), Some("0,0"));
+        assert_eq!(
+            geo.coordinates_string().as_deref(),
+            Some("0,0"),
+            "should format a supplied zero coordinate pair rather than omit it"
+        );
         assert_eq!(
             serde_json::to_value(geo).expect("should serialize geo"),
-            original
+            original,
+            "should preserve supplied zero latitude and longitude when serializing Geo"
         );
     }
 
