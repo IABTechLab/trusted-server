@@ -669,6 +669,13 @@ impl EcContext {
     }
 
     /// Takes the row built by [`Self::generate_if_needed`].
+    /// The row this navigation creates for the EC it minted, until finalize
+    /// takes it.
+    #[must_use]
+    pub fn pending_entry(&self) -> Option<&KvEntry> {
+        self.pending_entry.as_deref()
+    }
+
     pub(crate) fn take_pending_entry(&mut self) -> Option<KvEntry> {
         self.pending_entry.take().map(|entry| *entry)
     }

@@ -2626,6 +2626,118 @@ mod tests {
         );
     }
 
+    /// A minted EC with a page-phase lookup that found one UID.
+    fn minted_context_with_lookup(
+        settings: &Settings,
+        graph: &KvIdentityGraph,
+    ) -> (EcContext, String) {
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            None,
+            granting_consent(),
+            Some("192.0.2.10".to_owned()),
+        );
+        ec_context
+            .generate_if_needed(settings, Some(graph))
+            .expect("should mint");
+        let ec_id = ec_context.ec_value().expect("should mint").to_owned();
+        let uid = KvUid::new(
+            UidValue::try_from("p-first-visit").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        ec_context.set_lookup_results(LookupResults::new(
+            &ec_id,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from("provider.example.com").expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![uid])],
+                )],
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        ));
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        (ec_context, ec_id)
+    }
+
+    #[test]
+    fn minted_ec_row_is_created_with_its_lookup_results() {
+        // Arrange
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("finalize");
+        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph);
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry_for("provider.example.com"),
+            None,
+            None,
+            &mut response,
+        );
+
+        // Assert
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read row")
+            .expect("should create row");
+        assert!(
+            entry.ids.contains_key("provider.example.com"),
+            "should store the first navigation's lookup result in the created row"
+        );
+        assert!(
+            get_header(&response, "set-cookie").is_some(),
+            "should issue the minted EC"
+        );
+    }
+
+    #[test]
+    fn minted_ec_collision_drops_its_lookup_results() {
+        // Arrange
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("finalize");
+        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph);
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed a colliding row");
+        let mut response = empty_response();
+
+        // Act
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry_for("provider.example.com"),
+            None,
+            None,
+            &mut response,
+        );
+
+        // Assert
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read row")
+            .expect("should keep the colliding row");
+        assert!(
+            !entry.ids.contains_key("provider.example.com"),
+            "should not write lookup results into another visitor's row"
+        );
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "should not issue an EC whose row was not created"
+        );
+    }
+
     fn withdrawing_context(ec_id: &str) -> EcContext {
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),

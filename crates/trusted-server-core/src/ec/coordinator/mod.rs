@@ -73,6 +73,10 @@ pub struct LookupContext<'a> {
     pub ec_id: &'a str,
     /// Row snapshot read before dispatch.
     pub snapshot: &'a EcKvSnapshot,
+    /// The row this navigation creates for an EC it minted, which `snapshot`
+    /// does not hold yet. Only providers that do not send the EC ID are
+    /// dispatched against it.
+    pub minted_entry: Option<&'a KvEntry>,
     /// Request consent.
     pub consent: &'a ConsentContext,
     /// Client signals lent to providers.
@@ -515,12 +519,18 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         if self.providers.is_empty() {
             return pending;
         }
-        let entry = lookup.snapshot.entry_for(lookup.ec_id);
+        let stored = lookup.snapshot.entry_for(lookup.ec_id);
         // Missing EC or EID consent, a withdrawal tombstone, an unreadable
         // row (which may hide a tombstone) or no row at all skips every
-        // provider: a lookup discloses the EC ID before finalize could
-        // decline it, and an EC without a row may never be issued.
-        let has_row = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. }) && entry.is_some();
+        // provider that sends the EC ID: a lookup discloses the EC ID before
+        // finalize could decline it, and an EC without a row may never be
+        // issued. A minted EC's pending row stands in for the stored one for
+        // providers that do not send it.
+        let has_row = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. }) && stored.is_some();
+        let minted = lookup
+            .minted_entry
+            .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
+        let entry = stored.or(minted);
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
@@ -536,7 +546,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 .policy
                 .tcf_vendor_id
                 .is_some_and(|vendor| tcf_vendor_consent_denied(lookup.consent, vendor));
-            if !has_row {
+            if !has_row && (minted.is_none() || registered.provider.sends_ec_id()) {
                 pending.early.push(skip(SkipReason::NoRow));
                 continue;
             }
@@ -1281,6 +1291,7 @@ mod tests {
         let context = LookupContext {
             ec_id: EC_ID,
             snapshot,
+            minted_entry: None,
             consent,
             client: ClientSignals {
                 ip: None,
@@ -1360,6 +1371,133 @@ mod tests {
                 .status,
             LookupStatus::Skipped(SkipReason::NoRow),
             "should skip a provider for an EC with no row"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    /// An echo provider whose request does not carry the EC ID.
+    struct NoEcIdProvider(EchoProvider);
+
+    impl IdentityProvider for NoEcIdProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn sends_ec_id(&self) -> bool {
+            false
+        }
+    }
+
+    /// The pending row of an EC minted on this navigation.
+    fn minted_entry(consent_ok: bool) -> KvEntry {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = consent_ok;
+        entry
+    }
+
+    fn run_minted<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
+        transport: &CannedTransport,
+        minted: &KvEntry,
+    ) -> LookupResults {
+        let snapshot = missing();
+        let consent = granting();
+        let limiter = Limiter(false);
+        let context = LookupContext {
+            ec_id: EC_ID,
+            snapshot: &snapshot,
+            minted_entry: Some(minted),
+            cookies: RequestCookies::new(""),
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            rate_limiter: &limiter,
+            now: UnixSeconds::new(1000),
+        };
+        futures::executor::block_on(async {
+            let pending = coordinator.dispatch(transport, &context).await;
+            coordinator.collect(transport, pending).await
+        })
+    }
+
+    fn no_ec_id_coordinator() -> ProviderCoordinator<NoEcIdProvider> {
+        ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                NoEcIdProvider(echo_provider(SourceInput::Anonymous)),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+    }
+
+    #[test]
+    fn minted_ec_dispatches_a_provider_that_does_not_send_the_ec_id() {
+        // Arrange
+        let coordinator = no_ec_id_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(true));
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should look up a provider that does not send the EC ID"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    #[test]
+    fn minted_ec_is_not_sent_by_a_provider_that_sends_the_ec_id() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(true));
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NoRow),
+            "should skip a provider that would send a minted EC"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn minted_ec_without_consent_skips_every_provider() {
+        // Arrange
+        let coordinator = no_ec_id_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(false));
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should follow the minted row's consent"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
