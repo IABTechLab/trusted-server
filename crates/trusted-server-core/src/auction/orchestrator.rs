@@ -1494,6 +1494,9 @@ mod tests {
     /// Endpoint of the bidder whose backend registration runs out of budget.
     const TIMED_OUT_BIDDER: &str = "https://timed-out.example.test/openrtb";
 
+    /// Endpoint of the bidder that bids beside a launch failure.
+    const WINNING_BIDDER: &str = "https://winning.example.test/openrtb";
+
     /// How a launch-failure test makes its bidder fail to launch.
     #[derive(Clone, Copy, Debug)]
     enum LaunchFailure {
@@ -1594,6 +1597,25 @@ mod tests {
         }
     }
 
+    /// A standard `OpenRTB` reply with one bid for the fixture slot.
+    fn bid_reply(price: f64) -> ScriptedReply {
+        ScriptedReply::status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "seatbid": [{"seat": "fictional-seat", "bid": [{
+                        "id": "fictional-bid",
+                        "impid": "fictional-slot",
+                        "price": price,
+                        "adm": "<div>fictional creative</div>",
+                        "w": 300,
+                        "h": 250
+                    }]}]
+                }))
+                .expect("should serialize the bid reply"),
+            )
+    }
+
     /// Each provider with the `error_type` its response carries, if any.
     fn error_types(result: &OrchestrationResult) -> Vec<(&str, Option<serde_json::Value>)> {
         result
@@ -1666,6 +1688,56 @@ mod tests {
                     bidders.requests().len(),
                     2 * failure.requests_per_auction(),
                     "{failure:?} should send no bid request beyond the failed registrations"
+                );
+            }
+        }
+
+        #[test]
+        fn launch_failure_leaves_a_later_bid_to_win() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            for failure in LaunchFailure::ALL {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                failure.script(&bidders, 1);
+                bidders.respond_to(
+                    Method::POST,
+                    WINNING_BIDDER,
+                    bid_reply(2.0).after(Duration::from_millis(100)),
+                );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[
+                        ("launch-fail", failure.endpoint()),
+                        ("winner", WINNING_BIDDER),
+                    ]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .unwrap_or_else(|error| {
+                        panic!("{failure:?} should complete the auction beside the launch failure: {error:?}")
+                    });
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        ("winner", None),
+                    ],
+                    "{failure:?} should keep the launch failure beside the bid"
+                );
+                assert_eq!(
+                    result
+                        .get_winning_bid("fictional-slot")
+                        .and_then(|bid| bid.price),
+                    Some(2.0),
+                    "{failure:?} should let the bid that arrives after the launch failure win"
                 );
             }
         }
@@ -1930,25 +2002,6 @@ mod tests {
 
         fn duration_ms(duration: Duration) -> u32 {
             u32::try_from(duration.as_millis()).expect("should fit the fixture duration in u32")
-        }
-
-        /// A standard `OpenRTB` reply with one bid for the fixture slot.
-        fn bid_reply(price: f64) -> ScriptedReply {
-            ScriptedReply::status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(
-                    serde_json::to_vec(&serde_json::json!({
-                        "seatbid": [{"seat": "fictional-seat", "bid": [{
-                            "id": "fictional-bid",
-                            "impid": "fictional-slot",
-                            "price": price,
-                            "adm": "<div>fictional creative</div>",
-                            "w": 300,
-                            "h": 250
-                        }]}]
-                    }))
-                    .expect("should serialize the bid reply"),
-                )
         }
 
         fn batch_context<'a>(
