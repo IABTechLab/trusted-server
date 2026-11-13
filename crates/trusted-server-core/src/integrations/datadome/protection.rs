@@ -1749,6 +1749,52 @@ mod tests {
     }
 
     #[test]
+    fn get_challenge_passes_the_verdict_body_through() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::POST,
+            PROTECTION_VALIDATE_URL,
+            ScriptedReply::status(StatusCode::FORBIDDEN)
+                .header(HEADER_DATADOME_RESPONSE, "403")
+                .body("challenge"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = DataDomeIntegration::try_new(protection_config())
+            .expect("should create DataDome integration");
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &mut request,
+                geo_info: None,
+                is_integration_route: false,
+            },
+        ));
+
+        let RequestFilterDecision::Respond { response, .. } = decision else {
+            panic!("should challenge the GET on a DataDome 403 verdict");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should keep the challenge status"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should hold the buffered challenge body")
+                .as_ref(),
+            b"challenge",
+            "should answer a GET with the verdict's challenge body"
+        );
+    }
+
+    #[test]
     fn classify_head_challenge_omits_response_body() {
         let integration = protection_integration();
         let response = edgezero_core::http::response_builder()
