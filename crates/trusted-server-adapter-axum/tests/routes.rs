@@ -941,7 +941,7 @@ async fn first_party_sign_post_signs_the_url_in_its_body() {
     );
     assert!(
         body.contains(r#""href":"https://test-publisher.example.com/first-party/proxy?tsurl="#),
-        "should return the absolute first-party proxy URL for the configured public origin: {body}"
+        "should return the first-party proxy URL on the default public origin: {body}"
     );
     server.assert_no_outbound_requests();
 }
@@ -1307,6 +1307,17 @@ fn raw_header<'response>(response: &'response str, name: &str) -> Option<&'respo
         .map(|(_, value)| value.trim())
 }
 
+/// Returns the git version compiled into this build.
+///
+/// # Panics
+///
+/// Panics when the build has none, so a version assertion cannot pass on an
+/// absent header.
+fn compiled_git_version() -> &'static str {
+    trusted_server_core::constants::TS_GIT_VERSION
+        .expect("should compile a git version into the test build")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_not_found_carries_x_ts_version() {
     let server = TestServer::with_test_settings().await;
@@ -1329,7 +1340,7 @@ async fn canonical_not_found_carries_x_ts_version() {
     );
     assert_eq!(
         raw_header(&response, "x-ts-version"),
-        trusted_server_core::constants::TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 404; response:\n{response}"
     );
     server.assert_no_outbound_requests();
@@ -1359,7 +1370,7 @@ async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|value| value.to_str().ok()),
-        trusted_server_core::constants::TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 405"
     );
     server.assert_no_outbound_requests();
