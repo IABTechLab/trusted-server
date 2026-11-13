@@ -1,13 +1,16 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08 and 2026-11-11
+2026-11-08, 2026-11-11, 2026-11-12 and 2026-11-13
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
-found folded in since. Five agent review rounds, then a 2026-11-06 update
-against PR 275 head `9b31a697` and its review, and the 2026-11-07 fixes for
-GitHub reviews 5810751514 and 5815168335. The maintainer answered Q1 to Q7 on
-2026-11-08 ([Maintainer answers](#maintainer-answers)).
+found folded in since. The [Review log](#review-log) has eleven agent review
+rounds: six in fresh Claude Code sessions (Rounds 1 to 6) and five GitHub
+reviews on PR #1506 (Rounds 7 to 11). Before Round 6 the spec was updated against PR
+275 head `9b31a697` and its review. The maintainer answered Q1 to Q7 on
+2026-11-08 ([Maintainer answers](#maintainer-answers)), and Round 11 approved
+with nothing blocking. The log then records the implementation reviews and
+their fixes.
 
 **EdgeZero target:** `IABTechLab/edgezero` PR 275 (branch
 `docs/outbound-http-spec`). This spec was checked against head
@@ -2851,3 +2854,37 @@ change are D5, D7, D13, D18, and D20.
     endpoints are accepted.
   - The five blocking defects found at H were verified fixed at later PR 275
     heads (Open EdgeZero defects at H).
+
+- **Round 10 (GitHub review 5816590624 on PR #1506, 2026-11-08, at
+  `85f5ca3d9`).** No new defect. The reviewer accepted the recorded answers and
+  re-verified the six earlier corrections. Its verdict stayed BLOCKED only
+  because the requester had not yet confirmed directly that the Q1 to Q7
+  decisions, merge and production before EZ-Q1 among them, were theirs.
+
+- **Round 11 (GitHub review 5816701136 on PR #1506, 2026-11-08, at
+  `85f5ca3d9`).** The requester confirmed all seven decisions, and the reviewer
+  changed its verdict to APPROVE at the same head, with nothing blocking.
+  GitHub refused a formal approval because the reviewer and the author share
+  one account, so the verdict is a review comment.
+
+- **Implementation phase (2026-11-08 to 2026-11-13).** The cut was built from
+  the approved spec, and each correction the code forced is folded in above.
+  - An internal whole-branch review at `6c39a56a1` (Claude Code, Opus) found
+    nothing critical, four important findings, and eight minor ones (M1 to
+    M8). The important ones were client errors logged at error (I1), a CodeQL
+    cleartext-logging alert in the scripted client (I2), no automated test for
+    test 11's Fastly leg (I3), and twelve spec passages that contradicted the
+    code (I4). The commits up to `9ec4711d3` fixed them and brought those
+    passages in line.
+  - GitHub review 5887835958 (2026-11-13, at `9ec4711d3`) asked for the full
+    publisher cap and error matrix of test 21 and a Viceroy oracle for test 6's
+    overlap. Both were built (tests 6 and 21).
+  - GitHub review 5888499941 (2026-11-13, at `9ec4711d3`) left 72 findings: 2
+    blocking, 29 should-fix, and 41 nits. The blocking ones were #1516's
+    missing port and the 1 MiB Prebid Server and APS cap. The fix round that
+    followed merged `main` with #1516 (In-flight work), restored the
+    per-profile bidder caps (Fastly differences item 26), deleted the code the
+    cut left over, made each outbound failure log once (section 9), added the
+    missing tests, and corrected this spec. Two gaps it found are EdgeZero's,
+    and Trusted Server asked EdgeZero for both: the Spin upload framing (2.5)
+    and the Cloudflare and Spin log backend (section 9).
