@@ -8299,7 +8299,7 @@ mod tests {
         fn origin_cache_policies(&self) -> Vec<OutboundCachePolicy> {
             self.origin_requests()
                 .iter()
-                .map(|request| request.cache_policy)
+                .map(|request| request.cache_policy.clone())
                 .collect()
         }
 

@@ -8,10 +8,16 @@ stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
 
 ## Pinned version
 
-The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
-`IABTechLab/edgezero`: `14a6ca8bb5a5cbe055a1f725bdab8f42569a3bf0`, the head of
-EdgeZero pull request 275. The pin moves with that pull request's head until
-it merges, and then to an EdgeZero release tag.
+The workspace `Cargo.toml` selects the existing EdgeZero release tag
+`v0.0.12-rc-axum.202611.2` for all six direct dependencies. `Cargo.lock` resolves
+all EdgeZero packages to commit `4407d94130a9b752a70528b6c6f9c8fe3c10b81d`.
+The dependency does not follow a moving PR or branch.
+
+On native Axum, the application captures authenticated publisher forwarding
+metadata before EdgeZero removes transport forwarding headers. That decision
+survives sanitation without retaining credentials or changing transport ingress
+provenance. Missing, invalid or duplicate credentials cannot establish a public
+origin, and an existing rejected decision cannot be upgraded.
 
 ## Lifecycle
 
