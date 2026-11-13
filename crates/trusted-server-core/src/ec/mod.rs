@@ -199,6 +199,19 @@ struct RequestEc {
     jar: Option<CookieJar>,
 }
 
+/// Returns the value of the first cookie named `name` across every Cookie
+/// header field of `req`.
+fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<String> {
+    req.headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(cookie::Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
+}
+
 /// Parses EC identity from request cookies in a single pass.
 ///
 /// # Errors
@@ -211,21 +224,11 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
-    let pull_marker_present = jar
-        .as_ref()
-        .is_some_and(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE).is_some());
     // Browsers may split cookies across several Cookie fields, and the jar
-    // holds only the first, so every field is searched: a mirror missed here
-    // would not be expired after a consent withdrawal.
-    let mirror_cookie = req
-        .headers()
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(cookie::Cookie::split_parse)
-        .filter_map(Result::ok)
-        .find(|cookie| cookie.name() == COOKIE_TS_EIDS_MIRROR)
-        .map(|cookie| cookie.value().to_owned());
+    // holds only the first, so every field is searched: a mirror or retired
+    // marker missed here would not be expired.
+    let pull_marker_present = find_cookie_in_any_field(req, COOKIE_TS_EC_PULL_COMPLETE).is_some();
+    let mirror_cookie = find_cookie_in_any_field(req, COOKIE_TS_EIDS_MIRROR);
 
     Ok(RequestEc {
         cookie_ec,
@@ -1059,6 +1062,21 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_finds_the_pull_marker_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let marker = format!("{COOKIE_TS_EC_PULL_COMPLETE}=1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &marker)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(
+            ec.pull_marker_present(),
+            "should detect the retired pull marker in a later Cookie field"
+        );
     }
 
     #[test]
