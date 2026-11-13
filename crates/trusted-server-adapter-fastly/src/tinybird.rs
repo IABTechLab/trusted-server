@@ -11,12 +11,16 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method, header};
 use edgezero_core::outbound::{HttpClient, OutboundCachePolicy, ResponseDecoding};
 use error_stack::Report;
 use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
+use trusted_server_core::outbound::{
+    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
+    outbound_request,
+};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::settings::TinybirdSettings;
 
@@ -141,10 +145,10 @@ pub(crate) async fn send_queued_batches(
             )
             .cache_policy(OutboundCachePolicy::Bypass),
             Err(error) => {
-                log::warn!(
-                    "failed to build the Tinybird Events API request: {} ({}){log_context}",
-                    error.status(),
-                    error.kind()
+                log_send_failure(
+                    error,
+                    "the Events API request could not be built".to_owned(),
+                    log_context,
                 );
                 continue;
             }
@@ -162,13 +166,30 @@ pub(crate) async fn send_queued_batches(
                 response.status(),
                 config.auction_dataset
             ),
-            Err(error) => log::warn!(
-                "Tinybird Events API request failed with {} ({}){log_context}",
-                error.status(),
-                error.kind()
+            Err(error) => log_send_failure(
+                error,
+                format!(
+                    "the Events API request for dataset {} failed",
+                    config.auction_dataset
+                ),
+                log_context,
             ),
         }
     }
+}
+
+/// Logs one failed Tinybird send at warn, through [`outbound_error`], followed by `log_context`.
+///
+/// `outbound_error` logs the failure's status, kind, budget source, and provider
+/// detail, never the error's message, which can hold provider text or a URL.
+/// This then logs the report with the `failed` step.
+fn log_send_failure(error: EdgeError, failed: String, log_context: &dyn fmt::Display) {
+    let report = outbound_error(
+        error,
+        TrustedServerError::Proxy { message: failed },
+        OutboundRequestSource::Internal,
+    );
+    log::warn!("Tinybird telemetry send failed: {report:?}{log_context}");
 }
 
 fn tinybird_events_uri(api_host: &str, dataset: &str) -> String {
@@ -185,6 +206,7 @@ pub(crate) mod tests {
     use trusted_server_core::auction::telemetry::AuctionEventRow;
     use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::test_support::logging::WarningCapture;
     use trusted_server_core::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -434,6 +456,69 @@ pub(crate) mod tests {
             client.requests().len(),
             2,
             "should still send the second body after the first fails"
+        );
+    }
+
+    #[test]
+    fn send_and_build_failures_log_through_outbound_error() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::POST,
+            EVENTS_URI,
+            ScriptedReply::error(EdgeError::bad_gateway("tinybird provider text")),
+        );
+        let mut unbuildable = enabled_config();
+        unbuildable.api_host = "api tinybird.example.com".to_owned();
+        let capture = WarningCapture::start();
+
+        clock.drive(send_queued_batches(
+            &client.http_client(),
+            &enabled_config(),
+            &queue_of(&["{\"row\":1}\n"]),
+            &" [request=example]",
+        ));
+        clock.drive(send_queued_batches(
+            &client.http_client(),
+            &unbuildable,
+            &queue_of(&["{\"row\":2}\n"]),
+            &" [request=example]",
+        ));
+
+        let warnings = capture.take();
+        let typed = warnings
+            .iter()
+            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
+            .count();
+        assert_eq!(
+            typed, 2,
+            "should log the send failure and the build failure through outbound_error"
+        );
+        for step in [
+            "the Events API request for dataset auction_events_raw failed",
+            "the Events API request could not be built",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning
+                        .message
+                        .starts_with("Tinybird telemetry send failed:")
+                        && warning.message.contains(step)
+                        && warning.message.ends_with(" [request=example]")
+                }),
+                "should log the report for `{step}` with the log context"
+            );
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains("tinybird provider text")),
+            "should keep the provider text out of the logs"
+        );
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "should send only the request that could be built"
         );
     }
 
