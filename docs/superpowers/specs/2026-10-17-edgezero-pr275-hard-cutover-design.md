@@ -652,11 +652,12 @@ batch must outlive the handler.
    `owner.run(client.send(origin))` still captures the callback scope.
    Outside the response-body scope, head finishing gives a streamed body its
    own response-body owner (`edgezero:crates/edgezero-core/src/outbound/head.rs:296-302`,
-   `:384-400`). The raw `Buffered` and `PassThrough` conversions keep that body
-   (`publisher.rs:1868-1877`, `:2093-2095`, `:2546-2556`), so the attach below
-   would fail with "response body already owns an outbound scope". Inside the
-   scope, head finishing binds the body to the shared scope and adds no owner
-   (`head.rs:388-393`). Test 20 covers both calls and every raw variant.
+   `:384-400`). The raw `Buffered` conversion, which also carries a
+   pass-through response, keeps that body (`publisher.rs:1868-1877`,
+   `:2093-2095`, `:2546-2556`), so the attach below would fail with "response
+   body already owns an outbound scope". Inside the scope, head finishing binds
+   the body to the shared scope and adds no owner (`head.rs:388-393`). Test 20
+   covers both calls and every raw response.
 4. The adapter call site attaches the owner exactly once, after
    `publisher_response_into_streaming_response` (`publisher.rs:2500`, Fastly) or
    `buffer_publisher_response_async` (the other three) returns:
@@ -675,10 +676,10 @@ On Axum, Cloudflare, and Spin, `buffer_publisher_response_async` collects every
 variant before it returns, so nothing streams to egress there (Non-goals). H
 collects only `ResponseMode::Buffered` bodies (`head.rs:288-301`), and a
 streamed response has no byte cap by default (`outbound.rs:1514-1515`,
-`:1554-1556`). Without collection, the raw `Buffered` and `PassThrough`
-variants, which the function returns unchanged today (`publisher.rs:1868-1877`,
-`:2093-2095`), would stream, lose today's client caps, and fail during egress
-instead of before it.
+`:1554-1556`). Without collection, a raw `Buffered` response, pass-through
+responses included, which the function returns unchanged today
+(`publisher.rs:1868-1877`, `:2093-2095`), would stream, lose today's client
+caps, and fail during egress instead of before it.
 
 Today's clients bound the origin input before the publisher classifies the
 response (`publisher.rs:5944-5964`, `:6046-6075`), so the bound covers HTML as
@@ -1598,7 +1599,9 @@ that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
 or partner, and that rendering prints the budget source and
 `provider_failure_detail()` (`error.rs:490`). The helper itself does not log,
 so a failure never logs its detail twice. The detail holds closed enums and
-numeric codes, never provider text or URLs (EZ-16).
+numeric codes, never provider text or URLs (EZ-16). A handler that returns an
+`EdgeError` is logged once on every adapter, with its status and kind only,
+because its message can hold provider text or a URL.
 
 ### 10. Documentation
 
@@ -2212,8 +2215,8 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    site in 2.3 it asserts the method, URI, and headers, `host_authority()` and
    `has_host_authority_override()`, a set `timeout`, a connect timeout of
    exactly 1 s (EZ-4 criterion 10), `Accept-Encoding` exactly as Trusted Server
-   set it and absent when it set none, the decoding mode, the marker off
-   through `effective_proxy_marker_enabled` (EZ-7), the response cap, the cache
+   set it and absent when it set none, the decoding mode, the resolved proxy
+   marker off (EZ-7), the response cap, the cache
    policy, and the Image Optimizer options read back from the request (EZ-8).
    On the asset proxy the options read back on a final GET and on a final
    HEAD, and never on the S3 preflight. For bidders it asserts the consent and
@@ -2308,8 +2311,8 @@ git grep -n into_core_request -- crates/trusted-server-adapter-fastly
    and EdgeZero's assembly error answers 500, today's startup status (EZ-22
    criterion 9's text says 503), with an EdgeZero JSON body and no
    `x-ts-version`. With the blob restored, the next initialization of the same
-   `Sandbox` succeeds, and its `SandboxCounters` show one more build and the
-   same instance (EZ-22 criterion 9).
+   `Sandbox` succeeds, and its `SandboxCounters` show one more build (EZ-22
+   criterion 9).
 10. **Validation.** `validate_settings_for_deploy` rejects each setting the
     Configuration table rejects, and each degrades as listed at runtime. Spin
     ignores `origin_host_header_override` with a warning. Settings load accepts
