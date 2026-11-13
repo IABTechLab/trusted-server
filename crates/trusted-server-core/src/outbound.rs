@@ -28,7 +28,7 @@ pub const STREAMED_TIMEOUT: Duration = Duration::from_secs(60);
 pub const BUFFERED_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Deadline for a whole redirect chain, measured from its first request.
-pub const REDIRECT_CHAIN_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const REDIRECT_CHAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Response cap for a buffered site that has no Trusted Server cap of its own.
 ///
@@ -37,7 +37,7 @@ pub const REDIRECT_CHAIN_DEADLINE: Duration = Duration::from_secs(60);
 pub const DEFAULT_BUFFERED_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Cap on a publisher request body forwarded to the origin.
-pub const PUBLISHER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const PUBLISHER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Returns the outbound client the adapter installed on the request, with the proxy marker off.
 ///
