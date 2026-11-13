@@ -1670,7 +1670,10 @@ Responses:
    `Content-Length` and `Transfer-Encoding` can differ from today's (D20).
 8. A startup failure answers with EdgeZero's redacted JSON and carries no
    `x-ts-version`, `x-ts-fastly-version`, or finalize headers (EZ-19.7). Today
-   it carries `x-ts-version`. Its status is unchanged.
+   it carries `x-ts-version`. Its status is unchanged, except for `TRACE` and
+   `CONNECT`. Today's startup-error router registers only the seven publisher
+   methods (`crates/trusted-server-adapter-fastly/src/app.rs:1064-1068`), so
+   they get its 405. Now every method gets the failure's status.
 9. A response body must finish within 60 s after egress starts.
 
 Outbound:
