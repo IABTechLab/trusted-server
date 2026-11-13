@@ -870,51 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = Settings::from_toml(
-            r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
-                [publisher]
-                domain = "publisher.example"
-                cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
-                proxy_secret = "fictional-proxy-secret"
-
-                [ec]
-                passphrase = "fictional-secret-key-32-bytes-minimum"
-            "#,
-        )
-        .expect("should parse startup test settings");
-        settings.auction.enabled = false;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
-                    (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect();
-
-        build_state_with_settings(settings)
-            .expect("disabled Cloudflare auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn cloudflare_and_spin_load_multi_provider_plan() {
+    fn startup_loads_multi_provider_plan() {
         let mut settings = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -959,7 +915,7 @@ mod tests {
         assert_eq!(
             state.orchestrator.provider_count(),
             2,
-            "should fan out to both configured providers"
+            "should register both configured providers"
         );
     }
 

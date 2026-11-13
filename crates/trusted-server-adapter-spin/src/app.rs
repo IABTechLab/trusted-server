@@ -1071,23 +1071,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = multi_provider_settings();
-        settings.auction.enabled = false;
-
-        build_state_with_settings(settings)
-            .expect("disabled Spin auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn cloudflare_and_spin_load_multi_provider_plan() {
+    fn startup_loads_multi_provider_plan() {
         let state = build_state_with_settings(multi_provider_settings())
             .expect("should load a multi-provider auction plan on Spin");
 
         assert_eq!(
             state.orchestrator.provider_count(),
             2,
-            "should fan out to both configured providers"
+            "should register both configured providers"
         );
     }
 

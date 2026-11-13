@@ -63,7 +63,10 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 ```
 
 Every adapter runs a multi-provider auction as one EdgeZero request batch.
-The Cloudflare and Spin tests load a multi-provider plan and run its auction.
+The Cloudflare and Spin startup tests load a multi-provider plan. The
+integration tests `multi_provider_auction_runs_cloudflare` and
+`multi_provider_auction_runs_spin` run its auction on each runtime. They are
+ignored by default, so the commands above do not reach them.
 Fastly's tests also cover its startup bound of 160 provider backends.
 
 See [Auction orchestration](/guide/auction-orchestration) for configuration and
