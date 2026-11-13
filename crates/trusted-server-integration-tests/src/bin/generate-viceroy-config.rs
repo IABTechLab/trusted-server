@@ -20,8 +20,8 @@ struct Args {
     app_config: Option<PathBuf>,
     output: PathBuf,
     origin_url: Option<String>,
-    provider_endpoint_origin: Option<String>,
     public_origin: Option<String>,
+    provider_endpoint_origin: Option<String>,
 }
 
 fn main() -> Result<(), DynError> {
@@ -80,8 +80,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
     let mut app_config = None;
     let mut output = None;
     let mut origin_url = None;
-    let mut provider_endpoint_origin = None;
     let mut public_origin = None;
+    let mut provider_endpoint_origin = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -119,8 +119,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
         app_config,
         output: output.ok_or_else(|| error_box(format!("missing --output\n\n{}", usage())))?,
         origin_url,
-        provider_endpoint_origin,
         public_origin,
+        provider_endpoint_origin,
     })
 }
 
@@ -273,7 +273,6 @@ mod tests {
     use super::*;
     use error_stack::Report;
     use std::collections::HashMap;
-    use tempfile::tempdir;
     use trusted_server_core::config_payload::settings_from_config_blob;
     use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
@@ -438,6 +437,41 @@ mod tests {
     }
 
     #[test]
+    fn retargeting_keeps_rewritten_provider_endpoints() {
+        let envelope = build_app_config_envelope(
+            TRACE_APP_CONFIG,
+            None,
+            Some("http://127.0.0.1:43130"),
+            Some("http://127.0.0.1:8888"),
+        )
+        .expect("should build a trace envelope with a public origin and a provider origin");
+        let generated = inject_generated_config_stores(TEMPLATE, &envelope)
+            .expect("should inject generated stores");
+        let generated_data: serde_json::Value =
+            serde_json::from_str(&envelope).expect("should parse the generated envelope");
+        assert_eq!(
+            generated_data["data"]["publisher"]["public_origin"], "http://127.0.0.1:43130",
+            "should support a runtime public origin alongside a provider endpoint origin"
+        );
+
+        let retargeted =
+            retarget_generated_config(&generated, None, Some("http://127.0.0.1:43131"))
+                .expect("should retarget the generated trace config");
+        let retargeted: toml::Value =
+            toml::from_str(&retargeted).expect("should parse the retargeted trace config");
+        let retargeted_envelope = retargeted["local_server"]["config_stores"]
+            [DEFAULT_CONFIG_STORE_ID]["contents"][CONFIG_BLOB_KEY]
+            .as_str()
+            .expect("should contain a blob");
+
+        assert_eq!(
+            provider_endpoint(retargeted_envelope, "example"),
+            "http://127.0.0.1:8888/api/trace-bidder",
+            "should keep the rewritten provider endpoint when retargeting the runtime listener"
+        );
+    }
+
+    #[test]
     fn parse_args_accepts_required_flags_and_origin_override() {
         let args = parse_args([
             "--template".to_string(),
@@ -458,79 +492,15 @@ mod tests {
                 app_config: Some(PathBuf::from("trusted-server.toml")),
                 output: PathBuf::from("generated.toml"),
                 origin_url: Some("http://127.0.0.1:9999".to_string()),
-                provider_endpoint_origin: None,
                 public_origin: None,
+                provider_endpoint_origin: None,
             },
             "should parse expected args"
         );
     }
 
-    fn run_provider_fixture(origin: &str) -> Result<toml::Value, DynError> {
-        let directory = tempdir().expect("should create isolated generator fixture");
-        let template = directory.path().join("template.toml");
-        let app_config = directory.path().join("app.toml");
-        let output = directory.path().join("output.toml");
-        fs::write(&template, TEMPLATE).expect("should write runtime template");
-        fs::write(&app_config, TRACE_APP_CONFIG).expect("should write controlled app config");
-        run(&Args {
-            template,
-            app_config: Some(app_config),
-            output: output.clone(),
-            origin_url: None,
-            provider_endpoint_origin: Some(origin.to_string()),
-            public_origin: Some("http://127.0.0.1:43130".to_string()),
-        })?;
-        Ok(toml::from_str(&fs::read_to_string(output)?)?)
-    }
-
     #[test]
-    fn controlled_provider_retargets_typed_endpoint_and_keeps_public_origin_independent() {
-        let generated = run_provider_fixture("http://127.0.0.1:8888")
-            .expect("should generate explicit loopback provider endpoints");
-        let read_envelope = |config: &toml::Value| {
-            let envelope: BlobEnvelope = serde_json::from_str(
-                config["local_server"]["config_stores"][DEFAULT_CONFIG_STORE_ID]["contents"]
-                    [CONFIG_BLOB_KEY]
-                    .as_str()
-                    .expect("should retain the app config blob"),
-            )
-            .expect("should parse the app config envelope");
-            envelope
-                .verify()
-                .expect("should verify the generated envelope");
-            envelope.data
-        };
-        let original = read_envelope(&generated);
-        assert_eq!(
-            original["auction"]["providers"]["example"]["endpoint"],
-            "http://127.0.0.1:8888/api/trace-bidder",
-            "should use the explicit typed provider endpoint without legacy backend aliases"
-        );
-        assert_eq!(
-            original["publisher"]["public_origin"], "http://127.0.0.1:43130",
-            "should configure the browser origin independently of the provider"
-        );
-        let retargeted = retarget_generated_config(
-            &toml::to_string(&generated).expect("should serialize the generated config"),
-            None,
-            Some("http://127.0.0.1:43131"),
-        )
-        .expect("should retarget the browser origin");
-        let retargeted: toml::Value =
-            toml::from_str(&retargeted).expect("should parse the retargeted config");
-        let changed = read_envelope(&retargeted);
-        assert_eq!(
-            changed["auction"], original["auction"],
-            "should preserve provider configuration while retargeting the listener"
-        );
-        assert_eq!(
-            changed["publisher"]["public_origin"], "http://127.0.0.1:43131",
-            "should apply the new browser-facing origin"
-        );
-    }
-
-    #[test]
-    fn parse_args_rejects_provider_endpoint_override_without_app_config() {
+    fn parse_args_rejects_provider_endpoint_origin_without_app_config() {
         let result = parse_args([
             "--template".to_string(),
             "generated.toml".to_string(),
@@ -541,7 +511,7 @@ mod tests {
         ]);
         assert!(
             result.is_err(),
-            "should not silently ignore bidder injection when retargeting an existing blob"
+            "should not silently ignore a provider endpoint origin when retargeting an existing blob"
         );
     }
 

@@ -9,9 +9,10 @@
 
 use std::time::Duration;
 
+use edgezero_core::context::RequestContext;
 use edgezero_core::error::{BudgetSource, EdgeError};
 use edgezero_core::error_detail::ProviderFailureDetail;
-use edgezero_core::outbound::{OutboundRequest, ResponseDecoding};
+use edgezero_core::outbound::{HttpClient, OutboundRequest, ResponseDecoding};
 use error_stack::Report;
 use http::{Method, StatusCode, Uri};
 
@@ -37,6 +38,36 @@ pub const DEFAULT_BUFFERED_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Cap on a publisher request body forwarded to the origin.
 pub const PUBLISHER_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Returns the outbound client the adapter installed on the request, with the proxy marker off.
+///
+/// # Errors
+///
+/// Returns [`EdgeError::Internal`] when the request carries no outbound client.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::Body;
+/// use edgezero_core::context::RequestContext;
+/// use edgezero_core::http::request_builder;
+/// use trusted_server_core::outbound::request_outbound_client;
+///
+/// let request = request_builder()
+///     .body(Body::empty())
+///     .expect("should build a request");
+/// let context = RequestContext::new(request, Default::default());
+/// let error = request_outbound_client(&context)
+///     .err()
+///     .expect("should reject a request without an outbound client");
+/// assert_eq!(error.to_string(), "internal error: request has no outbound client");
+/// ```
+pub fn request_outbound_client(ctx: &RequestContext) -> Result<HttpClient, EdgeError> {
+    let client = ctx.http_client().ok_or_else(|| {
+        EdgeError::internal(std::io::Error::other("request has no outbound client"))
+    })?;
+    Ok(client.with_proxy_marker(false))
+}
 
 /// Builds a `method` request to `target`, a URL Trusted Server assembled.
 ///
@@ -246,6 +277,7 @@ mod tests {
     use std::io;
     use std::time::Duration;
 
+    use edgezero_core::body::Body;
     use edgezero_core::error::{BudgetSource, EdgeError, RequestBodyOverflowOrigin};
     use edgezero_core::error_detail::{
         FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase,
@@ -256,6 +288,7 @@ mod tests {
     use super::*;
     use crate::error::IntoHttpResponse as _;
     use crate::test_support::logging::WarningCapture;
+    use crate::test_support::scripted_client::ScriptedHttpClient;
 
     const BOTH_SOURCES: [OutboundRequestSource; 2] = [
         OutboundRequestSource::ClientForward,
@@ -277,6 +310,27 @@ mod tests {
 
     fn example_request() -> OutboundRequest {
         OutboundRequest::get("https://example.com/resource").expect("should build a GET request")
+    }
+
+    #[test]
+    fn request_outbound_client_turns_the_proxy_marker_off() {
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let mut request = edgezero_core::http::request_builder()
+            .body(Body::empty())
+            .expect("should build a request");
+        request.extensions_mut().insert(client);
+        let context = RequestContext::new(request, Default::default());
+
+        let client = request_outbound_client(&context).expect("should return the request's client");
+
+        assert!(
+            !client.proxy_marker_enabled(),
+            "should turn the proxy marker off on the request's client"
+        );
     }
 
     #[test]

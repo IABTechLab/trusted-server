@@ -115,8 +115,9 @@ pub(crate) fn body_as_reader(
 /// malformed `Content-Length` never decides the outcome on its own. The
 /// read also ends with an error once the inbound read deadline passes.
 ///
-/// Rejections the client caused are logged at warn and host read failures at
-/// error. Body bytes are never logged.
+/// This function does not log. The report names the limit or carries the
+/// read error, and [`http_error`](crate::error::http_error) logs it at the
+/// level its status calls for. Body bytes never reach the report.
 ///
 /// # Errors
 ///
@@ -162,9 +163,6 @@ pub async fn read_request_body(
     if let Some(declared) = single_declared_content_length(headers)
         && declared > u64::try_from(max).unwrap_or(u64::MAX)
     {
-        log::warn!(
-            "Rejecting request body: declared Content-Length {declared} exceeds the {max} byte limit"
-        );
         return Err(Report::new(TrustedServerError::RequestTooLarge {
             message: format!("declared Content-Length {declared} exceeds the {max} byte limit"),
         }));
@@ -195,30 +193,18 @@ fn single_declared_content_length(headers: &HeaderMap) -> Option<u64> {
 fn request_body_read_error(error: &EdgeError, max: usize) -> Report<TrustedServerError> {
     let status = error.status();
     let context = match status {
-        StatusCode::PAYLOAD_TOO_LARGE => {
-            log::warn!("Rejecting request body: body exceeds the {max} byte limit");
-            TrustedServerError::RequestTooLarge {
-                message: format!("request body exceeds the {max} byte limit"),
-            }
-        }
-        StatusCode::REQUEST_TIMEOUT => {
-            log::warn!("Rejecting request body: read deadline passed: {error}");
-            TrustedServerError::RequestTimeout {
-                message: "request body was not read before the read deadline".to_string(),
-            }
-        }
-        status if status.is_client_error() => {
-            log::warn!("Rejecting request body: client read error ({status}): {error}");
-            TrustedServerError::BadRequest {
-                message: "request body could not be read".to_string(),
-            }
-        }
-        status => {
-            log::error!("Failed to read request body ({status}): {error}");
-            TrustedServerError::Proxy {
-                message: "failed to read request body".to_string(),
-            }
-        }
+        StatusCode::PAYLOAD_TOO_LARGE => TrustedServerError::RequestTooLarge {
+            message: format!("request body exceeds the {max} byte limit"),
+        },
+        StatusCode::REQUEST_TIMEOUT => TrustedServerError::RequestTimeout {
+            message: "request body was not read before the read deadline".to_string(),
+        },
+        status if status.is_client_error() => TrustedServerError::BadRequest {
+            message: "request body could not be read".to_string(),
+        },
+        _ => TrustedServerError::Proxy {
+            message: "failed to read request body".to_string(),
+        },
     };
     Report::new(context).attach(format!("body read failed with {status}: {error}"))
 }
@@ -644,10 +630,12 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::IntoHttpResponse as _;
+    use crate::error::{IntoHttpResponse as _, http_error};
     use crate::platform::ClientInfo;
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::WarningCapture;
     use http::{HeaderName, HeaderValue, Method};
 
     #[test]
@@ -1636,6 +1624,40 @@ mod tests {
             |error| matches!(error, TrustedServerError::Proxy { .. }),
             StatusCode::BAD_GATEWAY,
         );
+    }
+
+    #[test]
+    fn body_read_failure_logs_once_at_its_status_level() {
+        for case in body_read_failure_cases(READ_TEST_MAX) {
+            let (request, expectation) =
+                case.into_request(http::Request::builder().uri("https://example.com/"));
+            let (parts, body) = request.into_parts();
+            let capture = WarningCapture::start();
+
+            let report = read_body(&parts.headers, body).expect_err("should reject the body");
+            let response = http_error(&report);
+
+            let records = capture.take();
+            drop(capture);
+            let name = expectation.name();
+            let expected = expectation.expected();
+            assert_eq!(
+                response.status(),
+                expected,
+                "should answer the {name} case with {expected}"
+            );
+            let levels: Vec<log::Level> = records.iter().map(|record| record.level).collect();
+            let level = if expected.is_client_error() {
+                log::Level::Warn
+            } else {
+                log::Level::Error
+            };
+            assert_eq!(
+                levels,
+                [level],
+                "should log the {name} case once, at {level}"
+            );
+        }
     }
 
     #[test]
