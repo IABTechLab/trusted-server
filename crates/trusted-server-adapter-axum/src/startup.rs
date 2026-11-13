@@ -21,6 +21,8 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 
 use crate::app::TrustedServerApp;
+use crate::middleware::apply_finalize_headers;
+use crate::platform::geo_from_outcome;
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -253,6 +255,7 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         )
         .map_err(settings_error)?;
     validate_snapshot_consumers(&settings)?;
+    let finalize_settings = settings.clone();
     let router = TrustedServerApp::routes_with_settings(settings).map_err(settings_error)?;
     if deadline.is_expired_at(clock.now()) {
         return Err(configuration_error(
@@ -267,6 +270,10 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         secret_store,
     });
     app.set_router(router);
+    app.set_admitted_error_response_finalizer(move |outcome, response| {
+        let geo = geo_from_outcome(outcome);
+        apply_finalize_headers(&finalize_settings, geo.as_ref(), response);
+    });
     app.insert_state(snapshot);
     Ok(())
 }

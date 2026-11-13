@@ -809,16 +809,7 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
         .get("cf-ipcountry")
         .and_then(|value| value.to_str().ok())
         .filter(|country| *country != "XX")
-        .map(|country| GeoInfo {
-            city: String::new(),
-            country: country.to_owned(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: None,
-            asn: None,
-        });
+        .map(|country| GeoInfo::country_region(country, None));
     TraceMetadata {
         client_info: ClientInfo {
             client_ip,

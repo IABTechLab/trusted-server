@@ -606,16 +606,7 @@ mod tests {
     }
 
     fn geo_info(country: &str, region: Option<&str>) -> GeoInfo {
-        GeoInfo {
-            city: String::new(),
-            country: country.to_string(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: region.map(str::to_string),
-            asn: None,
-        }
+        GeoInfo::country_region(country, region.map(str::to_string))
     }
 
     fn config_with_geo_query_parameters() -> DidomiIntegrationConfig {

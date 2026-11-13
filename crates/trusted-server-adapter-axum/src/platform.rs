@@ -2,7 +2,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_adapter_axum::diagnostics::NativeIngressMetadata;
 use edgezero_core::error::EdgeError;
+use edgezero_core::geo::{GeoOutcome, GeoStatus};
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
@@ -13,12 +15,43 @@ use trusted_server_core::platform::{
 // PlatformGeo
 // ---------------------------------------------------------------------------
 
-/// No-op geo implementation — geographic lookup is unavailable in local development.
-pub struct AxumPlatformGeo;
+/// An owned snapshot of the managed native request's geographic outcome.
+///
+/// Provider resolution belongs to `EdgeZero` ingress. Every downstream lookup
+/// returns this same request's data, never an IP lookup or shared global state.
+#[derive(Clone, Default)]
+pub struct AxumPlatformGeo {
+    info: Option<GeoInfo>,
+}
+
+impl AxumPlatformGeo {
+    fn from_context(context: &edgezero_core::context::RequestContext) -> Self {
+        Self {
+            info: geo_from_outcome(context.geo()),
+        }
+    }
+}
 
 impl PlatformGeo for AxumPlatformGeo {
     fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(None)
+        Ok(self.info.clone())
+    }
+}
+
+/// Project only the private managed outcome, without reading request headers.
+/// Unavailable, untrusted, error and unselected outcomes supply no location.
+pub(crate) fn geo_from_outcome(outcome: &GeoOutcome) -> Option<GeoInfo> {
+    match outcome {
+        GeoOutcome::Selected {
+            status: GeoStatus::Located { location, .. },
+            ..
+        } => Some(GeoInfo::country_region(
+            location.country().as_str(),
+            location
+                .subdivision()
+                .map(|value| value.as_str().to_owned()),
+        )),
+        _ => None,
     }
 }
 
@@ -36,6 +69,7 @@ impl PlatformGeo for AxumPlatformGeo {
 ///
 /// The outbound client is the one the request context carries, with the proxy
 /// marker turned off, and the clock is the context's monotonic clock.
+/// Geography is a request-local snapshot of the private managed outcome.
 ///
 /// # Errors
 ///
@@ -57,16 +91,18 @@ pub fn build_runtime_services(
         log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
-    let client_ip = ctx
-        .extensions()
-        .get::<AxumRequestContext>()
-        .and_then(|c| c.remote_addr)
-        .map(|addr| addr.ip());
+    let client_ip = match ctx.extensions().get::<NativeIngressMetadata>() {
+        Some(metadata) => metadata.effective_client(),
+        None => ctx
+            .extensions()
+            .get::<AxumRequestContext>()
+            .and_then(|context| context.remote_addr)
+            .map(|address| address.ip()),
+    };
 
     // Stateless shims are promoted to process-wide statics so callers clone
     // an existing Arc instead of allocating a new one per request.
     static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
-    static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
     static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
         std::sync::OnceLock::new();
@@ -82,9 +118,7 @@ pub fn build_runtime_services(
         })))
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
-        .geo(Arc::clone(GEO.get_or_init(|| {
-            Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
-        })))
+        .geo(Arc::new(AxumPlatformGeo::from_context(ctx)))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -111,6 +145,13 @@ impl trusted_server_core::platform::PlatformTimer for AxumTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::geo::{
+        CountryCode, GeoError, GeoLocation, GeoProviderId, GeoSource, GeoTrustBasis,
+        GeoUnavailableReason, SubdivisionCode,
+    };
+    use edgezero_core::http::request_builder;
     use trusted_server_core::platform::HttpClient;
     use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
@@ -165,6 +206,22 @@ mod tests {
         );
     }
 
+    fn located(country: &str, region: Option<&str>) -> GeoOutcome {
+        GeoOutcome::Selected {
+            provider: GeoProviderId::cloudfront(),
+            status: GeoStatus::Located {
+                location: GeoLocation::new(
+                    CountryCode::new(country).expect("should parse fixture country"),
+                    region.map(|value| {
+                        SubdivisionCode::new(value).expect("should parse fixture subdivision")
+                    }),
+                ),
+                source: GeoSource::CloudFront,
+                trust_basis: GeoTrustBasis::DeclaredProtectedAlb,
+            },
+        }
+    }
+
     #[test]
     fn html_finalization_timer_is_shared_without_an_executor() {
         let context = context_with_client(Some(ScriptedHttpClient::forbidding().http_client()));
@@ -185,6 +242,73 @@ mod tests {
     }
 
     #[test]
+    fn geography_is_partial_and_request_local() {
+        let first = AxumPlatformGeo {
+            info: geo_from_outcome(&located("US", Some("CA"))),
+        };
+        let second = AxumPlatformGeo {
+            info: geo_from_outcome(&located("GB", None)),
+        };
+        let us = first
+            .lookup(None)
+            .expect("should read first snapshot")
+            .expect("should retain US");
+        let gb = second
+            .lookup(None)
+            .expect("should read second snapshot")
+            .expect("should retain GB");
+        assert_eq!(us.country, "US");
+        assert_eq!(us.region.as_deref(), Some("CA"));
+        assert_eq!(gb.country, "GB");
+        assert_eq!(gb.region, None);
+        assert_eq!(us.coordinates, None);
+        assert_eq!(us.city, None);
+        assert_eq!(us.continent, None);
+        assert_eq!(us.metro_code, None);
+        assert_eq!(
+            first
+                .lookup(Some(
+                    "192.0.2.1".parse().expect("should parse different IP")
+                ))
+                .expect("should reuse same snapshot"),
+            Some(us),
+            "should not resolve geography from another lookup argument"
+        );
+    }
+
+    #[test]
+    fn unavailable_outcomes_and_forged_extensions_cannot_supply_geography() {
+        for status in [
+            GeoStatus::Unavailable(GeoUnavailableReason::MissingMetadata),
+            GeoStatus::Unavailable(GeoUnavailableReason::UntrustedIngress),
+            GeoStatus::Error(GeoError::InvalidAssertion),
+            GeoStatus::Error(GeoError::ProviderFailure),
+        ] {
+            assert!(
+                geo_from_outcome(&GeoOutcome::Selected {
+                    provider: GeoProviderId::cloudfront(),
+                    status,
+                })
+                .is_none()
+            );
+        }
+        let mut request = request_builder()
+            .header("cloudfront-viewer-country", "US")
+            .header("cloudfront-viewer-country-region", "CA")
+            .body(Body::empty())
+            .expect("should build unmanaged request");
+        request.extensions_mut().insert(located("US", Some("CA")));
+        let context = RequestContext::new(request, edgezero_core::params::PathParams::default());
+        assert!(
+            AxumPlatformGeo::from_context(&context)
+                .lookup(None)
+                .expect("should read unmanaged outcome")
+                .is_none(),
+            "should ignore raw headers and public extensions"
+        );
+    }
+
+    #[test]
     fn runtime_services_reject_a_request_without_prepared_snapshots() {
         let request = edgezero_core::http::request_builder()
             .body(edgezero_core::Body::empty())
@@ -200,7 +324,7 @@ mod tests {
 
     #[test]
     fn geo_always_returns_none() {
-        let geo = AxumPlatformGeo;
+        let geo = AxumPlatformGeo::default();
         let no_ip = geo.lookup(None).expect("should not error");
         assert!(no_ip.is_none(), "should return None for no IP");
         let with_ip = geo
