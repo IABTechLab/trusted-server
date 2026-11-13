@@ -597,19 +597,22 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
+        let response = async {
+            let registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
+            }
+        }
+        .await
+        .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
 
@@ -688,6 +691,7 @@ async fn run_named_route(
                     &req,
                     &ec.ec_context,
                 )
+                .await
             }
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
@@ -877,6 +881,7 @@ async fn dispatch_fallback(
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+                .await
         {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
