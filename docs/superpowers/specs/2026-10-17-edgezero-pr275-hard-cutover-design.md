@@ -967,20 +967,26 @@ call lines. On H every adapter streams and runs batches.
 Today every site wraps transport errors in its own context, and `Proxy`,
 `Integration`, `Auction`, and `Prebid` all map to 502
 (`crates/trusted-server-core/src/error.rs:116-135`). Trusted Server has no 504
-variant. One helper, `outbound_error(error: EdgeError, context: TrustedServerError)`,
+variant. One helper,
+`outbound_error(error: EdgeError, context: TrustedServerError, source: OutboundRequestSource)`,
 maps every `HttpClient` failure and every request-construction error
-(`from_request`, `host_authority_override`, and the builders) (D17):
+(`from_request`, `host_authority_override`, and the builders) (D17). `source`
+says who shaped the request: `ClientForward` for a forward of the client's own
+request, and `Internal` for a request Trusted Server built. Only the publisher
+forward passes `ClientForward`.
 
 - `PayloadTooLarge` becomes `RequestTooLarge` (413).
 - `RequestTimeout` becomes `RequestTimeout` (408, section 4). It comes from the
   inbound read deadline while a forwarded body is settled or uploaded.
-- `BadRequest` on the publisher forward becomes `BadRequest` (400). The client's
-  request usually causes it: a GET with a body, a malformed `Connection`, or a
-  URI with a fragment or backslash. A `publisher.origin_url` with userinfo also
-  causes it, so validation rejects such a URL (Configuration).
+- `BadRequest` becomes `BadRequest` (400) only for
+  `OutboundRequestSource::ClientForward`. The client's request usually causes
+  it: a GET with a body, a malformed `Connection`, or a URI with a fragment or
+  backslash. A `publisher.origin_url` with userinfo also causes it, so
+  validation rejects such a URL (Configuration).
 - Everything else keeps the site's context, which is 502 as today. That covers
   timeouts, connect failures, protocol errors, a Fastly `NameInUse`, and a
-  `BadRequest` from a request Trusted Server built itself.
+  `BadRequest` with `OutboundRequestSource::Internal`, from a request Trusted
+  Server built itself.
 
 The helper attaches the `EdgeError`, its budget source, and its
 `provider_failure_detail()` to the report. It does not log; section 9 says
