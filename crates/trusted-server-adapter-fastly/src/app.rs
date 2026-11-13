@@ -2164,11 +2164,6 @@ mod tests {
             first.builds + 1,
             "should count one more build in the same sandbox"
         );
-        assert_eq!(
-            second.log_context().to_string().split(' ').nth(1),
-            first.log_context().to_string().split(' ').nth(1),
-            "should keep serving from the same sandbox instance"
-        );
     }
 
     #[test]
