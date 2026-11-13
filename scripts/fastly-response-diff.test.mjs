@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url'
 import {
   InputError,
   classifyDifferences,
+  compare,
+  normalize,
   parseExpected,
 } from './fastly-response-diff.mjs'
 
@@ -178,5 +180,125 @@ test('classifyDifferences reports unlisted and missing differences', () => {
       ['unexpected', 'header etag'],
       ['missing', 'header content-length'],
     ]
+  )
+})
+
+const UUID_A = '123e4567-e89b-12d3-a456-426614174000'
+const UUID_B = '00000000-1111-2222-3333-444444444444'
+const EC_ID_A = `${'a'.repeat(64)}.Ab12Cd`
+const EC_ID_B = `${'b'.repeat(64)}.Xy34Zw`
+
+/** A response as `send` returns it. */
+function response(headers, body = '', status = 200) {
+  return { status, headers, body: Buffer.from(body) }
+}
+
+/** The differences between two responses after normalization. */
+function diff(base, head, staging = false) {
+  return compare(normalize(base, staging), normalize(head, staging))
+}
+
+test('normalize scrubs UUIDs and EC IDs in headers and bodies', () => {
+  const base = response(
+    [
+      ['x-request-id', UUID_A],
+      ['set-cookie', `ts-ec=${EC_ID_A}; Path=/`],
+    ],
+    `<p>${UUID_A} ${EC_ID_A}</p>`
+  )
+  const head = response(
+    [
+      ['x-request-id', UUID_B],
+      ['set-cookie', `ts-ec=${EC_ID_B}; Path=/`],
+    ],
+    `<p>${UUID_B} ${EC_ID_B}</p>`
+  )
+
+  assert.deepEqual(
+    [...normalize(base, false).headers],
+    [
+      ['x-request-id', ['<uuid>']],
+      ['set-cookie', ['ts-ec=<ec-id>; Path=/']],
+    ],
+    'should replace each generated ID with its placeholder'
+  )
+  assert.equal(
+    diff(base, head).size,
+    0,
+    'should find no difference between responses that differ only in generated IDs'
+  )
+})
+
+test('a header value that changes beyond its IDs still differs', () => {
+  const base = response([['set-cookie', `ts-ec=${EC_ID_A}; Max-Age=100`]])
+  const head = response([['set-cookie', `ts-ec=${EC_ID_B}; Max-Age=200`]])
+
+  assert.deepEqual(
+    Object.fromEntries(diff(base, head)),
+    {
+      'header set-cookie': {
+        base: ['ts-ec=<ec-id>; Max-Age=100'],
+        head: ['ts-ec=<ec-id>; Max-Age=200'],
+      },
+    },
+    'should report the EC cookie whose attributes changed'
+  )
+})
+
+test('a header on one side only still differs after normalization', () => {
+  const base = response([['set-cookie', `ts-ec=${EC_ID_A}; Path=/`]])
+  const head = response([])
+
+  assert.deepEqual(
+    Object.fromEntries(diff(base, head)),
+    {
+      'header set-cookie': { base: ['ts-ec=<ec-id>; Path=/'], head: [] },
+    },
+    'should report the header head dropped'
+  )
+})
+
+test('volatile headers keep their presence', () => {
+  const base = response([
+    ['date', 'Mon, 02 Nov 2026 10:00:00 GMT'],
+    ['x-ts-version', 'base-build'],
+  ])
+  const sameNames = response([
+    ['date', 'Mon, 02 Nov 2026 10:00:07 GMT'],
+    ['x-ts-version', 'head-build'],
+  ])
+  const dropped = response([['x-ts-version', 'head-build']])
+
+  assert.equal(
+    diff(base, sameNames).size,
+    0,
+    'should ignore the values of volatile headers'
+  )
+  assert.deepEqual(
+    Object.fromEntries(diff(base, dropped)),
+    { 'header date': { base: ['<normalized>'], head: [] } },
+    'should still report a volatile header head dropped'
+  )
+})
+
+test('staging-only headers are left alone without --staging', () => {
+  const base = response([
+    ['x-geo-country', 'US'],
+    ['x-ts-env', 'staging'],
+  ])
+  const head = response([
+    ['x-geo-country', 'CA'],
+    ['x-ts-env', 'production'],
+  ])
+
+  assert.deepEqual(
+    [...diff(base, head).keys()],
+    ['header x-geo-country', 'header x-ts-env'],
+    'should compare staging-only headers without --staging'
+  )
+  assert.equal(
+    diff(base, head, true).size,
+    0,
+    'should normalize staging-only headers with --staging'
   )
 })
