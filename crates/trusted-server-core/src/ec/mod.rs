@@ -214,9 +214,17 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
     let pull_marker_present = jar
         .as_ref()
         .is_some_and(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE).is_some());
-    let mirror_cookie = jar
-        .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EIDS_MIRROR))
+    // Browsers may split cookies across several Cookie fields, and the jar
+    // holds only the first, so every field is searched: a mirror missed here
+    // would not be expired after a consent withdrawal.
+    let mirror_cookie = req
+        .headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(cookie::Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == COOKIE_TS_EIDS_MIRROR)
         .map(|cookie| cookie.value().to_owned());
 
     Ok(RequestEc {
@@ -1051,6 +1059,22 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_finds_the_mirror_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let mirror = format!("{COOKIE_TS_EIDS_MIRROR}=m-1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &mirror)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.mirror_cookie(),
+            Some("m-1"),
+            "should capture the mirror from a later Cookie field"
+        );
     }
 
     #[test]
