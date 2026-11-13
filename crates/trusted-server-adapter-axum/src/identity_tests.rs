@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use edgezero_core::http::{Request, Uri, header};
+use edgezero_core::http::{HeaderValue, Request, Response, Uri, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::ec::kv_types::KvEntry;
@@ -25,6 +25,7 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 
 use crate::app::{AppState, build_router, build_state_with_services};
+use crate::identity::build_ec_request_state;
 use crate::platform::{
     AxumPlatformBackend, AxumPlatformConfigStore, AxumPlatformHttpClient, AxumPlatformSecretStore,
 };
@@ -33,19 +34,27 @@ const PUBLISHER_URL: &str = "https://publisher.example.com/article";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const FIRST_PUBCID: &str = "11111111-1111-4111-8111-111111111111";
 const SECOND_PUBCID: &str = "22222222-2222-4222-8222-222222222222";
+const PARTNER_TOKEN: &str = "example-partner-token-for-identify-tests";
 
 /// Local stub serving the publisher origin and the ID5 endpoint.
 struct Stub {
     address: String,
     id5_requests: Arc<AtomicUsize>,
+    origin_requests: Arc<AtomicUsize>,
 }
 
 async fn start_stub() -> Stub {
     let id5_requests = Arc::new(AtomicUsize::new(0));
+    let origin_requests = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&id5_requests);
+    let origin_counter = Arc::clone(&origin_requests);
     let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
         let counter = Arc::clone(&counter);
+        let origin_counter = Arc::clone(&origin_counter);
         async move {
+            if !uri.path().starts_with("/id5") {
+                origin_counter.fetch_add(1, Ordering::SeqCst);
+            }
             if uri.path().starts_with("/id5") {
                 counter.fetch_add(1, Ordering::SeqCst);
                 (
@@ -79,6 +88,7 @@ async fn start_stub() -> Stub {
     Stub {
         address,
         id5_requests,
+        origin_requests,
     }
 }
 
@@ -197,11 +207,16 @@ fn settings(providers: &str) -> Settings {
         name = "pubcid.org"
         source_domain = "pubcid.org"
         bidstream_enabled = true
+        api_token = "{PARTNER_TOKEN}"
 
         [[ec.partners]]
         name = "id5.example.com"
         source_domain = "id5.example.com"
         bidstream_enabled = true
+
+        [[proxy.asset_routes]]
+        prefix = "/assets/"
+        origin_url = "https://assets.example.com"
 
         {providers}
         "#
@@ -281,6 +296,14 @@ impl Harness {
             .map(str::to_owned)
     }
 
+    /// Sends `request` through the router.
+    async fn send(&self, request: Request) -> Response {
+        self.router
+            .oneshot(request)
+            .await
+            .expect("should serve the request")
+    }
+
     /// Mints an EC on a first navigation and returns it.
     async fn mint_ec(&self, consent_cookie: &str) -> String {
         self.navigate(consent_cookie)
@@ -356,7 +379,7 @@ fn consented() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sharedid_cookie_is_stored_and_kept_over_a_later_value() {
+async fn sharedid_cookie_is_stored_and_replaced_by_a_later_value() {
     let harness = harness(SHAREDID_PROVIDER, "DE").await;
     let consent = consented();
     let ec_id = harness.mint_ec(&consent).await;
@@ -375,8 +398,8 @@ async fn sharedid_cookie_is_stored_and_kept_over_a_later_value() {
     assert_eq!(first, vec![FIRST_PUBCID], "should store the SharedID");
     assert_eq!(
         second,
-        vec![FIRST_PUBCID],
-        "should keep the stored SharedID over a different cookie value"
+        vec![SECOND_PUBCID],
+        "should replace the stored SharedID with the cookie's new value"
     );
 }
 
@@ -522,5 +545,161 @@ async fn after_response_http_lookup_stores_the_vendor_id() {
         stored,
         vec!["id5-example-uid"],
         "should store the vendor ID in the follow-up write"
+    );
+}
+
+/// Builds a browser request with `cookie` for `method` and `path`.
+fn browser_request(method: &str, path: &str, cookie: &str) -> Request {
+    edgezero_core::http::request_builder()
+        .method(method)
+        .uri(format!("https://publisher.example.com{path}"))
+        .header(header::HOST, "publisher.example.com")
+        .header(header::USER_AGENT, BROWSER_UA)
+        .header(header::COOKIE, cookie)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build browser request")
+}
+
+fn set_cookies(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_cookie_header_records_a_setup_error() {
+    let harness = harness(SHAREDID_PROVIDER, "DE").await;
+    let mut request = browser_request("GET", "/article", "");
+    request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_bytes(b"ts-ec=\xff").expect("should build a non-UTF-8 cookie header"),
+    );
+
+    let state = build_ec_request_state(&harness.state, &services(&harness.stub, "DE"), &request);
+
+    assert!(
+        state.setup_error.is_some(),
+        "should record the EC context error so dispatch short-circuits"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auction_route_records_a_consent_withdrawal() {
+    let harness = harness(SHAREDID_PROVIDER, "DE").await;
+    let ec_id = harness.mint_ec(&consented()).await;
+    let withdrawn = format!("euconsent-v2={}", tc_string(&[]));
+
+    let response = harness
+        .send(browser_request(
+            "POST",
+            "/auction",
+            &format!("{withdrawn}; ts-ec={ec_id}"),
+        ))
+        .await;
+
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .any(|cookie| cookie.starts_with("ts-ec=;")
+                || cookie.starts_with("ts-ec=\"\";")
+                || (cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0"))),
+        "should expire the EC cookie on the auction response, got {:?}",
+        set_cookies(&response)
+    );
+    assert!(
+        !harness
+            .entry(&ec_id)
+            .expect("should keep the withdrawal tombstone")
+            .consent
+            .ok,
+        "should tombstone the EC row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_returns_the_stored_ids() {
+    let harness = harness(SHAREDID_PROVIDER, "DE").await;
+    let consent = consented();
+    let ec_id = harness
+        .mint_ec(&format!("{consent}; _pubcid={FIRST_PUBCID}"))
+        .await;
+
+    let mut request = browser_request(
+        "GET",
+        "/_ts/api/v1/identify",
+        &format!("{consent}; ts-ec={ec_id}"),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {PARTNER_TOKEN}"))
+            .expect("should build the bearer header"),
+    );
+
+    let response = harness.send(request).await;
+
+    assert_eq!(response.status(), 200, "should serve identify");
+    let body = String::from_utf8(
+        response
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the identify body")
+            .to_vec(),
+    )
+    .expect("should read a UTF-8 identify body");
+    assert!(
+        body.contains(FIRST_PUBCID),
+        "should return the stored SharedID, got {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_sync_route_is_served_without_a_bearer_token() {
+    let harness = harness(SHAREDID_PROVIDER, "DE").await;
+
+    let response = harness
+        .send(browser_request("POST", "/_ts/api/v1/batch-sync", ""))
+        .await;
+
+    assert_eq!(
+        response.status(),
+        401,
+        "should reject batch sync without a bearer token instead of proxying it"
+    );
+    assert_eq!(
+        harness.stub.origin_requests.load(Ordering::SeqCst),
+        0,
+        "should not proxy batch sync to the origin"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asset_route_skips_ec_finalization() {
+    let harness = harness(SHAREDID_PROVIDER, "DE").await;
+    let mut request = browser_request("GET", "/assets/logo.png", &consented());
+    request
+        .headers_mut()
+        .insert("sec-fetch-dest", HeaderValue::from_static("document"));
+    request
+        .headers_mut()
+        .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+    request
+        .headers_mut()
+        .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+
+    let response = harness.send(request).await;
+
+    assert_eq!(
+        harness.stub.origin_requests.load(Ordering::SeqCst),
+        1,
+        "should proxy the asset to its origin"
+    );
+    assert!(
+        set_cookies(&response).is_empty(),
+        "should set no EC cookie on an asset response, got {:?}",
+        set_cookies(&response)
     );
 }

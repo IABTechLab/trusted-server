@@ -11,14 +11,16 @@
 //! - The identity graph is the process-local [`crate::ec_kv::LocalEcKvStore`].
 //! - The dev server sees no TLS or HTTP/2 fingerprint, so the bot gate
 //!   accepts any request whose `User-Agent` names a known platform.
-//! - After-response lookups run on a blocking tokio task spawned when the
-//!   handler returns, rather than after the response bytes are sent.
-//! - Partner pull sync is not run.
+//! - Partner pull sync and after-response lookups run on a blocking tokio
+//!   task spawned when the handler returns, rather than after the response
+//!   bytes are sent.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use edgezero_core::http::{Request, Response, header};
+use error_stack::Report;
+use trusted_server_core::consent::types::ConsentContext;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::cookies::extract_cookie_value;
 use trusted_server_core::ec::after_response::{
@@ -33,10 +35,14 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::page_load::NavigationPermit;
+use trusted_server_core::ec::page_load::{AfterResponseWrite, NavigationPermit};
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
+use trusted_server_core::ec::pull_sync::{
+    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
+};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, current_timestamp};
-use trusted_server_core::platform::{PlatformPendingRequest, RuntimeServices};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::platform::{GeoInfo, PlatformPendingRequest, RuntimeServices};
 
 use crate::app::AppState;
 
@@ -51,6 +57,10 @@ pub(crate) struct EcRequestState {
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
+    /// Geo for request filters.
+    pub(crate) geo_info: Option<GeoInfo>,
+    /// Error reading the EC context, such as a malformed consent string.
+    pub(crate) setup_error: Option<Report<TrustedServerError>>,
 }
 
 /// Identity lookups dispatched for a navigation, collected before finalize.
@@ -118,7 +128,7 @@ pub(crate) fn build_ec_request_state(
             log::warn!("geo lookup failed during EC setup: {e}");
             None
         });
-    let (ec_context, setup_ok) = match EcContext::read_from_request_with_geo(
+    let (ec_context, setup_error) = match EcContext::read_from_request_with_geo(
         state.settings(),
         req,
         services,
@@ -126,18 +136,15 @@ pub(crate) fn build_ec_request_state(
     ) {
         Ok(mut context) => {
             context.set_device_signals(device_signals);
-            (context, true)
+            (context, None)
         }
-        Err(report) => {
-            // A malformed consent signal leaves a fail-closed default context
-            // with no identity-graph access.
-            log::warn!("EC context read failed: {report:?}");
-            (EcContext::default(), false)
-        }
+        Err(report) => (EcContext::default(), Some(report)),
     };
 
-    let kv_graph = setup_ok.then(|| state.identity_graph()).flatten();
-    let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
+    let kv_graph = state.identity_graph();
+    let finalize_kv_graph = if setup_error.is_none()
+        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
+    {
         kv_graph.clone()
     } else {
         None
@@ -151,6 +158,8 @@ pub(crate) fn build_ec_request_state(
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        geo_info,
+        setup_error,
     }
 }
 
@@ -255,17 +264,55 @@ pub(crate) async fn finalize_navigation(
     );
 }
 
-/// Spawns after-response lookups once the navigation response is ready.
+/// Spawns post-response work once a finalized response is ready.
 ///
-/// Runs only when finalization issued the follow-up permit. The lookups run
-/// on a blocking tokio task so they never delay the response; returns `None`
-/// when nothing was spawned.
-pub(crate) fn spawn_after_response_lookups(
+/// Mirrors the Fastly entry point, which runs partner pull sync and then
+/// after-response lookups once the response has been sent. Pull sync runs
+/// for a recognised browser with a consented row that misses a pull-partner
+/// UID. Lookups run only when finalization issued the follow-up permit. The
+/// work runs on a blocking tokio task so it never delays the response;
+/// returns `None` when nothing was spawned.
+pub(crate) fn spawn_post_response_work(
     state: Arc<AppState>,
     services: RuntimeServices,
     ec: &mut EcRequestState,
     lookups: Option<AfterResponseLookups>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    let pull_sync = ec
+        .is_real_browser
+        .then(|| build_pull_sync_context(&ec.ec_context, state.partner_registry()))
+        .flatten();
+    let lookups = after_response_job(ec, lookups);
+    if pull_sync.is_none() && lookups.is_none() {
+        return None;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        log::warn!("Post-response work skipped: no tokio runtime");
+        return None;
+    };
+    Some(tokio::task::spawn_blocking(move || {
+        let _guard = runtime.enter();
+        if let Some(context) = pull_sync {
+            run_pull_sync(&state, &services, &context);
+        }
+        if let Some(job) = lookups {
+            runtime.block_on(run_after_response_lookups(&state, &services, job));
+        }
+    }))
+}
+
+/// After-response lookups cleared to run, with the permit finalization issued.
+struct AfterResponseJob {
+    lookups: AfterResponseLookups,
+    permit: AfterResponseWrite,
+    ec_generated: bool,
+    consent: ConsentContext,
+}
+
+fn after_response_job(
+    ec: &mut EcRequestState,
+    lookups: Option<AfterResponseLookups>,
+) -> Option<AfterResponseJob> {
     let lookups = lookups?;
     let Some(permit) = ec.ec_context.take_after_response_permit() else {
         log::debug!(
@@ -277,57 +324,81 @@ pub(crate) fn spawn_after_response_lookups(
         log::debug!("After-response lookups skipped: EC changed during the request");
         return None;
     }
-    let ec_generated = ec.ec_context.ec_generated();
-    let consent = ec.ec_context.consent().clone();
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        log::warn!("After-response lookups skipped: no tokio runtime");
-        return None;
+    Some(AfterResponseJob {
+        lookups,
+        permit,
+        ec_generated: ec.ec_context.ec_generated(),
+        consent: ec.ec_context.consent().clone(),
+    })
+}
+
+fn run_pull_sync(state: &AppState, services: &RuntimeServices, context: &PullSyncContext) {
+    let Some(graph) = state.identity_graph() else {
+        log::debug!("Pull sync: identity graph unavailable, skipping");
+        return;
     };
-    Some(tokio::task::spawn_blocking(move || {
-        runtime.block_on(async move {
-            let Some(coordinator) = state.after_response_identity() else {
-                return;
-            };
-            let Some(graph) = state.identity_graph() else {
-                return;
-            };
-            let snapshot = graph.load_snapshot(&lookups.ec_id);
-            if !after_response_lookups_allowed(&snapshot, &lookups.ec_id, ec_generated) {
-                log::debug!("After-response lookups skipped: new EC or no live row");
-                return;
-            }
-            let transport = PlatformLookupTransport::new(&services);
-            let pending = coordinator
-                .dispatch(
-                    &transport,
-                    &LookupContext {
-                        ec_id: &lookups.ec_id,
-                        snapshot: &snapshot,
-                        minted_entry: None,
-                        consent: &consent,
-                        client: ClientSignals {
-                            ip: lookups.client_ip,
-                            user_agent: lookups.user_agent.as_deref(),
-                        },
-                        publisher_domain: &state.settings().publisher.domain,
-                        cookies: RequestCookies::new(&lookups.cookie_header),
-                        rate_limiter: state.rate_limiter(),
-                        now: UnixSeconds::new(current_timestamp()),
-                    },
-                )
-                .await;
-            if pending.is_empty() {
-                return;
-            }
-            let results = coordinator.collect(&transport, pending).await;
-            let outcome = commit_after_response_lookups(
-                &graph,
-                permit,
-                state.partner_registry(),
-                &lookups.ec_id,
-                &results,
-            );
-            log::info!("After-response lookups: write outcome={outcome}");
-        });
-    }))
+    dispatch_pull_sync(
+        state.settings(),
+        &graph,
+        state.partner_registry(),
+        state.rate_limiter(),
+        context,
+        services,
+    );
+}
+
+async fn run_after_response_lookups(
+    state: &AppState,
+    services: &RuntimeServices,
+    job: AfterResponseJob,
+) {
+    let AfterResponseJob {
+        lookups,
+        permit,
+        ec_generated,
+        consent,
+    } = job;
+    let Some(coordinator) = state.after_response_identity() else {
+        return;
+    };
+    let Some(graph) = state.identity_graph() else {
+        return;
+    };
+    let snapshot = graph.load_snapshot(&lookups.ec_id);
+    if !after_response_lookups_allowed(&snapshot, &lookups.ec_id, ec_generated) {
+        log::debug!("After-response lookups skipped: new EC or no live row");
+        return;
+    }
+    let transport = PlatformLookupTransport::new(services);
+    let pending = coordinator
+        .dispatch(
+            &transport,
+            &LookupContext {
+                ec_id: &lookups.ec_id,
+                snapshot: &snapshot,
+                minted_entry: None,
+                consent: &consent,
+                client: ClientSignals {
+                    ip: lookups.client_ip,
+                    user_agent: lookups.user_agent.as_deref(),
+                },
+                publisher_domain: &state.settings().publisher.domain,
+                cookies: RequestCookies::new(&lookups.cookie_header),
+                rate_limiter: state.rate_limiter(),
+                now: UnixSeconds::new(current_timestamp()),
+            },
+        )
+        .await;
+    if pending.is_empty() {
+        return;
+    }
+    let results = coordinator.collect(&transport, pending).await;
+    let outcome = commit_after_response_lookups(
+        &graph,
+        permit,
+        state.partner_registry(),
+        &lookups.ec_id,
+        &results,
+    );
+    log::info!("After-response lookups: write outcome={outcome}");
 }
