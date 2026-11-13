@@ -8188,6 +8188,8 @@ mod tests {
         response_is_private: bool,
         auction_preserved_client_snapshot: bool,
         origin_kv_auction_order: bool,
+        /// Whether any request reached the scheduling bid endpoint.
+        bidder_dispatched: bool,
         datadome_tag_suppressed: bool,
         ok: bool,
     }
@@ -8424,6 +8426,7 @@ mod tests {
         let origin_kv_auction_order = bidder_dispatch
             .as_ref()
             .is_some_and(|dispatch| dispatch.origin_calls == 1 && dispatch.lookups == 1);
+        let bidder_dispatched = bidder_dispatch.is_some();
         let datadome_tag_suppressed = if let Ok(response) = result {
             let registry = IntegrationRegistry::new(&settings)
                 .expect("should create integration registry with DataDome");
@@ -8461,6 +8464,7 @@ mod tests {
             response_is_private,
             auction_preserved_client_snapshot,
             origin_kv_auction_order,
+            bidder_dispatched,
             datadome_tag_suppressed,
             ok,
         }
@@ -8696,7 +8700,7 @@ mod tests {
             "origin-start failure must occur before any EC KV work"
         );
         assert!(
-            !outcome.origin_kv_auction_order,
+            !outcome.bidder_dispatched,
             "origin-start failure must occur before any auction dispatch"
         );
     }
