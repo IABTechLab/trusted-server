@@ -148,7 +148,7 @@ fn rewrite_provider_endpoints(settings: &mut Settings, origin: &str) -> Result<(
         let mut rewritten = origin.clone();
         rewritten.set_path(endpoint.path());
         rewritten.set_query(endpoint.query());
-        provider.endpoint = rewritten.into();
+        provider.endpoint = String::from(rewritten);
     }
     Ok(())
 }
