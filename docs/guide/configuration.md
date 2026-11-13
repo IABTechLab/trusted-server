@@ -630,6 +630,13 @@ Integration-owned allocations are outside the framework's bound.
   same capped decoder as the Fastly streaming path. Buffered responses also keep
   their separate post-rewrite output cap. A processor that reduces the document
   size cannot bypass these input limits.
+- On **Axum, Cloudflare, and Spin** it also caps the publisher origin input for
+  every response, raw ones included, before egress: the origin's encoded bytes,
+  and the decoded bytes of processed HTML, or of every response on Cloudflare,
+  which decodes the origin body. Cloudflare and Spin keep their
+  10 MiB and 8 MiB caps when this setting is higher. On Axum it is the only
+  input cap, and a raw origin response over it now fails with `502` where Axum
+  buffered it with no cap.
 
 **Behavior when exceeded**:
 
