@@ -218,6 +218,13 @@ impl IdentityProvider for LiveRampProvider {
         &self.capabilities
     }
 
+    /// Only the Custom ID lookup sends the EC ID. Without an `endpoint` the
+    /// provider only reads cookies, so it may run on the navigation that
+    /// mints the EC.
+    fn sends_ec_id(&self) -> bool {
+        self.lookup.is_some()
+    }
+
     fn build_request(
         &self,
         lookup: &LookupInput<'_>,
