@@ -2061,6 +2061,20 @@ fn spin_runtime_publisher_post_body_reaches_origin() {
             sent.len(),
             received.body.len()
         );
+        // EdgeZero's Spin client sends a streamed upload chunked and drops its
+        // declared length. Trusted Server asked EdgeZero to keep the declared
+        // `Content-Length` on PR 275
+        // (https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880).
+        // Once a repin carries that fix, this assertion fails: expect
+        // `Content-Length: 4096` and no `Transfer-Encoding` instead.
+        assert_eq!(
+            (
+                received.content_length.as_deref(),
+                received.transfer_encoding.as_deref()
+            ),
+            (None, Some("chunked")),
+            "Spin should forward a streamed upload chunked until EdgeZero keeps its declared length"
+        );
     });
 }
 

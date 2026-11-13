@@ -735,6 +735,22 @@ buffered body is checked before sending
 (`edgezero:crates/edgezero-core/src/outbound.rs:1903-1908`). Today Fastly
 reads the whole inbound body into memory with no cap.
 
+A streamed Spin upload also loses its declared length. The Spin inbound body
+is a stream (`edgezero@14a6ca8b:crates/edgezero-adapter-spin/src/request.rs:97`),
+`from_request` drops `Content-Length` with the other request framing fields
+(`edgezero@14a6ca8b:crates/edgezero-core/src/outbound.rs:2253-2256`), and the
+Spin client sets `Content-Length` only for a buffered body
+(`edgezero@14a6ca8b:crates/edgezero-adapter-spin/src/outbound.rs:900-915`). So
+a Spin publisher POST, PUT, or PATCH reaches the origin chunked, with no
+`Content-Length`, where Trusted Server's Spin client buffered the upload and
+sent its length (`crates/trusted-server-adapter-spin/src/platform.rs:512-523`).
+An origin or WAF that requires a length answers 411 or rejects the request.
+Trusted Server does not buffer the upload to restore the length. EdgeZero is
+asked to keep the declared `Content-Length` for a streamed Spin upload
+([PR 275 comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880)).
+`spin_runtime_publisher_post_body_reaches_origin` asserts the chunked framing,
+so a repin that carries the fix fails it.
+
 #### 2.6 Redirect following
 
 `proxy_with_redirects` (`proxy.rs:1276-1560`) and `ProxyRedirectPolicy`
@@ -1581,12 +1597,12 @@ numeric codes, never provider text or URLs (EZ-16).
 
 ## Adapter impact
 
-| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                                                                                                           |
-| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Publisher origin input is capped at `publisher.max_buffered_body_bytes` for every classification, its first input cap, and raw responses are collected before egress (2.5). Startup failure exits the process         |
-| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip (`Decode`, 2.5) and manual redirect. Publisher origin input still capped at 10 MiB for every classification, and raw responses collected before egress (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error     |
-| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Publisher origin input and HTML expansion still capped at 8 MiB for every classification, and raw responses collected before egress (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check |
+| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Publisher origin input is capped at `publisher.max_buffered_body_bytes` for every classification, its first input cap, and raw responses are collected before egress (2.5). Startup failure exits the process                                                                                                                                  |
+| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip (`Decode`, 2.5) and manual redirect. Publisher origin input still capped at 10 MiB for every classification, and raw responses collected before egress (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error                                                                                                                              |
+| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Publisher origin input and HTML expansion still capped at 8 MiB for every classification, and raw responses collected before egress (2.5). A publisher upload reaches the origin chunked, with no `Content-Length`, until EdgeZero keeps the declared length (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check |
 
 Core carries 63 sites plus the outbound migration. The CLI library compiles
 against H unchanged, and its tests change only for the Axum harness.
@@ -1890,6 +1906,13 @@ Other reviewers' open threads also reach Trusted Server:
   Server's body helper then answers 502 and logs at error. At the pin, Fastly
   and Cloudflare map such an error the same way, so Failure handling lists 502
   for every adapter.
+
+Trusted Server's own asks on PR 275 are in
+[one comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880),
+checked against head `1467e28a`. Trusted Server adds no workaround for them:
+
+- A streamed Spin upload goes out chunked and loses its declared
+  `Content-Length` (2.5).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
