@@ -17,6 +17,7 @@ use crate::integrations::aps::{ApsDebugRequest, parse_planned_aps_response};
 use crate::integrations::prebid::{apply_prebid_transport_headers, parse_planned_prebid_response};
 
 use crate::error::TrustedServerError;
+use crate::integrations::UPSTREAM_RTB_MAX_RESPONSE_BYTES;
 use crate::outbound::{OutboundRequestSource, buffered, outbound_error, outbound_request};
 use crate::request_signing::{RequestSigner, SigningParams};
 
@@ -29,8 +30,21 @@ use super::profile::CompiledOpenRtbProfile;
 use super::routing::{ProviderAuctionInput, RoutedAuction};
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
-/// Response cap for every bidder request.
-const MAX_PLANNED_RESPONSE_BYTES: u64 = 1024 * 1024;
+/// Response cap for a Standard-profile bidder request.
+const STANDARD_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// The response cap for a bidder request with `profile`.
+///
+/// Prebid Server and APS keep the 2 MiB RTB cap
+/// ([`UPSTREAM_RTB_MAX_RESPONSE_BYTES`]), and Standard keeps 1 MiB.
+fn response_cap(profile: &CompiledOpenRtbProfile) -> u64 {
+    match profile {
+        CompiledOpenRtbProfile::Standard(_) => STANDARD_MAX_RESPONSE_BYTES,
+        CompiledOpenRtbProfile::PrebidServer(_) | CompiledOpenRtbProfile::Aps(_) => {
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES
+        }
+    }
+}
 
 fn attach_provider_routing_metadata(
     response: &mut AuctionResponse,
@@ -256,7 +270,8 @@ impl GenericOpenRtbProvider {
     ///
     /// The request carries the configured provider timeout, never the
     /// remaining auction budget, which only `logical_budget_ms` and the batch
-    /// cutoff reflect. Its response is buffered under 1 MiB and decoded.
+    /// cutoff reflect. Its response is buffered under the profile's
+    /// [`response_cap`] and decoded.
     pub(crate) fn request_bids_routed(
         &self,
         input: &ProviderAuctionInput,
@@ -315,7 +330,7 @@ impl GenericOpenRtbProvider {
         let mut outbound = buffered(
             target,
             Duration::from_millis(u64::from(self.plan.timeout_ms)),
-            MAX_PLANNED_RESPONSE_BYTES,
+            response_cap(&self.plan.profile),
             ResponseDecoding::Decode,
         )
         .cache_policy(OutboundCachePolicy::Bypass)
@@ -513,7 +528,7 @@ impl GenericOpenRtbProvider {
         }
 
         let body = response
-            .into_bytes_bounded(MAX_PLANNED_RESPONSE_BYTES)
+            .into_bytes_bounded(STANDARD_MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| {
                 outbound_error(

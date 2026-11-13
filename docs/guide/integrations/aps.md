@@ -219,7 +219,7 @@ exchange in that provider's summary returned by `POST /auction`:
 }
 ```
 
-This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. A response body over the 2 MiB upstream limit fails the provider with `error_type` `transport` and carries no debug metadata. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
 
 The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
 

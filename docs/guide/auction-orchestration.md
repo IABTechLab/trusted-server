@@ -846,8 +846,10 @@ A provider's reported response time runs from the batch start to its bid's
 arrival, so a collection that waits after an on-time bid does not increase it.
 
 Personalized auction and mediator requests explicitly bypass intermediary
-caches. Each bidder response is capped at 1 MiB and the mediator response at
-2 MiB. No cap applies across all bidder responses together.
+caches. A `prebid-server` or `aps` bidder response is capped at 2 MiB, a
+`standard` bidder response at 1 MiB, and the mediator response at 2 MiB. A
+bidder response over its cap fails that provider with `error_type`
+`transport`. No cap applies across all bidder responses together.
 
 On Fastly, EdgeZero records a bid's arrival whenever one of its polls services
 the provider, including the origin body reads while a page streams. A bid that

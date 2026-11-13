@@ -2290,6 +2290,7 @@ pub(crate) async fn parse_planned_prebid_response(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // The request buffered the response under the same cap.
     let body_bytes = response
         .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
         .await
@@ -9467,67 +9468,6 @@ set = { networkId = 42 }
                 && !parsed.metadata.contains_key("upstream_message_truncated"),
             "debug-disabled planned PBS must not expose upstream error metadata"
         );
-    }
-
-    #[test]
-    fn planned_parser_bounds_oversized_success_and_error_bodies() {
-        let profile = planned_prebid_profile(true);
-        for response in [
-            prebid_platform_response(
-                StatusCode::OK,
-                Some("application/json"),
-                vec![b'x'; rtb_cap_len() + 1],
-            ),
-            prebid_platform_response_with_body(
-                StatusCode::OK,
-                Some("application/json"),
-                EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; rtb_cap_len()]),
-                    Bytes::from_static(b"x"),
-                ])),
-            ),
-        ] {
-            assert!(
-                futures::executor::block_on(parse_planned_prebid_response(
-                    "pbs-instance",
-                    &profile,
-                    &planned_prebid_input(&["fictional-slot"]),
-                    response,
-                    42,
-                    "auction-oversized-success",
-                ))
-                .is_err(),
-                "oversized successful planned PBS responses must fail bounded collection"
-            );
-        }
-
-        for response in [
-            prebid_platform_response(
-                StatusCode::BAD_GATEWAY,
-                Some("text/plain"),
-                vec![b'x'; rtb_cap_len() + 1],
-            ),
-            prebid_platform_response_with_body(
-                StatusCode::SERVICE_UNAVAILABLE,
-                Some("text/plain"),
-                EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; rtb_cap_len()]),
-                    Bytes::from_static(b"x"),
-                ])),
-            ),
-        ] {
-            let expected_status = response.status().as_u16();
-            let parsed = futures::executor::block_on(parse_planned_prebid_response(
-                "pbs-instance",
-                &profile,
-                &planned_prebid_input(&["fictional-slot"]),
-                response,
-                42,
-                "auction-oversized-error",
-            ))
-            .expect("should preserve HTTP classification for oversized planned error body");
-            assert_oversized_http_error_is_classified(&parsed, expected_status);
-        }
     }
 
     #[test]

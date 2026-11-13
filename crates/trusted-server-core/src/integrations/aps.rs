@@ -876,10 +876,12 @@ fn parse_planned_aps_value(
     response
 }
 
-/// Reads an APS response body under the RTB cap its request buffered it with.
+/// Reads an APS response body under the 2 MiB RTB cap.
 ///
-/// A failure keeps `message` as a 502 and carries the [`EdgeError`](edgezero_core::error::EdgeError)
-/// opaquely, through [`outbound_error`].
+/// A planned APS request buffers its response under the same cap. A failure
+/// keeps `message` as a 502 and carries the
+/// [`EdgeError`](edgezero_core::error::EdgeError) opaquely, through
+/// [`outbound_error`].
 async fn read_aps_body(
     response: OutboundResponse,
     message: &str,

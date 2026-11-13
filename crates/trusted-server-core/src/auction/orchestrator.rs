@@ -1293,7 +1293,7 @@ mod tests {
 
     use base64::Engine as _;
     use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
-    use edgezero_core::outbound::OutboundResponse;
+    use edgezero_core::outbound::{OutboundResponse, ResponseMode};
     use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use http::{Method, StatusCode};
 
@@ -1322,7 +1322,7 @@ mod tests {
         StoreName,
     };
     use crate::test_support::scripted_client::{
-        ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
+        RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::Report;
@@ -1331,8 +1331,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_TIMEOUT,
-        ERROR_TYPE_TRANSPORT, OrchestrationResult,
+        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_HTTP_STATUS, ERROR_TYPE_LAUNCH_FAILED,
+        ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT, OrchestrationResult,
     };
 
     /// Endpoint every [`planned_config`] provider shares.
@@ -5875,7 +5875,10 @@ mod tests {
 
     #[tokio::test]
     async fn planned_routing_count_survives_standard_and_aps_bounded_body_failures() {
-        for (profile, provider_id) in [("standard", "standard"), ("aps", "aps-instance")] {
+        for (profile, provider_id, cap) in [
+            ("standard", "standard", STANDARD_CAP),
+            ("aps", "aps-instance", RTB_CAP),
+        ] {
             let clock = TestClock::new();
             let http = ScriptedHttpClient::new(&clock);
             let endpoint = if profile == "standard" {
@@ -5883,7 +5886,7 @@ mod tests {
             } else {
                 APS_ENDPOINT
             };
-            respond(&http, endpoint, 200, vec![b'x'; 1024 * 1024 + 1]);
+            respond(&http, endpoint, 200, vec![b'x'; cap + 1]);
             let services = build_services_with_outbound_client(&http, &clock);
             let mut config = if profile == "standard" {
                 planned_config(&[(provider_id, RoutingMode::AllEligible)], false)
@@ -5924,12 +5927,186 @@ mod tests {
             let response = &result.provider_responses[0];
             assert_eq!(response.status, BidStatus::Error, "{profile}");
             assert_eq!(
+                response.metadata["error_type"], ERROR_TYPE_TRANSPORT,
+                "{profile} should fail a body over its cap in the transport"
+            );
+            assert_eq!(
                 response.metadata["routing"]["unused_bidder_params_count"], 1,
                 "{profile} bounded-body failure should retain the input-derived count"
             );
             let routing = serde_json::to_string(&response.metadata["routing"])
                 .expect("should serialize routing metadata");
             assert!(!routing.contains("example-bidder") && !routing.contains("private"));
+        }
+    }
+
+    /// The Standard bidder response cap, as a body length.
+    const STANDARD_CAP: usize = 1024 * 1024;
+
+    /// The Prebid Server and APS bidder response cap, as a body length.
+    const RTB_CAP: usize = 2 * 1024 * 1024;
+
+    /// Endpoint of the [`planned_prebid_config`] provider `pbs`.
+    const PBS_ENDPOINT: &str = "https://pbs.example.test/openrtb";
+
+    /// Runs one planned auction over `config` with `reply` queued for `endpoint`.
+    ///
+    /// Returns the result and the requests the auction sent.
+    async fn run_one_planned_auction(
+        config: AuctionPlanConfig,
+        request: &AuctionRequest,
+        endpoint: &str,
+        reply: ScriptedReply,
+    ) -> (OrchestrationResult, Vec<RecordedRequest>) {
+        let clock = TestClock::new();
+        let http = ScriptedHttpClient::new(&clock);
+        http.respond_to(Method::POST, endpoint, reply);
+        let services = build_services_with_outbound_client(&http, &clock);
+        let plan = AuctionPlan::compile(config).expect("should compile the planned auction");
+        let orchestrator = planned_orchestrator(plan, None);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+        let result = orchestrator
+            .run_auction(request, &context)
+            .await
+            .expect("should complete the planned auction");
+        (result, http.requests())
+    }
+
+    /// One provider of each profile, with the request it routes and its endpoint.
+    fn one_provider_per_profile() -> [(
+        &'static str,
+        AuctionPlanConfig,
+        AuctionRequest,
+        &'static str,
+    ); 3] {
+        [
+            (
+                "standard",
+                planned_config(&[("standard", RoutingMode::AllEligible)], false),
+                planned_request(),
+                PLANNED_ENDPOINT,
+            ),
+            (
+                "prebid-server",
+                planned_prebid_config(&[(
+                    "pbs",
+                    serde_json::json!({}),
+                    NotificationConfig::default(),
+                )]),
+                planned_prebid_request(),
+                PBS_ENDPOINT,
+            ),
+            ("aps", planned_aps_config(), planned_request(), APS_ENDPOINT),
+        ]
+    }
+
+    #[tokio::test]
+    async fn planned_bidder_response_cap_follows_the_profile() {
+        for (profile, config, request, endpoint) in one_provider_per_profile() {
+            let (_, requests) =
+                run_one_planned_auction(config, &request, endpoint, reply(204, Vec::new())).await;
+
+            let [bidder] = requests.as_slice() else {
+                panic!(
+                    "should send one {profile} bidder request, sent {}",
+                    requests.len()
+                );
+            };
+            let expected = if profile == "standard" {
+                STANDARD_CAP
+            } else {
+                RTB_CAP
+            };
+            assert_eq!(
+                bidder.response_mode,
+                ResponseMode::Buffered {
+                    max_bytes: u64::try_from(expected).expect("should fit the cap in u64")
+                },
+                "should buffer the {profile} bidder response under its profile's cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_prebid_reply_between_one_and_two_mib_wins() {
+        let reply_body = serde_json::to_vec(&serde_json::json!({
+            "seatbid": [{"seat": "example-seat", "bid": [{
+                "id": "large-bid",
+                "impid": "fictional-slot",
+                "price": 2.5,
+                "adm": "<div>fictional creative</div>",
+                "w": 300,
+                "h": 250
+            }]}],
+            "ext": {"padding": "x".repeat(STANDARD_CAP / 2 * 3)}
+        }))
+        .expect("should serialize the large PBS reply");
+        assert!(
+            (STANDARD_CAP..RTB_CAP).contains(&reply_body.len()),
+            "should build a reply over the Standard cap and under the RTB cap"
+        );
+
+        let (result, _) = run_one_planned_auction(
+            planned_prebid_config(&[("pbs", serde_json::json!({}), NotificationConfig::default())]),
+            &planned_prebid_request(),
+            PBS_ENDPOINT,
+            reply(200, reply_body),
+        )
+        .await;
+
+        let response = &result.provider_responses[0];
+        assert_eq!(
+            (response.status.clone(), response.metadata.get("error_type")),
+            (BidStatus::Success, None),
+            "should parse a valid PBS reply under the 2 MiB cap"
+        );
+        assert_eq!(
+            result.winning_bids["fictional-slot"].bid_id.as_deref(),
+            Some("large-bid"),
+            "should let the large PBS reply's bid win"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_rtb_bodies_past_the_cap_fail_in_transport() {
+        for (profile, config, request, endpoint) in one_provider_per_profile() {
+            if profile == "standard" {
+                continue;
+            }
+            for (status, length, error_type) in [
+                (200, RTB_CAP + 1, ERROR_TYPE_TRANSPORT),
+                (502, RTB_CAP + 1, ERROR_TYPE_TRANSPORT),
+                (502, RTB_CAP, ERROR_TYPE_HTTP_STATUS),
+            ] {
+                let (result, _) = run_one_planned_auction(
+                    config.clone(),
+                    &request,
+                    endpoint,
+                    reply(status, vec![b'x'; length]),
+                )
+                .await;
+
+                let response = &result.provider_responses[0];
+                assert_eq!(
+                    (response.status.clone(), &response.metadata["error_type"]),
+                    (BidStatus::Error, &serde_json::json!(error_type)),
+                    "should classify a {profile} {status} with a {length}-byte body as {error_type}"
+                );
+                if error_type == ERROR_TYPE_HTTP_STATUS {
+                    assert_eq!(
+                        response.metadata["http_status"], status,
+                        "should keep the {profile} status for an error body at the cap"
+                    );
+                }
+            }
         }
     }
 

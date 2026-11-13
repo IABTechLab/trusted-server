@@ -386,7 +386,7 @@ is not UTF-8 and would fail the whole call (`outbound.rs:1191-1211`).
 
 | Site                               | Trusted Server code                                                                                                                                                                                                                                                                 | Call on H                                    | Response                                                                       | Timeout                                                                                                |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| O1 Auction bidders                 | `GenericOpenRtbProvider::request_bids_routed` (`crates/trusted-server-core/src/auction/provider.rs:273-400`)                                                                                                                                                                        | One `start_batch_until` per auction (2.4)    | Buffered, 1 MiB (`provider.rs:30`), Decode                                     | Configured provider timeout                                                                            |
+| O1 Auction bidders                 | `GenericOpenRtbProvider::request_bids_routed` (`crates/trusted-server-core/src/auction/provider.rs:273-400`)                                                                                                                                                                        | One `start_batch_until` per auction (2.4)    | Buffered per profile: PBS and APS 2 MiB, Standard 1 MiB, Decode                | Configured provider timeout                                                                            |
 | O2 Auction mediator                | `AdServerMockProvider::request_bids` (`crates/trusted-server-core/src/integrations/adserver_mock.rs:435-523`)                                                                                                                                                                       | `send` after the batch (2.4)                 | Buffered 2 MiB (`UPSTREAM_RTB_MAX_RESPONSE_BYTES`, unchanged), Decode          | Configured mediator timeout, plus the auction deadline                                                 |
 | O3 Auction entry points            | `/auction` `handle_auction` (`crates/trusted-server-core/src/auction/endpoints.rs:407`), page bids `handle_page_bids` (`crates/trusted-server-core/src/publisher.rs:7634`), and the publisher page path                                                                             | O1 and O2                                    | As O1 and O2                                                                   | As O1 and O2                                                                                           |
 | O4 Publisher, overlapped           | `publisher.rs:5318-5352`, `:5676`                                                                                                                                                                                                                                                   | `begin` (2.5)                                | Streamed, Original                                                             | 60 s                                                                                                   |
@@ -1664,9 +1664,13 @@ Outbound, continued:
 26. Bidder responses have no aggregate buffer cap. Today Trusted Server's
     Fastly collector caps the partial bid bodies it retains at 10 MiB together
     (`MAX_TOTAL_BUFFERED_BODY_BYTES`). After the cut each bidder response keeps
-    its own 1 MiB cap, across up to 160 provider backends. The maintainer
-    accepted the per-bidder cap as enough, so the cut adds no aggregate cap and
-    asks EdgeZero for none.
+    today's cap for its profile, 2 MiB for Prebid Server and APS and 1 MiB for
+    Standard, across up to 160 provider backends. The maintainer accepted the
+    per-bidder caps as enough, so the cut adds no aggregate cap and asks
+    EdgeZero for none. Each cap now applies in EdgeZero's buffered collection,
+    so a body over it is classed `transport`. Today the platform collects up
+    to 10 MiB, and a body over the profile's cap is classed `parse_response`,
+    or `http_status` for an error status.
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
