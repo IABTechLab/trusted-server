@@ -193,16 +193,17 @@ marks the record contract and geo as supported.
   the dev-server image (`STOPSIGNAL SIGINT`).
 - **AX-6 Reference infrastructure.** The reference stack wires the DynamoDB
   table, port 443 egress for vendor APIs, a readiness signal, JSON logs, two or
-  more tasks and an example rate-based rule at the load balancer,
-  since Axum's own limits are off by default (DEC-11). A store outage only
-  degrades identity (Failure handling), so the load balancer health check
-  stays green while identity reports itself degraded.
-  IABTechLab/edgezero#275 serves Axum on a current-thread runtime, so capacity
-  comes from task count. Accept: the stack applies with those properties, the
-  rate rule refuses traffic over its threshold, and with DynamoDB unreachable
-  pages keep serving while identity reports degraded. State: #1540 has the 443
-  egress (IPv4 only), a static `/health`, plain logs, one task and no DynamoDB
-  wiring; EdgeZero's readiness probe does not poll dependencies.
+  more tasks and an example rate-based rule at the load balancer, since Axum's
+  own limits are off by default (DEC-11). A store outage only degrades identity
+  (Failure handling), so the load balancer health check stays green while
+  identity reports itself degraded. IABTechLab/edgezero#275 serves Axum on a
+  current-thread runtime, so capacity comes from task count. Accept: the stack
+  applies with those properties, the rate rule refuses traffic over its
+  threshold, and with DynamoDB unreachable pages keep serving while identity
+  reports degraded. State: #1540 at `db1ba337a` has the 443 egress (IPv4 only),
+  a `/health` check, one task, an opt-in CloudFront front door for geo, and a
+  DynamoDB table whose IAM policy allows one partition key and one allocator
+  item (AX-4); EdgeZero's readiness probe does not poll dependencies.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
   (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists
   only on an RC branch, such as `456313675`, which #1528 pins today. Main may
@@ -642,11 +643,12 @@ Decided:
   to main rather than back-port the provider stack to it, which conflicted in 13
   to 23 files at the heads first measured and 21 to 24 at the round-4 heads.
   #1531 restacks on #1506 for A1 and #1532 on #1531 for #1529. The image and
-  Terraform units (#1539, #1538, #1540) restack on #1531, where they apply
-  cleanly. #1536 and #1537 are not restacked: their Axum-only stores, store
-  selection and wiring give way to EZI-2b, T6 and T21, and their tests move into
-  A2, A8 and T5. #1535 goes into the EC route (T19, T20), and #1533 and #1534
-  close as copies of #1525 and #1526.
+  Terraform units (#1539, #1538, #1540) restack on #1531: #1539 and #1538 apply
+  cleanly, and #1540 at `db1ba337a` conflicts in one file,
+  `docs/guide/native-ec-persistence.md`. #1536 and #1537 are not restacked:
+  their Axum-only stores, store selection and wiring give way to EZI-2b, T6 and
+  T21, and their tests move into A2, A8 and T5. #1535 goes into the EC route
+  (T19, T20), and #1533 and #1534 close as copies of #1525 and #1526.
 - **DEC-7 SharedID creation and retention.** Creation (user, 2026-11-12): when
   neither the record nor the request has a SharedID, the server creates one,
   because a browser may block Prebid.js from loading at all (WB-3). Retention
@@ -838,4 +840,5 @@ threads, 101 in all, and opened nothing new. Threads 40 and 58 stayed open on
 one issue: sending only the latest waiting consent could drop a withdrawal made
 between a grant in flight and a later regrant. ID-9 and T20 now keep a waiting
 withdrawal as a barrier that later changes wait behind, and ID-9's Accept adds
-the grant, withdrawal and regrant case.
+the grant, withdrawal and regrant case. After it, #1516 merged on main and #1540
+and #1541 moved, so Part A, Part C, AX-6 and DEC-6 now record their new state.

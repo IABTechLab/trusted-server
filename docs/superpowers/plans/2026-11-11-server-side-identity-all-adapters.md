@@ -82,30 +82,30 @@ design](../specs/2026-11-11-server-side-identity-all-adapters-design.md)
 
 Trusted Server:
 
-| PR                  | Head                                  | Base on GitHub                        | Fix                                                                                                                                                                                              |
-| ------------------- | ------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| #1557               | `76e1dd5f6`                           | main                                  | None                                                                                                                                                                                             |
-| #1525               | `cd8977cad`                           | main                                  | None; #1526 does not need it                                                                                                                                                                     |
-| #1526               | `e529e5576`                           | #1525's branch                        | Retarget to main; its own diff applies cleanly there                                                                                                                                             |
-| #1516               | `214cd4821`                           | main                                  | Rebase onto main: `CHANGELOG.md` conflicts                                                                                                                                                       |
-| #1503               | `5e10c24e4`                           | main                                  | None; needs neither #1506 nor new EdgeZero                                                                                                                                                       |
-| #1449               | `fd33f2c74`                           | main                                  | Outside this plan (DEC-19)                                                                                                                                                                       |
-| #1506               | `9ec4711d3`                           | main                                  | Rebase after #1557, #1526 and #1516                                                                                                                                                              |
-| #1487               | `1600781eb`                           | main                                  | Rebase after #1526 and #1506: 8 and 17 files conflict                                                                                                                                            |
-| #1488               | `7f55776f3`                           | #1487's branch                        | Take #1566's two #1488 commits                                                                                                                                                                   |
-| #1489               | `d3780ba13`                           | #1488's branch                        | None                                                                                                                                                                                             |
-| #1566               | `117a58e0e`                           | #1488's branch                        | Move its two #1488 commits down; rebuild the Axum part on T21 and EdgeZero (Part C). 1 file conflicts with #1489, 19 with #1506                                                                  |
-| #1527               | `a020daeec`                           | #1526's branch                        | Close once #1506 covers its tests (DEC-1)                                                                                                                                                        |
-| #1528               | `ea779fb47`                           | #1527's branch                        | Close once #1531 carries A1                                                                                                                                                                      |
-| #1543               | `e5e6ea7fa`                           | #1449's branch                        | Outside this plan (DEC-19)                                                                                                                                                                       |
-| #1424               | `2423a2ed2`                           | main                                  | Conflicting, head `rc/edgezero-431-demo`; close at parity                                                                                                                                        |
-| #1499               | `084fdbba9`                           | #1424's branch                        | Close at parity                                                                                                                                                                                  |
-| #1531               | `88a6ba596`                           | #1506's branch                        | Retargeted without a rebase: it forks from main with its own cutover and the RC tag pin, and 15 files conflict with #1506 at `9ec4711d3`. Rebase onto #1506; it then delivers A1                 |
-| #1532               | `852b875fe`                           | #1531's branch                        | Delivers #1529 (A4); restack after #1531                                                                                                                                                         |
-| #1533, #1534        | `82d9a0e66`, `646c39a34`              | #1532's and #1533's branches          | RC-baseline copies of #1525 and #1526: drop from the chain and close                                                                                                                             |
-| #1536, #1535, #1537 | `296e05405`, `0666a9b4b`, `4a838272c` | #1534's, #1536's and #1535's branches | Not restacked: mostly Axum-only stores, store selection and wiring that EZI-2b, T6 and T21 replace. Their tests go to A2, A8 and T5 and #1535's code to T19 and T20; each closes when those land |
-| #1539, #1538, #1540 | `8d41cb06c`, `3111c2456`, `eb6e19ef4` | #1537's, #1539's and #1538's branches | Restack on #1531 (A1), where they apply cleanly. #1539 and #1543 both add `.dockerignore`, so whichever lands second reconciles it                                                               |
-| #1541               | `7dd2e3056`                           | main                                  | Close at parity                                                                                                                                                                                  |
+| PR                  | Head                                  | Base on GitHub                        | Fix                                                                                                                                                                                                                                             |
+| ------------------- | ------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1557               | `76e1dd5f6`                           | main                                  | None                                                                                                                                                                                                                                            |
+| #1525               | `cd8977cad`                           | main                                  | None; #1526 does not need it                                                                                                                                                                                                                    |
+| #1526               | `e529e5576`                           | #1525's branch                        | Retarget to main; its own diff applies cleanly there                                                                                                                                                                                            |
+| #1516               | `8b9c45d5e`                           | main                                  | Merged on main as `1810c763a` on 2026-11-12                                                                                                                                                                                                     |
+| #1503               | `5e10c24e4`                           | main                                  | None; needs neither #1506 nor new EdgeZero                                                                                                                                                                                                      |
+| #1449               | `fd33f2c74`                           | main                                  | Outside this plan (DEC-19)                                                                                                                                                                                                                      |
+| #1506               | `9ec4711d3`                           | main                                  | Rebase after #1557 and #1526; #1516 has merged                                                                                                                                                                                                  |
+| #1487               | `1600781eb`                           | main                                  | Rebase after #1526 and #1506: 8 and 17 files conflict                                                                                                                                                                                           |
+| #1488               | `7f55776f3`                           | #1487's branch                        | Take #1566's two #1488 commits                                                                                                                                                                                                                  |
+| #1489               | `d3780ba13`                           | #1488's branch                        | None                                                                                                                                                                                                                                            |
+| #1566               | `117a58e0e`                           | #1488's branch                        | Move its two #1488 commits down; rebuild the Axum part on T21 and EdgeZero (Part C). 1 file conflicts with #1489, 19 with #1506                                                                                                                 |
+| #1527               | `a020daeec`                           | #1526's branch                        | Close once #1506 covers its tests (DEC-1)                                                                                                                                                                                                       |
+| #1528               | `ea779fb47`                           | #1527's branch                        | Close once #1531 carries A1                                                                                                                                                                                                                     |
+| #1543               | `e5e6ea7fa`                           | #1449's branch                        | Outside this plan (DEC-19)                                                                                                                                                                                                                      |
+| #1424               | `2423a2ed2`                           | main                                  | Conflicting, head `rc/edgezero-431-demo`; close at parity                                                                                                                                                                                       |
+| #1499               | `084fdbba9`                           | #1424's branch                        | Close at parity                                                                                                                                                                                                                                 |
+| #1531               | `88a6ba596`                           | #1506's branch                        | Retargeted without a rebase: it forks from main with its own cutover and the RC tag pin, and 15 files conflict with #1506 at `9ec4711d3`. Rebase onto #1506; it then delivers A1                                                                |
+| #1532               | `852b875fe`                           | #1531's branch                        | Delivers #1529 (A4); restack after #1531                                                                                                                                                                                                        |
+| #1533, #1534        | `82d9a0e66`, `646c39a34`              | #1532's and #1533's branches          | RC-baseline copies of #1525 and #1526: drop from the chain and close                                                                                                                                                                            |
+| #1536, #1535, #1537 | `296e05405`, `0666a9b4b`, `4a838272c` | #1534's, #1536's and #1535's branches | Not restacked: mostly Axum-only stores, store selection and wiring that EZI-2b, T6 and T21 replace. Their tests go to A2, A8 and T5 and #1535's code to T19 and T20; each closes when those land                                                |
+| #1539, #1538, #1540 | `8d41cb06c`, `3111c2456`, `db1ba337a` | #1537's, #1539's and #1538's branches | Restack on #1531 (A1). #1539 and #1538 apply cleanly; #1540 conflicts in `docs/guide/native-ec-persistence.md` since its `db1ba337a` merged the AWS examples. #1539 and #1543 both add `.dockerignore`, so whichever lands second reconciles it |
+| #1541               | `86797e0b4`                           | main                                  | Close at parity                                                                                                                                                                                                                                 |
 
 EdgeZero:
 
@@ -135,14 +135,14 @@ Close.
 | 0    | TS T1                                                                                                                                                  | P0  | New              | Answer identify and batch sync locally on every adapter                                                                                                           | none                                                                                                     |
 | 0    | TS #1557                                                                                                                                               | P1  | Merge            | Sourcepoint consent                                                                                                                                               | none                                                                                                     |
 | 0    | TS #1526, #1522                                                                                                                                        | P1  | PR fix, Merge    | Retarget to main, fix its round-1 review; delivers #1522                                                                                                          | none                                                                                                     |
-| 0    | TS #1516                                                                                                                                               | P1  | Merge            | Already approved                                                                                                                                                  | none                                                                                                     |
+| 0    | TS #1516                                                                                                                                               | P1  | Merged           | Merged on main as `1810c763a`                                                                                                                                     | none                                                                                                     |
 | 0    | TS #1189                                                                                                                                               | P1  | Close            | Fixed on main by `56a19229f` (#1157), which deleted the ungated `ingest_*` functions; ask its author to close it                                                  | none                                                                                                     |
 | 0    | IABTechLab/edgezero#460                                                                                                                                | P1  | PR fix           | Part C fixes, then fold into IABTechLab/edgezero#275's branch with `9f090e57` and one CI trigger change                                                           | none                                                                                                     |
 | 0    | IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#414                                                                              | P1  | PR fix           | Move `4ea99467` to IABTechLab/edgezero#406 and `9a985c99` to IABTechLab/edgezero#407                                                                              | none                                                                                                     |
 | 0    | IABTechLab/edgezero#463                                                                                                                                | P1  | PR fix           | Rebase off the commits it carries                                                                                                                                 | none                                                                                                     |
 | 0    | TS #1503, #1432                                                                                                                                        | P2  | Merge            | `ts ec` commands; delivers #1432                                                                                                                                  | none                                                                                                     |
 | 0    | TS #1233                                                                                                                                               | P2  | Move             | `ts-ec` to creative assets                                                                                                                                        | none                                                                                                     |
-| 1    | TS #1506                                                                                                                                               | P1  | PR fix, Merge    | Rebase; repin after the fold-in, or the fallback below; delivers #1507                                                                                            | #1557, #1526, #1516, IABTechLab/edgezero#460 fold-in                                                     |
+| 1    | TS #1506                                                                                                                                               | P1  | PR fix, Merge    | Rebase; repin after the fold-in, or the fallback below; delivers #1507                                                                                            | #1557, #1526, IABTechLab/edgezero#460 fold-in                                                            |
 | 1    | IABTechLab/edgezero#275                                                                                                                                | P1  | PR fix, Merge    | Resolve its review, then merge                                                                                                                                    | IABTechLab/edgezero#460 fold-in                                                                          |
 | 2    | TS #1487                                                                                                                                               | P1  | PR fix, Merge    | Part C fixes                                                                                                                                                      | #1526, #1506                                                                                             |
 | 2    | IABTechLab/edgezero#406 to IABTechLab/edgezero#439; IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432 | P1  | PR fix, Merge    | Resolve reviews, retarget to main, merge in order; delivers IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437 and IABTechLab/edgezero#432 | IABTechLab/edgezero#275                                                                                  |
@@ -203,9 +203,10 @@ waits on a Cloudflare or Spin item, so the MVP ships without waves 10 to 18
 (DEC-4). Waves 10 to 14 (Cloudflare), waves 15 to 18 (Spin) and the `any` rows
 follow the MVP; an `any` row starts when its decision or reviewer is ready.
 
-Fallback for wave 1: if the fold-in has not landed two weeks after #1557,
-#1526 and #1516 have all merged on main, #1506 merges pinned to IABTechLab/edgezero#275's head as it stands
-(allowed by AX-7) and keeps its readthrough rejection until the repin.
+Fallback for wave 1: if the fold-in has not landed two weeks after #1557 and
+#1526 have both merged on main (#1516 merged on 2026-11-12), #1506 merges pinned
+to IABTechLab/edgezero#275's head as it stands (allowed by AX-7) and keeps its
+readthrough rejection until the repin.
 
 The two longest chains:
 
@@ -394,15 +395,15 @@ re-checks each item at the PR's current head before posting.
 
 ### Trusted Server
 
-- **#1506 at `9ec4711d3` (AX-7).** Rebase after #1557, #1526 and #1516. Keep
-  EdgeZero pinned to IABTechLab/edgezero#275's head or an integration-branch tag
-  (DEC-5): an RC-tag pin pushed to this branch on
-  2026-11-12 was reverted.
-  Repin after the fold-in, or under wave 1's fallback; drop the
-  `origin_readthrough_enabled` rejection in `config.rs` once cache tags return.
-  The current pin already carries IABTechLab/edgezero `b97efec1`, which stops
-  Spin sending `Content-Length: 0` on bodiless DELETE and OPTIONS. Port #1527's
-  native-client, response-owner and managed Fastly delivery tests if missing.
+- **#1506 at `9ec4711d3` (AX-7).** Rebase after #1557 and #1526; #1516 has
+  merged. Keep EdgeZero pinned to IABTechLab/edgezero#275's head or an
+  integration-branch tag (DEC-5): an RC-tag pin pushed to this branch on
+  2026-11-12 was reverted. Repin after the fold-in, or under wave 1's fallback;
+  drop the `origin_readthrough_enabled` rejection in `config.rs` once cache tags
+  return. The current pin already carries IABTechLab/edgezero `b97efec1`, which
+  stops Spin sending `Content-Length: 0` on bodiless DELETE and OPTIONS. Port
+  #1527's native-client, response-owner and managed Fastly delivery tests if
+  missing.
 - **#1526 at `e529e5576` (ID-2, SH-3).** Retarget to main. Address its round-1
   review, including the finalize-under-`block_on` test gap.
 - **#1525 at `cd8977cad`.** Address its round-1 review.
@@ -450,32 +451,35 @@ re-checks each item at the PR's current head before posting.
   lacks `ingress`), the type error, the CodeQL alerts and the per-request
   `AtomicBool` in the Fastly `AppState`.
 - **RC units, forward-ported (DEC-6).** #1531 goes on #1506 for A1 and #1532 on
-  #1531 for #1529. #1539, #1538 and #1540 go on #1531 for A6 and A7, where they
-  apply cleanly. #1533 and #1534 close as copies of #1525 and #1526. #1536 and
-  #1537 are not restacked: their Axum-only stores, store selection and wiring
-  give way to EZI-2b, T6 and T21, and their tests move into A2, A8 and T5. #1535
-  (Sourcepoint GPP capture and server consent reconciliation) feeds T19 and T20:
-  its reconciliation runs in the EC route and its GPP capture in the injected
-  script, in place of a separate `/_ts/consent` route wired into each adapter
-  (DEC-16). #1532 takes its geo provider from EdgeZero's manifest once
-  IABTechLab/edgezero#439 binds it, dropping `TS_NATIVE_GEO_PROFILE_FILE`. The
-  notes below were checked at the RC tag `v0.1.1-rc-axum.202611.2`
-  (`7c6e68d94`), which contains every unit. They are forward-port notes: each
-  applies to the PR that ports its unit to main, and Task 6 posts it there once
-  that PR exists, checked at its head. On the RC unit PRs themselves Task 6
-  posts a note only after re-checking it at the unit's head, read on 2026-11-12
-  as #1532 `852b875fe`, #1536 `296e05405`, #1537 `4a838272c`, #1539 `8d41cb06c`,
-  #1540 `eb6e19ef4` and #1541 `7dd2e3056`. #1532: drop the core change that maps
-  a US request with no region to `Unknown`, which fails every US Cloudflare
-  request closed (AX-3), and show that the same trusted country and region reach
-  EC creation and auction consent on Axum. #1536: do not port the adapter-local
-  DynamoDB store (ID-2, AX-4). #1537: do not port its Axum celld store or
-  storage selection, which EdgeZero's providers and logical stores replace
-  (EZI-2b, DEC-16); its example config also breaks startup on Axum, Cloudflare
-  and Spin. #1539: fix the failing Axum test. #1540: trust IPv6 CloudFront
-  ranges, turn geo on, wire DynamoDB and add an example rate-based rule (AX-3,
-  AX-6, DEC-11). All units: replace `TS_*` names (AX-2). #1541: drop the commits
-  of closed #1545.
+  #1531 for #1529. #1539, #1538 and #1540 go on #1531 for A6 and A7: #1539 and
+  #1538 apply cleanly, and #1540 at `db1ba337a` conflicts in
+  `docs/guide/native-ec-persistence.md`. #1533 and #1534 close as copies of
+  #1525 and #1526. #1536 and #1537 are not restacked: their Axum-only stores,
+  store selection and wiring give way to EZI-2b, T6 and T21, and their tests
+  move into A2, A8 and T5. #1535 (Sourcepoint GPP capture and server consent
+  reconciliation) feeds T19 and T20: its reconciliation runs in the EC route and
+  its GPP capture in the injected script, in place of a separate `/_ts/consent`
+  route wired into each adapter (DEC-16). #1532 takes its geo provider from
+  EdgeZero's manifest once IABTechLab/edgezero#439 binds it, dropping
+  `TS_NATIVE_GEO_PROFILE_FILE`. The notes below were checked at the RC tag
+  `v0.1.1-rc-axum.202611.2` (`7c6e68d94`), which contains every unit. They are
+  forward-port notes: each applies to the PR that ports its unit to main, and
+  Task 6 posts it there once that PR exists, checked at its head. On the RC unit
+  PRs themselves Task 6 posts a note only after re-checking it at the unit's
+  head, read on 2026-11-12 as #1532 `852b875fe`, #1536 `296e05405`, #1537
+  `4a838272c` and #1539 `8d41cb06c`, and on 2026-11-13 as #1540 `db1ba337a` and
+  #1541 `86797e0b4`. #1532: drop the core change that maps a US request with no
+  region to `Unknown`, which fails every US Cloudflare request closed (AX-3),
+  and show that the same trusted country and region reach EC creation and
+  auction consent on Axum. #1536: do not port the adapter-local DynamoDB store
+  (ID-2, AX-4). #1537: do not port its Axum celld store or storage selection,
+  which EdgeZero's providers and logical stores replace (EZI-2b, DEC-16); its
+  example config also breaks startup on Axum, Cloudflare and Spin. #1539: fix
+  the failing Axum test. #1540: trust IPv6 CloudFront ranges, turn geo on, key
+  the DynamoDB table by partition instead of the one partition key and one
+  allocator item its IAM policy allows (AX-4), and add an example rate-based
+  rule at the load balancer (AX-3, AX-6, DEC-11). All units: replace `TS_*`
+  names (AX-2). #1541: drop the commits of closed #1545.
 - **Proposed closures.** #1527 once its tests move (DEC-1); #1528 once #1531
   carries A1; #1533 and #1534, the RC copies of #1525 and #1526; #1535, #1536
   and #1537 once T19, T20, A2 and A8 carry their code and tests; #1310, which
