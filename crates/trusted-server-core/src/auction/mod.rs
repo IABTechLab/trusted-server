@@ -192,6 +192,7 @@ mod plan_sharing_tests {
         settings.auction.providers = std::collections::BTreeMap::from([(
             "aps-main".parse().expect("should parse APS provider ID"),
             ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

@@ -5555,6 +5555,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://primary.example.test/openrtb".to_string(),
@@ -5567,6 +5568,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://secondary.example.test/openrtb".to_string(),
@@ -9091,6 +9093,7 @@ set = { networkId = 42 }
             providers: BTreeMap::from([(
                 provider_id.clone(),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example/openrtb2/auction".to_string(),
