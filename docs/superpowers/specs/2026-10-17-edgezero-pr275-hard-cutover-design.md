@@ -2112,7 +2112,7 @@ EdgeZero `c8fd1939` documents that split
 (`edgezero@14a6ca8b:docs/guide/proxying.md:320-323`).
 
 Issue #1484 asks for multi-provider fan-out on Cloudflare and Spin. The cut
-closes it.
+implements it (2.4), and PR #1506 closes it with `Closes #1484`.
 
 The cut lands first, and later pull requests rebase onto it. New uses of
 `PlatformHttpClient`, `PlatformBackend`, and `StubHttpClient` are not frozen
