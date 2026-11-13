@@ -5,6 +5,11 @@
 //! a provider that fails to build disables every provider for the request, so
 //! this wrapper adds [`validate_providers`] to the config checks: a
 //! provider-specific setting error then fails the command before deploy.
+//!
+//! `push` and `diff` name a target adapter, so for one that does not run
+//! identity providers they check [`ProviderlessAppConfig`], which also
+//! rejects enabled providers. `validate` names no adapter and stays
+//! adapter-agnostic: it accepts enabled providers.
 
 use std::borrow::Cow;
 
@@ -12,7 +17,7 @@ use edgezero_core::app_config::{AppConfigMeta, SecretField};
 use error_stack::{AttachmentKind, FrameKind, Report};
 use serde::{Deserialize, Serialize};
 use trusted_server_core::config::TrustedServerAppConfig;
-use trusted_server_core::ec::provider::ProviderConfigError;
+use trusted_server_core::ec::provider::{ProviderConfigError, reject_enabled_providers};
 use trusted_server_identity_providers::validate_providers;
 use validator::{Validate, ValidationError, ValidationErrors};
 
@@ -44,6 +49,43 @@ impl Validate for CheckedAppConfig {
 impl AppConfigMeta for CheckedAppConfig {
     fn secret_fields() -> Vec<SecretField> {
         TrustedServerAppConfig::secret_fields()
+    }
+}
+
+/// Whether the named target adapter runs identity providers.
+///
+/// Only the Fastly adapter runs them; the Axum, Cloudflare and Spin adapters
+/// refuse to start with an enabled provider.
+pub(crate) fn adapter_runs_identity_providers(adapter: &str) -> bool {
+    adapter == "fastly"
+}
+
+/// [`CheckedAppConfig`] for a target adapter that does not run identity
+/// providers: validation also rejects every enabled provider, so `ts config
+/// push` and `diff` fail before deploying a config the adapter would refuse.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProviderlessAppConfig(CheckedAppConfig);
+
+impl Validate for ProviderlessAppConfig {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = self.0.validate().err().unwrap_or_default();
+        if let Err(report) = reject_enabled_providers(&self.0.0.settings().ec, "target") {
+            let mut error = ValidationError::new("trusted_server_adapter_providers");
+            error.message = Some(Cow::Owned(report.current_context().to_string()));
+            errors.add(PROVIDER_VALIDATION_FIELD, error);
+        }
+        if errors.errors().is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl AppConfigMeta for ProviderlessAppConfig {
+    fn secret_fields() -> Vec<SecretField> {
+        CheckedAppConfig::secret_fields()
     }
 }
 
@@ -112,6 +154,56 @@ mod tests {
             .and_then(|errors| errors.first())
             .and_then(|error| error.message.as_deref())
             .map(str::to_owned)
+    }
+
+    fn adapter_error(config: &ProviderlessAppConfig) -> Option<String> {
+        let errors = config.validate().err()?;
+        errors
+            .field_errors()
+            .get(PROVIDER_VALIDATION_FIELD)
+            .and_then(|errors| errors.first())
+            .and_then(|error| error.message.as_deref())
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn fastly_runs_identity_providers_and_other_adapters_do_not() {
+        assert!(
+            adapter_runs_identity_providers("fastly"),
+            "should run providers on fastly"
+        );
+        for adapter in ["axum", "cloudflare", "spin"] {
+            assert!(
+                !adapter_runs_identity_providers(adapter),
+                "should not run providers on {adapter}"
+            );
+        }
+    }
+
+    #[test]
+    fn providerless_config_rejects_an_enabled_provider() {
+        let config = ProviderlessAppConfig(with_liveramp(
+            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
+        ));
+
+        let message = adapter_error(&config).expect("should reject the enabled provider");
+
+        assert!(
+            message.contains("liveramp") && message.contains("does not run identity providers"),
+            "should name the enabled provider, got: {message}"
+        );
+    }
+
+    #[test]
+    fn providerless_config_accepts_the_example_config() {
+        let config: ProviderlessAppConfig =
+            toml::from_str(EXAMPLE_CONFIG).expect("should parse the example config");
+
+        assert_eq!(
+            adapter_error(&config),
+            None,
+            "should accept a config without enabled providers"
+        );
     }
 
     #[test]
