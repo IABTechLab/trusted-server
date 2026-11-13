@@ -140,17 +140,18 @@ impl FastlyManagementApiClient {
         Self { api_key, base_url }
     }
 
-    /// Sends one management API request through `client` and returns its body.
+    /// Sends one management API request through `client`.
     ///
     /// A DELETE that the API answers 404 succeeds, because the entry is already
-    /// gone, so retries after a partial failure converge.
+    /// gone, so retries after a partial failure converge. The response body is
+    /// read only to describe a failure.
     async fn make_request(
         &self,
         client: &HttpClient,
         method: Method,
         path: &str,
         body: Option<ManagementBody>,
-    ) -> Result<Bytes, Report<TrustedServerError>> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let failed = || TrustedServerError::Configuration {
             message: format!("Fastly management API {method} {path} failed"),
         };
@@ -176,14 +177,13 @@ impl FastlyManagementApiClient {
             .await
             .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
         let status = response.status();
+        if status.is_success() || (method == Method::DELETE && status == StatusCode::NOT_FOUND) {
+            return Ok(());
+        }
         let body = response
             .into_bytes_bounded(MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
-
-        if status.is_success() || (method == Method::DELETE && status == StatusCode::NOT_FOUND) {
-            return Ok(body);
-        }
         Err(Report::new(failed()).attach(format!(
             "management API answered HTTP {status} - {}",
             truncate_error_body(&String::from_utf8_lossy(&body))
