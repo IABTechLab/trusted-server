@@ -224,6 +224,14 @@ struct FetchReply<'body> {
     signature: Option<&'body RawValue>,
 }
 
+/// Prebid's shared `id5id` cookie: the reply for each partner under
+/// `pbjs`, keyed by partner ID. Its top level holds the last partner's reply.
+#[derive(Deserialize)]
+struct MultiplexedCookie<'body> {
+    #[serde(default, borrow)]
+    pbjs: Option<BTreeMap<String, &'body RawValue>>,
+}
+
 #[derive(Deserialize)]
 struct ReplyExt<'body> {
     #[serde(rename = "linkType", default, borrow)]
@@ -331,37 +339,40 @@ impl Id5Provider {
     }
 
     /// Reads one ID5 cookie value: a fetch reply JSON or a bare ID.
+    ///
+    /// A shared cookie that holds replies per partner yields only this
+    /// partner's reply, and nothing when it holds none for this partner.
     fn cookie_eids<'cookie>(&self, value: &'cookie str) -> Option<Vec<ProviderEid<'cookie>>> {
-        let eids = match percent_decoded(value) {
-            Cow::Borrowed(value) if value.trim_start().starts_with('{') => {
-                self.parse_reply(value.as_bytes()).ok()?
+        let decoded = percent_decoded(value);
+        let eids = if decoded.trim_start().starts_with('{') {
+            match partner_reply(decoded, self.partner_id)? {
+                Cow::Borrowed(reply) => self.parse_reply(reply.as_bytes()).ok()?,
+                Cow::Owned(reply) => self
+                    .parse_reply(reply.as_bytes())
+                    .ok()?
+                    .into_iter()
+                    .map(owned)
+                    .collect(),
             }
-            Cow::Owned(value) if value.trim_start().starts_with('{') => self
-                .parse_reply(value.as_bytes())
-                .ok()?
-                .into_iter()
-                .map(owned)
-                .collect(),
-            value => {
-                let id = value.trim();
-                if !is_usable_uid(id) || !is_usable_id(id) {
-                    return None;
-                }
-                vec![ProviderEid {
-                    source: Cow::Owned(self.primary_source().as_str().to_owned()),
-                    inserter: None,
-                    matcher: None,
-                    mm: None,
+        } else {
+            let id = decoded.trim();
+            if !is_usable_uid(id) || !is_usable_id(id) {
+                return None;
+            }
+            vec![ProviderEid {
+                source: Cow::Owned(self.primary_source().as_str().to_owned()),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Owned(id.to_owned()),
+                    atype: Some(1),
                     ext: None,
-                    uids: vec![ProviderUid {
-                        id: Cow::Owned(id.to_owned()),
-                        atype: Some(1),
-                        ext: None,
-                        expiry: bounded_expiry(None),
-                        refresh: None,
-                    }],
-                }]
-            }
+                    expiry: bounded_expiry(None),
+                    refresh: None,
+                }],
+            }]
         };
         (!eids.is_empty()).then_some(eids)
     }
@@ -447,22 +458,46 @@ impl IdentityProvider for Id5Provider {
         &self,
         cookies: RequestCookies<'cookie>,
     ) -> CookieRead<'cookie> {
-        if self.cookies.any(cookies, is_opt_out_cookie) {
+        if self
+            .cookies
+            .any(cookies, |value| is_opt_out_cookie(value, self.partner_id))
+        {
             return CookieRead::OptedOut;
         }
         CookieRead::from(self.cookies.read(cookies, |value| self.cookie_eids(value)))
     }
 }
 
-/// Whether one ID5 cookie value records an opt-out: a bare `0`, or a
-/// (possibly percent-encoded) reply whose `universal_uid` is `0`.
-fn is_opt_out_cookie(value: &str) -> bool {
+/// Whether one ID5 cookie value records an opt-out for `partner_id`: a bare
+/// `0`, or a (possibly percent-encoded) reply whose `universal_uid` is `0`.
+fn is_opt_out_cookie(value: &str, partner_id: u32) -> bool {
     let decoded = percent_decoded(value);
     let decoded = decoded.trim();
     if !decoded.starts_with('{') {
         return decoded == OPTED_OUT_UID;
     }
-    is_opt_out_reply(decoded.as_bytes())
+    partner_reply(Cow::Borrowed(decoded), partner_id)
+        .is_some_and(|reply| is_opt_out_reply(reply.as_bytes()))
+}
+
+/// The fetch reply for `partner_id` in a JSON cookie value.
+///
+/// Prebid's shared cookie keeps each partner's reply under `pbjs`; it yields
+/// this partner's entry, or `None` when it has none. A cookie without `pbjs`
+/// is a single reply and is returned as is.
+fn partner_reply(decoded: Cow<'_, str>, partner_id: u32) -> Option<Cow<'_, str>> {
+    let selected = serde_json::from_str::<MultiplexedCookie<'_>>(&decoded)
+        .ok()
+        .and_then(|cookie| cookie.pbjs)
+        .map(|partners| {
+            partners
+                .get(&partner_id.to_string())
+                .map(|reply| reply.get().to_owned())
+        });
+    match selected {
+        None => Some(decoded),
+        Some(reply) => reply.map(Cow::Owned),
+    }
 }
 
 /// Whether a fetch reply body, taken as is, has a `universal_uid` of `0`.
@@ -1132,6 +1167,67 @@ mod tests {
                 "should report an opt-out from {header}"
             );
         }
+    }
+
+    /// A shared cookie holding partner 1234's reply and partner 5678's, with
+    /// 5678's at the top level, as Prebid writes it.
+    fn shared_cookie(partner_1234: &serde_json::Value) -> String {
+        let other = json!({
+            "universal_uid": "other-example",
+            "ids": {
+                "id5": { "eid": { "source": "id5.example.com", "uids": [{ "id": "other-partner-example", "atype": 1 }] } },
+            },
+        });
+        let mut cookie = other.clone();
+        cookie["pbjs"] = json!({ "1234": partner_1234, "5678": other });
+        format!("id5id={}", urlencoding::encode(&cookie.to_string()))
+    }
+
+    #[test]
+    fn reads_the_configured_partner_reply_from_a_shared_cookie() {
+        let provider = provider();
+
+        let uids = read(&*provider, &shared_cookie(&reply_cookie()))
+            .expect("should read the partner's reply");
+
+        assert_eq!(
+            uids.iter().map(|uid| uid.1.as_str()).collect::<Vec<_>>(),
+            vec!["id5-example"],
+            "should read partner 1234's ID, not the top-level reply"
+        );
+    }
+
+    #[test]
+    fn ignores_a_shared_cookie_without_the_configured_partner() {
+        let provider = provider();
+        let cookie = json!({
+            "universal_uid": "0",
+            "ids": {},
+            "pbjs": { "5678": { "universal_uid": "0", "ids": {} } },
+        });
+        let header = format!("id5id={cookie}");
+
+        assert!(
+            matches!(
+                provider.read_request_cookies(RequestCookies::new(&header)),
+                CookieRead::Absent
+            ),
+            "should neither read another partner's reply nor its opt-out"
+        );
+    }
+
+    #[test]
+    fn reports_the_configured_partner_opt_out_from_a_shared_cookie() {
+        let provider = provider();
+        let header = shared_cookie(&json!({ "universal_uid": "0", "ids": {} }));
+
+        assert!(
+            matches!(
+                provider.read_request_cookies(RequestCookies::new(&header)),
+                CookieRead::OptedOut
+            ),
+            "should report partner 1234's opt-out"
+        );
     }
 
     #[test]
