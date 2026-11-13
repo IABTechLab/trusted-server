@@ -14,7 +14,7 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 4. Apply the origin query policy.
 5. For S3-authenticated requests with Image Optimizer enabled, preflight the original object with an uncached signed `HEAD` before invoking IO.
 6. Add origin authentication headers when the route configures auth.
-7. Send the request to the resolved origin, with IO metadata when enabled.
+7. Send the request to the resolved backend origin, with IO metadata when enabled.
 8. Return the origin status, body, and safe headers.
 
 On Fastly, the signed preflight bypasses the readthrough cache so the cache cannot change its method after signing. A successful or `304` preflight allows the final IO request to use its normal caching path. Even when the optimized image is already cached, each qualifying request first waits for an uncached origin `HEAD`. Account for that S3 request volume, cost, and latency. Origin throttling or unavailability can prevent a cached derivative from being served.
