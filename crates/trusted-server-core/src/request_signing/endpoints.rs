@@ -16,6 +16,19 @@ use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
 use crate::settings::Settings;
 
+/// Logs a failed key operation's report once: at warn for a client error, and
+/// at error otherwise.
+///
+/// The response carries only the report's display text, so this line is
+/// where the outbound status, budget source, and provider detail appear.
+fn log_key_operation_failure(operation: &str, report: &Report<TrustedServerError>) {
+    if report.current_context().status_code().is_client_error() {
+        log::warn!("{operation} failed: {report:?}");
+    } else {
+        log::error!("{operation} failed: {report:?}");
+    }
+}
+
 fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
     Response::builder()
         .status(status)
@@ -340,6 +353,7 @@ pub async fn handle_rotate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            log_key_operation_failure("Key rotation", &e);
             let status = e.current_context().status_code();
             let response = RotateKeyResponse {
                 success: false,
@@ -463,6 +477,14 @@ pub async fn handle_deactivate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            log_key_operation_failure(
+                if deactivate_req.delete {
+                    "Key deletion"
+                } else {
+                    "Key deactivation"
+                },
+                &e,
+            );
             let status = e.current_context().status_code();
             let response = DeactivateKeyResponse {
                 success: false,
@@ -503,6 +525,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
 
     fn build_request(method: Method, uri: &str, body: Option<&str>) -> HttpRequest<EdgeBody> {
         let body = match body {
@@ -720,6 +743,7 @@ mod tests {
     fn test_handle_rotate_key_with_empty_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
+        let capture = LogCapture::start();
 
         let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response even when stores are unavailable");
@@ -728,6 +752,15 @@ mod tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when store writes fail"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && record.message.starts_with("Key rotation failed: ")
+            ),
+            "should log the failed rotation once, at error"
         );
 
         let body = response_body_string(resp);
@@ -854,6 +887,8 @@ mod tests {
             Some(&body_json),
         );
 
+        let capture = LogCapture::start();
+
         let resp =
             futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
                 .expect("should return a response even when stores are unavailable");
@@ -862,6 +897,15 @@ mod tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when active-kids cannot be read"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && record.message.starts_with("Key deactivation failed: ")
+            ),
+            "should log the failed deactivation once, at error"
         );
 
         let body = response_body_string(resp);

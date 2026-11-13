@@ -372,11 +372,12 @@ fn pull_request(url: &Url, token: &str) -> Result<OutboundRequest, EdgeError> {
     ))
 }
 
-/// Logs one failed pull-sync step at warn, through [`outbound_error`].
+/// Logs one failed pull-sync step at warn, as one line.
 ///
-/// `outbound_error` logs the failure's status, kind, budget source, and
+/// The line is the [`outbound_error`] report with the `failed` step, which
+/// names the partner. The report carries the failure's budget source and
 /// provider detail, never the error's message, which can hold provider text
-/// or a URL. This then logs the report with the `failed` step.
+/// or a URL.
 fn log_pull_failure(error: EdgeError, failed: String) {
     let report = outbound_error(
         error,
@@ -389,7 +390,8 @@ fn log_pull_failure(error: EdgeError, failed: String) {
 /// Sends the queued `group` and collects the UIDs its partners answer with.
 ///
 /// The group ends [`PULL_SYNC_GROUP_CUTOFF`] after it starts. A partner that
-/// has not answered by then is logged and skipped.
+/// has not answered by then is logged and skipped. When the group itself
+/// fails, its one failure line names the partners it left unanswered.
 async fn send_pull_group(
     client: &HttpClient,
     clock: &MonotonicClock,
@@ -404,15 +406,17 @@ async fn send_pull_group(
         .map(|queued| (queued.source_domain, queued.request))
         .unzip();
     let cutoff = clock.deadline_after(PULL_SYNC_GROUP_CUTOFF);
-    let slots = match client.send_all_until(requests, cutoff).await {
-        Ok(results) => results.into_parts().0,
+    let (slots, group_error) = match client.send_all_until(requests, cutoff).await {
+        Ok(results) => (results.into_parts().0, None),
         Err(failure) => {
             let (error, slots) = failure.into_parts();
-            log_pull_failure(error, "partner group failed".to_owned());
-            slots
+            (slots, Some(error))
         }
     };
 
+    // A failed group leaves every partner it had not reported unresolved. The
+    // group failure names them in its one line, instead of a cutoff warning each.
+    let mut unanswered = Vec::new();
     for (source_domain, slot) in source_domains.into_iter().zip(slots) {
         let response = match slot {
             OutboundCollectedSlot::Resolved(result) => match result.outcome {
@@ -423,10 +427,14 @@ async fn send_pull_group(
                 }
             },
             OutboundCollectedSlot::Unresolved => {
-                log::warn!(
-                    "Pull sync: partner '{source_domain}' did not answer within the {}s group cutoff",
-                    PULL_SYNC_GROUP_CUTOFF.as_secs()
-                );
+                if group_error.is_some() {
+                    unanswered.push(format!("'{source_domain}'"));
+                } else {
+                    log::warn!(
+                        "Pull sync: partner '{source_domain}' did not answer within the {}s group cutoff",
+                        PULL_SYNC_GROUP_CUTOFF.as_secs()
+                    );
+                }
                 continue;
             }
             OutboundCollectedSlot::AlreadyDelivered => continue,
@@ -435,6 +443,17 @@ async fn send_pull_group(
         if let Some(uid) = extract_pull_uid(response, &source_domain).await {
             updates.push(PartnerIdUpdate::new(source_domain, uid));
         }
+    }
+    if let Some(error) = group_error {
+        let failed = if unanswered.is_empty() {
+            "partner group failed".to_owned()
+        } else {
+            format!(
+                "partner group failed before {} answered",
+                unanswered.join(", ")
+            )
+        };
+        log_pull_failure(error, failed);
     }
 }
 
@@ -1066,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_sync_failures_log_through_outbound_error() {
+    fn pull_sync_failures_log_one_line_each() {
         let mut settings = create_test_settings();
         // One partner per group, so the failing batch ends only its own group.
         settings.ec.pull_sync_concurrency = 1;
@@ -1100,19 +1119,17 @@ mod tests {
         run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
         let warnings = capture.take_all();
-        let typed = warnings
+        let messages: Vec<&str> = warnings
             .iter()
-            .filter(|warning| {
-                warning.level == log::Level::Warn
-                    && warning.message.starts_with("Outbound request failed with")
-            })
-            .count();
+            .map(|warning| warning.message.as_str())
+            .collect();
         assert_eq!(
-            typed, 3,
-            "should log the group failure, the request failure, and the build failure through outbound_error"
+            messages.len(),
+            3,
+            "should log one line each for the group failure, the request failure, and the build failure, got {messages:?}"
         );
         for step in [
-            "partner group failed",
+            "partner group failed before 'alpha.example.com' answered",
             "request for partner 'beta.example.com' failed",
             "request for partner 'gamma.example.com' could not be built",
         ] {

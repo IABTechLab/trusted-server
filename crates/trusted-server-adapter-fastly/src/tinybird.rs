@@ -178,11 +178,11 @@ pub(crate) async fn send_queued_batches(
     }
 }
 
-/// Logs one failed Tinybird send at warn, through [`outbound_error`], followed by `log_context`.
+/// Logs one failed Tinybird send at warn, as one line followed by `log_context`.
 ///
-/// `outbound_error` logs the failure's status, kind, budget source, and provider
-/// detail, never the error's message, which can hold provider text or a URL.
-/// This then logs the report with the `failed` step.
+/// The line is the [`outbound_error`] report with the `failed` step. The
+/// report carries the failure's budget source and provider detail, never the
+/// error's message, which can hold provider text or a URL.
 fn log_send_failure(error: EdgeError, failed: String, log_context: &dyn fmt::Display) {
     let report = outbound_error(
         error,
@@ -460,7 +460,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn send_and_build_failures_log_through_outbound_error() {
+    fn send_and_build_failures_log_one_line_each() {
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client.respond_to(
@@ -486,16 +486,14 @@ pub(crate) mod tests {
         ));
 
         let warnings = capture.take_all();
-        let typed = warnings
+        let messages: Vec<&str> = warnings
             .iter()
-            .filter(|warning| {
-                warning.level == log::Level::Warn
-                    && warning.message.starts_with("Outbound request failed with")
-            })
-            .count();
+            .map(|warning| warning.message.as_str())
+            .collect();
         assert_eq!(
-            typed, 2,
-            "should log the send failure and the build failure through outbound_error"
+            messages.len(),
+            2,
+            "should log one line each for the send failure and the build failure, got {messages:?}"
         );
         for step in [
             "the Events API request for dataset auction_events_raw failed",

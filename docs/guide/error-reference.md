@@ -182,14 +182,15 @@ handshake failed, the provider answered with a protocol error, or Fastly could
 not register the provider's backend. EdgeZero derives Fastly backends from the
 provider endpoint; they are not static Fastly backends. A registration failure
 records `launch_failed` for the provider, and other failures record
-`transport_failed`. The preceding `Outbound request failed` warning carries the
-provider failure detail, which holds closed failure codes and no URL.
+`transport_failed`. The report in this warning carries the provider failure
+detail (`outbound provider failure detail: ...`), which holds closed failure
+codes and no URL.
 
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
   valid certificate; origin TLS is always verified
-- Read the provider failure detail in the `Outbound request failed` warning
+- Read the `outbound provider failure detail` line in the warning's report
 - On Fastly, check the service's dynamic backend use. Fastly allows 200
   dynamic backends per service; the auction may use up to 160, and the
   publisher origin, integrations, and other outbound sites share the rest

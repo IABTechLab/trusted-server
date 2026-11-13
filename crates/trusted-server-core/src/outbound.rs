@@ -202,10 +202,11 @@ struct OutboundFailureDetail(ProviderFailureDetail);
 ///   502 for every outbound site.
 ///
 /// The report carries `error` as an opaque attachment, the budget source of a
-/// timeout, and the error's provider failure detail. The detail is logged at
-/// warn with `{:?}`. Neither that log nor the report's `{:?}` rendering carries
-/// the error's message, which can hold provider text or a URL. Callers that
-/// need the error downcast the report to [`EdgeError`].
+/// timeout, and the error's provider failure detail. It logs nothing: the
+/// caller logs the report once, naming its site or partner, and the report's
+/// `{:?}` rendering prints the budget source and the detail. That rendering
+/// never carries the error's message, which can hold provider text or a URL.
+/// Callers that need the error downcast the report to [`EdgeError`].
 ///
 /// # Examples
 ///
@@ -237,10 +238,6 @@ pub fn outbound_error(
         _ => None,
     };
     let detail = error.provider_failure_detail().copied();
-    log::warn!(
-        "Outbound request failed with {status} ({kind}): budget source {budget_source:?}, provider detail {detail:?}",
-        kind = error.kind()
-    );
 
     let mapped = match (status, source) {
         (StatusCode::PAYLOAD_TOO_LARGE, _) => Some(TrustedServerError::RequestTooLarge {
@@ -525,14 +522,14 @@ mod tests {
     }
 
     #[test]
-    fn outbound_error_logs_provider_detail_without_provider_text() {
+    fn outbound_error_leaves_logging_to_the_report_which_carries_the_detail() {
         let detail = ProviderFailureDetail::Fastly {
             phase: ProviderFailurePhase::Send,
             cause: FastlyFailureCause::ConnectionRefused,
         };
         let capture = LogCapture::start();
 
-        let _report = outbound_error(
+        let report = outbound_error(
             EdgeError::bad_gateway_with_detail(
                 "provider said no to https://example.com/secret-path",
                 edgezero_core::error::BadGatewayReason::Transport,
@@ -542,21 +539,18 @@ mod tests {
             OutboundRequestSource::Internal,
         );
 
-        let warnings = capture.take_all();
-        assert_eq!(warnings.len(), 1, "should log one record per failure");
-        assert_eq!(
-            warnings[0].level,
-            log::Level::Warn,
-            "should log the failure at warn"
-        );
-        let message = &warnings[0].message;
         assert!(
-            message.contains(&format!("{detail:?}")),
-            "should log the provider detail with Debug, got `{message}`"
+            capture.take_all().is_empty(),
+            "should leave the one log line to the caller that logs the report"
+        );
+        let rendered = format!("{report:?}");
+        assert!(
+            rendered.contains(&format!("{detail:?}")),
+            "should render the provider detail with Debug, got `{rendered}`"
         );
         assert!(
-            !message.contains("provider said no") && !message.contains("example.com"),
-            "should never log provider text or URLs, got `{message}`"
+            !rendered.contains("provider said no") && !rendered.contains("example.com"),
+            "should never render provider text or URLs, got `{rendered}`"
         );
     }
 

@@ -318,7 +318,8 @@ fn materialize_planned_response(
 /// Logs one failed bidder or mediator request without its provider text.
 ///
 /// A timeout is an expected auction outcome, so it logs at debug. Every other
-/// failure goes through [`outbound_error`], which logs its typed detail.
+/// failure logs one warn line: the [`outbound_error`] report, which carries
+/// the typed detail, with the role and provider name.
 fn log_request_failure(role: &str, provider_name: &str, error: EdgeError) {
     if matches!(error, EdgeError::GatewayTimeout { .. }) {
         log::debug!("{role} '{provider_name}' exhausted its response budget");
@@ -1129,15 +1130,18 @@ async fn settle_bidder_slot(
             .await
         {
             Ok(parsed) => (parsed, true),
-            Err(error) => (
-                provider_error_response(
-                    provider_name,
-                    response_time_ms,
-                    ERROR_TYPE_PARSE_RESPONSE,
-                    &error,
-                ),
-                false,
-            ),
+            Err(error) => {
+                log::warn!("Planned provider '{provider_name}' response parse failed: {error:?}");
+                (
+                    provider_error_response(
+                        provider_name,
+                        response_time_ms,
+                        ERROR_TYPE_PARSE_RESPONSE,
+                        &error,
+                    ),
+                    false,
+                )
+            }
         },
         Err(error) => {
             let timed_out = matches!(error, EdgeError::GatewayTimeout { .. });

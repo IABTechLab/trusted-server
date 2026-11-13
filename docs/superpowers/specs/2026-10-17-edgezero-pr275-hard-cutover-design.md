@@ -949,7 +949,8 @@ maps every `HttpClient` failure and every request-construction error
   `BadRequest` from a request Trusted Server built itself.
 
 The helper attaches the `EdgeError`, its budget source, and its
-`provider_failure_detail()` to the report.
+`provider_failure_detail()` to the report. It does not log; section 9 says
+who does.
 
 ### 3. Fastly on the canonical lifecycle
 
@@ -1527,10 +1528,12 @@ backend (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:977-1023`).
 Trusted Server keeps `owns_logging` false. Its Fastly and Axum loggers already
 admit target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
-log once (`app.rs:113-146`). Outbound failures log
-`provider_failure_detail()` (`error.rs:490`) with `{:?}` at warn through the
-helper in 2.11. The detail holds closed enums and numeric codes, never provider
-text or URLs (EZ-16).
+log once (`app.rs:113-146`). Each outbound failure logs one line: the site
+that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
+or partner, and that rendering prints the budget source and
+`provider_failure_detail()` (`error.rs:490`). The helper itself does not log,
+so a failure never logs its detail twice. The detail holds closed enums and
+numeric codes, never provider text or URLs (EZ-16).
 
 ### 10. Documentation
 

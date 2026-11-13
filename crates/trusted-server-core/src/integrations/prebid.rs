@@ -2310,7 +2310,7 @@ pub(crate) async fn parse_planned_prebid_response(
             Ok(body_bytes) => Some(body_bytes),
             Err(error) => {
                 log::warn!(
-                    "Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
+                    "Provider '{provider_id}' Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
                 );
                 None
             }

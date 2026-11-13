@@ -942,7 +942,9 @@ pub(crate) async fn parse_planned_aps_response(
             match read_aps_body(response, "Failed to read APS profile debug response body").await {
                 Ok(body) => Some(body),
                 Err(error) => {
-                    log::warn!("Failed to read APS profile debug response body: {error:?}");
+                    log::warn!(
+                        "Failed to read APS profile {provider_id} debug response body: {error:?}"
+                    );
                     None
                 }
             }
