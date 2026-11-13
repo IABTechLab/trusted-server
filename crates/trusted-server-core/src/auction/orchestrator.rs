@@ -2207,6 +2207,48 @@ mod tests {
         }
 
         #[test]
+        fn provider_responses_follow_plan_order_not_arrival_order() {
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::new(&clock);
+            client
+                .respond_to(
+                    Method::POST,
+                    SLOW_BIDDER,
+                    bid_reply(2.5).after(Duration::from_millis(200)),
+                )
+                .respond_to(
+                    Method::POST,
+                    FAST_BIDDER,
+                    bid_reply(1.5).after(Duration::from_millis(100)),
+                );
+            let services = build_services_with_outbound_client(&client, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                batch_plan(&[
+                    ("first-planned", SLOW_BIDDER, Duration::from_secs(1)),
+                    ("second-planned", FAST_BIDDER, Duration::from_secs(1)),
+                ]),
+                None,
+            );
+            let settings = create_test_settings();
+            let inbound = inbound_request();
+            let context = batch_context(&settings, &inbound, &services, AUCTION_TIMEOUT);
+
+            let result = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect("should complete the auction");
+
+            assert_eq!(
+                result
+                    .provider_responses
+                    .iter()
+                    .map(|response| response.provider.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first-planned", "second-planned"],
+                "should report providers in plan order although the later-planned one answered first"
+            );
+        }
+
+        #[test]
         fn bid_after_cutoff_becomes_provider_timeout() {
             let clock = TestClock::new();
             let client = ScriptedHttpClient::new(&clock);
@@ -3607,11 +3649,6 @@ mod tests {
     // Minimal test double for AuctionProvider
     // ---------------------------------------------------------------------------
 
-    /// Mediator whose context-aware parse restores `nurl`/`ad_id` (mirroring
-    /// `adserver_mock`), while its context-free parse does not. Lets a test prove
-    /// the synchronous mediation path calls `parse_response_with_context`.
-    struct CacheRestoringMediator;
-
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
             BidRenderer::Aps(ApsRendererV1 {
@@ -3672,59 +3709,6 @@ mod tests {
             cache_host: None,
             cache_path: None,
             metadata: HashMap::new(),
-        }
-    }
-
-    /// Endpoint the [`CacheRestoringMediator`] sends its mediation request to.
-    const CACHE_RESTORING_MEDIATOR: &str = "https://mediator.example.com/mediate";
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for CacheRestoringMediator {
-        fn provider_name(&self) -> &str {
-            "mediator"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            Ok(ProviderRequestOutcome::ready(
-                edgezero_core::outbound::OutboundRequest::post(CACHE_RESTORING_MEDIATOR)
-                    .expect("should build the mediator request"),
-            ))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: OutboundResponse,
-            response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            // Context-free path: cannot restore SSP-only render/accounting fields.
-            Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(None)],
-                response_time_ms,
-            ))
-        }
-
-        async fn parse_response_with_context(
-            &self,
-            _response: OutboundResponse,
-            response_time_ms: u64,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            // Context-aware path: restores nurl/ad_id from the collected SSP bids.
-            Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(Some("https://nurl.example/win".to_string()))],
-                response_time_ms,
-            ))
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            2000
         }
     }
 
@@ -4158,18 +4142,22 @@ mod tests {
         run_raw_mock_mediator_response(status, body, floor).await
     }
 
+    /// The [`AdServerMockProvider`] mediator at [`MOCK_MEDIATOR_ENDPOINT`].
+    fn mock_mediator() -> Arc<AdServerMockProvider> {
+        Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: MOCK_MEDIATOR_ENDPOINT.to_string(),
+            timeout_ms: 500,
+            ..AdServerMockConfig::default()
+        }))
+    }
+
     async fn run_raw_mock_mediator_response(
         status: u16,
         body: Vec<u8>,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
-        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
-            enabled: true,
-            endpoint: MOCK_MEDIATOR_ENDPOINT.to_string(),
-            timeout_ms: 500,
-            ..AdServerMockConfig::default()
-        }));
-        run_mediated_provider_auction(mediator, Some((status, body)), floor).await
+        run_mediated_provider_auction(mock_mediator(), Some((status, body)), floor).await
     }
 
     /// Runs a planned auction whose single provider returns bids at 1.5 and 2.0.
@@ -4448,7 +4436,7 @@ mod tests {
         );
         http.respond_to(
             Method::POST,
-            CACHE_RESTORING_MEDIATOR,
+            MOCK_MEDIATOR_ENDPOINT,
             ScriptedReply::error(edgezero_core::error::EdgeError::bad_gateway(
                 "fictional mediator transport failure",
             )),
@@ -4459,7 +4447,7 @@ mod tests {
             false,
         ))
         .expect("should compile planned auction");
-        let orchestrator = planned_orchestrator(plan, Some(Arc::new(CacheRestoringMediator)));
+        let orchestrator = planned_orchestrator(plan, Some(mock_mediator()));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
