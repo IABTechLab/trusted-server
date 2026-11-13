@@ -772,7 +772,7 @@ fn send_response_to_client(mut response: HttpResponse, counters: Option<&Sandbox
     }
 }
 
-/// Apply every late response mutation, then restore privacy invariants before headers commit.
+/// Apply late mutations, then restore privacy and encoding before headers commit.
 fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
@@ -800,6 +800,7 @@ fn apply_terminal_response_effects(
     // `apply_finalize_headers` and normalized asset policy reapplication ran.
     crate::middleware::enforce_set_cookie_cache_privacy(response);
     crate::middleware::enforce_uncacheable_cache_privacy(response);
+    edgezero_adapter_fastly::delivery_compression::finalize_response(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -903,6 +904,9 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::delivery_compression::{
+        DeliveryCompressionIntent, DeliveryCompressionSupport,
+    };
     use edgezero_core::http::response_builder;
     use edgezero_core::http::{HeaderValue, Method, StatusCode};
     use edgezero_core::ingress::{
@@ -1355,6 +1359,135 @@ mod tests {
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
         assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_change_offloaded_delivery_encoding() {
+        futures::executor::block_on(async {
+            let identity = b"<html><head></head><body>Example article</body></html>";
+            for streaming in [false, true] {
+                let body = if streaming {
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                        identity,
+                    )]))
+                } else {
+                    EdgeBody::from(identity.to_vec())
+                };
+                let mut response = response_builder()
+                    .header("content-type", "text/html")
+                    .header("content-length", identity.len())
+                    .header("cache-control", "private, no-store")
+                    .body(body)
+                    .expect("should install final identity output");
+                response.extensions_mut().insert(TerminalPrivateResponse);
+                DeliveryCompressionSupport::GzipBrotli
+                    .mark_identity_response(&mut response)
+                    .expect("should mark installed identity output");
+                assert!(
+                    response
+                        .extensions()
+                        .get::<DeliveryCompressionIntent>()
+                        .is_some()
+                );
+                assert!(response.headers().get("x-compress-hint").is_none());
+                let effects = RequestFilterEffects {
+                    request_headers: Vec::new(),
+                    response_headers: vec![
+                        HeaderMutation::set("content-encoding", "gzip"),
+                        HeaderMutation::set("content-length", "9999"),
+                        HeaderMutation::set("x-compress-hint", "off"),
+                        HeaderMutation::set("vary", "Origin"),
+                        HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                        HeaderMutation::set("surrogate-control", "max-age=3600"),
+                        HeaderMutation::set("cdn-cache-control", "max-age=3600"),
+                    ],
+                };
+
+                apply_terminal_response_effects(&mut response, Some(&effects));
+
+                assert!(response.headers().get("content-encoding").is_none());
+                assert!(response.headers().get("content-length").is_none());
+                assert_eq!(response.headers()["x-compress-hint"], "on");
+                assert!(
+                    response.headers().get_all("vary").iter().any(|value| {
+                        value
+                            .to_str()
+                            .is_ok_and(|value| value.eq_ignore_ascii_case("accept-encoding"))
+                    }),
+                    "should restore delivery variation after late effects"
+                );
+                assert_eq!(response.headers()["cache-control"], "no-store, private");
+                assert!(response.headers().get("surrogate-control").is_none());
+                assert!(response.headers().get("cdn-cache-control").is_none());
+                assert_eq!(
+                    response.body().is_stream(),
+                    streaming,
+                    "should preserve send form"
+                );
+                let body = response
+                    .into_body()
+                    .into_bytes_bounded(1024)
+                    .await
+                    .expect("should collect guest identity output");
+                assert_eq!(
+                    body.as_ref(),
+                    identity,
+                    "should preserve exact identity bytes"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_delivery_finalization_preserves_unmarked_gzip() {
+        futures::executor::block_on(async {
+            let gzip = base64::engine::general_purpose::STANDARD
+                .decode(
+                    "H4sIAAAAAAAAA7PJKMnNsbNJyk+ptHPNS85PSU1RKM5MysnMS7fRB4va6IOVAAB6wM8tKQAAAA==",
+                )
+                .expect("should decode actual gzip fixture");
+            for streaming in [false, true] {
+                let body = if streaming {
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
+                        gzip.clone(),
+                    )]))
+                } else {
+                    EdgeBody::from(gzip.clone())
+                };
+                let mut response = response_builder()
+                    .header("content-type", "text/html")
+                    .header("content-encoding", "gzip")
+                    .header("content-length", gzip.len())
+                    .header("vary", "Accept-Encoding")
+                    .body(body)
+                    .expect("should build encoded sibling");
+                let headers = response.headers().clone();
+
+                apply_terminal_response_effects(&mut response, None);
+
+                assert_eq!(
+                    response.headers(),
+                    &headers,
+                    "should leave encoded framing unchanged"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<DeliveryCompressionIntent>()
+                        .is_none()
+                );
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes_bounded(1024)
+                        .await
+                        .expect("should read encoded sibling")
+                        .as_ref(),
+                    gzip.as_slice(),
+                    "should never relabel or re-encode unmarked gzip"
+                );
+            }
+        });
     }
 
     #[test]
