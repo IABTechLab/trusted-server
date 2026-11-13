@@ -16,6 +16,11 @@
 //! reply as soon as the test clock reaches its
 //! arrival, which is more eager than Fastly's, where a check reports only what an earlier
 //! `EdgeZero` poll recorded.
+//!
+//! The double accepts every request option. It does not model the options a real adapter
+//! rejects: `EdgeZero`'s Axum, Cloudflare, and Spin clients refuse Image Optimizer options,
+//! and Spin's also refuses a host authority override. A route test that sends one of those
+//! passes here while the adapter fails the request in production.
 
 // This module builds under the `test-utils` feature, which the crate-root
 // `cfg(test)` allow does not cover, and it buffers scripted bodies.
@@ -468,6 +473,10 @@ impl RecordedRequest {
     /// proxy marker off, the URI authority sent upstream with no override, and the timeout,
     /// response mode, decoding, and cache policy in `expected`. A failure names the request by
     /// its method only, never its URI or the authority it sent.
+    ///
+    /// The proxy-marker check catches only a request that turns the marker on itself.
+    /// [`ScriptedHttpClient::http_client`] already turns the client's marker off, so the
+    /// adapters' tests that build per-request services from a marker-on client pin the default.
     ///
     /// # Panics
     ///
