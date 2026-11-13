@@ -392,7 +392,12 @@ pub(crate) mod tests {
 
     #[test]
     fn delivery_routed_committed_application_body_with_error_runs_post_delivery() {
-        for error in [DeliveryError::Source, DeliveryError::Transport] {
+        for error in [
+            DeliveryError::Conversion,
+            DeliveryError::Deadline,
+            DeliveryError::Source,
+            DeliveryError::Transport,
+        ] {
             let delivery = routed_delivery(|envelope| committed_then_failed(envelope, error));
 
             assert_eq!(
