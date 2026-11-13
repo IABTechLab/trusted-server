@@ -351,6 +351,7 @@ pub fn validate_settings_for_runtime(
 ) -> Result<(), Report<TrustedServerError>> {
     warn_ignored_certificate_check(settings);
     warn_ignored_origin_readthrough(settings);
+    warn_origin_url_userinfo(settings);
     for id in unknown_integration_ids(settings) {
         log::warn!(
             "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
@@ -412,9 +413,7 @@ fn reject_origin_readthrough(settings: &Settings) -> Result<(), Report<TrustedSe
 ///
 /// Returns [`TrustedServerError::Configuration`] when the URL has a username or password.
 fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    let has_userinfo = url::Url::parse(&settings.publisher.origin_url)
-        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
-    if !has_userinfo {
+    if !origin_url_has_userinfo(settings) {
         return Ok(());
     }
     Err(Report::new(TrustedServerError::Configuration {
@@ -422,6 +421,25 @@ fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedS
             "publisher.origin_url must not contain userinfo; put credentials in a header instead"
                 .to_owned(),
     }))
+}
+
+/// Whether `publisher.origin_url` carries a username or password.
+fn origin_url_has_userinfo(settings: &Settings) -> bool {
+    url::Url::parse(&settings.publisher.origin_url)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
+}
+
+/// Warns that a live `publisher.origin_url` with userinfo fails every publisher request.
+///
+/// A config that predates the rejection keeps loading, but the publisher
+/// forward refuses such a target, so each publisher request answers 400. The
+/// warning never echoes the URL, which holds the credentials.
+fn warn_origin_url_userinfo(settings: &Settings) {
+    if origin_url_has_userinfo(settings) {
+        log::warn!(
+            "publisher.origin_url contains userinfo, so every publisher request answers 400; put the credentials in a header and push the config again"
+        );
+    }
 }
 
 /// Rejects operator `response_headers` entries that Trusted Server never sends:
@@ -1870,6 +1888,37 @@ password = "production-admin-password-32-bytes"
                 "should name the rejected setting on validate and push: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_warns_once_about_origin_url_userinfo_without_echoing_it() {
+        let mut settings = valid_settings();
+        settings.publisher.origin_url =
+            "https://example-user:example-pass@origin.test-publisher.example.com".to_owned();
+        let capture = LogCapture::start();
+
+        validate_settings_for_runtime(&settings)
+            .expect("should keep loading a live config whose origin URL has userinfo");
+
+        let records = capture.take_all();
+        let userinfo: Vec<_> = records
+            .iter()
+            .filter(|record| record.message.contains("publisher.origin_url"))
+            .collect();
+        assert!(
+            matches!(
+                userinfo.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.contains("answers 400")
+            ),
+            "should warn once that every publisher request answers 400"
+        );
+        assert!(
+            records.iter().all(|record| {
+                !record.message.contains("example-user") && !record.message.contains("example-pass")
+            }),
+            "should never echo the credentials"
+        );
     }
 
     #[test]
