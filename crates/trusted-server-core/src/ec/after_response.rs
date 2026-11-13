@@ -205,6 +205,41 @@ mod tests {
     }
 
     #[test]
+    fn results_with_nothing_to_persist_skip_the_row_read() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph = KvIdentityGraph::counting("counting-store", std::sync::Arc::clone(&reads));
+        let not_due = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::NotDue),
+                entries: Vec::new(),
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        );
+
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &not_due,
+        );
+
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Unchanged,
+            "should report nothing to write"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "should not re-read the row when every provider was not due"
+        );
+    }
+
+    #[test]
     fn writes_after_response_results_to_an_existing_row() {
         let graph = KvIdentityGraph::in_memory("after-response");
         let mut entry = live_entry();

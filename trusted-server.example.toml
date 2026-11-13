@@ -114,6 +114,9 @@ pull_sync_concurrency = 3
 # openrtb_atype = 3
 # include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
+# also mirror provider-written UIDs to the JS-readable __Host-ts-eids-mirror
+# cookie (default false; requires bidstream_enabled)
+# mirror_enabled = false
 # Only for inbound identify or batch-sync API access:
 # api_token = "partner_api_token"
 # Required when pull sync is enabled:

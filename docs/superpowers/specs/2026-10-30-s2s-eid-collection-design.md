@@ -72,22 +72,22 @@ decision.
 
 These were agreed before drafting and are binding on the rest of the spec.
 
-| #   | Topic                     | Decision                                                                                                                                                                                                   |
-| --- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | Which request may write   | Only the top-level document navigation. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV.                                                                                        |
-| D2  | Provider timing           | Provider requests start when the navigation starts, run concurrently with the origin fetch, and are collected within a shared total budget of about 200 ms. Their results join the navigation's write.     |
-| D3  | Which navigations look up | Any navigation where an enabled provider has a due source (missing or expired UID). No-match results are not cached in V1.                                                                                 |
-| D4  | Failed write              | Not retried in that page load. KV and the mirror cookie stay unchanged. A new EC is not issued if its row was not created. The next navigation is a new page load and may write.                           |
-| D5  | Availability              | Provider IDs are guaranteed to `/auction` from the next page load. On the same page they are used if the write already completed.                                                                          |
-| D6  | Mirror cookie             | JavaScript-readable. Holds provider-owned UIDs of `bidstream_enabled` sources only. Never trusted by the server over KV. Filled deterministically up to its size limit.                                    |
-| D6b | Mirror consumer           | The tsjs change that reads the mirror and hands IDs to Prebid is a separate optional PR.                                                                                                                   |
-| D7  | Expiry                    | Declared by the writing provider per UID. A UID without `exp` is served until replaced or removed. Browser and batch IDs carry no `exp` and no owner.                                                      |
-| D8  | Conflicts                 | On a provider-owned source, the provider's UIDs replace that source's UIDs. Browser ingest fills only missing sources and never overwrites provider-owned UIDs. Batch sync rejects provider-owned sources. |
-| D9  | Removal                   | Only consent withdrawal (the existing whole-row tombstone) is in scope. A tombstone wins over concurrent and later collection; IDs return only after consent is granted again.                             |
-| D10 | Pull sync                 | Re-expressed as the first provider on the trait; the separate post-send dispatcher is removed.                                                                                                             |
-| D11 | Consent                   | Existing EID-persistence consent check, plus an optional per-provider TCF vendor ID that must also have vendor consent.                                                                                    |
-| D12 | KV schema                 | Stay on `v: 1` with additive optional fields; no migration.                                                                                                                                                |
-| D13 | Other consumers           | Provider IDs appear in `x-ts-eids` and `/_ts/api/v1/identify`, subject to `bidstream_enabled`, expiry and consent.                                                                                         |
+| #   | Topic                     | Decision                                                                                                                                                                                                                                                                                                   |
+| --- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | Which request may write   | Only the top-level document navigation. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV.                                                                                                                                                                                        |
+| D2  | Provider timing           | Provider requests start when the navigation starts, run concurrently with the origin fetch, and are collected within a shared total budget of about 200 ms. Their results join the navigation's write.                                                                                                     |
+| D3  | Which navigations look up | Any navigation where an enabled provider has a due source (missing or expired UID). No-match results are not cached in V1.                                                                                                                                                                                 |
+| D4  | Failed write              | Not retried in that page load. KV and the mirror cookie stay unchanged. A new EC is not issued if its row was not created. The next navigation is a new page load and may write.                                                                                                                           |
+| D5  | Availability              | Provider IDs are guaranteed to `/auction` from the next page load. On the same page they are used if the write already completed.                                                                                                                                                                          |
+| D6  | Mirror cookie             | JavaScript-readable. Holds provider-owned UIDs of sources with both `bidstream_enabled` and `mirror_enabled` (off by default), leaving out UIDs of sources with a denied gating TCF vendor or a GDPR-region exclusion. Never trusted by the server over KV. Filled deterministically up to its size limit. |
+| D6b | Mirror consumer           | The tsjs change that reads the mirror and hands IDs to Prebid is a separate optional PR.                                                                                                                                                                                                                   |
+| D7  | Expiry                    | Declared by the writing provider per UID. A UID without `exp` is served until replaced or removed. Browser and batch IDs carry no `exp` and no owner.                                                                                                                                                      |
+| D8  | Conflicts                 | On a provider-owned source, the provider's UIDs replace that source's UIDs. Browser ingest fills only missing sources and never overwrites provider-owned UIDs. Batch sync rejects provider-owned sources.                                                                                                 |
+| D9  | Removal                   | Only consent withdrawal (the existing whole-row tombstone) is in scope. A tombstone wins over concurrent and later collection; IDs return only after consent is granted again.                                                                                                                             |
+| D10 | Pull sync                 | Re-expressed as the first provider on the trait; the separate post-send dispatcher is removed.                                                                                                                                                                                                             |
+| D11 | Consent                   | Existing EID-persistence consent check, plus an optional per-provider TCF vendor ID that must also have vendor consent.                                                                                                                                                                                    |
+| D12 | KV schema                 | Stay on `v: 1` with additive optional fields; no migration.                                                                                                                                                                                                                                                |
+| D13 | Other consumers           | Provider IDs appear in `x-ts-eids` and `/_ts/api/v1/identify`, subject to `bidstream_enabled`, expiry and consent.                                                                                                                                                                                         |
 
 §5.2.1 (opt-in `collect = "after_response"`) and §5.6 (refresh state) extend
 D2 and D3 additively; defaults are unchanged.
@@ -1064,10 +1064,6 @@ pub trait IdentityCoordinator {
         transport: &T,
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults;
-
-    /// Builds the mirror cookie from the row as it stands after this
-    /// navigation: the committed row, or the snapshot when no write landed.
-    fn mirror(&self, row: Option<&KvEntry>, consent: &ConsentContext, now: UnixSeconds) -> MirrorCookie;
 }
 ```
 
@@ -1239,7 +1235,9 @@ where
             Err(report) => ec.record_write_failure(&report),
         }
     }
-    ec.apply_cookies(&mut response, row.as_ref(), coordinator.mirror(row.as_ref(), ec.consent(), ec.now()));
+    // `ec_finalize_response` then applies the mirror (§10) with
+    // `ec::mirror::build_mirror(row, consent, partners, now)`.
+    ec.apply_cookies(&mut response, row.as_ref());
     response
 }
 ```
@@ -1429,19 +1427,33 @@ still due.
 | Value     | base64url of `{"v":1,"eids":[...]}`; each entry is an OpenRTB EID whose UIDs may carry `exp` |
 | Size      | Encoded value at most 3,584 bytes                                                            |
 
-- **Contents:** live, provider-owned UIDs of `bidstream_enabled` sources, with
-  their EID-level and UID-level fields.
+- **Contents:** live, provider-owned UIDs of sources whose partner sets both
+  `bidstream_enabled` and `mirror_enabled` (off by default), with their
+  EID-level and UID-level fields. A source's UIDs are left out while the
+  request denies consent to any TCF vendor gating that source: the
+  `tcf_vendor_id` of every configured provider claiming it, enabled or
+  disabled (§8.6).
 - **Fill order:** sources in `[[ec.partners]]` config order; entries and UIDs in
   stored order. Each UID is added if the encoded value still fits; otherwise it
   is skipped and filling continues. KV keeps the complete set.
-- **Set** on every consented navigation response from the row as it stands
-  after the navigation: the committed row, or the snapshot when no write
-  landed. Setting a cookie is not a KV write, and this restores a mirror the
-  browser lost.
-- **Expired** (`Max-Age=0`) on any response where EID consent is absent or
-  withdrawn, whatever happened to the KV write, and on a navigation whose
-  mirror would be empty.
-- **The server never reads it.** Readers on the page must drop UIDs whose `exp`
+- **Built** by `ec::mirror::build_mirror(row, consent, partners, now)`, called
+  from `ec_finalize_response`, on consented navigations from the row as it
+  stands after the navigation: the committed row, or the snapshot when no
+  write landed. It is **set** only when its value differs from the one the
+  request carried, so unchanged responses carry no `Set-Cookie`; a mirror the
+  browser lost is restored on the next navigation.
+- **Expired** (`Max-Age=0`) only when the request carried it: on any response
+  where EID consent is absent or withdrawn, whatever happened to the KV write;
+  on a navigation whose mirror would be empty; and, where the mirror cannot be
+  rebuilt (non-navigations, or a navigation whose row cannot be read), when it
+  holds UIDs of a mirrored partner with a gating TCF vendor the request
+  denies or a source excluded where GDPR applies on a GDPR visit. A carried
+  value that does not decode is treated as holding them whenever any
+  mirrored partner is so withheld.
+- **Left untouched** on a navigation whose row cannot be read authoritatively
+  (KV failure), unless the vendor rule above expires it.
+- **The server reads it only to decide whether to set or expire it**, and
+  never trusts it over KV. Readers on the page must drop UIDs whose `exp`
   has passed and strip `exp` before use.
 
 ## 11. Consumers
@@ -1590,15 +1602,15 @@ PR A alone keeps the old post-send pull-sync write as a separate channel
 adds to it. PR B removes it. Within each pull
 request the units are separate, ordered commits so they stay reviewable.
 
-| PR  | Title                                    | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Depends on      |
-| --- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-| PR0 | Spec                                     | This document.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | —               |
-| PR1 | Full-fidelity EID storage and resolution | `ec::eid_types` value types (§6.2); `KvEid`/`KvUid` additive schema; EID-level fields on `crate::openrtb::Eid`; resolver drops UIDs that are not live; auction merge (§11.1); `x-ts-eids` and identify use it. No new writers.                                                                                                                                                                                                                                                           | PR0             |
-| PR2 | Page-load write permit                   | Navigation classifier; `PageLoadWrite` and `commit_page_load`; single attempt; non-navigation requests read-only except withdrawal tombstones; browser ingest on navigation only; withdrawal handling (§3.1, §5.7); integration-proxy EC minting stops.                                                                                                                                                                                                                                  | PR0             |
-| PR3 | Provider trait and coordinator           | `ec::provider` (`IdentityProvider`, `ProviderKind`), `ec::coordinator` (`IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `PlatformLookupTransport`), provider crate with no kinds, config and validation, consent, allowlist, budgeted fan-out, validation, merge into the navigation write, provider-owned skip in ingest, metrics, example config.                                                                                                                  | PR1, PR2, #1433 |
-| PR4 | Batch sync on provider-owned sources     | Reject and count records for sources an enabled provider claims.                                                                                                                                                                                                                                                                                                                                                                                                                         | PR3             |
-| PR5 | Pull sync as a provider                  | `pull-sync` kind built from existing `[[ec.partners]]` pull-sync settings with no config change; existing per-partner rate limit kept as provider-scoped eligibility; post-send dispatcher and completeness marker removed, leftover marker cookies expired. Behaviour change for existing pull-sync partners: their sources become provider-owned, so browser ingest skips them and, with PR4, batch sync rejects them; once PR6 lands their IDs are mirrored when `bidstream_enabled`. | PR3             |
-| PR6 | Mirror cookie                            | Adds `IdentityCoordinator::mirror` (PR3 ships the trait without it); encoding, fill order, set and expiry rules (§10).                                                                                                                                                                                                                                                                                                                                                                   | PR3             |
+| PR  | Title                                    | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Depends on      |
+| --- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| PR0 | Spec                                     | This document.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | —               |
+| PR1 | Full-fidelity EID storage and resolution | `ec::eid_types` value types (§6.2); `KvEid`/`KvUid` additive schema; EID-level fields on `crate::openrtb::Eid`; resolver drops UIDs that are not live; auction merge (§11.1); `x-ts-eids` and identify use it. No new writers.                                                                                                                                                                                                                                                                                                                                            | PR0             |
+| PR2 | Page-load write permit                   | Navigation classifier; `PageLoadWrite` and `commit_page_load`; single attempt; non-navigation requests read-only except withdrawal tombstones; browser ingest on navigation only; withdrawal handling (§3.1, §5.7); integration-proxy EC minting stops.                                                                                                                                                                                                                                                                                                                   | PR0             |
+| PR3 | Provider trait and coordinator           | `ec::provider` (`IdentityProvider`, `ProviderKind`), `ec::coordinator` (`IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `PlatformLookupTransport`), provider crate with no kinds, config and validation, consent, allowlist, budgeted fan-out, validation, merge into the navigation write, provider-owned skip in ingest, metrics, example config.                                                                                                                                                                                                   | PR1, PR2, #1433 |
+| PR4 | Batch sync on provider-owned sources     | Reject and count records for sources an enabled provider claims.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | PR3             |
+| PR5 | Pull sync as a provider                  | `pull-sync` kind built from existing `[[ec.partners]]` pull-sync settings with no config change; existing per-partner rate limit kept as provider-scoped eligibility; post-send dispatcher and completeness marker removed, leftover marker cookies expired. Behaviour for existing pull-sync partners: browser ingest and batch sync keep filling their sources, as before; pull sync fills a source only when it holds no UID. Pull-sync UIDs are provider-written, so once PR6 lands they are mirrored when the partner sets `bidstream_enabled` and `mirror_enabled`. | PR3             |
+| PR6 | Mirror cookie                            | `ec::mirror::build_mirror`, called from `ec_finalize_response`; per-partner `mirror_enabled` opt-in; encoding, fill order, set and expiry rules (§10).                                                                                                                                                                                                                                                                                                                                                                                                                    | PR3             |
 
 ### 13.2 Optional and future (Tech Lead decision)
 
@@ -1669,9 +1681,9 @@ request the units are separate, ordered commits so they stay reviewable.
 20. **Redirect.** The navigation's origin response is a 302. → No KV write; the
     redirect target navigation may write.
 21. **Pull-sync partner after PR5.** A partner with pull sync enabled also
-    receives a browser `ts-eids` UID and a batch record. → Both are ignored or
-    rejected as for any provider-owned source; the pull-sync provider's UID is
-    stored and served.
+    receives a browser `ts-eids` UID and a batch record. → Both still fill the
+    source when it holds no UID, as before PR5; pull sync is not called for a
+    source that already holds a live UID, and fills it only when it holds none.
 22. **After-response provider.** Provider A is `collect = "page"` and answers
     in 50 ms; provider B is `collect = "after_response"` and answers in
     900 ms; page budget 200 ms. → The response is sent without waiting for B;
@@ -1828,3 +1840,40 @@ clock edges and privacy leaks.
 - Non-blocking, no change: a UID2 refresh that keeps failing is retried on
   every navigation until the token expires unless `rate_limit_per_hour` is
   set. The fix for overdue UID2 refresh state (834af2591) chose this bound.
+
+### Round 9 (2026-11-12, PR #1489 at 4b11d05a1, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow end to end, from partner config and the registry through
+pull sync dispatch, the after-response write and bidstream egress, to the
+mirror cookie and its vendor-consent expiry, on the tree restacked onto PR
+#1488.
+
+- Blocking, fixed (9638d7184): pull sync, now a provider, stored UIDs up to
+  1024 bytes. It runs for existing deployments with no config change, so a
+  row holding a longer pull-sync UID broke rollback, which older builds
+  reject whole (§6.3, §12.3). Pull-sync UIDs over 512 bytes are ignored, as
+  legacy pull sync did.
+- Restack: the mirror's vendor gate now uses the per-source vendor set from
+  PR #1487 round 5, so a disabled provider's denied vendor withholds the
+  source from the mirror and expires a carried mirror holding it, as in the
+  bidstream. Tested; §10, the guide and the changelog no longer name a single
+  owning vendor.
+- Non-blocking, fixed: stale comments on pull-sync ownership and on when a
+  provider claiming a pull-sync source fails.
+
+### Round 10 (2026-11-12, PR #1489 at 9638d7184, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed mirror cookies and pull-sync replies, config
+combinations, adapter differences and privacy leaks.
+
+- No blocking findings. Re-checked forged, undecodable and oversized mirror
+  values (an undecodable one is expired whenever a mirrored vendor is denied;
+  one naming unknown sources is never trusted over KV); non-string, blank and
+  oversized pull-sync UIDs; zero rate limits and tokens that cannot form a
+  header (rejected at startup); `mirror_enabled` without
+  `bidstream_enabled`, and a configured provider or `kind = "pull-sync"`
+  claiming a pull-sync source (rejected); withdrawal and missing EID consent
+  expiring the mirror on every response; and the bot gate on pull sync.
+- Non-blocking, no change: pull sync and provider-written mirror contents
+  exist only on Fastly; other adapters build the mirror from rows without
+  provider UIDs, so it stays unset there (§12.3 "On Fastly").

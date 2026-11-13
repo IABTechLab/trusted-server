@@ -42,6 +42,12 @@ do not call either API may omit it. Provision high-entropy values under
 `ec_passphrase` and `partner_api_token`; see
 [Configuration](/guide/configuration#secret-store-migration).
 
+A partner with pull sync enabled (`pull_sync_enabled` and `pull_sync_url`)
+owns its source through the pull-sync provider. Browser EID ingestion and batch
+sync keep filling that source, so a partner may use all three; pull sync only
+fills a source that holds no UID. See
+[Pull Sync on Navigations](/guide/edge-cookies#pull-sync-on-navigations).
+
 Required behavior assumptions:
 
 - The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters

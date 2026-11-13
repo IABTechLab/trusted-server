@@ -29,11 +29,11 @@
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`eid_types`] — Value types for full-fidelity provider EIDs
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
-//! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 //! - [`page_load`] — Single-use page-load write permit and row changes
 //! - [`write_plan`] — Plans a navigation's single row change
 //! - [`provider`] — Identity provider interface and configuration
 //! - [`coordinator`] — Server-side identity lookup coordination
+//! - [`mirror`] — JS-readable mirror of provider-owned bidstream UIDs
 
 mod auth;
 
@@ -52,12 +52,11 @@ pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
+pub mod mirror;
 pub mod page_load;
 pub mod partner;
 pub mod prebid_eids;
 pub mod provider;
-pub mod pull_sync;
-pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
 pub mod write_plan;
@@ -85,7 +84,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -99,7 +98,6 @@ use self::coordinator::results::LookupResults;
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
 use self::page_load::{AfterResponseWrite, NavigationPermit};
-use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
 ///
@@ -193,10 +191,25 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
-    /// Pull-sync completeness marker, if present.
-    pull_sync_marker: Option<String>,
+    /// Whether the retired pull-sync completeness marker is present.
+    pull_marker_present: bool,
+    /// The mirror cookie's value, when present.
+    mirror_cookie: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
+}
+
+/// Returns the value of the first cookie named `name` across every Cookie
+/// header field of `req`.
+fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<String> {
+    req.headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(cookie::Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
 }
 
 /// Parses EC identity from request cookies in a single pass.
@@ -211,15 +224,16 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
-    let pull_sync_marker = jar
-        .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
-        .map(cookie::Cookie::value)
-        .map(str::to_owned);
+    // Browsers may split cookies across several Cookie fields, and the jar
+    // holds only the first, so every field is searched: a mirror or retired
+    // marker missed here would not be expired.
+    let pull_marker_present = find_cookie_in_any_field(req, COOKIE_TS_EC_PULL_COMPLETE).is_some();
+    let mirror_cookie = find_cookie_in_any_field(req, COOKIE_TS_EIDS_MIRROR);
 
     Ok(RequestEc {
         cookie_ec,
-        pull_sync_marker,
+        pull_marker_present,
+        mirror_cookie,
         jar,
     })
 }
@@ -311,8 +325,10 @@ pub struct EcContext {
     /// sent instead of being limited to whatever fits in the size-capped
     /// `ts-eids` cookie.
     client_eids: Option<Vec<Eid>>,
-    /// Browser-carried proof of recent pull-partner completeness.
-    pull_sync_marker: PullSyncMarkerState,
+    /// Whether the request carried the retired pull-sync marker cookie.
+    pull_marker_present: bool,
+    /// The mirror cookie's value, when the request carried it.
+    mirror_cookie: Option<String>,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
     /// Navigation permit issued by the router for page-load navigations.
@@ -404,7 +420,8 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
+            pull_marker_present: parsed.pull_marker_present,
+            mirror_cookie: parsed.mirror_cookie,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -476,7 +493,6 @@ impl EcContext {
         }
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
-        self.pull_sync_marker.invalidate_for_replaced_ec();
         Ok(())
     }
 
@@ -595,35 +611,34 @@ impl EcContext {
         self.client_eids.as_deref()
     }
 
-    /// Validates a browser completeness marker against the active EC and partner set.
-    pub(crate) fn validate_pull_sync_marker(
-        &mut self,
-        settings: &Settings,
-        registry: &registry::PartnerRegistry,
-    ) {
-        validate_marker_state(
-            &mut self.pull_sync_marker,
-            settings,
-            registry,
-            self.ec_value.as_deref(),
-        );
-    }
-
-    /// Returns the current pull-sync marker state.
+    /// Whether the request carried the retired pull-sync marker cookie.
     #[must_use]
-    pub(crate) fn pull_sync_marker(&self) -> &PullSyncMarkerState {
-        &self.pull_sync_marker
+    pub(crate) fn pull_marker_present(&self) -> bool {
+        self.pull_marker_present
     }
 
-    /// Returns mutable pull-sync marker state for response reconciliation.
-    pub(crate) fn pull_sync_marker_mut(&mut self) -> &mut PullSyncMarkerState {
-        &mut self.pull_sync_marker
+    /// Whether the request carried the mirror cookie.
+    #[must_use]
+    pub(crate) fn mirror_cookie_present(&self) -> bool {
+        self.mirror_cookie.is_some()
     }
 
-    /// Sets pull-sync marker state in focused unit tests.
+    /// The mirror cookie's value, when the request carried it.
+    #[must_use]
+    pub(crate) fn mirror_cookie(&self) -> Option<&str> {
+        self.mirror_cookie.as_deref()
+    }
+
+    /// Sets the mirror cookie the request carried, for tests.
     #[cfg(test)]
-    pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
-        self.pull_sync_marker = state;
+    pub(crate) fn set_mirror_cookie_for_test(&mut self, value: Option<&str>) {
+        self.mirror_cookie = value.map(str::to_owned);
+    }
+
+    /// Marks the retired pull-sync marker cookie as present, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_pull_marker_present_for_test(&mut self, present: bool) {
+        self.pull_marker_present = present;
     }
 
     /// Stores the navigation permit issued by the router.
@@ -685,7 +700,6 @@ impl EcContext {
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
         self.kv_snapshot = snapshot;
-        self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
     /// Returns whether EC creation is permitted by consent for this request.
@@ -736,7 +750,8 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -765,7 +780,8 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -797,7 +813,8 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -1010,6 +1027,36 @@ mod tests {
     }
 
     #[test]
+    fn leftover_pull_marker_is_expired() {
+        let settings = create_test_settings();
+        let req = create_test_request(&[("cookie", "ts-ec-pull-complete=x")]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+        let mut response = http::Response::new(EdgeBody::empty());
+
+        finalize::ec_finalize_response(
+            &settings,
+            &mut ec,
+            None,
+            &registry::PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=;")
+                    && cookie.contains("Max-Age=0")),
+            "should expire the leftover marker"
+        );
+    }
+
+    #[test]
     fn read_from_request_ignores_header_ec() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("a", "HdrEc1");
@@ -1022,6 +1069,37 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_finds_the_pull_marker_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let marker = format!("{COOKIE_TS_EC_PULL_COMPLETE}=1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &marker)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(
+            ec.pull_marker_present(),
+            "should detect the retired pull marker in a later Cookie field"
+        );
+    }
+
+    #[test]
+    fn read_from_request_finds_the_mirror_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let mirror = format!("{COOKIE_TS_EIDS_MIRROR}=m-1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &mirror)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.mirror_cookie(),
+            Some("m-1"),
+            "should capture the mirror from a later Cookie field"
+        );
     }
 
     #[test]

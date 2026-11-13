@@ -97,7 +97,9 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     }
 }
 
-/// Fills missing sources from the browser, skipping provider-owned ones.
+/// Fills missing sources from the browser, skipping sources an enabled
+/// configured provider owns. A source owned only by its partner's pull sync
+/// is still filled, as it was before pull sync became a provider.
 ///
 /// Returns the sources it inserted, in insertion order.
 fn apply_browser_ingest(
@@ -924,6 +926,28 @@ mod tests {
                 "should not store a browser UID for a provider-owned source"
             );
         }
+    }
+
+    #[test]
+    fn browser_ingest_fills_a_source_owned_only_by_pull_sync() {
+        // Arrange: pull sync runs for the source, but no configured provider owns it.
+        let registry = registry(&[]);
+        let snapshot = present(&live_entry());
+        let ingest = ingest_owned();
+        let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::NotDue));
+
+        // Act
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
+            .expect("should plan an update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update the existing row")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "browser-id",
+            "should store the browser UID for a pull-sync source"
+        );
     }
 
     #[test]

@@ -503,6 +503,15 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Whether this partner's provider-written UIDs are mirrored to the
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
+    /// effect only with `bidstream_enabled`.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub mirror_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -524,11 +533,8 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
-    ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
+    /// Legacy pull-sync refresh interval; retained for config compatibility;
+    /// unused.
     #[serde(
         default = "EcPartner::default_pull_sync_ttl_sec",
         deserialize_with = "from_value_or_str"
@@ -546,6 +552,13 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    /// Whether this partner runs pull sync as an identity provider, which
+    /// makes its source provider-owned.
+    #[must_use]
+    pub fn runs_pull_sync(&self) -> bool {
+        self.pull_sync_enabled && self.pull_sync_url.is_some()
+    }
+
     /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
     /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
@@ -691,6 +704,31 @@ impl IdentityProviderConfig {
         true
     }
 
+    /// Builds an enabled page-phase config with no TCF vendor, no rate limit,
+    /// default secrets and empty provider settings.
+    #[must_use]
+    pub fn new(
+        id: String,
+        kind: String,
+        endpoint: String,
+        allowed_domains: Vec<String>,
+        sources: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            enabled: true,
+            endpoint: Some(endpoint),
+            allowed_domains,
+            sources,
+            tcf_vendor_id: None,
+            collect: CollectTiming::default(),
+            rate_limit_per_hour: None,
+            secrets: ProviderSecrets::default(),
+            settings: serde_json::Map::new(),
+        }
+    }
+
     /// The configured implementation kind.
     #[must_use]
     pub fn kind(&self) -> &str {
@@ -739,7 +777,8 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
+    /// Maximum number of pull-sync lookups dispatched per navigation; 0
+    /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 
@@ -831,6 +870,19 @@ impl Ec {
         "trusted-server-placeholder-secret",
         "replace-with-random-ec-passphrase",
     ];
+
+    /// Normalizes every partner's `pull_sync_allowed_domains`: trimmed,
+    /// lowercased and without a trailing dot, matching how request hosts are
+    /// compared.
+    fn normalize_pull_sync_domains(&mut self) {
+        for domain in self
+            .partners
+            .iter_mut()
+            .flat_map(|partner| partner.pull_sync_allowed_domains.iter_mut())
+        {
+            *domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        }
+    }
 
     /// Default maximum concurrent pull-sync requests.
     #[must_use]
@@ -3595,6 +3647,7 @@ impl Settings {
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
+        self.ec.normalize_pull_sync_domains();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
@@ -4540,6 +4593,30 @@ mod tests {
     }
 
     #[test]
+    fn pull_sync_allowed_domains_are_normalized_at_load() {
+        let toml = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Pull partner"
+            source_domain = "partner.example.com"
+            pull_sync_enabled = true
+            pull_sync_url = "https://sync.example.com/pull"
+            pull_sync_allowed_domains = [" Sync.Example.COM. "]
+            ts_pull_token = "example-pull-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse settings");
+
+        assert_eq!(
+            settings.ec.partners[0].pull_sync_allowed_domains,
+            vec!["sync.example.com".to_owned()],
+            "should trim, lowercase and drop the trailing dot"
+        );
+    }
+
+    #[test]
     fn html_finalization_timeout_defaults_and_boundaries() {
         let parsed = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse an omitted terminal timeout");
@@ -4677,6 +4754,41 @@ mod tests {
         assert!(
             serialized.get("sandbox_metrics_enabled").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn default_partner_omits_mirror_enabled_for_rollback() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+
+        assert!(
+            serialized.get("mirror_enabled").is_none(),
+            "a default partner must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_mirror_serializes_and_round_trips() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+            "mirror_enabled": true,
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+        let restored: EcPartner =
+            serde_json::from_value(serialized).expect("should deserialize serialized partner");
+
+        assert!(
+            restored.mirror_enabled,
+            "an enabled mirror must survive a round trip"
         );
     }
 
@@ -5100,6 +5212,7 @@ mod tests {
             source_domain: "canary-partner.example".to_string(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -7156,6 +7269,7 @@ source_domain = "partner.example.com"
             source_domain: "partner.example.com".to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: api_token.map(|token| Redacted::new(token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,

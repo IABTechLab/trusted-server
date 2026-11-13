@@ -13,18 +13,19 @@ use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
+use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{expire_ec_cookie, set_ec_cookie};
+use super::cookies::{COOKIE_MAX_AGE, append_cookie, expire_ec_cookie, set_ec_cookie};
 use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
+use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
-use super::pull_sync_marker::{expire_marker, reconcile_marker};
-use super::registry::PartnerRegistry;
+use super::registry::{PartnerConfig, PartnerRegistry};
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -62,21 +63,160 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    ec_context.validate_pull_sync_marker(settings, registry);
+    let navigation = finalize_response_inner(
+        settings,
+        ec_context,
+        kv,
+        registry,
+        eids_cookie,
+        sharedid_cookie,
+        response,
+    );
+    apply_mirror(ec_context, registry, navigation, response);
+    expire_retired_pull_marker(ec_context, response);
+}
+
+/// Sets or expires the mirror cookie (spec §10). Best effort.
+///
+/// Navigations rebuild it from the row as it stands after the page-load
+/// write: the committed row is stored as the `Present` snapshot, so
+/// [`super::EcKvSnapshot::entry_for`] returns it, or the read snapshot when no
+/// write landed. Without EC and EID consent it is expired on any response
+/// whose request carried it.
+///
+/// The cookie is only expired when the request carried it, and only set when
+/// its value differs from the one the request carried, so responses that
+/// leave the mirror as it was stay free of `Set-Cookie` and keep their
+/// cacheability. An unchanged mirror is therefore not re-extended; once it
+/// lapses, the next navigation sets it again.
+///
+/// Where the mirror cannot be rebuilt (non-navigations, or a navigation
+/// without a readable row), a carried mirror is expired when the request
+/// denies TCF vendor consent to a vendor gating any mirrored partner it holds,
+/// or when a provider excludes such a partner's source on this GDPR visit;
+/// otherwise it is left untouched.
+fn apply_mirror(
+    ec_context: &EcContext,
+    registry: &PartnerRegistry,
+    navigation: bool,
+    response: &mut Response<EdgeBody>,
+) {
+    let decision = if !mirror_consent(ec_context.consent()) {
+        MirrorCookie::Expire
+    } else if navigation && let Some(row) = mirror_row(ec_context) {
+        build_mirror(
+            row,
+            ec_context.consent(),
+            registry,
+            UnixSeconds::new(current_timestamp()),
+        )
+    } else if mirror_vendor_denied(ec_context, registry) {
+        // The mirror cannot be rebuilt here, and it may hold UIDs of a
+        // provider whose TCF vendor consent is now denied or whose source is
+        // excluded on this GDPR visit.
+        MirrorCookie::Expire
+    } else {
+        if navigation {
+            log::debug!("Leaving the mirror cookie untouched: identity row is unavailable");
+        }
+        return;
+    };
+    match decision {
+        MirrorCookie::Set(value) if ec_context.mirror_cookie() == Some(value.as_str()) => {}
+        MirrorCookie::Set(value) => append_cookie(
+            response,
+            &format!(
+                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+                value.as_str()
+            ),
+        ),
+        MirrorCookie::Expire if ec_context.mirror_cookie_present() => {
+            append_cookie(
+                response,
+                &format!("{COOKIE_TS_EIDS_MIRROR}=; Path=/; Secure; SameSite=Lax; Max-Age=0"),
+            );
+        }
+        MirrorCookie::Expire => {}
+    }
+}
+
+/// Whether the request carries a mirror that holds UIDs of a mirrored partner
+/// with a denied gating TCF vendor (that of any configured provider claiming
+/// its source, enabled or disabled) or a source excluded where GDPR applies
+/// for this visitor, so those UIDs must no longer reach the page.
+///
+/// A carried value that does not decode as a mirror may hold anything, so it
+/// counts as holding denied UIDs whenever any mirrored partner is denied.
+fn mirror_vendor_denied(ec_context: &EcContext, registry: &PartnerRegistry) -> bool {
+    let Some(value) = ec_context.mirror_cookie() else {
+        return false;
+    };
+    let denied = |partner: &PartnerConfig| {
+        partner.bidstream_enabled
+            && partner.mirror_enabled
+            && (partner.owner_vendor_consent_denied(ec_context.consent())
+                || partner.excluded_for(ec_context.consent()))
+    };
+    if !registry.in_config_order().any(denied) {
+        return false;
+    }
+    mirror_sources(value).is_none_or(|sources| {
+        sources
+            .iter()
+            .any(|source| registry.find_by_source_domain(source).is_some_and(denied))
+    })
+}
+
+/// The row the mirror is built from.
+///
+/// Returns `Some(None)` when there is authoritatively no row (no EC or a
+/// missing row), and `None` when the row is unknown because the read failed
+/// or never happened.
+fn mirror_row(ec_context: &EcContext) -> Option<Option<&KvEntry>> {
+    let Some(ec_id) = ec_context.ec_value() else {
+        return Some(None);
+    };
+    let snapshot = ec_context.kv_snapshot();
+    match snapshot {
+        EcKvSnapshot::Present { .. } | EcKvSnapshot::Missing { .. }
+            if snapshot.belongs_to(ec_id) =>
+        {
+            Some(snapshot.entry_for(ec_id))
+        }
+        _ => None,
+    }
+}
+
+/// Expires a leftover pull-sync completeness marker; the marker is retired.
+fn expire_retired_pull_marker(ec_context: &EcContext, response: &mut Response<EdgeBody>) {
+    if ec_context.pull_marker_present() {
+        append_cookie(
+            response,
+            &format!(
+                "{COOKIE_TS_EC_PULL_COMPLETE}=; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly"
+            ),
+        );
+    }
+}
+
+fn finalize_response_inner(
+    settings: &Settings,
+    ec_context: &mut EcContext,
+    kv: Option<&KvIdentityGraph>,
+    registry: &PartnerRegistry,
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    response: &mut Response<EdgeBody>,
+) -> bool {
     let (permit, after_response) = ec_context
         .take_navigation_permit()
         .and_then(|permit| permit.confirm_with_after_response(response.status()))
         .unzip();
+    let navigation = permit.is_some();
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        // Expire the request-local marker independently of the EC cookie: a
-        // withdrawal must stop any pending pull-sync disclosure window.
-        if consent_withdrawn && ec_context.pull_sync_marker().was_present() {
-            expire_marker(ec_context.pull_sync_marker_mut(), response);
-        }
-
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -85,7 +225,7 @@ pub fn ec_finalize_response(
             consent_withdrawn,
             response,
         );
-        return;
+        return navigation;
     }
 
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
@@ -126,8 +266,7 @@ pub fn ec_finalize_response(
         // mint a browser cookie with no backing identity-graph row.
         log::info!("Skipping generated EC response write because KV graph is unavailable");
     }
-
-    reconcile_pull_sync_marker(settings, registry, ec_context, response);
+    navigation
 }
 
 /// Shared inputs for the navigation's single write.
@@ -279,24 +418,6 @@ fn update_returning(
             false
         }
     }
-}
-
-fn reconcile_pull_sync_marker(
-    settings: &Settings,
-    registry: &PartnerRegistry,
-    ec_context: &mut EcContext,
-    response: &mut Response<EdgeBody>,
-) {
-    let ec_id = ec_context.ec_value().map(str::to_owned);
-    let snapshot = ec_context.kv_snapshot().clone();
-    reconcile_marker(
-        settings,
-        registry,
-        ec_id.as_deref(),
-        &snapshot,
-        ec_context.pull_sync_marker_mut(),
-        response,
-    );
 }
 
 /// Withholds EID-derived KV updates when consent does not allow EID
@@ -561,6 +682,8 @@ mod tests {
 
     use base64::Engine as _;
 
+    use std::num::NonZeroU16;
+
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
@@ -574,6 +697,7 @@ mod tests {
     use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
+    use crate::test_support::tests::consent_granting_vendors;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
 
     fn empty_response() -> Response<EdgeBody> {
@@ -647,6 +771,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -835,7 +960,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "should keep the EC cookie when the tombstone write fails"
         );
         assert!(
@@ -1118,59 +1243,6 @@ mod tests {
         assert!(
             !stored.ids.contains_key("id5-sync.com"),
             "denied Purpose 4 EID must not be persisted even on the recovered row"
-        );
-    }
-
-    #[test]
-    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
-        let settings = create_test_settings();
-        let orphaned_ec = sample_ec_id("orphn2");
-        let consent = ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        };
-        let mut ec_context = EcContext::new_for_test_with_ip(
-            Some(orphaned_ec.clone()),
-            consent,
-            Some("192.0.2.10".to_owned()),
-        );
-        ec_context.set_recovery_eligible(true);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Valid { expires_at: 4_600 },
-        );
-        let mut partner = make_partner("pull.example.com");
-        partner.pull_sync_enabled = true;
-        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
-        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        ec_context.set_navigation_permit(NavigationPermit::for_test());
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            None,
-            None,
-            &mut response,
-        );
-
-        assert_eq!(
-            ec_context.ec_value(),
-            Some(orphaned_ec.as_str()),
-            "an unread snapshot should defer orphan rotation until marker expiry"
-        );
-        assert!(
-            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
-            "a marker-skipped request should leave the snapshot unread"
-        );
-        assert!(
-            response.headers().get(http::header::SET_COOKIE).is_none(),
-            "bounded orphan deferral should not rewrite browser identity state"
         );
     }
 
@@ -1864,7 +1936,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "must not emit a cookie without an authoritative backing row"
         );
     }
@@ -1940,6 +2012,514 @@ mod tests {
     // Orphan-recovery gating and two-ID withdrawal
     // -----------------------------------------------------------------------
 
+    fn mirror_cookies(response: &Response<EdgeBody>) -> Vec<String> {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|cookie| cookie.starts_with("__Host-ts-eids-mirror="))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn provider_found(source: &str) -> LookupResults {
+        provider_found_by(source, "example-provider")
+    }
+
+    fn provider_found_by(source: &str, owner: &str) -> LookupResults {
+        let uid = KvUid::new(
+            UidValue::try_from("provider-uid").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new(owner)),
+            Expiry::Never,
+        );
+        // Made for the EC ID `run_mirror_navigation` seeds.
+        LookupResults::new(
+            &sample_ec_id("mirr01"),
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from(source).expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![uid])],
+                )],
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        )
+    }
+
+    fn run_mirror_navigation(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        kv_read_failed: bool,
+    ) -> Response<EdgeBody> {
+        run_mirror_request(lookups, mirror, kv_read_failed, true)
+    }
+
+    fn run_mirror_request(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        kv_read_failed: bool,
+        navigation: bool,
+    ) -> Response<EdgeBody> {
+        run_mirror_request_with_owner(
+            lookups,
+            mirror,
+            kv_read_failed,
+            navigation,
+            MirrorGate::Open,
+        )
+    }
+
+    /// What withholds the mirrored source in [`run_mirror_request_with_owner`].
+    #[derive(Clone, Copy)]
+    enum MirrorGate {
+        /// Nothing withholds the source.
+        Open,
+        /// The source's owning provider has TCF vendor 9999 and the request's
+        /// TCF string keeps Purposes 1 and 4 but denies that vendor.
+        VendorDenied,
+        /// A provider excludes the source where GDPR applies, and the request
+        /// is a GDPR visit granting Purposes 1 and 4.
+        RegionExcluded,
+    }
+
+    /// Runs a mirror request with the source withheld as `gate` says.
+    fn run_mirror_request_with_owner(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        kv_read_failed: bool,
+        navigation: bool,
+        gate: MirrorGate,
+    ) -> Response<EdgeBody> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("mirr01");
+        let graph = KvIdentityGraph::in_memory("mirror_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row");
+        let snapshot = if kv_read_failed {
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            }
+        } else {
+            graph.load_snapshot(&ec_id)
+        };
+        let mut ec_context = returning_user_context(&ec_id, snapshot, navigation);
+        ec_context.set_mirror_cookie_for_test(mirror);
+        ec_context.set_lookup_results(lookups);
+        let mut partner = make_partner("ids.example.com");
+        partner.mirror_enabled = true;
+        let mut registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let owner_vendor = match gate {
+            MirrorGate::Open => None,
+            MirrorGate::VendorDenied => {
+                *ec_context.consent_mut() = consent_granting_vendors(Vec::new());
+                NonZeroU16::new(9999)
+            }
+            MirrorGate::RegionExcluded => {
+                *ec_context.consent_mut() = consent_granting_vendors(Vec::new());
+                assert!(
+                    registry.exclude_where_gdpr_applies("ids.example.com"),
+                    "should exclude the source"
+                );
+                None
+            }
+        };
+        registry.mark_provider_owned("ids.example.com", owner_vendor);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+        response
+    }
+
+    #[test]
+    fn navigation_sets_mirror_from_committed_row() {
+        let response = run_mirror_navigation(provider_found("ids.example.com"), None, false);
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should set one mirror cookie");
+        assert!(
+            !cookies[0].contains("Max-Age=0") && cookies[0].contains("Max-Age="),
+            "should set the mirror with a non-zero Max-Age"
+        );
+        assert!(
+            !cookies[0].contains("HttpOnly") && !cookies[0].contains("Domain="),
+            "should be JS-readable and host-only"
+        );
+    }
+
+    #[test]
+    fn pull_sync_result_is_mirrored_with_its_owner() {
+        let response = run_mirror_navigation(
+            provider_found_by("ids.example.com", "pull-sync:ids.example.com"),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            mirror_cookies(&response).len(),
+            1,
+            "should mirror a provider-owned pull-sync UID"
+        );
+    }
+
+    #[test]
+    fn vendor_withdrawal_expires_the_mirror_on_a_non_navigation() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+            MirrorGate::VendorDenied,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror whose owning vendor lost consent"
+        );
+    }
+
+    #[test]
+    fn vendor_withdrawal_expires_the_mirror_when_the_row_is_unavailable() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            true,
+            true,
+            MirrorGate::VendorDenied,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire the mirror without a readable row"
+        );
+    }
+
+    /// Runs a mirror request with two mirrored partners: `a.example.com`,
+    /// whose owning vendor 1111 is granted, and `b.example.com`, whose owning
+    /// vendor 9999 is denied. The lookup finds UIDs for both.
+    fn run_split_vendor_mirror_request(
+        mirror: Option<&str>,
+        navigation: bool,
+    ) -> Response<EdgeBody> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("mirr01");
+        let graph = KvIdentityGraph::in_memory("mirror_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row");
+        let mut ec_context =
+            returning_user_context(&ec_id, graph.load_snapshot(&ec_id), navigation);
+        *ec_context.consent_mut() = consent_granting_vendors(vec![1111]);
+        ec_context.set_mirror_cookie_for_test(mirror);
+        let entry = |source: &str| {
+            let uid = KvUid::new(
+                UidValue::try_from("provider-uid").expect("should build uid"),
+                AgentType::try_from(1).expect("should build atype"),
+                None,
+                Some(ProviderId::new("example-provider")),
+                Expiry::Never,
+            );
+            (
+                SourceDomain::try_from(source).expect("should build source"),
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+            )
+        };
+        ec_context.set_lookup_results(LookupResults::new(
+            &ec_id,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Found {
+                    kept: 2,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![entry("a.example.com"), entry("b.example.com")],
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        ));
+        let partners = ["a.example.com", "b.example.com"].map(|source| {
+            let mut partner = make_partner(source);
+            partner.mirror_enabled = true;
+            partner
+        });
+        let mut registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        registry.mark_provider_owned("a.example.com", NonZeroU16::new(1111));
+        registry.mark_provider_owned("b.example.com", NonZeroU16::new(9999));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+        response
+    }
+
+    fn mirror_value(cookie: &str) -> &str {
+        cookie
+            .strip_prefix("__Host-ts-eids-mirror=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("should carry a mirror value")
+    }
+
+    #[test]
+    fn partial_vendor_denial_keeps_a_mirror_without_the_denied_vendor() {
+        // Arrange
+        let navigation = run_split_vendor_mirror_request(None, true);
+        let set = mirror_cookies(&navigation);
+        assert_eq!(set.len(), 1, "should set the mirror on navigation");
+        let value = mirror_value(&set[0]).to_owned();
+        let sources = mirror_sources(&value).expect("should decode the mirror");
+        assert_eq!(
+            sources,
+            vec!["a.example.com".to_owned()],
+            "should mirror only the granted vendor's partner"
+        );
+
+        // Act
+        let non_navigation = run_split_vendor_mirror_request(Some(&value), false);
+        let next_navigation = run_split_vendor_mirror_request(Some(&value), true);
+
+        // Assert
+        assert!(
+            mirror_cookies(&non_navigation).is_empty(),
+            "should keep a mirror that holds no denied vendor's UIDs"
+        );
+        assert!(
+            mirror_cookies(&next_navigation).is_empty(),
+            "should not re-set an unchanged mirror on the next navigation"
+        );
+    }
+
+    #[test]
+    fn partial_vendor_denial_expires_a_mirror_holding_the_denied_vendor() {
+        // Arrange
+        let json = serde_json::json!({
+            "v": 1,
+            "eids": [
+                {"source": "a.example.com", "uids": [{"id": "provider-uid", "atype": 1}]},
+                {"source": "b.example.com", "uids": [{"id": "provider-uid", "atype": 1}]},
+            ],
+        });
+        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string());
+
+        // Act
+        let response = run_split_vendor_mirror_request(Some(&value), false);
+
+        // Assert
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror holding a denied vendor's UIDs"
+        );
+    }
+
+    #[test]
+    fn region_exclusion_expires_the_mirror_on_a_non_navigation() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+            MirrorGate::RegionExcluded,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror holding a source excluded where GDPR applies"
+        );
+    }
+
+    #[test]
+    fn vendor_withdrawal_without_a_mirror_cookie_emits_nothing() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            None,
+            false,
+            false,
+            MirrorGate::VendorDenied,
+        );
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should not expire a mirror the request did not carry"
+        );
+    }
+
+    #[test]
+    fn consented_non_navigation_leaves_the_mirror_untouched() {
+        let response = run_mirror_request(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+        );
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should neither set nor expire the mirror outside a navigation"
+        );
+    }
+
+    #[test]
+    fn navigation_with_an_unchanged_mirror_emits_no_cookie() {
+        // Arrange
+        let first = run_mirror_navigation(provider_found("ids.example.com"), None, false);
+        let set = mirror_cookies(&first);
+        let value = set[0]
+            .strip_prefix("__Host-ts-eids-mirror=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("should set a mirror value");
+
+        // Act
+        let unchanged =
+            run_mirror_navigation(provider_found("ids.example.com"), Some(value), false);
+        let changed =
+            run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), false);
+
+        // Assert
+        assert!(
+            mirror_cookies(&unchanged).is_empty(),
+            "should not re-set a mirror whose value is unchanged"
+        );
+        assert_eq!(
+            mirror_cookies(&changed).len(),
+            1,
+            "should set the mirror when its value changed"
+        );
+    }
+
+    #[test]
+    fn navigation_without_provider_uids_expires_mirror() {
+        let response = run_mirror_navigation(LookupResults::default(), Some("stale"), false);
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire the mirror when no provider UID qualifies"
+        );
+    }
+
+    #[test]
+    fn navigation_without_mirror_cookie_emits_no_expiry() {
+        let response = run_mirror_navigation(LookupResults::default(), None, false);
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should not expire a mirror the request did not carry"
+        );
+    }
+
+    #[test]
+    fn kv_read_failure_leaves_mirror_untouched() {
+        let response =
+            run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), true);
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should leave the mirror untouched when the row could not be read"
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_without_mirror_cookie_emits_nothing() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            mirror_cookies(&response).is_empty(),
+            "should not expire a mirror the request did not carry"
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_expires_mirror_on_any_response() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        ec_context.set_mirror_cookie_for_test(Some("stale"));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire the mirror without a navigation"
+        );
+    }
+
     fn granting_consent() -> ConsentContext {
         ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
@@ -1968,6 +2548,17 @@ mod tests {
         ec
     }
 
+    /// Whether the response sets or expires the `ts-ec` cookie; other
+    /// cookies, such as the mirror, are ignored.
+    fn ec_cookie_emitted(response: &Response<EdgeBody>) -> bool {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|cookie| cookie.starts_with("ts-ec="))
+    }
+
     fn assert_did_not_rotate(ec_context: &EcContext, orphan: &str, response: &Response<EdgeBody>) {
         assert_eq!(
             ec_context.ec_value(),
@@ -1976,7 +2567,7 @@ mod tests {
         );
         assert!(!ec_context.ec_generated(), "must not mark a rotated EC");
         assert!(
-            get_header(response, "set-cookie").is_none(),
+            !ec_cookie_emitted(response),
             "must not emit a replacement cookie"
         );
     }
@@ -2239,9 +2830,7 @@ mod tests {
         };
         let mut ec_context =
             make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
-        );
+        ec_context.set_pull_marker_present_for_test(true);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let graph = KvIdentityGraph::failing("unavailable-store");
         let mut response = empty_response();
@@ -2276,59 +2865,6 @@ mod tests {
                 cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
             }),
             "KV failure should not prevent marker deletion"
-        );
-    }
-
-    #[test]
-    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("compl1");
-        let mut partner = make_partner("ssp.example.com");
-        partner.pull_sync_enabled = true;
-        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
-        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
-        let mut ec_context = make_context(
-            Some(&ec_id),
-            Some(&ec_id),
-            true,
-            false,
-            Jurisdiction::NonRegulated,
-        );
-        let mut entry = live_entry();
-        entry.ids.insert(
-            "ssp.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId::single("partner-uid".to_owned()),
-        );
-        ec_context.set_kv_snapshot(EcKvSnapshot::Present {
-            ec_id,
-            entry: Box::new(entry),
-            generation: Some(1),
-        });
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            None,
-            &registry,
-            None,
-            None,
-            &mut response,
-        );
-
-        let cookies = response
-            .headers()
-            .get_all(http::header::SET_COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-        assert!(
-            cookies
-                .iter()
-                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=v1.")),
-            "complete snapshot should issue the marker"
         );
     }
 
@@ -2370,9 +2906,7 @@ mod tests {
             ..Default::default()
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent);
-        ec_context.set_pull_sync_marker_for_test(
-            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
-        );
+        ec_context.set_pull_marker_present_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -2621,7 +3155,7 @@ mod tests {
         );
 
         assert!(
-            get_header(&response, "set-cookie").is_none(),
+            !ec_cookie_emitted(&response),
             "should not issue an EC whose row was not created"
         );
     }

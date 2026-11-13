@@ -66,7 +66,6 @@ sequenceDiagram
         TS-->>B: Response<br/>(no cookie refresh)
     end
 
-    Note over TS,KV: Phase 4: Post-send (background)<br/>Dispatch pull-sync to partners
 ```
 
 ### Response Finalization
@@ -203,7 +202,7 @@ sequenceDiagram
     participant DSP as Downstream Partners / DSPs
 
     alt Pull sync seeds partner UID
-        TS->>DSP: Background pull sync request<br/>(EC ID + consent context)
+        TS->>DSP: Pull sync lookup on a page navigation<br/>(EC ID + consent context)
         DSP-->>TS: Partner UID for EC
         TS->>KV: Upsert ids[source_domain] = UID
     else Prebid sync seeds browser EIDs
@@ -265,15 +264,27 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs from the `ts-eids` or `sharedId` cookie only fill partner UIDs that are missing from KV (the `/auction` request body goes to bidders only and is never stored); a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
-### Pull-Sync Completeness Marker
+### Pull Sync on Navigations
 
-When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+Pull sync runs as an identity provider after the response has been sent, on top-level page navigations from recognized browsers that send Fetch Metadata (`Sec-Fetch-Dest: document` and `Sec-Fetch-Mode: navigate`) and are not prefetches. Requests that fail the browser check never trigger it. Before it became a provider, it also ran after `/auction` responses and on navigations without Fetch Metadata. It uses the after-response budget (`identity_after_response_budget_ms`, shared with the other after-response providers), so a slow partner never delays the page; a partner that answers after the budget is not filled, where each pull used to wait up to 15 seconds for a first byte. Its result reaches the row in the follow-up write and is served from the next page load. Like other after-response lookups, it never creates a row. Browser EID ingestion (`ts-eids`, `sharedId`) still fills a pull-sync partner's source when it holds no UID, and batch sync still accepts the partner's mappings, as before. A source that already holds any live UID, including a browser-supplied or batch-synced one, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC. On Fastly that limit is enforced as a per-minute budget of at least one, so values below 60 behave like 60 per hour. At most `pull_sync_concurrency` partners are pulled per navigation (0 means no limit), unlike before, when every eligible partner was pulled in batches of that size; a partner past the cap is logged as `skipped_concurrency_cap`. The partner order rotates every hour, so partners past the cap still get turns. When every pull-sync source is already held and no configured provider runs after the response, the after-response phase makes no KV read. A configured after-response provider always runs, so an opt-out or a changed ID in its own cookies is noticed while its sources hold live UIDs.
 
-A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
+The former `ts-ec-pull-complete` completeness marker is retired. A response to a request that still carries it expires the leftover cookie. The marker used to let a returning navigation skip reading the EC row before the origin response when no auction, browser EID cookie or withdrawal needed it; that navigation now reads the row. With the default inline mode the read overlaps the origin fetch.
 
-Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal always expires any present `ts-ec-pull-complete` marker, and expires `ts-ec` once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), `ts-ec` is kept so the next request that carries it retries the withdrawal.
+Explicit withdrawal expires `ts-ec` once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), `ts-ec` is kept so the next request that carries it retries the withdrawal.
 
-Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
+### EID Mirror Cookie
+
+Trusted Server can mirror provider-written UIDs into a JavaScript-readable cookie so client-side code can use them. The mirror is off by default: a partner's UIDs are mirrored only when it sets both `bidstream_enabled = true` and `mirror_enabled = true`. Setting `mirror_enabled` without `bidstream_enabled` is rejected at startup and by `ts config push`.
+
+- **Name**: `__Host-ts-eids-mirror`
+- **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=<EC cookie max age>`, host-only (no `Domain`) and not `HttpOnly`
+- **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
+- **Contents source**: live UIDs written by an identity provider. Ownerless UIDs, from browser ingest, batch sync or legacy pull sync, are never mirrored.
+- **Pull-sync UIDs**: pull sync writes provider-owned UIDs, so a pull-sync partner with `mirror_enabled = true` has its UIDs mirrored. Any script on the page can read them, and the cookie is sent on every same-origin request, including to the publisher origin. Leave `mirror_enabled` off for a partner whose UIDs must not reach the page; its UIDs still reach the bidstream when `bidstream_enabled` is set.
+- **Vendor consent**: a source's UIDs are left out while the request's TCF string denies the `tcf_vendor_id` of any configured provider claiming that source, enabled or disabled, or while a provider excludes that source where GDPR applies and the visit is in a GDPR jurisdiction, as they are from the bidstream.
+- **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Where it cannot be rebuilt (other responses, or a navigation whose row cannot be read), it is also expired when it holds UIDs of a mirrored partner with such a denied vendor or GDPR exclusion, or when its value does not decode while any mirrored partner is so withheld. Responses to browsers without a mirror get no mirror `Set-Cookie`. Otherwise, when the identity row cannot be read (KV failure), the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
+
+Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID.
 
 ## Configuration
 
