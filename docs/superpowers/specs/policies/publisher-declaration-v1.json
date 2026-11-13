@@ -1,0 +1,38 @@
+{
+  "schema": "ts-publisher-policy-v1",
+  "id": "publisher-declaration-v1",
+  "version": 1,
+  "checks": {
+    "host_authorization": {
+      "requirement": "pass",
+      "methods": ["dns-key-control-v1"]
+    },
+    "key_possession": {
+      "requirement": "pass",
+      "methods": ["publisher-evidence-jws-v1"]
+    },
+    "host_service_binding": {
+      "requirement": "pass_or_not_assessed",
+      "methods": null
+    },
+    "active_version": {
+      "requirement": "pass_or_not_assessed",
+      "methods": null
+    },
+    "configuration": {
+      "requirement": "pass",
+      "methods": ["public-identity-projection-v1"]
+    }
+  },
+  "build": {
+    "assurance": ["declared", "fingerprint_only"],
+    "declared_methods": [
+      "publisher-custom-declaration-v1",
+      "publisher-unspecified-declaration-v1"
+    ],
+    "fingerprint_methods": null,
+    "artifact_methods": []
+  },
+  "max_assessment_lifetime_seconds": 900,
+  "extensions": {}
+}

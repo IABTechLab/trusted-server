@@ -1,0 +1,35 @@
+{
+  "schema": "ts-publisher-policy-v1",
+  "id": "fictional-official-profile-v1",
+  "version": 1,
+  "checks": {
+    "host_authorization": {
+      "requirement": "pass",
+      "methods": ["dns-key-control-v1"]
+    },
+    "key_possession": {
+      "requirement": "pass",
+      "methods": ["publisher-evidence-jws-v1"]
+    },
+    "host_service_binding": {
+      "requirement": "pass",
+      "methods": ["fictional-fastly-host-service-binding-v1"]
+    },
+    "active_version": {
+      "requirement": "pass",
+      "methods": ["fictional-fastly-active-version-v1"]
+    },
+    "configuration": {
+      "requirement": "pass",
+      "methods": ["public-identity-projection-v1"]
+    }
+  },
+  "build": {
+    "assurance": ["artifact_bound"],
+    "declared_methods": [],
+    "fingerprint_methods": [],
+    "artifact_methods": ["fictional-fastly-artifact-binding-v1"]
+  },
+  "max_assessment_lifetime_seconds": 900,
+  "extensions": {}
+}
