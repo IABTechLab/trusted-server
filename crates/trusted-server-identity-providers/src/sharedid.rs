@@ -10,15 +10,13 @@
 //! `_pubcid_optout` reports an opt-out, which removes a stored `SharedID`.
 //! No server call is made.
 //!
-//! A stored `SharedID` lives as long as the row and wins over a different
-//! cookie value, so the ID bidders see stays stable.
-//!
 //! `SharedID` is a publisher first-party ID with no vendor server. With
 //! `generate = true`, when the cookies hold none and no live `SharedID` is
 //! stored, Trusted Server generates one itself: a random UUID v4, stored in
-//! the row only. No cookie is set, so Prebid's own cookie is never touched.
-//! An expired generated ID an older row still holds is renewed with the same
-//! value.
+//! the row only. No cookie is set, so Prebid's own cookie is never touched;
+//! when Prebid later writes one, the cookie's ID replaces the generated one.
+//! An expired generated ID the row still holds is renewed with the same
+//! value, so it stays stable for as long as the row lives.
 //! Generation is off by default: Prebid may keep its opt-out in localStorage,
 //! which the server cannot see, so only a publisher who knows its opt-out
 //! lives in the `_pubcid_optout` cookie should turn it on.
@@ -30,12 +28,14 @@ use serde::Deserialize;
 use trusted_server_core::ec::eid_types::SourceDomain;
 use trusted_server_core::ec::provider::{
     CookieRead, IdentityProvider, LookupInput, LookupOutcome, ProviderCapabilities, ProviderCommon,
-    ProviderConfigError, ProviderEid, ProviderError, ProviderExpiry, ProviderKind, ProviderRequest,
+    ProviderConfigError, ProviderEid, ProviderError, ProviderKind, ProviderRequest,
     ProviderResponse, RequestCookies,
 };
 use uuid::Uuid;
 
-use crate::common::{CookieReader, cookie_capabilities, device_eid, is_usable_id};
+use crate::common::{
+    CookieReader, MAX_TTL, bounded_expiry, cookie_capabilities, device_eid, is_usable_id,
+};
 
 /// Settings key naming the cookies that hold the `SharedID`.
 pub const COOKIE_NAMES_SETTING: &str = "cookie_names";
@@ -136,16 +136,11 @@ impl IdentityProvider for SharedIdProvider {
         else {
             return CookieRead::Absent;
         };
-        // No expiry: the ID lives as long as the row.
         CookieRead::Found(vec![device_eid(
             &self.source,
             Cow::Borrowed(id),
-            ProviderExpiry::Unspecified,
+            bounded_expiry(None),
         )])
-    }
-
-    fn keeps_stored_uids(&self) -> bool {
-        true
     }
 
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
@@ -165,8 +160,9 @@ impl IdentityProvider for SharedIdProvider {
         Some(vec![device_eid(
             &self.source,
             Cow::Owned(id),
-            // A generated ID lives as long as the row.
-            ProviderExpiry::Unspecified,
+            // A generated ID has no cookie to renew it, so it keeps the
+            // longest lifetime rather than changing every day.
+            bounded_expiry(Some(MAX_TTL)),
         )])
     }
 }
@@ -178,7 +174,7 @@ mod tests {
         AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds,
     };
     use trusted_server_core::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
-    use trusted_server_core::ec::provider::{OwnedEntries, build_kind};
+    use trusted_server_core::ec::provider::{OwnedEntries, ProviderExpiry, build_kind};
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
     use super::*;
@@ -222,24 +218,6 @@ mod tests {
             read("_pubcid=pubcid-example").as_deref(),
             Some("pubcid-example"),
             "should fall back to _pubcid"
-        );
-    }
-
-    #[test]
-    fn keeps_a_cookie_id_as_long_as_the_row_and_over_a_different_cookie() {
-        let provider = provider();
-        let eids = provider
-            .read_request_cookies(RequestCookies::new("_sharedid=sharedid-example"))
-            .into_found()
-            .expect("should read the cookie");
-
-        assert!(
-            matches!(eids[0].uids[0].expiry, ProviderExpiry::Unspecified),
-            "should state no expiry, so the ID lives as long as the row"
-        );
-        assert!(
-            provider.keeps_stored_uids(),
-            "should keep a stored ID over a different cookie"
         );
     }
 
@@ -368,8 +346,8 @@ mod tests {
         );
         assert_ne!(uid.id, second[0].uids[0].id, "should be random");
         assert!(
-            matches!(uid.expiry, ProviderExpiry::Unspecified),
-            "should keep a generated ID as long as the row"
+            matches!(uid.expiry, ProviderExpiry::After(ttl) if ttl == MAX_TTL),
+            "should keep a generated ID for the longest TTL"
         );
     }
 }
