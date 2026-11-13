@@ -48,7 +48,7 @@ use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 #[cfg(test)]
 use crate::openrtb::{
@@ -57,10 +57,8 @@ use crate::openrtb::{
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::outbound::{
-    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
-    outbound_request,
-};
+use crate::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
+use crate::outbound::{OutboundRequestSource, outbound_error};
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 #[cfg(test)]
@@ -2292,15 +2290,18 @@ pub(crate) async fn parse_planned_prebid_response(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body_bytes = collect_response_bounded(
-        response.into_body(),
-        UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-        "prebid",
-    )
-    .await
-    .change_context(TrustedServerError::Prebid {
-        message: "Failed to read Prebid response body".to_string(),
-    });
+    let body_bytes = response
+        .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            outbound_error(
+                error,
+                TrustedServerError::Prebid {
+                    message: "Failed to read Prebid response body".to_string(),
+                },
+                OutboundRequestSource::Internal,
+            )
+        });
 
     if !status.is_success() {
         log::warn!("Prebid auction {auction_id:?} returned non-success status: {status}");
@@ -3230,16 +3231,18 @@ impl PrebidAuctionProvider {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
-        // Parse response — collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            "prebid",
-        )
-        .await
-        .change_context(TrustedServerError::Prebid {
-            message: "Failed to read Prebid response body".to_string(),
-        });
+        let body_bytes = response
+            .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Prebid {
+                        message: "Failed to read Prebid response body".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            });
 
         if !status.is_success() {
             let auction_id = auction_id.unwrap_or("<unavailable>");
@@ -3874,6 +3877,11 @@ mod tests {
                 .to_vec(),
         )
         .expect("should parse response body as utf-8")
+    }
+
+    /// The RTB response cap as a body length.
+    fn rtb_cap_len() -> usize {
+        usize::try_from(UPSTREAM_RTB_MAX_RESPONSE_BYTES).expect("should fit the RTB cap in usize")
     }
 
     fn prebid_platform_response(
@@ -7346,7 +7354,7 @@ external_bundle_sri = "sha384-AAAA"
         let response = prebid_platform_response(
             StatusCode::BAD_GATEWAY,
             Some("text/plain"),
-            vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+            vec![b'x'; rtb_cap_len() + 1],
         );
 
         let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
@@ -7364,7 +7372,7 @@ external_bundle_sri = "sha384-AAAA"
         config.debug = true;
         let provider = PrebidAuctionProvider::new(config);
         let stream = futures::stream::iter([
-            Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+            Bytes::from(vec![b'x'; rtb_cap_len()]),
             Bytes::from_static(b"x"),
         ]);
         let response = prebid_platform_response_with_body(
@@ -9468,13 +9476,13 @@ set = { networkId = 42 }
             prebid_platform_response(
                 StatusCode::OK,
                 Some("application/json"),
-                vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+                vec![b'x'; rtb_cap_len() + 1],
             ),
             prebid_platform_response_with_body(
                 StatusCode::OK,
                 Some("application/json"),
                 EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+                    Bytes::from(vec![b'x'; rtb_cap_len()]),
                     Bytes::from_static(b"x"),
                 ])),
             ),
@@ -9497,13 +9505,13 @@ set = { networkId = 42 }
             prebid_platform_response(
                 StatusCode::BAD_GATEWAY,
                 Some("text/plain"),
-                vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+                vec![b'x'; rtb_cap_len() + 1],
             ),
             prebid_platform_response_with_body(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Some("text/plain"),
                 EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+                    Bytes::from(vec![b'x'; rtb_cap_len()]),
                     Bytes::from_static(b"x"),
                 ])),
             ),

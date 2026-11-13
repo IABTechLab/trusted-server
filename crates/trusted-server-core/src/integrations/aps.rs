@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::outbound::OutboundResponse;
 #[cfg(test)]
@@ -36,7 +37,7 @@ use crate::auction::types::{
 use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 #[cfg(test)]
 use crate::openrtb::ToExt;
@@ -46,10 +47,8 @@ use crate::openrtb::{
     UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::outbound::{
-    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
-    outbound_request,
-};
+use crate::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
+use crate::outbound::{OutboundRequestSource, outbound_error};
 use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -877,6 +876,28 @@ fn parse_planned_aps_value(
     response
 }
 
+/// Reads an APS response body under the RTB cap its request buffered it with.
+///
+/// A failure keeps `message` as a 502 and carries the [`EdgeError`](edgezero_core::error::EdgeError)
+/// opaquely, through [`outbound_error`].
+async fn read_aps_body(
+    response: OutboundResponse,
+    message: &str,
+) -> Result<Bytes, Report<TrustedServerError>> {
+    response
+        .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            outbound_error(
+                error,
+                TrustedServerError::Auction {
+                    message: message.to_owned(),
+                },
+                OutboundRequestSource::Internal,
+            )
+        })
+}
+
 /// Parse one APS-profile response using only provider-local routed state.
 pub(crate) async fn parse_planned_aps_response(
     provider_id: &str,
@@ -916,13 +937,7 @@ pub(crate) async fn parse_planned_aps_response(
     if !status.is_success() {
         log::warn!("APS profile {provider_id} returns a non-success status");
         let body = if policy.debug {
-            match collect_response_bounded(
-                response.into_body(),
-                UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-                APS_INTEGRATION_ID,
-            )
-            .await
-            {
+            match read_aps_body(response, "Failed to read APS profile debug response body").await {
                 Ok(body) => Some(body),
                 Err(error) => {
                     log::warn!("Failed to read APS profile debug response body: {error:?}");
@@ -944,15 +959,11 @@ pub(crate) async fn parse_planned_aps_response(
             status,
         ));
     }
-    let body = collect_response_bounded(
-        response.into_body(),
-        UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-        APS_INTEGRATION_ID,
+    let body = read_aps_body(
+        response,
+        &format!("Failed to read APS profile {provider_id} response body"),
     )
-    .await
-    .change_context(TrustedServerError::Auction {
-        message: format!("Failed to read APS profile {provider_id} response body"),
-    })?;
+    .await?;
     let value: Json = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -1588,13 +1599,7 @@ impl ApsAuctionProvider {
         if !status.is_success() {
             log::warn!("APS returns a non-success status");
             let body = if debug_enabled {
-                match collect_response_bounded(
-                    response.into_body(),
-                    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-                    APS_INTEGRATION_ID,
-                )
-                .await
-                {
+                match read_aps_body(response, "Failed to read APS debug response body").await {
                     Ok(body) => Some(body),
                     Err(error) => {
                         log::warn!("Failed to read APS debug response body: {error:?}");
@@ -1613,15 +1618,7 @@ impl ApsAuctionProvider {
                 status,
             ));
         }
-        let body = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            APS_INTEGRATION_ID,
-        )
-        .await
-        .change_context(TrustedServerError::Auction {
-            message: "Failed to read APS response body".to_string(),
-        })?;
+        let body = read_aps_body(response, "Failed to read APS response body").await?;
         log::trace!("APS response body: {}", String::from_utf8_lossy(&body));
         let value: Json = match serde_json::from_slice(&body) {
             Ok(value) => value,
@@ -2698,13 +2695,13 @@ mod tests {
                 ]))
                 .expect("should build preview-limited APS response"),
         );
+        let oversized_len = usize::try_from(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+            .expect("should fit the RTB cap in usize")
+            + 1;
         let oversized = outbound_response(
             edgezero_core::http::response_builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(EdgeBody::from(vec![
-                    b'x';
-                    UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1
-                ]))
+                .body(EdgeBody::from(vec![b'x'; oversized_len]))
                 .expect("should build oversized APS response"),
         );
 

@@ -29,9 +29,6 @@ use crate::integrations::UPSTREAM_RTB_MAX_RESPONSE_BYTES;
 use crate::outbound::{OutboundRequestSource, buffered, outbound_error, outbound_request};
 use crate::settings::{IntegrationConfig, Settings};
 
-/// The mediator response cap, the RTB cap that Prebid and APS responses share.
-const MEDIATOR_MAX_RESPONSE_BYTES: u64 = UPSTREAM_RTB_MAX_RESPONSE_BYTES as u64;
-
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -404,7 +401,7 @@ impl AdServerMockProvider {
 
         // The request buffered the response under the same cap.
         let body_bytes = response
-            .into_bytes_bounded(MEDIATOR_MAX_RESPONSE_BYTES)
+            .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| {
                 outbound_error(
@@ -491,7 +488,7 @@ impl AuctionProvider for AdServerMockProvider {
         let mut mediation_request = buffered(
             target,
             Duration::from_millis(u64::from(self.config.timeout_ms)),
-            MEDIATOR_MAX_RESPONSE_BYTES,
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
             ResponseDecoding::Decode,
         )
         .cache_policy(OutboundCachePolicy::Bypass)
