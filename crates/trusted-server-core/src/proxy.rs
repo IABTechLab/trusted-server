@@ -4,9 +4,9 @@ use crate::http_util::{
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::error::EdgeError;
 use edgezero_core::outbound::{
-    OutboundFollowFailure, OutboundImageOptimizerOptions, OutboundRedirectAction,
-    OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest, OutboundResponse,
-    ResponseDecoding,
+    OutboundCachePolicy, OutboundFollowFailure, OutboundImageOptimizerOptions,
+    OutboundRedirectAction, OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest,
+    OutboundResponse, ResponseDecoding,
 };
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -1005,8 +1005,9 @@ fn apply_asset_origin_auth(
 ///
 /// A `GET` streams its response under the 60 s streamed timeout. Any other method,
 /// the S3 `HEAD` preflight included, buffers its response under the 15 s buffered
-/// timeout. Both keep the origin's content coding and the default cache policy,
-/// and `image_optimizer` options go on the request as given.
+/// timeout. Both keep the origin's content coding. `cache_policy` and
+/// `image_optimizer` options go on the request as given; `EdgeZero` rejects a
+/// request that carries both [`OutboundCachePolicy::Bypass`] and options.
 ///
 /// `outbound_headers` may carry the signer's `Host` input. `EdgeZero` drops that
 /// header and sends the URI authority, from which [`asset_origin_host_header`]
@@ -1021,13 +1022,15 @@ async fn send_asset_origin_request(
     method: &Method,
     target_url: &url::Url,
     outbound_headers: &http::HeaderMap,
+    cache_policy: OutboundCachePolicy,
     image_optimizer: Option<OutboundImageOptimizerOptions>,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let failed = || TrustedServerError::Proxy {
         message: "Failed to proxy asset request".to_string(),
     };
     let mut request = outbound_request(method.clone(), target_url.as_str())
-        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?
+        .cache_policy(cache_policy);
     *request.headers_mut() = outbound_headers.clone();
     if let Some(options) = image_optimizer {
         request = request.image_optimizer(options);
@@ -1096,10 +1099,22 @@ async fn preflight_s3_origin_for_image_optimizer(
     // Fastly Image Optimizer can mask or transform S3 origin errors. A signed
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
+    //
+    // The preflight HEAD and the raw error-body GET bypass the readthrough
+    // cache. On a miss it can forward a signed HEAD as a GET, invalidating
+    // SigV4, and the error response must come from S3 rather than from a cached
+    // object.
     let mut head_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
-    let head_response =
-        send_asset_origin_request(services, &Method::HEAD, target_url, &head_headers, None).await?;
+    let head_response = send_asset_origin_request(
+        services,
+        &Method::HEAD,
+        target_url,
+        &head_headers,
+        OutboundCachePolicy::Bypass,
+        None,
+    )
+    .await?;
     let head_status = head_response.response().status();
     if head_status.is_success() || head_status == StatusCode::NOT_MODIFIED {
         return Ok(None);
@@ -1115,8 +1130,15 @@ async fn preflight_s3_origin_for_image_optimizer(
 
     let mut get_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
-    let mut response =
-        send_asset_origin_request(services, &Method::GET, target_url, &get_headers, None).await?;
+    let mut response = send_asset_origin_request(
+        services,
+        &Method::GET,
+        target_url,
+        &get_headers,
+        OutboundCachePolicy::Bypass,
+        None,
+    )
+    .await?;
     strip_asset_proxy_response_headers(response.response_mut());
     response.apply_no_store_private_policy();
 
@@ -1200,11 +1222,23 @@ pub async fn handle_asset_proxy_request(
         apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
+    // A signed raw HEAD bypasses the readthrough cache so the cache cannot turn
+    // it into a GET after signing. A request with Image Optimizer options keeps
+    // the platform default, because bypass disables Image Optimizer on Fastly.
+    let cache_policy = if image_optimizer.is_none()
+        && req.method() == Method::HEAD
+        && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
+    {
+        OutboundCachePolicy::Bypass
+    } else {
+        OutboundCachePolicy::PlatformDefault
+    };
     let mut response = send_asset_origin_request(
         services,
         req.method(),
         &target_url,
         &outbound_headers,
+        cache_policy,
         image_optimizer,
     )
     .await?;
@@ -5144,7 +5178,8 @@ mod tests {
         );
     }
 
-    /// Settings every asset `GET` carries: a streamed response in its original coding.
+    /// Settings an asset `GET` carries: a streamed response in its original coding,
+    /// through the platform cache.
     fn asset_get_transport() -> ExpectedTransport {
         ExpectedTransport {
             timeout: STREAMED_TIMEOUT,
@@ -5154,7 +5189,8 @@ mod tests {
         }
     }
 
-    /// Settings every asset `HEAD` carries, the S3 preflight included.
+    /// Settings an asset `HEAD` carries: a buffered response in its original coding,
+    /// through the platform cache.
     fn asset_head_transport() -> ExpectedTransport {
         ExpectedTransport {
             timeout: BUFFERED_TIMEOUT,
@@ -5163,6 +5199,17 @@ mod tests {
             },
             response_decoding: ResponseDecoding::Original,
             cache_policy: OutboundCachePolicy::PlatformDefault,
+        }
+    }
+
+    /// `transport` with the readthrough cache bypassed.
+    ///
+    /// The signed S3 preflight `HEAD`, its raw error-body `GET`, and a signed raw
+    /// `HEAD` carry it.
+    fn uncached(transport: ExpectedTransport) -> ExpectedTransport {
+        ExpectedTransport {
+            cache_policy: OutboundCachePolicy::Bypass,
+            ..transport
         }
     }
 
@@ -5743,7 +5790,7 @@ mod tests {
                 vec![S3_OBJECT, S3_OBJECT],
                 "should strip transform query from both S3 requests"
             );
-            requests[0].assert_transport(asset_head_transport());
+            requests[0].assert_transport(uncached(asset_head_transport()));
             requests[1].assert_image_optimizer_transport(transport, &medium_profile_options());
         }
     }
@@ -5844,8 +5891,8 @@ mod tests {
             vec![Method::HEAD, Method::GET],
             "should fetch S3 error body after failed HEAD preflight"
         );
-        requests[0].assert_transport(asset_head_transport());
-        requests[1].assert_transport(asset_get_transport());
+        requests[0].assert_transport(uncached(asset_head_transport()));
+        requests[1].assert_transport(uncached(asset_get_transport()));
     }
 
     #[test]
