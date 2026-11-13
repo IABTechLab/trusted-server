@@ -1535,14 +1535,10 @@ backend (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:977-1023`).
 
 ### 9. Logging
 
-On Fastly and Axum, Trusted Server keeps `owns_logging` false. Their loggers
-already admit target `edgezero::boot` at warn
+Trusted Server keeps `owns_logging` false. Its Fastly and Axum loggers already
+admit target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
-log once (`app.rs:113-146`). EdgeZero's Cloudflare and Spin `init_logger` is a
-no-op, so on those two adapters `owns_logging` is true and the entry point
-installs a warn-level logger before it calls `run_app`: the Workers console on
-Cloudflare and stderr on Spin. The startup report and the runtime warnings
-reach those logs. Each outbound failure logs one line: the site
+log once (`app.rs:113-146`). Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
 or partner, and that rendering prints the budget source and
 `provider_failure_detail()` (`error.rs:490`). The helper itself does not log,

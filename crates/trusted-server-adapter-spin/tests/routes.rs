@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use edgezero_adapter_spin::SPIN_PLATFORM;
-use edgezero_core::app::{App, Hooks as _};
+use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
@@ -69,14 +69,6 @@ async fn route(router: RouterService, mut req: Request) -> Response {
         HttpClient::with_client(ScriptedHttpClient::forbidding()),
     );
     router.oneshot(req).await.expect("should route request")
-}
-
-#[test]
-fn trusted_server_owns_logging() {
-    assert!(
-        TrustedServerApp::owns_logging(),
-        "should own logging, so Spin's no-op init_logger leaves the entry point's logger alone"
-    );
 }
 
 // ---------------------------------------------------------------------------
