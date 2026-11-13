@@ -253,11 +253,29 @@ bare address and rejects bracketed, ported, or zone-suffixed forms.
 ### Effect on origin requests
 
 Trusted Server treats `fastly-client-ip` as client-spoofable and strips it at
-request entry whether or not `[trusted_client_ip]` is configured, so it no
-longer forwards an inbound `Fastly-Client-IP` to the publisher origin. Check
-whether the origin reads that header for geolocation, fraud checks, or logging
-before deploying. Reconstructing a trustworthy client-address header for origin
-requests is tracked separately from this mechanism.
+request entry whether or not `[trusted_client_ip]` is configured, so it does not
+forward an inbound `Fastly-Client-IP` to the publisher origin. An origin whose
+WAF rules, logging, rate limits, or geolocation read that header otherwise
+receives no reader address on requests that pass through Trusted Server.
+
+To send the resolved address to the origin, set
+[`publisher.origin_client_ip_header`](./configuration.md#origin-client-ip-header):
+
+```toml
+[publisher]
+origin_client_ip_header = "fastly-client-ip"
+```
+
+Trusted Server then writes the address it resolved into that header on every
+publisher-origin request, replacing any client-supplied copy. With
+`[trusted_client_ip]` configured and authenticated, that is the reader; without
+it, the value is the immediate peer, which behind a front door is the fronting
+POP. Behind a front door, enable `origin_client_ip_header` only after the
+verification steps above pass; otherwise the origin receives one POP address for
+every reader, which can trip origin rate limits. If the request to `origin_url` passes back through a Fastly VCL service
+that overwrites `Fastly-Client-IP` with `client.ip`, that service replaces the
+value with Trusted Server's egress address, so point `origin_url` at the origin
+directly or exempt that route from the overwrite.
 
 ## Create Config and Secret Stores
 
