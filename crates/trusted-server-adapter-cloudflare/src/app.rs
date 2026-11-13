@@ -38,7 +38,7 @@ use trusted_server_core::proxy::{
 };
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
-    PublisherResponse, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
@@ -293,7 +293,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Publisher response helper
+// Publisher origin input cap
 // ---------------------------------------------------------------------------
 
 /// Largest publisher origin body the Cloudflare adapter collects before egress.
@@ -301,36 +301,6 @@ where
 /// It keeps the 10 MiB limit the adapter's own client applied before the
 /// publisher origin moved to `EdgeZero`'s client.
 const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 10 * 1024 * 1024;
-
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
-///
-/// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction, collects raw origin bodies under
-/// `input_cap`, and enforces `settings.publisher.max_buffered_body_bytes` on
-/// processed output, then removes any `Transfer-Encoding` header since the
-/// buffered body is no longer chunked.
-async fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-    input_cap: u64,
-) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response_async(
-        publisher_response,
-        method,
-        settings,
-        registry,
-        orchestrator,
-        services,
-        Some(input_cap),
-    )
-    .await?;
-    response.headers_mut().remove(header::TRANSFER_ENCODING);
-    Ok(response)
-}
 
 fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
@@ -579,14 +549,14 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 )
                 .await
                 {
-                    Ok((pr, owner)) => resolve_publisher_response(
+                    Ok((pr, owner)) => buffer_publisher_response_async(
                         pr,
                         &method,
                         &state.settings,
                         &state.registry,
                         &state.orchestrator,
                         &services,
-                        input_cap,
+                        Some(input_cap),
                     )
                     .await
                     .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
