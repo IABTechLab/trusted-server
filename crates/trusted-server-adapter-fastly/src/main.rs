@@ -742,6 +742,8 @@ pub(crate) fn run_after_response_lookups(
     // The request snapshot holds the row as finalize left it. A source held
     // there is still held in the live row unless consent was withdrawn, which
     // blocks the lookup anyway, so the live read is skipped when nothing is due.
+    // Only pull sync can be skipped: configured providers always run, so their
+    // cookie opt-outs and regional exclusions are processed.
     let now = current_timestamp();
     let request_entry = ec_state.ec_context.kv_snapshot().entry_for(&lookups.ec_id);
     if !coordinator.any_due(request_entry, UnixSeconds::new(now)) {

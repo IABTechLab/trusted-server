@@ -318,14 +318,22 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             })
     }
 
-    /// Whether any provider has a due source in `entry`, ignoring consent and
-    /// rate limits, so a caller can skip a row read that cannot lead to a
-    /// lookup. `None` (no row known) counts every source as due.
+    /// Whether any provider may need after-response processing, ignoring
+    /// consent and rate limits, so a caller can skip a row read that cannot
+    /// lead to a lookup or a change. `None` (no row known) counts every
+    /// source as due.
+    ///
+    /// A configured provider always counts: dispatch reads its first-party
+    /// cookies and applies regional exclusions even when no source is due,
+    /// so an opt-out, a changed ID or an opt-back-in is noticed while its
+    /// sources hold live UIDs. Only pull sync, which fills missing sources
+    /// and reads no cookies, can skip the row read when every source is held.
     #[must_use]
     pub fn any_due(&self, entry: Option<&KvEntry>, now: UnixSeconds) -> bool {
         self.providers.iter().any(|registered| {
-            !entry.is_some_and(|entry| entry.opted_out(&registered.id, now))
-                && !Self::due_sources(registered, entry, now).0.is_empty()
+            !registered.policy.pull_sync
+                || (!entry.is_some_and(|entry| entry.opted_out(&registered.id, now))
+                    && !Self::due_sources(registered, entry, now).0.is_empty())
         })
     }
 
@@ -2132,6 +2140,22 @@ mod tests {
             );
         }
         assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn any_due_counts_a_configured_provider_whose_sources_are_held() {
+        let coordinator = cookie_coordinator();
+        let now = UnixSeconds::new(1000);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), provider_record("p-1"));
+
+        assert!(
+            coordinator.any_due(Some(&entry), now),
+            "should dispatch so the provider's cookies can report an opt-out"
+        );
     }
 
     #[test]
