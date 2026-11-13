@@ -392,6 +392,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
+    use trusted_server_core::consent::jurisdiction::{Jurisdiction, detect_jurisdiction};
+    use trusted_server_core::consent::{
+        ConsentContext, allows_ec_creation, consent_allows_server_side_auction,
+    };
+    use trusted_server_core::consent_config::ConsentConfig;
 
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
@@ -629,6 +634,59 @@ mod tests {
         let coordinates = info.coordinates.expect("should populate coordinate pair");
         assert_eq!(coordinates.latitude, 40.71);
         assert_eq!(coordinates.longitude, -74.01);
+    }
+
+    #[test]
+    fn build_geo_country_projection_preserves_core_consent_policy() {
+        let config = ConsentConfig::default();
+        let expected = vec![
+            (Some("US"), Jurisdiction::NonRegulated, true, true),
+            (Some("XK"), Jurisdiction::NonRegulated, true, true),
+            (Some("T1"), Jurisdiction::NonRegulated, true, true),
+            (Some("JP"), Jurisdiction::NonRegulated, true, true),
+            (Some("DE"), Jurisdiction::Gdpr, false, false),
+            (Some("GB"), Jurisdiction::Gdpr, false, false),
+            (Some("XX"), Jurisdiction::Unknown, false, false),
+            (None, Jurisdiction::Unknown, false, false),
+        ];
+        let actual: Vec<_> = expected
+            .iter()
+            .map(|(country, _, _, _)| {
+                let ctx = match country {
+                    Some(country) => make_ctx_with_header("cf-ipcountry", country),
+                    None => make_ctx_without_header(),
+                };
+                let geo = build_geo(&ctx)
+                    .lookup(None)
+                    .expect("should project Cloudflare country into Core GeoInfo");
+                if let Some(geo) = &geo {
+                    assert_eq!(
+                        geo,
+                        &GeoInfo::country_region(&geo.country, None),
+                        "should preserve country-only Cloudflare geography without inventing detail"
+                    );
+                }
+                let consent = ConsentContext {
+                    jurisdiction: detect_jurisdiction(geo.as_ref(), &config),
+                    ..ConsentContext::default()
+                };
+                assert!(
+                    consent.tcf.is_none() && !consent.gdpr_applies,
+                    "should not synthesize a TCF signal from Cloudflare geography"
+                );
+                (
+                    *country,
+                    consent.jurisdiction.clone(),
+                    consent_allows_server_side_auction(&consent),
+                    allows_ec_creation(&consent),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "should retain baseline jurisdiction, auction admission and EC creation policy for Cloudflare countries"
+        );
     }
 
     #[test]

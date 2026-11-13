@@ -487,6 +487,335 @@ fn legacy_live_framing_headers_load_without_reapplying_operator_push_rules() {
     );
 }
 
+#[cfg(feature = "geo-cloudfront")]
+mod managed_geo_consumers {
+    use super::*;
+
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+
+    use axum::Router;
+    use axum::body::to_bytes;
+    use axum::extract::{Request, State};
+    use axum::http::HeaderMap;
+    use axum::response::{IntoResponse as _, Response};
+    use edgezero_core::blob_envelope::BlobEnvelope;
+    use reqwest::blocking::Client;
+    use serde_json::{Value, json};
+    use tokio::sync::oneshot;
+
+    struct CapturedRequest {
+        path: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    struct LocalUpstream {
+        url: String,
+        received: Receiver<CapturedRequest>,
+        stop: Option<oneshot::Sender<()>>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl LocalUpstream {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .expect("should bind local bidder and publisher capture");
+            let url = format!(
+                "http://{}",
+                listener.local_addr().expect("should read capture address")
+            );
+            listener
+                .set_nonblocking(true)
+                .expect("should set nonblocking capture listener");
+            let (sent, received) = mpsc::channel();
+            let (stop, stopped) = oneshot::channel();
+            let worker = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("should build local capture runtime");
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("should adopt capture listener");
+                    let router = Router::new().fallback(capture).with_state(sent);
+                    tokio::select! {
+                        result = axum::serve(listener, router) => {
+                            result.expect("should serve local capture");
+                        }
+                        _ = stopped => {}
+                    }
+                });
+            });
+            Self {
+                url,
+                received,
+                stop: Some(stop),
+                worker: Some(worker),
+            }
+        }
+
+        fn receive(&self) -> CapturedRequest {
+            self.received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("should capture the real outbound request within the test bound")
+        }
+
+        fn assert_no_dispatch(&self) {
+            assert!(
+                matches!(
+                    self.received.recv_timeout(Duration::from_millis(200)),
+                    Err(RecvTimeoutError::Timeout)
+                ),
+                "should not dispatch any bidder request after consent denial"
+            );
+        }
+    }
+
+    impl Drop for LocalUpstream {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("should stop local capture runtime");
+            }
+        }
+    }
+
+    async fn capture(State(sent): State<Sender<CapturedRequest>>, request: Request) -> Response {
+        let (parts, body) = request.into_parts();
+        let body = tokio::time::timeout(Duration::from_secs(2), to_bytes(body, usize::MAX))
+            .await
+            .expect("should receive outbound body within the test bound")
+            .expect("should read outbound body");
+        let response = if parts.uri.path() == "/bid" {
+            let auction: Value =
+                serde_json::from_slice(&body).expect("should receive OpenRTB JSON");
+            axum::Json(json!({
+                "id": auction["id"],
+                "cur": "USD",
+                "seatbid": [{"seat": "fixture-bidder", "bid": [{
+                    "id": "fixture-bid",
+                    "impid": auction["imp"][0]["id"],
+                    "price": 1.25,
+                    "adm": "<div>local fixture bid</div>",
+                    "crid": "fixture-creative",
+                    "adomain": ["advertiser.example"],
+                    "w": 300,
+                    "h": 250
+                }]}]
+            }))
+            .into_response()
+        } else {
+            "local publisher response".into_response()
+        };
+        sent.send(CapturedRequest {
+            path: parts.uri.path().to_owned(),
+            headers: parts.headers,
+            body: body.to_vec(),
+        })
+        .expect("should record outbound request");
+        response
+    }
+
+    fn envelope(upstream: &LocalUpstream) -> String {
+        let original: BlobEnvelope =
+            serde_json::from_str(ENVELOPE).expect("should parse existing startup envelope");
+        let mut data = original.into_data();
+        data["publisher"]["origin_url"] = json!(upstream.url);
+        data["auction"] = json!({
+            "enabled": true,
+            "providers": {"local-bidder": {
+                "protocol": "openrtb-2.6",
+                "profile": "standard",
+                "endpoint": format!("{}/bid", upstream.url),
+                "routing": "all_eligible"
+            }}
+        });
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-11-12T00:00:00Z".to_owned()))
+            .expect("should serialize a correctly hashed local auction envelope")
+    }
+
+    fn client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("should create bounded local HTTP client")
+    }
+
+    fn auction(
+        client: &Client,
+        server: &ServerFixture,
+        country: Option<&str>,
+        region: Option<&str>,
+    ) -> Value {
+        let mut request = client
+            .post(format!("http://{}/auction", server.addr))
+            .header("host", "publisher.example.com")
+            .header("x-origin-test-removal", "fixture-origin-credential")
+            .json(&json!({"adUnits": [{
+                "code": "fixture-slot",
+                "mediaTypes": {"banner": {"sizes": [[300, 250]]}}
+            }]}));
+        if let Some(country) = country {
+            request = request.header("cloudfront-viewer-country", country);
+        }
+        if let Some(region) = region {
+            request = request.header("cloudfront-viewer-country-region", region);
+        }
+        let response = request.send().expect("should execute real auction route");
+        let status = response.status();
+        let body = response.text().expect("should read real auction response");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "should execute auction: {body}"
+        );
+        serde_json::from_str(&body).expect("should return OpenRTB JSON")
+    }
+
+    fn assert_bid(response: &Value) {
+        assert_eq!(
+            response["seatbid"][0]["bid"][0]["id"], "fixture-bid",
+            "should return the local bidder's bid after Core consent allows dispatch: {response}"
+        );
+    }
+
+    fn assert_denied(response: &Value, upstream: &LocalUpstream) {
+        // BidResponse omits an empty seatbid array on the wire.
+        assert!(
+            response.get("seatbid").is_none(),
+            "should omit bids when Core consent denies dispatch: {response}"
+        );
+        assert_eq!(
+            response["ext"]["orchestrator"]["providers"], 0,
+            "should not execute any provider when consent denies dispatch: {response}"
+        );
+        assert_eq!(
+            response["ext"]["orchestrator"]["total_bids"], 0,
+            "should report no provider bids when consent denies dispatch: {response}"
+        );
+        upstream.assert_no_dispatch();
+    }
+
+    #[test]
+    fn protected_origin_credential_is_stripped_before_publisher_forwarding() {
+        let upstream = LocalUpstream::start();
+        let mut server = ServerFixture::new(Some(&envelope(&upstream)));
+        server.spawn_configured(false, false, Some(GEO_PROFILE));
+        server.wait_ready();
+
+        let response = client()
+            .get(format!("http://{}/credential-capture.txt", server.addr))
+            .header("host", "publisher.example.com")
+            .header("cloudfront-viewer-country", "US")
+            .header("cloudfront-viewer-country-region", "CA")
+            .header(
+                "X-Origin-Test-Removal",
+                "fixture-publisher-origin-credential",
+            )
+            .header("x-publisher-capture-control", "retained")
+            .send()
+            .expect("should forward the request to the local publisher");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "should preserve the local publisher's response status"
+        );
+        assert_eq!(
+            response.headers()["x-geo-country"],
+            "US",
+            "should process the publisher request through managed Geo ingress"
+        );
+        assert_eq!(
+            response.text().expect("should read publisher response"),
+            "local publisher response",
+            "should return the captured publisher's response"
+        );
+
+        let captured = upstream.receive();
+        assert_eq!(
+            captured.path, "/credential-capture.txt",
+            "should observe the actual outbound publisher request"
+        );
+        assert_eq!(
+            captured.headers["x-publisher-capture-control"], "retained",
+            "should preserve an ordinary request header while stripping the credential"
+        );
+        assert!(
+            !captured.headers.contains_key("x-origin-test-removal"),
+            "should strip the protected credential before publisher forwarding, not merely from the response"
+        );
+        assert!(
+            !captured.headers.values().any(|value| value
+                .as_bytes()
+                .windows(b"fixture-publisher-origin-credential".len())
+                .any(|window| window == b"fixture-publisher-origin-credential")),
+            "should not leak the protected credential under another outbound header"
+        );
+        upstream.assert_no_dispatch();
+    }
+
+    #[test]
+    fn protected_geo_reaches_core_consent_and_outgoing_auction_without_reuse() {
+        let upstream = LocalUpstream::start();
+        let mut server = ServerFixture::new(Some(&envelope(&upstream)));
+        server.spawn_configured(false, false, Some(GEO_PROFILE));
+        server.wait_ready();
+        let client = client();
+
+        // No consent signals are supplied. US/CA allows the auction, whereas
+        // missing geography and GDPR geography must fail closed in real Core.
+        assert_bid(&auction(&client, &server, Some("us"), Some("ca")));
+        let captured = upstream.receive();
+        assert_eq!(
+            captured.path, "/bid",
+            "should reach the configured local bidder"
+        );
+        let outgoing: Value = serde_json::from_slice(&captured.body)
+            .expect("should capture the real outgoing auction JSON");
+        assert_eq!(
+            outgoing["device"]["geo"],
+            json!({"country": "US", "region": "CA", "type": 2}),
+            "should export the same normalized country/subdivision and no invented optional detail"
+        );
+        assert!(
+            !captured.headers.contains_key("x-origin-test-removal"),
+            "should not forward protected ingress credential to the bidder"
+        );
+
+        assert_denied(&auction(&client, &server, None, None), &upstream);
+        assert_denied(&auction(&client, &server, Some("GB"), None), &upstream);
+
+        // A later country-only request must neither retain CA nor require
+        // consent because an earlier request was in a GDPR jurisdiction.
+        assert_bid(&auction(&client, &server, Some("JP"), None));
+        let captured = upstream.receive();
+        let outgoing: Value = serde_json::from_slice(&captured.body)
+            .expect("should capture independent country-only auction JSON");
+        assert_eq!(
+            outgoing["device"]["geo"],
+            json!({"country": "JP", "type": 2}),
+            "should not reuse the previous country's subdivision or invent missing detail"
+        );
+        upstream.assert_no_dispatch();
+
+        let mut untrusted = ServerFixture::new(Some(&envelope(&upstream)));
+        untrusted.spawn_configured(
+            false,
+            false,
+            Some(&GEO_PROFILE.replace("127.0.0.1/32", "192.0.2.1/32")),
+        );
+        untrusted.wait_ready();
+        assert_denied(
+            &auction(&client, &untrusted, Some("US"), Some("CA")),
+            &upstream,
+        );
+    }
+}
+
 #[test]
 fn handwritten_store_metadata_matches_the_manifest() {
     let manifest = include_str!("../../../edgezero.toml");
