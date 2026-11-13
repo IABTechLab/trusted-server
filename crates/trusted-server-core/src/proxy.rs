@@ -696,6 +696,11 @@ pub async fn proxy_request(
     }
     check_proxy_target(&target, allowed_domains, require_https)?;
 
+    // A 301, 302, or 303 drops this body when the request is followed.
+    let body_method = body
+        .as_ref()
+        .is_some_and(|body| !body.is_empty())
+        .then(|| req.method().clone());
     let request = proxy_outbound_request(&req, &target, body, &headers, copy_request_headers)
         .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
     let request = if stream_response {
@@ -718,7 +723,7 @@ pub async fn proxy_request(
             .follow(
                 request.deadline(chain_deadline),
                 limit,
-                redirect_policy(allowed_domains.to_vec(), require_https),
+                redirect_policy(allowed_domains.to_vec(), require_https, body_method),
             )
             .await
             .map_err(|failure| match failure {
@@ -778,7 +783,11 @@ fn check_proxy_target(
         }));
     }
     if require_https && scheme != "https" {
-        log::warn!("request to `{target}` blocked: HTTPS is required");
+        // The target carries the forwarded `ts-ec` query, so log the scheme and host only.
+        log::warn!(
+            "request to `{scheme}://{}` blocked: HTTPS is required",
+            target.host_str().unwrap_or_default()
+        );
         return Err(Report::new(TrustedServerError::Forbidden {
             message: "non-HTTPS proxy target blocked".to_string(),
         }));
@@ -853,9 +862,15 @@ fn proxy_outbound_request(
 /// 4. [`TrustedServerError::AllowlistViolation`] when `allowed_domains` does not
 ///    permit the host
 /// 5. [`OutboundRedirectAction::FollowPrepared`] otherwise
+///
+/// `body_method` is the method of a request that carries a body. `EdgeZero`
+/// follows a 301, 302, or 303 without the body, so the first such hop the
+/// policy follows warns once that the body is dropped, naming only the
+/// target's host.
 fn redirect_policy(
     allowed_domains: Vec<String>,
     require_https: bool,
+    mut body_method: Option<Method>,
 ) -> impl FnMut(&mut OutboundRedirectContext<'_>) -> Result<OutboundRedirectAction, TrustedServerError>
 + 'static {
     move |context| {
@@ -865,7 +880,11 @@ fn redirect_policy(
             })?;
         let scheme = target.scheme();
         if require_https && scheme != "https" {
-            log::warn!("redirect to `{target}` blocked: HTTPS is required");
+            // The redirect target can carry query tokens, so log the scheme and host only.
+            log::warn!(
+                "redirect to `{scheme}://{}` blocked: HTTPS is required",
+                target.host_str().unwrap_or_default()
+            );
             return Err(TrustedServerError::Forbidden {
                 message: "non-HTTPS redirect blocked".to_string(),
             });
@@ -886,6 +905,12 @@ fn redirect_policy(
             });
         }
 
+        let status = context.status().as_u16();
+        if matches!(status, 301..=303)
+            && let Some(method) = body_method.take()
+        {
+            log::warn!("dropping the {method} request body on a {status} redirect to `{host}`");
+        }
         Ok(OutboundRedirectAction::FollowPrepared)
     }
 }
@@ -4340,7 +4365,32 @@ mod tests {
     #[test]
     fn proxy_request_post_redirect_drops_body_for_301_302_303() {
         for status in [301, 302, 303] {
+            let capture = LogCapture::start();
             let (client, _response) = proxy_through_redirect(&Method::POST, status);
+
+            let records = capture.take_all();
+            drop(capture);
+            let dropped: Vec<_> = records
+                .iter()
+                .filter(|record| record.message.starts_with("dropping"))
+                .collect();
+            assert!(
+                matches!(
+                    dropped.as_slice(),
+                    [record] if record.level == log::Level::Warn
+                        && record.message
+                            == format!(
+                                "dropping the POST request body on a {status} redirect to `redirect.example.com`"
+                            )
+                ),
+                "should warn once, naming only the host, that the {status} redirect drops the body"
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| !record.message.contains("/final")),
+                "should keep the redirect path out of the logs for {status}"
+            );
 
             assert_eq!(
                 sent_methods(&client),
@@ -4421,7 +4471,17 @@ mod tests {
     #[test]
     fn proxy_request_post_redirect_retains_method_and_body_for_307_308() {
         for status in [307, 308] {
+            let capture = LogCapture::start();
             let (client, _response) = proxy_through_redirect(&Method::POST, status);
+
+            assert!(
+                capture
+                    .take_all()
+                    .iter()
+                    .all(|record| !record.message.starts_with("dropping")),
+                "should not warn about a body that the {status} redirect replays"
+            );
+            drop(capture);
 
             assert_eq!(
                 sent_methods(&client),
@@ -4761,6 +4821,83 @@ mod tests {
             );
             assert_eq!(client.requests().len(), 1, "should not follow {location}");
         }
+    }
+
+    #[test]
+    fn https_required_warnings_name_only_the_scheme_and_host() {
+        let capture = LogCapture::start();
+        let (_clock, client, services) = scripted_services();
+        let settings = create_test_settings();
+        let mut req = build_http_request(Method::GET, "https://edge.example.com/");
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC,
+            HeaderValue::from_static("ec-sentinel-123"),
+        );
+        let error = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("http://insecure.example.com/target-path?token=query-sentinel")
+                .with_https_only(),
+            &services,
+        ))
+        .expect_err("should block a plain-HTTP target that must be HTTPS");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Forbidden { .. }
+            ),
+            "should forbid the plain-HTTP target"
+        );
+        assert!(
+            client.requests().is_empty(),
+            "should not send the blocked target"
+        );
+
+        client.respond_to(
+            Method::GET,
+            &source_url("/start"),
+            redirect_reply(
+                302,
+                "http://insecure.example.com/next-path?token=redirect-sentinel",
+            ),
+        );
+        // The redirect target is the upstream's, so its query carries the token here.
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+        let error = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .with_https_only(),
+            &services,
+        ))
+        .expect_err("should block a redirect that leaves HTTPS");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Forbidden { .. }
+            ),
+            "should forbid the plain-HTTP redirect"
+        );
+
+        let records = capture.take_all();
+        for expected in [
+            "request to `http://insecure.example.com` blocked: HTTPS is required",
+            "redirect to `http://insecure.example.com` blocked: HTTPS is required",
+        ] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.level == log::Level::Warn && record.message == expected),
+                "should warn `{expected}`"
+            );
+        }
+        assert!(
+            records.iter().all(|record| {
+                !record.message.contains("sentinel") && !record.message.contains("-path")
+            }),
+            "should keep the EC ID, the query, and the path out of every log"
+        );
     }
 
     #[test]

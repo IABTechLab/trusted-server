@@ -757,6 +757,13 @@ reads the whole inbound body into memory with no cap.
   - `Err(Proxy)` for a missing host, as today
   - `Err(AllowlistViolation)` when `is_host_permitted` rejects the host
   - `FollowPrepared` otherwise
+
+  The policy also owns whether the request carries a body. When it follows
+  the first 301, 302, or 303 of such a request, it warns that the body is
+  dropped, naming only the target's host, as today's per-hop warning did. The
+  HTTPS-required warnings name the scheme and host only, never the path or a
+  query such as `ts-ec`.
+
 - Followed requests set `.timeout(15 s)` per hop and
   `.deadline(clock.deadline_after(60 s))` for the whole chain. Per-call timeouts
   restart on every hop, and only a deadline holds across the chain
