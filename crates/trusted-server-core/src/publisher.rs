@@ -3037,36 +3037,20 @@ fn apply_datadome_client_tag_cache_privacy(
 /// Drop a bodiless response's body and correct its framing headers.
 ///
 /// The response keeps no body and never keeps `Trailer`: response egress
-/// refuses to send a response that declares one. Its `Content-Length` is
-/// corrected where the origin's value would be invalid for the now-empty
-/// message:
-/// - **204 No Content**: RFC 9110 §8.6 forbids `Content-Length`; remove it.
-/// - **205 Reset Content**: the reset response carries nothing, so a nonzero
-///   origin length is wrong (RFC 9110 §15.4.6); normalize it to `0`.
-/// - **HEAD and 304 Not Modified**: `Content-Length` legitimately advertises
-///   the `GET` representation length, so it is preserved untouched.
+/// refuses to send a response that declares one. A 205 Reset Content carries
+/// nothing, so a nonzero origin length is wrong (RFC 9110 §15.4.6) and egress
+/// would refuse it; its `Content-Length` is normalized to `0`. `HEAD` and 304
+/// Not Modified keep theirs: it advertises the `GET` representation length.
 ///
-/// The normalized 204/205 responses also drop `Transfer-Encoding`: RFC 9112
-/// §6.1 forbids it on a 204, and keeping it on a 205 alongside the
-/// `Content-Length: 0` inserted above would advertise two conflicting framings.
-/// `HEAD` and 304 keep it for the same reason they keep `Content-Length`: it
-/// describes the `GET` representation, not this message. Response egress
-/// strips `Transfer-Encoding` from every response before it is sent.
+/// `EdgeZero` already strips `Transfer-Encoding` from every upstream head and
+/// `Content-Length` from a 204, so neither needs correcting here.
 fn make_response_bodiless(response: &mut Response<EdgeBody>) {
     *response.body_mut() = EdgeBody::empty();
     response.headers_mut().remove(header::TRAILER);
-    match response.status() {
-        StatusCode::NO_CONTENT => {
-            response.headers_mut().remove(header::CONTENT_LENGTH);
-            response.headers_mut().remove(header::TRANSFER_ENCODING);
-        }
-        StatusCode::RESET_CONTENT => {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_LENGTH, HeaderValue::from(0_u64));
-            response.headers_mut().remove(header::TRANSFER_ENCODING);
-        }
-        _ => {}
+    if response.status() == StatusCode::RESET_CONTENT {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(0_u64));
     }
 }
 
@@ -25733,25 +25717,43 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         }
     }
 
-    // (method, status, expected Content-Length, expected Transfer-Encoding)
-    // after bodiless normalization. 204 forbids Content-Length (removed); 205
-    // must advertise a zero-length body; HEAD and 304 legitimately advertise the
-    // GET representation length. `Transfer-Encoding` is stripped from 204
-    // (forbidden by RFC 9112 §6.1) and 205 (would conflict with the inserted
-    // `Content-Length: 0`), but preserved for HEAD and 304, whose message length
-    // is fixed by the header section regardless of framing fields
-    // (RFC 9112 §6.3, rule 1). `Trailer` goes in every case.
+    // (method, status, origin Content-Length, expected Content-Length) after
+    // bodiless normalization. The origin heads are what `EdgeZero` hands over:
+    // no `Transfer-Encoding`, and no `Content-Length` on a 204. A 205 must
+    // advertise a zero-length body; HEAD and 304 legitimately advertise the GET
+    // representation length. `Trailer` goes in every case.
     const BODILESS_FRAMING_CASES: [(Method, StatusCode, Option<&str>, Option<&str>); 4] = [
-        (Method::HEAD, StatusCode::OK, Some("42"), Some("chunked")),
+        (Method::HEAD, StatusCode::OK, Some("42"), Some("42")),
         (Method::GET, StatusCode::NO_CONTENT, None, None),
-        (Method::GET, StatusCode::RESET_CONTENT, Some("0"), None),
+        (
+            Method::GET,
+            StatusCode::RESET_CONTENT,
+            Some("42"),
+            Some("0"),
+        ),
         (
             Method::GET,
             StatusCode::NOT_MODIFIED,
             Some("42"),
-            Some("chunked"),
+            Some("42"),
         ),
     ];
+
+    /// Builds a bodiless-case origin response with `body`, the origin
+    /// `Content-Length` when it has one, and a `Trailer`.
+    fn bodiless_case_response(
+        status: StatusCode,
+        origin_length: Option<&str>,
+        body: EdgeBody,
+    ) -> Response<EdgeBody> {
+        let mut builder = Response::builder()
+            .status(status)
+            .header(header::TRAILER, "expires");
+        if let Some(length) = origin_length {
+            builder = builder.header(header::CONTENT_LENGTH, length);
+        }
+        builder.body(body).expect("should build response")
+    }
 
     /// Assert the framing fields left on a normalized bodiless response.
     fn assert_bodiless_framing(
@@ -25759,7 +25761,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         method: &Method,
         status: StatusCode,
         expected_length: Option<&str>,
-        expected_transfer_encoding: Option<&str>,
     ) {
         let header_value = |name: header::HeaderName| {
             response
@@ -25772,11 +25773,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             header_value(header::CONTENT_LENGTH).as_deref(),
             expected_length,
             "bodiless {method} {status} must carry the corrected Content-Length"
-        );
-        assert_eq!(
-            header_value(header::TRANSFER_ENCODING).as_deref(),
-            expected_transfer_encoding,
-            "bodiless {method} {status} must carry the corrected Transfer-Encoding"
         );
         assert_eq!(
             header_value(header::TRAILER),
@@ -25792,7 +25788,6 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             let mut response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_LENGTH, "42")
-                .header(header::TRANSFER_ENCODING, "chunked")
                 .header(header::TRAILER, "expires")
                 .body(EdgeBody::from(b"origin body".to_vec()))
                 .expect("should build response");
@@ -25838,17 +25833,14 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 .expect("should build the auction orchestrator"),
         );
 
-        for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
-        {
-            let response = Response::builder()
-                .status(status)
-                .header(header::CONTENT_LENGTH, "42")
-                .header(header::TRANSFER_ENCODING, "chunked")
-                .header(header::TRAILER, "expires")
-                .body(EdgeBody::stream(futures::stream::iter(vec![
-                    bytes::Bytes::from_static(b"origin body bytes that must not reach the client"),
-                ])))
-                .expect("should build response");
+        for (method, status, origin_length, expected_length) in BODILESS_FRAMING_CASES {
+            let response = bodiless_case_response(
+                status,
+                origin_length,
+                EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                    b"origin body bytes that must not reach the client",
+                )])),
+            );
             let publisher_response = PublisherResponse::Buffered(response);
 
             let response = futures::executor::block_on(publisher_response_into_streaming_response(
@@ -25865,13 +25857,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                 !response.body().is_stream(),
                 "bodiless {method} {status} must not carry a streaming body"
             );
-            assert_bodiless_framing(
-                &response,
-                &method,
-                status,
-                expected_length,
-                expected_transfer_encoding,
-            );
+            assert_bodiless_framing(&response, &method, status, expected_length);
 
             let drained = futures::executor::block_on(
                 response
@@ -25905,17 +25891,12 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should build the auction orchestrator");
         let services = noop_services();
 
-        for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
-        {
-            let response = Response::builder()
-                .status(status)
-                .header(header::CONTENT_LENGTH, "42")
-                .header(header::TRANSFER_ENCODING, "chunked")
-                .header(header::TRAILER, "expires")
-                .body(EdgeBody::from(
-                    b"origin body bytes that must not reach the client".to_vec(),
-                ))
-                .expect("should build response");
+        for (method, status, origin_length, expected_length) in BODILESS_FRAMING_CASES {
+            let response = bodiless_case_response(
+                status,
+                origin_length,
+                EdgeBody::from(b"origin body bytes that must not reach the client".to_vec()),
+            );
             let publisher_response = PublisherResponse::Buffered(response);
 
             let response = futures::executor::block_on(buffer_publisher_response_async(
@@ -25929,13 +25910,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             ))
             .expect("should finalize buffered response");
 
-            assert_bodiless_framing(
-                &response,
-                &method,
-                status,
-                expected_length,
-                expected_transfer_encoding,
-            );
+            assert_bodiless_framing(&response, &method, status, expected_length);
 
             let drained = futures::executor::block_on(
                 response
