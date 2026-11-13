@@ -1330,8 +1330,8 @@ pub(crate) fn is_host_allowed(host: &str, pattern: &str) -> bool {
 /// - `u`: Base64 URL-safe (no padding) encoded URL of the third-party resource.
 ///
 /// Behavior:
-/// - Proxies the decoded URL, following redirects only to hosts in
-///   `proxy.allowed_domains`.
+/// - Proxies the decoded URL, following redirects to hosts `proxy.allowed_domains`
+///   permits (every host when it is empty).
 /// - If the response `Content-Type` contains `text/html`, rewrites the HTML creative
 ///   (img/srcset/iframe to first-party) before returning `text/html; charset=utf-8`.
 /// - If the response is an image or the request `Accept` indicates images, ensures an
