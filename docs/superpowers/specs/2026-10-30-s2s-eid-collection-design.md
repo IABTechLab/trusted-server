@@ -279,9 +279,12 @@ never write. They do not receive a permit, so the write API cannot be called
   Vendor cookies are read first on every navigation; a usable cookie ID is
   used instead of a refresh request. Refresh state that is empty, over 2048
   bytes or has no stated time is dropped and the UID is kept.
-- A UID is refresh-due only while it is still live. A failing refresh is
-  therefore retried at most until the UID expires, and the provider's
-  `rate_limit_per_hour` also bounds it.
+- Once a UID expires its source is due like any source without a live UID,
+  and its refresh state is still passed to the provider, so a refresh can
+  still run: a vendor refresh token may outlive the UID (UID2's does). A
+  failing refresh keeps the state and is retried on later navigations;
+  only the provider's `rate_limit_per_hour` bounds the retries, and the
+  state is dropped when the expired UID is pruned on the next write.
 - A refresh reply may report an opt-out (`LookupOutcome::OptedOut`). It is
   handled like a cookie opt-out: the provider's sources are cleared from the
   row.
@@ -1271,12 +1274,15 @@ For each provider with a `Found` outcome and each source in its response:
   unowned ones (D8). Each written UID records `owner` and `exp`.
 - Sources the provider claims but did not return stay unchanged.
 - `NoMatch`, failures, timeouts and skipped providers leave the row unchanged.
-- `OptedOut` (a cookie or a refresh reply) clears every source the provider
-  claims and records the opt-out in the row's `opt_outs` map for 30 days. Until
-  it lapses the provider is skipped as `skipped_opted_out` and not called, and
-  a result from a lookup dispatched before the opt-out was recorded is
-  discarded rather than written over it. Generated and cookie IDs merge like
-  `Found`.
+- `OptedOut` (a cookie or a vendor server's reply) clears every source the
+  provider claims. Only an opt-out a vendor server reports is recorded in the
+  row's `opt_outs` map for 30 days: a cookie opt-out is re-read on every
+  navigation, so it needs no memory. Until a recorded opt-out lapses the
+  provider is skipped as `skipped_opted_out` and not called, and a result from
+  a lookup dispatched before the opt-out was recorded is discarded rather than
+  written over it. The vendor's cookies are read before the recorded opt-out
+  is checked: an ID in them means the visitor opted back in, so the opt-out is
+  forgotten and the ID stored. Generated and cookie IDs merge like `Found`.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
 results, so the write order never lets browser data overwrite provider data.
@@ -1788,3 +1794,37 @@ combinations and adapter differences, on the tree after round 5's fix.
 - Non-blocking, no change: only the Fastly adapter builds the registry with
   provider ownership and vendor gates (§12.3 "On Fastly"); per-adapter deploy
   validation stays with #1552.
+
+### Round 7 (2026-11-12, PR #1488 at 5d22274c1, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow and edge cases end to end per provider (UID2, ID5,
+LiveRamp, ConnectID, LiveIntent, SharedID, Criteo, Lockr): cookie parsing,
+request building, reply parsing, opt-out, 204 and 404 handling, refresh,
+expiry, and consent and region gating.
+
+- No blocking findings.
+- Non-blocking, fixed in 371e0ccba: LiveIntent kept a blank or `0` ID from
+  the reply; it now uses the shared usable-ID check. A LiveRamp envelope
+  entry without `type` failed the whole reply; it is now skipped.
+- Non-blocking, no change: Lockr's storage format was checked against
+  Prebid's `lockrAIMIdSystem`. It writes only the raw `advertising_token`
+  under `key_name` to a cookie, with no `inserter` and no revoke marker, so
+  neither can be read from cookies.
+- Known, open: LiveIntent partner UIDs carry `ext.provider` of
+  `liveintent.com` rather than the page domain, and a reply's `m` is not
+  copied into the `nonId` EID's `ext`.
+
+### Round 8 (2026-11-12, PR #1488 at 371e0ccba, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed cookies and replies, config combinations,
+clock edges and privacy leaks.
+
+- No blocking findings. Re-checked non-integer, negative, huge and NaN
+  expiry and TTL values (rejected, clamped to 30 days in validation, or
+  read as expired); empty and duplicate cookies, a stale opt-out cookie
+  beside a live ID (the opt-out wins); Lockr names equal to own names, Lockr
+  with empty own cookies, and Lockr under GDPR; and that no cookie value or
+  token is logged.
+- Non-blocking, no change: a UID2 refresh that keeps failing is retried on
+  every navigation until the token expires unless `rate_limit_per_hour` is
+  set. The fix for overdue UID2 refresh state (834af2591) chose this bound.

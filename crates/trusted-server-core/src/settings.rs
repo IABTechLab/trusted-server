@@ -637,8 +637,11 @@ impl EcPartner {
 }
 
 /// One `[[ec.identity_providers]]` entry.
+///
+/// A `sharedid` provider with no `sources` claims `pubcid.org`, the source
+/// Prebid sends `SharedID` under.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct IdentityProviderConfig {
     /// Unique provider ID; recorded as the owner of the UIDs it writes.
     pub id: String,
@@ -651,7 +654,11 @@ pub struct IdentityProviderConfig {
     )]
     pub enabled: bool,
     /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
-    pub endpoint: String,
+    ///
+    /// Optional for kinds that only read first-party cookies; kinds that
+    /// make lookups reject a missing endpoint when they are built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Exact hosts the coordinator may call for this provider.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
@@ -681,6 +688,28 @@ pub struct IdentityProviderConfig {
     #[serde(default)]
     pub settings: serde_json::Map<String, JsonValue>,
 }
+
+impl<'de> Deserialize<'de> for IdentityProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut config = Self::deserialize(deserializer)?;
+        if config.kind == SHAREDID_PROVIDER_KIND && config.sources.is_empty() {
+            config.sources = vec![SHAREDID_DEFAULT_SOURCE.to_owned()];
+        }
+        Ok(config)
+    }
+}
+
+impl Serialize for IdentityProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// Provider kind of Prebid's `SharedID`.
+const SHAREDID_PROVIDER_KIND: &str = "sharedid";
+
+/// Source a `sharedid` provider claims when none is configured.
+pub const SHAREDID_DEFAULT_SOURCE: &str = "pubcid.org";
 
 impl IdentityProviderConfig {
     const fn default_enabled() -> bool {
