@@ -571,14 +571,14 @@ mod tests {
             request.assert_transport(management_transport());
         }
 
-        let secret = &requests[0];
-        secret.assert_headers(&[
+        let upsert_request = &requests[0];
+        upsert_request.assert_headers(&[
             ("fastly-key", API_KEY),
             ("accept", "application/json"),
             ("content-type", "application/json"),
         ]);
-        let upsert: serde_json::Value =
-            serde_json::from_slice(&secret.body).expect("should send the secret upsert as JSON");
+        let upsert: serde_json::Value = serde_json::from_slice(&upsert_request.body)
+            .expect("should send the secret upsert as JSON");
         assert_eq!(
             (&upsert["name"], &upsert["method"]),
             (

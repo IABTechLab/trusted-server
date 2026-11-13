@@ -159,6 +159,7 @@ async fn handle_batch_sync_with_writer(
                 TrustedServerError::RequestTooLarge { .. }
             ) =>
         {
+            log::warn!("Rejecting batch sync request: {report:?}");
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body_too_large",
@@ -317,6 +318,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::body_read::{body_read_failure_cases, streamed_over};
+    use crate::test_support::logging::WarningCapture;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -518,6 +520,7 @@ mod tests {
             let writer = MockWriter::new(vec![]);
             let (req, expectation) = case.into_request(authorized_batch_builder());
 
+            let capture = WarningCapture::start();
             let outcome = futures::executor::block_on(handle_batch_sync_with_writer(
                 &writer, &registry, &limiter, req,
             ));
@@ -529,6 +532,14 @@ mod tests {
                 expectation.name()
             );
             if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                let levels: Vec<log::Level> =
+                    capture.take().iter().map(|record| record.level).collect();
+                assert_eq!(
+                    levels,
+                    [log::Level::Warn],
+                    "should log the {} case once, at warn",
+                    expectation.name()
+                );
                 let response = outcome.expect("should answer an overflow with a response");
                 assert_eq!(
                     response_json(response),
