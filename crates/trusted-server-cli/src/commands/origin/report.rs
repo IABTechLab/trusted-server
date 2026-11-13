@@ -1,10 +1,9 @@
 //! The probe's result model and its two renderings.
 //!
-//! Every axis and every verdict is **blocking**. That is not a style choice: the origin
-//! readthrough gate is decided before the origin responds, and no post-response hook is
-//! reachable on the Fastly adapter, so none of the template cache's response-side refusals
-//! can be applied to the readthrough path. This probe is the only control, which is why a
-//! failure exits non-zero rather than printing a warning.
+//! Every axis and every verdict is **blocking**. That is not a style choice:
+//! `origin_is_cookie_independent = true` asserts that cookies do not change the origin's
+//! HTML, and no single response shows whether that holds. This probe is the only control,
+//! which is why a failure exits non-zero rather than printing a warning.
 
 use serde::{Deserialize, Serialize};
 
@@ -143,7 +142,7 @@ impl ProbeReport {
         out.push_str(if self.passed() {
             "VERDICT: shareable on the URLs sampled.\n"
         } else {
-            "VERDICT: NOT shareable. Do not enable origin_readthrough_enabled or origin_is_cookie_independent.\n"
+            "VERDICT: NOT shareable. Do not enable origin_is_cookie_independent.\n"
         });
         out.push_str(LIMITS);
         out

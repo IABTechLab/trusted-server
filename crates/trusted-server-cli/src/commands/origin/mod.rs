@@ -175,11 +175,11 @@ fn run_probe(args: &ProbeShareabilityArgs, out: &mut impl std::io::Write) -> Cli
     if report.passed() {
         Ok(())
     } else {
-        // A failing verdict is the answer, not a malfunction — but it must not exit zero.
-        // The gate this probe guards is decided before the origin responds, so this
-        // result is the only thing standing between it and cross-serving.
+        // A failing verdict is the answer, not a malfunction, but it must not exit zero:
+        // nothing at runtime checks the `origin_is_cookie_independent` claim this probe
+        // guards.
         crate::error::cli_error(
-            "origin is not safe to share: do not enable origin_readthrough_enabled or origin_is_cookie_independent",
+            "origin is not safe to share: do not enable origin_is_cookie_independent",
         )
     }
 }

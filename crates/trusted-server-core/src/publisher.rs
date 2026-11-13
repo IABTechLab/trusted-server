@@ -1968,9 +1968,8 @@ pub async fn buffer_publisher_response_async(
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
             let bytes = output.into_inner();
-            // The origin readthrough cache holds raw origin bytes; the template cache
-            // stores processed reader-neutral HTML. Caching the final per-user
-            // assembled response is forbidden.
+            // The template cache stores processed reader-neutral HTML. Caching the
+            // final per-user assembled response is forbidden.
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
             // Swapping these two lines would leak an assembled response into the cache.
@@ -4792,9 +4791,10 @@ pub struct AuctionDispatch<'a> {
 /// Request-side conditions that decide whether this request's origin response may be
 /// shared between readers.
 ///
-/// Necessary for both the origin readthrough cache and the template cache, which is why it
-/// is one type rather than two parallel expressions that must be kept in step. Keeping the
-/// template-only conditions out of it is deliberate: the assembly mode and the reader's
+/// Necessary for the template cache, and recorded as the `origin_cache_shareable`
+/// telemetry. Origin readthrough is unavailable until `EdgeZero` surrogate keys (EZ-11)
+/// restore it; the telemetry measures the reach it would have. One type keeps the two
+/// from drifting apart. Keeping the template-only conditions out of it is deliberate: the assembly mode and the reader's
 /// encoding support say whether *this pipeline* can assemble a shared template, not whether
 /// the origin's bytes may be shared at all.
 #[derive(Debug, Clone, Copy)]
@@ -4805,8 +4805,9 @@ pub(crate) struct SharedRequestInputs {
     pub(crate) host_present: bool,
     /// The request carried an `Authorization` value that did not pass edge auth unchanged.
     pub(crate) authorization_disqualifies: bool,
-    /// Cookie policy refuses this cache's key. Readthrough additionally refuses
-    /// configured cookie dimensions that only the template key can represent.
+    /// Cookie policy refuses this cache's key. The shareability telemetry additionally
+    /// counts configured cookie dimensions, which only the template key can represent, as
+    /// not shareable.
     pub(crate) cookie_disqualifies: bool,
     /// Request cache semantics, diagnostics, or an integration require a fresh origin
     /// response for this reader specifically.
@@ -5283,8 +5284,9 @@ pub async fn handle_publisher_request(
     // origin's response can be shared, and the origin only ever sees the request as it
     // stands here. Judging the pre-strip headers marked a repeat visitor's `If-None-Match`
     // navigation unshareable even though the origin was about to be asked an
-    // unconditional question and return a full document — losing readthrough for exactly
-    // the repeat-visit population this work targets, with nothing gained.
+    // unconditional question and return a full document, undercounting shareable
+    // reach for exactly the repeat-visit population this work targets, with nothing
+    // gained.
     //
     // The strip removes four headers; this predicate tests six plus `Cache-Control`
     // request directives, so `If-Match`, `If-Unmodified-Since` and a `no-store` reader
