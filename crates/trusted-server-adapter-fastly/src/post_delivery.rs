@@ -48,7 +48,7 @@ pub(crate) fn run_post_delivery(
     settings: &Settings,
     log_context: &dyn fmt::Display,
 ) {
-    let client = HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false);
+    let client = post_delivery_client();
     let clock = MonotonicClock::default();
     futures::executor::block_on(post_delivery_work(
         state,
@@ -58,6 +58,13 @@ pub(crate) fn run_post_delivery(
         &clock,
         log_context,
     ));
+}
+
+/// A fresh Fastly client for post-delivery work, with the proxy marker off.
+///
+/// Tinybird and the pull-sync partners never receive `x-edgezero-proxy`.
+fn post_delivery_client() -> HttpClient {
+    HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false)
 }
 
 /// The post-delivery work itself, on `client` and `clock`: telemetry, then pull sync.
@@ -209,6 +216,14 @@ mod tests {
             panic!("should send the queued auction once after delivery, got {requests:?}");
         };
         assert_events_request(request, &body);
+    }
+
+    #[test]
+    fn post_delivery_client_turns_the_proxy_marker_off() {
+        assert!(
+            !post_delivery_client().proxy_marker_enabled(),
+            "should send telemetry and pull-sync requests without the proxy marker"
+        );
     }
 
     #[test]
