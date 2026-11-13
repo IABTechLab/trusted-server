@@ -780,15 +780,18 @@ If you encounter an error not listed here:
 
 ## Common HTTP Status Codes
 
-| Code    | Meaning         | Common Causes                    | Quick Fix            |
-| ------- | --------------- | -------------------------------- | -------------------- |
-| **400** | Bad Request     | Missing parameters, invalid JSON | Check request format |
-| **401** | Unauthorized    | Missing/invalid auth             | Check credentials    |
-| **403** | Forbidden       | Invalid token, disabled feature  | Verify token/config  |
-| **404** | Not Found       | Unknown endpoint                 | Check URL path       |
-| **500** | Internal Error  | Configuration error, bug         | Check logs           |
-| **502** | Bad Gateway     | Backend unavailable              | Verify backend       |
-| **504** | Gateway Timeout | Backend slow                     | Increase timeout     |
+| Code    | Meaning                         | Common Causes                                                   | Quick Fix                          |
+| ------- | ------------------------------- | --------------------------------------------------------------- | ---------------------------------- |
+| **400** | Bad Request                     | Missing parameters, invalid JSON                                | Check request format               |
+| **401** | Unauthorized                    | Missing/invalid auth                                            | Check credentials                  |
+| **403** | Forbidden                       | Invalid token, disabled feature                                 | Verify token/config                |
+| **404** | Not Found                       | Unknown endpoint                                                | Check URL path                     |
+| **408** | Request Timeout                 | Request body still unread 30 s after the request arrived        | Check the client's upload          |
+| **413** | Payload Too Large               | Body over the endpoint's cap, or a publisher upload over 16 MiB | Reduce the body size               |
+| **414** | URI Too Long                    | Request target over 8192 bytes                                  | Shorten the URL or query           |
+| **431** | Request Header Fields Too Large | More than 100 header fields or 64 KiB of headers                | Trim headers and cookies           |
+| **500** | Internal Error                  | Configuration error, bug                                        | Check logs                         |
+| **502** | Bad Gateway                     | Backend unavailable or timed out; Trusted Server has no 504     | Verify the backend and its latency |
 
 ---
 

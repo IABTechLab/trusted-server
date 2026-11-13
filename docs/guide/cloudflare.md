@@ -13,7 +13,9 @@ config that `ts config push` writes into KV to the nested
 
 This row is the canonical status summary. Cloudflare has no
 `/health` route and supports multiple auction providers. When startup fails,
-every route answers 500 with EdgeZero's JSON error body.
+every route answers with EdgeZero's JSON error body at the startup error's
+status. That is normally 500; a KV store error answers 503, an auction, proxy,
+or integration error 502, and a bad-request error 400.
 
 Production Worker builds install no `log` backend. EdgeZero's Cloudflare
 `init_logger` installs none, and Trusted Server leaves that to EdgeZero, so the

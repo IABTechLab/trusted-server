@@ -535,7 +535,9 @@ connecting to the host in `origin_url`.
 **Spin**: EdgeZero's Spin client cannot send a `Host` that differs from the
 connection target, so Spin ignores this setting and logs a warning at settings
 load. Production Spin builds drop that warning until EdgeZero's Spin
-`init_logger` installs a log backend. Fastly, Axum, and Cloudflare send it.
+`init_logger` installs a log backend. Fastly and Axum send it. Cloudflare
+sends it too, which EdgeZero rates best effort because Cloudflare's routing of
+the override is unqualified.
 
 #### `proxy_secret`
 
@@ -2603,7 +2605,7 @@ with an exhausted budget. Each bidder request carries its provider timeout as a
 total timeout, and the cutoff bounds it by the remaining budget.
 
 Dropping the batch cancels in-flight bidder and mediator requests on every
-adapter; Fastly host cancellation is best effort. Local processing and delivery
+adapter; host cancellation is best effort on Cloudflare, Fastly, and Spin. Local processing and delivery
 can finish after the network cutoff. See
 [Timeout behavior](/guide/auction-orchestration#timeout-behavior) for runtime
 semantics and limitations.

@@ -90,10 +90,12 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
 
 **Outbound requests.**
 
-- Every request has a 1 s connect timeout and a constant total timeout: the
+- Every request sets a 1 s connect timeout and a constant total timeout: the
   configured timeout where a setting names one, such as an auction provider's
   `timeout_ms`, 2 s for Tinybird, and otherwise 15 s for a buffered response or
-  60 s for a streamed one. A redirect chain also has a 60 s deadline.
+  60 s for a streamed one. A redirect chain also has a 60 s deadline. EdgeZero
+  enforces the connect timeout natively on Fastly only. On Axum, Cloudflare,
+  and Spin it is best effort, and the total timeout still bounds the request.
 - Origin TLS is always verified.
 - A request that sets no `Accept-Encoding` carries `Accept-Encoding: identity`.
 - Hop-by-hop fields, and fields that `Connection` names, never reach an

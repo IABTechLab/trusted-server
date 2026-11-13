@@ -263,6 +263,8 @@ The endpoint bounds POST bodies to prevent memory pressure:
   `max_beacon_body_size` and returns `413 Payload Too Large`.
 - A body still unread 30 s after the request arrived returns
   `408 Request Timeout`.
+- A body stream that fails with EdgeZero's framing error returns
+  `400 Bad Request`.
 - Any other failed body read returns `502 Bad Gateway`.
 
 **Memory Protection**:

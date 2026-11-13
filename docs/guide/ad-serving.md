@@ -72,7 +72,7 @@ assets at runtime.
   deadline, measured from auction start. A bid that has not arrived by the
   cutoff becomes a provider timeout, and mediation is skipped when no budget
   remains. Dropping the batch cancels in-flight requests on every adapter;
-  Fastly host cancellation is best effort. See
+  host cancellation is best effort on Cloudflare, Fastly, and Spin. See
   [Timeout behavior](/guide/auction-orchestration#timeout-behavior).
 
 See also [Creative processing](/guide/creative-processing) and the

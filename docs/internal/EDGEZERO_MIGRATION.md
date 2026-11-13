@@ -67,7 +67,9 @@ needs an EdgeZero-vs-legacy branch split. Watch aggregate service metrics:
 - **Error rate:** `5xx / total_requests` by edge PoP
 - **Latency p95:** service-wide
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
-- **Timeout rate:** `504 / total_requests`
+- **Timeout rate:** Trusted Server answers an upstream timeout with `502`, not
+  `504`, so count timeouts from the logged failure reports that carry an
+  `outbound budget source` line
 
 For local validation under Viceroy, use the integration-test fixtures or
 `fastly compute serve` with a `trusted_server_config` store present.

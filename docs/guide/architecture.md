@@ -182,7 +182,8 @@ whose cutoff is the auction deadline, so a multi-provider auction fans out on
 Fastly, Axum, Cloudflare, and Spin alike. Fastly startup also rejects an enabled
 plan that could need more than 160 provider backends. A bid that has not arrived
 by the cutoff becomes a provider timeout. Dropping the batch cancels in-flight
-bidder and mediator requests; Fastly host cancellation is best effort. See
+bidder and mediator requests; host cancellation is best effort on Cloudflare,
+Fastly, and Spin. See
 [Auction timeout behavior](/guide/auction-orchestration#timeout-behavior) for
 scheduling, worker-runtime dispatch, and local processing limitations.
 

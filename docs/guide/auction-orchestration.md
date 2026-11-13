@@ -859,8 +859,8 @@ dropped.
 Dropping the batch cancels its in-flight requests on every adapter. An abandoned
 auction, an origin error, a non-HTML response, or a client that disconnects
 mid-stream therefore cancels the bidder and mediator requests. Only guest-side
-cancellation is guaranteed: Fastly host cancellation is best effort, so a bidder
-may still receive and answer a cancelled request. Upstream side effects that
+cancellation is guaranteed: host cancellation is best effort on Cloudflare,
+Fastly, and Spin, so a bidder may still receive and answer a cancelled request. Upstream side effects that
 already happened cannot be undone.
 
 Timer granularity and runtime scheduling can add a small overshoot. Parsing,
