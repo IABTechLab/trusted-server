@@ -8,7 +8,7 @@
 
 **Consumer:** Trusted Server `main` at `a9037770a`, which pins EdgeZero `v0.0.9` today
 
-**Companion:** [EdgeZero PR 275 hard cutover](2026-10-17-edgezero-pr275-hard-cutover-design.md), the Trusted Server side of the cut. It is being revised to the decisions in this document.
+**Companion:** [EdgeZero PR 275 hard cutover](2026-10-17-edgezero-pr275-hard-cutover-design.md), the Trusted Server side of the cut. The companion records the decisions; this copy is as handed over.
 
 ## Purpose
 
