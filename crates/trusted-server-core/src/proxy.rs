@@ -5896,51 +5896,246 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_answers_head_with_raw_s3_preflight_error() {
-        let (_clock, client, services) = scripted_services();
-        client.respond_to(
-            Method::HEAD,
-            S3_OBJECT,
-            ScriptedReply::status(StatusCode::FORBIDDEN)
-                .header(header::CACHE_CONTROL.as_str(), "public, max-age=3600")
-                .header(header::SET_COOKIE.as_str(), "asset=1; Path=/"),
-        );
-        let settings = image_optimizer_settings(test_profile_set());
-        let req = build_http_request(
-            Method::HEAD,
-            "https://www.example.com/.images/foo.jpg?profile=medium",
-        );
+    fn handle_asset_proxy_request_returns_s3_head_errors_without_cache_or_io() {
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+            let (_clock, client, services) = scripted_services();
+            client.respond_to(
+                Method::HEAD,
+                S3_OBJECT,
+                ScriptedReply::status(status)
+                    .header(header::CONTENT_TYPE.as_str(), "application/xml")
+                    .header(header::CONTENT_LENGTH.as_str(), "42")
+                    .header(header::CACHE_CONTROL.as_str(), "public, max-age=3600")
+                    .header(header::SET_COOKIE.as_str(), "asset=1; Path=/"),
+            );
+            let settings = image_optimizer_settings(test_profile_set());
+            let req = build_http_request(
+                Method::HEAD,
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+            );
 
-        let asset_response = futures::executor::block_on(handle_asset_proxy_request(
-            &settings,
-            &services,
-            req,
-            &test_s3_image_optimizer_route(),
-        ))
-        .expect("should return the raw S3 preflight error");
+            let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &test_s3_image_optimizer_route(),
+            ))
+            .expect("should return the raw S3 preflight error");
 
-        assert_eq!(
-            asset_response.cache_policy(),
-            AssetProxyCachePolicy::NoStorePrivate,
-            "should carry a typed no-store policy for router finalization"
-        );
-        let (response, stream_body) = asset_response.into_response_and_body();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(stream_body.is_none(), "should answer HEAD without a body");
-        assert_eq!(
-            response_header(&response, header::CACHE_CONTROL),
-            Some("no-store, private"),
-            "S3 origin errors should not be cached"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "raw S3 error should still strip unsafe response headers"
-        );
-        assert_eq!(
-            sent_methods(&client),
-            vec![Method::HEAD],
-            "should answer a HEAD from its failed preflight alone"
-        );
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::NoStorePrivate,
+                "S3 HEAD {status} should carry a typed no-store policy"
+            );
+            let (response, stream_body) = asset_response.into_response_and_body();
+            assert_eq!(
+                response.status(),
+                status,
+                "S3 HEAD {status} should keep the origin status"
+            );
+            assert!(
+                stream_body.is_none(),
+                "S3 HEAD {status} should be answered without a body stream"
+            );
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("no-store, private"),
+                "S3 HEAD {status} should not be cached"
+            );
+            assert_eq!(
+                response_header(&response, header::CONTENT_LENGTH),
+                Some("42"),
+                "S3 HEAD {status} should keep the origin Content-Length"
+            );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "S3 HEAD {status} should strip Set-Cookie"
+            );
+            assert!(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should buffer the HEAD answer")
+                    .is_empty(),
+                "S3 HEAD {status} error response must not contain a body"
+            );
+            assert_eq!(
+                sent_methods(&client),
+                vec![Method::HEAD],
+                "S3 HEAD {status} should be answered from its failed preflight alone"
+            );
+            client.requests()[0].assert_transport(uncached(asset_head_transport()));
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_bypasses_cache_for_signed_raw_head() {
+        let s3_logo = "https://examplebucket.s3.example.com/.images/logo.svg";
+        for (case, uri, origin) in [
+            (
+                "svg",
+                "https://www.example.com/.images/logo.svg?profile=medium",
+                s3_logo,
+            ),
+            (
+                "svgz",
+                "https://www.example.com/.images/logo.svgz?profile=medium",
+                "https://examplebucket.s3.example.com/.images/logo.svgz",
+            ),
+            (
+                "rewritten_svg",
+                "https://www.example.com/.images/logo.png?profile=medium",
+                s3_logo,
+            ),
+            (
+                "debug",
+                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+                S3_OBJECT,
+            ),
+            (
+                "disabled_io",
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+                "https://examplebucket.s3.example.com/.images/foo.jpg?profile=medium",
+            ),
+            (
+                "absent_io",
+                "https://www.example.com/.images/foo.jpg",
+                S3_OBJECT,
+            ),
+        ] {
+            // An asset HEAD is always buffered, so the request must carry the same
+            // settings whether the origin delivers its empty body as one chunk or
+            // as a stream of chunks.
+            for (delivery, body) in [
+                ("buffered", vec![Bytes::new()]),
+                ("streamed", vec![Bytes::new(), Bytes::new()]),
+            ] {
+                let (_clock, client, services) = scripted_services();
+                client.respond_to(
+                    Method::HEAD,
+                    origin,
+                    ScriptedReply::status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH.as_str(), "42")
+                        .header(header::CACHE_CONTROL.as_str(), "public, max-age=60")
+                        .chunks(body),
+                );
+                let mut route = test_s3_image_optimizer_route();
+                match case {
+                    "rewritten_svg" => {
+                        route.path_pattern = Some(r"^/\.images/(.*)\.png$".to_string());
+                        route.target_path = Some("/.images/$1.svg".to_string());
+                    }
+                    "disabled_io" => {
+                        route
+                            .image_optimizer
+                            .as_mut()
+                            .expect("should configure Image Optimizer")
+                            .enabled = false;
+                    }
+                    "absent_io" => route.image_optimizer = None,
+                    _ => {}
+                }
+
+                let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+                    &image_optimizer_settings(test_profile_set()),
+                    &services,
+                    build_http_request(Method::HEAD, uri),
+                    &route,
+                ))
+                .expect("should proxy the signed raw HEAD");
+
+                assert_eq!(
+                    sent_methods(&client),
+                    vec![Method::HEAD],
+                    "{case} should send one HEAD for a {delivery} origin reply"
+                );
+                let requests = client.requests();
+                assert_eq!(
+                    requests[0].cache_policy,
+                    OutboundCachePolicy::Bypass,
+                    "{case} signed raw HEAD must bypass the readthrough cache for a {delivery} origin reply"
+                );
+                requests[0].assert_transport(uncached(asset_head_transport()));
+                assert_eq!(
+                    asset_response.cache_policy(),
+                    AssetProxyCachePolicy::OriginControlled,
+                    "{case} HEAD should keep the origin cache policy for a {delivery} origin reply"
+                );
+                let (response, stream_body) = asset_response.into_response_and_body();
+                assert!(
+                    stream_body.is_none(),
+                    "{case} HEAD should be answered without a body stream for a {delivery} origin reply"
+                );
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{case} HEAD should keep the origin status"
+                );
+                assert_eq!(
+                    response_header(&response, header::CONTENT_LENGTH),
+                    Some("42"),
+                    "{case} HEAD should keep the origin Content-Length"
+                );
+                assert_eq!(
+                    response_header(&response, header::CACHE_CONTROL),
+                    Some("public, max-age=60"),
+                    "{case} HEAD should keep the origin cache headers"
+                );
+                assert!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer the HEAD answer")
+                        .is_empty(),
+                    "{case} HEAD should stay bodiless for a {delivery} origin reply"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_keeps_cache_for_raw_get_and_unsigned_head() {
+        let origin = "https://examplebucket.s3.example.com/.images/logo.svg";
+        for (method, signed, transport) in [
+            (Method::GET, true, asset_get_transport()),
+            (Method::GET, false, asset_get_transport()),
+            (Method::HEAD, false, asset_head_transport()),
+        ] {
+            let (_clock, client, services) = scripted_services();
+            client.respond_to(
+                method.clone(),
+                origin,
+                ScriptedReply::status(StatusCode::OK),
+            );
+            let mut route = test_s3_image_optimizer_route();
+            if !signed {
+                route.auth = None;
+            }
+
+            futures::executor::block_on(handle_asset_proxy_request(
+                &create_test_settings(),
+                &services,
+                build_http_request(
+                    method.clone(),
+                    "https://www.example.com/.images/logo.svg?profile=medium",
+                ),
+                &route,
+            ))
+            .expect("should proxy the raw asset");
+
+            assert_eq!(
+                sent_methods(&client),
+                vec![method.clone()],
+                "{method} with signed={signed} should not add a preflight"
+            );
+            let requests = client.requests();
+            assert_eq!(
+                requests[0].cache_policy,
+                OutboundCachePolicy::PlatformDefault,
+                "{method} with signed={signed} should keep readthrough caching"
+            );
+            requests[0].assert_transport(transport);
+        }
     }
 
     /// Proxies `uri` through `route` and returns the one origin request it sent.
