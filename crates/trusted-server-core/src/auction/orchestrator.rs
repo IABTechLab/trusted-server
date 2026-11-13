@@ -994,6 +994,9 @@ impl AuctionOrchestrator {
     /// Returns `None`, so the caller ranks bids locally, when the deadline has
     /// passed, or the mediator fails, times out, returns a response it cannot
     /// process (such as a non-success HTTP status), or reports an error status.
+    /// A result the mediator returns without a request is dropped too once its
+    /// logical budget, the earlier of its timeout and the auction deadline, has
+    /// run out.
     async fn run_mediator(
         &self,
         mediator: &dyn AuctionProvider,
@@ -1039,7 +1042,19 @@ impl AuctionOrchestrator {
             .trace
             .map(|trace| trace.launch_provider(TraceProviderRole::Mediator));
         let mediator_start = run.clock.now();
+        let mediator_deadline = run
+            .clock
+            .deadline_after(Duration::from_millis(u64::from(logical_budget_ms)));
         let mediated = match mediator.request_bids(run.request, &mediator_context).await {
+            Ok(ProviderRequestOutcome::Immediate(_))
+                if mediator_deadline.is_expired_at(run.clock.now()) =>
+            {
+                log::debug!(
+                    "Mediator '{}' exhausted its response budget during launch; using local ranking",
+                    mediator.provider_name()
+                );
+                None
+            }
             Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
             Ok(ProviderRequestOutcome::Ready {
                 request: mediator_request,
@@ -2728,6 +2743,94 @@ mod tests {
                     ),
                     (cause, duration_ms(ends_at).into()),
                     "should end the mediator at the earlier of its timeout and the auction deadline"
+                );
+            }
+        }
+
+        /// A mediator that answers without a request once its launch has taken
+        /// `launch` on the test clock.
+        struct SlowImmediateMediator {
+            clock: TestClock,
+            launch: Duration,
+            timeout: Duration,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for SlowImmediateMediator {
+            fn provider_name(&self) -> &str {
+                "slow-immediate-mediator"
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                _context: &AuctionContext<'_>,
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+                self.clock.advance(self.launch);
+                Ok(ProviderRequestOutcome::Immediate(AuctionResponse::success(
+                    self.provider_name(),
+                    vec![mediated_bid(Some(
+                        "https://nurl.example/immediate".to_string(),
+                    ))],
+                    0,
+                )))
+            }
+
+            async fn parse_response(
+                &self,
+                _response: OutboundResponse,
+                _response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                panic!("immediate mediator response should not be parsed");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                duration_ms(self.timeout)
+            }
+        }
+
+        #[test]
+        fn immediate_mediator_result_counts_only_within_its_budget() {
+            // The auction deadline ends the first launch and the mediator's own
+            // timeout the second. The third answers in time.
+            for (launch, timeout, mediated) in [
+                (Duration::from_millis(600), Duration::from_secs(1), false),
+                (
+                    Duration::from_millis(200),
+                    Duration::from_millis(100),
+                    false,
+                ),
+                (Duration::from_millis(50), Duration::from_millis(100), true),
+            ] {
+                let clock = TestClock::new();
+                let client = ScriptedHttpClient::new(&clock);
+                client.respond_to(Method::POST, FAST_BIDDER, bid_reply(1.5));
+                let services = build_services_with_outbound_client(&client, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    batch_plan(&[("fast", FAST_BIDDER, Duration::from_secs(1))]),
+                    Some(Arc::new(SlowImmediateMediator {
+                        clock: clock.clone(),
+                        launch,
+                        timeout,
+                    })),
+                );
+                let settings = create_test_settings();
+                let inbound = inbound_request();
+                let context = batch_context(&settings, &inbound, &services, AUCTION_TIMEOUT);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction");
+
+                assert_eq!(
+                    (
+                        result.mediator_response.is_some(),
+                        result
+                            .get_winning_bid("fictional-slot")
+                            .and_then(|bid| bid.price),
+                    ),
+                    (mediated, (!mediated).then_some(1.5)),
+                    "should keep an immediate mediator result only within its budget, launch {launch:?} and timeout {timeout:?}"
                 );
             }
         }
