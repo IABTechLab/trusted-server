@@ -131,6 +131,12 @@ impl IdentityProvider for ConnectIdProvider {
         &self.capabilities
     }
 
+    /// The request carries no EC ID, so it may run on the navigation that
+    /// mints the EC.
+    fn sends_ec_id(&self) -> bool {
+        false
+    }
+
     fn build_request(
         &self,
         _lookup: &LookupInput<'_>,
