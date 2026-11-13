@@ -72,6 +72,14 @@ async fn route(router: RouterService, mut req: Request) -> Response {
 }
 
 #[test]
+fn trusted_server_owns_logging() {
+    assert!(
+        TrustedServerApp::owns_logging(),
+        "should own logging, so Spin's no-op init_logger leaves the entry point's logger alone"
+    );
+}
+
+#[test]
 fn routes_build_without_panic() {
     // Host targets have no production config store, so `routes()` returns
     // the startup error instead of panicking.

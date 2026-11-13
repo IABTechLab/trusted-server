@@ -382,6 +382,12 @@ impl Hooks for TrustedServerApp {
         install_edge_policies(app, synthesized_response_headers())
     }
 
+    /// The entry point installs a warn-level console logger before `run_app`,
+    /// because `EdgeZero`'s Cloudflare `init_logger` installs none.
+    fn owns_logging() -> bool {
+        true
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }

@@ -27,8 +27,7 @@ use worker::{Context, Env, Request, Response, Result, event};
 /// Returns a Workers runtime error when the fallback error response cannot be
 /// constructed.
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    #[cfg(feature = "test-utils")]
-    install_fixture_logger();
+    install_logger();
     if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
         app::set_cloudflare_config_json(config.to_string());
     }
@@ -43,27 +42,41 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-struct FixtureLogger;
+/// Writes warn and error records to the Workers console.
+///
+/// `EdgeZero`'s Cloudflare `init_logger` installs no backend, so
+/// [`app::TrustedServerApp`] owns logging and the entry point installs this.
+#[cfg(target_arch = "wasm32")]
+struct ConsoleLogger;
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-impl log::Log for FixtureLogger {
+#[cfg(target_arch = "wasm32")]
+impl log::Log for ConsoleLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Warn
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            worker::console_warn!("{}", record.args());
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if record.level() == log::Level::Error {
+            worker::console_error!("{}: {}", record.target(), record.args());
+        } else {
+            worker::console_warn!("{}: {}", record.target(), record.args());
         }
     }
 
     fn flush(&self) {}
 }
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-fn install_fixture_logger() {
-    static LOGGER: FixtureLogger = FixtureLogger;
+/// Installs [`ConsoleLogger`] at warn, once per isolate, before `EdgeZero`
+/// assembles the app.
+///
+/// It also routes panics to the console, which a Worker otherwise reports only
+/// as an unreachable trap.
+#[cfg(target_arch = "wasm32")]
+fn install_logger() {
+    static LOGGER: ConsoleLogger = ConsoleLogger;
     if log::set_logger(&LOGGER).is_ok() {
         std::panic::set_hook(Box::new(|information| {
             worker::console_error!("{}", information);

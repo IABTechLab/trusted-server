@@ -114,6 +114,14 @@ fn make_router() -> RouterService {
 }
 
 #[test]
+fn trusted_server_owns_logging() {
+    assert!(
+        TrustedServerApp::owns_logging(),
+        "should own logging, so Cloudflare's no-op init_logger leaves the entry point's logger alone"
+    );
+}
+
+#[test]
 fn routes_report_missing_worker_config_as_internal_error() {
     // Host targets have no Worker config binding, so startup fails and
     // `routes()` returns the error EdgeZero answers with.
