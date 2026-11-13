@@ -9,6 +9,8 @@
 
 /// Application routing and handler registration.
 pub mod app;
+#[cfg(all(feature = "celld-ec", not(target_arch = "wasm32")))]
+pub mod celld_ec;
 /// Native live DynamoDB conditional identity storage and provider selection.
 pub mod ec_kv;
 /// Request middleware for authentication and response finalization.

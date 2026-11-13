@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use edgezero_core::app::{Hooks as _, StoreMetadata};
+use edgezero_core::blob_envelope::BlobEnvelope;
+use serde_json::json;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 
@@ -17,6 +19,41 @@ use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRE
 // BlobEnvelope v1 format. All values are synthetic local fixture inputs.
 const ENVELOPE: &str = r#"{"data":{"ec":{"passphrase":"ec_key"},"handlers":[{"password":"admin_key","path":"^/_ts/admin","username":"admin"}],"publisher":{"cookie_domain":".publisher.example.com","domain":"publisher.example.com","origin_url":"https://origin.publisher.example.com","proxy_secret":"proxy_key"},"request_signing":null},"sha256":"f4dc03017deb24bfd589efde7dce0f9f8a20d952c28ebcbdb6141b08661cd137","version":1,"generated_at":"2026-10-20T00:00:00Z"}"#;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "celld-ec")]
+#[path = "support/celld.rs"]
+mod celld_fixture;
+
+#[cfg(feature = "celld-ec")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires CELLD_EC_TEST_BINARY pointing to the built real conditional-record server"]
+async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_on_outage() {
+    let mut celld = celld_fixture::CelldFixture::new();
+    for _ in 0..2 {
+        let storage =
+            serde_json::to_value(celld.settings()).expect("should serialize pure celld settings");
+        let mut storage = storage;
+        storage["provider"] = json!("celld");
+        let mut server = ServerFixture::new(Some(&storage_envelope(storage)));
+        server.spawn(false, false);
+        server.wait_ready();
+        let store = celld.store().await;
+        assert!(
+            !trusted_server_core::ec::kv_backend::EcKvStore::key_exists(&store, "never-issued")
+                .await
+                .expect("should read strongly through prepared typed backend")
+        );
+        drop(server);
+        celld.restart();
+    }
+    let mut storage =
+        serde_json::to_value(celld.settings()).expect("should serialize final binding");
+    storage["provider"] = json!("celld");
+    celld.stop();
+    let mut server = ServerFixture::new(Some(&storage_envelope(storage)));
+    server.spawn(false, false);
+    server.assert_failed_before_listen("native EC celld preparation failed");
+}
 
 struct ServerFixture {
     root: PathBuf,
@@ -85,6 +122,16 @@ impl ServerFixture {
         short_passphrase: bool,
         profile: Option<&str>,
     ) {
+        self.spawn_inputs(missing_secret, short_passphrase, profile, None);
+    }
+
+    fn spawn_inputs(
+        &mut self,
+        missing_secret: bool,
+        short_passphrase: bool,
+        profile: Option<&str>,
+        legacy: Option<&str>,
+    ) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
@@ -125,6 +172,9 @@ impl ServerFixture {
                     "native-fixture-passphrase-32-bytes-minimum"
                 },
             );
+        }
+        if let Some(value) = legacy {
+            command.env("TS_EC_DYNAMODB_ENABLED", value);
         }
         self.child = Some(
             command
@@ -252,6 +302,52 @@ impl Drop for ServerFixture {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn storage_envelope(storage: serde_json::Value) -> String {
+    let mut envelope: serde_json::Value =
+        serde_json::from_str(ENVELOPE).expect("should decode fixture envelope");
+    let mut data = envelope["data"].take();
+    data["ec"]["storage"] = storage;
+    serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+        .expect("should encode existing envelope format")
+}
+
+#[test]
+fn active_legacy_ec_environment_cannot_disable_or_override_published_storage() {
+    let configured = storage_envelope(
+        json!({"provider":"celld","endpoint":"http://127.0.0.1:7780","store":"identity","access":{"mode":"trusted-network"}}),
+    );
+    for envelope in [ENVELOPE, configured.as_str()] {
+        let mut server = ServerFixture::new(Some(envelope));
+        server.spawn_inputs(false, false, None, Some("true"));
+        server.assert_failed_before_listen(
+            "publish ec.storage and remove legacy EC environment selection",
+        );
+    }
+}
+
+#[test]
+fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
+    let cases=[
+        Some((json!({"provider":"fastly","store":"exact-binding"}),"unsupported by the selected serving runtime")),
+        (!cfg!(feature="aws-dynamodb-ec")).then(||(json!({"provider":"dynamodb","region":"us-east-1","table":"example-identity","namespace":"fixture"}),"aws-dynamodb-ec build feature is unavailable")),
+        (!cfg!(feature="celld-ec")).then(||(json!({"provider":"celld","endpoint":"http://127.0.0.1:7780","store":"identity","access":{"mode":"trusted-network"}}),"celld-ec build feature is unavailable")),
+    ];
+    for (storage, expected) in cases.into_iter().flatten() {
+        let mut server = ServerFixture::new(Some(&storage_envelope(storage)));
+        server.spawn(false, false);
+        server.assert_failed_before_listen(expected);
+    }
+}
+
+#[cfg(feature = "celld-ec")]
+#[test]
+fn selected_celld_captures_only_its_explicit_bootstrap_reference_before_network() {
+    let storage = json!({"provider":"celld","endpoint":"https://127.0.0.1:7780","store":"identity","access":{"mode":"authenticated","token_env":"FIXTURE_MISSING_CELLD_TOKEN"}});
+    let mut server = ServerFixture::new(Some(&storage_envelope(storage)));
+    server.spawn(false, false);
+    server.assert_failed_before_listen("selected EC celld bootstrap token is unavailable");
 }
 
 #[test]

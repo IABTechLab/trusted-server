@@ -1,6 +1,6 @@
 # Native EC persistence
 
-The native Axum adapter can use a dedicated DynamoDB EC backend. Build with `aws-dynamodb-ec` and select it explicitly at startup. This is separate from ordinary byte KV and from immutable AppConfig or secret snapshots. A local database file on an ephemeral ECS volume is not a substitute for retained identity state.
+The native Axum adapter can use dedicated DynamoDB or celld EC persistence. Build with `aws-dynamodb-ec` or `celld-ec` and select the provider explicitly in published `[ec.storage]` configuration. This is separate from ordinary byte KV and from immutable AppConfig or secret snapshots. A local database file on an ephemeral ECS volume is not a substitute for retained identity state.
 
 Persistence does not grant consent. Keep the shared EC consent, bot, browser-navigation and withdrawal rules intact. A request can be eligible for an auction but ineligible for an EC. Missing qualifying consent in a jurisdiction that requires it must still prevent EC issuance. Consent capture and CMP integration are separate work.
 
@@ -37,22 +37,68 @@ docker build --platform linux/amd64 \
   -t trusted-server-native-ec:local .
 ```
 
-This command is an operator example, not evidence of a qualified image. Rebuild the final runtime image from the new binary and record its source, dependency and image digests. A historical AppConfig/Secrets Manager image qualification does not cover EC persistence merely because environment variables were added.
+This command is an operator example, not evidence of a qualified image. Rebuild the final runtime image from the new binary and record its source, dependency and image digests. A historical AppConfig/Secrets Manager image qualification does not cover EC persistence merely because a provider was added to published configuration.
 
-Set these variables on the application container, not the AppConfig Agent:
+Publish the non-secret selection in the existing Trusted Server app-config BlobEnvelope, through the same `ts config push`/AppConfig publication path used for other settings:
 
-```sh
-TS_EC_DYNAMODB_ENABLED=true
-TS_EC_DYNAMODB_REGION=us-east-1
-TS_EC_DYNAMODB_TABLE=example-retained-ec
-TS_EC_DYNAMODB_NAMESPACE=example-staging
+```toml
+[ec.storage]
+provider = "dynamodb"
+region = "us-east-1"
+table = "example-retained-ec"
+namespace = "example-staging"
 ```
 
-`TS_EC_DYNAMODB_ENABLED=true` selects the provider. `false` or absence leaves it off. Region, table and namespace are required when selected. Use the same region as the table. The TS region setting is explicit; do not rely on an unrelated `AWS_REGION` value to select the EC table region. Selected-provider preparation must succeed before readiness. Do not treat a selected-provider failure as permission to fall back to memory or emit an unbacked cookie.
+Region, table and namespace are required. Preserve the exact existing table and namespace when migrating. Use the same region as the table; unrelated `AWS_REGION` values do not select the EC region. No provider or default binding is inferred on native. An ordinary KV declaration does not enable EC persistence. Selected-provider preparation must succeed before readiness. An error never permits fallback to memory, another provider or an unbacked cookie.
 
-The provider uses the standard AWS workload credential chain. In ECS, the application uses the task role. Keep credential values out of deployment inputs, logs, Terraform and container environment. The execution role still handles image pull, logs and task startup secrets, not application DynamoDB calls. Without a local-test selection, production preparation ignores configured endpoint overrides and uses the regional AWS endpoint. Local-only acceptance can set `TS_EC_DYNAMODB_LOCAL_ENDPOINT=http://127.0.0.1:8000`. This seam accepts only loopback HTTP with an explicit port and root path, bypasses the AWS config and credential chain, and uses dummy credentials. Never set it in a deployed task. In-process fixtures can also inject a client through the test preparation API.
+This is a hard cutover from native environment-only selection. `TS_EC_DYNAMODB_ENABLED=true` now fails before readiness with migration guidance, even if new config is also present. Malformed enablement also fails. Absent or `false` does not select a backend; orphaned old binding variables are ignored, not another source. Prepare and publish the new config, then remove the old enablement/region/table/namespace/endpoint launch inputs. There is no fallback reader.
+
+Legacy `[ec] ec_store = "exact-binding"` remains supported on Fastly and inactive on other adapters. New Fastly config may use `[ec.storage] store = "exact-binding"`, with an omitted or explicit `fastly` provider. Both forms together are rejected. Cloudflare and Spin reject any explicit storage selection before routed application work. Shared parsing and publication do not resolve providers according to the CLI host. Missing storage stays absent when serialized, with no injected provider defaults.
+
+Older binaries reject the new section. Deploy a compatible binary before publishing it; rollback requires an old-compatible config and matching binary together. A provider or namespace switch does not migrate identity data or withdrawal obligations.
+
+The provider uses the standard AWS workload credential chain. In ECS, the application uses the task role. Keep credential values out of deployment inputs, logs, Terraform and container environment. The execution role still handles image pull, logs and task startup secrets, not application DynamoDB calls. Without a local-test selection, production preparation ignores configured endpoint overrides and uses the regional AWS endpoint. Local-only acceptance can set `local_endpoint = "http://127.0.0.1:8000"` inside `[ec.storage]`. This seam accepts only loopback HTTP with an explicit port and root path, bypasses the AWS config and credential chain, and uses dummy credentials. Never set it in a deployed task. In-process fixtures can also inject a client through the test preparation API.
 
 The table is a single-region base table. Do not add Global Tables or route writes to different regions and assume the same CAS guarantees. A single namespace partition and generation counter can become hot; `PAY_PER_REQUEST` is not a throughput qualification.
+
+## Celld conditional records
+
+Build the native adapter with `celld-ec` and publish an explicit binding:
+
+```toml
+[ec.storage]
+provider = "celld"
+endpoint = "https://stores.example.com:7780"
+store = "checkout-identity"
+
+[ec.storage.access]
+mode = "authenticated"
+token_env = "CHECKOUT_STORE_TOKEN"
+```
+
+The endpoint, service-owned alias and access policy use EdgeZero's pure celld settings. Do not publish a physical namespace or bearer token. The selected bootstrap variable is captured once during preparation; request paths do not reread it. Authenticated access requires HTTPS with normal certificate verification. Trusted-network access is an explicit alternative under the existing celld policy, never an authentication fallback.
+
+The provider requires the additive conditional-record protocol and checks both store and record version headers before readiness. Ordinary raw celld KV and the `celld-kv` feature do not supply the EC contract. Missing compiled provider, invalid credentials, unsupported protocol and unavailable service all fail closed.
+
+The typed client maps the unchanged EC trait onto body and opaque metadata, full-u64 server generations, atomic Add/Overwrite/IfGenerationMatch, exact physical existence, bounded strong prefix listing, TTL and hard deletion. A full list page is not proof of completeness. The server samples relative millisecond expiry inside the write transaction; finer positive client TTLs round upward. The core graph still owns every lifetime, tombstone and CAS retry. Transport does not replay uncertain mutations. Record cleanup must never reset the durable allocator. Raw KV keys and conditional record keys are separate datasets.
+
+Run the real disposable local-server proof explicitly with an existing tested celld binary:
+
+```sh
+CELLD_EC_TEST_BINARY=/absolute/path/to/celld \
+  cargo test --locked --target x86_64-unknown-linux-gnu \
+  -p trusted-server-adapter-axum --features celld-ec \
+  --test native_ec --test startup -- --include-ignored --test-threads=1
+
+CELLD_EC_TEST_BINARY=/absolute/path/to/celld \
+  cargo test --locked --target x86_64-unknown-linux-gnu \
+  -p trusted-server-adapter-axum --features celld-ec,geo-cloudfront \
+  --test native_acceptance \
+  real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage \
+  -- --ignored --test-threads=1
+```
+
+Missing prerequisites fail instead of silently skipping this selected check. Fixtures own temporary policy/data and loopback listeners, not operator configuration. They exercise the real typed client and graph through native issuance, EID update, withdrawal, restart, outage and published-envelope readiness. The second check drives actual native HTTP issuance from the published envelope using a real origin and celld, synthetic protected-ingress geography and isolated secret references. It covers application recreation, server restart and outage without replacing the graph with a memory double. Tests are serialized to keep subprocess listener ownership separate. Synthetic local geography and GPC inputs are not genuine live-browser consent acceptance. Same-disk fixture restart is not replicated disaster recovery or production storage qualification. The server's separate fresh-node-cache LTX proof does not certify a production object-store deployment either.
 
 ## Table and namespace ownership
 

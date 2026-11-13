@@ -120,6 +120,9 @@ fn app_config_envelope(
             "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    // This builder supplies native and Cloudflare fixtures. Fastly's generator
+    // reads the shared source separately and keeps its explicit binding.
+    table_mut(&mut table, "ec")?.remove("storage");
     customize(&mut table)?;
     let app_config: TrustedServerAppConfig =
         toml::Value::Table(table).try_into().map_err(|error| {
@@ -428,6 +431,35 @@ mod tests {
             "should explicitly enable isolated trace fixture"
         );
     }
+    #[test]
+    fn native_and_cloudflare_fixtures_do_not_select_a_fastly_graph() {
+        let native = super::integration_app_config_envelope(8888)
+            .expect("should generate native fixture envelope");
+        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(&native).expect("should parse native envelope");
+        assert!(
+            envelope.data["ec"].get("storage").is_none(),
+            "should retain native unconfigured persistence"
+        );
+        for binding in [
+            super::cloudflare_config_json(8888),
+            super::cloudflare_auction_config_json(8888),
+        ] {
+            let binding: serde_json::Value =
+                serde_json::from_str(&binding.expect("should generate Cloudflare fixture"))
+                    .expect("should parse Cloudflare binding");
+            let encoded = binding[trusted_server_core::config_payload::CONFIG_BLOB_KEY]
+                .as_str()
+                .expect("should contain existing envelope");
+            let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+                serde_json::from_str(encoded).expect("should parse Cloudflare envelope");
+            assert!(
+                envelope.data["ec"].get("storage").is_none(),
+                "should retain Cloudflare unconfigured persistence"
+            );
+        }
+    }
+
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";
