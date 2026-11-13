@@ -344,6 +344,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    // Provider kinds are registered outside core, so `ts config` refuses an
+    // enabled provider whose kind is not registered by building it.
     validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
     Ok(())
 }
@@ -1614,7 +1616,7 @@ gam_network_id = "99999"
         let settings = settings_with_identity_provider(serde_json::json!({}));
 
         validate_settings_for_deploy(&settings)
-            .expect("should accept an enabled provider; the CLI builds its kind");
+            .expect("should leave the registered-kind check to the provider crate");
     }
 
     #[test]
