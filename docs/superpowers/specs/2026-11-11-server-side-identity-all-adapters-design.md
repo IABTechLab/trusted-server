@@ -302,21 +302,26 @@ marks the record contract and geo as supported.
   the record reaches the page. A plain `GET` answers Prebid's SharedID
   `pixelUrl` with an empty 204: it never mints, calls a provider or changes
   consent, and only re-sets an existing SharedID cookie from the record (WB-3).
-  The script keeps at most one call in flight and sends the latest consent after
-  it settles, so a withdrawal always lands after any grant in progress; it
-  discards a result that arrives while a newer consent change is waiting, and a
-  withdrawal removes the IDs it merged into Prebid. Every response carries
-  `Cache-Control: no-store`; a rate limit on the route waits with ID-6 (DEC-15).
-  The route is served from the page's own host, which WebKit's cap on cookies
-  from non-document responses exempts when the IP matches the page's (read from
-  WebKit's source; the Accept tests it). Accept: on Fastly and Axum, a consented
-  same-origin `POST` with no `ts-ec` creates the record and sets `ts-ec` and the
-  SharedID cookie in that response; its JSON omits a non-mirrored partner's ID,
-  an ID whose vendor's TCF consent is denied and an expired ID; a withdrawal
-  issued while a grant call with no EC and delayed providers is in flight leaves
-  no identity cookie, no live record and no ID in Prebid; a cross-site `Origin`,
-  a `GET` and a client ID-7 refuses mint nothing and call no provider; an
-  unchanged returning reader gets no `Set-Cookie`; and in Safari, `ts-ec` and
+  The script sends consent changes in order with at most one call in flight.
+  While a call is in flight, a newer change replaces a waiting one, except a
+  waiting withdrawal, which is never replaced: later changes wait behind it. So
+  every withdrawal reaches the server, after any grant in progress and before
+  any later grant. The script discards a result that arrives while a newer
+  consent change is waiting, and a withdrawal removes the IDs it merged into
+  Prebid. Every response carries `Cache-Control: no-store`; a rate limit on the
+  route waits with ID-6 (DEC-15). The route is served from the page's own host,
+  which WebKit's cap on cookies from non-document responses exempts when the IP
+  matches the page's (read from WebKit's source; the Accept tests it). Accept:
+  on Fastly and Axum, a consented same-origin `POST` with no `ts-ec` creates the
+  record and sets `ts-ec` and the SharedID cookie in that response; its JSON
+  omits a non-mirrored partner's ID, an ID whose vendor's TCF consent is denied
+  and an expired ID; a withdrawal issued while a grant call with no EC and
+  delayed providers is in flight leaves no identity cookie, no live record and
+  no ID in Prebid; with grant A in flight, a withdrawal B and then a grant C
+  reach the server as A, B, C, so B expires the identity cookies and tombstones
+  A's record and C is handled as a first consent with no `ts-ec`; a cross-site
+  `Origin`, a `GET` and a client ID-7 refuses mint nothing and call no provider;
+  an unchanged returning reader gets no `Set-Cookie`; and in Safari, `ts-ec` and
   the SharedID cookie set by the route keep their one-year `Max-Age` on Fastly
   and on Axum behind CloudFront. State: on main only a real-browser navigation
   through the publisher proxy mints an EC, and no such route exists. #1535 (RC
@@ -720,15 +725,15 @@ revision addresses them; each thread holds its disposition.
 
 ### Round 2, 2026-11-12
 
-Review 5875159165 at `7cb8933f7`. It accepted and resolved 28 round-1
-findings and left six open: the fallback clock (thread 1), the review log and
-draft gate (7), SH-1's acceptance against the Axum HTTP client exception (14),
-the RC-unit baseline (15), ID-5's acceptance on Spin (18) and decision gates
-missing from plan cells (23). It added two should-fix findings: Task 1 must
-re-parent the EdgeZero issues it moves (35), and WB-3's no-write case must
-require a consistent `<name>_cst` (36). No blocking finding. The revision after
-it addresses all eight. The PR stays in draft until a round leaves no open
-finding.
+Review 5875159165 at `7cb8933f7`. It accepted and resolved 28 round-1 findings
+and left six open: the fallback clock (thread 1), the review log and draft gate
+(7), SH-1's acceptance against the Axum HTTP client exception (14), the RC-unit
+baseline (15), ID-5's acceptance on Spin (18) and decision gates missing from
+plan cells (23). It added two should-fix findings: Task 1 must re-parent the
+EdgeZero issues it moves (35), and WB-3's no-write case must require a
+consistent `<name>_cst` (36). No blocking finding. The revision after it
+addresses all eight. The PR stays in draft while known changes remain and is
+marked ready for each review round, as CONTRIBUTING.md asks.
 
 ### Round 3, 2026-11-12
 
@@ -825,3 +830,12 @@ view). EZI-2b now covers Axum only, with the portable providers in EZI-2p after
 the MVP, and R2 splits so providers no longer wait on JA4 (R2b). The revision
 after it addresses every open thread, including thread 37; each thread holds its
 disposition.
+
+### Round 5, 2026-11-13
+
+Review 5884927046 at `8e564f24c` accepted and resolved 65 of the 67 round-4
+threads, 101 in all, and opened nothing new. Threads 40 and 58 stayed open on
+one issue: sending only the latest waiting consent could drop a withdrawal made
+between a grant in flight and a later regrant. ID-9 and T20 now keep a waiting
+withdrawal as a barrier that later changes wait behind, and ID-9's Accept adds
+the grant, withdrawal and regrant case.
