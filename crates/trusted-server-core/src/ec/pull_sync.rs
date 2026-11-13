@@ -560,6 +560,8 @@ mod tests {
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
             ts_pull_token: Some(Redacted::new("token".to_owned())),
+            provider_owned: false,
+            owner_tcf_vendor_ids: Vec::new(),
         }
     }
 
@@ -652,9 +654,7 @@ mod tests {
         if let EcKvSnapshot::Present { entry, .. } = &mut snapshot {
             entry.ids.insert(
                 "ssp.example.com".to_owned(),
-                crate::ec::kv_types::KvPartnerId {
-                    uid: "uid".to_owned(),
-                },
+                crate::ec::kv_types::KvPartnerId::single("uid".to_owned()),
             );
         }
         ec_context.set_kv_snapshot(snapshot);
@@ -702,9 +702,7 @@ mod tests {
 
         entry.ids.insert(
             "b.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-b".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("uid-b".to_owned()),
         );
 
         assert!(
@@ -801,12 +799,12 @@ mod tests {
 
     #[test]
     fn extract_pull_uid_rejects_oversized_uid() {
-        let long_uid = "x".repeat(513);
+        let long_uid = "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1);
         let body = format!("{{\"uid\":\"{long_uid}\"}}");
         let response = make_response(200, body.as_bytes());
 
         let uid = extract_pull_uid(response, "ssp.example.com");
-        assert!(uid.is_none(), "should reject uid exceeding 512 bytes");
+        assert!(uid.is_none(), "should reject uid exceeding MAX_UID_LENGTH");
     }
 
     #[test]
@@ -1189,7 +1187,7 @@ mod tests {
         let (entry, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("tombstone should remain");
+            .expect("should keep the tombstone");
         assert!(
             entry.ids.is_empty(),
             "no partner UID may be written back onto a tombstoned row"
@@ -1213,9 +1211,7 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "already-known".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::single("already-known".to_owned()),
         );
         graph
             .create(&ec_id, &entry)

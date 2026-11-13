@@ -37,6 +37,7 @@ log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-identity-providers = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 web-time = { workspace = true }

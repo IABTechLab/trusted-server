@@ -7,9 +7,10 @@
 //!    context. This is called pre-routing on every request.
 //!
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
-//!    when none exists and consent allows it. This is called only in organic
-//!    handlers (publisher proxy, integration proxy) — never in read-only
-//!    endpoints like `/_ts/api/v1/identify`.
+//!    when none exists and consent allows it. This is called only for
+//!    publisher navigations — never in integration proxies or read-only
+//!    endpoints like `/_ts/api/v1/identify`. The new row is written by the
+//!    navigation's single page-load write in finalize ([`page_load`]).
 //!
 //! # Module structure
 //!
@@ -26,16 +27,24 @@
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`eid_types`] — Value types for full-fidelity provider EIDs
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
+//! - [`page_load`] — Single-use page-load write permit and row changes
+//! - [`write_plan`] — Plans a navigation's single row change
+//! - [`provider`] — Identity provider interface and configuration
+//! - [`coordinator`] — Server-side identity lookup coordination
 
 mod auth;
 
 pub mod admin;
+pub mod after_response;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
+pub mod coordinator;
 pub mod device;
+pub mod eid_types;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
@@ -43,12 +52,15 @@ pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
+pub mod page_load;
 pub mod partner;
 pub mod prebid_eids;
+pub mod provider;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
+pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
 const LOG_ID_PREFIX_CHARS: usize = 8;
@@ -83,8 +95,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
-use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
+use self::coordinator::results::LookupResults;
+use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
+use self::page_load::{AfterResponseWrite, NavigationPermit};
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
 /// Bounded request classifications that may persist browser EID cookies.
@@ -104,9 +118,6 @@ pub enum EidSyncSource {
     /// Admitted `GET /_ts/page-bids` SPA navigation.
     #[display("page_bids")]
     PageBids,
-    /// Request that generated a new EC identity during finalization.
-    #[display("new_ec")]
-    NewEc,
 }
 
 /// Request-scoped view of one EC identity-graph lookup.
@@ -240,6 +251,28 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
     Ok(ec_id)
 }
 
+/// Holds the request's navigation permit. Cloning an [`EcContext`] never
+/// copies the permit, so only the original context can spend it.
+#[derive(Debug, Default)]
+struct PermitSlot(Option<NavigationPermit>);
+
+impl Clone for PermitSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+/// Holds the navigation's after-response permit. Like [`PermitSlot`],
+/// cloning an [`EcContext`] never copies it.
+#[derive(Debug, Default)]
+struct AfterResponsePermitSlot(Option<AfterResponseWrite>);
+
+impl Clone for AfterResponsePermitSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
 /// Captures the EC state for a single request lifecycle.
 ///
 /// Created via [`read_from_request`](Self::read_from_request) during
@@ -282,6 +315,15 @@ pub struct EcContext {
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Navigation permit issued by the router for page-load navigations.
+    navigation_permit: PermitSlot,
+    /// Permit for the navigation's follow-up write after its response, set
+    /// by finalize when it confirms the navigation permit.
+    after_response_permit: AfterResponsePermitSlot,
+    /// Validated provider lookup results collected for this navigation.
+    lookup_results: LookupResults,
+    /// New row built by [`Self::generate_if_needed`], written by finalize.
+    pending_entry: Option<Box<KvEntry>>,
 }
 
 impl EcContext {
@@ -364,14 +406,21 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
         })
     }
 
     /// Generates a new EC ID if none exists and consent allows it.
     ///
-    /// This is the second phase of the EC lifecycle. Call this only in
-    /// organic handlers (publisher proxy, integration proxy, auction) —
-    /// never in read-only endpoints.
+    /// This is the second phase of the EC lifecycle. Call this only for
+    /// publisher navigations — never in read-only endpoints.
+    ///
+    /// Never writes KV. When `kv` is available, the new row is held as the
+    /// pending entry and created by the navigation's single page-load write
+    /// in finalize; the EC is issued only if that write succeeds.
     ///
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
@@ -403,62 +452,32 @@ impl EcContext {
             })
         })?;
 
-        const MAX_CREATE_ATTEMPTS: usize = 5;
-        for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let ec_id = generation::generate_ec_id(settings, client_ip)?;
-            log::info!("Generated new EC ID: {}", log_id(&ec_id));
-            let now = current_timestamp();
-            let mut entry = KvEntry::new(
-                &self.consent,
-                self.geo_info.as_ref(),
-                now,
-                &settings.publisher.domain,
-            );
-            entry.device = self
-                .device_signals
-                .as_ref()
-                .map(DeviceSignals::to_kv_device);
+        let ec_id = generation::generate_ec_id(settings, client_ip)?;
+        log::info!("Generated new EC ID: {}", log_id(&ec_id));
+        let now = current_timestamp();
+        let mut entry = KvEntry::new(
+            &self.consent,
+            self.geo_info.as_ref(),
+            now,
+            &settings.publisher.domain,
+        );
+        entry.device = self
+            .device_signals
+            .as_ref()
+            .map(DeviceSignals::to_kv_device);
 
-            if let Some(graph) = kv {
-                match graph.create_if_absent(&ec_id, &entry) {
-                    Ok(CreateIfAbsentOutcome::Written) => {
-                        self.kv_snapshot = EcKvSnapshot::Present {
-                            ec_id: ec_id.clone(),
-                            entry: Box::new(entry),
-                            generation: None,
-                        };
-                    }
-                    Ok(CreateIfAbsentOutcome::AlreadyExists) => {
-                        log::warn!(
-                            "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
-                            attempt + 1
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        log::error!(
-                            "Failed to create EC entry for id '{}' after generation: {err:?}",
-                            log_id(&ec_id),
-                        );
-                        return Err(err.change_context(TrustedServerError::EdgeCookie {
-                            message: "Failed to persist generated EC ID to KV identity graph"
-                                .to_string(),
-                        }));
-                    }
-                }
-            }
-
-            self.ec_value = Some(ec_id);
-            self.ec_generated = true;
-            self.pull_sync_marker.invalidate_for_replaced_ec();
-            return Ok(());
+        if kv.is_some() {
+            // The row is created by the navigation's single page-load write in
+            // finalize; a collision there leaves this EC unissued.
+            self.pending_entry = Some(Box::new(entry));
+            self.kv_snapshot = EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            };
         }
-
-        Err(Report::new(TrustedServerError::EdgeCookie {
-            message: format!(
-                "Failed to allocate a unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
-            ),
-        }))
+        self.ec_value = Some(ec_id);
+        self.ec_generated = true;
+        self.pull_sync_marker.invalidate_for_replaced_ec();
+        Ok(())
     }
 
     /// Returns the EC ID value, if present (either from request or generated).
@@ -607,6 +626,60 @@ impl EcContext {
         self.pull_sync_marker = state;
     }
 
+    /// Stores the navigation permit issued by the router.
+    pub fn set_navigation_permit(&mut self, permit: NavigationPermit) {
+        self.navigation_permit = PermitSlot(Some(permit));
+    }
+
+    /// Whether this request still holds its page-load write permit.
+    pub(crate) fn has_navigation_permit(&self) -> bool {
+        self.navigation_permit.0.is_some()
+    }
+
+    /// Takes the navigation permit; returns `None` after the first call.
+    pub(crate) fn take_navigation_permit(&mut self) -> Option<NavigationPermit> {
+        self.navigation_permit.0.take()
+    }
+
+    /// Stores the after-response permit confirmed with the navigation permit.
+    pub(crate) fn set_after_response_permit(&mut self, permit: AfterResponseWrite) {
+        self.after_response_permit = AfterResponsePermitSlot(Some(permit));
+    }
+
+    /// Takes the after-response permit; returns `None` when finalize did not
+    /// confirm a navigation, or after the first call.
+    pub fn take_after_response_permit(&mut self) -> Option<AfterResponseWrite> {
+        self.after_response_permit.0.take()
+    }
+
+    /// Takes the navigation permit, for adapter tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn take_navigation_permit_for_test(&mut self) -> Option<NavigationPermit> {
+        self.take_navigation_permit()
+    }
+
+    /// Stores validated provider lookup results for finalize.
+    pub fn set_lookup_results(&mut self, results: LookupResults) {
+        self.lookup_results = results;
+    }
+
+    /// Provider lookup results collected for this navigation.
+    pub(crate) fn lookup_results(&self) -> &LookupResults {
+        &self.lookup_results
+    }
+
+    /// Takes the row built by [`Self::generate_if_needed`].
+    /// The row this navigation creates for the EC it minted, until finalize
+    /// takes it.
+    #[must_use]
+    pub fn pending_entry(&self) -> Option<&KvEntry> {
+        self.pending_entry.as_deref()
+    }
+
+    pub(crate) fn take_pending_entry(&mut self) -> Option<KvEntry> {
+        self.pending_entry.take().map(|entry| *entry)
+    }
+
     /// Replaces an orphaned active ID after its new backing row is persisted.
     pub(crate) fn replace_with_generated(&mut self, ec_id: String, snapshot: EcKvSnapshot) {
         self.ec_value = Some(ec_id);
@@ -665,6 +738,10 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
         }
     }
 
@@ -690,6 +767,10 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
         }
     }
 
@@ -718,6 +799,10 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
         }
     }
 }
@@ -728,7 +813,8 @@ impl EcContext {
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
 /// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
 /// available.
-pub(crate) fn current_timestamp() -> u64 {
+#[must_use]
+pub fn current_timestamp() -> u64 {
     checked_current_timestamp().unwrap_or(0)
 }
 
@@ -766,68 +852,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
-    use crate::ec::kv_backend::{
-        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
-    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
-
-    /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
-    /// precondition failure, forcing generation to retry with a fresh suffix.
-    struct AddCollidingEcKv {
-        inner: InMemoryEcKv,
-        collisions_remaining: std::sync::Mutex<u32>,
-    }
-
-    impl AddCollidingEcKv {
-        fn new(collisions: u32) -> Self {
-            Self {
-                inner: InMemoryEcKv::new("add-colliding-store"),
-                collisions_remaining: std::sync::Mutex::new(collisions),
-            }
-        }
-    }
-
-    impl EcKvStore for AddCollidingEcKv {
-        fn store_name(&self) -> &str {
-            self.inner.store_name()
-        }
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key)
-        }
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
-        }
-
-        fn insert(
-            &self,
-            key: &str,
-            write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            if matches!(write.mode, EcKvWriteMode::Add) {
-                let mut remaining = self
-                    .collisions_remaining
-                    .lock()
-                    .expect("should lock collision counter");
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Ok(EcKvWriteOutcome::PreconditionFailed);
-                }
-            }
-            self.inner.insert(key, write)
-        }
-        fn list_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
-        }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
-        }
-    }
 
     fn granting_consent() -> ConsentContext {
         ConsentContext {
@@ -838,37 +864,48 @@ mod tests {
     }
 
     #[test]
-    fn generate_if_needed_retries_id_collision_then_persists() {
+    fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
         let settings = create_test_settings();
-        let mut ec =
-            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
-        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            None,
+            granting_consent(),
+            Some("192.0.2.10".to_owned()),
+        );
+        let graph = KvIdentityGraph::in_memory("gen");
 
-        ec.generate_if_needed(&settings, Some(&graph))
-            .expect("should generate after bounded collisions");
+        ec_context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should mint EC");
 
-        assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
-        assert!(ec.ec_generated(), "should mark the EC as generated");
+        let ec_id = ec_context.ec_value().expect("should set EC").to_owned();
         assert!(
-            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
-            "generation should seed a present snapshot"
+            graph.get(&ec_id).expect("should read").is_none(),
+            "should not write during generation"
+        );
+        assert!(
+            ec_context.take_pending_entry().is_some(),
+            "should hold the new row for finalize"
+        );
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. }),
+            "should record missing row"
         );
     }
 
     #[test]
-    fn generate_if_needed_errors_after_collision_exhaustion() {
-        let settings = create_test_settings();
-        let mut ec =
-            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()));
-        // Collide on every attempt so the bounded retry is exhausted.
-        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
+    fn cloned_context_never_carries_the_navigation_permit() {
+        let mut ec_context = EcContext::default();
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
 
-        let result = ec.generate_if_needed(&settings, Some(&graph));
+        let mut clone = ec_context.clone();
 
-        assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
-            ec.ec_value().is_none() && !ec.ec_generated(),
-            "must not activate an EC ID it could not persist"
+            clone.take_navigation_permit().is_none(),
+            "should drop permit on clone"
+        );
+        assert!(
+            ec_context.take_navigation_permit().is_some(),
+            "should keep permit on original"
         );
     }
 

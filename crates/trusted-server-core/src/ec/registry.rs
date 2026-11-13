@@ -5,12 +5,14 @@
 //! lookup by source domain and API key hash.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU16;
 
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
-use crate::settings::EcPartner;
+use crate::settings::{Ec, EcPartner};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
@@ -47,6 +49,24 @@ pub struct PartnerConfig {
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
+    /// Whether an enabled identity provider claims this source. Browser
+    /// ingest skips it and batch sync rejects it.
+    pub provider_owned: bool,
+    /// TCF vendor IDs of the configured providers, enabled or disabled, that
+    /// claim this source. Its UIDs leave the server only while every one of
+    /// these vendors has consent.
+    pub owner_tcf_vendor_ids: Vec<NonZeroU16>,
+}
+
+impl PartnerConfig {
+    /// Whether the effective TCF consent denies any vendor that gates this
+    /// source.
+    #[must_use]
+    pub fn owner_vendor_consent_denied(&self, consent: &ConsentContext) -> bool {
+        self.owner_tcf_vendor_ids
+            .iter()
+            .any(|vendor| tcf_vendor_consent_denied(consent, *vendor))
+    }
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -205,6 +225,59 @@ impl PartnerRegistry {
         })
     }
 
+    /// Builds the registry from `[ec]` settings without provider ownership.
+    ///
+    /// For adapters with no identity-provider implementations, which refuse
+    /// to start with an enabled provider: no source is provider-owned, so
+    /// browser-supplied IDs are ingested for every source. Use
+    /// [`Self::from_ec_with_kinds`] where kinds are known.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`].
+    pub fn from_ec(ec: &Ec) -> Result<Self, Report<TrustedServerError>> {
+        Self::from_config(&ec.partners)
+    }
+
+    /// Builds the registry from `[ec]` settings and marks every source claimed
+    /// by an enabled identity provider whose kind is registered as
+    /// provider-owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_config`], and
+    /// [`TrustedServerError::Configuration`] for an enabled provider whose
+    /// kind is not registered: it could never run, and its sources would
+    /// silently go back to browser ingest.
+    pub fn from_ec_with_kinds(
+        ec: &Ec,
+        is_registered_kind: impl Fn(&str) -> bool,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut registry = Self::from_config(&ec.partners)?;
+        for provider in ec.identity_providers.iter().filter(|p| p.enabled) {
+            if !is_registered_kind(provider.kind()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "identity provider `{}` has kind `{}`, which this build does not include",
+                        provider.id,
+                        provider.kind()
+                    ),
+                }));
+            }
+            for source in &provider.sources {
+                registry.mark_provider_owned(source, provider.tcf_vendor_id);
+            }
+        }
+        // A disabled provider's stored UIDs stay behind its vendor consent,
+        // though its sources go back to browser ingest.
+        for provider in ec.identity_providers.iter().filter(|p| !p.enabled) {
+            for source in &provider.sources {
+                registry.keep_vendor_gate(source, provider.tcf_vendor_id);
+            }
+        }
+        Ok(registry)
+    }
+
     /// Returns an empty registry (no partners configured).
     #[must_use]
     pub fn empty() -> Self {
@@ -234,12 +307,53 @@ impl PartnerRegistry {
         self.get(domain)
     }
 
-    /// Returns all partners with `pull_sync_enabled = true`.
+    /// Marks `source` as owned by an enabled identity provider, recording the
+    /// provider's TCF vendor ID, if any.
+    ///
+    /// Returns `false` when the source has no `[[ec.partners]]` entry.
+    pub fn mark_provider_owned(&mut self, source: &str, tcf_vendor_id: Option<NonZeroU16>) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.provider_owned = true;
+                partner.owner_tcf_vendor_ids.extend(tcf_vendor_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adds a disabled provider's TCF vendor ID to the gate for `source`, even
+    /// when an enabled provider now owns it, so egress still checks that
+    /// vendor's consent for the UIDs the disabled provider stored.
+    fn keep_vendor_gate(&mut self, source: &str, tcf_vendor_id: Option<NonZeroU16>) {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return;
+        };
+        if let Some(partner) = self.by_source_domain.get_mut(&normalized) {
+            partner.owner_tcf_vendor_ids.extend(tcf_vendor_id);
+        }
+    }
+
+    /// Whether an enabled identity provider owns `source`.
+    #[must_use]
+    pub fn is_provider_owned(&self, source: &str) -> bool {
+        self.find_by_source_domain(source)
+            .is_some_and(|partner| partner.provider_owned)
+    }
+
+    /// Returns all partners with `pull_sync_enabled = true` whose source no
+    /// identity provider owns.
+    ///
+    /// A provider writes full-fidelity records for the sources it owns, so a
+    /// pull-sync write there would overwrite them with a single UID.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
         self.by_source_domain
             .values()
-            .filter(|p| p.pull_sync_enabled)
+            .filter(|p| p.pull_sync_enabled && !p.provider_owned)
             .collect()
     }
 
@@ -305,6 +419,8 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        provider_owned: false,
+        owner_tcf_vendor_ids: Vec::new(),
     }
 }
 
@@ -433,6 +549,133 @@ mod tests {
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: None,
         }
+    }
+
+    #[test]
+    fn from_ec_marks_enabled_provider_sources_only() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            make_partner("ids.example.com", &valid_api_token("ids-partner")),
+            make_partner("other.example.com", &valid_api_token("other-partner")),
+        ];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"k\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"b\"\nkind = \"k\"\nenabled = false\ntcf_vendor_id = 42\nendpoint = \"https://ids.example.com/\"\nsources = [\"other.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+
+        assert!(
+            registry.is_provider_owned("ids.example.com"),
+            "should mark enabled provider source"
+        );
+        assert!(
+            !registry.is_provider_owned("other.example.com"),
+            "should not mark disabled provider source"
+        );
+        assert_eq!(
+            registry
+                .get("other.example.com")
+                .map(|partner| partner.owner_tcf_vendor_ids.clone()),
+            Some(vec![NonZeroU16::new(42).expect("should be non-zero")]),
+            "should keep the disabled provider's vendor consent gate"
+        );
+    }
+
+    #[test]
+    fn from_ec_with_kinds_keeps_a_disabled_providers_gate_on_a_reassigned_source() {
+        // Arrange: provider `old` (vendor 42) is disabled and its source is now
+        // claimed by enabled provider `new` (vendor 7, consented).
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"new\"\nkind = \"k\"\ntcf_vendor_id = 7\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+            toml::from_str(
+                "id = \"old\"\nkind = \"k\"\nenabled = false\ntcf_vendor_id = 42\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse disabled provider"),
+        ];
+        let consent = ConsentContext {
+            gdpr_applies: true,
+            tcf: Some(crate::consent::types::TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: vec![true; 24],
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: vec![7],
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        };
+
+        // Act
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let partner = registry
+            .get("ids.example.com")
+            .expect("should find the partner");
+
+        // Assert
+        assert!(
+            partner.provider_owned,
+            "should stay owned by the enabled provider"
+        );
+        assert!(
+            partner.owner_vendor_consent_denied(&consent),
+            "should withhold the source while the disabled provider's vendor lacks consent"
+        );
+    }
+
+    #[test]
+    fn from_ec_with_kinds_rejects_an_unregistered_kind() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"a\"\nkind = \"missing\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse enabled provider"),
+        ];
+
+        let error = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect_err("should reject an enabled provider with an unregistered kind");
+        let plain = PartnerRegistry::from_ec(&ec).expect("should build registry");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should report a configuration error"
+        );
+        assert!(
+            !plain.is_provider_owned("ids.example.com"),
+            "should not claim sources without provider implementations"
+        );
     }
 
     #[test]
@@ -567,6 +810,25 @@ mod tests {
         )];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject invalid source domain");
+    }
+
+    #[test]
+    fn pull_enabled_partners_excludes_provider_owned_sources() {
+        let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
+        pull_partner.api_token = None;
+        pull_partner.pull_sync_enabled = true;
+        pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
+        pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
+        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+        let mut registry =
+            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
+
+        registry.mark_provider_owned("pull.example.com", None);
+
+        assert!(
+            registry.pull_enabled_partners().is_empty(),
+            "should not pull sources an identity provider owns"
+        );
     }
 
     #[test]

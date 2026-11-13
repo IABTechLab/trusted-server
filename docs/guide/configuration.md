@@ -60,6 +60,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.passphrase`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
+- `ec.identity_providers[*].secrets.token`, when a provider needs an API token
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
 - `integrations.datadome.server_side_key_secret_name`, when protection is enabled
@@ -858,14 +859,17 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field                               | Type           | Required | Description                                                             |
+| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
+| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `partners`                          | Array          | No       | Static partner registry entries                                         |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                  |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                  |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -897,6 +901,126 @@ bidstream_enabled = true
 TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
+
+### Identity providers
+
+`[[ec.identity_providers]]` entries look up a visitor's IDs from a provider's
+server on publisher page navigations. Lookups start before the origin fetch,
+share the `identity_budget_ms` budget, and are collected before the response is
+finalized. Results go into the navigation's single EC row write. A lookup that
+times out or fails leaves the row unchanged.
+
+Lookups run only when consent allows EID persistence, and, when
+`tcf_vendor_id` is set and TCF applies to the request, only with TCF vendor
+consent for that vendor. They run for an EC whose row already exists, with one
+exception: on the navigation that mints an EC, the page-phase lookups of
+providers whose requests do not carry the EC ID (each provider kind declares
+this) run against the row the navigation creates, whose consent gates them, and
+their results go into the write that creates the row. If that create fails or
+loses to another writer, their results are dropped. Providers that send the EC
+ID, and `after_response` lookups, wait for the next navigation. The page's own
+auction starts before lookups are collected, so it never carries provider IDs
+for a newly minted EC; they reach auctions from the next page load. The same vendor consent gates
+egress of the provider's `sources`, even while the provider is disabled: while
+it is withheld, every ID for those sources, whether a provider stored it or the
+browser sent it in `ts-eids` or the `/auction` body, is left out of auction
+`user.eids`, `x-ts-eids` and `/_ts/api/v1/identify`. Removing the provider's
+entry removes that gate, so keep a provider with `enabled = false` while its
+stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
+the EID-persistence purposes alone, so set it for any provider that has a TCF
+vendor ID.
+
+Identity providers run only on Fastly. This release registers no provider kind,
+so `ts config validate`, `push` and `diff` reject an enabled provider; keep
+`enabled = false` until a kind ships. The Axum, Cloudflare and Spin adapters
+refuse to start when an enabled provider is configured. On Fastly, an enabled
+provider whose `kind` this build does not include, or whose `settings` its kind
+rejects, also fails startup. Lookups always verify the provider's TLS
+certificate, whatever `proxy.certificate_check` says.
+
+A provider owns its `sources`: its results replace whatever the row holds for
+them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
+(`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
+provider cleared on an opt-out is not refilled from the browser.
+
+When a provider reports an opt-out, its sources are cleared and the row
+remembers the opt-out for 30 days. The provider is not called for that EC
+again until the 30 days pass.
+
+| Field                 | Type    | Required | Description                                                             |
+| --------------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `id`                  | String  | Yes      | Stable provider ID used in logs, metrics and KV ownership               |
+| `kind`                | String  | Yes      | Provider implementation; must be one this build includes                |
+| `enabled`             | Boolean | No       | Whether the provider runs (default `true`)                              |
+| `endpoint`            | String  | Yes      | HTTPS lookup URL; its host must be in `allowed_domains`                 |
+| `allowed_domains`     | Array   | Yes      | Hosts the provider may call                                             |
+| `sources`             | Array   | Yes      | Source domains the provider owns; each needs an `[[ec.partners]]` entry |
+| `tcf_vendor_id`       | Integer | No       | TCF vendor ID that must have vendor consent                             |
+| `collect`             | String  | No       | `"page"` (default) or `"after_response"`; see below                     |
+| `rate_limit_per_hour` | Integer | No       | Most lookups per EC hash per hour; unset means unlimited. See below     |
+| `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token            |
+| `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                 |
+
+**Example**:
+
+```toml
+[ec]
+identity_budget_ms = 200
+
+[[ec.partners]]
+name = "Example IDs"
+source_domain = "ids.example.com"
+
+[[ec.identity_providers]]
+id = "example-provider"
+kind = "example-kind"
+# This release registers no provider kind; an enabled provider fails deploy
+# validation and startup.
+enabled = false
+endpoint = "https://ids.example.com/v1/lookup"
+allowed_domains = ["ids.example.com"]
+sources = ["ids.example.com"]
+
+[ec.identity_providers.secrets]
+token = "example_provider_token"
+```
+
+`collect = "after_response"` lookups run after the response is sent, within
+`identity_after_response_budget_ms`, and only when `ec_store` is configured,
+the response is not a redirect, the navigation's own write succeeded (or had
+nothing to change), the row is live, and the EC was not minted on this
+navigation; a row recovered from an orphaned cookie gets a newly minted EC, so
+its lookups wait for the next navigation. They also run behind an error
+response, including a `502` that Trusted Server generates when the origin is
+unreachable. Their results reach the row in a follow-up write. Providers run
+only on Fastly.
+
+::: warning Rate limit granularity
+`rate_limit_per_hour` is counted per EC hash, which is derived from the client
+IP, so ECs behind one IP (a NAT or carrier gateway) share the budget. On
+Fastly it is enforced as a per-minute budget rounded up to at least one lookup
+per minute, so any value below 60 behaves like 60 per hour. Values of 60 and
+above are enforced as `ceil(value / 60)` per minute.
+:::
+
+**Validation**: configuration validation fails when an enabled provider's
+`endpoint` is not HTTPS or its host is not in `allowed_domains`, when it claims
+no sources, when a source has no `[[ec.partners]]` entry, when two enabled
+providers claim the same source, or when its `id` is empty or shared with
+another enabled provider. `identity_budget_ms` must be 1–1000 and
+`identity_after_response_budget_ms` 1–5000. Deploy validation also rejects an
+empty `secrets.token` key name, and, because this release registers no
+provider kind, any enabled provider. A disabled provider's `secrets.token` is
+not resolved.
+
+::: warning Rollback
+A config blob that configures identity providers, or sets either identity
+budget to a non-default value, cannot be loaded by a build from before
+identity providers. Roll the runtime back only with a blob that leaves them
+out. Rows holding a provider UID over 512 bytes also fail to load on such a
+build, and an older writer drops a row's `eids` and provider opt-outs when it
+rewrites the row.
+:::
 
 ### Field Details
 
@@ -2560,11 +2684,11 @@ push as proof that a Cloudflare or Spin multi-provider plan can start.
 ### Deadline behavior
 
 Auction response collection waits only until an absolute deadline measured from
-dispatch, including headers and complete response bodies. One nonblocking snapshot
+dispatch, including headers and complete response bodies. One final snapshot
 retains complete available responses after a slow origin; unfinished providers
 become timeouts and mediation cannot start with an exhausted budget. Backend
-timeout rounding does not extend network waiting.
-Provider bids that are already complete at the final nonblocking snapshot remain
+timeout rounding does not extend network waiting. On Fastly the snapshot may wait up to 1 ms per partially received body so the host can surface bytes that already arrived, and reads on into the body of a response whose headers arrived by the cutoff instead of abandoning it.
+Provider bids that are already complete at the final snapshot remain
 eligible even after `tmax`; mediation starts only with remaining budget and
 rejects responses collected after its cutoff.
 

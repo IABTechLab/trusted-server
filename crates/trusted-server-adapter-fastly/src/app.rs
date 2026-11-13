@@ -86,6 +86,8 @@
 //! [`load_settings_from_config_store`]; if settings loading itself fails, they
 //! are returned without geo or TS headers.
 
+use std::cell::RefCell;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
@@ -97,7 +99,7 @@ use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -111,11 +113,18 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::coordinator::transport::PlatformLookupTransport;
+use trusted_server_core::ec::coordinator::{
+    IdentityCoordinator as _, LookupContext, PendingLookups, ProviderCoordinator,
+};
 use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::page_load::NavigationPermit;
+use trusted_server_core::ec::provider::ClientSignals;
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::{EcContext, EidSyncSource};
+use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -123,7 +132,8 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, PlatformPendingRequest,
+    RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -142,6 +152,9 @@ use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
+use trusted_server_identity_providers::{
+    build_after_response_coordinator, build_coordinator_with, partner_registry,
+};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -190,14 +203,28 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Partner registry, built with the state.
+    pub(crate) partner_registry: Arc<PartnerRegistry>,
+    /// Coordinator for providers collected before the response, if any.
+    pub(crate) page_identity: Option<Arc<ProviderCoordinator>>,
+    /// Coordinator for providers collected after the response, if any.
+    pub(crate) after_response_identity: Option<Arc<ProviderCoordinator>>,
+}
+
+impl AppState {
+    /// Returns the partner registry.
+    pub(crate) fn partner_registry(&self) -> Arc<PartnerRegistry> {
+        Arc::clone(&self.partner_registry)
+    }
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when settings, the auction orchestrator, the integration
+/// registry, the partner registry or an enabled identity provider fail to
+/// initialise.
 pub(crate) fn build_state(
     stores: &RuntimeStoreConfig,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -229,12 +256,30 @@ pub(crate) fn build_state_from_settings(
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
+    // A provider that cannot run must stop startup: skipping it would quietly
+    // hand its sources back to browser ingest.
+    let partner_registry = Arc::new(partner_registry(&settings.ec)?);
+    let page_identity = build_coordinator_with(&settings, Arc::clone(&partner_registry))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    let after_response_identity =
+        build_after_response_coordinator(&settings, Arc::clone(&partner_registry))
+            .change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })?
+            .map(Arc::new);
+
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        partner_registry,
+        page_identity,
+        after_response_identity,
     }))
 }
 
@@ -332,6 +377,138 @@ pub(crate) struct EcFinalizeState {
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client.
     pub(crate) services: RuntimeServices,
+}
+
+/// Identity lookups dispatched for this navigation, collected before finalize.
+pub(crate) struct IdentityLookups {
+    pub(crate) coordinator: Arc<ProviderCoordinator>,
+    pub(crate) pending: PendingLookups<PlatformPendingRequest>,
+}
+
+/// What a navigation's after-response identity lookups need once the response
+/// has been sent.
+///
+/// The router owns the request, so the request signals the providers read are
+/// copied here. The lookups are dispatched only after the response, so they
+/// never delay the page.
+pub(crate) struct AfterResponseLookups {
+    pub(crate) ec_id: String,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) user_agent: Option<String>,
+}
+
+/// Identity work a navigation hands to the entry point.
+///
+/// In-flight platform requests are not `Send`, so they cannot ride in
+/// response extensions with [`EcFinalizeState`]. They travel through one
+/// request-local slot instead: the entry point clears it before routing and
+/// takes it after the router returns.
+#[derive(Default)]
+pub(crate) struct NavigationLookups {
+    /// Page-phase lookups, collected before EC finalization.
+    pub(crate) page: Option<IdentityLookups>,
+    /// After-response lookups, dispatched once the response has been sent.
+    pub(crate) after_response: Option<AfterResponseLookups>,
+}
+
+thread_local! {
+    static NAVIGATION_LOOKUPS: RefCell<NavigationLookups> = RefCell::new(NavigationLookups::default());
+}
+
+/// Takes the identity work stored for the current request.
+///
+/// The entry point calls this before routing (discarding anything a prior
+/// request left behind) and after the router returns.
+pub(crate) fn take_navigation_lookups() -> NavigationLookups {
+    NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Request signals lent to identity providers.
+struct ProviderRequestSignals<'a> {
+    client_ip: Option<IpAddr>,
+    user_agent: Option<&'a str>,
+}
+
+impl<'a> ProviderRequestSignals<'a> {
+    fn read(req: &'a Request, ec: &EcRequestState) -> Self {
+        Self {
+            // The trusted raw address: `EcContext::client_ip` is the
+            // normalized EC-hash input, which drops IPv6 separators.
+            client_ip: ec.services.client_info().client_ip,
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+        }
+    }
+}
+
+/// Captures the request signals for after-response identity lookups on a
+/// permitted publisher navigation.
+///
+/// Returns `None` when no after-response provider is enabled, the request has
+/// no EC, or the identity graph is unavailable.
+fn prepare_after_response_lookups(
+    state: &AppState,
+    req: &Request,
+    ec: &EcRequestState,
+) -> Option<AfterResponseLookups> {
+    state.after_response_identity.as_ref()?;
+    ec.kv_graph.as_ref()?;
+    let ec_id = ec.ec_context.ec_value()?.to_owned();
+    let signals = ProviderRequestSignals::read(req, ec);
+    Some(AfterResponseLookups {
+        ec_id,
+        client_ip: signals.client_ip,
+        user_agent: signals.user_agent.map(str::to_owned),
+    })
+}
+
+/// Starts identity-provider lookups for a permitted publisher navigation.
+///
+/// Returns `None` when no provider is enabled, the request has no EC, or the
+/// identity graph is unavailable. For an EC minted on this request only
+/// providers that do not send the EC ID are dispatched, against the row this
+/// navigation will create.
+async fn dispatch_identity_lookups(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+    ec: &mut EcRequestState,
+) -> Option<IdentityLookups> {
+    let coordinator = Arc::clone(state.page_identity.as_ref()?);
+    let graph = ec.kv_graph.as_ref()?;
+    let ec_id = ec.ec_context.ec_value()?.to_owned();
+    if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
+        let snapshot = graph.load_snapshot(&ec_id);
+        ec.ec_context.set_kv_snapshot(snapshot);
+    }
+    let transport = PlatformLookupTransport::new(services);
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    let signals = ProviderRequestSignals::read(req, ec);
+    let now = trusted_server_core::ec::current_timestamp();
+    let pending = coordinator
+        .dispatch(
+            &transport,
+            &LookupContext {
+                ec_id: &ec_id,
+                snapshot: ec.ec_context.kv_snapshot(),
+                minted_entry: ec.ec_context.pending_entry(),
+                consent: ec.ec_context.consent(),
+                client: ClientSignals {
+                    ip: signals.client_ip,
+                    user_agent: signals.user_agent,
+                },
+                publisher_domain: &state.settings.publisher.domain,
+                rate_limiter: &limiter,
+                now: UnixSeconds::new(now),
+            },
+        )
+        .await;
+    Some(IdentityLookups {
+        coordinator,
+        pending,
+    })
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -579,19 +756,19 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
-                NamedRouteHandler::AdminEcLookup => {
-                    // Deliberately do not use an EC request-state graph: that
-                    // copy is bot-gated, while operators use curl for this
-                    // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
-                }
-                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
-                _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
+        let registry = state.partner_registry();
+        let response = match handler {
+            NamedRouteHandler::AdminEcLookup => {
+                // Deliberately do not use an EC request-state graph: that
+                // copy is bot-gated, while operators use curl for this
+                // authenticated diagnostic.
+                let kv = crate::maybe_identity_graph(&state.settings);
+                handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+            }
+            NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
+            _ => unreachable!("admin diagnostics should use early dispatch"),
+        }
+        .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
 
@@ -660,7 +837,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                let partner_registry = state.partner_registry();
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -674,11 +851,11 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = state.partner_registry();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -698,11 +875,11 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = state.partner_registry();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(&*partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -745,7 +922,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+        let partner_registry = state.partner_registry();
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -820,8 +997,6 @@ async fn dispatch_fallback(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
-                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })
@@ -848,16 +1023,43 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_navigation = is_navigation_request(&req);
+        let mut has_permit = false;
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+            // The page-load write permit uses the stricter Fetch Metadata test
+            // (spec §3.1); requests without it never write KV.
+            if let Some(permit) = NavigationPermit::classify(&req) {
+                ec.ec_context.set_navigation_permit(permit);
+                has_permit = true;
+            }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        // A new EC is minted only when this request may also write its row,
+        // so a client without Fetch Metadata never receives a throwaway EC.
         if is_publisher_navigation
+            && has_permit
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
         {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
+        }
+
+        // Identity lookups start before the origin fetch so they overlap it;
+        // the entry point collects them before EC finalization.
+        if is_publisher_navigation
+            && has_permit
+            && let Some(lookups) = dispatch_identity_lookups(state, services, &req, &mut ec).await
+        {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        }
+        // After-response providers only capture request signals here; they
+        // are built and dispatched once the response has been sent.
+        if is_publisher_navigation
+            && has_permit
+            && let Some(lookups) = prepare_after_response_lookups(state, &req, &ec)
+        {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
         }
 
         // Run the server-side auction with the configured creative-
@@ -867,44 +1069,40 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match PartnerRegistry::from_config(&state.settings.ec.partners) {
-            Ok(partner_registry) => {
-                let auction = AuctionDispatch {
-                    integration_registry: &state.registry,
-                    orchestrator: &state.orchestrator,
-                    slots,
-                    registry: Some(&partner_registry),
-                };
-                match handle_publisher_request(
-                    &state.settings,
-                    services,
-                    ec.kv_graph.as_ref(),
-                    &mut ec.ec_context,
-                    auction,
-                    req,
-                    EdgeCacheHeader::SurrogateControl,
+        let partner_registry = state.partner_registry();
+        let auction = AuctionDispatch {
+            integration_registry: &state.registry,
+            orchestrator: &state.orchestrator,
+            slots,
+            registry: Some(&*partner_registry),
+        };
+        match handle_publisher_request(
+            &state.settings,
+            services,
+            ec.kv_graph.as_ref(),
+            &mut ec.ec_context,
+            auction,
+            req,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await
+        {
+            Ok(pub_response) => {
+                // Origin start succeeded on the sole publisher-page
+                // path. Authorize orphan recovery only for real-browser
+                // document navigations so named routes, integration
+                // proxies, and filter short circuits cannot rotate an
+                // identity.
+                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                publisher_response_into_streaming_response(
+                    pub_response,
+                    &method,
+                    Arc::clone(&state.settings),
+                    state.registry.as_ref(),
+                    Arc::clone(&state.orchestrator),
+                    services.clone(),
                 )
                 .await
-                {
-                    Ok(pub_response) => {
-                        // Origin start succeeded on the sole publisher-page
-                        // path. Authorize orphan recovery only for real-browser
-                        // document navigations so named routes, integration
-                        // proxies, and filter short circuits cannot rotate an
-                        // identity.
-                        ec.ec_context.set_recovery_eligible(is_publisher_navigation);
-                        publisher_response_into_streaming_response(
-                            pub_response,
-                            &method,
-                            Arc::clone(&state.settings),
-                            state.registry.as_ref(),
-                            Arc::clone(&state.orchestrator),
-                            services.clone(),
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                }
             }
             Err(e) => Err(e),
         }
@@ -1421,8 +1619,18 @@ mod tests {
     use error_stack::Report;
     use futures::StreamExt as _;
     use futures::executor::block_on;
+    use std::borrow::Cow;
+    use std::num::NonZeroUsize;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
     use trusted_server_core::ec::device::DeviceSignals;
+    use trusted_server_core::ec::eid_types::SourceDomain;
+    use trusted_server_core::ec::provider::{
+        EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+        ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
+        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+    };
+    use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
@@ -1435,7 +1643,7 @@ mod tests {
         RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
-    use trusted_server_core::settings::Settings;
+    use trusted_server_core::settings::{EcPartner, IdentityProviderConfig, Settings};
     use trusted_server_core::test_support::nextjs_auction;
 
     #[test]
@@ -1615,6 +1823,9 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            partner_registry: Arc::new(PartnerRegistry::empty()),
+            page_identity: None,
+            after_response_identity: None,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2590,6 +2801,651 @@ mod tests {
                 "static, analytics, and integration requests must not persist EID cookies"
             );
         }
+    }
+
+    fn navigation_request(path: &str) -> Request {
+        let mut request = browser_request(Method::GET, path, "document");
+        request
+            .headers_mut()
+            .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        request
+    }
+
+    fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
+        response
+            .extensions_mut()
+            .remove::<super::EcFinalizeState>()
+            .expect("should attach finalize state")
+    }
+
+    #[test]
+    fn publisher_navigation_receives_navigation_permit() {
+        let router = test_router();
+
+        let mut response = route(&router, navigation_request("/article"));
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_some(),
+            "should issue a permit"
+        );
+    }
+
+    fn consented_navigation(mut request: Request) -> Request {
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out lets the navigation mint an EC.
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..ClientInfo::default()
+        });
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_static("us_privacy=1YNN"));
+        request
+    }
+
+    #[test]
+    fn enabled_provider_with_unregistered_kind_fails_startup() {
+        let mut settings = test_settings();
+        settings.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "Example IDs",
+                "source_domain": "ids.example.com"
+            }))
+            .expect("should parse partner"),
+        );
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse provider"),
+        );
+
+        let Err(error) = build_state_from_settings(settings) else {
+            panic!("should refuse to start with a provider this build cannot run");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("example-kind"),
+            "should name the provider and its unregistered kind: {message}"
+        );
+    }
+
+    #[test]
+    fn navigation_without_fetch_metadata_mints_no_ec() {
+        let router = test_router();
+        let mut request = consented_navigation(empty_request(Method::GET, "/article"));
+        request
+            .headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let mut response = route(&router, request);
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_none(),
+            "should not mint an EC that no row can back"
+        );
+    }
+
+    #[test]
+    fn navigation_with_fetch_metadata_mints_an_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            consented_navigation(navigation_request("/article")),
+        );
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_some(),
+            "should mint an EC on a page-load navigation"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_without_providers_dispatches_nothing() {
+        let router = test_router();
+
+        let mut response = route(&router, navigation_request("/article"));
+
+        let _state = take_finalize_state(&mut response);
+        assert!(
+            super::take_navigation_lookups().page.is_none(),
+            "should dispatch no identity lookups without enabled providers"
+        );
+    }
+
+    /// Answers every lookup with `p-1` and counts the lookups sent.
+    #[derive(Default)]
+    struct LookupHttpClient(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for LookupHttpClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PlatformPendingRequest::new(()).with_backend_name(request.backend_name))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select_until(
+            &self,
+            mut pending_requests: Vec<PlatformPendingRequest>,
+            _deadline: web_time::Instant,
+        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+            let Some(ready) = pending_requests.pop() else {
+                return Ok(None);
+            };
+            let backend_name = ready
+                .backend_name()
+                .expect("should carry the backend name")
+                .to_owned();
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .body(Body::from("p-1"))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(Some(PlatformSelectResult {
+                ready: Ok(PlatformResponse::new(response).with_backend_name(backend_name)),
+                remaining: pending_requests,
+                failed_backend_name: None,
+            }))
+        }
+    }
+
+    /// Looks up `ids.example.com` and returns the response body as its UID.
+    /// The flag is whether its request carries the EC ID.
+    struct EchoProvider(bool, ProviderCapabilities);
+
+    impl IdentityProvider for EchoProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            &self.1
+        }
+
+        fn sends_ec_id(&self) -> bool {
+            self.0
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Ok(ProviderRequest {
+                method: Method::GET,
+                url: url::Url::parse("https://ids.example.com/lookup").expect("should parse"),
+                headers: edgezero_core::http::HeaderMap::new(),
+                body: Bytes::new(),
+                context: None,
+            })
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            let id = std::str::from_utf8(response.body)
+                .map_err(|_| Report::new(ProviderError::InvalidResponse))?;
+            Ok(LookupOutcome::Found(vec![ProviderEid {
+                source: Cow::Borrowed("ids.example.com"),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed(id),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
+                }],
+            }]))
+        }
+    }
+
+    struct AfterResponseFixture {
+        state: Arc<AppState>,
+        sends: Arc<AtomicUsize>,
+        graph: trusted_server_core::ec::kv::KvIdentityGraph,
+    }
+
+    /// An app state whose after-response phase runs the echo provider.
+    fn after_response_fixture() -> AfterResponseFixture {
+        identity_fixture(true)
+    }
+
+    /// An app state that runs the echo provider in the page or the
+    /// after-response phase.
+    fn identity_fixture(after_response: bool) -> AfterResponseFixture {
+        identity_fixture_with(after_response, true)
+    }
+
+    fn identity_fixture_with(after_response: bool, sends_ec_id: bool) -> AfterResponseFixture {
+        let provider_config: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+        )
+        .expect("should parse provider config");
+        let partner: EcPartner = serde_json::from_value(serde_json::json!({
+            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true
+        }))
+        .expect("should build partner");
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.partners = vec![partner];
+        // This build registers no kind, so the app state is built without the
+        // provider and the test supplies its registry and coordinator.
+        let partners = {
+            let mut with_provider = settings.ec.clone();
+            with_provider.identity_providers = vec![provider_config.clone()];
+            Arc::new(
+                PartnerRegistry::from_ec_with_kinds(&with_provider, |_| true)
+                    .expect("should build registry"),
+            )
+        };
+        let provider: Box<dyn IdentityProvider> = Box::new(EchoProvider(
+            sends_ec_id,
+            ProviderCapabilities {
+                sources: Box::new([SourceCapability {
+                    source: SourceDomain::try_from("ids.example.com").expect("should parse source"),
+                    input: SourceInput::Anonymous,
+                }]),
+                shape: EidShape {
+                    max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                    max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                    eid_level_fields: EidLevelFields::Preserved,
+                },
+            },
+        ));
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(provider_config, provider)],
+            Arc::clone(&partners),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let graph = crate::require_identity_graph(&settings).expect("should open identity graph");
+        let coordinator = Some(Arc::new(coordinator));
+        let (page_identity, after_response_identity) = if after_response {
+            (None, coordinator)
+        } else {
+            (coordinator, None)
+        };
+        let state = Arc::new(AppState {
+            partner_registry: partners,
+            page_identity,
+            after_response_identity,
+            ..Arc::into_inner(app_state_for_settings(settings)).expect("should own the app state")
+        });
+        AfterResponseFixture {
+            state,
+            sends: Arc::default(),
+            graph,
+        }
+    }
+
+    fn seed_live_row(graph: &trusted_server_core::ec::kv::KvIdentityGraph, ec_id: &str) {
+        let mut entry = trusted_server_core::ec::kv_types::KvEntry::tombstone(
+            trusted_server_core::ec::current_timestamp(),
+        );
+        entry.consent.ok = true;
+        graph.create(ec_id, &entry).expect("should seed the row");
+    }
+
+    /// Routes one navigation, finalizes it and returns its after-response work.
+    fn finalized_navigation(
+        fixture: &AfterResponseFixture,
+        ec_id: Option<&str>,
+        client_ip: IpAddr,
+    ) -> (super::EcFinalizeState, Option<super::AfterResponseLookups>) {
+        let (ec_state, _, lookups) = finalized_navigation_with_page(fixture, ec_id, client_ip);
+        (ec_state, lookups)
+    }
+
+    /// Like [`finalized_navigation`], and also reports whether page-phase
+    /// lookups were dispatched.
+    fn finalized_navigation_with_page(
+        fixture: &AfterResponseFixture,
+        ec_id: Option<&str>,
+        client_ip: IpAddr,
+    ) -> (
+        super::EcFinalizeState,
+        bool,
+        Option<super::AfterResponseLookups>,
+    ) {
+        let router = TrustedServerApp::routes_for_state(&fixture.state);
+        let mut request = navigation_request("/article");
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        });
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out grants consent.
+        let cookie = ec_id.map_or_else(
+            || "us_privacy=1YNN".to_owned(),
+            |ec_id| format!("us_privacy=1YNN; ts-ec={ec_id}"),
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("should build cookie header"),
+        );
+        super::take_navigation_lookups();
+        let mut response = route(&router, request);
+        let navigation = super::take_navigation_lookups();
+        let lookups = navigation.after_response;
+        let page = navigation.page;
+        let page_dispatched = page.is_some();
+        let mut ec_state = take_finalize_state(&mut response);
+        ec_state.services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(LookupHttpClient(Arc::clone(&fixture.sends))))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        crate::apply_edgezero_ec_finalize(
+            &fixture.state.settings,
+            Some(&fixture.state),
+            &mut ec_state,
+            page,
+            &mut response,
+        )
+        .expect("should finalize");
+        (ec_state, page_dispatched, lookups)
+    }
+
+    #[test]
+    fn page_phase_lookups_reach_the_write_for_a_returning_ec() {
+        // Arrange
+        let fixture = identity_fixture(false);
+        let ec_id = format!("{}.pg0001", "c".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (_, dispatched, _) =
+            finalized_navigation_with_page(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        assert!(dispatched, "should dispatch page-phase lookups");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the page-load write"
+        );
+    }
+
+    #[test]
+    fn page_phase_lookups_skip_a_newly_minted_ec() {
+        // Arrange
+        let fixture = identity_fixture(false);
+
+        // Act
+        let (ec_state, _, _) =
+            finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        assert!(
+            ec_state.ec_context.ec_value().is_some(),
+            "should mint an EC"
+        );
+        let ec_id = ec_state.ec_context.ec_value().expect("should mint an EC");
+        assert_eq!(
+            owned_uid(&fixture, ec_id),
+            None,
+            "should not send a newly minted EC to a provider that sends the EC ID"
+        );
+    }
+
+    #[test]
+    fn page_phase_lookups_write_a_minted_ec_row_for_a_provider_without_the_ec_id() {
+        // Arrange
+        let fixture = identity_fixture_with(false, false);
+
+        // Act
+        let (ec_state, dispatched, _) =
+            finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        let ec_id = ec_state
+            .ec_context
+            .ec_value()
+            .expect("should mint an EC")
+            .to_owned();
+        assert!(dispatched, "should dispatch page-phase lookups");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the write that creates the row"
+        );
+    }
+
+    fn owned_uid(fixture: &AfterResponseFixture, ec_id: &str) -> Option<String> {
+        let snapshot = fixture.graph.load_snapshot(ec_id);
+        snapshot
+            .entry_for(ec_id)
+            .and_then(|entry| entry.ids.get("ids.example.com"))
+            .map(|record| record.uid.clone())
+    }
+
+    #[test]
+    fn after_response_lookups_capture_the_raw_ipv6_address() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0006", "7".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0xabcd, 1, 0, 0, 0, 0x1234,
+        ));
+
+        // Act
+        let (_, lookups) = finalized_navigation(&fixture, Some(&ec_id), ipv6);
+
+        // Assert
+        assert_eq!(
+            lookups.and_then(|lookups| lookups.client_ip),
+            Some(ipv6),
+            "should pass the raw IPv6 address to providers"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_write_to_a_live_row() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0001", "1".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        crate::run_after_response_lookups(&fixture.state, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(
+            fixture.sends.load(Ordering::SeqCst),
+            1,
+            "should send one lookup"
+        );
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID to the row"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_a_newly_minted_ec() {
+        // Arrange
+        let fixture = after_response_fixture();
+
+        // Act
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ec_id = ec_state
+            .ec_context
+            .ec_value()
+            .expect("should mint an EC")
+            .to_owned();
+        crate::run_after_response_lookups(&fixture.state, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(
+            fixture.sends.load(Ordering::SeqCst),
+            0,
+            "should send nothing"
+        );
+        assert_eq!(
+            owned_uid(&fixture, &ec_id),
+            None,
+            "should not write provider UIDs"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_when_the_ec_changed_since_capture() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0002", "2".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut lookups = lookups.expect("should capture after-response work");
+        lookups.ec_id = format!("{}.ar0003", "3".repeat(64));
+        // A live row for the other EC, so only the EC check can stop the send.
+        seed_live_row(&fixture.graph, &lookups.ec_id);
+
+        // Act
+        crate::run_after_response_lookups(&fixture.state, &mut ec_state, Some(lookups));
+
+        // Assert
+        assert_eq!(
+            fixture.sends.load(Ordering::SeqCst),
+            0,
+            "should send nothing"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_without_a_permit() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0004", "4".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(
+            ec_state.ec_context.take_after_response_permit().is_some(),
+            "should have issued a permit"
+        );
+
+        // Act
+        crate::run_after_response_lookups(&fixture.state, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(
+            fixture.sends.load(Ordering::SeqCst),
+            0,
+            "should send nothing"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_a_row_withdrawn_before_the_phase() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0005", "b".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        fixture.graph.delete(&ec_id).expect("should delete the row");
+        fixture
+            .graph
+            .create(
+                &ec_id,
+                &trusted_server_core::ec::kv_types::KvEntry::tombstone(
+                    trusted_server_core::ec::current_timestamp(),
+                ),
+            )
+            .expect("should write the tombstone");
+
+        // Act
+        crate::run_after_response_lookups(&fixture.state, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(
+            fixture.sends.load(Ordering::SeqCst),
+            0,
+            "should send nothing"
+        );
+        assert_eq!(
+            owned_uid(&fixture, &ec_id),
+            None,
+            "should keep the tombstone"
+        );
+    }
+
+    #[test]
+    fn publisher_request_without_fetch_metadata_navigation_gets_no_permit() {
+        let router = test_router();
+        let mut prefetch = navigation_request("/article");
+        prefetch
+            .headers_mut()
+            .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+
+        for request in [
+            browser_request(Method::GET, "/article", "document"),
+            prefetch,
+        ] {
+            let mut response = route(&router, request);
+
+            let mut state = take_finalize_state(&mut response);
+            assert!(
+                state.ec_context.take_navigation_permit_for_test().is_none(),
+                "should not issue a permit without a top-level navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_proxy_never_generates_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            navigation_request("/integrations/prebid/bundle.js"),
+        );
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            !state.ec_context.ec_generated(),
+            "should not mint an EC on an integration proxy"
+        );
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_none(),
+            "should not issue a permit to an integration proxy"
+        );
     }
 
     #[test]

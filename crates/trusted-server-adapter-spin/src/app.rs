@@ -133,6 +133,7 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Spin")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -653,7 +654,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                let result = PartnerRegistry::from_ec(&s.settings.ec)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
@@ -817,15 +818,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -1011,6 +1009,23 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = multi_provider_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Spin"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(

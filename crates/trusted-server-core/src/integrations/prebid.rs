@@ -7015,30 +7015,30 @@ external_bundle_sri = "sha384-AAAA"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();

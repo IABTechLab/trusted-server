@@ -414,8 +414,9 @@ pub trait PlatformHttpClient: Send + Sync {
 
     /// Collects an available response, waiting only until an absolute deadline.
     ///
-    /// On expiry, implementations take one nonblocking snapshot of complete
-    /// available responses before relinquishing unfinished requests. This
+    /// On expiry, implementations take one final snapshot of complete
+    /// available responses before relinquishing unfinished requests; it may
+    /// wait briefly for bytes the host already received. This
     /// preserves buffered bids when a publisher origin delays collection.
     /// Subsequent calls may drain only the completed snapshot. The deadline
     /// bounds network waiting, not eligibility by an upstream arrival timestamp.
@@ -428,7 +429,7 @@ pub trait PlatformHttpClient: Send + Sync {
     ///
     /// Complete response bodies are buffered within adapter-specific limits.
     /// Deadline expiry drops incomplete bodies and pending handles after the
-    /// nonblocking snapshot; complete buffered responses remain collectible.
+    /// final snapshot; complete buffered responses remain collectible.
     ///
     /// # Examples
     ///

@@ -1,0 +1,1861 @@
+//! Server-side identity lookup coordination (spec §8).
+//!
+//! [`ProviderCoordinator`] owns eligibility, consent, destination checks, a
+//! deadline-bounded fan-out through a [`LookupTransport`], validation and
+//! planning of the navigation's single row change. Providers stay pure.
+
+pub mod results;
+pub mod transport;
+mod validate;
+
+use std::collections::HashSet;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::sync::Arc;
+use std::time::Duration;
+
+use error_stack::Report;
+
+use self::results::{LookupResults, LookupStatus, ProviderLookup, SkipReason};
+use self::transport::{
+    Deadline, LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse,
+};
+use self::validate::{ValidatedEntries, ValidationPolicy, validate};
+use crate::consent::ConsentContext;
+use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
+use crate::ec::EcKvSnapshot;
+use crate::ec::consent::ec_consent_granted;
+use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::generation::ec_hash;
+use crate::ec::kv_types::KvEntry;
+use crate::ec::provider::{
+    ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
+    ProviderEid, ProviderResponse, SourceInput, destination_allowed, parse_sources,
+    validate_enabled_configs,
+};
+use crate::ec::rate_limiter::RateLimiter;
+use crate::ec::registry::PartnerRegistry;
+
+use crate::settings::IdentityProviderConfig;
+
+/// Coordinates server-side identity lookups for one navigation.
+///
+/// Implementations own eligibility, consent, destination checks, the shared
+/// time budget and validation. Providers never see KV, cookies, HTTP or the
+/// clock. Implementations never write KV: they return the change and the
+/// caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+#[allow(async_fn_in_trait)]
+pub trait IdentityCoordinator {
+    /// Starts lookups for every eligible provider without waiting.
+    ///
+    /// Returns empty pending lookups when no provider is enabled; skipped
+    /// providers are recorded and reported by [`Self::collect`].
+    async fn dispatch<T: LookupTransport>(
+        &self,
+        transport: &T,
+        lookup: &LookupContext<'_>,
+    ) -> PendingLookups<T::Pending>;
+
+    /// Waits for dispatched lookups until all finish or the deadline passes,
+    /// then parses and validates each response.
+    ///
+    /// Never fails: per-provider failures are recorded in [`LookupResults`].
+    async fn collect<T: LookupTransport>(
+        &self,
+        transport: &T,
+        pending: PendingLookups<T::Pending>,
+    ) -> LookupResults;
+}
+
+/// Request-scoped inputs to [`IdentityCoordinator::dispatch`].
+pub struct LookupContext<'a> {
+    /// Active EC ID.
+    pub ec_id: &'a str,
+    /// Row snapshot read before dispatch.
+    pub snapshot: &'a EcKvSnapshot,
+    /// The row this navigation creates for an EC it minted, which `snapshot`
+    /// does not hold yet. Only providers that do not send the EC ID are
+    /// dispatched against it.
+    pub minted_entry: Option<&'a KvEntry>,
+    /// Request consent.
+    pub consent: &'a ConsentContext,
+    /// Client signals lent to providers.
+    pub client: ClientSignals<'a>,
+    /// Publisher domain.
+    pub publisher_domain: &'a str,
+    /// Existing EC rate limiter, used only for `rate_limit_per_hour`.
+    pub rate_limiter: &'a dyn RateLimiter,
+    /// Request time.
+    pub now: UnixSeconds,
+}
+
+/// Lookups in flight for one navigation.
+///
+/// Only the coordinator module can create a non-empty value. `Default`
+/// (empty) and `Debug` (counts only) are implemented by hand so they do not
+/// require bounds on `Pending`.
+pub struct PendingLookups<Pending> {
+    requests: Vec<Tagged<Pending>>,
+    deadline: Option<Deadline>,
+    /// EC ID the lookups were dispatched for.
+    ec_id: String,
+    /// Request time, for validating `exp` and resolving relative expiry.
+    now: UnixSeconds,
+    /// Providers that finished at dispatch (skipped or failed to send).
+    early: Vec<Tagged<LookupStatus>>,
+    /// Providers whose IDs were generated at dispatch, validated.
+    generated: Vec<Tagged<ProviderLookup>>,
+    /// Provider state to hand back with each in-flight request's response.
+    contexts: Vec<Tagged<String>>,
+}
+
+impl<Pending> Default for PendingLookups<Pending> {
+    fn default() -> Self {
+        Self {
+            requests: Vec::new(),
+            deadline: None,
+            ec_id: String::new(),
+            now: UnixSeconds::new(0),
+            early: Vec::new(),
+            generated: Vec::new(),
+            contexts: Vec::new(),
+        }
+    }
+}
+
+impl<Pending> std::fmt::Debug for PendingLookups<Pending> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLookups")
+            .field("requests", &self.requests.len())
+            .field("early", &self.early.len())
+            .field("generated", &self.generated.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Pending> PendingLookups<Pending> {
+    /// Whether nothing was dispatched, generated or skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.early.is_empty() && self.generated.is_empty()
+    }
+}
+
+/// A configured provider handed to [`ProviderCoordinator::new`].
+pub struct RegisteredProvider<P> {
+    /// The provider's configuration entry.
+    pub config: IdentityProviderConfig,
+    /// The built provider.
+    pub provider: P,
+}
+
+impl<P> RegisteredProvider<P> {
+    /// Pairs a configuration entry with its built provider.
+    #[must_use]
+    pub fn new(config: IdentityProviderConfig, provider: P) -> Self {
+        Self { config, provider }
+    }
+}
+
+/// A provider with the operator policy the coordinator applies to it.
+struct Registered<P> {
+    id: ProviderId,
+    policy: ProviderPolicy,
+    provider: P,
+}
+
+/// Operator policy for one provider, validated when the coordinator is built.
+struct ProviderPolicy {
+    sources: Box<[SourceDomain]>,
+    allowed_domains: Box<[Box<str>]>,
+    tcf_vendor_id: Option<NonZeroU16>,
+    rate_limit_per_hour: Option<NonZeroU32>,
+}
+
+/// The production coordinator, built once at startup.
+///
+/// Generic over the provider type: production uses the boxed default, tests
+/// and single-provider builds use a concrete type.
+pub struct ProviderCoordinator<P = Box<dyn IdentityProvider>> {
+    providers: Box<[Registered<P>]>,
+    /// Partner config: `openrtb_atype` for validation.
+    partners: Arc<PartnerRegistry>,
+    budget: Duration,
+}
+
+impl<P: IdentityProvider> ProviderCoordinator<P> {
+    /// Validates and registers the enabled providers.
+    ///
+    /// Disabled providers are dropped: they make no requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderConfigError::Invalid`] when an enabled provider's
+    /// endpoint is not `https` with an allowlisted host, a source has no
+    /// partner entry, a source is outside the provider's capabilities, a
+    /// source is claimed by two enabled providers, or more than `u16::MAX`
+    /// providers are enabled.
+    pub fn new(
+        registered: Vec<RegisteredProvider<P>>,
+        partners: Arc<PartnerRegistry>,
+        budget: Duration,
+    ) -> Result<Self, Report<ProviderConfigError>> {
+        let enabled: Vec<RegisteredProvider<P>> = registered
+            .into_iter()
+            .filter(|registered| registered.config.enabled)
+            .collect();
+        if u16::try_from(enabled.len()).is_err() {
+            return Err(Report::new(ProviderConfigError::Invalid)
+                .attach("too many identity providers are enabled"));
+        }
+        validate_enabled_configs(
+            enabled.iter().map(|registered| &registered.config),
+            &partners,
+        )?;
+
+        let providers = enabled
+            .into_iter()
+            .map(Self::register)
+            .collect::<Result<Box<[_]>, Report<ProviderConfigError>>>()?;
+
+        Ok(Self {
+            providers,
+            partners,
+            budget,
+        })
+    }
+
+    fn register(
+        registered: RegisteredProvider<P>,
+    ) -> Result<Registered<P>, Report<ProviderConfigError>> {
+        let RegisteredProvider { config, provider } = registered;
+        let sources = parse_sources(&config)?;
+        let capable: HashSet<&SourceDomain> = provider
+            .capabilities()
+            .sources
+            .iter()
+            .map(|capability| &capability.source)
+            .collect();
+        if let Some(source) = sources.iter().find(|source| !capable.contains(source)) {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "source `{source}` of provider `{}` is outside its kind's capabilities",
+                config.id
+            )));
+        }
+        Ok(Registered {
+            id: ProviderId::new(&config.id),
+            policy: ProviderPolicy {
+                sources,
+                allowed_domains: config
+                    .allowed_domains
+                    .iter()
+                    .map(|domain| Box::from(domain.as_str()))
+                    .collect(),
+                tcf_vendor_id: config.tcf_vendor_id,
+                rate_limit_per_hour: config.rate_limit_per_hour,
+            },
+            provider,
+        })
+    }
+
+    /// Whether no provider is enabled.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Whether the row holds a live provider-written UID for `source`.
+    fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
+        entry
+            .and_then(|entry| entry.ids.get(source))
+            .is_some_and(|record| record.is_provider_written() && record.has_live_uid(now))
+    }
+
+    /// Claimed sources lacking a live provider-written UID (a browser
+    /// fallback does not count), minus sources needing input V1
+    /// never has; the flag reports whether any source was removed for input.
+    fn due_sources(
+        registered: &Registered<P>,
+        entry: Option<&KvEntry>,
+        now: UnixSeconds,
+    ) -> (Vec<SourceDomain>, bool) {
+        let capabilities = registered.provider.capabilities();
+        let mut input_blocked = false;
+        let mut due = Vec::new();
+        for source in &registered.policy.sources {
+            let record = entry
+                .and_then(|entry| entry.ids.get(source.as_str()))
+                .filter(|record| record.is_provider_written());
+            // A UID whose provider asked for a refresh makes its source due;
+            // the stored refresh state is the lookup's input.
+            if record.is_some_and(|record| record.refresh_due_for(&registered.id, now)) {
+                due.push(source.clone());
+                continue;
+            }
+            if record.is_some_and(|record| record.has_live_uid(now)) {
+                continue;
+            }
+            let needs_input = capabilities
+                .sources
+                .iter()
+                .find(|capability| capability.source == *source)
+                .is_some_and(|capability| capability.input != SourceInput::Anonymous);
+            if needs_input {
+                input_blocked = true;
+                continue;
+            }
+            due.push(source.clone());
+        }
+        (due, input_blocked)
+    }
+
+    /// Whether the provider's hourly limit is reached. Limiter errors fail
+    /// open, matching pull sync.
+    ///
+    /// The bucket is the EC hash (derived from the client IP), not the full
+    /// EC ID, so ECs behind one IP share it and a client that clears cookies
+    /// cannot reset it.
+    fn rate_limited(registered: &Registered<P>, lookup: &LookupContext<'_>) -> bool {
+        let Some(limit) = registered.policy.rate_limit_per_hour else {
+            return false;
+        };
+        let key = format!("identity:{}:{}", registered.id, ec_hash(lookup.ec_id));
+        match lookup.rate_limiter.exceeded(&key, limit.get()) {
+            Ok(exceeded) => exceeded,
+            Err(report) => {
+                log::warn!(
+                    "Identity lookup: provider={} rate limiter failed, allowing lookup: {report:?}",
+                    registered.id
+                );
+                false
+            }
+        }
+    }
+
+    fn lookup(
+        &self,
+        provider: ProviderIndex,
+        status: LookupStatus,
+        entries: ValidatedEntries,
+    ) -> ProviderLookup {
+        let registered = &self.providers[provider.get()];
+        let cleared = if status == LookupStatus::Skipped(SkipReason::OptedOut) {
+            registered.policy.sources.to_vec()
+        } else {
+            Vec::new()
+        };
+        ProviderLookup {
+            provider: registered.id.clone(),
+            status,
+            entries,
+            cleared,
+        }
+    }
+
+    fn interpret(
+        &self,
+        provider: ProviderIndex,
+        response: Result<TransportResponse, Report<TransportError>>,
+        context: Option<&str>,
+        now: UnixSeconds,
+    ) -> ProviderLookup {
+        let registered = &self.providers[provider.get()];
+        let response = match response {
+            Ok(response) => response,
+            Err(report) => {
+                let status = match report.current_context() {
+                    TransportError::Timeout => LookupStatus::Timeout,
+                    TransportError::Send | TransportError::BodyTooLarge => {
+                        log::debug!(
+                            "Identity lookup: provider={} transport failed: {report:?}",
+                            registered.id
+                        );
+                        LookupStatus::TransportFailed
+                    }
+                };
+                return self.lookup(provider, status, Vec::new());
+            }
+        };
+        if matches!(
+            response.status,
+            http::StatusCode::NOT_FOUND | http::StatusCode::NO_CONTENT
+        ) {
+            return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
+        }
+        if !response.status.is_success() {
+            return self.lookup(
+                provider,
+                LookupStatus::HttpError(response.status),
+                Vec::new(),
+            );
+        }
+        let parsed = registered.provider.parse_response(ProviderResponse {
+            status: response.status,
+            headers: &response.headers,
+            body: &response.body,
+            context,
+        });
+        let eids = match parsed {
+            Ok(LookupOutcome::Found(eids)) => eids,
+            Ok(LookupOutcome::NoMatch) => {
+                return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
+            }
+            Ok(LookupOutcome::OptedOut) => {
+                return self.lookup(
+                    provider,
+                    LookupStatus::Skipped(SkipReason::OptedOut),
+                    Vec::new(),
+                );
+            }
+            Err(report) => {
+                log::debug!(
+                    "Identity lookup: provider={} response not parsed: {}",
+                    registered.id,
+                    report.current_context()
+                );
+                return self.lookup(provider, LookupStatus::InvalidResponse, Vec::new());
+            }
+        };
+        self.validated(provider, eids, now)
+    }
+
+    /// Validates a provider's entries and reports them as one lookup.
+    fn validated(
+        &self,
+        provider: ProviderIndex,
+        eids: Vec<ProviderEid<'_>>,
+        now: UnixSeconds,
+    ) -> ProviderLookup {
+        let registered = &self.providers[provider.get()];
+        let policy = ValidationPolicy {
+            provider: &registered.id,
+            claimed: &registered.policy.sources,
+            shape: registered.provider.capabilities().shape,
+            partners: &self.partners,
+            now,
+        };
+        let (entries, dropped) = validate(eids, &policy);
+        let kept = entries
+            .iter()
+            .flat_map(|(_, eids)| eids)
+            .map(|eid| eid.uids().len())
+            .sum::<usize>();
+        if kept == 0 {
+            log::info!(
+                "Identity lookup: provider={} dropped every UID ({} drops)",
+                registered.id,
+                dropped.total()
+            );
+            return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
+        }
+        let kept = u16::try_from(kept).unwrap_or(u16::MAX);
+        self.lookup(provider, LookupStatus::Found { kept, dropped }, entries)
+    }
+}
+
+impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
+    async fn dispatch<T: LookupTransport>(
+        &self,
+        transport: &T,
+        lookup: &LookupContext<'_>,
+    ) -> PendingLookups<T::Pending> {
+        let mut pending = PendingLookups {
+            ec_id: lookup.ec_id.to_owned(),
+            now: lookup.now,
+            ..PendingLookups::default()
+        };
+        if self.providers.is_empty() {
+            return pending;
+        }
+        let stored = lookup.snapshot.entry_for(lookup.ec_id);
+        // Missing EC or EID consent, a withdrawal tombstone, an unreadable
+        // row (which may hide a tombstone) or no row at all skips every
+        // provider that sends the EC ID: a lookup discloses the EC ID before
+        // finalize could decline it, and an EC without a row may never be
+        // issued. A minted EC's pending row stands in for the stored one for
+        // providers that do not send it.
+        let has_row = !matches!(lookup.snapshot, EcKvSnapshot::Failed { .. }) && stored.is_some();
+        let minted = lookup
+            .minted_entry
+            .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
+        let entry = stored.or(minted);
+        let consented = ec_consent_granted(lookup.consent)
+            && allows_eid_persistence(lookup.consent)
+            && entry.is_some_and(|entry| entry.consent.ok);
+        let deadline = Deadline::after(self.budget);
+        pending.deadline = Some(deadline);
+        for (index, registered) in self.providers.iter().enumerate() {
+            let provider = ProviderIndex::new(index);
+            let skip = |reason| Tagged {
+                provider,
+                value: LookupStatus::Skipped(reason),
+            };
+            let vendor_denied = registered
+                .policy
+                .tcf_vendor_id
+                .is_some_and(|vendor| tcf_vendor_consent_denied(lookup.consent, vendor));
+            if !has_row && (minted.is_none() || registered.provider.sends_ec_id()) {
+                pending.early.push(skip(SkipReason::NoRow));
+                continue;
+            }
+            if !consented || vendor_denied {
+                pending.early.push(skip(SkipReason::Consent));
+                continue;
+            }
+            // A remembered opt-out keeps the provider from being called until
+            // it lapses. It clears only sources the row still stores, so once
+            // they are gone the after-response path skips its re-read.
+            if let Some(entry) = entry.filter(|entry| entry.opted_out(&registered.id, lookup.now)) {
+                pending.generated.push(Tagged {
+                    provider,
+                    value: ProviderLookup {
+                        provider: registered.id.clone(),
+                        status: LookupStatus::Skipped(SkipReason::OptedOut),
+                        entries: Vec::new(),
+                        cleared: registered
+                            .policy
+                            .sources
+                            .iter()
+                            .filter(|source| entry.ids.contains_key(source.as_str()))
+                            .cloned()
+                            .collect(),
+                    },
+                });
+                continue;
+            }
+            let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
+            if due.is_empty() {
+                pending.early.push(skip(if input_blocked {
+                    SkipReason::Input
+                } else {
+                    SkipReason::NotDue
+                }));
+                continue;
+            }
+            let input = LookupInput {
+                ec_id: lookup.ec_id,
+                consent: lookup.consent,
+                client: lookup.client,
+                publisher_domain: lookup.publisher_domain,
+                due_sources: &due,
+                current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
+                hashed_email: None,
+            };
+            if let Some(mut eids) = registered.provider.generate(&input) {
+                // Only a due source without a live UID may take a generated
+                // ID: a refresh-due source keeps its UID and goes to lookup.
+                eids.retain(|eid| {
+                    SourceDomain::try_from(eid.source.as_ref()).is_ok_and(|source| {
+                        due.contains(&source)
+                            && !Self::holds_live_uid(entry, source.as_str(), lookup.now)
+                    })
+                });
+                if !eids.is_empty() {
+                    pending.generated.push(Tagged {
+                        provider,
+                        value: self.validated(provider, eids, lookup.now),
+                    });
+                    continue;
+                }
+            }
+            if Self::rate_limited(registered, lookup) {
+                pending.early.push(skip(SkipReason::RateLimited));
+                continue;
+            }
+            let mut request = match registered.provider.build_request(&input) {
+                Ok(request) => request,
+                Err(report) => {
+                    log::warn!(
+                        "Identity lookup: provider={} request not built: {}",
+                        registered.id,
+                        report.current_context()
+                    );
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::RequestFailed,
+                    });
+                    continue;
+                }
+            };
+            if !destination_allowed(&request.url, &registered.policy.allowed_domains) {
+                pending.early.push(skip(SkipReason::Destination));
+                continue;
+            }
+            let context = request.context.take();
+            match transport.start(request, deadline).await {
+                Ok(value) => {
+                    pending.requests.push(Tagged { provider, value });
+                    if let Some(value) = context {
+                        pending.contexts.push(Tagged { provider, value });
+                    }
+                }
+                Err(report) => {
+                    log::warn!(
+                        "Identity lookup: provider={} send failed: {}",
+                        registered.id,
+                        report.current_context()
+                    );
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::TransportFailed,
+                    });
+                }
+            }
+        }
+        pending
+    }
+
+    async fn collect<T: LookupTransport>(
+        &self,
+        transport: &T,
+        pending: PendingLookups<T::Pending>,
+    ) -> LookupResults {
+        let PendingLookups {
+            requests,
+            deadline,
+            ec_id,
+            now,
+            early,
+            generated,
+            contexts,
+        } = pending;
+        let responses = match deadline {
+            Some(deadline) if !requests.is_empty() => transport.gather(requests, deadline).await,
+            _ => Vec::new(),
+        };
+        let mut slots: Vec<Option<ProviderLookup>> =
+            (0..self.providers.len()).map(|_| None).collect();
+        for Tagged { provider, value } in early {
+            slots[provider.get()] = Some(self.lookup(provider, value, Vec::new()));
+        }
+        for Tagged { provider, value } in generated {
+            slots[provider.get()] = Some(value);
+        }
+        for Tagged { provider, value } in responses {
+            let context = contexts
+                .iter()
+                .find(|tagged| tagged.provider == provider)
+                .map(|tagged| tagged.value.as_str());
+            slots[provider.get()] = Some(self.interpret(provider, value, context, now));
+        }
+        let lookups: Vec<ProviderLookup> = slots.into_iter().flatten().collect();
+        for lookup in &lookups {
+            log_outcome(lookup);
+        }
+        LookupResults::new(&ec_id, lookups)
+    }
+}
+
+fn log_outcome(lookup: &ProviderLookup) {
+    let (kept, dropped) = match lookup.status {
+        LookupStatus::Found { kept, dropped } => (kept, dropped.total()),
+        _ => (0, 0),
+    };
+    log::info!(
+        "Identity lookup: provider={} outcome={} kept={kept} dropped={dropped}",
+        lookup.provider,
+        lookup.status.metric_name()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::TcfConsent;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvRefresh, KvUid};
+    use crate::ec::provider::{
+        EidLevelFields, EidShape, ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry,
+        ProviderRequest, ProviderUid, SourceCapability,
+    };
+    use crate::error::TrustedServerError;
+    use crate::settings::EcPartner;
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::num::NonZeroUsize;
+
+    const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
+
+    type Reply = fn() -> Result<TransportResponse, Report<TransportError>>;
+
+    /// Context the echo provider sets on its request and expects back.
+    const ECHO_CONTEXT: &str = "echo-context";
+
+    struct EchoProvider(ProviderCapabilities);
+
+    impl IdentityProvider for EchoProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            &self.0
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Ok(ProviderRequest {
+                method: http::Method::GET,
+                url: url::Url::parse(&format!(
+                    "https://ids.example.com/lookup?due={}",
+                    lookup.due_sources.len()
+                ))
+                .expect("should parse"),
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::new(),
+                context: Some(ECHO_CONTEXT.to_owned()),
+            })
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            if response.context != Some(ECHO_CONTEXT) {
+                return Err(Report::new(ProviderError::InvalidResponse));
+            }
+            let id = std::str::from_utf8(response.body)
+                .map_err(|_| Report::new(ProviderError::InvalidResponse))?;
+            if id == "optout" {
+                return Ok(LookupOutcome::OptedOut);
+            }
+            Ok(LookupOutcome::Found(vec![ProviderEid {
+                source: Cow::Borrowed("ids.example.com"),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed(id),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
+                }],
+            }]))
+        }
+    }
+
+    /// Answers every request with a canned result, recording the URLs sent.
+    struct CannedTransport {
+        reply: Reply,
+        sent: RefCell<Vec<String>>,
+    }
+
+    impl CannedTransport {
+        fn new(reply: Reply) -> Self {
+            Self {
+                reply,
+                sent: RefCell::default(),
+            }
+        }
+    }
+
+    impl LookupTransport for CannedTransport {
+        type Pending = ();
+
+        async fn start(
+            &self,
+            request: ProviderRequest,
+            _deadline: Deadline,
+        ) -> Result<(), Report<TransportError>> {
+            self.sent.borrow_mut().push(request.url.to_string());
+            Ok(())
+        }
+
+        async fn gather(
+            &self,
+            pending: Vec<Tagged<()>>,
+            _deadline: Deadline,
+        ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
+            pending
+                .into_iter()
+                .map(|tagged| Tagged {
+                    provider: tagged.provider,
+                    value: (self.reply)(),
+                })
+                .collect()
+        }
+    }
+
+    struct Limiter(bool);
+
+    impl RateLimiter for Limiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            Ok(self.0)
+        }
+    }
+
+    fn reply(status: http::StatusCode, body: &'static [u8]) -> TransportResponse {
+        TransportResponse {
+            status,
+            headers: http::HeaderMap::new(),
+            body: bytes::Bytes::from_static(body),
+        }
+    }
+
+    fn ok_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, b"p-1"))
+    }
+
+    fn timeout_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Err(Report::new(TransportError::Timeout))
+    }
+
+    fn not_found_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::NOT_FOUND, b""))
+    }
+
+    fn server_error_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::BAD_GATEWAY, b""))
+    }
+
+    fn invalid_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, b"\xff"))
+    }
+
+    fn partners() -> Arc<PartnerRegistry> {
+        let partner: EcPartner = serde_json::from_value(serde_json::json!({
+            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true
+        }))
+        .expect("should build partner");
+        Arc::new(PartnerRegistry::from_config(&[partner]).expect("should build registry"))
+    }
+
+    fn provider_config(extra: &str) -> IdentityProviderConfig {
+        toml::from_str(&format!(
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]\n{extra}"
+        ))
+        .expect("should parse config")
+    }
+
+    fn echo_provider(input: SourceInput) -> EchoProvider {
+        EchoProvider(ProviderCapabilities {
+            sources: Box::new([SourceCapability {
+                source: SourceDomain::try_from("ids.example.com").expect("should parse"),
+                input,
+            }]),
+            shape: EidShape {
+                max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                eid_level_fields: EidLevelFields::Preserved,
+            },
+        })
+    }
+
+    fn coordinator_with(
+        registered: RegisteredProvider<EchoProvider>,
+    ) -> ProviderCoordinator<EchoProvider> {
+        ProviderCoordinator::new(vec![registered], partners(), Duration::from_millis(200))
+            .expect("should build coordinator")
+    }
+
+    fn coordinator(extra: &str) -> ProviderCoordinator<EchoProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(extra),
+            echo_provider(SourceInput::Anonymous),
+        ))
+    }
+
+    fn granting() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..Default::default()
+        }
+    }
+
+    fn missing() -> EcKvSnapshot {
+        EcKvSnapshot::Missing {
+            ec_id: EC_ID.to_owned(),
+        }
+    }
+
+    /// A consented row with no IDs yet.
+    fn live_row() -> EcKvSnapshot {
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        EcKvSnapshot::Present {
+            ec_id: EC_ID.to_owned(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        }
+    }
+
+    fn run_with<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
+        transport: &CannedTransport,
+        snapshot: &EcKvSnapshot,
+        consent: &ConsentContext,
+        limiter: &dyn RateLimiter,
+    ) -> LookupResults {
+        let context = LookupContext {
+            ec_id: EC_ID,
+            snapshot,
+            minted_entry: None,
+            consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            rate_limiter: limiter,
+            now: UnixSeconds::new(1000),
+        };
+        futures::executor::block_on(async {
+            let pending = coordinator.dispatch(transport, &context).await;
+            coordinator.collect(transport, pending).await
+        })
+    }
+
+    fn run<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
+        transport: &CannedTransport,
+        snapshot: &EcKvSnapshot,
+        consent: &ConsentContext,
+    ) -> LookupResults {
+        run_with(coordinator, transport, snapshot, consent, &Limiter(false))
+    }
+
+    fn only_status(results: &LookupResults) -> LookupStatus {
+        results
+            .iter()
+            .next()
+            .expect("should report the provider")
+            .status
+    }
+
+    fn seeded_snapshot(entry: &KvEntry) -> EcKvSnapshot {
+        let graph = KvIdentityGraph::in_memory("coord");
+        graph.create(EC_ID, entry).expect("should seed");
+        graph.load_snapshot(EC_ID)
+    }
+
+    #[test]
+    fn due_source_is_looked_up_and_validated() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep one UID"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0]
+                .owner()
+                .map(ProviderId::as_str),
+            Some("example-provider"),
+            "should record the owner"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    #[test]
+    fn ec_without_a_row_is_not_sent_to_vendors() {
+        // Arrange: a well-formed `ts-ec` cookie whose row does not exist.
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(&coordinator, &transport, &missing(), &granting());
+
+        // Assert
+        assert_eq!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .status,
+            LookupStatus::Skipped(SkipReason::NoRow),
+            "should skip a provider for an EC with no row"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    /// An echo provider whose request does not carry the EC ID.
+    struct NoEcIdProvider(EchoProvider);
+
+    impl IdentityProvider for NoEcIdProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn sends_ec_id(&self) -> bool {
+            false
+        }
+    }
+
+    /// The pending row of an EC minted on this navigation.
+    fn minted_entry(consent_ok: bool) -> KvEntry {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = consent_ok;
+        entry
+    }
+
+    fn run_minted<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
+        transport: &CannedTransport,
+        minted: &KvEntry,
+    ) -> LookupResults {
+        let snapshot = missing();
+        let consent = granting();
+        let limiter = Limiter(false);
+        let context = LookupContext {
+            ec_id: EC_ID,
+            snapshot: &snapshot,
+            minted_entry: Some(minted),
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+            },
+            publisher_domain: "www.example.com",
+            rate_limiter: &limiter,
+            now: UnixSeconds::new(1000),
+        };
+        futures::executor::block_on(async {
+            let pending = coordinator.dispatch(transport, &context).await;
+            coordinator.collect(transport, pending).await
+        })
+    }
+
+    fn no_ec_id_coordinator() -> ProviderCoordinator<NoEcIdProvider> {
+        ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                NoEcIdProvider(echo_provider(SourceInput::Anonymous)),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+    }
+
+    #[test]
+    fn minted_ec_dispatches_a_provider_that_does_not_send_the_ec_id() {
+        // Arrange
+        let coordinator = no_ec_id_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(true));
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should look up a provider that does not send the EC ID"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    #[test]
+    fn minted_ec_is_not_sent_by_a_provider_that_sends_the_ec_id() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(true));
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NoRow),
+            "should skip a provider that would send a minted EC"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn minted_ec_without_consent_skips_every_provider() {
+        // Arrange
+        let coordinator = no_ec_id_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_minted(&coordinator, &transport, &minted_entry(false));
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should follow the minted row's consent"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    fn provider_record(id: &str) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record")
+    }
+
+    #[test]
+    fn source_with_browser_fallback_uid_is_still_due() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            KvPartnerId::single("fallback"),
+        );
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up a source holding only a browser fallback"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    #[test]
+    fn source_with_live_uid_is_not_due() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), provider_record("p-1"));
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should skip"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn tombstoned_row_skips_for_consent() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&KvEntry::tombstone(1000)),
+            &granting(),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip a tombstoned row"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn missing_ec_consent_skips_every_provider() {
+        let coordinator = coordinator("");
+        let cases = [
+            (
+                "GPC opt-out in a US state",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+                    gpc: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unknown jurisdiction",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::Unknown,
+                    ..Default::default()
+                },
+            ),
+            (
+                "GDPR without a TC string",
+                ConsentContext {
+                    jurisdiction: Jurisdiction::Gdpr,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, consent) in cases {
+            let transport = CannedTransport::new(ok_reply);
+            let mut entry = KvEntry::tombstone(1000);
+            entry.consent.ok = true;
+
+            let results = run(&coordinator, &transport, &seeded_snapshot(&entry), &consent);
+
+            assert_eq!(
+                only_status(&results),
+                LookupStatus::Skipped(SkipReason::Consent),
+                "should skip for {label}"
+            );
+            assert!(
+                transport.sent.borrow().is_empty(),
+                "should send nothing for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_snapshot_skips_every_provider() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let snapshot = EcKvSnapshot::Failed {
+            ec_id: EC_ID.to_owned(),
+        };
+
+        let results = run(&coordinator, &transport, &snapshot, &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NoRow),
+            "should skip when the row could not be read"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn tcf_vendor_id_does_not_gate_traffic_without_tcf() {
+        let coordinator = coordinator("tcf_vendor_id = 9999");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert!(
+            !matches!(only_status(&results), LookupStatus::Skipped(_)),
+            "should look up when no TCF string applies outside GDPR"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send one request");
+    }
+
+    fn tcf_consent(vendor_consents: Vec<u16>) -> ConsentContext {
+        let mut purposes = vec![false; 24];
+        purposes[0] = true;
+        purposes[3] = true;
+        ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: purposes,
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents,
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        }
+    }
+
+    #[test]
+    fn missing_tcf_vendor_consent_skips_before_building_a_request() {
+        let coordinator = coordinator("tcf_vendor_id = 9999");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![1]));
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn granted_tcf_vendor_consent_allows_the_lookup() {
+        let coordinator = coordinator("tcf_vendor_id = 9999");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &tcf_consent(vec![9999]),
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up with vendor consent"
+        );
+    }
+
+    #[test]
+    fn hashed_email_sources_are_skipped_for_input() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            echo_provider(SourceInput::HashedEmail),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip sources needing hashed email"
+        );
+    }
+
+    #[test]
+    fn rate_limited_provider_is_skipped() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("rate_limit_per_hour = 1"),
+            echo_provider(SourceInput::Anonymous),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run_with(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(true),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::RateLimited),
+            "should skip a rate-limited provider"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn built_url_outside_allowlist_is_rejected() {
+        let coordinator = coordinator("");
+        // The echo provider builds its URL on the configured host; narrow the
+        // policy afterwards so the built URL falls outside the allowlist.
+        let coordinator = ProviderCoordinator {
+            providers: coordinator
+                .providers
+                .into_vec()
+                .into_iter()
+                .map(|mut registered| {
+                    registered.policy.allowed_domains = Box::new([Box::from("other.example.com")]);
+                    registered
+                })
+                .collect(),
+            ..coordinator
+        };
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Destination),
+            "should reject the destination"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn transport_and_http_outcomes_map_to_statuses() {
+        let cases: [(Reply, LookupStatus); 4] = [
+            (timeout_reply, LookupStatus::Timeout),
+            (not_found_reply, LookupStatus::NoMatch),
+            (
+                server_error_reply,
+                LookupStatus::HttpError(http::StatusCode::BAD_GATEWAY),
+            ),
+            (invalid_reply, LookupStatus::InvalidResponse),
+        ];
+        for (reply, expected) in cases {
+            let coordinator = coordinator("");
+            let transport = CannedTransport::new(reply);
+
+            let results = run(&coordinator, &transport, &live_row(), &granting());
+
+            let lookup = results.iter().next().expect("should report");
+            assert_eq!(lookup.status, expected, "should map the outcome");
+            assert!(lookup.entries.is_empty(), "should carry no entries");
+        }
+    }
+
+    #[test]
+    fn disabled_provider_is_not_registered() {
+        let coordinator = coordinator("enabled = false");
+
+        assert!(coordinator.is_empty(), "should drop disabled providers");
+    }
+
+    #[test]
+    fn endpoint_outside_allowlist_is_rejected_at_build() {
+        let mut config = provider_config("");
+        config.endpoint = "https://other.example.com/".to_owned();
+
+        let error = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                config,
+                echo_provider(SourceInput::Anonymous),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .err()
+        .expect("should reject endpoint");
+
+        assert!(
+            matches!(error.current_context(), ProviderConfigError::Invalid),
+            "should report invalid config"
+        );
+    }
+
+    #[test]
+    fn source_outside_capabilities_is_rejected_at_build() {
+        let provider = EchoProvider(ProviderCapabilities {
+            sources: Box::new([]),
+            ..echo_provider(SourceInput::Anonymous).0
+        });
+
+        let error = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(provider_config(""), provider)],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .err()
+        .expect("should reject source outside capabilities");
+
+        assert!(
+            matches!(error.current_context(), ProviderConfigError::Invalid),
+            "should report invalid config"
+        );
+    }
+
+    fn refreshable_record(from: u64) -> KvPartnerId {
+        refreshable_record_owned_by("example-provider", from)
+    }
+
+    fn refreshable_record_owned_by(owner: &str, from: u64) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from("p-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new(owner)),
+            Expiry::At(UnixSeconds::new(5000)),
+        )
+        .with_refresh(KvRefresh {
+            state: "refresh-state".to_owned(),
+            from: UnixSeconds::new(from),
+        });
+        KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record")
+    }
+
+    fn snapshot_holding(record: KvPartnerId) -> EcKvSnapshot {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.ids.insert("ids.example.com".to_owned(), record);
+        seeded_snapshot(&entry)
+    }
+
+    #[test]
+    fn a_due_refresh_makes_a_live_source_due() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should refresh a live UID whose refresh time has passed"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send the refresh");
+    }
+
+    #[test]
+    fn a_future_refresh_leaves_the_source_held() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(2000)),
+            &granting(),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not refresh before the refresh time"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn remembered_opt_out_skips_the_provider_until_it_lapses() {
+        // Arrange
+        let coordinator = coordinator("");
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(provider.clone(), 1001);
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should skip a provider whose opt-out is remembered"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call a provider the visitor opted out of"
+        );
+        assert!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .cleared
+                .is_empty(),
+            "should clear nothing when the row stores none of its sources"
+        );
+
+        // Arrange: a UID for a claimed source is still stored.
+        let mut stored = entry.clone();
+        stored
+            .ids
+            .insert("ids.example.com".to_owned(), KvPartnerId::single("p-1"));
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&stored),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should clear the claimed source the row still stores"
+        );
+
+        // Arrange: the opt-out lapsed.
+        entry.opt_outs.insert(provider, 1000);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should call the provider again once the opt-out lapses"
+        );
+    }
+
+    #[test]
+    fn another_providers_refresh_state_is_never_handed_over() {
+        // Arrange: a live UID with due refresh state written by a provider that
+        // no longer owns the source.
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record_owned_by("former-provider", 900)),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not refresh a UID another provider wrote"
+        );
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not send another provider's refresh state"
+        );
+    }
+
+    fn optout_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, b"optout"))
+    }
+
+    #[test]
+    fn an_opted_out_reply_clears_the_sources() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(optout_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should report the opt-out"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should clear the provider's sources"
+        );
+    }
+
+    /// An echo provider whose request can never be built.
+    struct UnbuildableProvider(EchoProvider);
+
+    impl IdentityProvider for UnbuildableProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Err(Report::new(ProviderError::Request))
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+    }
+
+    #[test]
+    fn a_request_the_provider_cannot_build_is_reported_as_a_failure() {
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                UnbuildableProvider(echo_provider(SourceInput::Anonymous)),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::RequestFailed,
+            "should report a provider bug instead of a skip"
+        );
+    }
+
+    /// An echo provider that generates its ID for the given source instead of
+    /// looking it up.
+    struct GeneratingProvider(EchoProvider, &'static str);
+
+    impl IdentityProvider for GeneratingProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn generate(&self, _lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
+            Some(vec![ProviderEid {
+                source: Cow::Borrowed(self.1),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed("generated-1"),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
+                }],
+            }])
+        }
+    }
+
+    fn generating_coordinator() -> ProviderCoordinator<GeneratingProvider> {
+        generating_coordinator_for("ids.example.com")
+    }
+
+    fn generating_coordinator_for(source: &'static str) -> ProviderCoordinator<GeneratingProvider> {
+        ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                GeneratingProvider(echo_provider(SourceInput::Anonymous), source),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+    }
+
+    #[test]
+    fn a_generated_id_replaces_the_lookup_for_a_due_source() {
+        let coordinator = generating_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep the generated UID"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0].id().as_str(),
+            "generated-1",
+            "should store the generated ID"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn a_generated_id_matches_its_due_source_after_normalizing() {
+        let coordinator = generating_coordinator_for("IDS.example.com");
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep the generated UID for a differently cased source"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn a_refresh_due_live_source_is_looked_up_not_regenerated() {
+        let coordinator = generating_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+        );
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            lookup
+                .entries
+                .iter()
+                .flat_map(|(_, eids)| eids)
+                .flat_map(KvEid::uids)
+                .all(|uid| uid.id().as_str() != "generated-1"),
+            "should not replace the live UID with a generated one"
+        );
+        assert_eq!(
+            transport.sent.borrow().len(),
+            1,
+            "should send the refresh lookup instead"
+        );
+    }
+
+    #[test]
+    fn a_held_source_is_not_regenerated() {
+        let coordinator = generating_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(provider_record("p-1")),
+            &granting(),
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should keep the held ID"
+        );
+    }
+}

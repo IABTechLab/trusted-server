@@ -363,8 +363,10 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 **Contract:** The JSON body is limited to 2 MiB and 1,000 mappings. The
 per-partner, per-minute limit is `ec.partners[].batch_rate_limit`. Responses are
 `200` when every mapping is accepted or `207` when at least one is rejected;
-item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
-`kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
+item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`,
+`provider_owned` (the source belongs to a server-side identity provider),
+`row_full` (the EC's row would exceed its 16 KiB limit; retrying gives the
+same result), or `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
 or CORS headers. It is Fastly-only and requires the EC KV store.

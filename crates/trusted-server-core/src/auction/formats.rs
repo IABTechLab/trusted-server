@@ -850,14 +850,14 @@ mod tests {
     #[test]
     fn response_includes_eid_headers_when_eids_present() {
         let mut request = make_auction_request();
-        request.user.eids = Some(vec![Eid {
-            source: "ssp.com".to_owned(),
-            uids: vec![Uid {
+        request.user.eids = Some(vec![Eid::new(
+            "ssp.com".to_owned(),
+            vec![Uid {
                 id: "uid-1".to_owned(),
                 atype: Some(3),
                 ext: None,
             }],
-        }]);
+        )]);
 
         let settings = make_settings();
         let result = make_empty_result();
