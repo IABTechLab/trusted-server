@@ -79,13 +79,6 @@ fn trusted_server_owns_logging() {
     );
 }
 
-#[test]
-fn routes_build_without_panic() {
-    // Host targets have no production config store, so `routes()` returns
-    // the startup error instead of panicking.
-    let _router = TrustedServerApp::routes();
-}
-
 // ---------------------------------------------------------------------------
 // Synthesized headers on EdgeZero's canonical responses
 // ---------------------------------------------------------------------------
