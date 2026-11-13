@@ -109,8 +109,8 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to an HTTP response via
-///   [`http_error`] using the error's documented status code.
+/// - `Err(report)` → internal error; [`http_error`] logs it once and converts it
+///   to an HTTP response with the error's documented status code.
 ///
 /// # Errors
 ///
@@ -135,10 +135,7 @@ impl Middleware for AuthMiddleware {
         match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(http_error(&report));
-            }
+            Err(report) => return Ok(http_error(&report)),
         }
 
         next.run(ctx).await
@@ -368,6 +365,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use futures::executor::block_on;
     use trusted_server_core::response_privacy::apply_inactive_ad_stack_browser_cache_policy;
+    use trusted_server_core::test_support::logging::LogCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -797,6 +795,43 @@ mod tests {
         assert_eq!(
             cookie_count, 2,
             "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
+        );
+    }
+
+    #[test]
+    fn auth_handle_logs_a_configuration_error_once() {
+        let mut settings = settings_with_response_headers(vec![]);
+        settings.handlers.clear();
+        let middleware = AuthMiddleware::new(Arc::new(settings));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/_ts/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build an admin request");
+        let ctx = RequestContext::new(request, PathParams::new(HashMap::new()));
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(ctx, Next::new(&[], &*handler)))
+            .expect("should answer the configuration error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer an admin path no handler covers with 500"
+        );
+        let levels: Vec<log::Level> = capture
+            .take_all()
+            .iter()
+            .map(|record| record.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error],
+            "should log the configuration error once, at error"
         );
     }
 

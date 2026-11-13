@@ -527,13 +527,10 @@ async fn run_pre_route_filters(
             response: *response,
             effects,
         },
-        Err(report) => {
-            log::error!("Failed to run integration request filters: {report:?}");
-            PreRoute::ShortCircuit {
-                response: http_error(&report),
-                effects: RequestFilterEffects::default(),
-            }
-        }
+        Err(report) => PreRoute::ShortCircuit {
+            response: http_error(&report),
+            effects: RequestFilterEffects::default(),
+        },
     }
 }
 

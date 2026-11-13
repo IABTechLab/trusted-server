@@ -91,7 +91,7 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
+/// - `Err(report)` → internal error; [`http_error`] logs it once and answers 500.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
@@ -110,10 +110,7 @@ impl Middleware for AuthMiddleware {
         match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(http_error(&report));
-            }
+            Err(report) => return Ok(http_error(&report)),
         }
 
         next.run(ctx).await
@@ -163,7 +160,7 @@ mod tests {
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{Method, request_builder, response_builder};
+    use edgezero_core::http::{Method, StatusCode, request_builder, response_builder};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
     use futures::executor::block_on;
@@ -318,6 +315,43 @@ mod tests {
             *observed.lock().expect("should lock observation"),
             Some((false, false)),
             "should remove both configured trust headers before the handler"
+        );
+    }
+
+    #[test]
+    fn auth_handle_logs_a_configuration_error_once() {
+        let mut settings = settings_with_response_headers(vec![]);
+        settings.handlers.clear();
+        let middleware = AuthMiddleware::new(Arc::new(settings));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/_ts/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build an admin request");
+        let ctx = RequestContext::new(request, PathParams::new(HashMap::new()));
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(ctx, Next::new(&[], &*handler)))
+            .expect("should answer the configuration error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer an admin path no handler covers with 500"
+        );
+        let levels: Vec<log::Level> = capture
+            .take_all()
+            .iter()
+            .map(|record| record.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error],
+            "should log the configuration error once, at error"
         );
     }
 
