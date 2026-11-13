@@ -11,7 +11,7 @@
 use std::collections::btree_map;
 
 use super::EcKvSnapshot;
-use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
+use super::coordinator::results::{LookupResults, LookupStatus, OptOutMemory, SkipReason};
 use super::eid_types::{SourceDomain, UnixSeconds};
 use super::kv::PartnerIdUpdate;
 use super::kv_types::{KvEntry, KvPartnerId, MAX_ENTRY_BYTES};
@@ -130,9 +130,11 @@ fn apply_lookups(
     let mut written = Vec::new();
     for lookup in lookups.iter() {
         // A newer request may have recorded this provider's opt-out after
-        // the lookup was dispatched; never restore its UIDs over it.
+        // the lookup was dispatched; never restore its UIDs over it, unless
+        // the vendor's cookies showed the visitor opted back in.
         if entry.opted_out(&lookup.provider, now)
             && lookup.status != LookupStatus::Skipped(SkipReason::OptedOut)
+            && lookup.opt_out != OptOutMemory::Forget
         {
             log::info!(
                 "EC write planner: discarding results of opted-out provider '{}'",
@@ -140,13 +142,16 @@ fn apply_lookups(
             );
             continue;
         }
+        if lookup.opt_out == OptOutMemory::Forget {
+            entry.forget_opt_out(&lookup.provider);
+        }
         for (source, eids) in &lookup.entries {
             if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
                 entry.ids.insert(source.as_str().to_owned(), record);
                 written.push(source.clone());
             }
         }
-        if lookup.status == LookupStatus::Skipped(SkipReason::OptedOut) {
+        if lookup.opt_out == OptOutMemory::Remember {
             entry.remember_opt_out(&lookup.provider, now);
         }
         for source in &lookup.cleared {
@@ -386,6 +391,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), uids)],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
@@ -609,6 +615,10 @@ mod tests {
     }
 
     fn failed_lookup(status: LookupStatus) -> LookupResults {
+        lookup_with_memory(status, OptOutMemory::Unchanged)
+    }
+
+    fn lookup_with_memory(status: LookupStatus, opt_out: OptOutMemory) -> LookupResults {
         LookupResults::new(
             EC_ID,
             vec![ProviderLookup {
@@ -616,8 +626,86 @@ mod tests {
                 status,
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out,
             }],
         )
+    }
+
+    #[test]
+    fn a_cookie_opt_out_is_not_remembered() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let mut lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+        let cleared = lookups.iter().next().expect("should hold a lookup").clone();
+        lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                ..cleared
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(
+            &present(&provider_entry(&["p-1"])),
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should clear the opted-out source"
+        );
+        assert!(
+            entry.opt_outs.is_empty(),
+            "should not remember an opt-out read from cookies"
+        );
+    }
+
+    #[test]
+    fn an_opt_back_in_forgets_the_opt_out_and_stores_the_ids() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = live_entry();
+        entry
+            .opt_outs
+            .insert(provider.clone(), 2000 + OPT_OUT_MEMORY_SECONDS);
+        let found = found("ids.example.com", &["c-1"]);
+        let lookup = found.iter().next().expect("should hold a lookup").clone();
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                opt_out: OptOutMemory::Forget,
+                ..lookup
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
+            .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.opt_outs.contains_key(&provider),
+            "should forget the remembered opt-out"
+        );
+        assert!(
+            entry.ids.contains_key("ids.example.com"),
+            "should store the cookie ID"
+        );
     }
 
     #[test]
@@ -633,6 +721,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::OptedOut),
                 entries: Vec::new(),
                 cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -656,7 +745,10 @@ mod tests {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let provider = ProviderId::new("example-provider");
-        let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+        let lookups = lookup_with_memory(
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            OptOutMemory::Remember,
+        );
 
         // Act: the first opt-out is remembered.
         let first = plan_write(&input(
@@ -747,6 +839,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::NotDue),
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 

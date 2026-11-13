@@ -122,9 +122,7 @@ pull_sync_concurrency = 3
 # pull_sync_enabled = false  # default false
 
 # Optional server-side identity providers (Fastly only), looked up on publisher
-# navigations before the origin fetch. Their budgets are set in [ec] above. This
-# release registers no provider kind, so `ts config push` rejects an enabled
-# provider and every runtime refuses to start with one.
+# navigations before the origin fetch. Their budgets are set in [ec] above.
 #
 # [[ec.identity_providers]]
 # id = "example-provider"
@@ -137,19 +135,209 @@ pull_sync_concurrency = 3
 # must be claimed by only one enabled provider.
 # sources = ["ids.example.com"]
 # Optional: require TCF vendor consent for lookups and for sending any ID of
-# these sources to bidders, including browser IDs, even while disabled.
+# these sources to bidders, including browser IDs, even while disabled. Set it
+# to the vendor's IAB Global Vendor List ID for every kind whose vendor is
+# registered there; without it, GDPR traffic is gated only by the purpose
+# consents.
 # tcf_vendor_id = 9999
 # "page" (default) collects before the response; "after_response" collects
-# after it is sent, only for an EC issued on an earlier request.
+# after it is sent, only for an EC issued on an earlier request. Keep
+# cookie-only kinds on "page".
 # collect = "page"
 # Optional: most lookups per EC hash (client IP) per hour. On Fastly this is
 # enforced per minute with a minimum of one, so values below 60 behave like 60.
+# Useful for kinds whose unresolved sources stay due, such as LiveIntent
+# partner IDs.
 # rate_limit_per_hour = 60
 # Secret Store key name, resolved like other secret references.
 # [ec.identity_providers.secrets]
 # token = "example_provider_token"
 # Provider-specific settings, parsed by the provider kind.
 # [ec.identity_providers.settings]
+#
+# ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
+# the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
+# Before any lookup it reads the first-party cookies in `cookie_names`, in
+# order. Prebid's ID5 module writes the `id5id` cookie only with
+# `storage.type: 'cookie'`; with `html5` storage the lookup runs.
+#
+# Lockr capability (id5, liveramp and uid2 only): Lockr AIM writes other
+# vendors' raw tokens into first-party cookies under key names configured per
+# publisher in Lockr. Enable `[ec.identity_providers.settings.lockr]` to read
+# them after the vendor's own cookies and before any lookup. Lockr cookies are
+# not read where GDPR applies, because Lockr AIM does not run there. The
+# default Lockr key of each kind equals one of its own cookie names, which are
+# already read, so the capability changes nothing until `cookie_names` lists
+# the key configured in Lockr when it differs. connectid and liveintent reject
+# a `lockr` table.
+# [[ec.identity_providers]]
+# id = "id5"
+# kind = "id5"
+# enabled = false
+# endpoint = "https://id5.example.com/gs/v2"
+# allowed_domains = ["id5.example.com"]
+# sources = ["id5.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# partner_id = 1234
+# Optional: who operates this integration, sent to ID5 as `provider`.
+# Defaults to the publisher domain.
+# provider_name = "publisher.example.com"
+# cookie_names = ["id5id"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_id5"]
+#
+# LiveIntent (kind "liveintent"): no hashed email, no secrets. Sends the
+# visitor's first-party LiveIntent cookie (the first present one of
+# `cookie_names`, default `_lc2_fpi`) as `duid`. `resolve` lists the attributes
+# to ask for (default `nonId`); each one is stored under LiveIntent's fixed
+# source for it, which must be listed in `sources`: nonId liveintent.com,
+# bidswitch bidswitch.net, medianet media.net, magnite rubiconproject.com,
+# index liveintent.indexexchange.com, openx openx.net, pubmatic pubmatic.com,
+# sovrn liveintent.sovrn.com, sharethrough sharethrough.com, sonobi
+# liveintent.sonobi.com, triplelift liveintent.triplelift.com, zetassp
+# zeta-ssp.liveintent.com, vidazoo liveintent.vidazoo.com, nexxen
+# liveintent.unrulymedia.com, uid2 uidapi.com, thetradedesk adserver.org.
+# Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
+# `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
+# `ext`; the others are partner IDs, sent with UID `ext.provider` naming
+# LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
+# `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
+# lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
+# distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner
+# IDs: on the `prebid` path LiveIntent returns only `nonId`.
+# [[ec.identity_providers]]
+# id = "liveintent"
+# kind = "liveintent"
+# enabled = false
+# endpoint = "https://liveintent.example.com/idex"
+# allowed_domains = ["liveintent.example.com"]
+# sources = ["liveintent.com", "rubiconproject.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# publisher_id = "any"
+# distributor_id = "did-0123"
+# resolve = ["nonId", "magnite"]
+# cookie_names = ["_lc2_fpi"]
+#
+# LiveRamp (kind "liveramp"): reads the RampID envelope from LiveRamp's own
+# first-party `_lr_env` cookie (ATS) or the bare envelope Prebid's
+# identityLink module stores in `idl_env`, and keeps it for 15 days. Takes
+# exactly one source; use the one LiveRamp gives you. Supports the Lockr
+# capability. Optional server lookup: with an `endpoint` (LiveRamp's ATS
+# envelope API, `/api/identity/v2/envelope`), a visitor without an envelope
+# cookie is looked up by Custom ID: the full EC ID, sent as
+# `<custom_id_namespace>:<id>` with the visitor IP and consent. LiveRamp must
+# enable Custom ID for `placement_id` and approve the publisher origin; both
+# settings are required with an endpoint. LiveRamp resolves a Custom ID only
+# through a mapping file the publisher sends it, tying each ID to a hashed
+# email; without one the lookup finds nothing. Trusted Server itself sends no
+# login or hashed email.
+# [[ec.identity_providers]]
+# id = "liveramp"
+# kind = "liveramp"
+# enabled = false
+# endpoint = "https://liveramp.example.com/api/identity/v2/envelope"
+# allowed_domains = ["liveramp.example.com"]
+# sources = ["liveramp.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["_lr_env", "idl_env"]
+# placement_id = 14
+# custom_id_namespace = "ana-example"
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_lr_env"]
+#
+# Yahoo ConnectID (kind "connectid"): no lookup and no endpoint. Reads
+# ConnectID from Yahoo's own first-party `connectId` cookie and keeps it until
+# its last sync plus TTL (at most 14 days). Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "connectid"
+# kind = "connectid"
+# enabled = false
+# sources = ["connectid.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["connectId"]
+#
+# UID2 (kind "uid2"): reads the advertising token from the UID2 SDK's
+# `__uid_2` cookie until its `identity_expires`, falling back to Prebid's raw
+# `__uid2_advertising_token` cookie. Both clients keep the token in
+# localStorage by default, which the server never sees: set the SDK's
+# `useCookie: true` or Prebid's `params.storage: 'cookie'`. Takes exactly one
+# source. `cookie_names` lists the raw token cookies, read in order after
+# `identity_cookie_name`.
+# Supports the Lockr capability; Lockr cookies are read last, as raw tokens.
+# Optional server refresh: set `endpoint` to the UID2 operator's
+# `/v2/token/refresh` URL. The `__uid_2` cookie's refresh token and response
+# key are then kept privately in the row (never served), and the token is
+# refreshed server side from `refresh_from`, with no API key and no email.
+# Tokens are never generated: that needs an email or phone number. Without
+# `endpoint`, the refresh token is never stored. The authenticated
+# `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]". UID2 is not
+# offered where GDPR applies: for a visitor whose detected jurisdiction is
+# GDPR it is skipped and the UIDs the row holds for it are removed. A TCF
+# string alone does not count, since some CMPs set one for every visitor.
+# [[ec.identity_providers]]
+# id = "uid2"
+# kind = "uid2"
+# enabled = false
+# endpoint = "https://uid2.example.com/v2/token/refresh"
+# allowed_domains = ["uid2.example.com"]
+# sources = ["uid2.example.com"]
+# [ec.identity_providers.settings]
+# identity_cookie_name = "__uid_2"
+# cookie_names = ["__uid2_advertising_token"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_uid2"]
+#
+# Prebid SharedID (kind "sharedid"): no lookup and no endpoint. Reads the
+# publisher common ID from Prebid's first-party `_sharedid` cookie, falling
+# back to the legacy `_pubcid`, as a device-based (atype 1) ID. The
+# `_pubcid_optout` cookie suppresses it. Takes exactly one source. With
+# generate = true, when no cookie holds an ID and none is stored, Trusted Server
+# generates a random UUID and stores it in the row only (no cookie is set); a
+# later Prebid cookie replaces it. Leave it off unless Prebid keeps its opt-out
+# in the `_pubcid_optout` cookie: a localStorage opt-out is invisible to the
+# server. SharedID is the publisher's own ID, so it has no TCF vendor.
+# [[ec.identity_providers]]
+# id = "sharedid"
+# kind = "sharedid"
+# enabled = false
+# sources = ["sharedid.example.com"]
+# [ec.identity_providers.settings]
+# cookie_names = ["_sharedid", "_pubcid"]
+# generate = false
+#
+# Criteo (kind "criteo"): no lookup and no endpoint. Reads Criteo's bid ID
+# from the first-party `cto_bidid` cookie Prebid's Criteo module keeps and
+# stores it percent-decoded, as Prebid sends it, as a device-based (atype 1)
+# ID. Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "criteo"
+# kind = "criteo"
+# enabled = false
+# sources = ["criteo.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["cto_bidid"]
+#
+# Unified ID (kind "unifiedid"): no lookup and no endpoint. Reads The Trade
+# Desk ID from the `TDID` field of Prebid's `pbjs-unifiedid` cookie and stores
+# it as Prebid sends it: atype 1, UID `ext` `{"rtiPartner":"TDID"}`, and
+# `inserter`/`matcher` `adserver.org` with `mm` 4. Takes exactly one source;
+# do not also list that source for a liveintent `thetradedesk` attribute.
+# [[ec.identity_providers]]
+# id = "unifiedid"
+# kind = "unifiedid"
+# enabled = false
+# sources = ["unifiedid.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["pbjs-unifiedid"]
 
 
 # =============================================================================

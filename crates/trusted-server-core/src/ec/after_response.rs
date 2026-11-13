@@ -134,7 +134,9 @@ pub fn commit_after_response_lookups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup, SkipReason};
+    use crate::ec::coordinator::results::{
+        DropCounts, LookupStatus, OptOutMemory, ProviderLookup, SkipReason,
+    };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::TombstoneOutcome;
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
@@ -190,6 +192,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), vec![uid])],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
@@ -507,6 +510,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::NotDue),
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -578,6 +582,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::OptedOut),
                 entries: Vec::new(),
                 cleared,
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
