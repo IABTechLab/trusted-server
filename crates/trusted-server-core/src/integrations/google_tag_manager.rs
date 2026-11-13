@@ -966,7 +966,18 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
 
         let proxy_config = match self.build_proxy_config(&path, &mut req, &target_url).await {
             Ok(config) => config,
-            Err(report) => return Self::empty_response(report.current_context().status_code()),
+            Err(report) => {
+                // GTM answers with its own bodiless response instead of
+                // `http_error`, so it logs the body-read report the same way:
+                // at warn for a client error, and at error otherwise.
+                let status = report.current_context().status_code();
+                if status.is_client_error() {
+                    log::warn!("Rejecting GTM beacon: {report:?}");
+                } else {
+                    log::error!("Rejecting GTM beacon: {report:?}");
+                }
+                return Self::empty_response(status);
+            }
         };
 
         let mut response = proxy_request(settings, req, proxy_config, services)
@@ -1111,6 +1122,7 @@ mod tests {
     use crate::streaming_processor::StreamProcessor as _;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -4377,11 +4389,27 @@ container_id = "GTM-DEFAULT"
                     .uri("https://edge.example.com/integrations/google_tag_manager/g/collect"),
             );
 
+            let capture = LogCapture::start();
             let outcome =
                 futures::executor::block_on(integration.handle(&settings, &services, req));
 
             expectation.assert_outcome("GTM beacon", &outcome);
             upstream.assert_no_requests();
+            let expected_level = if expectation.expected().is_client_error() {
+                log::Level::Warn
+            } else {
+                log::Level::Error
+            };
+            let records = capture.take_all();
+            assert!(
+                matches!(
+                    records.as_slice(),
+                    [record] if record.level == expected_level
+                        && record.message.starts_with("Rejecting GTM beacon: ")
+                ),
+                "should log the {} case once, at {expected_level}",
+                expectation.name()
+            );
         }
     }
 }
