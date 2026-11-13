@@ -398,7 +398,9 @@ fn trace_browser_workflow_spin() {
 // These cases record how each runtime hands request bodies and methods to
 // Trusted Server today, so later changes can show exactly what moved. They
 // all bind the fixed origin port, so each one holds `ORIGIN_PORT_LOCK` while
-// it runs and stays correct without `--test-threads=1`.
+// it runs. The lock serializes only these cases: other tests in this binary
+// bind the same port without it, so the binary still needs
+// `--test-threads=1`.
 
 /// Largest `/auction` body the handler accepts.
 ///
@@ -415,6 +417,9 @@ const ORIGIN_PASS_THROUGH_STATUS: u16 = 203;
 const INGRESS_FORM_PATH: &str = "/ingress-form";
 
 /// Serializes the ingress cases that bind the fixed origin port.
+///
+/// Only those cases take it. The rest of the binary still relies on
+/// `--test-threads=1` to keep the port free.
 static ORIGIN_PORT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Takes the origin-port lock for the rest of the calling case.
