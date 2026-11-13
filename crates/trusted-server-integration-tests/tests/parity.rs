@@ -778,25 +778,20 @@ async fn spin_auction_ignores_spoofed_forwarded_headers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publisher_proxy_fallback_parity() {
-    // Cookie (Set-Cookie) parity for the publisher proxy requires a live origin.
-    // Without an origin, both adapters return an error (4xx or 5xx). The parity
-    // assertion is that Set-Cookie presence matches across adapters regardless of
-    // whether the proxy succeeds.
+    // Every adapter's scripted client fails the publisher origin request, so
+    // all three answer the fallback with an error. The parity assertion is that
+    // the status and the Set-Cookie presence match exactly across adapters.
     let (axum_status, axum_headers) = axum_get("/").await;
     let (cf_status, cf_headers) = cf_get("/").await;
     let (spin_status, spin_headers) = spin_get("/").await;
 
-    // Axum and Cloudflare must agree on the exact fallback outcome. Spin uses
-    // a different HTTP client, so until a live origin is configured the parity
-    // guard only requires it to fail in the same broad class.
     assert_eq!(
         axum_status, cf_status,
         "publisher fallback status must match exactly: axum={axum_status} cf={cf_status}"
     );
     assert_eq!(
-        cf_status >= 500,
-        spin_status >= 500,
-        "publisher fallback 5xx behaviour must match: cf={cf_status} spin={spin_status}"
+        cf_status, spin_status,
+        "publisher fallback status must match exactly: cf={cf_status} spin={spin_status}"
     );
 
     let axum_has_cookie = axum_headers.contains_key("set-cookie");
