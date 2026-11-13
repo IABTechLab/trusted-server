@@ -407,7 +407,10 @@ mod tests {
                 .headers()
                 .get("x-ts-version")
                 .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version as x-ts-version"
         );
     }

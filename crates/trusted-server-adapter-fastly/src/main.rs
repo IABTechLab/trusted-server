@@ -1333,7 +1333,10 @@ mod tests {
 
         assert_eq!(
             response.get_header_str("x-ts-version"),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version on /health"
         );
         assert!(
@@ -1480,7 +1483,10 @@ mod tests {
         );
         assert_eq!(
             asset_header("x-ts-version"),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should apply the version header"
         );
         assert_eq!(

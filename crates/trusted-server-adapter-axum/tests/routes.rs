@@ -1140,7 +1140,7 @@ async fn health_reports_git_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|v| v.to_str().ok()),
-        trusted_server_core::constants::TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should report the compiled-in git version on /health"
     );
     server.assert_no_outbound_requests();

@@ -937,7 +937,10 @@ mod tests {
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
         assert_eq!(
             header("x-ts-version"),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version as x-ts-version"
         );
         assert_eq!(
