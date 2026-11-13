@@ -475,11 +475,13 @@ re-checks each item at the PR's current head before posting.
   (ID-2, AX-4). #1537: do not port its Axum celld store or storage selection,
   which EdgeZero's providers and logical stores replace (EZI-2b, DEC-16); its
   example config also breaks startup on Axum, Cloudflare and Spin. #1539: fix
-  the failing Axum test. #1540: trust IPv6 CloudFront ranges, turn geo on, key
-  the DynamoDB table by partition instead of the one partition key and one
-  allocator item its IAM policy allows (AX-4), and add an example rate-based
-  rule at the load balancer (AX-3, AX-6, DEC-11). All units: replace `TS_*`
-  names (AX-2). #1541: drop the commits of closed #1545.
+  the failing Axum test. #1540: trust IPv6 CloudFront ranges, keep the geo its
+  example inputs select but bind it through EdgeZero's manifest (EZI-4a) instead
+  of `TS_NATIVE_GEO_PROFILE_TOML`, key the DynamoDB table by partition instead
+  of the one partition key and one allocator item its IAM policy allows (AX-4),
+  and add an example rate-based rule at the load balancer (AX-3, AX-6, DEC-11).
+  All units: replace `TS_*` names (AX-2). #1541: drop the commits of closed
+  #1545.
 - **Proposed closures.** #1527 once its tests move (DEC-1); #1528 once #1531
   carries A1; #1533 and #1534, the RC copies of #1525 and #1526; #1535, #1536
   and #1537 once T19, T20, A2 and A8 carry their code and tests; #1310, which

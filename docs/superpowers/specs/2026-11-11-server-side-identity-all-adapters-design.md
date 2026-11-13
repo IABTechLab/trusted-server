@@ -176,7 +176,9 @@ marks the record contract and geo as supported.
   geo; a trusted IPv6 CloudFront hop is accepted; the reference deployment
   applies with geo on. State: IABTechLab/edgezero#409, IABTechLab/edgezero#439
   and #1532 accept IPv6; the reference Terraform in #1540 trusts IPv4 ranges
-  only and leaves geo off.
+  only. At `db1ba337a` its example inputs turn on a CloudFront front door with
+  geo, which reaches the application through `TS_NATIVE_GEO_PROFILE_TOML` rather
+  than EdgeZero's geo binding (EZI-4a).
 - **AX-4 Record store fit for production.** Writes are spread across partition
   keys by listing prefix: an EC row's partition is its IP hash, and a
   withdrawal marker's is the marker prefix and its EC ID, so no item is updated
@@ -201,9 +203,10 @@ marks the record contract and geo as supported.
   applies with those properties, the rate rule refuses traffic over its
   threshold, and with DynamoDB unreachable pages keep serving while identity
   reports degraded. State: #1540 at `db1ba337a` has the 443 egress (IPv4 only),
-  a `/health` check, one task, an opt-in CloudFront front door for geo, and a
-  DynamoDB table whose IAM policy allows one partition key and one allocator
-  item (AX-4); EdgeZero's readiness probe does not poll dependencies.
+  a `/health` check, one task, a CloudFront front door for geo that its example
+  inputs select, and a DynamoDB table whose IAM policy allows one partition key
+  and one allocator item (AX-4); EdgeZero's readiness probe does not poll
+  dependencies.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
   (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists
   only on an RC branch, such as `456313675`, which #1528 pins today. Main may
@@ -842,3 +845,18 @@ between a grant in flight and a later regrant. ID-9 and T20 now keep a waiting
 withdrawal as a barrier that later changes wait behind, and ID-9's Accept adds
 the grant, withdrawal and regrant case. After it, #1516 merged on main and #1540
 and #1541 moved, so Part A, Part C, AX-6 and DEC-6 now record their new state.
+
+### Round 6, 2026-11-13
+
+Review 5885768720 at `de7b2268c`, a merge of main onto `3bbd297ed`, accepted
+and resolved threads 40 and 58, so all 103 were resolved, found nothing new
+and gave an APPROVE verdict. `403a62a5f` then recorded #1516's merge and the
+moved #1540 and #1541, which moved the head past that verdict.
+
+### Round 7, 2026-11-13
+
+Review 5885982220 at `403a62a5f` kept all 103 resolutions and opened one
+should-fix, thread 104: at its new head #1540's example inputs already select
+CloudFront geo, so AX-3's State and Part C's "turn geo on" were stale. Both
+now describe that head, and Part C asks #1540 to bind geo through EdgeZero's
+manifest (EZI-4a) instead of `TS_NATIVE_GEO_PROFILE_TOML`.
