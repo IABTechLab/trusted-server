@@ -1,30 +1,29 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr as _;
-use std::sync::Arc;
 
 use base64::Engine as _;
 use edgezero_core::body::Body as EdgeBody;
-use http::{Request, header};
+use http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 
-use super::test_executor::execute_standard_fixture;
 use super::*;
 use crate::auction::plan::{
     AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
     ProviderConfig, ProviderId, RoutingMode,
 };
 use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
+use crate::auction::routing::RoutedAuction;
 use crate::auction::routing::route_auction;
 use crate::auction::test_support::canonical_parity_auction_request;
+use crate::auction::types::AuctionResponse;
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, ConsentSource};
-use crate::platform::PlatformHttpClient;
 use crate::platform::test_support::{
-    HashMapConfigStore, HashMapSecretStore, NoopHttpClient, StubBackend, StubHttpClient,
-    build_services_with_backend_and_http_client, build_services_with_config_secret_and_http_client,
+    HashMapConfigStore, HashMapSecretStore, build_services_with_config_and_secret,
 };
 use crate::request_signing::RequestSigner;
+use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
 
 fn config(profile: &str, profile_config: Value) -> AuctionPlanConfig {
     config_with_endpoint(
@@ -164,10 +163,9 @@ fn deterministic_signer() -> RequestSigner {
             .encode([7_u8; 32])
             .into_bytes(),
     );
-    let services = build_services_with_config_secret_and_http_client(
+    let services = build_services_with_config_and_secret(
         HashMapConfigStore::new(config_data),
         HashMapSecretStore::new(secret_data),
-        Arc::new(NoopHttpClient),
     );
     RequestSigner::from_services(&services).expect("should load deterministic signer")
 }
@@ -1388,105 +1386,116 @@ fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
     );
 }
 
-#[test]
-fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect() {
-    futures::executor::block_on(async {
-        let (plan, routed, request) = standard_fixture();
-        let provider = &plan.providers()[0];
-        let client = Arc::new(StubHttpClient::new());
-        client.push_response(
-            200,
-            serde_json::to_vec(&json!({"id":"mismatch","seatbid":[{"seat":"fictional-seat","bid":[
-                {"id":"good","impid":"fictional-slot","price":1.25,"adm":"<div>fictional</div>","w":300,"h":250},
-                {"id":"bad","impid":"fictional-slot","price":null,"adm":"bad","w":300,"h":250}
-            ]}]})).expect("should serialize response"),
-        );
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            client.as_ref(),
-        )
+/// Builds, sends, and parses one request through the real provider and a scripted client.
+///
+/// The client answers the provider's endpoint with `reply`, and the parsed response comes
+/// back with the client so the test can read what was sent.
+async fn execute_through_provider(
+    plan: &AuctionPlan,
+    routed: &RoutedAuction,
+    reply: ScriptedReply,
+) -> (AuctionResponse, ScriptedHttpClient) {
+    let provider_plan = plan.providers()[0].clone();
+    let provider = GenericOpenRtbProvider::new(provider_plan.clone());
+    let client = ScriptedHttpClient::new(&TestClock::new());
+    client.respond_to(Method::POST, provider_plan.endpoint.as_str(), reply);
+    let ProviderRequestOutcome::Ready {
+        request,
+        parse_state,
+    } = provider
+        .request_bids_routed(&routed.inputs()[0], routed, 321, None)
+        .expect("should build one provider request")
+    else {
+        panic!("should build an unsent provider request");
+    };
+    let response = client
+        .http_client()
+        .send(request)
         .await
-        .expect("should execute ordinary fixture");
+        .expect("should answer the provider request");
+    let parsed = provider
+        .parse_response_with_state(response, 0, parse_state.as_deref())
+        .await
+        .expect("should parse the provider response");
+    (parsed, client)
+}
+
+#[test]
+fn standard_provider_covers_bid_no_bid_malformed_unused_and_redirect() {
+    futures::executor::block_on(async {
+        let (plan, routed, _request) = standard_fixture();
+        let endpoint = plan.providers()[0].endpoint.as_str().to_owned();
+        let (response, client) = execute_through_provider(
+            &plan,
+            &routed,
+            ScriptedReply::status(StatusCode::OK).body(
+                serde_json::to_vec(&json!({"id":"mismatch","seatbid":[{"seat":"fictional-seat","bid":[
+                    {"id":"good","impid":"fictional-slot","price":1.25,"adm":"<div>fictional</div>","w":300,"h":250},
+                    {"id":"bad","impid":"fictional-slot","price":null,"adm":"bad","w":300,"h":250}
+                ]}]})).expect("should serialize response"),
+            ),
+        )
+        .await;
         assert_eq!(response.status, BidStatus::Success);
         assert_eq!(response.bids.len(), 1, "should isolate malformed sibling");
         assert_eq!(
             response.metadata["routing"]["unused_bidder_params_count"],
             1
         );
+        let sent = client.requests();
         assert_eq!(
-            client.recorded_request_uris(),
-            vec![provider.endpoint.as_str()]
+            sent.iter()
+                .map(|request| request.uri.to_string())
+                .collect::<Vec<_>>(),
+            vec![endpoint.clone()]
         );
-        let headers = &client.recorded_request_headers()[0];
         assert!(
-            !headers.iter().any(|(name, _)| name == "authorization"),
-            "fixture must add no authentication"
+            !sent[0].headers.contains_key(header::AUTHORIZATION),
+            "should add no authentication"
         );
-        let body: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
-            .expect("should parse recorded body");
+        let body: Value =
+            serde_json::from_slice(&sent[0].body).expect("should parse recorded body");
         assert_eq!(body["ext"]["fixture"], true, "should send static extension");
 
-        let no_bid = Arc::new(StubHttpClient::new());
-        no_bid.push_response(204, Vec::new());
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            no_bid.as_ref(),
+        let (response, _client) = execute_through_provider(
+            &plan,
+            &routed,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
         )
-        .await
-        .expect("should execute no-bid fixture");
+        .await;
         assert_eq!(response.status, BidStatus::NoBid);
 
-        let malformed = Arc::new(StubHttpClient::new());
-        malformed.push_response(200, b"not-json".to_vec());
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            malformed.as_ref(),
+        let (response, _client) = execute_through_provider(
+            &plan,
+            &routed,
+            ScriptedReply::status(StatusCode::OK).body("not-json"),
         )
-        .await
-        .expect("should classify malformed response");
+        .await;
         assert_eq!(response.status, BidStatus::Error);
         assert_eq!(response.metadata["error_type"], "parse_response");
 
-        let redirect = Arc::new(StubHttpClient::new());
-        redirect.push_response_with_headers(
-            302,
-            Vec::new(),
-            vec![("location", "https://redirect.example.test/openrtb")],
-        );
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            redirect.as_ref(),
+        let (response, redirect) = execute_through_provider(
+            &plan,
+            &routed,
+            ScriptedReply::status(StatusCode::FOUND)
+                .header("location", "https://redirect.example.test/openrtb"),
         )
-        .await
-        .expect("should classify redirect");
+        .await;
         assert_eq!(response.status, BidStatus::Error);
         assert_eq!(response.metadata["error_type"], "http_status");
         assert_eq!(response.metadata["http_status"], 302);
+        let sent = redirect.requests();
         assert_eq!(
-            redirect.recorded_request_uris(),
-            vec![provider.endpoint.as_str()],
+            sent.iter()
+                .map(|request| request.uri.to_string())
+                .collect::<Vec<_>>(),
+            vec![endpoint],
             "a 3xx Location must not trigger a second HTTP request"
         );
         assert_eq!(
-            redirect.recorded_backend_names(),
-            vec!["stub-backend"],
-            "the common driver must perform exactly one underlying send for a 3xx"
+            sent[0].host_authority, "exchange.example.test",
+            "should send the request to the provider's own authority"
         );
-        let spec = provider.backend_spec();
-        assert_eq!(spec.host, "exchange.example.test");
-        assert_eq!(spec.discriminator.as_deref(), Some("fictional-provider"));
     });
 }
 
@@ -1511,47 +1520,27 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
                 .body(EdgeBody::empty())
                 .expect("should build inbound request");
             let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
-            let provider_plan = plan.providers()[0].clone();
-            let provider = GenericOpenRtbProvider::new(provider_plan.clone());
-            let client = Arc::new(StubHttpClient::new());
-            client.push_response(204, Vec::new());
-            let services = build_services_with_backend_and_http_client(
-                Arc::new(StubBackend),
-                Arc::clone(&client) as Arc<dyn PlatformHttpClient>,
+
+            let (response, client) = execute_through_provider(
+                &plan,
+                &routed,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            )
+            .await;
+
+            let sent = client.requests();
+            assert_eq!(sent.len(), 1, "should send exactly one request");
+            assert_eq!(
+                response.provider, "fictional-provider",
+                "should parse the provider response"
             );
-            let mut reserved_backend_names = HashSet::new();
-
-            let outcome = provider
-                .request_bids_routed(
-                    &routed.inputs()[0],
-                    &routed,
-                    321,
-                    321,
-                    None,
-                    &services,
-                    &mut reserved_backend_names,
-                )
-                .await
-                .expect("should launch one Prebid Server request");
-            let ProviderRequestOutcome::Pending { request, .. } = outcome else {
-                panic!("should launch a pending Prebid Server request");
-            };
-            let selected = services
-                .http_client()
-                .select(vec![request])
-                .await
-                .expect("should select one Prebid Server response");
-            let response = selected
-                .ready
-                .expect("should receive the Prebid Server response");
-
-            assert_eq!(response.response.status(), http::StatusCode::NO_CONTENT);
-            assert_eq!(client.recorded_backend_names(), vec!["stub-backend"]);
-            assert_eq!(client.recorded_request_methods(), vec!["POST"]);
-            assert_eq!(client.recorded_request_uris(), vec![expected_endpoint]);
-            assert_eq!(provider_plan.backend_spec().host, "pbs.example");
-            let body: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
-                .expect("should parse recorded Prebid Server body");
+            assert_eq!(
+                (sent[0].method.as_str(), sent[0].uri.to_string()),
+                ("POST", expected_endpoint.to_owned())
+            );
+            assert_eq!(sent[0].host_authority, "pbs.example");
+            let body: Value =
+                serde_json::from_slice(&sent[0].body).expect("should parse recorded body");
             assert!(
                 !body
                     .as_object()

@@ -2,20 +2,23 @@
 
 use core::any::Any;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::{
+    OutboundCachePolicy, OutboundRequest, OutboundResponse, ResponseDecoding,
+};
 use error_stack::{Report, ResultExt as _};
-use http::{Method, Request, StatusCode, header};
+use http::header::HeaderValue;
+use http::{Method, StatusCode, header};
 use serde_json::{Value, json};
 
 use crate::integrations::aps::{ApsDebugRequest, parse_planned_aps_response};
 use crate::integrations::prebid::{apply_prebid_transport_headers, parse_planned_prebid_response};
 
 use crate::error::TrustedServerError;
-use crate::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
-};
+use crate::integrations::UPSTREAM_RTB_MAX_RESPONSE_BYTES;
+use crate::outbound::{OutboundRequestSource, buffered, outbound_error, outbound_request};
 use crate::request_signing::{RequestSigner, SigningParams};
 
 use super::openrtb::{
@@ -27,7 +30,21 @@ use super::profile::CompiledOpenRtbProfile;
 use super::routing::{ProviderAuctionInput, RoutedAuction};
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
-const MAX_PLANNED_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Response cap for a Standard-profile bidder request.
+const STANDARD_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// The response cap for a bidder request with `profile`.
+///
+/// Prebid Server and APS keep the 2 MiB RTB cap
+/// ([`UPSTREAM_RTB_MAX_RESPONSE_BYTES`]), and Standard keeps 1 MiB.
+fn response_cap(profile: &CompiledOpenRtbProfile) -> u64 {
+    match profile {
+        CompiledOpenRtbProfile::Standard(_) => STANDARD_MAX_RESPONSE_BYTES,
+        CompiledOpenRtbProfile::PrebidServer(_) | CompiledOpenRtbProfile::Aps(_) => {
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES
+        }
+    }
+}
 
 fn attach_provider_routing_metadata(
     response: &mut AuctionResponse,
@@ -44,11 +61,15 @@ fn attach_provider_routing_metadata(
 pub type ProviderParseState = Box<dyn Any + Send + Sync>;
 
 /// Result of asking a provider to start a bid request.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the outcome moves once from the provider to the orchestrator, so boxing the request would only add an allocation"
+)]
 pub enum ProviderRequestOutcome {
-    /// An upstream request is in flight and must be awaited by the orchestrator.
-    Pending {
-        /// Platform-specific pending request handle.
-        request: PlatformPendingRequest,
+    /// An upstream request built and unsent, which the orchestrator sends.
+    Ready {
+        /// The request, with its transport settings, ready for `EdgeZero`'s client.
+        request: OutboundRequest,
         /// Optional provider-local state consumed when the response is parsed.
         parse_state: Option<ProviderParseState>,
     },
@@ -57,22 +78,19 @@ pub enum ProviderRequestOutcome {
 }
 
 impl ProviderRequestOutcome {
-    /// Wrap an ordinary pending provider request without parse state.
+    /// Wrap an unsent provider request without parse state.
     #[must_use]
-    pub fn pending(request: PlatformPendingRequest) -> Self {
-        Self::Pending {
+    pub fn ready(request: OutboundRequest) -> Self {
+        Self::Ready {
             request,
             parse_state: None,
         }
     }
 
-    /// Wrap a pending provider request with provider-local parse state.
+    /// Wrap an unsent provider request with provider-local parse state.
     #[must_use]
-    pub fn pending_with_state(
-        request: PlatformPendingRequest,
-        parse_state: ProviderParseState,
-    ) -> Self {
-        Self::Pending {
+    pub fn ready_with_state(request: OutboundRequest, parse_state: ProviderParseState) -> Self {
+        Self::Ready {
             request,
             parse_state: Some(parse_state),
         }
@@ -88,20 +106,17 @@ pub trait AuctionProvider: Send + Sync {
     /// return their owned operator-defined [`super::plan::ProviderId`].
     fn provider_name(&self) -> &str;
 
-    /// Submit a bid request to this provider.
+    /// Build a bid request for this provider, without sending it.
     ///
-    /// Implementations normally return a pending upstream request, but may return
-    /// an immediate response for a legitimate outcome that requires no HTTP call.
-    /// The orchestrator handles waiting for and parsing pending responses.
-    /// Outbound auction and mediator requests must use
-    /// [`PlatformHttpRequest::with_cache_bypass`]: they carry personalized data,
-    /// and Fastly requires this marker for deadline-bounded collection.
+    /// Implementations normally return [`ProviderRequestOutcome::Ready`], but may
+    /// return an immediate response for a legitimate outcome that requires no
+    /// HTTP call. The orchestrator sends the request and parses its response.
+    /// Auction and mediator requests set [`OutboundCachePolicy::Bypass`],
+    /// because they carry personalized data.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request cannot be created or if the provider endpoint
-    /// cannot be reached (though usually network errors happen while the returned
-    /// [`PlatformPendingRequest`] is polled).
+    /// Returns an error if the request cannot be built.
     async fn request_bids(
         &self,
         request: &AuctionRequest,
@@ -110,16 +125,14 @@ pub trait AuctionProvider: Send + Sync {
 
     /// Parse the response from the provider into an `AuctionResponse`.
     ///
-    /// Called by the orchestrator after the [`PlatformPendingRequest`] completes.
-    /// Declared async so implementations can safely drain streaming response bodies
-    /// without panicking on the `Body::Stream` variant.
+    /// Called by the orchestrator once the provider's request completes.
     ///
     /// # Errors
     ///
     /// Returns an error if the response cannot be parsed into a valid `AuctionResponse`.
     async fn parse_response(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>>;
 
@@ -136,7 +149,7 @@ pub trait AuctionProvider: Send + Sync {
     /// Returns an error if the response cannot be parsed into a valid [`AuctionResponse`].
     async fn parse_response_with_context(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
@@ -155,7 +168,7 @@ pub trait AuctionProvider: Send + Sync {
     /// Returns an error if the response cannot be parsed into a valid [`AuctionResponse`].
     async fn parse_response_with_context_and_state(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
@@ -178,17 +191,6 @@ pub trait AuctionProvider: Send + Sync {
     /// Check if this provider is enabled.
     fn is_enabled(&self) -> bool {
         true
-    }
-
-    /// Return the backend name used by this provider for request routing.
-    ///
-    /// `timeout_ms` is the effective timeout that will be used when the backend
-    /// is registered in [`request_bids`](Self::request_bids).  It must be
-    /// forwarded to [`crate::platform::PlatformBackend::predict_name`] through
-    /// `services` so the predicted name matches the actual platform backend
-    /// registration.
-    fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-        None
     }
 }
 
@@ -257,28 +259,25 @@ impl GenericOpenRtbProvider {
         Box::new(state)
     }
 
-    /// Build, register, and start exactly one routed provider request.
+    /// Build exactly one routed provider request, unsent.
     ///
     /// The public [`AuctionProvider::request_bids`] seam cannot carry a
     /// [`ProviderAuctionInput`], the complete [`RoutedAuction`], or an
     /// auction-local [`RequestSigner`] without shared mutable provider state.
-    /// The plan-backed split dispatcher therefore supplies that explicit
-    /// execution context here, while this method reuses
-    /// [`ProviderRequestOutcome`] and [`ProviderParseState`] for the existing
-    /// request/parse token boundary.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the internal driver keeps routed inputs, both budgets, signer, services, and collision state explicit"
-    )]
-    pub(crate) async fn request_bids_routed(
+    /// The plan-backed dispatcher therefore supplies that explicit execution
+    /// context here, while this method reuses [`ProviderRequestOutcome`] and
+    /// [`ProviderParseState`] for the request and parse token boundary.
+    ///
+    /// The request carries the configured provider timeout, never the
+    /// remaining auction budget, which only `logical_budget_ms` and the batch
+    /// cutoff reflect. Its response is buffered under the profile's
+    /// [`response_cap`] and decoded.
+    pub(crate) fn request_bids_routed(
         &self,
         input: &ProviderAuctionInput,
         routed: &RoutedAuction,
         logical_budget_ms: u32,
-        transport_timeout_ms: u32,
         signer: Option<&RequestSigner>,
-        services: &RuntimeServices,
-        reserved_backend_names: &mut HashSet<String>,
     ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
         let signing_params = SigningParams::new(
             input.common_request().id.clone(),
@@ -304,100 +303,57 @@ impl GenericOpenRtbProvider {
             }
         };
 
-        let spec = self
-            .plan
-            .backend_spec_with_transport_timeout(transport_timeout_ms);
-        let predicted_name =
-            services
-                .backend()
-                .predict_name(&spec)
-                .change_context(TrustedServerError::Auction {
-                    message: format!(
-                        "Provider {} backend prediction failed",
-                        self.provider_name()
-                    ),
-                })?;
-        let backend_name =
-            services
-                .backend()
-                .ensure(&spec)
-                .change_context(TrustedServerError::Auction {
-                    message: format!(
-                        "Provider {} backend registration failed",
-                        self.provider_name()
-                    ),
-                })?;
-        if backend_name != predicted_name {
-            return Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Provider {} backend registration did not match prediction",
-                    self.provider_name()
-                ),
-            }));
-        }
-        if !reserved_backend_names.insert(backend_name.clone()) {
-            return Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Provider {} resolved an actual backend name already owned by another provider",
-                    self.provider_name()
-                ),
-            }));
-        }
-
         let body = serde_json::to_vec(&request).change_context(TrustedServerError::Auction {
             message: format!(
                 "Provider {} request serialization failed",
                 self.provider_name()
             ),
         })?;
-        let mut outbound = Request::builder()
-            .method(Method::POST)
-            .uri(self.plan.endpoint.as_str())
-            .header(header::CONTENT_TYPE, "application/json");
-        if matches!(&self.plan.profile, CompiledOpenRtbProfile::Standard(_)) {
-            outbound = outbound.header(header::ACCEPT, "application/json");
-        }
+        let target =
+            outbound_request(Method::POST, self.plan.endpoint.as_str()).map_err(|error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Auction {
+                        message: format!(
+                            "Provider {} request construction failed",
+                            self.provider_name()
+                        ),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            })?;
         let aps_debug_body = matches!(
             &self.plan.profile,
             CompiledOpenRtbProfile::Aps(profile) if profile.debug
         )
         .then(|| body.clone());
-        let mut outbound =
+        let mut outbound = buffered(
+            target,
+            Duration::from_millis(u64::from(self.plan.timeout_ms)),
+            response_cap(&self.plan.profile),
+            ResponseDecoding::Decode,
+        )
+        .cache_policy(OutboundCachePolicy::Bypass)
+        .body(body);
+        outbound.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if matches!(&self.plan.profile, CompiledOpenRtbProfile::Standard(_)) {
             outbound
-                .body(EdgeBody::from(body))
-                .change_context(TrustedServerError::Auction {
-                    message: format!(
-                        "Provider {} request construction failed",
-                        self.provider_name()
-                    ),
-                })?;
+                .headers_mut()
+                .insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        }
         let aps_debug_request = aps_debug_body
             .as_deref()
             .map(|body| ApsDebugRequest::capture(body, outbound.headers()));
         if let CompiledOpenRtbProfile::PrebidServer(profile) = &self.plan.profile {
             apply_prebid_transport_headers(
                 routed.prebid_transport_headers(),
-                &mut outbound,
+                outbound.headers_mut(),
                 profile.consent_forwarding,
                 routed.attested_client_ip(),
             );
-        }
-        let pending = services
-            .http_client()
-            .send_async(
-                PlatformHttpRequest::new(outbound, backend_name.clone()).with_cache_bypass(),
-            )
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: format!("Provider {} request launch failed", self.provider_name()),
-            })?;
-        if pending.backend_name() != Some(backend_name.as_str()) {
-            return Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Provider {} pending request backend did not match registered backend",
-                    self.provider_name()
-                ),
-            }));
         }
         let parse_state = match &self.plan.profile {
             CompiledOpenRtbProfile::Standard(_) => GenericOpenRtbParseState::Standard {
@@ -428,8 +384,8 @@ impl GenericOpenRtbProvider {
                 debug_request: aps_debug_request,
             },
         };
-        Ok(ProviderRequestOutcome::pending_with_state(
-            pending,
+        Ok(ProviderRequestOutcome::ready_with_state(
+            outbound,
             Box::new(parse_state),
         ))
     }
@@ -437,7 +393,7 @@ impl GenericOpenRtbProvider {
     /// Parse a response using state created by this exact provider instance.
     pub(crate) async fn parse_response_with_state(
         &self,
-        response: PlatformResponse,
+        response: OutboundResponse,
         response_time_ms: u64,
         parse_state: Option<&(dyn Any + Send + Sync)>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
@@ -548,7 +504,6 @@ impl GenericOpenRtbProvider {
             return Ok(parsed);
         }
 
-        let response = response.response;
         let status = response.status();
         let GenericOpenRtbParseState::Standard { input, .. } = parse_state else {
             unreachable!("profile-specific states are handled before standard parsing");
@@ -573,11 +528,16 @@ impl GenericOpenRtbProvider {
         }
 
         let body = response
-            .into_body()
-            .into_bytes_bounded(MAX_PLANNED_RESPONSE_BYTES)
+            .into_bytes_bounded(STANDARD_MAX_RESPONSE_BYTES)
             .await
-            .change_context(TrustedServerError::Auction {
-                message: format!("Provider {} response body failed", self.provider_name()),
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Auction {
+                        message: format!("Provider {} response body failed", self.provider_name()),
+                    },
+                    OutboundRequestSource::Internal,
+                )
             })?;
         let value: Value = match serde_json::from_slice(&body) {
             Ok(value) => value,

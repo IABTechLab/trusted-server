@@ -148,11 +148,10 @@ link it in the description, and mark it ready for review again.
 
 ## Fastly dependency updates
 
-Update the workspace `fastly` and `fastly-sys` dependencies together. The
-Fastly deadline collector uses raw asynchronous I/O readiness calls from
-`fastly-sys` with handles created by `fastly`, so both must use a compatible
-SDK ABI. Check the resolved versions in `Cargo.lock` and run the Fastly
-adapter tests, including the real deadline network fixture, after an SDK update.
+After a workspace `fastly` update, check that `Cargo.lock` resolves one
+`fastly` version for Trusted Server and `edgezero-adapter-fastly`, then run
+the Fastly adapter tests, including the real deadline network fixture
+(`crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs`).
 
 ## Verify
 

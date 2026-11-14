@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::asset_image_optimizer::image_optimizer_region;
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
@@ -24,7 +25,6 @@ use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
-use crate::platform::PlatformImageOptimizerRegion;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -178,6 +178,19 @@ impl Publisher {
         "replace-with-random-proxy-secret",
     ];
 
+    /// Drops `origin_host_header_override` on Spin, with a warning.
+    ///
+    /// Spin sends the origin URI authority as `Host` and cannot override it, so
+    /// the Spin adapter calls this when it loads settings. A config that sets
+    /// the override keeps serving there, with the URI authority.
+    pub fn drop_origin_host_header_override_for_spin(&mut self) {
+        if self.origin_host_header_override.take().is_some() {
+            log::warn!(
+                "publisher.origin_host_header_override is ignored on Spin; the origin receives its URI authority as Host"
+            );
+        }
+    }
+
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
     /// Per spec §5.2, EC cookies derive their domain from
@@ -297,14 +310,6 @@ impl Publisher {
         self.public_origin
             .clone()
             .unwrap_or_else(|| format!("https://{}", self.domain))
-    }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
     }
 }
 
@@ -1191,7 +1196,7 @@ impl AssetImageOptimizerConfig {
                         .to_string(),
             }));
         }
-        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+        if image_optimizer_region(&self.region).is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "proxy.asset_routes image_optimizer region `{}` is not supported",
@@ -1967,9 +1972,7 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Enable TLS certificate verification when proxying to HTTPS origins.
-    /// Defaults to true for secure production use.
-    /// Set to false for local development with self-signed certificates.
+    /// Must be true. Origin TLS is always verified.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the
@@ -6534,8 +6537,8 @@ origin_host_header_override = "www.example.com:8443""#,
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
-            "www.example.com:8443",
+            settings.publisher.origin_host_header_override.as_deref(),
+            Some("www.example.com:8443"),
             "should use configured host header override"
         );
     }
@@ -7394,7 +7397,6 @@ source_domain = "partner.example.com"
                 settings.publisher.origin_host_header_override.as_deref(),
                 Some("www.example.com")
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
@@ -7502,40 +7504,6 @@ source_domain = "partner.example.com"
             allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            public_origin: None,
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            public_origin: None,
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]

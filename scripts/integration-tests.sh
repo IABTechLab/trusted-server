@@ -10,6 +10,10 @@
 #   - Viceroy installed: cargo install viceroy --version 0.21.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #
+# The Spin runtime cases are skipped unless a test filter names one, as CI's
+# main integration job skips them. Naming one also needs the Spin CLI pinned in
+# .tool-versions, and the script then builds the production Spin component.
+#
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,6 +27,7 @@ NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 TEST_ARGS=("$@")
 SKIP_DUPLICATE_HELPERS=true
 TRACE_RUNTIME_REQUESTED=false
+SPIN_RUNTIME_REQUESTED=false
 TRACE_SKIP_VALUE=false
 
 if [ -z "$NODE_VERSION" ]; then
@@ -47,6 +52,9 @@ for arg in "$@"; do
         trace_browser_workflow*|trace_runtime_boundary*)
             TRACE_RUNTIME_REQUESTED=true
             ;;
+        multi_provider_auction_runs_spin|spin_runtime_*|navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin|publisher_head_and_conditional_304_return_real_status_spin)
+            SPIN_RUNTIME_REQUESTED=true
+            ;;
     esac
 done
 
@@ -59,6 +67,21 @@ if [ "$TRACE_RUNTIME_REQUESTED" = false ]; then
     TEST_ARGS=(--skip trace_browser_workflow --skip trace_runtime_boundary "${TEST_ARGS[@]}")
 fi
 
+# The Spin runtime cases run against the production Spin component, so they are
+# opt-in too. These are the skips CI's main integration job passes.
+if [ "$SPIN_RUNTIME_REQUESTED" = false ]; then
+    TEST_ARGS=(
+        --skip multi_provider_auction_runs_spin
+        --skip spin_runtime_
+        --skip navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin
+        --skip publisher_head_and_conditional_304_return_real_status_spin
+        "${TEST_ARGS[@]}"
+    )
+elif ! command -v spin >/dev/null 2>&1; then
+    echo "The Spin runtime cases need the Spin CLI pinned in .tool-versions" >&2
+    exit 1
+fi
+
 # Detect native target from rustc (handles all OS + arch combinations correctly)
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 if [ -z "$TARGET" ]; then
@@ -69,11 +92,15 @@ fi
 echo "==> Building WASM binary..."
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+if [ "$SPIN_RUNTIME_REQUESTED" = true ]; then
+    echo "==> Building the production Spin component..."
+    cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+fi
+
 echo "==> Building Axum native binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
 TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY="integration-test-secret-key" \
-TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build -p trusted-server-adapter-axum
 
 echo "==> Generating Viceroy configs..."

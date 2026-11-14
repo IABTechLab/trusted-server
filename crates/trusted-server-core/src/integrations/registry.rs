@@ -260,9 +260,10 @@ impl IntegrationEndpoint {
 ///
 /// `Send + Sync` bounds are required so trait objects can be stored in
 /// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
-/// request context. The `?Send` on the async methods is intentional — see the
-/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
-/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// request context. The `?Send` on the async methods is intentional:
+/// [`edgezero_core::body::Body`] wraps a `LocalBoxStream`, which is `!Send` for
+/// wasm32 compatibility, so the futures that carry request bodies cannot be
+/// `Send`. On wasm32 these bounds are compatible because the runtime is
 /// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {

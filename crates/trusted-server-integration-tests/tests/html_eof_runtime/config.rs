@@ -79,6 +79,16 @@ pub(super) fn fixture_config(
         "html_finalization_timeout_ms".to_owned(),
         Value::Integer(750),
     );
+    let (operator_name, operator_value) = super::OPERATOR_HEADER;
+    let mut response_headers = toml::map::Map::new();
+    response_headers.insert(
+        operator_name.to_owned(),
+        Value::String(operator_value.to_owned()),
+    );
+    table(&mut value, &[])?.insert(
+        "response_headers".to_owned(),
+        Value::Table(response_headers),
+    );
     replace(
         &mut value,
         &["auction", "enabled"],

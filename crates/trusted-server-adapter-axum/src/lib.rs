@@ -4,9 +4,12 @@
 //! the Fastly Compute adapter (via Viceroy). All routes and middleware mirror
 //! the Fastly adapter; store and geo primitives fall back to env vars and no-ops.
 
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
-/// Platform-trait implementations backed by env vars and `reqwest`.
+/// Platform-trait implementations backed by env vars.
 pub mod platform;

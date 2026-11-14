@@ -21,28 +21,22 @@ reusable-sandbox = []
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 derive_more = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 esi = { workspace = true }
 fastly = { workspace = true }
-# The SDK keeps timed body readiness private; auction deadlines use the ABI.
-fastly-sys = { workspace = true }
-fern = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
-log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
-url = { workspace = true }
 urlencoding = { workspace = true }
-web-time = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+edgezero-adapter-fastly = { workspace = true, features = ["fastly", "test-utils"] }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
