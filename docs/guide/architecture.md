@@ -59,7 +59,8 @@ Native Axum dev/test adapter (native binary):
 | Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
 | Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
-| Auction fan-out ordering                   | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking                                                     |
+| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                              |
+| Startup failure                            | The process exits non-zero before it listens                                                                                                                                                     |
 
 ### trusted-server-adapter-spin
 
@@ -67,8 +68,12 @@ Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
 - Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
-- Outbound HTTP via `spin_sdk::http::send` — no configurable per-request timeout (see rustdoc)
-- Single auction provider only; enabled multi-provider plans fail target validation at startup
+- Outbound HTTP through EdgeZero's Spin client, which cannot override the
+  `Host` authority, so Spin ignores `publisher.origin_host_header_override`
+  with a warning
+- Logs to the component's stderr through EdgeZero's managed backend, at
+  `EDGEZERO__LOGGING__LEVEL` (default `info`)
+- Multi-provider auctions fan out as one EdgeZero request batch
 
 ```bash
 # Check (native)
@@ -95,14 +100,17 @@ cargo clippy-spin-wasm
 Core request and response values use the standard `http` types with
 `edgezero_core::body::Body`. Runtime-specific capabilities are supplied through
 `RuntimeServices`, which holds trait objects for configuration and secret
-stores, KV access, dynamic backends, outbound HTTP, geographic lookup, template
-assembly, and template caching.
+stores, KV access, geographic lookup, template assembly, and template caching,
+and the request's EdgeZero `HttpClient` and `MonotonicClock`.
 
-The contracts live under `trusted_server_core::platform`, including
-`PlatformConfigStore`, `PlatformSecretStore`, `PlatformBackend`,
-`PlatformHttpClient`, `PlatformGeo`, `PlatformTemplateAssembler`, and
-`PlatformTemplateCache`. Each adapter constructs the services it supports;
-unavailable capabilities fail through explicit unavailable implementations.
+The store and lookup contracts live under `trusted_server_core::platform`,
+including `PlatformConfigStore`, `PlatformSecretStore`, `PlatformGeo`,
+`PlatformTemplateAssembler`, and `PlatformTemplateCache`. Outbound HTTP has no
+Trusted Server contract: each adapter passes the client that EdgeZero installs
+for the request, with the proxy marker off, and Fastly work after delivery
+builds a fresh EdgeZero client. Each adapter constructs the services it
+supports; unavailable capabilities fail through explicit unavailable
+implementations.
 
 ### Settings-Driven Configuration
 
@@ -168,13 +176,13 @@ Page content and request bodies are processed in-flight and are not persisted. E
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
 
-Fastly and Axum support concurrent auction provider fan-out. Cloudflare and Spin
-currently accept at most one provider in an enabled auction. Every adapter runs
-target-aware fan-out and backend-name checks at startup. Auction collection uses
-an absolute cutoff for network waiting across headers and complete response bodies.
-A nonblocking snapshot retains complete results after a slow origin. Fastly
-abandons pending backend requests because its SDK cannot cancel them; other
-adapters cancel their owned operations at cutoff. See
+Every adapter sends an auction's bidder requests as one EdgeZero request batch
+whose cutoff is the auction deadline, so a multi-provider auction fans out on
+Fastly, Axum, Cloudflare, and Spin alike. Fastly startup also rejects an enabled
+plan that could need more than 160 provider backends. A bid that has not arrived
+by the cutoff becomes a provider timeout. Dropping the batch cancels in-flight
+bidder and mediator requests; host cancellation is best effort on Cloudflare,
+Fastly, and Spin. See
 [Auction timeout behavior](/guide/auction-orchestration#timeout-behavior) for
 scheduling, worker-runtime dispatch, and local processing limitations.
 

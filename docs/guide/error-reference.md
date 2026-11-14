@@ -84,13 +84,14 @@ TOML file.
 **Error Message:**
 
 ```
-provider `pbs-main` endpoint must be an absolute HTTPS URL
+provider `pbs-main` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], with a host and no credentials or fragment
 ```
 
 **Cause:** Malformed auction provider endpoint.
 
 **Solution:** Configure an absolute HTTPS endpoint with a host and no embedded
-credentials or fragment:
+credentials or fragment. Plain HTTP is accepted only for `127.0.0.1` and
+`[::1]`, which local test bidders use:
 
 ```toml
 # ❌ Wrong
@@ -168,24 +169,32 @@ TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 
 ---
 
-### Backend not found
+### Provider request failed
 
 **Error Message:**
 
 ```
-Backend not found: prebid-server
+Planned provider 'pbs-main' request failed: ...
 ```
 
-**Cause:** Dynamic backend creation for a configured provider endpoint failed.
-Provider backends are derived from `[auction.providers.<id>]`; they are not
-manually named static Fastly backends.
+**Cause:** The bidder request did not complete: the connection or TLS
+handshake failed, the provider answered with a protocol error, or Fastly could
+not register the provider's backend. EdgeZero derives Fastly backends from the
+provider endpoint; they are not static Fastly backends. A registration failure
+records `launch_failed` for the provider, and other failures record
+`transport_failed`. The report in this warning carries the provider failure
+detail (`outbound provider failure detail: ...`), which holds closed failure
+codes and no URL.
 
 **Solution:**
 
-- Verify the provider endpoint is canonical HTTPS and reachable from the edge
-- Check the provider ID and target-specific backend-name validation error
-- Check platform backend-count limits
-- Run `ts config validate`, then verify target-aware startup validation on the selected adapter
+- Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
+  valid certificate; origin TLS is always verified
+- Read the `outbound provider failure detail` line in the warning's report
+- On Fastly, check the service's dynamic backend use. Fastly allows 200
+  dynamic backends per service; the auction may use up to 160, and the
+  publisher origin, integrations, and other outbound sites share the rest
+- Run `ts config validate`, then restart the adapter and check its startup log
 
 ---
 
@@ -220,19 +229,34 @@ curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.g
 **Error Message:**
 
 ```
-Upstream request timeout after 1000ms
+Planned provider 'pbs-main' exhausted its response budget
+Planned provider 'pbs-main' exhausted its dispatched auction collection budget
 ```
 
-**Cause:** Upstream service (Prebid Server, Permutive, etc.) didn't respond in time
+Both lines log at `debug`, and the auction response reports the provider as
+timed out.
+
+**Cause:** An auction provider didn't answer in time:
+
+- `exhausted its response budget`: the provider's own `timeout_ms` passed
+  before it answered.
+- `exhausted its dispatched auction collection budget`: the auction deadline,
+  `[auction].timeout_ms` from auction start, passed before it answered.
 
 **Solution:**
 
-1. Increase the affected server provider timeout:
+1. Match the remedy to the log line:
+   - For `exhausted its response budget`, raise that provider's timeout:
 
-```toml
-[auction.providers.pbs-main]
-timeout_ms = 2000
-```
+     ```toml
+     [auction.providers.pbs-main]
+     timeout_ms = 2000
+     ```
+
+   - For `exhausted its dispatched auction collection budget`, raise
+     `[auction].timeout_ms` or check the bidder's latency. A provider timeout
+     longer than the auction timeout does not help, because the auction
+     deadline ends collection first.
 
 Browser `[integrations.prebid].timeout_ms` is independent and does not control
 Prebid Server transport.
@@ -243,7 +267,10 @@ Prebid Server transport.
 curl -w "%{time_total}\n" https://upstream-service.example.com
 ```
 
-3. Check Fastly backend timeout settings
+3. Integration proxies such as Permutive use fixed timeouts that settings do
+   not change: a 1 s connect timeout, and a 15 s total timeout for a buffered
+   call or 60 s for a streamed one. Fastly backends have no timeout settings
+   of their own to tune.
 
 ---
 
@@ -580,7 +607,6 @@ fastly profile create
 **Service validation errors:**
 
 - Check Fastly dashboard for validation messages
-- Verify all required backends are configured
 - Ensure KV/Config/Secret stores are linked
 
 ---
@@ -754,15 +780,18 @@ If you encounter an error not listed here:
 
 ## Common HTTP Status Codes
 
-| Code    | Meaning         | Common Causes                    | Quick Fix            |
-| ------- | --------------- | -------------------------------- | -------------------- |
-| **400** | Bad Request     | Missing parameters, invalid JSON | Check request format |
-| **401** | Unauthorized    | Missing/invalid auth             | Check credentials    |
-| **403** | Forbidden       | Invalid token, disabled feature  | Verify token/config  |
-| **404** | Not Found       | Unknown endpoint                 | Check URL path       |
-| **500** | Internal Error  | Configuration error, bug         | Check logs           |
-| **502** | Bad Gateway     | Backend unavailable              | Verify backend       |
-| **504** | Gateway Timeout | Backend slow                     | Increase timeout     |
+| Code    | Meaning                         | Common Causes                                                   | Quick Fix                          |
+| ------- | ------------------------------- | --------------------------------------------------------------- | ---------------------------------- |
+| **400** | Bad Request                     | Missing parameters, invalid JSON                                | Check request format               |
+| **401** | Unauthorized                    | Missing/invalid auth                                            | Check credentials                  |
+| **403** | Forbidden                       | Invalid token, disabled feature                                 | Verify token/config                |
+| **404** | Not Found                       | Unknown endpoint                                                | Check URL path                     |
+| **408** | Request Timeout                 | Request body still unread 30 s after the request arrived        | Check the client's upload          |
+| **413** | Payload Too Large               | Body over the endpoint's cap, or a publisher upload over 16 MiB | Reduce the body size               |
+| **414** | URI Too Long                    | Request target over 8192 bytes                                  | Shorten the URL or query           |
+| **431** | Request Header Fields Too Large | More than 100 header fields or 64 KiB of headers                | Trim headers and cookies           |
+| **500** | Internal Error                  | Configuration error, bug                                        | Check logs                         |
+| **502** | Bad Gateway                     | Backend unavailable or timed out; Trusted Server has no 504     | Verify the backend and its latency |
 
 ---
 

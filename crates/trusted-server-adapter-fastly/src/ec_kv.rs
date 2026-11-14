@@ -2,7 +2,9 @@
 //!
 //! Maps the platform-neutral identity-graph store operations onto the
 //! Fastly KV Store API, including generation markers for compare-and-swap
-//! writes (`if_generation_match`).
+//! writes (`if_generation_match`). The SDK exposes only blocking completion
+//! hostcalls for KV operations, so these local async methods retain that Fastly
+//! behavior. Native backends must yield during network I/O instead.
 
 use error_stack::{Report, ResultExt};
 use fastly::kv_store::{InsertMode, KVStore, KVStoreError, ListPage};
@@ -86,12 +88,13 @@ impl FastlyEcKvStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl EcKvStore for FastlyEcKvStore {
     fn store_name(&self) -> &str {
         &self.store_name
     }
 
-    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+    async fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
         let store = self.open_store()?;
         let mut response = match store.lookup(key) {
             Ok(resp) => resp,
@@ -117,7 +120,7 @@ impl EcKvStore for FastlyEcKvStore {
         }))
     }
 
-    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+    async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
         let store = self.open_store()?;
         contains_exact_key(&self.store_name, key, |cursor| {
             // build_list defaults to ListMode::Strong, reading primary state.
@@ -129,7 +132,7 @@ impl EcKvStore for FastlyEcKvStore {
         })
     }
 
-    fn insert(
+    async fn insert(
         &self,
         key: &str,
         write: EcKvWrite<'_>,
@@ -160,7 +163,7 @@ impl EcKvStore for FastlyEcKvStore {
         }
     }
 
-    fn list_keys_with_prefix(
+    async fn list_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
@@ -178,7 +181,7 @@ impl EcKvStore for FastlyEcKvStore {
             })
     }
 
-    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+    async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
         let store = self.open_store()?;
         store
             .delete(key)
@@ -205,7 +208,7 @@ mod tests {
         FastlyEcKvStore::new(TEST_STORE)
     }
 
-    fn write(key: &str, body: &str, mode: EcKvWriteMode) -> EcKvWriteOutcome {
+    async fn write(key: &str, body: &str, mode: EcKvWriteMode) -> EcKvWriteOutcome {
         store()
             .insert(
                 key,
@@ -216,6 +219,7 @@ mod tests {
                     mode,
                 },
             )
+            .await
             .expect("should reach the store")
     }
 
@@ -334,166 +338,201 @@ mod tests {
 
     #[test]
     fn strong_existence_checks_real_store_keys_exactly() {
-        let backend = store();
-        let key = "existence-test-key";
-        let longer = "existence-test-key-longer";
-        write(longer, "body", EcKvWriteMode::Overwrite);
-        assert!(
-            !backend.key_exists(key).expect("should list the prefix"),
-            "should not confuse a prefix with an exact key"
-        );
-        write(key, "body", EcKvWriteMode::Overwrite);
-        assert!(
-            backend.key_exists(key).expect("should list the issued key"),
-            "should see a completed issuance"
-        );
-        backend.delete(key).expect("should delete exact key");
-        backend.delete(longer).expect("should delete longer key");
-        assert!(
-            !backend.key_exists(key).expect("should list after deletion"),
-            "should report absence after deletion"
-        );
+        futures::executor::block_on(async {
+            let backend = store();
+            let key = "existence-test-key";
+            let longer = "existence-test-key-longer";
+            write(longer, "body", EcKvWriteMode::Overwrite).await;
+            assert!(
+                !backend
+                    .key_exists(key)
+                    .await
+                    .expect("should list the prefix"),
+                "should not confuse a prefix with an exact key"
+            );
+            write(key, "body", EcKvWriteMode::Overwrite).await;
+            assert!(
+                backend
+                    .key_exists(key)
+                    .await
+                    .expect("should list the issued key"),
+                "should see a completed issuance"
+            );
+            backend.delete(key).await.expect("should delete exact key");
+            backend
+                .delete(longer)
+                .await
+                .expect("should delete longer key");
+            assert!(
+                !backend
+                    .key_exists(key)
+                    .await
+                    .expect("should list after deletion"),
+                "should report absence after deletion"
+            );
+        });
     }
 
     #[test]
     fn opening_a_store_this_service_does_not_have_is_an_error() {
-        let error = FastlyEcKvStore::new("no_such_store")
-            .lookup("any-key")
-            .expect_err("should not resolve against a store that is not linked");
+        futures::executor::block_on(async {
+            let error = FastlyEcKvStore::new("no_such_store")
+                .lookup("any-key")
+                .await
+                .expect_err("should not resolve against a store that is not linked");
 
-        assert!(
-            matches!(
-                error.current_context(),
-                TrustedServerError::KvStore { store_name, .. } if store_name == "no_such_store"
-            ),
-            "should name the store it could not open: {error:?}"
-        );
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::KvStore { store_name, .. } if store_name == "no_such_store"
+                ),
+                "should name the store it could not open: {error:?}"
+            );
+        });
     }
 
     #[test]
     fn a_missing_key_is_absent_rather_than_an_error() {
-        let absent = format!("{}.ABC123", "1".repeat(64));
+        futures::executor::block_on(async {
+            let absent = format!("{}.ABC123", "1".repeat(64));
 
-        assert!(
-            store()
-                .lookup(&absent)
-                .expect("should reach the store")
-                .is_none(),
-            "a key the store does not hold is absent, not a failure"
-        );
+            assert!(
+                store()
+                    .lookup(&absent)
+                    .await
+                    .expect("should reach the store")
+                    .is_none(),
+                "a key the store does not hold is absent, not a failure"
+            );
+        });
     }
 
     #[test]
     fn an_entry_round_trips_through_insert_lookup_and_delete() {
-        let key = format!("{}.ABC123", "2".repeat(64));
-        let backend = store();
+        futures::executor::block_on(async {
+            let key = format!("{}.ABC123", "2".repeat(64));
+            let backend = store();
 
-        assert_eq!(
-            write(&key, "entry-body-1", EcKvWriteMode::Overwrite),
-            EcKvWriteOutcome::Written,
-            "should write the entry"
-        );
+            assert_eq!(
+                write(&key, "entry-body-1", EcKvWriteMode::Overwrite).await,
+                EcKvWriteOutcome::Written,
+                "should write the entry"
+            );
 
-        let found = backend
-            .lookup(&key)
-            .expect("should reach the store")
-            .expect("should hold the entry just written");
-        assert_eq!(found.body, b"entry-body-1", "should read back the body");
-        assert_eq!(
-            found.metadata.as_deref(),
-            Some(METADATA.as_bytes()),
-            "should read back the metadata"
-        );
-
-        backend.delete(&key).expect("should delete the entry");
-        assert!(
-            backend
+            let found = backend
                 .lookup(&key)
+                .await
                 .expect("should reach the store")
-                .is_none(),
-            "a deleted key is absent"
-        );
+                .expect("should hold the entry just written");
+            assert_eq!(found.body, b"entry-body-1", "should read back the body");
+            assert_eq!(
+                found.metadata.as_deref(),
+                Some(METADATA.as_bytes()),
+                "should read back the metadata"
+            );
+
+            backend.delete(&key).await.expect("should delete the entry");
+            assert!(
+                backend
+                    .lookup(&key)
+                    .await
+                    .expect("should reach the store")
+                    .is_none(),
+                "a deleted key is absent"
+            );
+        });
     }
 
     #[test]
     fn add_mode_refuses_a_key_that_already_exists() {
-        let key = format!("{}.ABC123", "3".repeat(64));
-        let backend = store();
+        futures::executor::block_on(async {
+            let key = format!("{}.ABC123", "3".repeat(64));
+            let backend = store();
 
-        assert_eq!(
-            write(&key, "entry-body-1", EcKvWriteMode::Add),
-            EcKvWriteOutcome::Written,
-            "should create a key nothing holds"
-        );
-        assert_eq!(
-            write(&key, "entry-body-2", EcKvWriteMode::Add),
-            EcKvWriteOutcome::PreconditionFailed,
-            "a precondition failure is control flow, not an error"
-        );
+            assert_eq!(
+                write(&key, "entry-body-1", EcKvWriteMode::Add).await,
+                EcKvWriteOutcome::Written,
+                "should create a key nothing holds"
+            );
+            assert_eq!(
+                write(&key, "entry-body-2", EcKvWriteMode::Add).await,
+                EcKvWriteOutcome::PreconditionFailed,
+                "a precondition failure is control flow, not an error"
+            );
 
-        backend.delete(&key).expect("should delete the entry");
+            backend.delete(&key).await.expect("should delete the entry");
+        });
     }
 
     #[test]
     fn a_generation_mismatch_is_reported_as_a_precondition_failure() {
-        let key = format!("{}.ABC123", "4".repeat(64));
-        let backend = store();
+        futures::executor::block_on(async {
+            let key = format!("{}.ABC123", "4".repeat(64));
+            let backend = store();
 
-        write(&key, "entry-body-1", EcKvWriteMode::Overwrite);
-        let generation = backend
-            .lookup(&key)
-            .expect("should reach the store")
-            .expect("should hold the entry just written")
-            .generation;
+            write(&key, "entry-body-1", EcKvWriteMode::Overwrite).await;
+            let generation = backend
+                .lookup(&key)
+                .await
+                .expect("should reach the store")
+                .expect("should hold the entry just written")
+                .generation;
 
-        assert_eq!(
-            write(
-                &key,
-                "entry-body-2",
-                EcKvWriteMode::IfGenerationMatch(generation)
-            ),
-            EcKvWriteOutcome::Written,
-            "should write when the generation still matches"
-        );
-        assert_eq!(
-            write(
-                &key,
-                "entry-body-3",
-                EcKvWriteMode::IfGenerationMatch(generation)
-            ),
-            EcKvWriteOutcome::PreconditionFailed,
-            "the generation moved on with the previous write"
-        );
+            assert_eq!(
+                write(
+                    &key,
+                    "entry-body-2",
+                    EcKvWriteMode::IfGenerationMatch(generation)
+                )
+                .await,
+                EcKvWriteOutcome::Written,
+                "should write when the generation still matches"
+            );
+            assert_eq!(
+                write(
+                    &key,
+                    "entry-body-3",
+                    EcKvWriteMode::IfGenerationMatch(generation)
+                )
+                .await,
+                EcKvWriteOutcome::PreconditionFailed,
+                "the generation moved on with the previous write"
+            );
 
-        backend.delete(&key).expect("should delete the entry");
+            backend.delete(&key).await.expect("should delete the entry");
+        });
     }
 
     #[test]
     fn counting_a_prefix_counts_only_the_keys_under_it() {
-        let hash = "5".repeat(64);
-        let backend = store();
-        let keys = [format!("{hash}.AAA111"), format!("{hash}.BBB222")];
-        for key in &keys {
-            write(key, "entry-body-1", EcKvWriteMode::Overwrite);
-        }
+        futures::executor::block_on(async {
+            let hash = "5".repeat(64);
+            let backend = store();
+            let keys = [format!("{hash}.AAA111"), format!("{hash}.BBB222")];
+            for key in &keys {
+                write(key, "entry-body-1", EcKvWriteMode::Overwrite).await;
+            }
 
-        assert_eq!(
-            backend
-                .count_keys_with_prefix(&hash, 100)
-                .expect("should list the prefix"),
-            2,
-            "should count both keys issued under this hash"
-        );
-        assert_eq!(
-            backend
-                .count_keys_with_prefix(&"6".repeat(64), 100)
-                .expect("should list the prefix"),
-            0,
-            "should count nothing under a hash nothing was issued for"
-        );
+            assert_eq!(
+                backend
+                    .count_keys_with_prefix(&hash, 100)
+                    .await
+                    .expect("should list the prefix"),
+                2,
+                "should count both keys issued under this hash"
+            );
+            assert_eq!(
+                backend
+                    .count_keys_with_prefix(&"6".repeat(64), 100)
+                    .await
+                    .expect("should list the prefix"),
+                0,
+                "should count nothing under a hash nothing was issued for"
+            );
 
-        for key in &keys {
-            backend.delete(key).expect("should delete the entry");
-        }
+            for key in &keys {
+                backend.delete(key).await.expect("should delete the entry");
+            }
+        });
     }
 }

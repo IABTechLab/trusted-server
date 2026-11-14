@@ -9,12 +9,25 @@ use http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
-use crate::http_util::enforce_max_body_size;
+use crate::http_util::read_request_body;
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
 use crate::settings::Settings;
+
+/// Logs a failed key operation's report once: at warn for a client error, and
+/// at error otherwise.
+///
+/// The response carries only the report's display text, so this line is
+/// where the outbound status, budget source, and provider detail appear.
+fn log_key_operation_failure(operation: &str, report: &Report<TrustedServerError>) {
+    if report.current_context().status_code().is_client_error() {
+        log::warn!("{operation} failed: {report:?}");
+    } else {
+        log::error!("{operation} failed: {report:?}");
+    }
+}
 
 fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
     Response::builder()
@@ -22,19 +35,6 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
         .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
         .body(EdgeBody::from(body.into_bytes()))
         .expect("should build json response")
-}
-
-fn request_body_bytes(
-    body: EdgeBody,
-    endpoint: &str,
-) -> Result<bytes::Bytes, Report<TrustedServerError>> {
-    if body.is_stream() {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: format!("{endpoint} request body must be buffered, not streamed"),
-        }));
-    }
-
-    Ok(body.into_bytes().unwrap_or_default())
 }
 
 /// Retrieves and returns the trusted-server discovery document.
@@ -106,15 +106,16 @@ const ADMIN_MAX_BODY_BYTES: usize = 4096;
 ///
 /// # Errors
 ///
-/// Returns an error if the request body cannot be parsed as JSON or if the
-/// response body cannot be serialized.
-pub fn handle_verify_signature(
+/// Returns an error if the request body cannot be read within 4096 bytes (see
+/// [`read_request_body`]), cannot be parsed as JSON, or if the response body
+/// cannot be serialized.
+pub async fn handle_verify_signature(
     _settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let body = request_body_bytes(req.into_body(), "verify-signature")?;
-    enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
+    let (parts, body) = req.into_parts();
+    let body = read_request_body(&parts.headers, body, VERIFY_MAX_BODY_BYTES).await?;
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -292,8 +293,9 @@ pub fn kid_is_creatable(kid: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_rotate_key(
+/// Returns an error if the request signing settings are missing, the request body
+/// cannot be read within 4096 bytes (see [`read_request_body`]), or JSON parsing fails.
+pub async fn handle_rotate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -303,8 +305,8 @@ pub fn handle_rotate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = request_body_bytes(req.into_body(), "rotate-key")?;
-    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
+    let (parts, body) = req.into_parts();
+    let body = read_request_body(&parts.headers, body, ADMIN_MAX_BODY_BYTES).await?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
     } else {
@@ -319,7 +321,10 @@ pub fn handle_rotate_key(
     } else {
         Ok(())
     };
-    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
+    let result = match validation_result {
+        Ok(()) => manager.rotate_key(services, rotate_req.kid).await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(result) => {
@@ -348,6 +353,7 @@ pub fn handle_rotate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            log_key_operation_failure("Key rotation", &e);
             let status = e.current_context().status_code();
             let response = RotateKeyResponse {
                 success: false,
@@ -411,8 +417,9 @@ pub struct DeactivateKeyResponse {
 ///
 /// # Errors
 ///
-/// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_deactivate_key(
+/// Returns an error if the request signing settings are missing, the request body
+/// cannot be read within 4096 bytes (see [`read_request_body`]), or JSON parsing fails.
+pub async fn handle_deactivate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -422,8 +429,8 @@ pub fn handle_deactivate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = request_body_bytes(req.into_body(), "deactivate-key")?;
-    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
+    let (parts, body) = req.into_parts();
+    let body = read_request_body(&parts.headers, body, ADMIN_MAX_BODY_BYTES).await?;
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -435,13 +442,11 @@ pub fn handle_deactivate_key(
     // validation rules (e.g. digit- or uppercase-leading) can still be
     // deactivated or deleted. The stricter validate_kid only gates new key
     // creation/rotation.
-    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
-        if deactivate_req.delete {
-            manager.delete_key(services, &deactivate_req.kid)
-        } else {
-            manager.deactivate_key(services, &deactivate_req.kid)
-        }
-    });
+    let result = match validate_kid_format(&deactivate_req.kid) {
+        Ok(()) if deactivate_req.delete => manager.delete_key(services, &deactivate_req.kid).await,
+        Ok(()) => manager.deactivate_key(services, &deactivate_req.kid).await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(()) => {
@@ -472,6 +477,14 @@ pub fn handle_deactivate_key(
             Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
+            log_key_operation_failure(
+                if deactivate_req.delete {
+                    "Key deletion"
+                } else {
+                    "Key deactivation"
+                },
+                &e,
+            );
             let status = e.current_context().status_code();
             let response = DeactivateKeyResponse {
                 success: false,
@@ -511,6 +524,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
 
     fn build_request(method: Method, uri: &str, body: Option<&str>) -> HttpRequest<EdgeBody> {
         let body = match body {
@@ -525,8 +540,11 @@ mod tests {
             .expect("should build request")
     }
 
-    fn build_streaming_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
-        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+    /// Builds a request whose `body` arrives as a stream of two chunks.
+    fn build_streaming_request(method: Method, uri: &str, body: &[u8]) -> HttpRequest<EdgeBody> {
+        let (head, tail) = body.split_at(body.len() / 2);
+        let stream =
+            futures::stream::iter([Bytes::copy_from_slice(head), Bytes::copy_from_slice(tail)]);
         HttpRequest::builder()
             .method(method)
             .uri(uri)
@@ -559,6 +577,7 @@ mod tests {
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for StubJwksConfigStore {
         fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             match key {
@@ -571,12 +590,12 @@ mod tests {
             }
         }
 
-        fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+        async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+        async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -605,7 +624,7 @@ mod tests {
             Some(&body),
         );
 
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should handle verification request");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_json_content_type(&resp);
@@ -644,7 +663,7 @@ mod tests {
             Some(&body),
         );
 
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should handle verification request");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_json_content_type(&resp);
@@ -679,7 +698,7 @@ mod tests {
         );
 
         let services = noop_services();
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should return a verification response for internal errors");
 
         assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
@@ -715,7 +734,8 @@ mod tests {
             Some("not valid json"),
         );
 
-        let result = handle_verify_signature(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_verify_signature(&settings, &noop_services(), req));
         assert!(result.is_err(), "Malformed JSON should error");
     }
 
@@ -723,14 +743,24 @@ mod tests {
     fn test_handle_rotate_key_with_empty_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
+        let capture = LogCapture::start();
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when store writes fail"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && record.message.starts_with("Key rotation failed: ")
+            ),
+            "should log the failed rotation once, at error"
         );
 
         let body = response_body_string(resp);
@@ -762,7 +792,7 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
@@ -794,7 +824,8 @@ mod tests {
             Some("invalid json"),
         );
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req));
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 
@@ -813,7 +844,7 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response for invalid kid");
 
         assert_eq!(
@@ -856,13 +887,25 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
+        let capture = LogCapture::start();
+
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when active-kids cannot be read"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && record.message.starts_with("Key deactivation failed: ")
+            ),
+            "should log the failed deactivation once, at error"
         );
 
         let body = response_body_string(resp);
@@ -896,8 +939,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
             resp.status(),
@@ -932,7 +976,8 @@ mod tests {
             Some("invalid json"),
         );
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req));
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 
@@ -953,8 +998,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for invalid kid");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response for invalid kid");
 
         assert_eq!(
             resp.status(),
@@ -988,8 +1034,9 @@ mod tests {
             "https://test.com/verify-signature",
             Some(&oversized),
         );
-        let err = handle_verify_signature(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
+        let err =
+            futures::executor::block_on(handle_verify_signature(&settings, &noop_services(), req))
+                .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -998,24 +1045,54 @@ mod tests {
     }
 
     #[test]
-    fn verify_signature_rejects_streaming_body() {
+    fn verify_signature_reads_a_streamed_body() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = build_streaming_request(Method::POST, "https://test.com/verify-signature");
-        let err = handle_verify_signature(&settings, &noop_services(), req)
-            .expect_err("should reject streaming verify body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::BAD_REQUEST,
-            "should return 400 for streaming verify body"
+        let services = build_request_signing_services();
+        let signer = crate::request_signing::RequestSigner::from_services(&services)
+            .expect("should create signer from services");
+        let verify_req = VerifySignatureRequest {
+            payload: "test message".to_string(),
+            signature: signer.sign(b"test message").expect("should sign payload"),
+            kid: signer.kid.clone(),
+        };
+        let body = serde_json::to_vec(&verify_req).expect("should serialize verify request");
+        let req = build_streaming_request(
+            Method::POST,
+            "https://edge.example.com/verify-signature",
+            &body,
         );
+
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
+            .expect("should verify a streamed body");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let verify_resp: VerifySignatureResponse =
+            serde_json::from_str(&response_body_string(resp))
+                .expect("should deserialize verify response");
         assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::BadRequest { message }
-                    if message == "verify-signature request body must be buffered, not streamed"
-            ),
-            "should explain that verify bodies must be buffered"
+            verify_resp.verified,
+            "should verify the signature read from a streamed body"
         );
+    }
+
+    #[test]
+    fn verify_signature_body_read_failures_map_to_statuses() {
+        let settings = crate::test_support::tests::create_test_settings();
+        for case in body_read_failure_cases(VERIFY_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example.com/verify-signature"),
+            );
+
+            let outcome = futures::executor::block_on(handle_verify_signature(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("verify-signature", &outcome);
+        }
     }
 
     #[test]
@@ -1027,7 +1104,7 @@ mod tests {
             "https://test.com/admin/keys/rotate",
             Some(&oversized),
         );
-        let err = handle_rotate_key(&settings, &noop_services(), req)
+        let err = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
@@ -1037,24 +1114,59 @@ mod tests {
     }
 
     #[test]
-    fn rotate_key_rejects_streaming_body() {
+    fn rotate_key_reads_a_streamed_body() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
-        let err = handle_rotate_key(&settings, &noop_services(), req)
-            .expect_err("should reject streaming rotate body");
+        let req = build_streaming_request(
+            Method::POST,
+            "https://edge.example.com/admin/keys/rotate",
+            br#"{"kid":"bad,kid"}"#,
+        );
+
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
+            .expect("should return a response for the streamed kid");
+
         assert_eq!(
-            err.current_context().status_code(),
+            resp.status(),
             StatusCode::BAD_REQUEST,
-            "should return 400 for streaming rotate body"
+            "should validate the kid read from a streamed body"
         );
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::BadRequest { message }
-                    if message == "rotate-key request body must be buffered, not streamed"
-            ),
-            "should explain that rotate bodies must be buffered"
-        );
+    }
+
+    #[test]
+    fn rotate_key_body_read_failures_map_to_statuses() {
+        let settings = crate::test_support::tests::create_test_settings();
+        for case in body_read_failure_cases(ADMIN_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example.com/admin/keys/rotate"),
+            );
+
+            let outcome =
+                futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req));
+
+            expectation.assert_outcome("rotate-key", &outcome);
+        }
+    }
+
+    #[test]
+    fn deactivate_key_body_read_failures_map_to_statuses() {
+        let settings = crate::test_support::tests::create_test_settings();
+        for case in body_read_failure_cases(ADMIN_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example.com/admin/keys/deactivate"),
+            );
+
+            let outcome = futures::executor::block_on(handle_deactivate_key(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("deactivate-key", &outcome);
+        }
     }
 
     #[test]
@@ -1066,8 +1178,9 @@ mod tests {
             "https://test.com/admin/keys/deactivate",
             Some(&oversized),
         );
-        let err = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
+        let err =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1159,8 +1272,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for a legacy digit-leading kid");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response for a legacy digit-leading kid");
 
         assert_ne!(
             resp.status(),

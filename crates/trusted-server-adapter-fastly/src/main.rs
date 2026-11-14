@@ -1,12 +1,15 @@
-use std::sync::Arc;
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_adapter_fastly::context::FastlyOutboundObservation;
+use edgezero_adapter_fastly::request::{
+    send_assembly_error, send_request_with_registries_and_hooks,
+};
+use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
-use edgezero_core::response::IntoResponse;
+use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+use edgezero_core::logging::ManagedLoggerError;
+use edgezero_core::time::MonotonicClock;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
@@ -16,58 +19,55 @@ use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
-};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::forwarder::ForwarderPreparation;
+use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
-use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::platform::ClientInfo;
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
-use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
+use trusted_server_core::version_header::git_version_header_value;
 
 mod app;
-mod backend;
 mod compat;
+#[cfg(test)]
+mod deadline_network;
+mod delivery;
 mod ec_kv;
 mod esi_assembly;
-mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+mod post_delivery;
 mod rate_limiter;
 mod sandbox;
 mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
+    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
     load_settings_from_config_store,
 };
+use crate::delivery::handle_delivery;
 use crate::ec_kv::FastlyEcKvStore;
-use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
-use crate::platform::{FastlyPlatformGeo, client_info_from_request, resolve_client_ip};
-use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
+use crate::middleware::{
+    HEADER_X_TS_FINALIZED, apply_finalize_headers, per_request_synthesized_headers,
+    resolve_geo_for_response,
+};
+use crate::platform::{RequestGeo, client_info_from_request, resolve_client_ip};
+use crate::post_delivery::{FinalizeState, run_post_delivery};
+use crate::sandbox::{
+    LogContext, RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics, instance_id,
+    metrics_enabled,
+};
+use crate::tinybird::TelemetryQueue;
 // Only the reuse path builds a serving loop, so the retirement snapshots have
 // no consumer in the default build.
 #[cfg(feature = "reusable-sandbox")]
 use crate::sandbox::RetirementCounters;
-
-/// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
-///
-/// # Errors
-///
-/// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = EdgeZeroFastlyConfigStore::try_open(store_name).map_err(|e| {
-        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
-    })?;
-    Ok(ConfigStoreHandle::new(Arc::new(store)))
-}
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
@@ -85,9 +85,9 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
-/// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
-/// [`fastly::Response::stream_to_client`] explicitly. It owns the sandbox
-/// lifecycle and delegates each request to [`handle_request`].
+/// `#[fastly::main]` so the entry point owns the sandbox lifecycle. Each
+/// request goes to [`handle_request`], which sends it through `EdgeZero`'s
+/// canonical Fastly lifecycle.
 ///
 /// Without the `reusable-sandbox` feature this takes one request and returns,
 /// which is the original behaviour. With the feature, the bounds still have to
@@ -105,13 +105,22 @@ fn main() {
 
     match mode {
         ServeMode::Single => {
-            // `run_custom` completes the callback's SDK result exactly once.
-            // The callback sends its own response and returns `()`, so there
-            // is no error for the SDK to turn into a second response.
-            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+            // `run_custom` installs `EdgeZero`'s managed logger from
+            // `TrustedServerApp::logging_for("fastly")` before the callback, and
+            // completes the callback's SDK result exactly once. The callback
+            // always returns `Ok`: `EdgeZero` or the callback has already
+            // answered, so there is no error for the SDK to turn into a second
+            // response. Only a failed logger installation returns `Err`.
+            let result = edgezero_adapter_fastly::lifecycle::run_custom::<TrustedServerApp, _, _, _>(
                 FastlyRequest::from_client(),
-                |request, sandbox: &mut Sandbox| handle_request(request, sandbox, &mut startup),
+                |request, sandbox: &mut Sandbox| {
+                    handle_request(request, sandbox, &mut startup);
+                    Ok::<(), ManagedLoggerError>(())
+                },
             );
+            if let Err(error) = result {
+                report_logger_failure(error);
+            }
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
@@ -129,7 +138,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
     // performed by the final callback is included.
     let mut counters = RetirementCounters::default();
 
-    let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
+    // `serve_custom` installs `EdgeZero`'s managed logger before each callback,
+    // as `run_custom` does.
+    let summary = edgezero_adapter_fastly::lifecycle::serve_custom::<TrustedServerApp, _, _, _>(
         fastly::http::serve::Serve::new()
             .with_max_requests(limits.max_requests)
             .with_max_memory(limits.max_memory_mib)
@@ -139,6 +150,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             counters.observe(sandbox, |sandbox| {
                 handle_request(request, sandbox, &mut startup);
             });
+            // An `Err` would end serving with no response, so the callback
+            // reports none, whatever happened to this request's delivery.
+            Ok::<(), ManagedLoggerError>(())
         },
     );
 
@@ -148,6 +162,20 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
         counters.requests(),
         counters.attempts()
     );
+    if let Some(error) = summary.error() {
+        report_logger_failure(*error);
+    }
+}
+
+/// Reports that `EdgeZero` could not install its managed logger.
+///
+/// `EdgeZero` stops before the callback when installation fails, so the error
+/// cannot go through `log`.
+fn report_logger_failure(error: ManagedLoggerError) {
+    #[allow(clippy::print_stderr, reason = "the managed logger is not installed")]
+    {
+        eprintln!("managed logger installation failed: {error}");
+    }
 }
 
 #[cfg(not(feature = "reusable-sandbox"))]
@@ -155,17 +183,22 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
     unreachable!("serve_mode never selects reuse without the reusable-sandbox feature")
 }
 
-/// Handles one request end to end, sending its own response.
+/// Handles one request end to end.
 ///
-/// Returns `()` rather than a response so the streaming publisher path can
-/// call [`fastly::Response::stream_to_client`] itself. The SDK's
-/// `HandlerResult` impl for `()` treats that as already sent.
+/// Native short-circuits answer first. Every other request is assembled into
+/// the sandbox's retained app and sent through `EdgeZero`, which owns the
+/// response; [`handle_delivery`] then decides whether anything is left to do,
+/// and [`log_outbound_observation`] logs the request's backend registrations.
 ///
-/// Every non-panicking path through this function must send exactly once. In a
-/// reused sandbox the SDK refuses to wait for the next request until the
-/// current one is complete, so a missed send stalls the loop rather than
+/// Every non-panicking path through this function must answer exactly once.
+/// In a reused sandbox the SDK refuses to wait for the next request until the
+/// current one is complete, so a missed answer stalls the loop rather than
 /// merely dropping one response.
 fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut StartupDiagnostics) {
+    // Taken at entry, so the assembly-error response and every deadline share
+    // one clock domain with `EdgeZero`'s.
+    let clock = MonotonicClock::default();
+    let request_start = clock.now();
     // The framework counts the callback before invoking it, including early
     // returns, so this is already this request's 1-based ordinal.
     let ordinal = sandbox.requests();
@@ -173,26 +206,15 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // trace-path decisions describe the request as received.
     let trace_path = is_trace_path(req.get_path());
 
-    // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
+    // Health probe bypasses settings and app construction as a cheap liveness signal.
     if !trace_path && let Some(response) = health_response(&req) {
         response.send_to_client();
         return;
     }
 
-    // Marked complete only once installation succeeds, so a failed install is
-    // retried on a later callback. `setup_once` rolls nothing back, so that is
-    // only correct because `init_logger` is harmless to repeat — see its docs.
-    match sandbox.setup_once(crate::logging::init_logger) {
-        Ok(()) => startup.flush(),
-        Err(error) => {
-            // Logger installation failed, so its own error cannot rely on log.
-            // Keep startup diagnostics pending until installation succeeds.
-            #[allow(clippy::print_stderr, reason = "logger installation failed")]
-            {
-                eprintln!("logger installation failed, retrying next callback: {error}");
-            }
-        }
-    }
+    // `EdgeZero` installed its managed logger before this callback, so the
+    // messages held since startup can go out now.
+    startup.flush();
 
     // Correlation is request-local and never retained. `FASTLY_TRACE_ID` names
     // the sandbox, not the request, so it is not used here. The id rides on the
@@ -203,7 +225,312 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
 
-    edgezero_main(req, sandbox, ordinal, &request_id, trace_path);
+    // Short-circuit the sandbox counters probe before app construction. It must
+    // not build the application: polling it would otherwise increment the very
+    // build counter it reports.
+    #[cfg(feature = "reusable-sandbox")]
+    if req.get_method() == FastlyMethod::GET && req.get_path() == sandbox::SANDBOX_METRICS_PATH {
+        match load_settings_from_config_store(&RuntimeStoreConfig::logical()) {
+            Ok(settings) if metrics_enabled(&settings) => {
+                sandbox_metrics_response(sandbox, ordinal).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("sandbox metrics endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
+
+    // Short-circuit the JA4 debug probe before app construction. Must run here
+    // because TLS/JA4 accessors are only available on FastlyRequest before
+    // conversion to edgezero types.
+    if !trace_path && req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+        match load_settings_from_config_store(&RuntimeStoreConfig::logical()) {
+            Ok(settings) if settings.debug.ja4_endpoint_enabled => {
+                build_ja4_debug_response(&req).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
+
+    // Assemble lazily, once per sandbox. Reached only past the health, JA4, and
+    // counters short-circuits, so none of those pays for construction.
+    // `initialize` retains only success and returns the error unchanged, so a
+    // transient config-store failure answers this request and the next
+    // callback retries assembly.
+    let assembled = sandbox.initialize(|| {
+        assemble_app(
+            load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+            &LogContext::new(ordinal, &request_id),
+        )
+    });
+    let counters = SandboxCounters::capture(sandbox, ordinal, &request_id);
+    match assembled.and_then(|()| retained_app(sandbox)) {
+        Ok(retained) => serve(req, retained, &counters, trace_path),
+        Err(error) => handle_delivery(
+            send_assembly_error(req, error, request_start, clock),
+            &counters,
+            |()| {},
+        ),
+    }
+    log_outbound_observation();
+}
+
+/// Logs this callback's backend registration counts at info.
+///
+/// Runs after delivery and post-delivery work, so pull-sync and telemetry
+/// registrations count. Hosted Fastly logs at info, so every request that
+/// reached `EdgeZero` leaves one line.
+fn log_outbound_observation() {
+    if let Some(observation) = FastlyOutboundObservation::current() {
+        let stats = observation.snapshot();
+        log::info!(
+            target: "trusted_server::outbound_observation",
+            "configurations={} registrations={} total_registration_us={} max_registration_us={}",
+            stats.configuration_count(),
+            stats.registration_count(),
+            stats.total_registration_duration().as_micros(),
+            stats.max_registration_duration().as_micros()
+        );
+    }
+}
+
+/// The app a successful `initialize` retained.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] if the sandbox retained nothing, which
+/// the entry point answers like any other assembly error.
+fn retained_app(sandbox: &Sandbox) -> Result<&RetainedApp, EdgeError> {
+    sandbox.state().ok_or_else(|| {
+        EdgeError::internal(std::io::Error::other(
+            "no application was retained after a successful build",
+        ))
+    })
+}
+
+/// Runs the native request work, sends the request through `EdgeZero`, and handles its delivery.
+///
+/// The native work, [`ClientRequestValues::read`], reads what only the SDK
+/// request exposes before `EdgeZero` converts it. `prepare` moves those values
+/// into the request extensions, with the telemetry queue and this request's
+/// synthesized headers. `finalize` takes over the post-routing steps.
+/// Post-delivery work runs only after a committed application body.
+fn serve(
+    mut req: FastlyRequest,
+    retained: &RetainedApp,
+    counters: &SandboxCounters,
+    trace_path: bool,
+) {
+    let settings = retained.state.settings.as_ref();
+    let values = ClientRequestValues::read(&mut req, settings, trace_path);
+    // The request's one geo lookup serves `finalize` here and, from the
+    // request extensions, every later step that uses geo.
+    let request_geo = values.request_geo.clone();
+    let queue = TelemetryQueue::default();
+
+    let prepare = |_req: &mut FastlyRequest, extensions: &mut Extensions| {
+        values.prepare(extensions, settings, &queue);
+    };
+    let inputs = FinalizeInputs {
+        settings,
+        geo: request_geo.geo(),
+        counters,
+    };
+    let delivery = send_request_with_registries_and_hooks(
+        &retained.app,
+        TrustedServerApp::stores(),
+        req,
+        prepare,
+        |response: &mut HttpResponse| finalize_response(response, &inputs),
+    );
+    handle_delivery(delivery, counters, |state| {
+        run_post_delivery(state, &queue, settings, &counters.log_context());
+    });
+}
+
+/// What the native work reads from the SDK client request before `EdgeZero` converts it.
+///
+/// Only the client request exposes the trusted forwarder, the resolved client
+/// IP, TLS metadata, and device signals.
+struct ClientRequestValues {
+    forwarder: ForwarderPreparation,
+    client_info: ClientInfo,
+    device_signals: Option<DeviceSignals>,
+    /// The geo lookup for `client_info`'s client IP.
+    request_geo: RequestGeo,
+}
+
+impl ClientRequestValues {
+    /// Reads the client request's values and sanitizes `req` for dispatch.
+    ///
+    /// A trace path keeps its forwarded and TLS headers, and reads no device
+    /// signals.
+    fn read(req: &mut FastlyRequest, settings: &Settings, trace_path: bool) -> Self {
+        let trusted_client_ip = settings.trusted_client_ip.as_ref();
+
+        // Preserve the public origin before native sanitation removes its source
+        // fields. The frozen decision carries no authentication material.
+        let forwarder = compat::capture_fastly_forwarder(req, settings);
+
+        // Resolve the trusted client IP, then strip client-spoofable forwarded
+        // headers before dispatch. One call keeps resolution ahead of the
+        // sanitization that removes the headers it reads.
+        let resolved_client_ip = if trace_path {
+            resolve_client_ip(req, req.get_client_ip_addr(), trusted_client_ip)
+        } else {
+            compat::resolve_and_sanitize_client_ip(req, trusted_client_ip)
+        };
+
+        if !trace_path {
+            // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+            // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+            // metadata here is authoritative. detect_request_scheme in http_util checks
+            // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
+            if req.get_tls_protocol().ok().flatten().is_some()
+                || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+            {
+                req.set_header("fastly-ssl", "1");
+            }
+
+            // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
+            // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
+            req.remove_header("x-ts-tls-protocol");
+            req.remove_header("x-ts-tls-cipher");
+            if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
+                req.set_header("x-ts-tls-protocol", proto);
+            }
+            if let Some(cipher) = req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_owned)
+            {
+                req.set_header("x-ts-tls-cipher", cipher);
+            }
+        }
+
+        // These accessors only return real values on the client request, so they
+        // are read here and carried in the request extensions for
+        // build_per_request_services and EC bot classification.
+        let client_info = client_info_from_request(req, resolved_client_ip);
+        let device_signals = (!trace_path).then(|| derive_device_signals(req));
+        // The request's one geo lookup, for the resolved client IP. The
+        // synthesized headers, `finalize`, the finalize middleware, the trace
+        // metadata and the per-request services all read it.
+        let request_geo = RequestGeo::lookup_once(client_info.client_ip);
+        Self {
+            forwarder,
+            client_info,
+            device_signals,
+            request_geo,
+        }
+    }
+
+    /// Moves the values into `extensions`, with `queue` and the request's synthesized headers.
+    fn prepare(self, extensions: &mut Extensions, settings: &Settings, queue: &TelemetryQueue) {
+        extensions.insert(self.forwarder);
+        if let Some(device_signals) = self.device_signals {
+            extensions.insert(device_signals);
+        }
+        extensions.insert(self.client_info);
+        extensions.insert(queue.clone());
+        extensions.insert(per_request_synthesized_headers(
+            settings,
+            self.request_geo.geo(),
+        ));
+        extensions.insert(self.request_geo);
+    }
+}
+
+/// What the `finalize` step reads besides the routed response.
+struct FinalizeInputs<'a> {
+    settings: &'a Settings,
+    /// The geo lookup the entry point ran once for this request.
+    geo: Option<&'a GeoInfo>,
+    counters: &'a SandboxCounters,
+}
+
+/// Takes over the post-routing steps for a routed response, before egress policy and framing.
+///
+/// `EdgeZero` runs it for every routed response, handler errors and its
+/// canonical 404 and 405 included. Detached responses never reach it. A trace
+/// response is returned untouched. Otherwise it applies the finalize headers
+/// unless the middleware already did, the asset cache policy, EC
+/// finalization, the terminal privacy effects, and, with metrics enabled, the
+/// sandbox counters.
+///
+/// Returns the pull-sync inputs post-delivery work needs, or `None` when the
+/// response carries no EC state or its partner registry cannot be built.
+fn finalize_response(
+    response: &mut HttpResponse,
+    inputs: &FinalizeInputs<'_>,
+) -> Option<FinalizeState> {
+    // Trace responses keep their exact hardened headers; no finalizer touches them.
+    if response
+        .extensions()
+        .get::<TraceTerminalResponse>()
+        .is_some()
+    {
+        return None;
+    }
+
+    let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
+    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
+    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+
+    if !take_finalize_sentinel(response) {
+        let geo = resolve_geo_for_response(response, inputs.geo);
+        apply_finalize_headers(inputs.settings, geo, response);
+    }
+
+    if let Some(policy) = asset_cache_policy {
+        policy.apply_after_route_finalization(response, EdgeCacheHeader::SurrogateControl);
+    }
+
+    let state = ec_state.and_then(|mut ec_state| {
+        // `EdgeZero` calls `finalize` synchronously after its dispatch executor
+        // has returned, and Fastly's KV SDK completes I/O through blocking
+        // hostcalls. Keep this bridge here, never in native or worker executors.
+        match futures::executor::block_on(apply_edgezero_ec_finalize(
+            inputs.settings,
+            &mut ec_state,
+            response,
+        )) {
+            Ok(partner_registry) => Some(FinalizeState {
+                partner_registry,
+                ec_state,
+            }),
+            Err(e) => {
+                log::error!(
+                    "EC finalize skipped: failed to build partner registry: {e:?}{}",
+                    inputs.counters.log_context()
+                );
+                None
+            }
+        }
+    });
+
+    apply_terminal_response_effects(response, request_filter_effects.as_ref());
+    if metrics_enabled(inputs.settings) {
+        attach_sandbox_counters(response, inputs.counters);
+    }
+    state
 }
 
 /// Builds the counters snapshot response.
@@ -235,10 +562,10 @@ fn sandbox_metrics_response(sandbox: &Sandbox, ordinal: u64) -> FastlyResponse {
 
 /// Attaches sandbox counters only to private, no-store workload responses.
 ///
-/// Called before headers are committed, which on the streaming path means
-/// before `stream_to_client`. The counters therefore describe the request up
-/// to commitment and cannot report its eventual outcome; a failure after
-/// commitment is recorded in logs instead and reconciled during analysis.
+/// Called from `finalize`, before headers are committed. The counters
+/// therefore describe the request up to commitment and cannot report its
+/// eventual outcome; a failure after commitment is recorded in logs instead,
+/// with the same counters, and reconciled during analysis.
 fn attach_sandbox_counters(response: &mut HttpResponse, counters: &SandboxCounters) {
     // Per-request measurements must never be replayed from a cache. Requiring
     // no-store also excludes browser-cacheable and field-qualified privacy.
@@ -292,23 +619,6 @@ fn serve_mode() -> (ServeMode, Vec<String>) {
     (ServeMode::Single, Vec::new())
 }
 
-/// Guest-instance identifier used to attribute requests to a sandbox.
-///
-/// `FASTLY_TRACE_ID` describes the sandbox, which is exactly what is wanted
-/// here and exactly why it must not be used as a request id. An absent value
-/// is reported rather than synthesized, so a measurement run cannot silently
-/// claim reuse it never observed.
-fn instance_id() -> String {
-    // The SDK documents this as the per-sandbox identifier; on wasm32-wasip1
-    // it resolves to `FASTLY_TRACE_ID`, which is why that value must never be
-    // used as a request id.
-    let id = fastly::compute_runtime::sandbox_id();
-    if id.is_empty() {
-        return sandbox::INSTANCE_ID_UNAVAILABLE.to_owned();
-    }
-    id.to_owned()
-}
-
 /// Cumulative guest vCPU milliseconds, or a marker when unsupported.
 fn vcpu_ms() -> String {
     fastly::compute_runtime::elapsed_vcpu_ms().map_or_else(
@@ -325,289 +635,6 @@ fn heap_mib() -> String {
     )
 }
 
-/// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(
-    mut req: FastlyRequest,
-    sandbox: &mut Sandbox,
-    ordinal: u64,
-    request_id: &str,
-    trace_path: bool,
-) {
-    let runtime_stores = RuntimeStoreConfig::logical();
-
-    // Short-circuit the sandbox counters probe before app construction. It must
-    // not build the application: polling it would otherwise increment the very
-    // build counter it reports.
-    #[cfg(feature = "reusable-sandbox")]
-    if req.get_method() == FastlyMethod::GET && req.get_path() == sandbox::SANDBOX_METRICS_PATH {
-        match load_settings_from_config_store(&runtime_stores) {
-            Ok(settings) if sandbox::metrics_enabled(&settings) => {
-                sandbox_metrics_response(sandbox, ordinal).send_to_client();
-            }
-            Ok(_) => {
-                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
-            }
-            Err(e) => {
-                log::warn!("sandbox metrics endpoint: failed to load settings: {e:?}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-            }
-        }
-        return;
-    }
-
-    // Short-circuit the JA4 debug probe before app construction. Must run here
-    // because TLS/JA4 accessors are only available on FastlyRequest before
-    // conversion to edgezero types.
-    if !trace_path && req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store(&runtime_stores) {
-            Ok(settings) if settings.debug.ja4_endpoint_enabled => {
-                build_ja4_debug_response(&req).send_to_client();
-            }
-            Ok(_) => {
-                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
-            }
-            Err(e) => {
-                log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-            }
-        }
-        return;
-    }
-
-    let config_store =
-        match open_trusted_server_config_store(runtime_stores.config_store_name.as_ref()) {
-            Ok(cs) => cs,
-            Err(e) => {
-                log::error!("failed to open config store: {e}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-                return;
-            }
-        };
-
-    // Build lazily, once per sandbox. Reached only past the health, JA4, and
-    // counters short-circuits, so none of those pays for construction.
-    //
-    // `initialize` builds only when the sandbox is empty, retains only
-    // success, and returns the error unchanged. A failed build hands back its
-    // error router as the error payload: that serves this request and is then
-    // dropped, so a transient config-store failure cannot pin the sandbox into
-    // permanent error mode, and the next callback retries construction.
-    let failed_build = sandbox
-        .initialize(|| {
-            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
-            match state {
-                Some(state) => Ok(RetainedApp { app, state }),
-                None => Err(app),
-            }
-        })
-        .err();
-
-    let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
-        match (failed_build.as_ref(), sandbox.state()) {
-            (Some(app), _) => (app, None),
-            (None, Some(retained)) => (&retained.app, Some(Arc::clone(&retained.state))),
-            (None, None) => {
-                log::error!("no application available after initialization");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-                return;
-            }
-        };
-
-    let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
-    let counters =
-        SandboxCounters::capture(sandbox, ordinal, request_id, settings_snapshot.as_deref());
-    let trusted_client_ip = settings_snapshot
-        .as_deref()
-        .and_then(|settings| settings.trusted_client_ip.as_ref());
-
-    // Preserve the public origin before native sanitation removes its source
-    // fields. The frozen decision carries no authentication material.
-    let forwarder = settings_snapshot
-        .as_deref()
-        .map(|settings| compat::capture_fastly_forwarder(&mut req, settings));
-
-    // Resolve the trusted client IP, then strip client-spoofable forwarded
-    // headers before dispatch. One call keeps resolution ahead of the
-    // sanitization that removes the headers it reads.
-    let resolved_client_ip = if trace_path {
-        resolve_client_ip(&req, req.get_client_ip_addr(), trusted_client_ip)
-    } else {
-        compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip)
-    };
-
-    if !trace_path {
-        // Re-inject a trusted TLS scheme signal after sanitization has stripped any
-        // client-sent fastly-ssl header. Setting it from Fastly's native TLS
-        // metadata here is authoritative. detect_request_scheme in http_util checks
-        // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
-        if req.get_tls_protocol().ok().flatten().is_some()
-            || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
-        {
-            req.set_header("fastly-ssl", "1");
-        }
-
-        // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
-        // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
-        req.remove_header("x-ts-tls-protocol");
-        req.remove_header("x-ts-tls-cipher");
-        if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
-            req.set_header("x-ts-tls-protocol", proto);
-        }
-        if let Some(cipher) = req
-            .get_tls_cipher_openssl_name()
-            .ok()
-            .flatten()
-            .map(str::to_owned)
-        {
-            req.set_header("x-ts-tls-cipher", cipher);
-        }
-    }
-
-    // Capture metadata from the original FastlyRequest before conversion. These
-    // accessors only return real values on the client request, so store them in
-    // request extensions for build_per_request_services and EC bot classification.
-    let client_info = client_info_from_request(&req, resolved_client_ip);
-    let client_ip = client_info.client_ip;
-    let device_signals = (!trace_path).then(|| derive_device_signals(&req));
-
-    // Dispatch directly through the EdgeZero router without an intermediate
-    // fastly::Response conversion. That preserves duplicate header values such
-    // as multiple Set-Cookie headers.
-    let mut response = match into_core_request(req) {
-        Ok(mut core_req) => {
-            if let Some(forwarder) = forwarder {
-                core_req.extensions_mut().insert(forwarder);
-            }
-            core_req.extensions_mut().insert(config_store);
-            if let Some(device_signals) = device_signals {
-                core_req.extensions_mut().insert(device_signals);
-            }
-            core_req.extensions_mut().insert(client_info);
-            match futures::executor::block_on(app.router().oneshot(core_req)) {
-                Ok(response) => response,
-                Err(error) => edge_error_response(error),
-            }
-        }
-        Err(e) => {
-            log::error!("EdgeZero request conversion failed: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
-
-    if response
-        .extensions()
-        .get::<TraceTerminalResponse>()
-        .is_some()
-    {
-        // Trace responses keep their exact hardened headers; no sandbox counters.
-        send_response_to_client(response, None);
-        return;
-    }
-
-    // Pop response extensions before the Fastly conversion, which drops them.
-    let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
-    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
-    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
-
-    if !take_finalize_sentinel(&mut response) {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
-                }
-                Err(e) => {
-                    log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
-                    // The compiled-in version needs no settings, so a deploy that cannot
-                    // load its config still reports which build is serving.
-                    apply_git_version_header(&mut response);
-                }
-            }
-        }
-    }
-
-    if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
-    }
-
-    if let Some(mut ec_state) = ec_state {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
-                Ok(partner_registry) => {
-                    send_edgezero_response(
-                        response,
-                        request_filter_effects.as_ref(),
-                        counters.as_ref(),
-                    );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
-                    return;
-                }
-                Err(e) => {
-                    log::error!(
-                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                    );
-                }
-            }
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
-                        Ok(partner_registry) => {
-                            send_edgezero_response(
-                                response,
-                                request_filter_effects.as_ref(),
-                                counters.as_ref(),
-                            );
-                            run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
-                }
-            }
-        }
-    }
-
-    send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
-}
-
-fn edge_error_response(error: EdgeError) -> HttpResponse {
-    log::error!("EdgeZero router returned error: {error:?}");
-    match error.into_response() {
-        Ok(response) => response,
-        Err(error) => {
-            log::error!("failed to convert EdgeZero error into response: {error:?}");
-            edgezero_core::http::response_builder()
-                .status(edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(EdgeBody::from("Internal Server Error"))
-                .expect("should build EdgeZero error response")
-        }
-    }
-}
-
 fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
     response
         .headers_mut()
@@ -615,28 +642,7 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-fn apply_entry_point_finalize_headers(
-    settings: &Settings,
-    response: &mut HttpResponse,
-    client_ip: Option<std::net::IpAddr>,
-) {
-    if response
-        .extensions()
-        .get::<TraceTerminalResponse>()
-        .is_some()
-    {
-        return;
-    }
-    let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
-        FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
-            log::warn!("entry-point geo lookup failed: {e}");
-            None
-        })
-    });
-    apply_finalize_headers(settings, geo_info.as_ref(), response);
-}
-
-fn apply_edgezero_ec_finalize(
+async fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
@@ -655,121 +661,9 @@ fn apply_edgezero_ec_finalize(
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+    )
+    .await;
     Ok(partner_registry)
-}
-
-fn run_edgezero_pull_sync_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
-) {
-    if !ec_state.is_real_browser {
-        return;
-    }
-
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
-        return;
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
-        settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        &ec_state.services,
-    );
-}
-
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
-    graph_factory: F,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
-where
-    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
-{
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return None;
-        }
-    };
-    Some((context, kv))
-}
-
-/// Sends a finalized `EdgeZero` response to the client.
-///
-/// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
-/// client stream so large asset and publisher-origin responses do not
-/// materialize in the Wasm heap.
-fn send_edgezero_response(
-    mut response: HttpResponse,
-    request_filter_effects: Option<&RequestFilterEffects>,
-    counters: Option<&SandboxCounters>,
-) {
-    apply_terminal_response_effects(&mut response, request_filter_effects);
-
-    send_response_to_client(response, counters);
-}
-
-/// Sends a response, attaching sandbox counters first when supplied.
-fn send_response_to_client(mut response: HttpResponse, counters: Option<&SandboxCounters>) {
-    // Captured before the body is consumed so post-commitment failures can be
-    // matched back to the response that carried these counters.
-    let counter_context = counters.map_or_else(String::new, |counters| {
-        format!(
-            " [instance={} ordinal={} request={}]",
-            instance_id(),
-            counters.ordinal,
-            counters.request_id
-        )
-    });
-
-    // Before headers commit, including before `stream_to_client` below.
-    if let Some(counters) = counters.as_ref() {
-        attach_sandbox_counters(&mut response, counters);
-    }
-
-    let (parts, body) = response.into_parts();
-
-    match body {
-        EdgeBody::Stream(_) => {
-            let skeleton = compat::to_fastly_response_skeleton(HttpResponse::from_parts(
-                parts,
-                EdgeBody::empty(),
-            ));
-            let mut streaming_body = skeleton.stream_to_client();
-            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
-                        // Also post-commitment: same attribution as the
-                        // streaming failure below.
-                        log::error!(
-                            "failed to finish EdgeZero streaming body{counter_context}: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // After commitment: log and stop. Returning an error here
-                    // would let the SDK attempt a second response. Counters
-                    // already went out with the headers, so the failure is
-                    // tagged with the same identity for reconciliation.
-                    log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
-                    drop(streaming_body);
-                }
-            }
-        }
-        once => {
-            compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
-        }
-    }
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -777,13 +671,6 @@ fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    if response
-        .extensions()
-        .get::<TraceTerminalResponse>()
-        .is_some()
-    {
-        return;
-    }
     let must_remain_private = response
         .extensions()
         .get::<TerminalPrivateResponse>()
@@ -901,16 +788,33 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use base64::Engine as _;
+    use edgezero_adapter_fastly::request::FastlyService;
+    use edgezero_core::app::App;
     use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::response_builder;
     use edgezero_core::http::{HeaderValue, Method, StatusCode};
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
+    use edgezero_core::pre_dispatch::PreDispatchRequest;
+    use edgezero_core::router::{PreDispatchHook, RouterService};
     use fastly::mime;
+    use std::net::{IpAddr, Ipv4Addr};
+
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::LogCapture;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
+    use trusted_server_core::trace::TracePreDispatchHook;
+
+    use crate::delivery::tests::{committed, committed_then_failed};
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -938,8 +842,8 @@ mod tests {
         .expect("should parse test settings")
     }
 
-    #[test]
-    fn trace_dispatch_terminal_asset_bypasses_hostile_native_finalizers() {
+    /// [`test_settings`] with the trace page on, behind fictional credentials.
+    fn trace_settings() -> Settings {
         let mut settings = test_settings();
         settings
             .integrations
@@ -950,7 +854,37 @@ mod tests {
             .expect("should configure trace");
         settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
             .expect("should configure trace protection"));
-        let mut request = edgezero_core::http::request_builder()
+        // Counters would land on a private, no-store response, so a trace
+        // response that kept its headers proves `finalize` never reached it.
+        settings.debug.sandbox_metrics_enabled = true;
+        settings
+    }
+
+    fn counters() -> SandboxCounters {
+        SandboxCounters {
+            ordinal: 2,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        }
+    }
+
+    /// Request filter effects that would break a trace response's contract.
+    fn hostile_effects() -> RequestFilterEffects {
+        RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("content-security-policy", "default-src *"),
+                HeaderMutation::set("content-type", "text/plain"),
+                HeaderMutation::append("set-cookie", "example=operator"),
+                HeaderMutation::set("cache-control", "public, max-age=3600"),
+            ],
+        }
+    }
+
+    #[test]
+    fn trace_response_passes_untouched() {
+        let settings = trace_settings();
+        let (mut request, _body) = edgezero_core::http::request_builder()
             .uri("https://publisher.example.com/_ts/trace/assets/v1.js")
             .header(
                 "authorization",
@@ -961,67 +895,78 @@ mod tests {
                 ),
             )
             .body(EdgeBody::empty())
-            .expect("should build protected asset request");
+            .expect("should build protected asset request")
+            .into_parts();
         let trusted_server_core::trace::TracePreflight::Ready(dispatch) =
             trusted_server_core::trace::preflight(&settings, &mut request)
         else {
             panic!("should accept protected fixed asset");
         };
         let mut response = dispatch.fixed_asset(b"example immutable asset");
+        response.extensions_mut().insert(hostile_effects());
         let original = response.headers().clone();
-        let effects = RequestFilterEffects {
-            request_headers: Vec::new(),
-            response_headers: vec![
-                HeaderMutation::set("content-security-policy", "default-src *"),
-                HeaderMutation::set("content-type", "text/plain"),
-                HeaderMutation::append("set-cookie", "example=operator"),
-                HeaderMutation::set("cache-control", "public, max-age=3600"),
-            ],
-        };
-        apply_entry_point_finalize_headers(&settings, &mut response, None);
-        apply_terminal_response_effects(&mut response, Some(&effects));
+        let counters = counters();
+
+        let state = finalize_response(
+            &mut response,
+            &FinalizeInputs {
+                settings: &settings,
+                geo: None,
+                counters: &counters,
+            },
+        );
+
+        assert!(state.is_none(), "should hand no pull-sync inputs on");
         assert_eq!(
             response.headers(),
             &original,
-            "should bypass every ordinary trace finalizer and preserve protected digest"
-        );
-        let native = compat::to_fastly_response(response);
-        assert_eq!(
-            native.get_header("etag").map(HeaderValue::as_bytes),
-            original.get("etag").map(HeaderValue::as_bytes),
-            "should preserve strong ETag through native conversion"
+            "should bypass every ordinary finalizer and preserve the protected digest"
         );
         assert!(
-            native.get_header("set-cookie").is_none(),
+            response.headers().get("set-cookie").is_none(),
             "should never acquire an operator cookie"
         );
     }
 
+    /// Drives `request` through `hook` on a router whose routes record a continuation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the hook continues to a route instead of answering.
+    fn dispatch_through_hook(
+        hook: &Arc<TracePreDispatchHook>,
+        request: HttpRequest,
+    ) -> HttpResponse {
+        let continued = Arc::new(AtomicBool::new(false));
+        let route_continued = Arc::clone(&continued);
+        let route = move |_ctx: RequestContext| {
+            route_continued.store(true, Ordering::SeqCst);
+            async { Ok::<_, EdgeError>(HttpResponse::new(EdgeBody::empty())) }
+        };
+        let method = request.method().clone();
+        let hook = Arc::clone(hook);
+        let router = RouterService::builder()
+            .pre_dispatch_hook_arc(hook)
+            .route("/", method.clone(), route.clone())
+            .route("/{*rest}", method, route)
+            .build();
+        let response = futures::executor::block_on(router.oneshot(request))
+            .expect("should build local trace response");
+        assert!(
+            !continued.load(Ordering::SeqCst),
+            "should intercept reserved request"
+        );
+        response
+    }
+
     #[test]
-    fn trace_dispatch_terminal_actions_errors_and_head_preserve_native_contract() {
-        let mut settings = test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "gpt_diagnostics",
-                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
-            )
-            .expect("should configure trace");
-        settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
-            .expect("should configure trace protection"));
-        let hook = trusted_server_core::trace::TracePreDispatchHook::new(
+    fn trace_terminal_actions_errors_and_head_pass_finalize_untouched() {
+        let settings = trace_settings();
+        let hook = Arc::new(TracePreDispatchHook::new(
             Arc::new(settings.clone()),
             Arc::new(|_| panic!("should never query metadata for actions, errors or HEAD")),
-        );
-        let effects = RequestFilterEffects {
-            request_headers: Vec::new(),
-            response_headers: vec![
-                HeaderMutation::set("content-security-policy", "default-src *"),
-                HeaderMutation::set("content-type", "text/plain"),
-                HeaderMutation::append("set-cookie", "example=operator"),
-                HeaderMutation::set("cache-control", "public, max-age=3600"),
-            ],
-        };
+        ));
+        let counters = counters();
         for (method, path, authenticated, expected, action) in [
             (
                 Method::GET,
@@ -1103,71 +1048,75 @@ mod tests {
                     HeaderFidelity::default(),
                 ));
             }
-            let mut response = futures::executor::block_on(
-                edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
-            )
-            .expect("should build local trace response")
-            .expect("should intercept reserved request");
+            let mut response = dispatch_through_hook(&hook, request);
             assert_eq!(
                 response.status(),
                 expected,
                 "should preserve action and preflight status"
             );
+            response.extensions_mut().insert(hostile_effects());
             let original = response.headers().clone();
-            apply_entry_point_finalize_headers(&settings, &mut response, None);
-            apply_terminal_response_effects(&mut response, Some(&effects));
+
+            let state = finalize_response(
+                &mut response,
+                &FinalizeInputs {
+                    settings: &settings,
+                    geo: None,
+                    counters: &counters,
+                },
+            );
+
+            assert!(state.is_none(), "should hand no pull-sync inputs on");
             assert_eq!(
                 response.headers(),
                 &original,
                 "should bypass hostile ordinary finalizers for every terminal response"
             );
-            let mut native = compat::to_fastly_response(response);
-            for (name, value) in &original {
-                assert_eq!(
-                    native.get_header(name.as_str()).map(HeaderValue::as_bytes),
-                    Some(value.as_bytes()),
-                    "should preserve complete trace headers through native conversion"
-                );
-            }
             assert_eq!(
-                native
-                    .get_headers()
-                    .filter(|(name, _)| name.as_str() == "set-cookie")
-                    .count(),
+                response.headers().get_all("set-cookie").iter().count(),
                 usize::from(action.is_some()),
                 "should emit only one deliberate action cookie and none on reads or errors"
             );
             if head {
-                assert!(
-                    native.take_body_bytes().is_empty(),
-                    "should preserve bodyless trace HEAD through native conversion"
-                );
+                let body = futures::executor::block_on(response.into_body().into_bytes_bounded(1))
+                    .expect("should read the trace HEAD body");
+                assert!(body.is_empty(), "should keep the trace HEAD bodiless");
             }
         }
     }
 
-    #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
-        let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
-            calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
-        );
-        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
+    /// Records the path every request reaches the pre-dispatch hook with.
+    struct PathRecorder(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl PreDispatchHook for PathRecorder {
+        async fn handle(
+            &self,
+            request: &mut PreDispatchRequest,
+        ) -> Result<Option<HttpResponse>, EdgeError> {
+            self.0
+                .lock()
+                .expect("should record the hook path")
+                .push(request.uri().path().to_owned());
+            Ok(Some(HttpResponse::new(EdgeBody::empty())))
+        }
     }
 
     #[test]
-    fn trace_path_classification_survives_core_request_conversion() {
-        // `main` skips client-IP sanitization when the native path is a trace
-        // path; the router hook later classifies the converted URI. Both must
-        // agree, or unsanitized forwarded headers could reach ordinary dispatch.
+    fn trace_path_classification_survives_canonical_request_conversion() {
+        // The entry point skips client-IP sanitization when the native path is a
+        // trace path; the trace hook later classifies the path `EdgeZero`'s
+        // canonical conversion hands it. Both must agree, or unsanitized
+        // forwarded headers could reach ordinary dispatch.
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let app = App::from_router::<TrustedServerApp>(
+            RouterService::builder()
+                .pre_dispatch_hook_arc(Arc::new(PathRecorder(Arc::clone(&paths))))
+                .build(),
+            edgezero_adapter_fastly::FASTLY_PLATFORM,
+        )
+        .expect("should assemble the recording app");
+        let mut hooked = Vec::new();
         for url in [
             "https://example.com/_ts/trace",
             "https://example.com/_ts/trace/",
@@ -1187,14 +1136,191 @@ mod tests {
         ] {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
-            let core = into_core_request(req).expect("should convert the native request");
 
-            assert_eq!(
-                is_trace_path(core.uri().path()),
-                native,
-                "should classify {url} identically before and after conversion"
+            let _delivery = FastlyService::new(&app).run_request_with_hooks_for_test(
+                req,
+                |_req, _extensions| {},
+                |_| (),
+                committed,
+            );
+
+            // Admission may refuse an odd target before the hook runs, which
+            // keeps it out of ordinary dispatch too.
+            let reached = paths.lock().expect("should read the hook paths").pop();
+            if let Some(path) = reached {
+                assert_eq!(
+                    is_trace_path(&path),
+                    native,
+                    "should classify {url} identically before and after conversion"
+                );
+                hooked.push(url);
+            }
+        }
+        for url in [
+            "https://example.com/_ts/trace",
+            "https://example.com/_ts/trace/enable?source=example",
+            "https://example.com/auction",
+            "https://example.com/",
+        ] {
+            assert!(
+                hooked.contains(&url),
+                "should reach the pre-dispatch hook with {url}"
             );
         }
+    }
+
+    #[test]
+    fn reused_sandbox_keeps_serving_after_delivery_failure() {
+        let mut sandbox = Sandbox::default();
+        let settings = test_settings();
+        let mut statuses = Vec::new();
+        let mut post_delivery = 0;
+
+        // Two requests through one sandbox, each the way `handle_request`
+        // runs them. The first fails after commitment, which must neither
+        // end serving nor drop the retained app.
+        for request in 0..2 {
+            sandbox
+                .initialize(|| assemble_app(Ok(test_settings()), &""))
+                .expect("should assemble or reuse the app");
+            let retained = retained_app(&sandbox).expect("should retain the app");
+            let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
+            let inputs = FinalizeInputs {
+                settings: &settings,
+                geo: None,
+                counters: &counters,
+            };
+
+            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
+                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
+                |_req, extensions| {
+                    extensions.insert(ClientInfo::default());
+                    extensions.insert(RequestGeo::default());
+                },
+                |response: &mut HttpResponse| {
+                    statuses.push(response.status());
+                    finalize_response(response, &inputs)
+                },
+                |envelope| {
+                    if request == 0 {
+                        committed_then_failed(
+                            envelope,
+                            edgezero_adapter_fastly::delivery::DeliveryError::Transport,
+                        )
+                    } else {
+                        committed(envelope)
+                    }
+                },
+            );
+            handle_delivery(delivery, &counters, |_state| post_delivery += 1);
+        }
+
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::OK],
+            "should route both requests through the retained app"
+        );
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            1,
+            "should serve the second request from the first build"
+        );
+        assert_eq!(
+            post_delivery, 2,
+            "should run post-delivery work after each committed application body, the one that failed after commitment included"
+        );
+    }
+
+    #[test]
+    fn skipped_operator_header_warns_once_per_request() {
+        let mut settings = test_settings();
+        settings
+            .response_headers
+            .insert("connection".to_owned(), "x example".to_owned());
+        let mut sandbox = Sandbox::default();
+        sandbox
+            .initialize(|| assemble_app(Ok(settings.clone()), &""))
+            .expect("should assemble the app");
+        let retained = retained_app(&sandbox).expect("should retain the app");
+        let counters = SandboxCounters::capture(&sandbox, 1, "request-example");
+        let inputs = FinalizeInputs {
+            settings: &settings,
+            geo: None,
+            counters: &counters,
+        };
+
+        // A routed response, which the finalize middleware finalizes, and a
+        // canonical 405, which only the entry point's finalize step reaches.
+        for (label, request) in [
+            (
+                "routed",
+                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
+            ),
+            (
+                "canonical 405",
+                FastlyRequest::new(FastlyMethod::TRACE, "https://publisher.example.com/"),
+            ),
+        ] {
+            let capture = LogCapture::start();
+            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
+                request,
+                |_req, extensions| {
+                    extensions.insert(per_request_synthesized_headers(&settings, None));
+                    extensions.insert(ClientInfo::default());
+                    extensions.insert(RequestGeo::default());
+                },
+                |response: &mut HttpResponse| finalize_response(response, &inputs),
+                committed,
+            );
+            handle_delivery(delivery, &counters, |_state| {});
+
+            let skipped = capture
+                .take_warnings()
+                .into_iter()
+                .filter(|warning| warning.message.contains("`connection`"))
+                .count();
+            assert_eq!(
+                skipped, 1,
+                "should warn once about the skipped operator entry for the {label} request"
+            );
+        }
+    }
+
+    #[test]
+    fn client_request_values_carry_the_trusted_client_ip_to_client_info_and_geo() {
+        let mut settings = test_settings();
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-trusted-client-ip".to_owned(),
+            auth_header: "x-trusted-client-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+        });
+        let trusted = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut req = FastlyRequest::get("https://publisher.example/article");
+        req.set_header("x-trusted-client-ip", "192.0.2.1");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+        assert_ne!(
+            req.get_client_ip_addr(),
+            Some(trusted),
+            "test precondition: the peer IP should differ from the authenticated one"
+        );
+
+        let values = ClientRequestValues::read(&mut req, &settings, false);
+        let mut extensions = Extensions::new();
+        values.prepare(&mut extensions, &settings, &TelemetryQueue::default());
+
+        assert_eq!(
+            extensions.get::<ClientInfo>().map(|info| info.client_ip),
+            Some(Some(trusted)),
+            "should carry the authenticated client IP in ClientInfo"
+        );
+        assert_eq!(
+            extensions.get::<RequestGeo>().map(RequestGeo::client_ip),
+            Some(Some(trusted)),
+            "should look up geo for the authenticated client IP, not the peer"
+        );
     }
 
     #[test]
@@ -1223,7 +1349,10 @@ mod tests {
 
         assert_eq!(
             response.get_header_str("x-ts-version"),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version on /health"
         );
         assert!(
@@ -1259,13 +1388,196 @@ mod tests {
         );
     }
 
+    fn sample_geo() -> GeoInfo {
+        GeoInfo {
+            city: "San Francisco".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 37.7749,
+            longitude: -122.4194,
+            metro_code: 807,
+            region: Some("CA".to_owned()),
+            asn: None,
+        }
+    }
+
+    #[test]
+    fn finalize_sets_ec_cookies_geo_headers_cache_policy_and_counters() {
+        let mut settings = test_settings();
+        settings.debug.sandbox_metrics_enabled = true;
+        settings.response_headers =
+            std::iter::once(("x-operator".to_owned(), "kept".to_owned())).collect();
+        let geo = sample_geo();
+        let counters = counters();
+        let inputs = FinalizeInputs {
+            settings: &settings,
+            geo: Some(&geo),
+            counters: &counters,
+        };
+
+        // A returning reader withdraws consent with GPC in a US state.
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let request = edgezero_core::http::request_builder()
+            .uri("https://www.example.com/article")
+            .header("cookie", format!("ts-ec={ec_id}"))
+            .header("sec-gpc", "1")
+            .body(EdgeBody::empty())
+            .expect("should build the reader request");
+        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+            &settings,
+            &request,
+            &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
+            Some(&geo),
+        )
+        .expect("should read the EC context");
+        let mut page = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build the page response");
+        page.extensions_mut().insert(EcFinalizeState {
+            ec_context,
+            use_finalize_kv: false,
+            eids_cookie: None,
+            sharedid_cookie: None,
+            is_real_browser: true,
+        });
+
+        let state = finalize_response(&mut page, &inputs);
+
+        assert!(state.is_some(), "should hand the EC state on for pull sync");
+        let page_header = |name: &str| {
+            page.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let cookie = page_header("set-cookie").expect("should write the EC cookie");
+        assert!(
+            cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0"),
+            "should expire the withdrawn EC cookie, got {cookie}"
+        );
+        assert_eq!(
+            page_header("x-geo-country").as_deref(),
+            Some("US"),
+            "should apply the request's geo lookup"
+        );
+        assert_eq!(
+            page_header("x-operator").as_deref(),
+            Some("kept"),
+            "should apply the operator headers"
+        );
+        assert_eq!(
+            page_header("cache-control").as_deref(),
+            Some("private, max-age=0"),
+            "should keep a cookie-bearing response out of shared caches"
+        );
+
+        // An asset response keeps its protected cache policy and, being
+        // private and no-store, carries the sandbox counters.
+        let mut asset = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build the asset response");
+        asset
+            .extensions_mut()
+            .insert(AssetProxyCachePolicy::NoStorePrivate);
+
+        assert!(
+            finalize_response(&mut asset, &inputs).is_none(),
+            "should hand no pull-sync inputs on without EC state"
+        );
+        let asset_header = |name: &str| {
+            asset
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        };
+        assert_eq!(
+            asset_header("cache-control"),
+            Some("no-store, private"),
+            "should apply the asset cache policy after the finalize headers"
+        );
+        assert_eq!(
+            asset_header("x-ts-version"),
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
+            "should apply the version header"
+        );
+        assert_eq!(
+            asset_header(sandbox::HEADER_SANDBOX_REQUEST_ID),
+            Some("request-example"),
+            "should attach the sandbox counters to the private response"
+        );
+        assert_eq!(
+            asset_header(sandbox::HEADER_SANDBOX_ORDINAL),
+            Some("2"),
+            "should report the request ordinal"
+        );
+    }
+
+    #[test]
+    fn finalize_keeps_counters_off_without_metrics() {
+        let settings = test_settings();
+        let counters = counters();
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        finalize_response(
+            &mut response,
+            &FinalizeInputs {
+                settings: &settings,
+                geo: None,
+                counters: &counters,
+            },
+        );
+
+        assert!(
+            response
+                .headers()
+                .get(sandbox::HEADER_SANDBOX_REQUEST_ID)
+                .is_none(),
+            "counters must stay off responses in the default configuration"
+        );
+    }
+
+    #[test]
+    fn finalize_skips_headers_the_middleware_already_set() {
+        let settings = test_settings();
+        let counters = counters();
+        let mut response = response_builder()
+            .header(HEADER_X_TS_FINALIZED, "1")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        finalize_response(
+            &mut response,
+            &FinalizeInputs {
+                settings: &settings,
+                geo: None,
+                counters: &counters,
+            },
+        );
+
+        assert!(
+            response.headers().get(HEADER_X_TS_FINALIZED).is_none(),
+            "should strip the sentinel"
+        );
+        assert!(
+            response
+                .headers()
+                .get(trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE)
+                .is_none(),
+            "should not finalize a middleware-finalized response twice"
+        );
+    }
+
     #[test]
     fn sandbox_counters_never_appear_on_cacheable_responses() {
-        let counters = SandboxCounters {
-            ordinal: 2,
-            builds: 1,
-            request_id: "request-example".to_owned(),
-        };
+        let counters = counters();
         for policy in [
             None,
             Some("public, s-maxage=3600"),
@@ -1295,11 +1607,7 @@ mod tests {
 
     #[test]
     fn sandbox_counters_follow_final_private_no_store_policy() {
-        let counters = SandboxCounters {
-            ordinal: 2,
-            builds: 1,
-            request_id: "request-example".to_owned(),
-        };
+        let counters = counters();
         let mut response = response_builder()
             .header("cache-control", "public, s-maxage=3600")
             .body(EdgeBody::empty())
@@ -1325,7 +1633,6 @@ mod tests {
             "should retain terminal privacy"
         );
     }
-
     #[test]
     fn late_filter_effects_cannot_make_an_assembled_response_public() {
         let mut response = response_builder()
@@ -1508,19 +1815,30 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
-    fn entry_point_finalize_skips_geo_lookup_for_401() {
+    fn entry_point_finalize_withholds_geo_from_401() {
         let settings = test_settings();
+        let request_geo = GeoInfo {
+            city: "Springfield".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 39.78,
+            longitude: -89.65,
+            metro_code: 648,
+            region: Some("IL".to_owned()),
+            asn: None,
+        };
         let mut response = response_builder()
             .status(edgezero_core::http::StatusCode::UNAUTHORIZED)
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        let geo_info = resolve_geo_for_response(&response, None, |_| {
-            panic!("should skip entry-point geo lookup for 401 responses");
-        });
-        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+        let geo = resolve_geo_for_response(&response, Some(&request_geo));
+        apply_finalize_headers(&settings, geo, &mut response);
 
+        assert!(
+            geo.is_none(),
+            "should withhold the request's geo from a 401"
+        );
         assert_eq!(
             response
                 .headers()

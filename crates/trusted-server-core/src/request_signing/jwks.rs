@@ -105,6 +105,7 @@ mod tests {
 
     struct FailingConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FailingConfigStore {
         fn get(
             &self,
@@ -114,17 +115,21 @@ mod tests {
             Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 

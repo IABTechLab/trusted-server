@@ -71,7 +71,7 @@ The input body limit is 5 MiB:
 - If collection exceeds the limit, Trusted Server stops reading and returns `502 Bad Gateway`. This also applies when `Content-Length` understates the size. The partial body is discarded, not returned to the browser.
 - Compressed responses, unsupported or malformed encoding headers, other content types, disabled rewriting, and ineligible methods or statuses do not collect the body for rewriting. Their bytes and encoding headers pass through unchanged.
 
-On Fastly, upstream responses remain streaming until the bounded collector reads them. It reads at most 5 MiB of input plus the current transport chunk, but its buffer grows by doubling, so a body over 4 MiB occupies an 8 MiB allocation before rewriting adds its own bounded copies. Non-rewritten responses remain streaming. Adapters without streaming support still buffer upstream responses before this check; this limit is not an adapter-level memory guarantee on Axum, Cloudflare, or Spin.
+On every adapter, upstream responses remain streaming until the bounded collector reads them. It reads at most 5 MiB of input plus the current transport chunk, but its buffer grows by doubling, so a body over 4 MiB occupies an 8 MiB allocation before rewriting adds its own bounded copies. Non-rewritten responses remain streaming.
 
 Likely JavaScript and HTML paths, including `/mms/v2/get_site_data`, request `Accept-Encoding: identity`. Rewritten bodies discard the upstream `Content-Length` and `Content-Encoding`, and remove `Accept-Encoding` from `Vary`. Non-UTF-8 bodies pass through unchanged after bounded collection.
 
@@ -84,6 +84,19 @@ Trusted Server also injects a `window._sp_` property trap that rewrites known So
 Single-page apps often insert CMP scripts after the initial HTML response. The `sourcepoint` tsjs module installs a DOM insertion guard so dynamically inserted Sourcepoint script and preload URLs are rewritten to first-party paths before the browser fetches them.
 
 ## Cookie Forwarding and Caching
+
+On HTTPS publisher pages, the browser integration also listens to Sourcepoint's
+TCF API. When the CMP has a settled GDPR decision and has not supplied
+`euconsent-v2`, it mirrors the original TC string into the host-only session
+cookie `__Host-ts-tcf`. Trusted Server prefers `euconsent-v2` when present and
+otherwise decodes the mirror through its existing TCF consent rules. The
+mirror is independent of GPP and does not create or change consent.
+
+A grant can permit Edge Cookie issuance on the next eligible page navigation.
+A later denial replaces the grant so subsequent requests can reconcile
+withdrawal. The browser integration neither reloads the page nor issues an Edge
+Cookie itself. In Prebid cookie forwarding modes, the selected TCF signal is
+sent as `euconsent-v2` rather than using the bridge cookie name.
 
 Trusted Server forwards only Sourcepoint's documented cookie names upstream, plus the optional `auth_cookie_name` when configured. Unrelated publisher cookies are deliberately excluded so first-party application state is not leaked to Sourcepoint.
 

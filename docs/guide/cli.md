@@ -44,6 +44,9 @@ commands are shown explicitly.
 | `ts dev proxy ca path`           | macOS only    | Print the per-machine CA certificate path                                                        | `ts dev proxy ca path`                                                                                         |
 | `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                          | `ts dev proxy ca regenerate`                                                                                   |
 | `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
+| `ts ec`                          | Linux + macOS | Edge Cookie identity diagnostics through a deployed service's admin routes                       | `ts ec <COMMAND>`                                                                                              |
+| `ts ec eids`                     | Linux + macOS | Preview which configured partners would match `ts-eids` and `sharedId` cookie values             | `ts ec eids [OPTIONS] --service <SERVICE> <--ts-eids <TS_EIDS>\|--shared-id <SHARED_ID>>`                      |
+| `ts ec show`                     | Linux + macOS | Show the identity-graph record stored for an EC ID and its auction EID preview                   | `ts ec show [OPTIONS] --service <SERVICE> <EC_ID>`                                                             |
 | `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
 | `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
 | `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                        | `ts prebid client [OPTIONS]`                                                                                   |
@@ -228,9 +231,14 @@ adapter flags directly need the `--` added. Trusted Server declares Config, KV,
 and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
 requires a verified application release root via `--application-release`; a
 bare `ts deploy --adapter fastly` without a release is accepted only for
-store-free applications. The CLI loads `edgezero.toml` from the working
-directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
-manifest outside the release root, so select the release's own manifest.
+store-free applications.
+
+`ts build`, `ts serve`, and `ts deploy` find the manifest in this order: the
+file `EDGEZERO_MANIFEST` names, the nearest `edgezero.toml` in the working
+directory or one of its parents, and then the nearest `edgezero.toml` under
+the workspace root. Two manifests equally near the working directory are an
+error. A managed deploy rejects a manifest outside the release root, so set
+`EDGEZERO_MANIFEST` to the release's own manifest.
 
 Managed deployment also requires a nonempty `FASTLY_API_TOKEN` in the process
 environment; signing in with `ts auth login` or a Fastly CLI profile alone

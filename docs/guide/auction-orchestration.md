@@ -8,7 +8,7 @@ The auction orchestrator is the core system that manages server-side ad auctions
 
 Key capabilities:
 
-- **Parallel execution** — Bid requests to all providers launch concurrently using Fastly's `select()` API
+- **Parallel execution** — Bid requests to all providers leave together as one EdgeZero request batch on every adapter
 - **Strategy-based winner selection** — Automatic strategy detection based on configuration
 - **Mediator support** — Optional external mediator for final winner selection and unified floor pricing
 - **Provider abstraction** — Pluggable provider interface for adding new demand sources
@@ -185,7 +185,7 @@ POST /auction (AdRequest in Prebid.js format)
 AuctionOrchestrator.run_auction()
   │
   ├─ Detect strategy (parallel_only or parallel_mediation)
-  ├─ Launch all providers in parallel via select()
+  ├─ Send all bidder requests as one EdgeZero batch
   ├─ Collect responses as they complete
   │
   ├─[parallel_only]─── Select highest decoded CPM per slot
@@ -330,15 +330,17 @@ Mediation is optional for APS. APS reduces to one candidate per impression befor
 
 Demand sources implement the async, platform-neutral
 [`AuctionProvider`](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs).
-The trait receives an `AuctionRequest` and `AuctionContext`, launches a request
-as a `ProviderRequestOutcome`, and parses a `PlatformResponse` into an
-`AuctionResponse`. It also supplies capability, timeout, enablement, and
-platform-backend metadata. Providers that need request-local response state use
-the context-aware parsing hooks instead of storing mutable state on the shared
-provider instance.
+The trait receives an `AuctionRequest` and `AuctionContext` and returns a
+`ProviderRequestOutcome`: `Ready` with an unsent EdgeZero `OutboundRequest`, or
+an immediate response that needs no upstream call. It parses the
+`OutboundResponse` into an `AuctionResponse`, and also supplies media-type
+support, its timeout, and enablement. Providers that need request-local
+response state use the context-aware parsing hooks instead of storing mutable
+state on the shared provider instance.
 
-The orchestrator launches every request before collecting pending responses, so
-providers can run concurrently without depending on a Fastly-specific API.
+The orchestrator builds and signs every bidder request before it sends any, then
+sends them together as one batch, so providers run concurrently without
+depending on a Fastly-specific API.
 
 ### Prebid Provider
 
@@ -767,21 +769,25 @@ timeout_ms = 500
 ```
 
 `[auction.providers]` is a map, not a provider-name list. Each provider ID owns
-endpoint/backend correlation and telemetry. `[auction.bidders]` maps each
+endpoint correlation and telemetry. `[auction.bidders]` maps each
 client-visible bidder ID to one provider. The mediator remains a separately
 registered integration selected by `[auction].mediator`.
 
 Common provider fields and defaults:
 
-| Field            | Default         | Meaning                                                        |
-| ---------------- | --------------- | -------------------------------------------------------------- |
-| `protocol`       | Required        | `openrtb-2.6`                                                  |
-| `profile`        | `standard`      | Typed OpenRTB behavior                                         |
-| `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
-| `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
-| `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
-| `profile_config` | `{}`            | Profile-owned typed settings                                   |
-| `notifications`  | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats |
+| Field                 | Default         | Meaning                                                                            |
+| --------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `protocol`            | Required        | `openrtb-2.6`                                                                      |
+| `profile`             | `standard`      | Typed OpenRTB behavior                                                             |
+| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                      |
+| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
+| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                         |
+| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                 |
+| `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
+| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
+
+A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
+`[::1]`.
 
 APS normally uses `all_eligible`, which sends every compatible banner slot but
 never another provider's bidder parameters. `explicit` providers receive only
@@ -812,58 +818,56 @@ are each limited to 16 KiB, eight container levels, and 256 keys at one object
 level. Notification seat lists are limited to 128 unique entries of at most 128
 UTF-8 bytes each.
 
-### Validation and target capability
+### Validation and the Fastly backend bound
 
 Target-independent `ts config validate` compiles profiles, defaults, routes,
 endpoints, bounds, signing structure, and mediator selection. Every adapter
-startup compiles the same plan and then validates backend-name prediction,
-fan-out capability, and target resource limits. Fastly and Axum allow
-multi-provider fan-out; Cloudflare and Spin currently reject enabled auctions
-with more than one provider. Fastly reserves 40 of its default 200 dynamic
-backend names for non-auction traffic and rejects auction plans whose provider
-IDs and reachable timeout buckets could require more than the remaining 160.
-
-This tree does not yet have the EdgeZero callback required to run target-aware
-validation before `ts config push --adapter <target>` performs remote work.
-Until that callback lands, startup remains the mandatory target-aware gate.
+startup compiles the same plan, and every adapter runs multi-provider auctions.
+Fastly startup adds one check: an enabled plan may need at most 160 Fastly
+backend configurations, which leaves 40 of Fastly's 200 dynamic backends for
+other outbound traffic. Each distinct tuple of provider scheme, host, port, and
+timeout counts as one configuration. Config validation and push do not run this
+check, so Fastly startup is where it applies.
 
 ### Timeout behavior
 
-Auction requests start at dispatch and progress while the publisher origin loads.
-Response collection waits for headers and complete upstream bodies only until the
-original absolute deadline. At expiry, one nonblocking snapshot preserves complete
-responses already available; unfinished providers become timeouts. A slow origin
-never restarts the budget or causes an already-buffered bid to be discarded.
-Fastly has no upstream arrival timestamp, so this is a bound on network waiting,
-not bid eligibility based on an exact server-side arrival time. A mediator starts
-only with remaining budget and uses the earlier of the auction cutoff and its own
-logical timeout.
+The orchestrator builds and signs every bidder request, then sends them together
+as one EdgeZero request batch whose cutoff is the auction deadline, measured
+from auction start. The bids progress while the publisher origin loads. Each
+bidder request carries the provider's configured timeout as its total timeout
+and a 1 s connect timeout, and the batch cutoff bounds it by the remaining
+auction budget. Collection waits on the batch until every bidder has answered
+or the cutoff passes. A bid that has not arrived by the cutoff becomes a
+provider timeout. A slow origin never restarts the budget or discards a bid that
+already arrived. The mediator starts after the batch finishes, only with
+remaining budget, and uses the earlier of the auction deadline and its own
+timeout.
 
-Provider bids that are already complete at the final nonblocking snapshot remain
-eligible even after `tmax`; mediation starts only with remaining budget and
-rejects responses collected after its cutoff.
+A provider's reported response time runs from the batch start to its bid's
+arrival, so a collection that waits after an on-time bid does not increase it.
 
-Personalized auction and mediator requests explicitly bypass intermediary caches.
-Fastly uses the SDK's direct pending-request handles and body readiness handles in
-a timed wait. Retained partial payloads share a 10 MiB budget. Under memory pressure,
-the largest partial response is rejected with its own backend attribution so a
-large stalled provider cannot make a small healthy sibling take the failure.
-Completed payloads move directly into the platform body without a host-buffer
-round trip. This cap covers retained payloads, not every allocator or host buffer. The final nonblocking body drain is bounded by this payload limit; its local CPU work can extend beyond the network cutoff.
+Personalized auction and mediator requests explicitly bypass intermediary
+caches. A `prebid-server` or `aps` bidder response is capped at 2 MiB, a
+`standard` bidder response at 1 MiB, and the mediator response at 2 MiB. A
+bidder response over its cap fails that provider with `error_type`
+`transport`. No cap applies across all bidder responses together.
 
-On expiry Fastly closes acquired response bodies and abandons unfinished requests;
-the installed SDK has no pending-request cancellation API. Axum aborts outstanding
-request tasks. Cloudflare and Spin start owned background tasks at dispatch and
-retain abort handles until response collection completes. Cloudflare also aborts
-its fetch through an AbortController. Both workers retain their single-provider
-restriction. Dropping a pending handle cancels queued or running guest work;
-upstream side effects that already happened cannot be undone.
+On Fastly, EdgeZero records a bid's arrival whenever one of its polls services
+the provider, including the origin body reads while a page streams. A bid that
+completes while nothing polls, and is first observed after the cutoff, is
+dropped.
 
-Backend first-byte and between-byte timeouts remain transport safeguards rather
-than total deadlines. Timer granularity and runtime scheduling can add a small
-overshoot. Parsing, ranking, HTML processing, and delivery are local work outside
-network collection, so this cutoff is not a hard ceiling on the whole publisher
-response time.
+Dropping the batch cancels its in-flight requests on every adapter. An abandoned
+auction, an origin error, a non-HTML response, or a client that disconnects
+mid-stream therefore cancels the bidder and mediator requests. Only guest-side
+cancellation is guaranteed: host cancellation is best effort on Cloudflare,
+Fastly, and Spin, so a bidder may still receive and answer a cancelled request. Upstream side effects that
+already happened cannot be undone.
+
+Timer granularity and runtime scheduling can add a small overshoot. Parsing,
+ranking, HTML processing, and delivery are local work outside network
+collection, so this cutoff is not a hard ceiling on the whole publisher response
+time.
 
 Browser Prebid `timeout_ms` and `debug` stay under `[integrations.prebid]` and
 are independent of all server provider values. Server endpoint, timeout,
@@ -915,7 +919,7 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — The provider records a `launch_failed` outcome and other providers continue. If every eligible provider fails before producing a pending or immediate outcome, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
+- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built, Fastly cannot register its backend, or the Spin or Cloudflare adapter cannot prepare the request, and other providers continue. If every routed provider fails to launch, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
 - **No providers configured** — Completes as a no-bid without provider I/O.
 - **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.
@@ -930,9 +934,9 @@ The auction system logs at multiple levels throughout execution:
 
 | Level   | Examples                                                                                |
 | ------- | --------------------------------------------------------------------------------------- |
-| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing   |
+| `info`  | Auction request received, in-flight bidders, bid counts, winner selection, total timing |
 | `debug` | Bid-drop reasons, mediation restoration notes, creative processing mode and byte counts |
-| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices          |
+| `warn`  | Provider request failures, parse failures, mediator bids without decoded prices         |
 
 ### Response Metadata
 

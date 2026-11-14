@@ -210,8 +210,7 @@ proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
-# Verify TLS certs when proxying to HTTPS origins (default true; false only for
-# local self-signed dev).
+# Must be true. Origin TLS is always verified, and validation rejects false.
 # certificate_check = true
 # Allowlist for first-party proxy signing, initial fetch targets, and redirect
 # targets. Supports exact ("example.com") and wildcard ("*.example.com", also
@@ -406,9 +405,8 @@ auction_timeout_ms = 500
 # With either list nonempty, false bypasses unlisted cookies; true asserts those
 # cookies do not change origin HTML. No identity or consent cookie is exempt.
 # With both lists empty, false bypasses all Cookie headers, as before.
-# On the template path, origin `Vary: Cookie` is always refused. Readthrough
-# has no response-side guard; run `ts origin probe-shareability` before enabling.
-# Configured key-cookie dimensions disable readthrough, preserving template variants.
+# On the template path, origin `Vary: Cookie` is always refused. Run
+# `ts origin probe-shareability` before setting true.
 # origin_is_cookie_independent = false
 # Invalid names, duplicates, cross-list overlap, and TS identity cookies in the
 # key list reject configuration. Named policies bypass ambiguous/nonconforming
@@ -418,17 +416,11 @@ auction_timeout_ms = 500
 # Rollback: older binaries reject both new fields even as empty lists. Remove
 # both fields AND restore independence=false or disable ESI when HTML uses cookies.
 #
-# Applies shareability checks to the platform's origin cache. Default false keeps
-# the existing policy: ad-serving requests bypass; other publisher requests use
-# the platform default. True admits shareable ad requests and bypasses unshareable
-# non-ad requests. A DIFFERENT cache from the template cache
-# above, and a weaker one: the decision is made before the origin replies, so
-# none of the template cache's response-side refusals (`Set-Cookie`, CSP nonce,
-# missing freshness) apply. `ts origin probe-shareability` must pass on every
-# axis and verdict first. Tagged readthrough objects can be purged with
-# ts cache purge (--all or the exact reader-facing --page URL). Older untagged
-# objects must expire on the origin TTL; see the configuration guide's rollback note.
-# origin_readthrough_enabled = false
+# Origin readthrough is unavailable. `ts config validate` and `ts config push`
+# reject origin_readthrough_enabled = true. A live config that still sets it
+# keeps loading, logs a warning, and treats it as false. Ad-serving requests
+# bypass the platform's origin cache; other publisher requests keep its default.
+# Leave the setting out.
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id

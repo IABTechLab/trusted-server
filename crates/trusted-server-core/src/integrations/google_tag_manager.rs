@@ -15,20 +15,19 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::{Report, ResultExt};
-use futures::StreamExt as _;
 use http::{Method, Request, Response, StatusCode, header};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
-use crate::error::TrustedServerError;
+use crate::error::{IntoHttpResponse as _, TrustedServerError};
+use crate::http_util::{into_body_payload, read_request_body};
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
-    IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-    collect_response_bounded,
+    IntegrationScriptRewriter, ScriptRewriteAction,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS, ProxyRequestConfig, proxy_request};
@@ -47,17 +46,6 @@ const GA_COLLECT_DOMAIN: &str = "google-analytics.com";
 const GTM_SCRIPT_HOST: &str = "www.googletagmanager.com";
 /// Alternate analytics host that appears in tag script bodies.
 const ANALYTICS_HOST: &str = "analytics.google.com";
-
-/// Error type for payload size validation
-#[derive(Debug)]
-enum PayloadSizeError {
-    TooLarge {
-        actual: usize,
-        max: usize,
-    },
-    /// Transport error while reading a streaming body chunk.
-    StreamRead(String),
-}
 
 /// Regex pattern for validating GTM container IDs.
 /// Format: GTM-XXXXXX where X is alphanumeric.
@@ -794,71 +782,24 @@ impl GoogleTagManagerIntegration {
             .change_context(Self::error("Failed to build GTM response"))
     }
 
-    /// Returns the status to answer with when a POST declares a body this
-    /// integration will not read, or `None` when the request may proceed.
-    ///
-    /// A missing `Content-Length` is not rejected here: the body is bounded
-    /// again while it is read, which keeps HTTP/2 and chunked intermediaries
-    /// working.
-    fn content_length_rejection(&self, req: &Request<EdgeBody>) -> Option<StatusCode> {
-        if req.method() != Method::POST {
-            return None;
-        }
-        let declared = req
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())?;
-        match declared.parse::<usize>() {
-            Ok(content_length) if content_length > self.config.max_beacon_body_size => {
-                log::warn!(
-                    "Rejecting POST beacon with Content-Length {} exceeding max {}",
-                    content_length,
-                    self.config.max_beacon_body_size
-                );
-                Some(StatusCode::PAYLOAD_TOO_LARGE)
-            }
-            Ok(_) => None,
-            Err(_) => {
-                log::warn!("POST request with malformed Content-Length header");
-                Some(StatusCode::BAD_REQUEST)
-            }
-        }
-    }
-
-    /// Maps a body-size failure onto the status the client should see.
-    fn payload_size_status(error: &PayloadSizeError) -> StatusCode {
-        match error {
-            PayloadSizeError::TooLarge { actual, max } => {
-                log::warn!(
-                    "Returning 413: actual body size {actual} exceeds max {max} (Content-Length mismatch)"
-                );
-                StatusCode::PAYLOAD_TOO_LARGE
-            }
-            PayloadSizeError::StreamRead(error) => {
-                log::error!("Returning 502: failed to read GTM request body stream: {error}");
-                StatusCode::BAD_GATEWAY
-            }
-        }
-    }
-
     /// Rewrites a proxied script body so its internal URLs stay first-party.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError`] when the body cannot be read within the
-    /// response cap or the response cannot be built.
-    async fn rewritten_script_response(
+    /// Returns [`TrustedServerError`] when the body was not buffered or the
+    /// response cannot be built.
+    fn rewritten_script_response(
         &self,
         response: Response<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         log::debug!("Rewriting GTM/gtag script content");
         let status = response.status();
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-            GTM_INTEGRATION_ID,
-        )
-        .await?;
+        // `proxy_request` buffers the script under its response cap.
+        let BodyPayload::Once(body_bytes) = into_body_payload(response.into_body()) else {
+            return Err(Report::new(Self::error(
+                "GTM script response was not buffered",
+            )));
+        };
         let body_str = String::from_utf8_lossy(&body_bytes);
         let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 
@@ -903,14 +844,14 @@ impl GoogleTagManagerIntegration {
     ///
     /// # Errors
     ///
-    /// Returns [`PayloadSizeError`] when the request body exceeds
+    /// Returns the [`read_request_body`] error when a POST body exceeds
     /// `max_beacon_body_size` or cannot be read.
     async fn build_proxy_config<'a>(
         &'a self,
         path: &str,
         req: &mut Request<EdgeBody>,
         target_url: &'a str,
-    ) -> Result<ProxyRequestConfig<'a>, PayloadSizeError> {
+    ) -> Result<ProxyRequestConfig<'a>, Report<TrustedServerError>> {
         // The upstream body is re-served from the publisher's origin, so the
         // fetch itself must not be downgradable, and a redirect must not be
         // able to carry it to a host the operator never configured.
@@ -925,8 +866,8 @@ impl GoogleTagManagerIntegration {
             // Read body with size cap to prevent unbounded memory allocation.
             let body = std::mem::replace(req.body_mut(), EdgeBody::empty());
             let body_bytes =
-                Self::collect_request_body_bounded(body, self.config.max_beacon_body_size).await?;
-            proxy_config.body = Some(body_bytes);
+                read_request_body(req.headers(), body, self.config.max_beacon_body_size).await?;
+            proxy_config.body = Some(body_bytes.to_vec());
         }
 
         // Explicitly strip X-Forwarded-For to prevent client IP leakage to Google.
@@ -944,53 +885,6 @@ impl GoogleTagManagerIntegration {
         }
 
         Ok(proxy_config)
-    }
-
-    async fn collect_request_body_bounded(
-        body: EdgeBody,
-        max_size: usize,
-    ) -> Result<Vec<u8>, PayloadSizeError> {
-        match body {
-            EdgeBody::Once(bytes) => {
-                if bytes.len() > max_size {
-                    log::warn!(
-                        "POST body size {} exceeds max {} (rejected before proxy)",
-                        bytes.len(),
-                        max_size
-                    );
-                    return Err(PayloadSizeError::TooLarge {
-                        actual: bytes.len(),
-                        max: max_size,
-                    });
-                }
-                Ok(bytes.to_vec())
-            }
-            EdgeBody::Stream(mut stream) => {
-                let mut body_bytes = Vec::new();
-                while let Some(chunk_result) = stream.next().await {
-                    let chunk = chunk_result.map_err(|error| {
-                        log::error!("Error reading request body stream: {}", error);
-                        PayloadSizeError::StreamRead(error.to_string())
-                    })?;
-
-                    if body_bytes.len() + chunk.len() > max_size {
-                        let total_size = body_bytes.len() + chunk.len();
-                        log::warn!(
-                            "POST body size {} exceeds max {} (rejected during stream read)",
-                            total_size,
-                            max_size
-                        );
-                        return Err(PayloadSizeError::TooLarge {
-                            actual: total_size,
-                            max: max_size,
-                        });
-                    }
-
-                    body_bytes.extend_from_slice(&chunk);
-                }
-                Ok(body_bytes)
-            }
-        }
     }
 }
 
@@ -1059,10 +953,6 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         let path = req.uri().path().to_string();
         log::debug!("Handling GTM request: {} {}", req.method(), path);
 
-        if let Some(status) = self.content_length_rejection(&req) {
-            return Self::empty_response(status);
-        }
-
         let Some(target) = self.build_target_url(&req, &path) else {
             return Self::empty_response(StatusCode::NOT_FOUND);
         };
@@ -1076,7 +966,18 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
 
         let proxy_config = match self.build_proxy_config(&path, &mut req, &target_url).await {
             Ok(config) => config,
-            Err(error) => return Self::empty_response(Self::payload_size_status(&error)),
+            Err(report) => {
+                // GTM answers with its own bodiless response instead of
+                // `http_error`, so it logs the body-read report the same way:
+                // at warn for a client error, and at error otherwise.
+                let status = report.current_context().status_code();
+                if status.is_client_error() {
+                    log::warn!("Rejecting GTM beacon: {report:?}");
+                } else {
+                    log::error!("Rejecting GTM beacon: {report:?}");
+                }
+                return Self::empty_response(status);
+            }
         };
 
         let mut response = proxy_request(settings, req, proxy_config, services)
@@ -1095,7 +996,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                 log::warn!("GTM upstream returned status {}", response.status());
                 return Ok(response);
             }
-            return self.rewritten_script_response(response).await;
+            return self.rewritten_script_response(response);
         }
 
         Ok(response)
@@ -1213,10 +1114,19 @@ mod tests {
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
         IntegrationScriptRewriter, ScriptRewriteAction,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::{
+        BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, REDIRECT_CHAIN_DEADLINE,
+    };
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::settings::Settings;
     use crate::streaming_processor::StreamProcessor as _;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
 
     #[test]
     fn container_id_validation_matches_gtm_pattern() {
@@ -1837,31 +1747,112 @@ mod tests {
         });
     }
 
-    /// Drives `handle` against a stubbed upstream that returns `headers`.
+    /// A scripted upstream that answers the URL `integration` proxies `req` to with `reply`.
+    ///
+    /// A request that resolves to no proxied target scripts nothing, so any request it sends
+    /// fails.
+    fn scripted_gtm_upstream(
+        integration: &GoogleTagManagerIntegration,
+        req: &http::Request<EdgeBody>,
+        reply: ScriptedReply,
+    ) -> (TestClock, ScriptedHttpClient, RuntimeServices) {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        if let Some(GtmTarget::Proxy(target_url)) =
+            integration.build_target_url(req, req.uri().path())
+        {
+            client.respond_to(req.method().clone(), &target_url, reply);
+        }
+        let services = build_services_with_outbound_client(&client, &clock);
+        (clock, client, services)
+    }
+
+    /// Drives `handle` against a scripted upstream that returns `headers`.
     fn handle_with_upstream_headers(
         path_and_query: &str,
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
     ) -> Response<EdgeBody> {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(status, b"upstream body".to_vec(), headers);
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
-            let req = build_http_request(
-                Method::GET,
-                &format!("https://edge.example.com{path_and_query}"),
-                EdgeBody::empty(),
-            );
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+        let req = build_http_request(
+            Method::GET,
+            &format!("https://edge.example.com{path_and_query}"),
+            EdgeBody::empty(),
+        );
+        let reply = headers.into_iter().fold(
+            ScriptedReply::status(StatusCode::from_u16(status).expect("should be a valid status"))
+                .body("upstream body"),
+            |reply, (name, value)| reply.header(name, value),
+        );
+        let (_clock, _client, services) = scripted_gtm_upstream(&integration, &req, reply);
 
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should handle the GTM request")
+    }
+
+    #[test]
+    fn gtm_script_request_readback() {
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/integrations/google_tag_manager/gtm.js")
+            .header(header::USER_AGENT, "fictional-agent/1.0")
+            .header(header::ACCEPT, "*/*")
+            .header(header::ACCEPT_LANGUAGE, "en-US")
+            .header(header::REFERER, "https://publisher.example.com/article")
+            .header(crate::constants::HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .header(header::COOKIE, "_ga=fictional")
+            .body(EdgeBody::empty())
+            .expect("should build the GTM script request");
+        let target_url = into_proxy_url(
             integration
-                .handle(&settings, &services, req)
-                .await
-                .expect("should handle the GTM request")
-        })
+                .build_target_url(&req, req.uri().path())
+                .expect("should resolve a gtm.js target"),
+        );
+        let (clock, client, services) = scripted_gtm_upstream(
+            &integration,
+            &req,
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "application/javascript")
+                .body("var gtm = true;"),
+        );
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should serve the GTM script");
+
+        assert_eq!(response.status(), StatusCode::OK, "should serve the script");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one script request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string()),
+            (&Method::GET, target_url),
+            "should fetch the configured container script"
+        );
+        sent.assert_headers(&[
+            ("user-agent", "fictional-agent/1.0"),
+            ("accept", "*/*"),
+            ("accept-language", "en-US"),
+            ("referer", "https://publisher.example.com/article"),
+            ("x-forwarded-for", ""),
+            ("accept-encoding", "identity"),
+        ]);
+        sent.assert_followed_transport(
+            ExpectedTransport {
+                timeout: BUFFERED_TIMEOUT,
+                response_mode: ResponseMode::Buffered {
+                    max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+                },
+                response_decoding: ResponseDecoding::Original,
+                cache_policy: OutboundCachePolicy::PlatformDefault,
+            },
+            clock
+                .monotonic_clock()
+                .deadline_after(REDIRECT_CHAIN_DEADLINE),
+        );
     }
 
     #[test]
@@ -1957,63 +1948,95 @@ mod tests {
         );
     }
 
+    /// Builds the proxy config for `req` on its own path, as `handle` does.
+    async fn proxy_config_result(
+        integration: &GoogleTagManagerIntegration,
+        mut req: http::Request<EdgeBody>,
+    ) -> Result<Option<Vec<u8>>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+        let target_url = into_proxy_url(
+            integration
+                .build_target_url(&req, &path)
+                .expect("should resolve the target URL"),
+        );
+        integration
+            .build_proxy_config(&path, &mut req, &target_url)
+            .await
+            .map(|config| config.body)
+    }
+
     #[test]
-    fn content_length_rejection_matches_the_declared_body_size() {
-        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
-        let max = default_max_beacon_body_size();
+    fn post_body_is_bounded_by_a_valid_declared_length_and_by_the_read() {
+        futures::executor::block_on(async {
+            let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+            let max = default_max_beacon_body_size();
+            let payload = b"v=2&tid=G-TEST".to_vec();
 
-        let within = build_http_request(
-            Method::POST,
-            "https://edge.example.com/integrations/google_tag_manager/collect",
-            EdgeBody::empty(),
-        );
-        assert_eq!(
-            integration.content_length_rejection(&within),
-            None,
-            "a POST without Content-Length proceeds and is bounded while read"
-        );
+            // A malformed declaration is not trusted in either direction, so
+            // the bounded read decides, as it does with no declaration at all.
+            for (declared, expected) in [
+                (None, None),
+                (Some(max.to_string()), None),
+                (
+                    Some((max + 1).to_string()),
+                    Some(StatusCode::PAYLOAD_TOO_LARGE),
+                ),
+                (Some("not-a-number".to_string()), None),
+            ] {
+                let mut req = build_http_request(
+                    Method::POST,
+                    "https://edge.example.com/integrations/google_tag_manager/collect",
+                    EdgeBody::from(payload.clone()),
+                );
+                if let Some(declared) = &declared {
+                    req.headers_mut().insert(
+                        header::CONTENT_LENGTH,
+                        http::HeaderValue::from_str(declared).expect("should build header"),
+                    );
+                }
 
-        for (declared, expected) in [
-            (max.to_string(), None),
-            ((max + 1).to_string(), Some(StatusCode::PAYLOAD_TOO_LARGE)),
-            ("not-a-number".to_string(), Some(StatusCode::BAD_REQUEST)),
-        ] {
-            let mut req = build_http_request(
-                Method::POST,
-                "https://edge.example.com/integrations/google_tag_manager/collect",
-                EdgeBody::empty(),
-            );
-            req.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                http::HeaderValue::from_str(&declared).expect("should build header"),
-            );
-
-            assert_eq!(
-                integration.content_length_rejection(&req),
-                expected,
-                "Content-Length `{declared}` should map to {expected:?}"
-            );
-        }
+                match (proxy_config_result(&integration, req).await, expected) {
+                    (Ok(body), None) => assert_eq!(
+                        body.as_deref(),
+                        Some(payload.as_slice()),
+                        "Content-Length {declared:?} should forward the payload"
+                    ),
+                    (Err(report), Some(status)) => assert_eq!(
+                        report.current_context().status_code(),
+                        status,
+                        "Content-Length {declared:?} should map to {status}"
+                    ),
+                    (Ok(_), Some(status)) => {
+                        panic!("Content-Length {declared:?} should answer {status}")
+                    }
+                    (Err(report), None) => {
+                        panic!("Content-Length {declared:?} should proceed: {report:?}")
+                    }
+                }
+            }
+        });
     }
 
     #[test]
     fn get_requests_are_not_subject_to_the_body_size_check() {
-        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
-        let mut req = build_http_request(
-            Method::GET,
-            "https://edge.example.com/integrations/google_tag_manager/gtm.js",
-            EdgeBody::empty(),
-        );
-        req.headers_mut().insert(
-            header::CONTENT_LENGTH,
-            http::HeaderValue::from_static("999999999"),
-        );
+        futures::executor::block_on(async {
+            let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+            let mut req = build_http_request(
+                Method::GET,
+                "https://edge.example.com/integrations/google_tag_manager/gtm.js",
+                EdgeBody::empty(),
+            );
+            req.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                http::HeaderValue::from_static("999999999"),
+            );
 
-        assert_eq!(
-            integration.content_length_rejection(&req),
-            None,
-            "the beacon body cap applies to POST only"
-        );
+            let body = proxy_config_result(&integration, req)
+                .await
+                .expect("the beacon body cap applies to POST only");
+
+            assert_eq!(body, None, "should not read or forward a GET body");
+        });
     }
 
     #[test]
@@ -2173,32 +2196,27 @@ mod tests {
         );
     }
 
-    /// Drives `handle` with a stubbed upstream body and the given config.
+    /// Drives `handle` with a scripted upstream body and the given config.
     fn handle_with_upstream_body(
         config: GoogleTagManagerConfig,
         path_and_query: &str,
         status: u16,
         body: &[u8],
     ) -> Response<EdgeBody> {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(status, body.to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let integration = GoogleTagManagerIntegration::new(config);
-            let req = build_http_request(
-                Method::GET,
-                &format!("https://edge.example.com{path_and_query}"),
-                EdgeBody::empty(),
-            );
+        let settings = create_test_settings();
+        let integration = GoogleTagManagerIntegration::new(config);
+        let req = build_http_request(
+            Method::GET,
+            &format!("https://edge.example.com{path_and_query}"),
+            EdgeBody::empty(),
+        );
+        let reply =
+            ScriptedReply::status(StatusCode::from_u16(status).expect("should be a valid status"))
+                .body(body.to_vec());
+        let (_clock, _client, services) = scripted_gtm_upstream(&integration, &req, reply);
 
-            integration
-                .handle(&settings, &services, req)
-                .await
-                .expect("should handle the GTM request")
-        })
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should handle the GTM request")
     }
 
     #[test]
@@ -2254,15 +2272,10 @@ mod tests {
             "should carry the configured cache lifetime"
         );
 
-        let body = futures::executor::block_on(async {
-            collect_response_bounded(
-                response.into_body(),
-                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-                GTM_INTEGRATION_ID,
-            )
-            .await
-            .expect("should read the rewritten body")
-        });
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the rewritten body");
         assert_eq!(
             String::from_utf8_lossy(&body),
             r#"var beacon = "/integrations/google_tag_manager/g/collect";"#,
@@ -2798,7 +2811,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             let mut req = build_http_request(
                 Method::POST,
                 "https://edge.example.com/integrations/google_tag_manager/collect",
-                EdgeBody::from(oversized_payload.clone()),
+                EdgeBody::from(oversized_payload),
             );
 
             let path = req.uri().path().to_string();
@@ -2813,14 +2826,21 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
                 .build_proxy_config(&path, &mut req, &target_url)
                 .await;
 
-            assert!(result.is_err(), "Oversized POST body should be rejected");
-
-            if let Err(PayloadSizeError::TooLarge { actual, max }) = result {
-                assert_eq!(actual, max_size + 1, "Should report actual size");
-                assert_eq!(max, max_size, "Should report max size");
-            } else {
-                panic!("Expected PayloadSizeError::TooLarge");
-            }
+            let Err(report) = result else {
+                panic!("should reject the oversized POST body");
+            };
+            assert!(
+                matches!(
+                    report.current_context(),
+                    TrustedServerError::RequestTooLarge { .. }
+                ),
+                "should report the overflow as RequestTooLarge"
+            );
+            assert_eq!(
+                report.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should answer 413 for the oversized POST body"
+            );
         });
     }
 
@@ -2904,7 +2924,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             let mut req = build_http_request(
                 Method::POST,
                 "https://edge.example.com/integrations/google_tag_manager/collect",
-                EdgeBody::from(oversized_payload.clone()),
+                EdgeBody::from(oversized_payload),
             );
             // Set Content-Length to a small value (incorrect)
             req.headers_mut().insert(
@@ -2920,23 +2940,26 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
                     .expect("should resolve collect target URL"),
             );
 
-            // build_proxy_config should detect the mismatch and return PayloadSizeError
+            // build_proxy_config should detect the mismatch and return RequestTooLarge
             let result = integration
                 .build_proxy_config(&path, &mut req, &target_url)
                 .await;
 
+            let Err(report) = result else {
+                panic!("should reject the oversized POST body");
+            };
             assert!(
-                result.is_err(),
-                "Should reject when actual body exceeds max despite low Content-Length"
+                matches!(
+                    report.current_context(),
+                    TrustedServerError::RequestTooLarge { .. }
+                ),
+                "should report the overflow as RequestTooLarge"
             );
-
-            // Verify it's a PayloadSizeError::TooLarge
-            if let Err(PayloadSizeError::TooLarge { actual, max }) = result {
-                assert_eq!(actual, oversized_payload.len(), "Should report actual size");
-                assert_eq!(max, max_size, "Should report max size");
-            } else {
-                panic!("Expected PayloadSizeError::TooLarge");
-            }
+            assert_eq!(
+                report.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should answer 413 for the oversized POST body"
+            );
         });
     }
 
@@ -2984,35 +3007,45 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     }
 
     #[test]
-    fn test_handle_returns_400_for_invalid_content_length() {
+    fn test_handle_forwards_post_with_malformed_content_length() {
         futures::executor::block_on(async {
-            // Verify that handle() returns 400 Bad Request for malformed Content-Length
-            let config = tag_config("GTM-TEST1234", &[]);
-            let integration = GoogleTagManagerIntegration::new(config);
-
-            // Create POST request with invalid Content-Length header
+            // A malformed Content-Length no longer answers 400 before the read:
+            // the bounded read governs, and a body under the cap is forwarded.
+            let integration = GoogleTagManagerIntegration::new(tag_config("GTM-TEST1234", &[]));
             let payload = b"v=2&tid=G-TEST&cid=123".to_vec();
-            let mut req = http::Request::builder()
-                .method(Method::POST)
-                .uri("https://edge.example.com/integrations/google_tag_manager/collect")
-                .body(EdgeBody::from(payload))
-                .expect("should build malformed request");
+            let mut req = build_http_request(
+                Method::POST,
+                "https://edge.example.com/integrations/google_tag_manager/collect",
+                EdgeBody::from(payload.clone()),
+            );
             req.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from_static("not-a-number"),
             );
+            let (_clock, upstream, services) = scripted_gtm_upstream(
+                &integration,
+                &req,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
 
-            let settings = make_settings();
             let response = integration
-                .handle(&settings, &noop_services(), req)
+                .handle(&make_settings(), &services, req)
                 .await
-                .expect("handle should not return error");
+                .expect("should proxy the beacon");
 
-            // Verify we get 400 Bad Request for malformed Content-Length
             assert_eq!(
                 response.status(),
-                StatusCode::BAD_REQUEST,
-                "Should return 400 for malformed Content-Length"
+                StatusCode::NO_CONTENT,
+                "should return the upstream answer"
+            );
+            assert_eq!(
+                upstream
+                    .requests()
+                    .iter()
+                    .map(|request| request.body.to_vec())
+                    .collect::<Vec<_>>(),
+                vec![payload],
+                "should forward the beacon body read under the cap"
             );
         });
     }
@@ -4339,6 +4372,43 @@ container_id = "GTM-DEFAULT"
             assert!(
                 !might_contain_gtm_prefix(text),
                 "`{text}` should not engage GTM accumulation"
+            );
+        }
+    }
+
+    #[test]
+    fn gtm_beacon_body_read_failures_map_to_statuses() {
+        let settings = make_settings();
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-TEST1234", &[]));
+        for case in body_read_failure_cases(default_max_beacon_body_size()) {
+            let upstream = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&upstream, &TestClock::new());
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example.com/integrations/google_tag_manager/g/collect"),
+            );
+
+            let capture = LogCapture::start();
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("GTM beacon", &outcome);
+            upstream.assert_no_requests();
+            let expected_level = if expectation.expected().is_client_error() {
+                log::Level::Warn
+            } else {
+                log::Level::Error
+            };
+            let records = capture.take_all();
+            assert!(
+                matches!(
+                    records.as_slice(),
+                    [record] if record.level == expected_level
+                        && record.message.starts_with("Rejecting GTM beacon: ")
+                ),
+                "should log the {} case once, at {expected_level}",
+                expectation.name()
             );
         }
     }

@@ -960,6 +960,7 @@ mod routing_metadata_tests {
                 providers: BTreeMap::from([(
                     provider_id.clone(),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: profile.to_string(),
                         endpoint: if profile == "aps" {
@@ -995,7 +996,5 @@ mod routing_metadata_tests {
     }
 }
 
-#[cfg(test)]
-mod test_executor;
 #[cfg(test)]
 mod tests;

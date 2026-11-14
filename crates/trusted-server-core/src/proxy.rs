@@ -1,16 +1,20 @@
 use crate::http_util::{
-    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+    RequestInfo, body_as_reader, compute_encrypted_sha256_token, ct_str_eq, read_request_body,
 };
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
+use edgezero_core::error::EdgeError;
+use edgezero_core::outbound::{
+    OutboundCachePolicy, OutboundFollowFailure, OutboundImageOptimizerOptions,
+    OutboundRedirectAction, OutboundRedirectContext, OutboundRedirectLimit, OutboundRequest,
+    OutboundResponse, ResponseDecoding,
+};
 use error_stack::{Report, ResultExt};
-use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Write};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::asset_image_optimizer::{image_optimizer_options, profile_for_asset_request};
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
     apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
@@ -23,10 +27,12 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor, first_party_url};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::platform::{
-    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
-    RuntimeServices,
+use crate::outbound::{
+    BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource,
+    REDIRECT_CHAIN_DEADLINE, STREAMED_TIMEOUT, buffered, outbound_error, outbound_request,
+    streamed,
 };
+use crate::platform::RuntimeServices;
 use crate::s3_sigv4::{self, S3Credentials};
 use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -39,23 +45,6 @@ const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
 const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
-
-fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes().unwrap_or_default())
-}
-
-fn request_body_bytes(
-    body: EdgeBody,
-    endpoint: &str,
-) -> Result<bytes::Bytes, Report<TrustedServerError>> {
-    if body.is_stream() {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: format!("{endpoint} request body must be buffered, not streamed"),
-        }));
-    }
-
-    Ok(body.into_bytes().unwrap_or_default())
-}
 
 /// Headers copied from the original client request to the upstream proxy request
 /// when `copy_request_headers` is enabled.
@@ -70,15 +59,6 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_ACCEPT_LANGUAGE,
     HEADER_REFERER,
     HEADER_X_FORWARDED_FOR,
-];
-
-/// Request headers that describe a body and must not ride on a bodyless redirect follow-up.
-const REQUEST_BODY_HEADERS: [header::HeaderName; 5] = [
-    header::CONTENT_TYPE,
-    header::CONTENT_LENGTH,
-    header::CONTENT_ENCODING,
-    header::CONTENT_LANGUAGE,
-    header::CONTENT_LOCATION,
 ];
 
 /// Curated request headers preserved for asset proxying.
@@ -155,39 +135,27 @@ impl AssetProxyCachePolicy {
 }
 
 /// Asset proxy response plus metadata needed by the outer router.
+///
+/// The response keeps the origin body: a stream for a `GET` that carries one,
+/// and an empty body for a `HEAD`, 204, or 304.
 pub struct AssetProxyResponse {
     response: Response<EdgeBody>,
-    stream_body: Option<EdgeBody>,
     cache_policy: AssetProxyCachePolicy,
 }
 
 impl AssetProxyResponse {
-    fn new(
-        response: Response<EdgeBody>,
-        stream_body: Option<EdgeBody>,
-        cache_policy: AssetProxyCachePolicy,
-    ) -> Self {
+    fn origin_controlled(response: Response<EdgeBody>) -> Self {
         Self {
             response,
-            stream_body,
-            cache_policy,
+            cache_policy: AssetProxyCachePolicy::OriginControlled,
         }
     }
 
-    fn origin_controlled(response: Response<EdgeBody>) -> Self {
-        Self::new(response, None, AssetProxyCachePolicy::OriginControlled)
-    }
-
-    fn origin_controlled_stream(response: Response<EdgeBody>, stream_body: EdgeBody) -> Self {
-        Self::new(
-            response,
-            Some(stream_body),
-            AssetProxyCachePolicy::OriginControlled,
-        )
-    }
-
     fn no_store_private(response: Response<EdgeBody>) -> Self {
-        Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+        Self {
+            response,
+            cache_policy: AssetProxyCachePolicy::NoStorePrivate,
+        }
     }
 
     fn response(&self) -> &Response<EdgeBody> {
@@ -214,118 +182,11 @@ impl AssetProxyResponse {
         self.cache_policy
     }
 
-    /// Consume this wrapper and return a buffered Fastly response.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Proxy`] when the response carries a
-    /// streaming body. Use [`Self::into_response_and_body`] when the caller
-    /// needs to handle both buffered and streaming asset responses.
-    pub fn into_response(self) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-        if self.stream_body.is_some() {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming asset response cannot be converted into a buffered response"
-                    .to_string(),
-            }));
-        }
-
-        Ok(self.response)
-    }
-
-    /// Consume this wrapper and return the response headers plus optional stream body.
+    /// Consume this wrapper and return the response with its body.
     #[must_use]
-    pub fn into_response_and_body(self) -> (Response<EdgeBody>, Option<EdgeBody>) {
-        (self.response, self.stream_body)
+    pub fn into_response(self) -> Response<EdgeBody> {
+        self.response
     }
-}
-
-/// Convert a platform-neutral response into a buffered [`Response`] for downstream processing.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
-/// streaming body, which the buffered proxy path cannot materialize.
-pub(crate) fn platform_response_to_fastly(
-    platform_resp: PlatformResponse,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming platform response body is not supported by Fastly response conversion"
-                    .to_string(),
-            }));
-        }
-    };
-    Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
-}
-
-fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
-    let (parts, body) = platform_resp.response.into_parts();
-
-    match body {
-        EdgeBody::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
-            parts,
-            EdgeBody::from(bytes.to_vec()),
-        )),
-        stream_body @ EdgeBody::Stream(_) => {
-            let resp = Response::from_parts(parts, EdgeBody::empty());
-            AssetProxyResponse::origin_controlled_stream(resp, stream_body)
-        }
-    }
-}
-
-/// Stream a platform response body directly to a writable client stream.
-///
-/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
-/// after headers have been committed through `stream_to_client()`.
-///
-/// # Errors
-///
-/// Returns an error if the platform stream yields an error or if writing a
-/// chunk to the client stream fails.
-pub async fn stream_asset_body<W: Write>(
-    body: EdgeBody,
-    output: &mut W,
-) -> Result<(), Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
-            output
-                .write_all(bytes.as_ref())
-                .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered platform response body".to_string(),
-                })?;
-        }
-        EdgeBody::Stream(mut stream) => {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|err| {
-                    Report::new(TrustedServerError::Proxy {
-                        message: format!("streaming platform response body failed: {err}"),
-                    })
-                })?;
-                output
-                    .write_all(chunk.as_ref())
-                    .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming platform response body".to_string(),
-                    })?;
-                // Flush per chunk: Fastly's `StreamingBody` is a
-                // `BufWriter<StreamingBodyHandle>`, so a segment smaller than
-                // the write buffer would sit in the Wasm heap until a later
-                // write filled it. The publisher stream yields compressed
-                // segments that are commonly smaller than that buffer, and the
-                // generator then awaits the origin (or the auction) before
-                // producing the next one — without this flush the client sees
-                // committed headers and no body, undoing the codec's per-chunk
-                // sync flush and delaying first paint.
-                output.flush().change_context(TrustedServerError::Proxy {
-                    message: "failed to flush streaming platform response body".to_string(),
-                })?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -356,8 +217,12 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
-    /// When true, ask the platform adapter to preserve the upstream response body as a stream.
+    /// When true, stream the upstream response body instead of buffering it.
     pub stream_response: bool,
+    /// Cap on a buffered upstream response, in bytes.
+    ///
+    /// A streamed response, see [`Self::stream_response`], has no cap.
+    pub max_response_bytes: u64,
     /// Domains allowed for the initial request and any redirects.
     ///
     /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
@@ -387,6 +252,7 @@ impl<'a> ProxyRequestConfig<'a> {
             copy_request_headers: true,
             stream_passthrough: false,
             stream_response: false,
+            max_response_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
             allowed_domains: &[],
             require_https: false,
         }
@@ -441,10 +307,17 @@ impl<'a> ProxyRequestConfig<'a> {
         self
     }
 
-    /// Ask the platform adapter to preserve the upstream response body as a stream.
+    /// Stream the upstream response body instead of buffering it.
     #[must_use]
     pub fn with_stream_response(mut self) -> Self {
         self.stream_response = true;
+        self
+    }
+
+    /// Cap a buffered upstream response at `max_response_bytes`.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_response_bytes: u64) -> Self {
+        self.max_response_bytes = max_response_bytes;
         self
     }
 }
@@ -501,7 +374,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body_as_reader(body), &mut output)
+        .process(body_as_reader(body, "proxy")?, &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;
@@ -760,26 +633,20 @@ fn finalize_response(
     Ok(response)
 }
 
-/// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
-struct ProxyRequestHeaders<'a> {
-    additional_headers: &'a [(header::HeaderName, HeaderValue)],
-    copy_request_headers: bool,
-    services: &'a RuntimeServices,
-}
-
-struct ProxyRedirectPolicy<'a> {
-    follow_redirects: bool,
-    stream_passthrough: bool,
-    stream_response: bool,
-    allowed_domains: &'a [String],
-    require_https: bool,
-}
+/// Redirects a followed proxy request takes before it returns the next one.
+const MAX_REDIRECTS: usize = 4;
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
 ///
 /// This forwards a curated header set, follows redirects when enabled, and can append
 /// the caller's EC ID as a `ts-ec` query parameter to the target URL.
 /// Optional bodies/headers can be supplied via [`ProxyRequestConfig`].
+///
+/// The target must pass [`check_proxy_target`] before anything is sent. A followed
+/// request goes through `EdgeZero`'s redirect follower, which shows every redirect
+/// to [`redirect_policy`]. Each hop gets the request's own timeout, 15 s buffered
+/// or 60 s streamed, and the whole chain shares a 60 s deadline. A request that does not follow redirects is sent
+/// once, and a `3xx` answer is returned as it is.
 ///
 /// Followed `307`/`308` redirects keep the original method and body. Followed
 /// `301`/`302`/`303` redirects are sent as a bodyless `GET` (a `HEAD` stays
@@ -792,6 +659,10 @@ struct ProxyRedirectPolicy<'a> {
 ///
 /// - [`TrustedServerError::Proxy`] if the target URL is invalid, uses an unsupported
 ///   scheme, lacks a host, or the upstream fetch fails
+/// - [`TrustedServerError::Forbidden`] if HTTPS is required and the target or a
+///   redirect is not HTTPS
+/// - [`TrustedServerError::AllowlistViolation`] if the target or a redirect leaves
+///   `allowed_domains`
 pub async fn proxy_request(
     settings: &Settings,
     req: Request<EdgeBody>,
@@ -807,40 +678,241 @@ pub async fn proxy_request(
         copy_request_headers,
         stream_passthrough,
         stream_response,
+        max_response_bytes,
         allowed_domains,
         require_https,
     } = config;
+    let failed = || TrustedServerError::Proxy {
+        message: "Failed to proxy".to_string(),
+    };
 
-    let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
+    let mut target = url::Url::parse(target_url).map_err(|_| {
         Report::new(TrustedServerError::Proxy {
             message: "invalid url".to_string(),
         })
     })?;
-
     if forward_ec_id {
-        append_ec_id(&req, &mut target_url_parsed);
+        append_ec_id(&req, &mut target);
     }
+    check_proxy_target(&target, allowed_domains, require_https)?;
 
-    proxy_with_redirects(
+    // A 301, 302, or 303 drops this body when the request is followed.
+    let body_method = body
+        .as_ref()
+        .is_some_and(|body| !body.is_empty())
+        .then(|| req.method().clone());
+    let request = proxy_outbound_request(&req, &target, body, &headers, copy_request_headers)
+        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+    let request = if stream_response {
+        streamed(request, STREAMED_TIMEOUT)
+    } else {
+        buffered(
+            request,
+            BUFFERED_TIMEOUT,
+            max_response_bytes,
+            ResponseDecoding::Original,
+        )
+    };
+
+    let (response, final_uri) = if follow_redirects {
+        let limit = OutboundRedirectLimit::new(MAX_REDIRECTS)
+            .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+        let chain_deadline = services.clock().deadline_after(REDIRECT_CHAIN_DEADLINE);
+        let followed = services
+            .outbound_client()
+            .follow(
+                request.deadline(chain_deadline),
+                limit,
+                redirect_policy(allowed_domains.to_vec(), require_https, body_method),
+            )
+            .await
+            .map_err(|failure| match failure {
+                OutboundFollowFailure::Policy { error, .. } => Report::new(error),
+                OutboundFollowFailure::Hop { error, .. } => {
+                    outbound_error(error, failed(), OutboundRequestSource::Internal)
+                }
+            })?;
+        if let Some(reason) = followed.stop_reason() {
+            log::warn!("returning an unfollowed redirect response: {reason:?}");
+        }
+        let (response, final_uri, _redirects_followed, _stop_reason) = followed.into_parts();
+        (response, final_uri)
+    } else {
+        let final_uri = request.uri().clone();
+        let response = services
+            .outbound_client()
+            .send(request)
+            .await
+            .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+        (response, final_uri)
+    };
+    let response = response
+        .into_response()
+        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+
+    finalize_response(
         settings,
         &req,
-        target_url_parsed,
-        body.as_deref(),
-        ProxyRequestHeaders {
-            additional_headers: &headers,
-            copy_request_headers,
-            services,
-        },
-        ProxyRedirectPolicy {
-            follow_redirects,
-            stream_passthrough,
-            stream_response: stream_response
-                && services.http_client().supports_streaming_responses(),
-            allowed_domains,
-            require_https,
-        },
+        &final_uri.to_string(),
+        response,
+        stream_passthrough,
     )
-    .await
+}
+
+/// Checks the first target of a proxied request before it is sent.
+///
+/// The target needs an `http` or `https` scheme, HTTPS when `require_https` is
+/// set, a host, and a host that `allowed_domains` permits. `EdgeZero` never shows
+/// the first request to [`redirect_policy`], which checks every later hop.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] for another scheme or a missing host,
+/// [`TrustedServerError::Forbidden`] for a non-HTTPS target that must be HTTPS,
+/// and [`TrustedServerError::AllowlistViolation`] for a host outside
+/// `allowed_domains`.
+fn check_proxy_target(
+    target: &url::Url,
+    allowed_domains: &[String],
+    require_https: bool,
+) -> Result<(), Report<TrustedServerError>> {
+    let scheme = target.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported scheme".to_string(),
+        }));
+    }
+    if require_https && scheme != "https" {
+        // The target carries the forwarded `ts-ec` query, so log the scheme and host only.
+        log::warn!(
+            "request to `{scheme}://{}` blocked: HTTPS is required",
+            target.host_str().unwrap_or_default()
+        );
+        return Err(Report::new(TrustedServerError::Forbidden {
+            message: "non-HTTPS proxy target blocked".to_string(),
+        }));
+    }
+
+    let host = target.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        }));
+    }
+    if !is_host_permitted(allowed_domains, host) {
+        log::warn!("request to `{host}` blocked: host not in proxy allowed_domains");
+        return Err(Report::new(TrustedServerError::AllowlistViolation {
+            host: host.to_string(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// Builds the first request of a proxied fetch from the client's `req`.
+///
+/// With `copy_request_headers`, the request carries [`PROXY_FORWARD_HEADERS`] from
+/// the client and [`SUPPORTED_ENCODINGS`] as `Accept-Encoding`. Each of the
+/// caller's `headers` then replaces any value of the same name.
+///
+/// # Errors
+///
+/// Returns [`EdgeError::BadRequest`] when `target` is not a URI `EdgeZero` sends.
+fn proxy_outbound_request(
+    req: &Request<EdgeBody>,
+    target: &url::Url,
+    body: Option<Vec<u8>>,
+    headers: &[(header::HeaderName, HeaderValue)],
+    copy_request_headers: bool,
+) -> Result<OutboundRequest, EdgeError> {
+    let mut request = outbound_request(req.method().clone(), target.as_str())?;
+    let outbound_headers = request.headers_mut();
+    if copy_request_headers {
+        for header_name in PROXY_FORWARD_HEADERS {
+            if let Some(value) = req.headers().get(&header_name) {
+                outbound_headers.insert(header_name, value.clone());
+            }
+        }
+        outbound_headers.insert(
+            HEADER_ACCEPT_ENCODING,
+            HeaderValue::from_static(SUPPORTED_ENCODINGS),
+        );
+    }
+    for (name, value) in headers {
+        outbound_headers.insert(name.clone(), value.clone());
+    }
+
+    Ok(match body {
+        Some(body) => request.body(body),
+        None => request,
+    })
+}
+
+/// Builds the policy a followed proxy request applies to every redirect.
+///
+/// It owns copies of `allowed_domains` and `require_https`, because `EdgeZero`
+/// keeps the policy for the whole chain. For each redirect it reads the resolved
+/// target and returns, in this order:
+///
+/// 1. [`TrustedServerError::Forbidden`] when `require_https` is set and the target
+///    is not `https`
+/// 2. [`OutboundRedirectAction::Stop`] for any other scheme that is not `http` or
+///    `https`, which returns the redirect response
+/// 3. [`TrustedServerError::Proxy`] for a target without a host
+/// 4. [`TrustedServerError::AllowlistViolation`] when `allowed_domains` does not
+///    permit the host
+/// 5. [`OutboundRedirectAction::FollowPrepared`] otherwise
+///
+/// `body_method` is the method of a request that carries a body. `EdgeZero`
+/// follows a 301, 302, or 303 without the body, so the first such hop the
+/// policy follows warns once that the body is dropped, naming only the
+/// target's host.
+fn redirect_policy(
+    allowed_domains: Vec<String>,
+    require_https: bool,
+    mut body_method: Option<Method>,
+) -> impl FnMut(&mut OutboundRedirectContext<'_>) -> Result<OutboundRedirectAction, TrustedServerError>
++ 'static {
+    move |context| {
+        let target =
+            url::Url::parse(context.resolved_target()).map_err(|_| TrustedServerError::Proxy {
+                message: "invalid redirect".to_string(),
+            })?;
+        let scheme = target.scheme();
+        if require_https && scheme != "https" {
+            // The redirect target can carry query tokens, so log the scheme and host only.
+            log::warn!(
+                "redirect to `{scheme}://{}` blocked: HTTPS is required",
+                target.host_str().unwrap_or_default()
+            );
+            return Err(TrustedServerError::Forbidden {
+                message: "non-HTTPS redirect blocked".to_string(),
+            });
+        }
+        if scheme != "http" && scheme != "https" {
+            return Ok(OutboundRedirectAction::Stop);
+        }
+
+        let Some(host) = target.host_str().filter(|host| !host.is_empty()) else {
+            return Err(TrustedServerError::Proxy {
+                message: "missing host in redirect location".to_string(),
+            });
+        };
+        if !is_host_permitted(&allowed_domains, host) {
+            log::warn!("redirect to `{host}` blocked: host not in proxy allowed_domains");
+            return Err(TrustedServerError::AllowlistViolation {
+                host: host.to_string(),
+            });
+        }
+
+        let status = context.status().as_u16();
+        if matches!(status, 301..=303)
+            && let Some(method) = body_method.take()
+        {
+            log::warn!("dropping the {method} request body on a {status} redirect to `{host}`");
+        }
+        Ok(OutboundRedirectAction::FollowPrepared)
+    }
 }
 
 fn default_port_for_scheme(scheme: &str) -> Option<u16> {
@@ -942,66 +1014,58 @@ fn apply_asset_origin_auth(
     }
 }
 
-fn build_asset_platform_request(
-    method: &Method,
-    target_url: &url::Url,
-    outbound_headers: &http::HeaderMap,
-    backend_name: &str,
-) -> Result<PlatformHttpRequest, Report<TrustedServerError>> {
-    let mut builder = edge_request_builder().method(method.clone()).uri(
-        target_url
-            .as_str()
-            .parse::<EdgeUri>()
-            .change_context(TrustedServerError::Proxy {
-                message: "invalid asset target URL".to_string(),
-            })?,
-    );
-
-    for (name, value) in outbound_headers {
-        builder = builder.header(name, value);
-    }
-
-    let edge_req =
-        builder
-            .body(EdgeBody::from(Vec::new()))
-            .change_context(TrustedServerError::Proxy {
-                message: "failed to build asset proxy request".to_string(),
-            })?;
-
-    Ok(PlatformHttpRequest::new(edge_req, backend_name))
-}
-
-async fn send_uncached_asset_origin_request(
+/// Sends one request to an asset origin.
+///
+/// A `GET` streams its response under the 60 s streamed timeout. Any other method,
+/// the S3 `HEAD` preflight included, buffers its response under the 15 s buffered
+/// timeout. Both keep the origin's content coding. `cache_policy` and
+/// `image_optimizer` options go on the request as given; `EdgeZero` rejects a
+/// request that carries both [`OutboundCachePolicy::Bypass`] and options.
+///
+/// `outbound_headers` may carry the signer's `Host` input. `EdgeZero` drops that
+/// header and sends the URI authority, from which [`asset_origin_host_header`]
+/// built it.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when the request cannot be built or the
+/// origin request fails.
+async fn send_asset_origin_request(
     services: &RuntimeServices,
-    backend_name: &str,
     method: &Method,
     target_url: &url::Url,
     outbound_headers: &http::HeaderMap,
-    stream_response: bool,
+    cache_policy: OutboundCachePolicy,
+    image_optimizer: Option<OutboundImageOptimizerOptions>,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
-    let stream_response = stream_response && services.http_client().supports_streaming_responses();
-    // Preflight HEADs and raw error-body GETs bypass the readthrough cache. On a
-    // miss it can forward a signed HEAD as GET, invalidating SigV4, and the error
-    // response must come from S3 rather than from a cached object.
-    let mut platform_req =
-        build_asset_platform_request(method, target_url, outbound_headers, backend_name)?
-            .with_cache_bypass();
-    if stream_response {
-        platform_req = platform_req.with_stream_response();
+    let failed = || TrustedServerError::Proxy {
+        message: "Failed to proxy asset request".to_string(),
+    };
+    let mut request = outbound_request(method.clone(), target_url.as_str())
+        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?
+        .cache_policy(cache_policy);
+    *request.headers_mut() = outbound_headers.clone();
+    if let Some(options) = image_optimizer {
+        request = request.image_optimizer(options);
     }
-    let platform_resp = services
-        .http_client()
-        .send(platform_req)
-        .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy asset request".to_string(),
-        })?;
-
-    if stream_response {
-        Ok(platform_response_to_fastly_asset(platform_resp))
+    let request = if method == Method::GET {
+        streamed(request, STREAMED_TIMEOUT)
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)
-    }
+        buffered(
+            request,
+            BUFFERED_TIMEOUT,
+            DEFAULT_BUFFERED_RESPONSE_BYTES,
+            ResponseDecoding::Original,
+        )
+    };
+
+    let response = services
+        .outbound_client()
+        .send(request)
+        .await
+        .and_then(OutboundResponse::into_response)
+        .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
+    Ok(AssetProxyResponse::origin_controlled(response))
 }
 
 fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
@@ -1032,7 +1096,6 @@ async fn preflight_s3_origin_for_image_optimizer(
     target_url: &url::Url,
     request_method: &Method,
     unsigned_headers: &http::HeaderMap,
-    backend_name: &str,
 ) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
     let Some(auth @ AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
         return Ok(None);
@@ -1041,15 +1104,20 @@ async fn preflight_s3_origin_for_image_optimizer(
     // Fastly Image Optimizer can mask or transform S3 origin errors. A signed
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
+    //
+    // The preflight HEAD and the raw error-body GET bypass the readthrough
+    // cache. On a miss it can forward a signed HEAD as a GET, invalidating
+    // SigV4, and the error response must come from S3 rather than from a cached
+    // object.
     let mut head_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
-    let head_response = send_uncached_asset_origin_request(
+    let head_response = send_asset_origin_request(
         services,
-        backend_name,
         &Method::HEAD,
         target_url,
         &head_headers,
-        false,
+        OutboundCachePolicy::Bypass,
+        None,
     )
     .await?;
     let head_status = head_response.response().status();
@@ -1058,7 +1126,8 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     if request_method == Method::HEAD {
-        let mut response = head_response.into_response()?;
+        // The preflight buffers its bodiless HEAD, so no stream comes back.
+        let mut response = head_response.into_response();
         strip_asset_proxy_response_headers(&mut response);
         apply_no_store_cache_control(&mut response);
         return Ok(Some(AssetProxyResponse::no_store_private(response)));
@@ -1066,13 +1135,13 @@ async fn preflight_s3_origin_for_image_optimizer(
 
     let mut get_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
-    let mut response = send_uncached_asset_origin_request(
+    let mut response = send_asset_origin_request(
         services,
-        backend_name,
         &Method::GET,
         target_url,
         &get_headers,
-        true,
+        OutboundCachePolicy::Bypass,
+        None,
     )
     .await?;
     strip_asset_proxy_response_headers(response.response_mut());
@@ -1085,18 +1154,20 @@ async fn preflight_s3_origin_for_image_optimizer(
 ///
 /// This is a lean raw pass-through path: it preserves status/body/headers,
 /// does not follow redirects, and bypasses publisher-page processing. The flow
-/// is path rewrite, profile-table Image Optimizer metadata extraction, optional
-/// origin query stripping, optional origin authentication, then platform send.
+/// is path rewrite, profile-table Image Optimizer options, optional origin query
+/// stripping, optional origin authentication, then the origin request.
 ///
 /// The origin query policy is applied before S3 signing so the signature covers
-/// the exact URL sent to the asset origin. Image Optimizer metadata remains
-/// separate from the origin URL and is translated by the platform adapter.
+/// the exact URL sent to the asset origin. Image Optimizer options stay separate
+/// from the origin URL and go only on the final request, never on the S3 `HEAD`
+/// preflight. A profile that cannot be expressed as options, which settings
+/// validation rules out, serves the asset unoptimized with a warning.
 ///
 /// # Errors
 ///
-/// Returns an error if the configured origin URL is invalid, backend
-/// registration fails, S3 credentials cannot be read, signing fails, image
-/// optimizer metadata cannot be built, or the upstream request cannot be sent.
+/// Returns an error if the configured origin URL is invalid, the request names
+/// an unknown image profile in `reject` mode, signing fails, or the upstream
+/// request cannot be sent.
 pub async fn handle_asset_proxy_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -1116,35 +1187,20 @@ pub async fn handle_asset_proxy_request(
         );
         None
     } else {
-        crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?
+        profile_for_asset_request(settings, route, incoming_query)?.and_then(|profile| {
+            image_optimizer_options(&profile)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "Serving asset {incoming_path} unoptimized: its Image Optimizer profile cannot be applied: {error}"
+                    );
+                })
+                .ok()
+        })
     };
 
     if route.origin_query_policy() == OriginQueryPolicy::Strip {
         target_url.set_query(None);
     }
-
-    let scheme = target_url.scheme();
-    let host = target_url.host_str().ok_or_else(|| {
-        Report::new(TrustedServerError::Proxy {
-            message: "Missing host in asset target URL".to_string(),
-        })
-    })?;
-
-    let backend_name = services
-        .backend()
-        .ensure(&PlatformBackendSpec {
-            scheme: scheme.to_string(),
-            host: host.to_string(),
-            port: target_url.port(),
-            host_header_override: None,
-            certificate_check: settings.proxy.certificate_check,
-            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            discriminator: None,
-        })
-        .change_context(TrustedServerError::Proxy {
-            message: "asset backend registration failed".to_string(),
-        })?;
 
     let mut outbound_headers = http::HeaderMap::new();
     for header_name in ASSET_PROXY_FORWARD_HEADERS {
@@ -1161,7 +1217,6 @@ pub async fn handle_asset_proxy_request(
             &target_url,
             req.method(),
             &outbound_headers,
-            &backend_name,
         )
         .await?
     {
@@ -1172,35 +1227,26 @@ pub async fn handle_asset_proxy_request(
         apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
-    let mut platform_req =
-        build_asset_platform_request(req.method(), &target_url, &outbound_headers, &backend_name)?;
-    if let Some(image_optimizer) = image_optimizer {
-        platform_req = platform_req.with_image_optimizer(image_optimizer);
-    } else if req.method() == Method::HEAD
+    // A signed raw HEAD bypasses the readthrough cache so the cache cannot turn
+    // it into a GET after signing. A request with Image Optimizer options keeps
+    // the platform default, because bypass disables Image Optimizer on Fastly.
+    let cache_policy = if image_optimizer.is_none()
+        && req.method() == Method::HEAD
         && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
     {
-        // Preserve the signed HEAD method on the raw path. IO requests must not
-        // use pass because Fastly prioritizes it over Image Optimizer.
-        platform_req = platform_req.with_cache_bypass();
-    }
-    let stream_response = services.http_client().supports_streaming_responses();
-    if stream_response {
-        platform_req = platform_req.with_stream_response();
-    }
-
-    let platform_resp = services
-        .http_client()
-        .send(platform_req)
-        .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy asset request".to_string(),
-        })?;
-
-    let mut response = if stream_response {
-        platform_response_to_fastly_asset(platform_resp)
+        OutboundCachePolicy::Bypass
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+        OutboundCachePolicy::PlatformDefault
     };
+    let mut response = send_asset_origin_request(
+        services,
+        req.method(),
+        &target_url,
+        &outbound_headers,
+        cache_policy,
+        image_optimizer,
+    )
+    .await?;
     strip_asset_proxy_response_headers(response.response_mut());
 
     let status = response.response().status();
@@ -1283,298 +1329,14 @@ pub(crate) fn is_host_allowed(host: &str, pattern: &str) -> bool {
     }
 }
 
-async fn proxy_with_redirects(
-    settings: &Settings,
-    req: &Request<EdgeBody>,
-    target_url_parsed: url::Url,
-    body: Option<&[u8]>,
-    request_headers: ProxyRequestHeaders<'_>,
-    redirect_policy: ProxyRedirectPolicy<'_>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    const MAX_REDIRECTS: usize = 4;
-
-    let mut current_url = target_url_parsed.to_string();
-    let mut current_method: Method = req.method().clone();
-    let mut current_body = body;
-    // Set once a redirect rewrites the request into a bodyless follow-up.
-    let mut body_dropped = false;
-
-    for redirect_attempt in 0..=MAX_REDIRECTS {
-        let parsed_url = url::Url::parse(&current_url).map_err(|_| {
-            Report::new(TrustedServerError::Proxy {
-                message: "invalid url".to_string(),
-            })
-        })?;
-
-        let scheme = parsed_url.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "unsupported scheme".to_string(),
-            }));
-        }
-        if redirect_policy.require_https && scheme != "https" {
-            log::warn!("request to `{}` blocked: HTTPS is required", current_url);
-            return Err(Report::new(TrustedServerError::Forbidden {
-                message: "non-HTTPS proxy target blocked".to_string(),
-            }));
-        }
-
-        let host = parsed_url.host_str().unwrap_or("");
-        if host.is_empty() {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "missing host".to_string(),
-            }));
-        }
-
-        if !is_host_permitted(redirect_policy.allowed_domains, host) {
-            log::warn!(
-                "request to `{}` blocked: host not in proxy allowed_domains",
-                host
-            );
-            return Err(Report::new(TrustedServerError::AllowlistViolation {
-                host: host.to_string(),
-            }));
-        }
-
-        let backend_name = request_headers
-            .services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: scheme.clone(),
-                host: host.to_string(),
-                port: parsed_url.port(),
-                host_header_override: None,
-                certificate_check: settings.proxy.certificate_check,
-                first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-                between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-                discriminator: None,
-            })
-            .change_context(TrustedServerError::Proxy {
-                message: "backend registration failed".to_string(),
-            })?;
-
-        let mut builder = edge_request_builder().method(current_method.clone()).uri(
-            current_url
-                .parse::<EdgeUri>()
-                .change_context(TrustedServerError::Proxy {
-                    message: "invalid url".to_string(),
-                })?,
-        );
-
-        // Collect outbound headers using insert-semantics so additional_headers override any
-        // header set by copy_request_headers, matching the old set_header() replace behavior.
-        let mut outbound_headers = http::HeaderMap::new();
-        if request_headers.copy_request_headers {
-            for header_name in PROXY_FORWARD_HEADERS {
-                if let Some(v) = req.headers().get(&header_name) {
-                    outbound_headers.insert(header_name, v.clone());
-                }
-            }
-            outbound_headers.insert(
-                HEADER_ACCEPT_ENCODING,
-                HeaderValue::from_static(SUPPORTED_ENCODINGS),
-            );
-        }
-        for (name, value) in request_headers.additional_headers {
-            // insert() replaces any existing value, matching set_header() semantics.
-            outbound_headers.insert(name.clone(), value.clone());
-        }
-        if body_dropped {
-            for header_name in &REQUEST_BODY_HEADERS {
-                outbound_headers.remove(header_name);
-            }
-        }
-        for (name, value) in &outbound_headers {
-            builder = builder.header(name, value);
-        }
-        let body_bytes = current_body.map(<[u8]>::to_vec).unwrap_or_default();
-        let edge_req =
-            builder
-                .body(EdgeBody::from(body_bytes))
-                .change_context(TrustedServerError::Proxy {
-                    message: "failed to build proxy request".to_string(),
-                })?;
-
-        let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
-        if redirect_policy.stream_response {
-            platform_request = platform_request.with_stream_response();
-        }
-
-        let platform_resp = request_headers
-            .services
-            .http_client()
-            .send(platform_request)
-            .await
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to proxy".to_string(),
-            })?;
-
-        let beresp = platform_resp.response;
-
-        if !redirect_policy.follow_redirects {
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        }
-
-        let status = beresp.status();
-        let is_redirect = matches!(
-            status,
-            StatusCode::MOVED_PERMANENTLY
-                | StatusCode::FOUND
-                | StatusCode::SEE_OTHER
-                | StatusCode::TEMPORARY_REDIRECT
-                | StatusCode::PERMANENT_REDIRECT
-        );
-
-        if !is_redirect {
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        }
-
-        let Some(location) = beresp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|h| h.to_str().ok())
-            .filter(|value| !value.is_empty())
-        else {
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        };
-
-        // Fetch keeps methods other than POST on a 301/302, but replaying the
-        // body would reach a target the caller did not address, and rewriting
-        // to GET would report success for an update that never ran.
-        if matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
-            && current_method != Method::GET
-            && current_method != Method::HEAD
-            && current_method != Method::POST
-        {
-            log::warn!(
-                "not following {} redirect for {current_method} request to {current_url}; returning redirect response",
-                status.as_u16()
-            );
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        }
-
-        if redirect_attempt == MAX_REDIRECTS {
-            log::warn!(
-                "redirect limit reached for {}; returning redirect response",
-                current_url
-            );
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        }
-
-        let next_url = url::Url::parse(location)
-            .or_else(|_| parsed_url.join(location))
-            .map_err(|_| {
-                Report::new(TrustedServerError::Proxy {
-                    message: "invalid redirect".to_string(),
-                })
-            })?;
-
-        let next_scheme = next_url.scheme().to_ascii_lowercase();
-        if redirect_policy.require_https && next_scheme != "https" {
-            log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
-            return Err(Report::new(TrustedServerError::Forbidden {
-                message: "non-HTTPS redirect blocked".to_string(),
-            }));
-        }
-        if next_scheme != "http" && next_scheme != "https" {
-            return finalize_response(
-                settings,
-                req,
-                &current_url,
-                beresp,
-                redirect_policy.stream_passthrough,
-            );
-        }
-
-        let next_host = match next_url.host_str() {
-            Some(h) if !h.is_empty() => h,
-            _ => {
-                return Err(Report::new(TrustedServerError::Proxy {
-                    message: "missing host in redirect location".to_string(),
-                }));
-            }
-        };
-        if !is_host_permitted(redirect_policy.allowed_domains, next_host) {
-            log::warn!(
-                "redirect to `{}` blocked: host not in proxy allowed_domains",
-                next_host
-            );
-            return Err(Report::new(TrustedServerError::AllowlistViolation {
-                host: next_host.to_string(),
-            }));
-        }
-
-        log::info!(
-            "following redirect {} => {} (status {})",
-            current_url,
-            next_url,
-            status.as_u16()
-        );
-
-        current_url = next_url.to_string();
-        // 307/308 replay the original method and body by design. 301/302/303
-        // become a bodyless GET (HEAD stays HEAD) so those redirects cannot
-        // carry the payload to a target the caller did not address.
-        if matches!(
-            status,
-            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
-        ) {
-            if current_body.is_some_and(|bytes| !bytes.is_empty()) {
-                log::warn!(
-                    "dropping {current_method} request body on {} redirect to {current_url}",
-                    status.as_u16()
-                );
-            }
-            if current_method != Method::HEAD {
-                current_method = Method::GET;
-            }
-            current_body = None;
-            body_dropped = true;
-        }
-    }
-
-    Err(Report::new(TrustedServerError::Proxy {
-        message: "redirect handling failed".to_string(),
-    }))
-}
-
 /// Unified proxy endpoint for resources referenced by ad creatives.
 ///
 /// Accepts:
 /// - `u`: Base64 URL-safe (no padding) encoded URL of the third-party resource.
 ///
 /// Behavior:
-/// - Proxies the decoded URL via a dynamic backend derived from scheme/host/port.
+/// - Proxies the decoded URL, following redirects to hosts `proxy.allowed_domains`
+///   permits (every host when it is empty).
 /// - If the response `Content-Type` contains `text/html`, rewrites the HTML creative
 ///   (img/srcset/iframe to first-party) before returning `text/html; charset=utf-8`.
 /// - If the response is an image or the request `Accept` indicates images, ensures an
@@ -1605,6 +1367,7 @@ pub async fn handle_first_party_proxy(
             copy_request_headers: true,
             stream_passthrough: false,
             stream_response: false,
+            max_response_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
             allowed_domains: &settings.proxy.allowed_domains,
             require_https: false,
         },
@@ -1701,7 +1464,8 @@ pub async fn handle_first_party_click(
 ///
 /// # Errors
 ///
-/// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
+/// Returns an error if a POST body cannot be read within 64 KiB (see
+/// [`read_request_body`]), JSON parsing fails, the URL cannot be parsed, the URL uses an
 /// unsupported scheme, the URL lacks a host, the host is declined by
 /// `rewrite.exclude_domains` or `rewrite.include_domains`, the host violates
 /// `proxy.allowed_domains`, or request metadata needed to determine the scheme
@@ -1722,7 +1486,7 @@ pub async fn handle_first_party_proxy_sign(
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = match crate::forwarder::public_origin(&req)
+    let request_scheme = match crate::forwarder::public_origin(req.extensions())
         .map(|origin| origin.scheme.clone())
         .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
     {
@@ -1731,8 +1495,8 @@ pub async fn handle_first_party_proxy_sign(
     };
 
     let payload = if method == Method::POST {
-        let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
-        enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
+        let (parts, body) = req.into_parts();
+        let body_bytes = read_request_body(&parts.headers, body, SIGN_MAX_BODY_BYTES).await?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
@@ -1922,8 +1686,8 @@ pub async fn handle_first_party_proxy_rebuild(
     let redirect_response = method == Method::GET || is_form_post;
 
     let payload = if method == Method::POST {
-        let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
-        enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
+        let (parts, body) = req.into_parts();
+        let body_bytes = read_request_body(&parts.headers, body, REBUILD_MAX_BODY_BYTES).await?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
@@ -2246,33 +2010,30 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::{HashMap, VecDeque};
-    use std::io;
-    use std::rc::Rc;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use super::{
-        AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
-        build_asset_proxy_target_url, handle_asset_proxy_request, handle_first_party_click,
-        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        is_host_allowed, is_host_permitted, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, stream_asset_body,
+        AssetProxyCachePolicy, AssetProxyResponse, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
+        REBUILD_MAX_BODY_BYTES, SIGN_MAX_BODY_BYTES, SUPPORTED_ENCODINGS, asset_origin_host_header,
+        asset_path_skips_image_optimizer, build_asset_proxy_target_url, handle_asset_proxy_request,
+        handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
+        handle_first_party_proxy_sign, is_host_allowed, is_host_permitted, proxy_request,
+        rebuild_response_with_body, reconstruct_and_validate_signed_target,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::{
-        HashMapSecretStore, StubHttpClient, build_services_with_http_client,
-        build_services_with_secret_and_http_client, noop_services,
+    use crate::outbound::{
+        BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, REDIRECT_CHAIN_DEADLINE,
+        STREAMED_TIMEOUT,
     };
+    use crate::platform::test_support::{build_services_with_outbound_client, noop_services};
     use crate::platform::{
-        PlatformCacheIntent, PlatformError, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-        StoreId, StoreName,
+        PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
     };
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -2280,10 +2041,20 @@ mod tests {
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
+    use edgezero_core::outbound::{
+        OutboundCachePolicy, OutboundCropFocus, OutboundImageFormat, OutboundImageOptimizerOptions,
+        OutboundImageOptimizerRegion, OutboundResizeFilter, ResponseDecoding, ResponseMode,
+    };
+    use edgezero_core::time::Deadline;
     use error_stack::Report;
     use http::{HeaderValue, Method, Request as HttpRequest, Response, StatusCode, header};
 
@@ -2351,8 +2122,13 @@ mod tests {
         build_http_post_json_request(uri, &serde_json::json!({ "url": target }))
     }
 
-    fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
-        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+    /// Builds a JSON `POST` whose `body` arrives as a stream of two chunks.
+    fn build_http_post_streaming_request(
+        uri: impl AsRef<str>,
+        body: &'static [u8],
+    ) -> HttpRequest<EdgeBody> {
+        let (head, tail) = body.split_at(body.len() / 2);
+        let stream = futures::stream::iter([Bytes::from_static(head), Bytes::from_static(tail)]);
         HttpRequest::builder()
             .method(Method::POST)
             .uri(uri.as_ref())
@@ -2372,79 +2148,6 @@ mod tests {
         .expect("response body should be valid UTF-8")
     }
 
-    struct QueuedHttpResponse {
-        status: u16,
-        headers: Vec<(header::HeaderName, HeaderValue)>,
-        body: Vec<u8>,
-    }
-
-    #[derive(Default)]
-    struct HeaderAwareStubHttpClient {
-        responses: Mutex<VecDeque<QueuedHttpResponse>>,
-    }
-
-    impl HeaderAwareStubHttpClient {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        fn push_response(
-            &self,
-            status: u16,
-            headers: Vec<(header::HeaderName, HeaderValue)>,
-            body: Vec<u8>,
-        ) {
-            self.responses
-                .lock()
-                .expect("should lock queued responses")
-                .push_back(QueuedHttpResponse {
-                    status,
-                    headers,
-                    body,
-                });
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for HeaderAwareStubHttpClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let queued = self
-                .responses
-                .lock()
-                .expect("should lock queued responses")
-                .pop_front()
-                .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
-
-            let mut builder = edgezero_core::http::response_builder().status(queued.status);
-            for (name, value) in queued.headers {
-                builder = builder.header(name, value);
-            }
-
-            let response = builder
-                .body(EdgeBody::from(queued.body))
-                .expect("should build stub HTTP response");
-
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
     fn build_http_response(status: StatusCode, body: EdgeBody) -> Response<EdgeBody> {
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -2456,57 +2159,6 @@ mod tests {
             .headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
-    }
-
-    /// Test double that always returns a streaming (non-buffered) response body.
-    ///
-    /// Used to exercise the `Body::Stream` pass-through path in
-    /// `proxy_request`, which returns the response body without materialising it.
-    /// Only `send` is implemented; `send_async` and
-    /// `select` return `PlatformError::Unsupported`.
-    struct StreamingResponseHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for StreamingResponseHttpClient {
-        fn supports_streaming_responses(&self) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let edge_response = edge_response_builder()
-                .status(StatusCode::OK)
-                .header(header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure")
-                .header(header::SET_COOKIE.as_str(), "other=2; Path=/; Secure")
-                .header(
-                    header::STRICT_TRANSPORT_SECURITY.as_str(),
-                    "max-age=31536000; includeSubDomains; preload",
-                )
-                .header("clear-site-data", "\"*\"")
-                .header(header::ETAG.as_str(), "\"stream-etag\"")
-                .body(EdgeBody::stream(futures::stream::iter(vec![
-                    Bytes::from_static(b"chunk"),
-                ])))
-                .expect("should build streaming test response");
-
-            Ok(PlatformResponse::new(edge_response).with_backend_name("stub-backend"))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
     }
 
     #[derive(Clone)]
@@ -2533,6 +2185,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
         fn get_bytes(
             &self,
@@ -2549,17 +2202,21 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
@@ -3017,7 +2674,9 @@ mod tests {
             );
             req.headers_mut()
                 .insert("x-forwarded-proto", HeaderValue::from_static("https"));
-            crate::forwarder::prepare_trusted_forwarder(&mut req, &settings);
+            crate::test_support::tests::with_request_parts(&mut req, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
 
             let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
@@ -4341,213 +4000,416 @@ mod tests {
         );
     }
 
-    // --- Platform HTTP client integration ---
+    // --- Outbound client integration ---
 
-    #[test]
-    fn proxy_request_calls_platform_http_client_send() {
-        futures::executor::block_on(async {
-            use crate::platform::test_support::StubHttpClient;
+    const SOURCE: &str = "https://source.example.com";
 
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://example.com/");
+    /// Test services whose outbound requests go to a fresh scripted upstream.
+    fn scripted_services() -> (TestClock, ScriptedHttpClient, RuntimeServices) {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let services = build_services_with_outbound_client(&client, &clock);
+        (clock, client, services)
+    }
 
-            let result = proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig {
-                    target_url: "https://example.com/resource",
-                    follow_redirects: false,
-                    forward_ec_id: false,
-                    body: None,
-                    headers: Vec::new(),
-                    copy_request_headers: false,
-                    stream_passthrough: false,
-                    stream_response: false,
-                    allowed_domains: &[],
-                    require_https: false,
-                },
-                &services,
-            )
-            .await;
+    fn source_url(path: &str) -> String {
+        format!("{SOURCE}{path}")
+    }
 
-            assert!(result.is_ok(), "should proxy successfully");
-            let calls = stub.recorded_backend_names();
-            assert_eq!(calls.len(), 1, "should call send exactly once");
-            assert_eq!(
-                calls[0], "stub-backend",
-                "should use backend name from StubBackend"
-            );
-        });
+    fn redirect_reply(status: u16, location: &str) -> ScriptedReply {
+        ScriptedReply::status(StatusCode::from_u16(status).expect("should be a redirect status"))
+            .header("location", location)
+    }
+
+    /// Settings every buffered proxy request carries.
+    fn proxied_transport() -> ExpectedTransport {
+        ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        }
+    }
+
+    /// The chain deadline a followed request takes from a clock that never moved.
+    fn chain_deadline(clock: &TestClock) -> Deadline {
+        clock
+            .monotonic_clock()
+            .deadline_after(REDIRECT_CHAIN_DEADLINE)
+    }
+
+    fn sent_methods(client: &ScriptedHttpClient) -> Vec<Method> {
+        client
+            .requests()
+            .into_iter()
+            .map(|request| request.method)
+            .collect()
+    }
+
+    fn sent_uris(client: &ScriptedHttpClient) -> Vec<String> {
+        client
+            .requests()
+            .iter()
+            .map(|request| request.uri.to_string())
+            .collect()
+    }
+
+    fn sent_bodies(client: &ScriptedHttpClient) -> Vec<Bytes> {
+        client
+            .requests()
+            .into_iter()
+            .map(|request| request.body)
+            .collect()
+    }
+
+    fn sent_header_names(client: &ScriptedHttpClient, index: usize) -> Vec<String> {
+        client.requests()[index]
+            .headers
+            .keys()
+            .map(|name| name.as_str().to_owned())
+            .collect()
     }
 
     #[test]
-    fn proxy_request_allows_open_mode_when_settings_allowlist_is_non_empty() {
-        futures::executor::block_on(async {
-            let mut settings = create_test_settings();
-            settings.proxy.allowed_domains = vec!["allowed.example".to_string()];
-
-            let stub = Arc::new(HeaderAwareStubHttpClient::new());
-            stub.push_response(200, Vec::new(), b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let req = build_http_request(Method::GET, "https://edge.example/");
-
-            let response = proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig {
-                    target_url: "https://blocked.example/resource.js",
-                    follow_redirects: false,
-                    forward_ec_id: false,
-                    body: None,
-                    headers: Vec::new(),
-                    copy_request_headers: false,
-                    stream_passthrough: false,
-                    stream_response: false,
-                    allowed_domains: &[],
-                    require_https: false,
-                },
-                &services,
-            )
-            .await
-            .expect("open mode should ignore settings.proxy.allowed_domains");
-
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response_body_string(response), "ok");
-        });
-    }
-
-    #[test]
-    fn proxy_request_uses_config_allowlist_for_redirect_hops() {
-        futures::executor::block_on(async {
-            let mut settings = create_test_settings();
-            settings.proxy.allowed_domains = vec!["origin.example".to_string()];
-
-            let stub = Arc::new(HeaderAwareStubHttpClient::new());
-            stub.push_response(
-                302,
-                vec![(
-                    header::LOCATION,
-                    HeaderValue::from_static("https://redirected.example/final.js"),
-                )],
-                Vec::new(),
-            );
-            stub.push_response(200, Vec::new(), b"redirected".to_vec());
-
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let req = build_http_request(Method::GET, "https://edge.example/");
-
-            let response = proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig {
-                    target_url: "https://origin.example/start.js",
-                    follow_redirects: true,
-                    forward_ec_id: false,
-                    body: None,
-                    headers: Vec::new(),
-                    copy_request_headers: false,
-                    stream_passthrough: false,
-                    stream_response: false,
-                    allowed_domains: &[],
-                    require_https: false,
-                },
-                &services,
-            )
-            .await
-            .expect("open mode should allow redirect hops outside settings allowlist");
-
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response_body_string(response), "redirected");
-        });
-    }
-
-    const REDIRECT_TEST_BODY: &[u8] = b"fictional-payload=example";
-
-    /// Send `method` with a body through one redirect of `status` and return the stub.
-    fn proxy_through_redirect(method: Method, status: u16) -> Arc<StubHttpClient> {
-        proxy_through_redirect_with_response(method, status).0
-    }
-
-    /// Like [`proxy_through_redirect`], but also return the proxied response.
-    fn proxy_through_redirect_with_response(
-        method: Method,
-        status: u16,
-    ) -> (Arc<StubHttpClient>, Response<EdgeBody>) {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response_with_headers(
-            status,
-            Vec::new(),
-            vec![("location", "https://redirect.example.com/final")],
-        );
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+    fn first_party_proxy_request_readback() {
+        let (clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://cdn.example.com/creative.png",
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "image/png")
+                .body("png"),
         );
         let settings = create_test_settings();
-        let req = build_http_request(method, "https://edge.example/");
+        let first_party =
+            creative::build_proxy_url(&settings, "https://cdn.example.com/creative.png", "");
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(format!("https://edge.example.com{first_party}"))
+            .header(header::USER_AGENT, "fictional-agent/1.0")
+            .header(header::ACCEPT, "image/*")
+            .header(header::ACCEPT_LANGUAGE, "en-US")
+            .header(header::REFERER, "https://publisher.example.com/article")
+            .header(HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .header(header::ACCEPT_ENCODING, "zstd")
+            .header(header::COOKIE, "session=fictional")
+            .header(header::AUTHORIZATION, "Basic ZmljdGlvbmFsOnNlY3JldA==")
+            .body(EdgeBody::empty())
+            .expect("should build the first-party proxy request");
+
+        let response =
+            futures::executor::block_on(handle_first_party_proxy(&settings, &services, req))
+                .expect("should proxy the creative");
+
+        assert_eq!(response.status(), StatusCode::OK, "should relay the origin");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one creative request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string()),
+            (
+                &Method::GET,
+                "https://cdn.example.com/creative.png".to_owned()
+            ),
+            "should fetch the signed target"
+        );
+        sent.assert_headers(&[
+            ("user-agent", "fictional-agent/1.0"),
+            ("accept", "image/*"),
+            ("accept-language", "en-US"),
+            ("referer", "https://publisher.example.com/article"),
+            ("x-forwarded-for", "198.51.100.10"),
+            ("accept-encoding", SUPPORTED_ENCODINGS),
+        ]);
+        sent.assert_followed_transport(proxied_transport(), chain_deadline(&clock));
+    }
+
+    #[test]
+    fn follow_disabled_uses_send_with_forward_headers() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::POST,
+            &source_url("/collect"),
+            redirect_reply(302, "https://redirect.example.com/final"),
+        );
+        let settings = create_test_settings();
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example.com/collect")
+            .header(header::USER_AGENT, "fictional-agent/1.0")
+            .header(header::ACCEPT, "text/html")
+            .header(header::ACCEPT_LANGUAGE, "en-US")
+            .header(header::REFERER, "https://publisher.example.com/article")
+            .header(HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .header(header::ACCEPT_ENCODING, "zstd")
+            .header(header::COOKIE, "session=fictional")
+            .body(EdgeBody::empty())
+            .expect("should build the client request");
+        let target = source_url("/collect");
+        let mut config = ProxyRequestConfig::new(&target)
+            .without_ec_id()
+            .with_body(b"fictional=beacon".to_vec())
+            .with_header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
+            .with_header(header::ACCEPT, HeaderValue::from_static("*/*"));
+        config.follow_redirects = false;
+
+        let response =
+            futures::executor::block_on(proxy_request(&settings, req, config, &services))
+                .expect("should return the unfollowed redirect");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should return the redirect instead of following it"
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string(), sent.body.as_ref()),
+            (
+                &Method::POST,
+                source_url("/collect"),
+                b"fictional=beacon".as_slice()
+            ),
+            "should send the method, target, and buffered body"
+        );
+        sent.assert_headers(&[
+            ("user-agent", "fictional-agent/1.0"),
+            ("accept", "*/*"),
+            ("accept-language", "en-US"),
+            ("referer", "https://publisher.example.com/article"),
+            ("x-forwarded-for", "198.51.100.10"),
+            ("accept-encoding", SUPPORTED_ENCODINGS),
+            ("content-type", "text/plain"),
+        ]);
+        sent.assert_transport(proxied_transport());
+    }
+
+    #[test]
+    fn proxy_request_streams_response_when_asked() {
+        let (clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            &source_url("/resource"),
+            ScriptedReply::status(StatusCode::OK).chunks(vec![
+                Bytes::from_static(b"stream"),
+                Bytes::from_static(b"ed"),
+            ]),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
 
         let response = futures::executor::block_on(proxy_request(
             &settings,
             req,
-            ProxyRequestConfig::new("https://source.example.com/start")
+            ProxyRequestConfig::new(&source_url("/resource"))
                 .without_ec_id()
                 .without_forward_headers()
+                .with_streaming()
+                .with_stream_response(),
+            &services,
+        ))
+        .expect("should proxy successfully");
+
+        assert!(
+            response.body().is_stream(),
+            "should keep the origin body as a stream"
+        );
+        let body = futures::executor::block_on(response.into_body().into_bytes_bounded(1024))
+            .expect("should read the streamed body");
+        assert_eq!(body.as_ref(), b"streamed", "should stream every chunk");
+        client.requests()[0].assert_followed_transport(
+            ExpectedTransport {
+                timeout: STREAMED_TIMEOUT,
+                response_mode: ResponseMode::Streamed,
+                response_decoding: ResponseDecoding::Original,
+                cache_policy: OutboundCachePolicy::PlatformDefault,
+            },
+            chain_deadline(&clock),
+        );
+    }
+
+    #[test]
+    fn proxy_target_with_fragment_is_sent_without_it() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            &source_url("/creative.html"),
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+
+        futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/creative.html#landing"))
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("should proxy a target that carries a fragment");
+
+        assert_eq!(
+            sent_uris(&client),
+            vec![source_url("/creative.html")],
+            "should drop the fragment from the upstream target"
+        );
+    }
+
+    #[test]
+    fn proxy_request_allows_open_mode_when_settings_allowlist_is_non_empty() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://blocked.example.com/resource.js",
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let mut settings = create_test_settings();
+        settings.proxy.allowed_domains = vec!["allowed.example.com".to_string()];
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+        let mut config = ProxyRequestConfig::new("https://blocked.example.com/resource.js")
+            .without_ec_id()
+            .without_forward_headers();
+        config.follow_redirects = false;
+
+        let response =
+            futures::executor::block_on(proxy_request(&settings, req, config, &services))
+                .expect("open mode should ignore settings.proxy.allowed_domains");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body_string(response), "ok");
+    }
+
+    #[test]
+    fn proxy_request_uses_config_allowlist_for_redirect_hops() {
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::GET,
+                "https://origin.example.com/start.js",
+                redirect_reply(302, "https://redirected.example.com/final.js"),
+            )
+            .respond_to(
+                Method::GET,
+                "https://redirected.example.com/final.js",
+                ScriptedReply::status(StatusCode::OK).body("redirected"),
+            );
+        let mut settings = create_test_settings();
+        settings.proxy.allowed_domains = vec!["origin.example.com".to_string()];
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://origin.example.com/start.js")
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("open mode should allow redirect hops outside settings allowlist");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body_string(response), "redirected");
+    }
+
+    const REDIRECT_TEST_BODY: &[u8] = b"fictional-payload=example";
+
+    /// Sends `method` through one `status` redirect and returns the upstream and the response.
+    ///
+    /// A method that carries a body sends [`REDIRECT_TEST_BODY`] with body headers. `GET` and
+    /// `HEAD` send none, because `EdgeZero` rejects a body on them.
+    fn proxy_through_redirect(
+        method: &Method,
+        status: u16,
+    ) -> (ScriptedHttpClient, Response<EdgeBody>) {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            method.clone(),
+            &source_url("/start"),
+            redirect_reply(status, "https://redirect.example.com/final"),
+        );
+        for follow_up in [Method::GET, Method::HEAD, method.clone()] {
+            client.respond_to(
+                follow_up,
+                "https://redirect.example.com/final",
+                ScriptedReply::status(StatusCode::OK).body("ok"),
+            );
+        }
+        let settings = create_test_settings();
+        let req = build_http_request(method.clone(), "https://edge.example.com/");
+        let target = source_url("/start");
+        let mut config = ProxyRequestConfig::new(&target)
+            .without_ec_id()
+            .without_forward_headers();
+        if method != Method::GET && method != Method::HEAD {
+            config = config
                 .with_body(REDIRECT_TEST_BODY.to_vec())
                 .with_header(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/x-www-form-urlencoded"),
                 )
-                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"))
-                .with_header(
-                    header::CONTENT_LENGTH,
-                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
-                ),
-            &services,
-        ))
-        .expect("should follow redirect");
+                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"));
+        }
 
-        (stub, response)
-    }
+        let response =
+            futures::executor::block_on(proxy_request(&settings, req, config, &services))
+                .expect("should proxy through the redirect");
 
-    fn recorded_header_names(stub: &StubHttpClient, index: usize) -> Vec<String> {
-        stub.recorded_request_headers()[index]
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect()
+        (client, response)
     }
 
     #[test]
     fn proxy_request_post_redirect_drops_body_for_301_302_303() {
         for status in [301, 302, 303] {
-            let stub = proxy_through_redirect(Method::POST, status);
+            let capture = LogCapture::start();
+            let (client, _response) = proxy_through_redirect(&Method::POST, status);
+
+            let records = capture.take_all();
+            drop(capture);
+            let dropped: Vec<_> = records
+                .iter()
+                .filter(|record| record.message.starts_with("dropping"))
+                .collect();
+            assert!(
+                matches!(
+                    dropped.as_slice(),
+                    [record] if record.level == log::Level::Warn
+                        && record.message
+                            == format!(
+                                "dropping the POST request body on a {status} redirect to `redirect.example.com`"
+                            )
+                ),
+                "should warn once, naming only the host, that the {status} redirect drops the body"
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| !record.message.contains("/final")),
+                "should keep the redirect path out of the logs for {status}"
+            );
 
             assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["POST".to_string(), "GET".to_string()],
+                sent_methods(&client),
+                vec![Method::POST, Method::GET],
                 "should follow a {status} POST redirect with GET"
             );
             assert_eq!(
-                stub.recorded_request_uris()[1],
+                sent_uris(&client)[1],
                 "https://redirect.example.com/final",
                 "should send the {status} follow-up to the Location target"
             );
             assert_eq!(
-                stub.recorded_request_bodies(),
-                vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+                sent_bodies(&client),
+                vec![Bytes::from_static(REDIRECT_TEST_BODY), Bytes::new()],
                 "should send the body only on the first hop for {status}"
             );
-            let first_hop_headers = recorded_header_names(&stub, 0);
-            let follow_up_headers = recorded_header_names(&stub, 1);
-            for body_header in ["content-type", "content-language", "content-length"] {
+            let first_hop_headers = sent_header_names(&client, 0);
+            let follow_up_headers = sent_header_names(&client, 1);
+            for body_header in ["content-type", "content-language"] {
                 assert!(
                     first_hop_headers.iter().any(|name| name == body_header),
                     "should send {body_header} on the first {status} hop"
@@ -4564,7 +4426,7 @@ mod tests {
     fn proxy_request_returns_301_302_unfollowed_for_non_post_body_methods() {
         for method in [Method::PUT, Method::PATCH, Method::DELETE] {
             for status in [301, 302] {
-                let (stub, response) = proxy_through_redirect_with_response(method.clone(), status);
+                let (client, response) = proxy_through_redirect(&method, status);
 
                 assert_eq!(
                     response.status().as_u16(),
@@ -4572,13 +4434,13 @@ mod tests {
                     "should return the {status} redirect for {method} to the caller"
                 );
                 assert_eq!(
-                    stub.recorded_request_methods(),
-                    vec![method.to_string()],
+                    sent_methods(&client),
+                    vec![method.clone()],
                     "should not follow a {status} redirect for {method}"
                 );
                 assert_eq!(
-                    stub.recorded_request_bodies(),
-                    vec![REDIRECT_TEST_BODY.to_vec()],
+                    sent_bodies(&client),
+                    vec![Bytes::from_static(REDIRECT_TEST_BODY)],
                     "should send the {method} body only to the addressed target on {status}"
                 );
             }
@@ -4587,7 +4449,7 @@ mod tests {
 
     #[test]
     fn proxy_request_put_redirect_becomes_bodyless_get_for_303() {
-        let (stub, response) = proxy_through_redirect_with_response(Method::PUT, 303);
+        let (client, response) = proxy_through_redirect(&Method::PUT, 303);
 
         assert_eq!(
             response.status().as_u16(),
@@ -4595,13 +4457,13 @@ mod tests {
             "should return the 303 target's response"
         );
         assert_eq!(
-            stub.recorded_request_methods(),
-            vec!["PUT".to_string(), "GET".to_string()],
+            sent_methods(&client),
+            vec![Method::PUT, Method::GET],
             "should follow a 303 PUT redirect with GET"
         );
         assert_eq!(
-            stub.recorded_request_bodies(),
-            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+            sent_bodies(&client),
+            vec![Bytes::from_static(REDIRECT_TEST_BODY), Bytes::new()],
             "should send the PUT body only on the first hop"
         );
     }
@@ -4609,20 +4471,33 @@ mod tests {
     #[test]
     fn proxy_request_post_redirect_retains_method_and_body_for_307_308() {
         for status in [307, 308] {
-            let stub = proxy_through_redirect(Method::POST, status);
+            let capture = LogCapture::start();
+            let (client, _response) = proxy_through_redirect(&Method::POST, status);
+
+            assert!(
+                capture
+                    .take_all()
+                    .iter()
+                    .all(|record| !record.message.starts_with("dropping")),
+                "should not warn about a body that the {status} redirect replays"
+            );
+            drop(capture);
 
             assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["POST".to_string(), "POST".to_string()],
+                sent_methods(&client),
+                vec![Method::POST, Method::POST],
                 "should keep POST across a {status} redirect"
             );
             assert_eq!(
-                stub.recorded_request_bodies(),
-                vec![REDIRECT_TEST_BODY.to_vec(), REDIRECT_TEST_BODY.to_vec()],
+                sent_bodies(&client),
+                vec![
+                    Bytes::from_static(REDIRECT_TEST_BODY),
+                    Bytes::from_static(REDIRECT_TEST_BODY)
+                ],
                 "should replay the exact body across a {status} redirect"
             );
             assert!(
-                recorded_header_names(&stub, 1)
+                sent_header_names(&client, 1)
                     .iter()
                     .any(|name| name == "content-type"),
                 "should keep Content-Type across a {status} redirect"
@@ -4632,38 +4507,36 @@ mod tests {
 
     #[test]
     fn proxy_request_post_body_stays_dropped_after_302_then_307() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response_with_headers(
-            302,
-            Vec::new(),
-            vec![("location", "https://redirect.example.com/second")],
-        );
-        stub.push_response_with_headers(
-            307,
-            Vec::new(),
-            vec![("location", "https://redirect.example.com/final")],
-        );
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::POST,
+                &source_url("/start"),
+                redirect_reply(302, "https://redirect.example.com/second"),
+            )
+            .respond_to(
+                Method::GET,
+                "https://redirect.example.com/second",
+                redirect_reply(307, "https://redirect.example.com/final"),
+            )
+            .respond_to(
+                Method::GET,
+                "https://redirect.example.com/final",
+                ScriptedReply::status(StatusCode::OK).body("ok"),
+            );
         let settings = create_test_settings();
-        let req = build_http_request(Method::POST, "https://edge.example/");
+        let req = build_http_request(Method::POST, "https://edge.example.com/");
 
         futures::executor::block_on(proxy_request(
             &settings,
             req,
-            ProxyRequestConfig::new("https://source.example.com/start")
+            ProxyRequestConfig::new(&source_url("/start"))
                 .without_ec_id()
                 .without_forward_headers()
                 .with_body(REDIRECT_TEST_BODY.to_vec())
                 .with_header(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/x-www-form-urlencoded"),
-                )
-                .with_header(
-                    header::CONTENT_LENGTH,
-                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
                 )
                 .with_header(
                     header::CONTENT_ENCODING,
@@ -4679,19 +4552,22 @@ mod tests {
         .expect("should follow the 302 then 307 chain");
 
         assert_eq!(
-            stub.recorded_request_methods(),
-            vec!["POST".to_string(), "GET".to_string(), "GET".to_string()],
+            sent_methods(&client),
+            vec![Method::POST, Method::GET, Method::GET],
             "should keep the 302 follow-up as GET across the later 307"
         );
         assert_eq!(
-            stub.recorded_request_bodies(),
-            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new(), Vec::new()],
+            sent_bodies(&client),
+            vec![
+                Bytes::from_static(REDIRECT_TEST_BODY),
+                Bytes::new(),
+                Bytes::new()
+            ],
             "should not restore the dropped body on the 307 hop"
         );
-        let first_hop_headers = recorded_header_names(&stub, 0);
+        let first_hop_headers = sent_header_names(&client, 0);
         for body_header in [
             "content-type",
-            "content-length",
             "content-encoding",
             "content-language",
             "content-location",
@@ -4702,7 +4578,7 @@ mod tests {
             );
             for hop in [1, 2] {
                 assert!(
-                    !recorded_header_names(&stub, hop)
+                    !sent_header_names(&client, hop)
                         .iter()
                         .any(|name| name == body_header),
                     "should not send {body_header} on bodyless hop {hop}"
@@ -4711,29 +4587,28 @@ mod tests {
         }
     }
 
+    /// Scripts a chain of five `302` answers, one more than the redirect limit follows.
+    fn script_redirect_limit(client: &ScriptedHttpClient, reply: impl Fn() -> ScriptedReply) {
+        client.respond_to(Method::GET, &source_url("/start"), reply());
+        for _ in 0..4 {
+            client.respond_to(Method::GET, "https://redirect.example.com/next", reply());
+        }
+    }
+
     #[test]
     fn proxy_request_redirect_limit_response_strips_cors_policy() {
-        let stub = Arc::new(StubHttpClient::new());
-        for _ in 0..5 {
-            stub.push_response_with_headers(
-                302,
-                Vec::new(),
-                vec![
-                    ("location", "https://redirect.example.com/next"),
-                    ("access-control-allow-origin", "*"),
-                ],
-            );
-        }
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let (_clock, client, services) = scripted_services();
+        script_redirect_limit(&client, || {
+            redirect_reply(302, "https://redirect.example.com/next")
+                .header("access-control-allow-origin", "*")
+        });
         let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://edge.example/");
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
 
         let response = futures::executor::block_on(proxy_request(
             &settings,
             req,
-            ProxyRequestConfig::new("https://source.example.com/start")
+            ProxyRequestConfig::new(&source_url("/start"))
                 .without_ec_id()
                 .without_forward_headers(),
             &services,
@@ -4741,7 +4616,7 @@ mod tests {
         .expect("should return the redirect once the limit is reached");
 
         assert_eq!(
-            stub.recorded_request_methods().len(),
+            client.requests().len(),
             5,
             "should stop following after the redirect limit"
         );
@@ -4761,27 +4636,19 @@ mod tests {
 
     #[test]
     fn proxy_request_redirect_limit_response_honors_stream_passthrough() {
-        let stub = Arc::new(StubHttpClient::new());
-        for _ in 0..5 {
-            stub.push_response_with_headers(
-                302,
-                b"<p>moved</p>".to_vec(),
-                vec![
-                    ("location", "https://redirect.example.com/next"),
-                    ("content-type", "text/html"),
-                ],
-            );
-        }
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
+        let (_clock, client, services) = scripted_services();
+        script_redirect_limit(&client, || {
+            redirect_reply(302, "https://redirect.example.com/next")
+                .header("content-type", "text/html")
+                .body("<p>moved</p>")
+        });
         let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://edge.example/");
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
 
         let response = futures::executor::block_on(proxy_request(
             &settings,
             req,
-            ProxyRequestConfig::new("https://source.example.com/start")
+            ProxyRequestConfig::new(&source_url("/start"))
                 .without_ec_id()
                 .without_forward_headers()
                 .with_streaming(),
@@ -4794,21 +4661,26 @@ mod tests {
             Some(&HeaderValue::from_static("text/html")),
             "should pass the redirect-limit response through without the HTML rewrite"
         );
+        assert_eq!(
+            response_body_string(response),
+            "<p>moved</p>",
+            "should keep the redirect body unchanged"
+        );
     }
 
     #[test]
     fn proxy_request_head_redirect_stays_head_for_301_302_303() {
         for status in [301, 302, 303] {
-            let stub = proxy_through_redirect(Method::HEAD, status);
+            let (client, _response) = proxy_through_redirect(&Method::HEAD, status);
 
             assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD".to_string(), "HEAD".to_string()],
+                sent_methods(&client),
+                vec![Method::HEAD, Method::HEAD],
                 "should keep HEAD across a {status} redirect"
             );
             assert!(
-                stub.recorded_request_bodies()[1].is_empty(),
-                "should send no body on the {status} HEAD follow-up"
+                sent_bodies(&client).iter().all(Bytes::is_empty),
+                "should send no body on either {status} HEAD hop"
             );
         }
     }
@@ -4816,32 +4688,29 @@ mod tests {
     #[test]
     fn proxy_request_head_redirect_keeps_header_only_compressed_response() {
         for (content_type, content_encoding) in [("text/html", "gzip"), ("text/css", "br")] {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                303,
-                Vec::new(),
-                vec![("location", "https://redirect.example.com/final")],
-            );
-            stub.push_response_with_headers(
-                200,
-                Vec::new(),
-                vec![
-                    ("content-type", content_type),
-                    ("content-encoding", content_encoding),
-                    ("content-length", "1234"),
-                    ("access-control-allow-origin", "*"),
-                ],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
+            let (_clock, client, services) = scripted_services();
+            client
+                .respond_to(
+                    Method::HEAD,
+                    &source_url("/start"),
+                    redirect_reply(303, "https://redirect.example.com/final"),
+                )
+                .respond_to(
+                    Method::HEAD,
+                    "https://redirect.example.com/final",
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", content_type)
+                        .header("content-encoding", content_encoding)
+                        .header("content-length", "1234")
+                        .header("access-control-allow-origin", "*"),
+                );
             let settings = create_test_settings();
-            let req = build_http_request(Method::HEAD, "https://edge.example/");
+            let req = build_http_request(Method::HEAD, "https://edge.example.com/");
 
             let response = futures::executor::block_on(proxy_request(
                 &settings,
                 req,
-                ProxyRequestConfig::new("https://source.example.com/start")
+                ProxyRequestConfig::new(&source_url("/start"))
                     .without_ec_id()
                     .without_forward_headers(),
                 &services,
@@ -4849,8 +4718,8 @@ mod tests {
             .expect("should return the header-only HEAD response");
 
             assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD".to_string(), "HEAD".to_string()],
+                sent_methods(&client),
+                vec![Method::HEAD, Method::HEAD],
                 "should keep HEAD across the 303 redirect"
             );
             assert_eq!(
@@ -4882,201 +4751,377 @@ mod tests {
 
     #[test]
     fn proxy_request_post_redirect_still_enforces_per_hop_allowlist() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                307,
-                Vec::new(),
-                vec![("location", "https://blocked.example.com/final")],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::POST,
+            &source_url("/start"),
+            redirect_reply(307, "https://blocked.example.com/final"),
+        );
+        let settings = create_test_settings();
+        let allowed_domains = vec!["source.example.com".to_string()];
+        let req = build_http_request(Method::POST, "https://edge.example.com/");
+
+        let err = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .without_forward_headers()
+                .with_body(REDIRECT_TEST_BODY.to_vec())
+                .with_allowed_domains(&allowed_domains),
+            &services,
+        ))
+        .expect_err("should block a redirect to a host outside the allowlist");
+
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::AllowlistViolation { host } if host == "blocked.example.com"
+            ),
+            "should report the blocked redirect host"
+        );
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "should never send the body to the blocked host"
+        );
+    }
+
+    #[test]
+    fn redirect_policy_blocks_https_downgrade_before_other_checks() {
+        for location in [
+            "http://blocked.example.com/final",
+            "ftp://files.example.com/final",
+        ] {
+            let (_clock, client, services) = scripted_services();
+            client.respond_to(
+                Method::GET,
+                &source_url("/start"),
+                redirect_reply(302, location),
             );
             let settings = create_test_settings();
             let allowed_domains = vec!["source.example.com".to_string()];
-            let req = build_http_request(Method::POST, "https://edge.example/");
+            let req = build_http_request(Method::GET, "https://edge.example.com/");
 
-            let err = proxy_request(
+            let err = futures::executor::block_on(proxy_request(
                 &settings,
                 req,
-                ProxyRequestConfig::new("https://source.example.com/start")
+                ProxyRequestConfig::new(&source_url("/start"))
                     .without_ec_id()
                     .without_forward_headers()
-                    .with_body(REDIRECT_TEST_BODY.to_vec())
-                    .with_allowed_domains(&allowed_domains),
+                    .with_allowed_domains(&allowed_domains)
+                    .with_https_only(),
                 &services,
-            )
-            .await
-            .expect_err("should block a redirect to a host outside the allowlist");
+            ))
+            .expect_err("should block a redirect that leaves HTTPS");
 
             assert!(
-                matches!(
-                    err.current_context(),
-                    TrustedServerError::AllowlistViolation { host } if host == "blocked.example.com"
+                matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
+                "should forbid the {location} hop before its scheme or host is checked"
+            );
+            assert_eq!(client.requests().len(), 1, "should not follow {location}");
+        }
+    }
+
+    #[test]
+    fn https_required_warnings_name_only_the_scheme_and_host() {
+        let capture = LogCapture::start();
+        let (_clock, client, services) = scripted_services();
+        let settings = create_test_settings();
+        let mut req = build_http_request(Method::GET, "https://edge.example.com/");
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC,
+            HeaderValue::from_static("ec-sentinel-123"),
+        );
+        let error = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("http://insecure.example.com/target-path?token=query-sentinel")
+                .with_https_only(),
+            &services,
+        ))
+        .expect_err("should block a plain-HTTP target that must be HTTPS");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Forbidden { .. }
+            ),
+            "should forbid the plain-HTTP target"
+        );
+        assert!(
+            client.requests().is_empty(),
+            "should not send the blocked target"
+        );
+
+        client.respond_to(
+            Method::GET,
+            &source_url("/start"),
+            redirect_reply(
+                302,
+                "http://insecure.example.com/next-path?token=redirect-sentinel",
+            ),
+        );
+        // The redirect target is the upstream's, so its query carries the token here.
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+        let error = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .with_https_only(),
+            &services,
+        ))
+        .expect_err("should block a redirect that leaves HTTPS");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Forbidden { .. }
+            ),
+            "should forbid the plain-HTTP redirect"
+        );
+
+        let records = capture.take_all();
+        for expected in [
+            "request to `http://insecure.example.com` blocked: HTTPS is required",
+            "redirect to `http://insecure.example.com` blocked: HTTPS is required",
+        ] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.level == log::Level::Warn && record.message == expected),
+                "should warn `{expected}`"
+            );
+        }
+        assert!(
+            records.iter().all(|record| {
+                !record.message.contains("sentinel") && !record.message.contains("-path")
+            }),
+            "should keep the EC ID, the query, and the path out of every log"
+        );
+    }
+
+    #[test]
+    fn redirect_policy_returns_the_redirect_for_other_schemes() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            &source_url("/start"),
+            redirect_reply(302, "ftp://files.example.com/final"),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("should return the redirect to a scheme it cannot follow");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should return the 302 itself"
+        );
+        assert_eq!(client.requests().len(), 1, "should not follow the ftp hop");
+    }
+
+    #[test]
+    fn redirect_chain_past_deadline_fails_with_site_502() {
+        let (clock, client, services) = scripted_services();
+        let hops = ["/start", "/one", "/two", "/three", "/four"];
+        for pair in hops.windows(2) {
+            client.respond_to(
+                Method::GET,
+                &source_url(pair[0]),
+                redirect_reply(302, &source_url(pair[1])).after(Duration::from_secs(14)),
+            );
+        }
+        client.respond_to(
+            Method::GET,
+            &source_url("/four"),
+            ScriptedReply::status(StatusCode::OK).after(Duration::from_secs(5)),
+        );
+        let deadline = chain_deadline(&clock);
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+        let target = source_url("/start");
+        let mut proxied = std::pin::pin!(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&target)
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        // Each hop answers inside its own 15 s timeout, but the fifth answer lands at 61 s.
+        for step in [14, 14, 14, 14, 5] {
+            assert!(
+                proxied.as_mut().poll(&mut context).is_pending(),
+                "should wait for the next hop"
+            );
+            clock.advance(Duration::from_secs(step));
+        }
+        let Poll::Ready(outcome) = proxied.as_mut().poll(&mut context) else {
+            panic!("should finish once the chain deadline passes");
+        };
+
+        let err = outcome.expect_err("should fail past the chain deadline");
+        assert!(
+            matches!(err.current_context(), TrustedServerError::Proxy { .. }),
+            "should keep the proxy's own error"
+        );
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_GATEWAY,
+            "should answer the expired chain with the site's 502"
+        );
+        let requests = client.requests();
+        assert_eq!(
+            requests.len(),
+            5,
+            "should send every hop before the deadline"
+        );
+        for request in &requests {
+            request.assert_followed_transport(proxied_transport(), deadline);
+        }
+    }
+
+    #[test]
+    fn location_with_userinfo_fails_with_site_502() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            &source_url("/start"),
+            redirect_reply(302, "https://fictional:secret@redirect.example.com/final"),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+
+        let err = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect_err("should reject a Location that carries userinfo");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_GATEWAY,
+            "should answer the userinfo redirect with the site's 502"
+        );
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "should not follow the userinfo Location"
+        );
+    }
+
+    #[test]
+    fn cross_origin_hop_strips_authorization_and_cookie() {
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::GET,
+                &source_url("/start"),
+                redirect_reply(302, &source_url("/same-origin")),
+            )
+            .respond_to(
+                Method::GET,
+                &source_url("/same-origin"),
+                redirect_reply(302, "https://other.example.com/final"),
+            )
+            .respond_to(
+                Method::GET,
+                "https://other.example.com/final",
+                ScriptedReply::status(StatusCode::OK).body("ok"),
+            );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
+
+        futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .without_forward_headers()
+                .with_header(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer fictional-token"),
+                )
+                .with_header(
+                    header::COOKIE,
+                    HeaderValue::from_static("session=fictional"),
                 ),
-                "should report the blocked redirect host"
+            &services,
+        ))
+        .expect("should follow the chain");
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 3, "should follow both redirects");
+        for (index, request) in requests.iter().enumerate() {
+            let credentials = (
+                request.headers.contains_key(header::AUTHORIZATION),
+                request.headers.contains_key(header::COOKIE),
             );
-            assert_eq!(
-                stub.recorded_request_bodies().len(),
-                1,
-                "should never send the body to the blocked host"
-            );
-        });
-    }
-
-    #[test]
-    fn proxy_request_forwards_stream_response_flag_to_platform_request() {
-        futures::executor::block_on(async {
-            use crate::platform::test_support::StubHttpClient;
-
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://example.com/");
-
-            proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig::new("https://example.com/resource")
-                    .without_forward_headers()
-                    .with_stream_response(),
-                &services,
-            )
-            .await
-            .expect("should proxy successfully");
-
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![true],
-                "should request a streaming platform response"
-            );
-        });
-    }
-
-    #[test]
-    fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
-        futures::executor::block_on(async {
-            use crate::platform::test_support::StubHttpClient;
-
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let mut req = HttpRequest::builder()
-                .method(Method::GET)
-                .uri("https://example.com/")
-                .body(EdgeBody::empty())
-                .expect("should build test request");
-            req.headers_mut().insert(
-                header::USER_AGENT,
-                HeaderValue::from_static("test-agent/1.0"),
-            );
-            req.headers_mut()
-                .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
-            req.headers_mut()
-                .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
-
-            let result = proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig {
-                    target_url: "https://example.com/resource",
-                    follow_redirects: false,
-                    forward_ec_id: false,
-                    body: None,
-                    headers: Vec::new(),
-                    copy_request_headers: true,
-                    stream_passthrough: false,
-                    stream_response: false,
-                    allowed_domains: &[],
-                    require_https: false,
-                },
-                &services,
-            )
-            .await;
-
-            assert!(result.is_ok(), "should proxy successfully");
-            let all_headers = stub.recorded_request_headers();
-            assert_eq!(all_headers.len(), 1, "should have captured one request");
-            let sent = &all_headers[0];
-
-            let header_value = |name: &str| -> Option<String> {
-                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+            let expected = if index < 2 {
+                (true, true)
+            } else {
+                (false, false)
             };
-
             assert_eq!(
-                header_value("user-agent").as_deref(),
-                Some("test-agent/1.0"),
-                "should forward User-Agent"
+                credentials,
+                expected,
+                "should keep credentials only on same-origin hops, hop {index} to {}",
+                request.method_and_path()
             );
-            assert_eq!(
-                header_value("accept").as_deref(),
-                Some("text/html"),
-                "should forward Accept"
-            );
-            assert_eq!(
-                header_value("accept-language").as_deref(),
-                Some("en-US"),
-                "should forward Accept-Language"
-            );
-            assert_eq!(
-                header_value("accept-encoding").as_deref(),
-                Some(SUPPORTED_ENCODINGS),
-                "should override Accept-Encoding with supported encodings"
-            );
-        });
+        }
     }
 
     #[test]
-    fn proxy_request_passes_through_streaming_platform_response_body() {
-        futures::executor::block_on(async {
-            // HTTP types can carry streaming bodies; proxy_request returns Ok even when
-            // the origin sends a streaming body.
-            let services = build_services_with_http_client(
-                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = HttpRequest::builder()
-                .method(Method::GET)
-                .uri("https://example.com/")
-                .body(EdgeBody::empty())
-                .expect("should build test request");
-
-            let result = proxy_request(
-                &settings,
-                req,
-                ProxyRequestConfig {
-                    target_url: "https://example.com/resource",
-                    follow_redirects: false,
-                    forward_ec_id: false,
-                    body: None,
-                    headers: Vec::new(),
-                    copy_request_headers: false,
-                    stream_passthrough: false,
-                    stream_response: false,
-                    allowed_domains: &[],
-                    require_https: false,
-                },
-                &services,
+    fn non_ascii_location_is_percent_encoded_and_followed() {
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::GET,
+                &source_url("/start"),
+                redirect_reply(302, "/caf\u{e9}?q=\u{e9}t\u{e9}"),
             )
-            .await;
+            .respond_to(
+                Method::GET,
+                &source_url("/caf%C3%A9?q=%C3%A9t%C3%A9"),
+                ScriptedReply::status(StatusCode::OK).body("followed"),
+            );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example.com/");
 
-            assert!(
-                result.is_ok(),
-                "should pass streaming body through with HTTP types: {result:?}"
-            );
-            assert_eq!(
-                result.expect("should succeed").status(),
-                StatusCode::OK,
-                "should preserve the origin status code"
-            );
-        });
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new(&source_url("/start"))
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("should follow the non-ASCII Location");
+
+        assert_eq!(
+            sent_uris(&client),
+            vec![
+                source_url("/start"),
+                source_url("/caf%C3%A9?q=%C3%A9t%C3%A9")
+            ],
+            "should percent-encode the Location before following it"
+        );
+        assert_eq!(response_body_string(response), "followed");
     }
 
     #[test]
@@ -5251,238 +5296,172 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_asset_proxy_request_forwards_asset_headers_and_host() {
-        futures::executor::block_on(async {
-            use crate::platform::test_support::StubHttpClient;
+    /// Settings an asset `GET` carries: a streamed response in its original coding,
+    /// through the platform cache.
+    fn asset_get_transport() -> ExpectedTransport {
+        ExpectedTransport {
+            timeout: STREAMED_TIMEOUT,
+            response_mode: ResponseMode::Streamed,
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        }
+    }
 
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(false);
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let mut req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?auto=webp",
-            );
-            req.headers_mut().insert(
-                header::USER_AGENT,
-                HeaderValue::from_static("asset-agent/1.0"),
-            );
-            req.headers_mut().insert(
-                header::ACCEPT,
-                HeaderValue::from_static("image/avif,image/webp,image/*,*/*;q=0.8"),
-            );
-            req.headers_mut().insert(
-                header::ACCEPT_ENCODING,
-                HeaderValue::from_static("gzip, br"),
-            );
-            req.headers_mut()
-                .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
-            req.headers_mut().insert(
-                header::REFERER,
-                HeaderValue::from_static("https://www.example.com/article"),
-            );
-            req.headers_mut().insert(
-                header::IF_NONE_MATCH,
-                HeaderValue::from_static("\"asset-etag\""),
-            );
-            req.headers_mut().insert(
-                header::IF_MODIFIED_SINCE,
-                HeaderValue::from_static("Thu, 13 Mar 2025 08:00:00 GMT"),
-            );
-            req.headers_mut().insert(
-                header::IF_MATCH,
-                HeaderValue::from_static("\"asset-precondition\""),
-            );
-            req.headers_mut().insert(
-                header::IF_UNMODIFIED_SINCE,
-                HeaderValue::from_static("Thu, 13 Mar 2025 09:00:00 GMT"),
-            );
-            req.headers_mut()
-                .insert(header::RANGE, HeaderValue::from_static("bytes=0-1023"));
-            req.headers_mut().insert(
-                header::IF_RANGE,
-                HeaderValue::from_static("\"asset-range\""),
-            );
-            req.headers_mut().insert(
-                HEADER_X_FORWARDED_FOR,
-                HeaderValue::from_static("198.51.100.10"),
-            );
-            req.headers_mut().insert(
-                header::HeaderName::from_static("x-custom-test"),
-                HeaderValue::from_static("drop-me"),
-            );
+    /// Settings an asset `HEAD` carries: a buffered response in its original coding,
+    /// through the platform cache.
+    fn asset_head_transport() -> ExpectedTransport {
+        ExpectedTransport {
+            timeout: BUFFERED_TIMEOUT,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        }
+    }
 
-            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request")
-                .into_response()
-                .expect("should return buffered asset response");
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![false],
-                "unsupported platforms should buffer asset proxy responses"
-            );
+    /// `transport` with the readthrough cache bypassed.
+    ///
+    /// The signed S3 preflight `HEAD`, its raw error-body `GET`, and a signed raw
+    /// `HEAD` carry it.
+    fn uncached(transport: ExpectedTransport) -> ExpectedTransport {
+        ExpectedTransport {
+            cache_policy: OutboundCachePolicy::Bypass,
+            ..transport
+        }
+    }
 
-            let all_headers = stub.recorded_request_headers();
-            assert_eq!(all_headers.len(), 1, "should have captured one request");
-            let sent = &all_headers[0];
-            let header_value = |name: &str| -> Option<String> {
-                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
-            };
-
-            assert_eq!(
-                header_value("user-agent").as_deref(),
-                Some("asset-agent/1.0"),
-                "should forward User-Agent"
-            );
-            assert_eq!(
-                header_value("accept-encoding").as_deref(),
-                Some("gzip, br"),
-                "should preserve the incoming Accept-Encoding"
-            );
-            assert_eq!(
-                header_value("if-none-match").as_deref(),
-                Some("\"asset-etag\""),
-                "should forward conditional ETag validation headers"
-            );
-            assert_eq!(
-                header_value("if-modified-since").as_deref(),
-                Some("Thu, 13 Mar 2025 08:00:00 GMT"),
-                "should forward conditional date validation headers"
-            );
-            assert_eq!(
-                header_value("if-match").as_deref(),
-                Some("\"asset-precondition\""),
-                "should forward precondition headers"
-            );
-            assert_eq!(
-                header_value("if-unmodified-since").as_deref(),
-                Some("Thu, 13 Mar 2025 09:00:00 GMT"),
-                "should forward date precondition headers"
-            );
-            assert_eq!(
-                header_value("range").as_deref(),
-                Some("bytes=0-1023"),
-                "should forward byte-range requests"
-            );
-            assert_eq!(
-                header_value("if-range").as_deref(),
-                Some("\"asset-range\""),
-                "should forward range validators"
-            );
-            assert_eq!(
-                header_value("host").as_deref(),
-                Some("assets.example.com:8443"),
-                "should override Host to the asset origin host"
-            );
-            assert!(
-                header_value("x-forwarded-for").is_none(),
-                "should not forward client-supplied X-Forwarded-For"
-            );
-            assert!(
-                header_value("x-custom-test").is_none(),
-                "should not forward unrelated custom headers"
-            );
-        });
+    /// Reads an asset response's streamed body, returning the response without it.
+    fn streamed_asset(asset_response: AssetProxyResponse) -> (Response<EdgeBody>, Vec<u8>) {
+        let (parts, body) = asset_response.into_response().into_parts();
+        assert!(body.is_stream(), "should keep the asset body as a stream");
+        let bytes = futures::executor::block_on(body.into_bytes_bounded(1024 * 1024))
+            .expect("should stream the asset body");
+        (
+            Response::from_parts(parts, EdgeBody::empty()),
+            bytes.to_vec(),
+        )
     }
 
     #[test]
-    fn handle_asset_proxy_request_streams_when_supported() {
-        futures::executor::block_on(async {
-            use crate::platform::test_support::StubHttpClient;
+    fn asset_proxy_get_request_readback() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com:8443/.images/foo.jpg?auto=webp",
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let settings = create_test_settings();
+        let mut req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?auto=webp",
+        );
+        for (name, value) in [
+            (header::USER_AGENT, "asset-agent/1.0"),
+            (header::ACCEPT, "image/avif,image/webp,image/*,*/*;q=0.8"),
+            (header::ACCEPT_ENCODING, "gzip, br"),
+            (header::ACCEPT_LANGUAGE, "en-US"),
+            (header::REFERER, "https://www.example.com/article"),
+            (header::IF_NONE_MATCH, "\"asset-etag\""),
+            (header::IF_MODIFIED_SINCE, "Thu, 13 Mar 2025 08:00:00 GMT"),
+            (header::IF_MATCH, "\"asset-precondition\""),
+            (header::IF_UNMODIFIED_SINCE, "Thu, 13 Mar 2025 09:00:00 GMT"),
+            (header::RANGE, "bytes=0-1023"),
+            (header::IF_RANGE, "\"asset-range\""),
+            (HEADER_X_FORWARDED_FOR, "198.51.100.10"),
+            (header::HeaderName::from_static("x-custom-test"), "drop-me"),
+        ] {
+            req.headers_mut()
+                .insert(name, HeaderValue::from_static(value));
+        }
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
 
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
-            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        let (response, body) = streamed_asset(
+            futures::executor::block_on(handle_asset_proxy_request(
+                &settings, &services, req, &route,
+            ))
+            .expect("should proxy asset request"),
+        );
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy streaming asset response");
-
-            assert_eq!(stub.recorded_stream_response_flags(), vec![true]);
-        });
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body, b"ok", "should stream the asset body");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one asset request");
+        let sent = &requests[0];
+        sent.assert_headers(&[
+            ("user-agent", "asset-agent/1.0"),
+            ("accept", "image/avif,image/webp,image/*,*/*;q=0.8"),
+            ("accept-encoding", "gzip, br"),
+            ("accept-language", "en-US"),
+            ("referer", "https://www.example.com/article"),
+            ("if-none-match", "\"asset-etag\""),
+            ("if-modified-since", "Thu, 13 Mar 2025 08:00:00 GMT"),
+            ("if-match", "\"asset-precondition\""),
+            ("if-unmodified-since", "Thu, 13 Mar 2025 09:00:00 GMT"),
+            ("range", "bytes=0-1023"),
+            ("if-range", "\"asset-range\""),
+        ]);
+        assert_eq!(
+            sent.host_authority, "assets.example.com:8443",
+            "should send the asset origin authority, which the Host header named"
+        );
+        sent.assert_transport(asset_get_transport());
     }
 
     #[test]
     fn handle_asset_proxy_request_strips_unsafe_response_headers() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                200,
-                Vec::new(),
-                vec![
-                    (header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure"),
-                    (header::SET_COOKIE.as_str(), "other=2; Path=/; Secure"),
-                    (
-                        header::STRICT_TRANSPORT_SECURITY.as_str(),
-                        "max-age=31536000; includeSubDomains; preload",
-                    ),
-                    ("clear-site-data", "\"*\""),
-                    (header::ETAG.as_str(), "\"asset-etag\""),
-                ],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/foo.jpg",
+            ScriptedReply::status(StatusCode::OK)
+                .header(header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure")
+                .header(header::SET_COOKIE.as_str(), "other=2; Path=/; Secure")
+                .header(
+                    header::STRICT_TRANSPORT_SECURITY.as_str(),
+                    "max-age=31536000; includeSubDomains; preload",
+                )
+                .header("clear-site-data", "\"*\"")
+                .header(header::ETAG.as_str(), "\"asset-etag\"")
+                .chunks(vec![Bytes::from_static(b"chunk")]),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
-            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+        let (response, body) = streamed_asset(
+            futures::executor::block_on(handle_asset_proxy_request(
+                &settings, &services, req, &route,
+            ))
+            .expect("should proxy asset request"),
+        );
 
-            assert!(
-                response.headers().get(header::SET_COOKIE).is_none(),
-                "should strip upstream Set-Cookie headers from asset responses"
-            );
-            assert!(
-                response
-                    .headers()
-                    .get(header::STRICT_TRANSPORT_SECURITY)
-                    .is_none(),
-                "should strip upstream HSTS headers from asset responses"
-            );
-            assert!(
-                response.headers().get("clear-site-data").is_none(),
-                "should strip upstream Clear-Site-Data headers from asset responses"
-            );
-            assert_eq!(
-                response_header(&response, header::ETAG),
-                Some("\"asset-etag\""),
-                "should preserve safe cache validator headers on asset responses"
-            );
-        });
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "should strip upstream Set-Cookie headers from asset responses"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .is_none(),
+            "should strip upstream HSTS headers from asset responses"
+        );
+        assert!(
+            response.headers().get("clear-site-data").is_none(),
+            "should strip upstream Clear-Site-Data headers from asset responses"
+        );
+        assert_eq!(
+            response_header(&response, header::ETAG),
+            Some("\"asset-etag\""),
+            "should preserve safe cache validator headers on asset responses"
+        );
+        assert_eq!(body, b"chunk", "should stream the origin body");
     }
 
-    #[test]
-    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                200,
-                b"asset".to_vec(),
-                vec![(header::CACHE_CONTROL.as_str(), "no-store")],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = Settings::from_toml(&format!(
-                r#"{}
+    fn fingerprinted_asset_settings() -> Settings {
+        Settings::from_toml(&format!(
+            r#"{}
 
                 [[cache.asset_rules]]
                 id = "fingerprinted-assets"
@@ -5494,52 +5473,63 @@ mod tests {
                 edge_ttl_seconds = 31536000
                 immutable = true
             "#,
-                crate_test_settings_str()
-            ))
-            .expect("should parse settings with cache asset rule");
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/assets/app.0123abcd.js",
-            );
-            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache asset rule")
+    }
 
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request");
-            assert_eq!(
-                asset_response.cache_policy(),
-                AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
-                    Duration::from_secs(31_536_000)
-                )),
-                "should carry normalized cache policy metadata"
-            );
+    #[test]
+    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/assets/app.0123abcd.js",
+            ScriptedReply::status(StatusCode::OK)
+                .header(header::CACHE_CONTROL.as_str(), "no-store")
+                .body("asset"),
+        );
+        let settings = fingerprinted_asset_settings();
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/assets/app.0123abcd.js",
+        );
+        let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
 
-            let mut response = asset_response
-                .into_response()
-                .expect("should return buffered asset response");
-            assert_eq!(
-                response_header(&response, header::CACHE_CONTROL),
-                Some("public, max-age=31536000, immutable"),
-                "configured rehost policy should replace the third-party no-store directive"
-            );
-            assert!(
-                response.headers().get("surrogate-control").is_none(),
-                "runtime-specific edge header should wait for adapter finalization"
-            );
-
+        let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+            &settings, &services, req, &route,
+        ))
+        .expect("should proxy asset request");
+        assert_eq!(
+            asset_response.cache_policy(),
             AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
-                31_536_000,
-            )))
-            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
-            assert_eq!(
-                response
-                    .headers()
-                    .get("surrogate-control")
-                    .and_then(|value| value.to_str().ok()),
-                Some("max-age=31536000"),
-                "Fastly finalization should render Surrogate-Control"
-            );
-        });
+                31_536_000
+            ))),
+            "should carry normalized cache policy metadata"
+        );
+
+        let (mut response, _body) = streamed_asset(asset_response);
+        assert_eq!(
+            response_header(&response, header::CACHE_CONTROL),
+            Some("public, max-age=31536000, immutable"),
+            "configured rehost policy should replace the third-party no-store directive"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "runtime-specific edge header should wait for adapter finalization"
+        );
+
+        AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+            31_536_000,
+        )))
+        .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "Fastly finalization should render Surrogate-Control"
+        );
     }
 
     #[test]
@@ -5581,53 +5571,34 @@ mod tests {
 
     #[test]
     fn handle_asset_proxy_request_leaves_non_matching_assets_origin_controlled() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                200,
-                b"asset".to_vec(),
-                vec![(header::CACHE_CONTROL.as_str(), "public, max-age=60")],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let settings = Settings::from_toml(&format!(
-                r#"{}
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/assets/app.js",
+            ScriptedReply::status(StatusCode::OK)
+                .header(header::CACHE_CONTROL.as_str(), "public, max-age=60")
+                .body("asset"),
+        );
+        let settings = fingerprinted_asset_settings();
+        let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
+        let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
 
-                [[cache.asset_rules]]
-                id = "fingerprinted-assets"
-                enabled = true
-                path_globs = ["/assets/**/*.js"]
-                fingerprint_style = "hex"
-                visibility = "public"
-                browser_ttl_seconds = 31536000
-                edge_ttl_seconds = 31536000
-                immutable = true
-            "#,
-                crate_test_settings_str()
-            ))
-            .expect("should parse settings with cache asset rule");
-            let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
-            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+            &settings, &services, req, &route,
+        ))
+        .expect("should proxy asset request");
 
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request");
-
-            assert_eq!(
-                asset_response.cache_policy(),
-                AssetProxyCachePolicy::OriginControlled,
-                "non-fingerprinted file should not receive normalized immutable policy"
-            );
-            let response = asset_response
-                .into_response()
-                .expect("should return buffered asset response");
-            assert_eq!(
-                response_header(&response, header::CACHE_CONTROL),
-                Some("public, max-age=60"),
-                "origin-controlled response should preserve origin cache header"
-            );
-        });
+        assert_eq!(
+            asset_response.cache_policy(),
+            AssetProxyCachePolicy::OriginControlled,
+            "non-fingerprinted file should not receive normalized immutable policy"
+        );
+        let (response, _body) = streamed_asset(asset_response);
+        assert_eq!(
+            response_header(&response, header::CACHE_CONTROL),
+            Some("public, max-age=60"),
+            "origin-controlled response should preserve origin cache header"
+        );
     }
 
     fn test_profile_set() -> ImageOptimizerProfileSet {
@@ -5657,24 +5628,8 @@ mod tests {
         }
     }
 
-    fn test_s3_secrets() -> HashMap<String, Vec<u8>> {
-        HashMap::from([
-            (
-                "access_key_id".to_string(),
-                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-            ),
-            (
-                "secret_access_key".to_string(),
-                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-            ),
-        ])
-    }
-
     fn test_s3_image_optimizer_route() -> ProxyAssetRoute {
-        let mut route = ProxyAssetRoute::new(
-            "/.images/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
+        let mut route = ProxyAssetRoute::new("/.images/", "https://examplebucket.s3.example.com");
         route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
             region: "us-east-1".to_string(),
             secret_store: None,
@@ -5694,1113 +5649,848 @@ mod tests {
         route
     }
 
+    const S3_OBJECT: &str = "https://examplebucket.s3.example.com/.images/foo.jpg";
+
+    fn image_optimizer_settings(profile_set: ImageOptimizerProfileSet) -> Settings {
+        let mut settings = create_test_settings();
+        settings.image_optimizer = ImageOptimizerSettings {
+            profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
+        };
+        settings
+    }
+
+    fn image_optimizer_route() -> ProxyAssetRoute {
+        let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+        });
+        route
+    }
+
+    /// The options [`test_profile_set`]'s `medium` profile maps to.
+    fn medium_profile_options() -> OutboundImageOptimizerOptions {
+        OutboundImageOptimizerOptions::new()
+            .region(OutboundImageOptimizerRegion::UsEast)
+            .quality(70)
+            .expect("should accept quality 70")
+            .resize_filter(OutboundResizeFilter::Bicubic)
+            .format(OutboundImageFormat::Auto)
+            .width(828)
+            .expect("should accept width 828")
+    }
+
     #[test]
     fn handle_asset_proxy_request_signs_s3_and_strips_transform_query() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let mut secrets = HashMap::new();
-            secrets.insert(
-                "access_key_id".to_string(),
-                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-            );
-            secrets.insert(
-                "secret_access_key".to_string(),
-                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-            );
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(secrets),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1",
-            );
-            let mut route = ProxyAssetRoute::new(
-                "/.images/",
-                "https://examplebucket.s3.us-east-1.amazonaws.com",
-            );
-            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                secret_access_key: Redacted::new(
-                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                session_token: None,
-                origin_query: Some(OriginQueryPolicy::Strip),
-            }));
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            S3_OBJECT,
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1",
+        );
+        let mut route = ProxyAssetRoute::new("/.images/", "https://examplebucket.s3.example.com");
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            session_token: None,
+            origin_query: Some(OriginQueryPolicy::Strip),
+        }));
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy signed S3 asset request");
+        futures::executor::block_on(handle_asset_proxy_request(
+            &settings, &services, req, &route,
+        ))
+        .expect("should proxy signed S3 asset request");
 
-            let uris = stub.recorded_request_uris();
-            assert_eq!(
-                uris,
-                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg"],
-                "should strip transform query before signing and sending to S3"
-            );
-            let headers = stub.recorded_request_headers();
-            let sent = &headers[0];
-            let header_value = |name: &str| -> Option<String> {
-                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
-            };
-            assert_eq!(
-                header_value("host").as_deref(),
-                Some("examplebucket.s3.us-east-1.amazonaws.com"),
-                "should sign for the S3 origin host"
-            );
-            assert!(
-                header_value("authorization")
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 Credential=")),
-                "should add a SigV4 Authorization header"
-            );
-            assert_eq!(
-                header_value("x-amz-content-sha256").as_deref(),
-                Some("UNSIGNED-PAYLOAD"),
-                "should use unsigned payload for read-only asset requests"
-            );
-        });
+        assert_eq!(
+            sent_uris(&client),
+            vec![S3_OBJECT],
+            "should strip transform query before signing and sending to S3"
+        );
+        let requests = client.requests();
+        let sent = &requests[0];
+        assert_eq!(
+            sent.host_authority, "examplebucket.s3.example.com",
+            "should send the S3 origin authority it signed as Host"
+        );
+        assert!(
+            sent.headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value
+                    .starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/")
+                    && value.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date")),
+            "should add a SigV4 Authorization header that signs the host"
+        );
+        assert_eq!(
+            sent.headers
+                .get("x-amz-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some("UNSIGNED-PAYLOAD"),
+            "should use unsigned payload for read-only asset requests"
+        );
+        sent.assert_transport(asset_get_transport());
     }
 
     #[test]
     fn handle_asset_proxy_request_uses_resolved_s3_credentials_without_store_reads() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, Vec::new());
-            stub.push_response(200, b"optimized".to_vec());
-            let secret_store = CountingSecretStore::new(HashMap::new());
-            let observed_secret_store = secret_store.clone();
-            let services = build_services_with_secret_and_http_client(
-                secret_store,
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
+        let (_clock, client, outbound_services) = scripted_services();
+        client
+            .respond_to(
+                Method::HEAD,
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::OK),
+            )
+            .respond_to(
                 Method::GET,
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::OK).body("optimized"),
+            );
+        let secret_store = CountingSecretStore::new(HashMap::new());
+        let observed_secret_store = secret_store.clone();
+        let services = RuntimeServices {
+            secret_store: Arc::new(secret_store),
+            ..outbound_services
+        };
+        let settings = image_optimizer_settings(test_profile_set());
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?profile=medium",
+        );
+        let mut route = test_s3_image_optimizer_route();
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            session_token: Some(Redacted::new("session-token".to_string())),
+            origin_query: None,
+        }));
+
+        futures::executor::block_on(handle_asset_proxy_request(
+            &settings, &services, req, &route,
+        ))
+        .expect("should proxy optimized S3 asset request");
+
+        assert_eq!(
+            sent_methods(&client),
+            vec![Method::HEAD, Method::GET],
+            "should sign both the S3 preflight and final request"
+        );
+        assert_eq!(
+            observed_secret_store.read_count("AKIAIOSFODNN7EXAMPLE"),
+            0,
+            "should not read S3 credentials from the runtime secret store"
+        );
+        assert!(
+            client.requests().iter().all(|sent| sent
+                .headers
+                .get("x-amz-security-token")
+                .is_some_and(|value| value == "session-token")),
+            "should sign both requests with the cached session token"
+        );
+    }
+
+    #[test]
+    fn asset_proxy_image_optimizer_options_read_back_on_final_get() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/foo.jpg",
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let settings = image_optimizer_settings(test_profile_set());
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1&x=71&y=bad",
+        );
+
+        futures::executor::block_on(handle_asset_proxy_request(
+            &settings,
+            &services,
+            req,
+            &image_optimizer_route(),
+        ))
+        .expect("should proxy optimized asset request");
+
+        assert_eq!(
+            sent_uris(&client),
+            vec!["https://assets.example.com/.images/foo.jpg"],
+            "should strip profile-table query from the origin request by default"
+        );
+        let expected = medium_profile_options()
+            .crop(1, 1, OutboundCropFocus::Percent { x: 70, y: 50 })
+            .expect("should accept the bucketed crop");
+        client.requests()[0].assert_image_optimizer_transport(asset_get_transport(), &expected);
+    }
+
+    #[test]
+    fn asset_proxy_image_optimizer_options_read_back_on_final_head() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::HEAD,
+            "https://assets.example.com/.images/foo.jpg",
+            ScriptedReply::status(StatusCode::OK).header("content-type", "image/jpeg"),
+        );
+        let settings = image_optimizer_settings(test_profile_set());
+        let req = build_http_request(
+            Method::HEAD,
+            "https://www.example.com/.images/foo.jpg?profile=medium",
+        );
+
+        let response = futures::executor::block_on(handle_asset_proxy_request(
+            &settings,
+            &services,
+            req,
+            &image_optimizer_route(),
+        ))
+        .expect("should proxy optimized asset HEAD")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK, "should relay the HEAD");
+        assert!(
+            !response.body().is_stream(),
+            "should buffer the bodiless HEAD"
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one HEAD");
+        requests[0]
+            .assert_image_optimizer_transport(asset_head_transport(), &medium_profile_options());
+    }
+
+    #[test]
+    fn asset_proxy_s3_preflight_is_buffered_without_image_optimizer_options() {
+        for (method, transport) in [
+            (Method::GET, asset_get_transport()),
+            (Method::HEAD, asset_head_transport()),
+        ] {
+            let (_clock, client, services) = scripted_services();
+            client
+                .respond_to(
+                    Method::HEAD,
+                    S3_OBJECT,
+                    ScriptedReply::status(StatusCode::OK),
+                )
+                .respond_to(
+                    method.clone(),
+                    S3_OBJECT,
+                    ScriptedReply::status(StatusCode::OK).body("optimized"),
+                );
+            let settings = image_optimizer_settings(test_profile_set());
+            let req = build_http_request(
+                method.clone(),
                 "https://www.example.com/.images/foo.jpg?profile=medium",
             );
-            let mut route = test_s3_image_optimizer_route();
-            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                secret_access_key: Redacted::new(
-                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                session_token: Some(Redacted::new("session-token".to_string())),
-                origin_query: None,
-            }));
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized S3 asset request");
+            futures::executor::block_on(handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &test_s3_image_optimizer_route(),
+            ))
+            .expect("should proxy optimized S3 asset request");
 
+            let requests = client.requests();
             assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD", "GET"],
-                "should sign both the S3 preflight and final request"
+                (requests.len(), &requests[0].method, &requests[1].method),
+                (2, &Method::HEAD, &method),
+                "should preflight S3 with HEAD before the optimized {method}"
             );
             assert_eq!(
-                observed_secret_store.read_count("AKIAIOSFODNN7EXAMPLE"),
-                0,
-                "should not read S3 credentials from the runtime secret store"
+                sent_uris(&client),
+                vec![S3_OBJECT, S3_OBJECT],
+                "should strip transform query from both S3 requests"
             );
-            let headers = stub.recorded_request_headers();
-            assert!(
-                headers
-                    .iter()
-                    .all(|sent| sent
-                        .iter()
-                        .any(|(name, value)| name == "x-amz-security-token"
-                            && value == "session-token")),
-                "should sign both requests with the cached session token"
-            );
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_attaches_image_optimizer_metadata() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1&x=71&y=bad",
-            );
-            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            route.image_optimizer = Some(AssetImageOptimizerConfig {
-                enabled: true,
-                region: "us_east".to_string(),
-                profile_set: "default_images".to_string(),
-                origin_query: None,
-            });
-
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized asset request");
-
-            let uris = stub.recorded_request_uris();
-            assert_eq!(
-                uris,
-                vec!["https://assets.example.com/.images/foo.jpg"],
-                "should strip profile-table query from the origin request by default"
-            );
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![true],
-                "final asset responses should stay streaming"
-            );
-            let options = stub.recorded_image_optimizer_options();
-            let options = options[0]
-                .as_ref()
-                .expect("should attach image optimizer metadata");
-            assert_eq!(options.region, "us_east");
-            assert!(!options.preserve_query_string_on_origin_request);
-            assert_eq!(options.params.quality, Some(70));
-            assert_eq!(options.params.resize_filter.as_deref(), Some("bicubic"));
-            assert_eq!(options.params.format.as_deref(), Some("auto"));
-            assert_eq!(options.params.width, Some(828));
-            let crop = options.params.crop.as_ref().expect("should set crop");
-            assert_eq!((crop.width, crop.height), (1, 1));
-            assert_eq!((crop.offset_x, crop.offset_y), (Some(70), Some(50)));
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_skips_image_optimizer_for_svg_assets() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut settings = create_test_settings();
-            let mut profile_set = test_profile_set();
-            profile_set.unknown_profile = UnknownProfilePolicy::Reject;
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/logo.SVG?profile=unknown&ar=1-1",
-            );
-            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            route.image_optimizer = Some(AssetImageOptimizerConfig {
-                enabled: true,
-                region: "us_east".to_string(),
-                profile_set: "default_images".to_string(),
-                origin_query: None,
-            });
-
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy SVG asset without Image Optimizer profile parsing");
-
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://assets.example.com/.images/logo.SVG"],
-                "should still strip profile-table query from SVG origin requests"
-            );
-            assert_eq!(
-                stub.recorded_image_optimizer_options(),
-                vec![None],
-                "SVG assets should bypass Image Optimizer metadata"
-            );
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_skips_image_optimizer_for_incoming_svg() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut settings = create_test_settings();
-            let mut profile_set = test_profile_set();
-            profile_set.unknown_profile = UnknownProfilePolicy::Reject;
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.image/object-id/logo.svg?profile=unknown&ar=1-1",
-            );
-            let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
-            route.path_pattern = Some(r"^/\.image/([^/]+)/[^/]+\.([^/.]+)$".to_string());
-            route.target_path = Some("/image/upload/$1".to_string());
-            route.image_optimizer = Some(AssetImageOptimizerConfig {
-                enabled: true,
-                region: "us_east".to_string(),
-                profile_set: "default_images".to_string(),
-                origin_query: None,
-            });
-
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy incoming SVG asset without Image Optimizer profile parsing");
-
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://assets.example.com/image/upload/object-id"],
-                "should strip profile-table query even when SVG target path omits extension"
-            );
-            assert_eq!(
-                stub.recorded_image_optimizer_options(),
-                vec![None],
-                "incoming SVG assets should bypass Image Optimizer metadata"
-            );
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_skips_image_optimizer_for_rewritten_svg_assets() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.image/options/id/logo.svg?profile=medium",
-            );
-            let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
-            route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
-            route.target_path = Some("/image/upload/$1.$2".to_string());
-            route.image_optimizer = Some(AssetImageOptimizerConfig {
-                enabled: true,
-                region: "us_east".to_string(),
-                profile_set: "default_images".to_string(),
-                origin_query: None,
-            });
-
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy rewritten SVG asset without Image Optimizer metadata");
-
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://assets.example.com/image/upload/options/id.svg"],
-                "should detect SVG after route path rewriting"
-            );
-            assert_eq!(
-                stub.recorded_image_optimizer_options(),
-                vec![None],
-                "rewritten SVG assets should bypass Image Optimizer metadata"
-            );
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_skips_s3_preflight_for_svg_image_optimizer_routes() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"raw-svg".to_vec());
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/logo.svg?profile=medium",
-            );
-            let route = test_s3_image_optimizer_route();
-
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy raw SVG asset through S3 route")
-                .into_response()
-                .expect("should return buffered asset response");
-
-            assert_eq!(response_body_string(response), "raw-svg");
-            assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["GET"],
-                "SVG IO bypass should not add an S3 preflight"
-            );
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/logo.svg"],
-                "SVG IO bypass should still strip the transform query"
-            );
-            assert_eq!(
-                stub.recorded_image_optimizer_options(),
-                vec![None],
-                "SVG IO bypass should not attach Image Optimizer metadata"
-            );
-        });
+            requests[0].assert_transport(uncached(asset_head_transport()));
+            requests[1].assert_image_optimizer_transport(transport, &medium_profile_options());
+        }
     }
 
     #[test]
     fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(200, Vec::new());
-            stub.push_response(200, b"optimized".to_vec());
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?profile=medium",
-            );
-            let route = test_s3_image_optimizer_route();
-
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy optimized S3 asset request")
-                    .into_response_and_body();
-
-            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
-            let mut output = Vec::new();
-            stream_asset_body(
-                stream_body.expect("should preserve the asset body as a stream"),
-                &mut output,
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::HEAD,
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::OK),
             )
-            .await
-            .expect("should stream the asset body");
-            assert_eq!(
-                output, b"optimized",
-                "should forward the complete asset body"
+            .respond_to(
+                Method::GET,
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::OK).body("optimized"),
             );
-            assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD", "GET"],
-                "should preflight S3 with HEAD before the optimized GET"
-            );
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec![
-                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
-                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
-                ],
-                "should strip transform query from both S3 requests"
-            );
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![false, true],
-                "S3 HEAD preflight stays non-streaming, final asset GET stays streaming"
-            );
-            assert_eq!(
-                stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Default],
-                "signed HEAD preflight must bypass cache without disabling IO GET caching"
-            );
-            let options = stub.recorded_image_optimizer_options();
-            assert_eq!(options.len(), 2, "should send two origin requests");
-            assert!(
-                options[0].is_none(),
-                "preflight should not attach IO metadata"
-            );
-            assert!(
-                options[1].is_some(),
-                "final asset request should attach IO metadata"
-            );
-        });
+        let settings = image_optimizer_settings(test_profile_set());
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?profile=medium",
+        );
+
+        let (response, body) = streamed_asset(
+            futures::executor::block_on(handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &test_s3_image_optimizer_route(),
+            ))
+            .expect("should proxy optimized S3 asset request"),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+        assert_eq!(body, b"optimized", "should forward the complete asset body");
+        assert_eq!(
+            sent_methods(&client),
+            vec![Method::HEAD, Method::GET],
+            "should preflight S3 with HEAD before the optimized GET"
+        );
+        assert_eq!(
+            client
+                .requests()
+                .iter()
+                .map(|sent| sent.cache_policy)
+                .collect::<Vec<_>>(),
+            vec![
+                OutboundCachePolicy::Bypass,
+                OutboundCachePolicy::PlatformDefault
+            ],
+            "signed HEAD preflight must bypass the cache without disabling Image Optimizer GET caching"
+        );
     }
 
     #[test]
     fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(404, Vec::new());
-            stub.push_response_with_headers(
-                404,
-                br#"<Error><Code>NoSuchKey</Code><Key>image/upload/missing.jpg</Key></Error>"#
-                    .to_vec(),
-                vec![
-                    (header::CONTENT_TYPE.as_str(), "application/xml"),
-                    (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
-                    (header::SET_COOKIE.as_str(), "asset=1; Path=/"),
-                ],
-            );
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
+        let (_clock, client, services) = scripted_services();
+        client
+            .respond_to(
+                Method::HEAD,
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::NOT_FOUND),
+            )
+            .respond_to(
                 Method::GET,
-                "https://www.example.com/.images/missing.jpg?profile=medium",
-            );
-            let route = test_s3_image_optimizer_route();
-
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should return raw S3 error response");
-            assert_eq!(
-                asset_response.cache_policy(),
-                AssetProxyCachePolicy::NoStorePrivate,
-                "should carry a typed no-store policy for router finalization"
-            );
-            let (response, stream_body) = asset_response.into_response_and_body();
-
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            assert_eq!(
-                response_header(&response, header::CACHE_CONTROL),
-                Some("no-store, private"),
-                "S3 origin errors should not be cached"
-            );
-            assert!(
-                response.headers().get(header::SET_COOKIE).is_none(),
-                "raw S3 error should still strip unsafe response headers"
-            );
-            let mut output = Vec::new();
-            stream_asset_body(
-                stream_body.expect("should preserve the raw S3 error body as a stream"),
-                &mut output,
-            )
-            .await
-            .expect("should stream the raw S3 error body");
-            let body = String::from_utf8(output).expect("should decode the S3 error body");
-            assert!(body.contains("NoSuchKey"), "should return S3 error body");
-            assert!(
-                body.contains("image/upload/missing.jpg"),
-                "should expose the missing S3 key"
-            );
-            assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD", "GET"],
-                "should fetch S3 error body after failed HEAD preflight"
-            );
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![false, true],
-                "S3 HEAD preflight stays non-streaming, error-body GET stays streaming"
-            );
-            assert_eq!(
-                stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Bypass],
-                "preflight and raw error-body fetch must both reach the S3 origin"
-            );
-            let options = stub.recorded_image_optimizer_options();
-            assert_eq!(
-                options,
-                vec![None, None],
-                "should not invoke IO for S3 errors"
-            );
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_bypasses_cache_for_signed_raw_head() {
-        futures::executor::block_on(async {
-            for (case, uri) in [
-                (
-                    "svg",
-                    "https://www.example.com/.images/logo.svg?profile=medium",
-                ),
-                (
-                    "svgz",
-                    "https://www.example.com/.images/logo.svgz?profile=medium",
-                ),
-                (
-                    "rewritten_svg",
-                    "https://www.example.com/.images/logo.png?profile=medium",
-                ),
-                (
-                    "debug",
-                    "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
-                ),
-                (
-                    "disabled_io",
-                    "https://www.example.com/.images/foo.jpg?profile=medium",
-                ),
-                ("absent_io", "https://www.example.com/.images/foo.jpg"),
-            ] {
-                for streaming in [false, true] {
-                    let stub = Arc::new(StubHttpClient::new());
-                    stub.set_streaming_responses_supported(streaming);
-                    stub.push_response_with_headers(
-                        200,
-                        Vec::new(),
-                        vec![
-                            (header::CONTENT_LENGTH.as_str(), "42"),
-                            (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
-                        ],
-                    );
-                    let services = build_services_with_secret_and_http_client(
-                        HashMapSecretStore::new(test_s3_secrets()),
-                        Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-                    );
-                    let mut settings = create_test_settings();
-                    settings.image_optimizer = ImageOptimizerSettings {
-                        profile_sets: HashMap::from([(
-                            "default_images".to_string(),
-                            test_profile_set(),
-                        )]),
-                    };
-                    let mut route = test_s3_image_optimizer_route();
-                    match case {
-                        "rewritten_svg" => {
-                            route.path_pattern = Some("^/\\.images/(.*)\\.png$".to_string());
-                            route.target_path = Some("/.images/$1.svg".to_string());
-                        }
-                        "disabled_io" => {
-                            route
-                                .image_optimizer
-                                .as_mut()
-                                .expect("should configure IO")
-                                .enabled = false;
-                        }
-                        "absent_io" => route.image_optimizer = None,
-                        _ => {}
-                    }
-                    let response = handle_asset_proxy_request(
-                        &settings,
-                        &services,
-                        build_http_request(Method::HEAD, uri),
-                        &route,
-                    )
-                    .await
-                    .expect("should proxy the signed raw HEAD");
-                    assert_eq!(
-                        stub.recorded_request_methods(),
-                        vec!["HEAD"],
-                        "{case} should send one HEAD with streaming={streaming}"
-                    );
-                    assert_eq!(
-                        stub.recorded_image_optimizer_options(),
-                        vec![None],
-                        "{case} HEAD should not attach IO with streaming={streaming}"
-                    );
-                    assert_eq!(
-                        stub.recorded_cache_intents(),
-                        vec![PlatformCacheIntent::Bypass],
-                        "{case} signed raw HEAD must bypass readthrough with streaming={streaming}"
-                    );
-                    assert_eq!(
-                        stub.recorded_stream_response_flags(),
-                        vec![streaming],
-                        "{case} HEAD should preserve streaming selection"
-                    );
-                    assert_eq!(
-                        response.cache_policy(),
-                        AssetProxyCachePolicy::OriginControlled,
-                        "{case} HEAD should preserve the origin cache policy"
-                    );
-                    let (response, stream_body) = response.into_response_and_body();
-                    assert_eq!(
-                        response.status(),
-                        StatusCode::OK,
-                        "{case} HEAD should retain the origin status"
-                    );
-                    assert_eq!(
-                        response_header(&response, header::CONTENT_LENGTH),
-                        Some("42"),
-                        "{case} HEAD should retain the origin content length"
-                    );
-                    assert_eq!(
-                        response_header(&response, header::CACHE_CONTROL),
-                        Some("public, max-age=60"),
-                        "{case} HEAD should retain origin cache headers"
-                    );
-                    let body = if let Some(stream_body) = stream_body {
-                        let mut body = Vec::new();
-                        stream_asset_body(stream_body, &mut body)
-                            .await
-                            .expect("should consume the HEAD stream");
-                        body
-                    } else {
-                        response
-                            .into_body()
-                            .into_bytes()
-                            .expect("should buffer the HEAD response")
-                            .to_vec()
-                    };
-                    assert!(
-                        body.is_empty(),
-                        "{case} HEAD should remain bodyless with streaming={streaming}"
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn handle_asset_proxy_request_keeps_cache_for_raw_get_and_unsigned_head() {
-        futures::executor::block_on(async {
-            for (method, signed) in [
-                (Method::GET, true),
-                (Method::GET, false),
-                (Method::HEAD, false),
-            ] {
-                let stub = Arc::new(StubHttpClient::new());
-                stub.push_response(200, Vec::new());
-                let services = build_services_with_secret_and_http_client(
-                    HashMapSecretStore::new(test_s3_secrets()),
-                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-                );
-                let mut route = test_s3_image_optimizer_route();
-                if !signed {
-                    route.auth = None;
-                }
-                handle_asset_proxy_request(
-                    &create_test_settings(),
-                    &services,
-                    build_http_request(
-                        method.clone(),
-                        "https://www.example.com/.images/logo.svg?profile=medium",
+                S3_OBJECT,
+                ScriptedReply::status(StatusCode::NOT_FOUND)
+                    .header(header::CONTENT_TYPE.as_str(), "application/xml")
+                    .header(header::CACHE_CONTROL.as_str(), "public, max-age=3600")
+                    .header(header::SET_COOKIE.as_str(), "asset=1; Path=/")
+                    .body(
+                        r#"<Error><Code>NoSuchKey</Code><Key>image/upload/missing.jpg</Key></Error>"#,
                     ),
-                    &route,
-                )
-                .await
-                .expect("should proxy the raw asset");
-                assert_eq!(
-                    stub.recorded_request_methods(),
-                    vec![method.as_str()],
-                    "{method} with signed={signed} should not add a preflight"
-                );
-                assert_eq!(
-                    stub.recorded_image_optimizer_options(),
-                    vec![None],
-                    "{method} with signed={signed} should not attach IO to SVG"
-                );
-                assert_eq!(
-                    stub.recorded_cache_intents(),
-                    vec![PlatformCacheIntent::Default],
-                    "{method} with signed={signed} should keep readthrough caching"
-                );
-            }
-        });
-    }
+            );
+        let settings = image_optimizer_settings(test_profile_set());
+        let req = build_http_request(
+            Method::GET,
+            "https://www.example.com/.images/foo.jpg?profile=medium",
+        );
 
-    #[test]
-    fn handle_asset_proxy_request_keeps_io_for_signed_optimized_head() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, Vec::new());
-            stub.push_response(200, Vec::new());
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
+        let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+            &settings,
+            &services,
+            req,
+            &test_s3_image_optimizer_route(),
+        ))
+        .expect("should return raw S3 error response");
+        assert_eq!(
+            asset_response.cache_policy(),
+            AssetProxyCachePolicy::NoStorePrivate,
+            "should carry a typed no-store policy for router finalization"
+        );
+        let (response, body) = streamed_asset(asset_response);
 
-            handle_asset_proxy_request(
-                &settings,
-                &services,
-                build_http_request(
-                    Method::HEAD,
-                    "https://www.example.com/.images/foo.jpg?profile=medium",
-                ),
-                &test_s3_image_optimizer_route(),
-            )
-            .await
-            .expect("should proxy the optimized HEAD");
-
-            assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["HEAD", "HEAD"],
-                "optimized HEAD should preflight before the IO request"
-            );
-            assert_eq!(
-                stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Default],
-                "optimized HEAD must not use pass, which disables IO on Fastly"
-            );
-            let options = stub.recorded_image_optimizer_options();
-            assert_eq!(
-                options.len(),
-                2,
-                "optimized HEAD should send the preflight and final IO request"
-            );
-            assert!(
-                options[0].is_none(),
-                "preflight should not attach IO metadata"
-            );
-            assert!(
-                options[1].is_some(),
-                "final optimized HEAD should attach IO metadata"
-            );
-        });
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_header(&response, header::CACHE_CONTROL),
+            Some("no-store, private"),
+            "S3 origin errors should not be cached"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "raw S3 error should still strip unsafe response headers"
+        );
+        let body = String::from_utf8(body).expect("should decode the S3 error body");
+        assert!(body.contains("NoSuchKey"), "should return S3 error body");
+        assert!(
+            body.contains("image/upload/missing.jpg"),
+            "should expose the missing S3 key"
+        );
+        let requests = client.requests();
+        assert_eq!(
+            sent_methods(&client),
+            vec![Method::HEAD, Method::GET],
+            "should fetch S3 error body after failed HEAD preflight"
+        );
+        requests[0].assert_transport(uncached(asset_head_transport()));
+        requests[1].assert_transport(uncached(asset_get_transport()));
     }
 
     #[test]
     fn handle_asset_proxy_request_returns_s3_head_errors_without_cache_or_io() {
-        futures::executor::block_on(async {
-            for status in [403, 404] {
-                let stub = Arc::new(StubHttpClient::new());
-                stub.set_streaming_responses_supported(true);
-                stub.push_response_with_headers(
-                    status,
-                    Vec::new(),
-                    vec![
-                        (header::CONTENT_TYPE.as_str(), "application/xml"),
-                        (header::CONTENT_LENGTH.as_str(), "42"),
-                        (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
-                        (header::SET_COOKIE.as_str(), "asset=1; Path=/"),
-                    ],
-                );
-                let services = build_services_with_secret_and_http_client(
-                    HashMapSecretStore::new(test_s3_secrets()),
-                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-                );
-                let mut settings = create_test_settings();
-                settings.image_optimizer = ImageOptimizerSettings {
-                    profile_sets: HashMap::from([(
-                        "default_images".to_string(),
-                        test_profile_set(),
-                    )]),
-                };
-                let req = build_http_request(
-                    Method::HEAD,
-                    "https://www.example.com/.images/missing.jpg?profile=medium",
-                );
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+            let (_clock, client, services) = scripted_services();
+            client.respond_to(
+                Method::HEAD,
+                S3_OBJECT,
+                ScriptedReply::status(status)
+                    .header(header::CONTENT_TYPE.as_str(), "application/xml")
+                    .header(header::CONTENT_LENGTH.as_str(), "42")
+                    .header(header::CACHE_CONTROL.as_str(), "public, max-age=3600")
+                    .header(header::SET_COOKIE.as_str(), "asset=1; Path=/"),
+            );
+            let settings = image_optimizer_settings(test_profile_set());
+            let req = build_http_request(
+                Method::HEAD,
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+            );
 
-                let response = handle_asset_proxy_request(
-                    &settings,
+            let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &test_s3_image_optimizer_route(),
+            ))
+            .expect("should return the raw S3 preflight error");
+
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::NoStorePrivate,
+                "S3 HEAD {status} should carry a typed no-store policy"
+            );
+            let response = asset_response.into_response();
+            assert_eq!(
+                response.status(),
+                status,
+                "S3 HEAD {status} should keep the origin status"
+            );
+            assert!(
+                !response.body().is_stream(),
+                "S3 HEAD {status} should be answered without a body stream"
+            );
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("no-store, private"),
+                "S3 HEAD {status} should not be cached"
+            );
+            assert_eq!(
+                response_header(&response, header::CONTENT_LENGTH),
+                Some("42"),
+                "S3 HEAD {status} should keep the origin Content-Length"
+            );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "S3 HEAD {status} should strip Set-Cookie"
+            );
+            assert!(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should buffer the HEAD answer")
+                    .is_empty(),
+                "S3 HEAD {status} error response must not contain a body"
+            );
+            assert_eq!(
+                sent_methods(&client),
+                vec![Method::HEAD],
+                "S3 HEAD {status} should be answered from its failed preflight alone"
+            );
+            client.requests()[0].assert_transport(uncached(asset_head_transport()));
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_bypasses_cache_for_signed_raw_head() {
+        let s3_logo = "https://examplebucket.s3.example.com/.images/logo.svg";
+        for (case, uri, origin) in [
+            (
+                "svg",
+                "https://www.example.com/.images/logo.svg?profile=medium",
+                s3_logo,
+            ),
+            (
+                "svgz",
+                "https://www.example.com/.images/logo.svgz?profile=medium",
+                "https://examplebucket.s3.example.com/.images/logo.svgz",
+            ),
+            (
+                "rewritten_svg",
+                "https://www.example.com/.images/logo.png?profile=medium",
+                s3_logo,
+            ),
+            (
+                "debug",
+                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+                S3_OBJECT,
+            ),
+            (
+                "disabled_io",
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+                "https://examplebucket.s3.example.com/.images/foo.jpg?profile=medium",
+            ),
+            (
+                "absent_io",
+                "https://www.example.com/.images/foo.jpg",
+                S3_OBJECT,
+            ),
+        ] {
+            // An asset HEAD is always buffered, so the request must carry the same
+            // settings whether the origin delivers its empty body as one chunk or
+            // as a stream of chunks.
+            for (delivery, body) in [
+                ("buffered", vec![Bytes::new()]),
+                ("streamed", vec![Bytes::new(), Bytes::new()]),
+            ] {
+                let (_clock, client, services) = scripted_services();
+                client.respond_to(
+                    Method::HEAD,
+                    origin,
+                    ScriptedReply::status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH.as_str(), "42")
+                        .header(header::CACHE_CONTROL.as_str(), "public, max-age=60")
+                        .chunks(body),
+                );
+                let mut route = test_s3_image_optimizer_route();
+                match case {
+                    "rewritten_svg" => {
+                        route.path_pattern = Some(r"^/\.images/(.*)\.png$".to_string());
+                        route.target_path = Some("/.images/$1.svg".to_string());
+                    }
+                    "disabled_io" => {
+                        route
+                            .image_optimizer
+                            .as_mut()
+                            .expect("should configure Image Optimizer")
+                            .enabled = false;
+                    }
+                    "absent_io" => route.image_optimizer = None,
+                    _ => {}
+                }
+
+                let asset_response = futures::executor::block_on(handle_asset_proxy_request(
+                    &image_optimizer_settings(test_profile_set()),
                     &services,
-                    req,
-                    &test_s3_image_optimizer_route(),
-                )
-                .await
-                .expect("should return the S3 HEAD error");
+                    build_http_request(Method::HEAD, uri),
+                    &route,
+                ))
+                .expect("should proxy the signed raw HEAD");
+
                 assert_eq!(
-                    response.cache_policy(),
-                    AssetProxyCachePolicy::NoStorePrivate,
-                    "S3 HEAD {status} should carry a typed no-store policy"
+                    sent_methods(&client),
+                    vec![Method::HEAD],
+                    "{case} should send one HEAD for a {delivery} origin reply"
                 );
-                let response = response
-                    .into_response()
-                    .expect("should buffer HEAD headers");
+                let requests = client.requests();
                 assert_eq!(
-                    response.status().as_u16(),
-                    status,
-                    "S3 HEAD {status} should keep the origin status"
+                    requests[0].cache_policy,
+                    OutboundCachePolicy::Bypass,
+                    "{case} signed raw HEAD must bypass the readthrough cache for a {delivery} origin reply"
+                );
+                requests[0].assert_transport(uncached(asset_head_transport()));
+                assert_eq!(
+                    asset_response.cache_policy(),
+                    AssetProxyCachePolicy::OriginControlled,
+                    "{case} HEAD should keep the origin cache policy for a {delivery} origin reply"
+                );
+                let response = asset_response.into_response();
+                assert!(
+                    !response.body().is_stream(),
+                    "{case} HEAD should be answered without a body stream for a {delivery} origin reply"
                 );
                 assert_eq!(
-                    response_header(&response, header::CACHE_CONTROL),
-                    Some("no-store, private"),
-                    "S3 HEAD {status} should not be cached"
+                    response.status(),
+                    StatusCode::OK,
+                    "{case} HEAD should keep the origin status"
                 );
                 assert_eq!(
                     response_header(&response, header::CONTENT_LENGTH),
                     Some("42"),
-                    "S3 HEAD {status} should keep the origin Content-Length"
+                    "{case} HEAD should keep the origin Content-Length"
                 );
-                assert!(
-                    response.headers().get(header::SET_COOKIE).is_none(),
-                    "S3 HEAD {status} should strip Set-Cookie"
+                assert_eq!(
+                    response_header(&response, header::CACHE_CONTROL),
+                    Some("public, max-age=60"),
+                    "{case} HEAD should keep the origin cache headers"
                 );
                 assert!(
                     response
                         .into_body()
                         .into_bytes()
-                        .expect("should buffer HEAD body")
+                        .expect("should buffer the HEAD answer")
                         .is_empty(),
-                    "S3 HEAD {status} error response must not contain a body"
-                );
-                assert_eq!(
-                    stub.recorded_request_methods(),
-                    vec!["HEAD"],
-                    "S3 HEAD {status} should not fetch an error body"
-                );
-                assert_eq!(
-                    stub.recorded_cache_intents(),
-                    vec![PlatformCacheIntent::Bypass],
-                    "S3 HEAD {status} preflight must bypass the readthrough cache"
-                );
-                assert_eq!(
-                    stub.recorded_image_optimizer_options(),
-                    vec![None],
-                    "S3 HEAD {status} should not invoke IO"
-                );
-                assert_eq!(
-                    stub.recorded_stream_response_flags(),
-                    vec![false],
-                    "S3 HEAD {status} preflight should stay non-streaming"
+                    "{case} HEAD should stay bodiless for a {delivery} origin reply"
                 );
             }
-        });
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_keeps_cache_for_raw_get_and_unsigned_head() {
+        let origin = "https://examplebucket.s3.example.com/.images/logo.svg";
+        for (method, signed, transport) in [
+            (Method::GET, true, asset_get_transport()),
+            (Method::GET, false, asset_get_transport()),
+            (Method::HEAD, false, asset_head_transport()),
+        ] {
+            let (_clock, client, services) = scripted_services();
+            client.respond_to(
+                method.clone(),
+                origin,
+                ScriptedReply::status(StatusCode::OK),
+            );
+            let mut route = test_s3_image_optimizer_route();
+            if !signed {
+                route.auth = None;
+            }
+
+            futures::executor::block_on(handle_asset_proxy_request(
+                &create_test_settings(),
+                &services,
+                build_http_request(
+                    method.clone(),
+                    "https://www.example.com/.images/logo.svg?profile=medium",
+                ),
+                &route,
+            ))
+            .expect("should proxy the raw asset");
+
+            assert_eq!(
+                sent_methods(&client),
+                vec![method.clone()],
+                "{method} with signed={signed} should not add a preflight"
+            );
+            let requests = client.requests();
+            assert_eq!(
+                requests[0].cache_policy,
+                OutboundCachePolicy::PlatformDefault,
+                "{method} with signed={signed} should keep readthrough caching"
+            );
+            requests[0].assert_transport(transport);
+        }
+    }
+
+    /// Proxies `uri` through `route` and returns the one origin request it sent.
+    fn single_asset_request(
+        settings: &Settings,
+        route: &ProxyAssetRoute,
+        uri: &str,
+        origin: &str,
+    ) -> RecordedRequest {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            origin,
+            ScriptedReply::status(StatusCode::OK).body("raw"),
+        );
+        let req = build_http_request(Method::GET, uri);
+
+        let (response, body) = streamed_asset(
+            futures::executor::block_on(handle_asset_proxy_request(
+                settings, &services, req, route,
+            ))
+            .expect("should proxy the asset"),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
+        assert_eq!(body, b"raw", "should forward the complete asset body");
+        let requests = client.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "should send one origin request for {uri}"
+        );
+        requests[0].clone()
+    }
+
+    fn rejecting_profile_set() -> ImageOptimizerProfileSet {
+        let mut profile_set = test_profile_set();
+        profile_set.unknown_profile = UnknownProfilePolicy::Reject;
+        profile_set
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_svg_assets() {
+        let sent = single_asset_request(
+            &image_optimizer_settings(rejecting_profile_set()),
+            &image_optimizer_route(),
+            "https://www.example.com/.images/logo.SVG?profile=unknown&ar=1-1",
+            "https://assets.example.com/.images/logo.SVG",
+        );
+
+        assert_eq!(
+            sent.uri.to_string(),
+            "https://assets.example.com/.images/logo.SVG",
+            "should still strip profile-table query from SVG origin requests"
+        );
+        sent.assert_transport(asset_get_transport());
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_incoming_svg() {
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/\.image/([^/]+)/[^/]+\.([^/.]+)$".to_string());
+        route.target_path = Some("/image/upload/$1".to_string());
+        route.image_optimizer = image_optimizer_route().image_optimizer;
+
+        let sent = single_asset_request(
+            &image_optimizer_settings(rejecting_profile_set()),
+            &route,
+            "https://www.example.com/.image/object-id/logo.svg?profile=unknown&ar=1-1",
+            "https://assets.example.com/image/upload/object-id",
+        );
+
+        assert_eq!(
+            sent.uri.to_string(),
+            "https://assets.example.com/image/upload/object-id",
+            "should strip profile-table query even when SVG target path omits extension"
+        );
+        sent.assert_transport(asset_get_transport());
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_rewritten_svg_assets() {
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
+        route.target_path = Some("/image/upload/$1.$2".to_string());
+        route.image_optimizer = image_optimizer_route().image_optimizer;
+
+        let sent = single_asset_request(
+            &image_optimizer_settings(test_profile_set()),
+            &route,
+            "https://www.example.com/.image/options/id/logo.svg?profile=medium",
+            "https://assets.example.com/image/upload/options/id.svg",
+        );
+
+        assert_eq!(
+            sent.uri.to_string(),
+            "https://assets.example.com/image/upload/options/id.svg",
+            "should detect SVG after route path rewriting"
+        );
+        sent.assert_transport(asset_get_transport());
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_s3_preflight_for_svg_image_optimizer_routes() {
+        let sent = single_asset_request(
+            &create_test_settings(),
+            &test_s3_image_optimizer_route(),
+            "https://www.example.com/.images/logo.svg?profile=medium",
+            "https://examplebucket.s3.example.com/.images/logo.svg",
+        );
+
+        assert_eq!(
+            (sent.method.clone(), sent.uri.to_string()),
+            (
+                Method::GET,
+                "https://examplebucket.s3.example.com/.images/logo.svg".to_owned()
+            ),
+            "SVG IO bypass should send one GET without an S3 preflight or the transform query"
+        );
+        sent.assert_transport(asset_get_transport());
     }
 
     #[test]
     fn handle_asset_proxy_request_does_not_preflight_when_io_disabled() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.set_streaming_responses_supported(true);
-            stub.push_response(200, b"raw".to_vec());
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
-            );
-            let route = test_s3_image_optimizer_route();
+        let sent = single_asset_request(
+            &image_optimizer_settings(test_profile_set()),
+            &test_s3_image_optimizer_route(),
+            "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+            S3_OBJECT,
+        );
 
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy debug S3 asset request")
-                    .into_response_and_body();
-
-            assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
-            let mut output = Vec::new();
-            stream_asset_body(
-                stream_body.expect("should preserve the asset body as a stream"),
-                &mut output,
-            )
-            .await
-            .expect("should stream the asset body");
-            assert_eq!(output, b"raw", "should forward the complete asset body");
-            assert_eq!(
-                stub.recorded_request_methods(),
-                vec!["GET"],
-                "disabled IO should not add S3 preflight"
-            );
-            assert_eq!(
-                stub.recorded_image_optimizer_options(),
-                vec![None],
-                "debug query param should disable image optimizer metadata"
-            );
-            assert_eq!(
-                stub.recorded_stream_response_flags(),
-                vec![true],
-                "debug asset responses should still stay streaming"
-            );
-            assert_eq!(
-                stub.recorded_cache_intents(),
-                vec![PlatformCacheIntent::Default],
-                "debug S3 GET should keep readthrough caching"
-            );
-        });
+        assert_eq!(
+            sent.method,
+            Method::GET,
+            "disabled IO should not add S3 preflight"
+        );
+        sent.assert_transport(asset_get_transport());
     }
 
     #[test]
     fn handle_asset_proxy_request_debug_param_disables_image_optimizer() {
-        futures::executor::block_on(async {
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"ok".to_vec());
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut settings = create_test_settings();
-            settings.image_optimizer = ImageOptimizerSettings {
-                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
-            };
-            let req = build_http_request(
-                Method::GET,
-                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
-            );
-            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            route.image_optimizer = Some(AssetImageOptimizerConfig {
-                enabled: true,
-                region: "us_east".to_string(),
-                profile_set: "default_images".to_string(),
-                origin_query: None,
-            });
+        let sent = single_asset_request(
+            &image_optimizer_settings(test_profile_set()),
+            &image_optimizer_route(),
+            "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+            "https://assets.example.com/.images/foo.jpg",
+        );
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy debug asset request");
-
-            let options = stub.recorded_image_optimizer_options();
-            assert!(
-                options[0].is_none(),
-                "debug query param should disable image optimizer metadata"
-            );
-        });
+        sent.assert_transport(asset_get_transport());
     }
 
     #[test]
-    fn handle_asset_proxy_request_accepts_streaming_platform_response_body() {
-        futures::executor::block_on(async {
-            let services = build_services_with_http_client(
-                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
-            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy a streaming asset response")
-                    .into_response_and_body();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert!(
-                response.headers().get(header::SET_COOKIE).is_none(),
-                "should strip upstream Set-Cookie headers from streaming asset responses"
-            );
-            assert!(
-                response
-                    .headers()
-                    .get(header::STRICT_TRANSPORT_SECURITY)
-                    .is_none(),
-                "should strip upstream HSTS headers from streaming asset responses"
-            );
-            assert!(
-                response.headers().get("clear-site-data").is_none(),
-                "should strip upstream Clear-Site-Data headers from streaming asset responses"
-            );
-            assert_eq!(
-                response_header(&response, header::ETAG),
-                Some("\"stream-etag\""),
-                "should preserve safe cache validator headers on streaming asset responses"
-            );
-
-            let mut output = Vec::new();
-            stream_asset_body(
-                stream_body.expect("should preserve asset body as a stream"),
-                &mut output,
-            )
-            .await
-            .expect("should stream asset body");
-
-            assert_eq!(output, b"chunk");
+    fn image_optimizer_builder_error_serves_unoptimized_with_warning() {
+        // Settings validation keeps crop offsets within 0 to 100, so only a
+        // profile set built past validation can make the options builder fail.
+        let mut profile_set = test_profile_set();
+        profile_set.crop_offsets = Some(ImageOptimizerCropOffsetsConfig {
+            enabled: true,
+            x_param: "x".to_string(),
+            y_param: "y".to_string(),
+            buckets: vec![150],
+            default: 150,
+            when_missing: Default::default(),
         });
-    }
+        let capture = LogCapture::start();
 
-    #[test]
-    fn stream_asset_body_reports_mid_stream_origin_errors() {
-        futures::executor::block_on(async {
-            let body = EdgeBody::from_stream(futures::stream::iter(vec![
-                Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
-                Err(io::Error::other("origin stream failed")),
-            ]));
-            let mut output = Vec::new();
+        let sent = single_asset_request(
+            &image_optimizer_settings(profile_set),
+            &image_optimizer_route(),
+            "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1&x=10&y=10",
+            "https://assets.example.com/.images/foo.jpg",
+        );
 
-            let err = stream_asset_body(body, &mut output)
-                .await
-                .expect_err("should report mid-stream origin errors");
-
-            assert_eq!(
-                output, b"partial",
-                "should only write chunks received before the stream error"
-            );
-            assert!(
-                format!("{err:?}").contains("streaming platform response body failed"),
-                "should describe the streaming failure: {err:?}"
-            );
-        });
-    }
-
-    /// One observable step of [`stream_asset_body`] driving a buffered sink.
-    #[derive(Debug, PartialEq, Eq)]
-    enum StreamSinkEvent {
-        SourcePolled(usize),
-        Wrote(usize),
-        Flushed,
-    }
-
-    /// Sink that records its calls so a test can assert how they interleave
-    /// with the source stream's polls.
-    struct RecordingSink(Rc<RefCell<Vec<StreamSinkEvent>>>);
-
-    impl io::Write for RecordingSink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.borrow_mut().push(StreamSinkEvent::Wrote(buf.len()));
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.borrow_mut().push(StreamSinkEvent::Flushed);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn stream_asset_body_flushes_each_chunk_before_polling_the_source_again() {
-        // Fastly's `StreamingBody` is a `BufWriter`, so a yielded segment only
-        // reaches the client once the sink is flushed. The publisher stream
-        // awaits the origin (and the auction) between segments, so a segment
-        // smaller than the write buffer must be flushed before the next poll or
-        // the client renders nothing behind committed headers.
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let source_events = Rc::clone(&events);
-        let body = EdgeBody::from_stream(async_stream::stream! {
-            for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
-                source_events
-                    .borrow_mut()
-                    .push(StreamSinkEvent::SourcePolled(index));
-                yield Ok::<Bytes, io::Error>(Bytes::from_static(segment.as_bytes()));
-            }
-        });
-
-        futures::executor::block_on(stream_asset_body(
-            body,
-            &mut RecordingSink(Rc::clone(&events)),
-        ))
-        .expect("should stream asset body");
-
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                StreamSinkEvent::SourcePolled(0),
-                StreamSinkEvent::Wrote(12),
-                StreamSinkEvent::Flushed,
-                StreamSinkEvent::SourcePolled(1),
-                StreamSinkEvent::Wrote(13),
-                StreamSinkEvent::Flushed,
-            ],
-            "each segment must be flushed to the client before the source is polled again"
+        sent.assert_transport(asset_get_transport());
+        let warnings = capture.take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("unoptimized")),
+            "should warn that the asset is served unoptimized, got {:?}",
+            warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn asset_proxy_response_into_response_rejects_stream_body() {
-        futures::executor::block_on(async {
-            let services = build_services_with_http_client(
-                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-            );
-            let settings = create_test_settings();
-            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
-            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy a streaming asset response");
+    fn handle_asset_proxy_request_streams_a_chunked_origin_body() {
+        let (_clock, client, services) = scripted_services();
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/foo.jpg",
+            ScriptedReply::status(StatusCode::OK)
+                .header(header::ETAG.as_str(), "\"stream-etag\"")
+                .chunks(vec![Bytes::from_static(b"ch"), Bytes::from_static(b"unk")]),
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
-            let err = asset_response
-                .into_response()
-                .expect_err("streaming asset responses should require explicit stream handling");
-            assert!(
-                format!("{err:?}").contains("streaming asset response cannot be converted"),
-                "should describe the buffered conversion failure: {err:?}"
-            );
-        });
+        let (response, body) = streamed_asset(
+            futures::executor::block_on(handle_asset_proxy_request(
+                &settings, &services, req, &route,
+            ))
+            .expect("should proxy a streaming asset response"),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_header(&response, header::ETAG),
+            Some("\"stream-etag\""),
+            "should keep the origin validators"
+        );
+        assert_eq!(body, b"chunk", "should stream every origin chunk");
     }
 
     // --- is_host_allowed ---
@@ -7019,35 +6709,32 @@ mod tests {
 
     #[test]
     fn proxy_request_blocks_non_https_target_when_https_only() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let services = crate::platform::test_support::build_services_with_http_client(
-                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>,
-            );
-            let req = build_http_request(
-                Method::GET,
-                "https://edge.example/integrations/prebid/bundle.js",
-            );
-            let config = ProxyRequestConfig::new("http://assets.example/prebid/trusted-prebid.js")
-                .without_ec_id()
-                .without_forward_headers()
-                .with_streaming()
-                .with_https_only();
+        let upstream = ScriptedHttpClient::forbidding();
+        let services = build_services_with_outbound_client(&upstream, &TestClock::new());
+        let settings = create_test_settings();
+        let req = build_http_request(
+            Method::GET,
+            "https://edge.example.com/integrations/prebid/bundle.js",
+        );
+        let config = ProxyRequestConfig::new("http://assets.example.com/prebid/trusted-prebid.js")
+            .without_ec_id()
+            .without_forward_headers()
+            .with_streaming()
+            .with_https_only();
 
-            let err = proxy_request(&settings, req, config, &services)
-                .await
-                .expect_err("should block non-HTTPS target before proxying");
+        let err = futures::executor::block_on(proxy_request(&settings, req, config, &services))
+            .expect_err("should block non-HTTPS target before proxying");
 
-            assert_eq!(
-                err.current_context().status_code(),
-                StatusCode::FORBIDDEN,
-                "HTTPS-only proxy requests should reject http targets"
-            );
-            assert!(
-                matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
-                "should return a forbidden error"
-            );
-        });
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::FORBIDDEN,
+            "HTTPS-only proxy requests should reject http targets"
+        );
+        assert!(
+            matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
+            "should return a forbidden error"
+        );
+        upstream.assert_no_requests();
     }
 
     #[test]
@@ -7108,27 +6795,65 @@ mod tests {
     }
 
     #[test]
-    fn sign_rejects_streaming_body() {
+    fn sign_reads_a_streamed_body() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            let req = build_http_post_streaming_request("https://edge.example/first-party/sign");
-            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                .await
-                .expect_err("should reject streaming sign body");
-            assert_eq!(
-                err.current_context().status_code(),
-                StatusCode::BAD_REQUEST,
-                "should return 400 for streaming sign body"
+            let req = build_http_post_streaming_request(
+                "https://edge.example/first-party/sign",
+                br#"{"url":"https://cdn.example/asset.js"}"#,
             );
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect("should sign the URL from a streamed body");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
             assert!(
-                matches!(
-                    err.current_context(),
-                    TrustedServerError::BadRequest { message }
-                        if message == "first-party sign request body must be buffered, not streamed"
-                ),
-                "should explain that sign bodies must be buffered"
+                json.contains("\"base\":\"https://cdn.example/asset.js\""),
+                "should sign the streamed target: {json}"
             );
         });
+    }
+
+    #[test]
+    fn sign_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        for case in body_read_failure_cases(SIGN_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/sign")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            );
+
+            let outcome = futures::executor::block_on(handle_first_party_proxy_sign(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("first-party sign", &outcome);
+        }
+    }
+
+    #[test]
+    fn rebuild_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        for case in body_read_failure_cases(REBUILD_MAX_BODY_BYTES) {
+            let (req, expectation) = case.into_request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/proxy-rebuild")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            );
+
+            let outcome = futures::executor::block_on(handle_first_party_proxy_rebuild(
+                &settings,
+                &noop_services(),
+                req,
+            ));
+
+            expectation.assert_outcome("first-party rebuild", &outcome);
+        }
     }
 
     #[test]

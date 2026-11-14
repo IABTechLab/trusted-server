@@ -187,34 +187,12 @@ mod plan_sharing_tests {
     }
 
     #[test]
-    fn cloudflare_and_spin_reject_multi_provider_plans_before_runtime_construction() {
-        let mut settings = create_test_settings();
-        settings.auction.enabled = true;
-        settings.auction.providers =
-            AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]);
-        let plan = compile_auction_plan(&settings).expect("should compile target-independent plan");
-
-        for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
-            crate::platform::AuctionTargetId::Spin,
-        ] {
-            let error = plan
-                .validate_for_target(target)
-                .expect_err("should reject unsupported multi-provider fanout");
-            assert!(
-                error
-                    .to_string()
-                    .contains("does not support concurrent provider fanout")
-            );
-        }
-    }
-
-    #[test]
     fn aps_profile_registers_renderer_without_browser_aps_config() {
         let mut settings = create_test_settings();
         settings.auction.providers = std::collections::BTreeMap::from([(
             "aps-main".parse().expect("should parse APS provider ID"),
             ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

@@ -43,7 +43,7 @@ GENERATOR_ARGS=(
     --origin-url "$ORIGIN_URL"
 )
 if [ -n "${INTEGRATION_BIDDER_ORIGIN_URL:-}" ]; then
-    GENERATOR_ARGS+=(--bidder-origin-url "$INTEGRATION_BIDDER_ORIGIN_URL")
+    GENERATOR_ARGS+=(--provider-endpoint-origin "$INTEGRATION_BIDDER_ORIGIN_URL")
 fi
 
 "$GENERATOR_BIN" "${GENERATOR_ARGS[@]}"
