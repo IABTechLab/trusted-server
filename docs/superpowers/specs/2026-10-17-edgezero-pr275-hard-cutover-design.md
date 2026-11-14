@@ -22,9 +22,15 @@ differences item 12 cites, is new in `9b31a697`. The cut is stacked on PR 275
 and follows its head, and `main` pins the head the cut was last rebased onto
 (D5, [Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head was
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
-the answers rely on. The cut now pins `737f8452`
-(`737f845276f89f83452f40394abf2236c05449f0`), PR 275's head on 2026-11-13.
-PR 275's history was rewritten after `14a6ca8b`, the previous pin, PR 275's
+the answers rely on. The cut now pins `5c32ae61`
+(`5c32ae61a3e1bb647c26abbfbbc942768faac8c3`), PR 275's head later on
+2026-11-13. It is one commit after `737f8452`, the previous pin, and in
+production code it changes only logging, chiefly Fastly's: `run_custom` and `serve_custom` take the `Hooks` type and
+install the managed logger, Fastly lines carry the record's target, and an
+optional `edgezero_logging` Config Store overrides the level (section 9). The
+Axum change in that commit is test-only. `737f8452`
+(`737f845276f89f83452f40394abf2236c05449f0`) was PR 275's head earlier on
+2026-11-13. PR 275's history was rewritten after `14a6ca8b`, the pin before it, PR 275's
 head on 2026-11-11: `737f8452` is three commits after `a7d7fd0f`, and
 `14a6ca8b` is not its ancestor. `a7d7fd0f`, the pin before `14a6ca8b`, was
 five commits after `dcbf622`, the cut's first pin, and changed only the
@@ -57,9 +63,9 @@ wider EdgeZero migration.
 Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
-EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b` is
-the cut's previous pin, `737f8452` is the cut's pin, and `v0.0.11` is the
-base's pin.
+EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b` and
+`737f8452` are earlier pins of the cut, `5c32ae61` is the cut's pin, and
+`v0.0.11` is the base's pin.
 
 ## Problem
 
@@ -185,7 +191,7 @@ decision sits in the section that implements it.
 
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
-they are. The rev is PR 275's head, `737f8452` at the 2026-11-13 repin, and
+they are. The rev is PR 275's head, `5c32ae61` at the second 2026-11-13 repin, and
 the cut repins it at each rebase. At merge, `main` pins the head the cut was
 last rebased onto (D5).
 
@@ -468,7 +474,7 @@ cache make no HTTP calls.
   it returns (EZ-6.7). At H it stops at the first slot that completes during
   setup, so later slots wait for the next EdgeZero poll
   ([open defect 1](#open-edgezero-defects-at-h)). Fixed at the pin: EdgeZero's
-  fix is in `598f0a2a`, an ancestor of `737f8452`, and Trusted Server keeps no
+  fix is in `598f0a2a`, an ancestor of `5c32ae61`, and Trusted Server keeps no
   workaround for it. Axum, Cloudflare, and Spin
   spawn a local task
   (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:268`,
@@ -501,7 +507,7 @@ cache make no HTTP calls.
   unobserved when the cutoff passes fails that way with an internal error
   ([open defect 3](#open-edgezero-defects-at-h)). Trusted Server adds no
   workaround. Fixed at the pin: EdgeZero's fix is in `598f0a2a`, an ancestor
-  of `737f8452`.
+  of `5c32ae61`.
 - The mediator goes out after the batch finishes, with `client.send(..)`,
   `.timeout(mediator timeout)`, and `.deadline(auction_deadline)`. The guest
   budget takes the earlier of the two
@@ -574,7 +580,7 @@ earlier poll recorded, and never wait
 (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:5456-5494`).
 Cross-cutting requirement 5 and EZ-6.11 require a check to record, so this is
 [open defect 2](#open-edgezero-defects-at-h). Fixed at the pin: EdgeZero's fix
-is in `6f0cc74c`, an ancestor of `737f8452`. At the pin under Viceroy 0.21.0,
+is in `6f0cc74c`, an ancestor of `5c32ae61`. At the pin under Viceroy 0.21.0,
 a `check` after the cutoff returns `Finished(Cutoff)` (section 8). Collection
 after the cutoff calls `batch.next()`, which also returns `Finished(Cutoff)`
 without a host wait. The
@@ -1032,9 +1038,11 @@ always returns `Ok(())`. An `Err` would end the reuse loop with no response
 The callback runs these steps in order.
 
 1. **Native short-circuits, unchanged.** The trace-path check, health probe,
-   `setup_once(init_logger)`, request id, sandbox metrics probe (reuse only),
-   and JA4 debug probe (`main.rs:172-208`, `:342`, `:362`) answer with native
-   responses before EdgeZero runs. The metrics probe must stay ahead of app
+   request id, sandbox metrics probe (reuse only), and JA4 debug probe
+   (`main.rs:172-208`, `:342`, `:362`) answer with native responses before
+   EdgeZero runs. At `5c32ae61`, `run_custom` and `serve_custom` install the
+   managed logger before the callback, so the old `setup_once(init_logger)`
+   step is gone (section 9). The metrics probe must stay ahead of app
    assembly. The callback takes `clock = MonotonicClock::default()` and
    `request_start = clock.now()` at entry. Only `send_assembly_error` uses them.
 2. **Assembly.** `sandbox.initialize` builds the router and calls
@@ -1611,9 +1619,9 @@ cut uses admits target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
 log once (`app.rs:113-146`).
 
-Since the 2026-11-13 repin, Trusted Server installs no logger of its own on
-any adapter. EdgeZero installs the logger on Axum, Cloudflare, and Spin, and
-Fastly's entry point installs EdgeZero's managed Fastly logger (below):
+Since the 2026-11-13 repins, Trusted Server installs no logger of its own on
+any adapter. EdgeZero installs the logger on every adapter, Fastly's under the
+custom lifecycle (below):
 
 - **Axum.** `run_app` installs `simple_logger` at `EDGEZERO__LOGGING__LEVEL`,
   `info` when unset or unrecognized
@@ -1638,31 +1646,34 @@ default `info` level admits the warnings they look for. The startup report and
 every warning this spec names on Cloudflare and Spin, such as the Spin
 `origin_host_header_override` warning, are logged.
 
-On Fastly, the cut uses EdgeZero's custom lifecycle, `run_custom` and
-`serve_custom`, which installs no logger
-(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lifecycle.rs:139-181`).
-EdgeZero's own `run_app`, `run_app_with_hooks`, `serve_app_with_hooks`, and
-`run_app_with_config` install its managed Fastly logger, and only when the
-baked `[adapters.fastly.logging]` table sets an endpoint
-(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:183-187`,
-`:237-247`, `:288-291`). Trusted Server's `logging.rs` is deleted. Its entry
-point does what `run_app_with_hooks` does: `setup_once` reads
-`FastlyLogging::from(TrustedServerApp::logging_for("fastly"))` and calls
-EdgeZero's public `init_logger(endpoint, level, echo_stdout)`
-(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:122-128`). The
-`app!` macro would bake `logging_for` from the manifest; Trusted Server's
-hand-written `Hooks` parses the compiled-in `edgezero.toml` with EdgeZero's
-`ManifestLoader` instead, so `[adapters.fastly.logging]` (endpoint `tslog`,
-level `info`, `echo_stdout = true`) is the single source. `owns_logging` stays
+On Fastly, the cut uses EdgeZero's custom lifecycle. At `5c32ae61`,
+`serve_custom::<A, T, F, E>` and `run_custom::<A, T, E, F>` take the `Hooks`
+type and install the managed Fastly logger from `A::logging_for("fastly")`
+before each callback, unless the app owns logging
+(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-200`,
+`logger.rs:91-122`). Installation runs once per instance; identical repeats
+succeed. The callback's error type takes `ManagedLoggerError`, which is the
+only error Trusted Server's callbacks can return; `main` reports it on
+stderr, because no logger exists then. Trusted Server's own `logging.rs` and
+its `setup_once` install are deleted.
+
+EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
+`tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
+Trusted Server's hand-written `Hooks` parses the compiled-in `edgezero.toml`
+with EdgeZero's `ManifestLoader` and caches the result, so the manifest is
+parsed once per instance and stays the single source. `owns_logging` stays
 false.
 
-Three behaviors of the deleted logger have no EdgeZero equivalent and are
-dropped: the `debug` level under Viceroy, the guest-environment
-`EDGEZERO_LOG_LEVEL` override, and the record's target in each line. EdgeZero's
-Fastly format is `<timestamp> <level> <message>`
-(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/logger.rs:30-42`), so
-the integration test that reads the outbound observation finds the line by its
-message text.
+Fastly lines read `<timestamp> <level> <target> <message>`
+(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/logger.rs:37-51`), so
+the integration test that reads the outbound observation finds the line by
+its `trusted_server::outbound_observation` target. A Config Store linked as
+`edgezero_logging` with the key `EDGEZERO__LOGGING__LEVEL` overrides the baked
+level, read once per instance
+(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/config_store.rs:243-254`,
+`logger.rs:102-122`). `scripts/template-cache-local-test.sh` declares that
+store in its Viceroy configuration to log at `debug` with the production
+`info` wasm, so it reads the debug-only template store line again.
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
@@ -2024,13 +2035,18 @@ Other reviewers' open threads also reach Trusted Server:
 
 Trusted Server's own asks on PR 275 are in
 [one comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880),
-checked against head `1467e28a`. Both are answered at `737f8452`, the pin, and
+checked against head `1467e28a`. Both are answered at `737f8452`, and
 Trusted Server added no workaround for either:
 
 - A streamed Spin upload went out chunked and lost its declared
   `Content-Length`. It now keeps the length (2.5).
 - Cloudflare and Spin installed no `log` backend, so their warnings and
   startup report were dropped. They now install managed backends (section 9).
+
+Its Fastly logging asks are in
+[a second comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6869073346),
+and `5c32ae61`, the pin, answers all three: a managed logger under the custom
+lifecycle, the target in Fastly lines, and a runtime level (section 9).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
@@ -2636,10 +2652,6 @@ old layer. That transient dual path exists only inside the pull request.
 - Dependabot ignore rules for EdgeZero-pinned crates.
 - Moving the pin from the PR 275 commit to an EdgeZero release tag once PR 275
   merges (D5).
-- EdgeZero asks posted in
-  https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6869073346
-  (managed logger under the custom lifecycle, target in the Fastly format,
-  runtime level).
 - Spin on `wasm32-wasip2`.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
