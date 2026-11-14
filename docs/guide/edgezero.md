@@ -9,7 +9,7 @@ stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
 ## Pinned version
 
 The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
-`IABTechLab/edgezero`: `737f845276f89f83452f40394abf2236c05449f0`, the head of
+`IABTechLab/edgezero`: `5c32ae61a3e1bb647c26abbfbbc942768faac8c3`, the head of
 EdgeZero pull request 275. The pin moves with that pull request's head until
 it merges, and then to an EdgeZero release tag.
 

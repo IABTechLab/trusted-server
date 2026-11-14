@@ -1,17 +1,14 @@
 // Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-use std::convert::Infallible;
-
-use edgezero_adapter_fastly::FastlyLogging;
 use edgezero_adapter_fastly::context::FastlyOutboundObservation;
-use edgezero_adapter_fastly::logger::InitLoggerError;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
 };
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -108,17 +105,22 @@ fn main() {
 
     match mode {
         ServeMode::Single => {
-            // `run_custom` completes the callback's SDK result exactly once.
-            // The callback always returns `Ok`: `EdgeZero` or the callback has
-            // already answered, so there is no error for the SDK to turn into a
-            // second response.
-            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+            // `run_custom` installs `EdgeZero`'s managed logger from
+            // `TrustedServerApp::logging_for("fastly")` before the callback, and
+            // completes the callback's SDK result exactly once. The callback
+            // always returns `Ok`: `EdgeZero` or the callback has already
+            // answered, so there is no error for the SDK to turn into a second
+            // response. Only a failed logger installation returns `Err`.
+            let result = edgezero_adapter_fastly::lifecycle::run_custom::<TrustedServerApp, _, _, _>(
                 FastlyRequest::from_client(),
                 |request, sandbox: &mut Sandbox| {
                     handle_request(request, sandbox, &mut startup);
-                    Ok::<(), Infallible>(())
+                    Ok::<(), ManagedLoggerError>(())
                 },
             );
+            if let Err(error) = result {
+                report_logger_failure(error);
+            }
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
@@ -136,7 +138,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
     // performed by the final callback is included.
     let mut counters = RetirementCounters::default();
 
-    let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
+    // `serve_custom` installs `EdgeZero`'s managed logger before each callback,
+    // as `run_custom` does.
+    let summary = edgezero_adapter_fastly::lifecycle::serve_custom::<TrustedServerApp, _, _, _>(
         fastly::http::serve::Serve::new()
             .with_max_requests(limits.max_requests)
             .with_max_memory(limits.max_memory_mib)
@@ -148,7 +152,7 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             });
             // An `Err` would end serving with no response, so the callback
             // reports none, whatever happened to this request's delivery.
-            Ok::<(), Infallible>(())
+            Ok::<(), ManagedLoggerError>(())
         },
     );
 
@@ -158,30 +162,25 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
         counters.requests(),
         counters.attempts()
     );
+    if let Some(error) = summary.error() {
+        report_logger_failure(*error);
+    }
+}
+
+/// Reports that `EdgeZero` could not install its managed logger.
+///
+/// `EdgeZero` stops before the callback when installation fails, so the error
+/// cannot go through `log`.
+fn report_logger_failure(error: ManagedLoggerError) {
+    #[allow(clippy::print_stderr, reason = "the managed logger is not installed")]
+    {
+        eprintln!("managed logger installation failed: {error}");
+    }
 }
 
 #[cfg(not(feature = "reusable-sandbox"))]
 fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnostics) {
     unreachable!("serve_mode never selects reuse without the reusable-sandbox feature")
-}
-
-/// Installs `EdgeZero`'s managed Fastly logger from `[adapters.fastly.logging]`.
-///
-/// Reads the settings the way `EdgeZero`'s own `run_app_with_hooks` does,
-/// through [`edgezero_core::app::Hooks::logging_for`] and [`FastlyLogging`],
-/// and installs nothing when the table names no endpoint.
-///
-/// # Errors
-///
-/// Returns `EdgeZero`'s error when the Fastly logger cannot be built or a
-/// global logger is already installed. Neither failure installs anything, so
-/// `Sandbox::setup_once` can safely retry it on a later callback.
-fn install_logger() -> Result<(), InitLoggerError> {
-    let logging = FastlyLogging::from(TrustedServerApp::logging_for("fastly"));
-    let Some(endpoint) = logging.endpoint.as_deref() else {
-        return Ok(());
-    };
-    edgezero_adapter_fastly::init_logger(endpoint, logging.level, logging.echo_stdout)
 }
 
 /// Handles one request end to end.
@@ -207,26 +206,15 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // trace-path decisions describe the request as received.
     let trace_path = is_trace_path(req.get_path());
 
-    // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
+    // Health probe bypasses settings and app construction as a cheap liveness signal.
     if !trace_path && let Some(response) = health_response(&req) {
         response.send_to_client();
         return;
     }
 
-    // Marked complete only once installation succeeds, so a failed install is
-    // retried on a later callback. `setup_once` rolls nothing back, which is
-    // safe here: see `install_logger`.
-    match sandbox.setup_once(install_logger) {
-        Ok(()) => startup.flush(),
-        Err(error) => {
-            // Logger installation failed, so its own error cannot rely on log.
-            // Keep startup diagnostics pending until installation succeeds.
-            #[allow(clippy::print_stderr, reason = "logger installation failed")]
-            {
-                eprintln!("logger installation failed, retrying next callback: {error}");
-            }
-        }
-    }
+    // `EdgeZero` installed its managed logger before this callback, so the
+    // messages held since startup can go out now.
+    startup.flush();
 
     // Correlation is request-local and never retained. `FASTLY_TRACE_ID` names
     // the sandbox, not the request, so it is not used here. The id rides on the

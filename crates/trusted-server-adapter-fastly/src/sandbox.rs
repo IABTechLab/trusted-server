@@ -484,42 +484,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn setup_runs_once_on_success_and_retries_after_failure() {
-        let mut sandbox = Sandbox::default();
-        let attempts = Cell::new(0_u32);
-
-        // A failed install must leave setup eligible for retry.
-        let failed = sandbox.setup_once(|| {
-            attempts.set(attempts.get() + 1);
-            Err::<(), &str>("install failed")
-        });
-        assert_eq!(
-            failed.err(),
-            Some("install failed"),
-            "the error should surface"
-        );
-
-        // The retry runs, because setup was never marked complete.
-        sandbox
-            .setup_once(|| {
-                attempts.set(attempts.get() + 1);
-                Ok::<(), &str>(())
-            })
-            .expect("the retry should succeed");
-        assert_eq!(attempts.get(), 2, "a failed install should be retried");
-
-        // Once successful, it never runs again, so the global logger is
-        // installed once; a second install would fail with `SetLoggerError`.
-        sandbox
-            .setup_once(|| -> Result<(), &str> {
-                attempts.set(attempts.get() + 1);
-                panic!("setup must not run again after success")
-            })
-            .expect("a completed setup should be skipped");
-        assert_eq!(attempts.get(), 2, "setup should stay complete");
-    }
-
     /// Minimal settings sufficient to build real application state.
     fn test_settings() -> Settings {
         Settings::from_toml(

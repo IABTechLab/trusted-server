@@ -85,7 +85,7 @@
 //! retains nothing, so the next request retries.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
@@ -1344,16 +1344,20 @@ impl Hooks for TrustedServerApp {
 
     /// Reads `[adapters.<adapter>.logging]` from the compiled-in `edgezero.toml`.
     ///
-    /// The `app!` macro bakes the same table into a generated `Hooks`; this
-    /// hand-written one parses [`EDGEZERO_MANIFEST`] with `EdgeZero`'s loader,
-    /// so the manifest stays the single source of the Fastly logging settings.
+    /// `EdgeZero`'s `run_custom` and `serve_custom` call this before every
+    /// callback to install the managed Fastly logger. The `app!` macro bakes the
+    /// same table into a generated `Hooks`; this hand-written one parses
+    /// [`EDGEZERO_MANIFEST`] with `EdgeZero`'s loader once per instance, so the
+    /// manifest stays the single source of the Fastly logging settings.
     ///
     /// # Panics
     ///
     /// Panics if the compiled-in manifest does not parse, which
     /// `logging_for_reads_the_fastly_logging_table` rules out.
     fn logging_for(adapter: &str) -> ResolvedLoggingConfig {
-        ManifestLoader::load_from_str(EDGEZERO_MANIFEST)
+        static MANIFEST: OnceLock<ManifestLoader> = OnceLock::new();
+        MANIFEST
+            .get_or_init(|| ManifestLoader::load_from_str(EDGEZERO_MANIFEST))
             .manifest()
             .logging_or_default(adapter)
     }
