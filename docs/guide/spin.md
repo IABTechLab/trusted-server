@@ -25,9 +25,9 @@ asked for on
 
 ## Prerequisites
 
-Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
-`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide, so an older runtime
-cannot start the component. Install or upgrade from the
+Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 8 imports
+WASI HTTP 0.3, which Spin 4.0.x does not provide, so an older runtime cannot
+start the component. Install or upgrade from the
 [Spin install guide](https://spinframework.dev/install).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
