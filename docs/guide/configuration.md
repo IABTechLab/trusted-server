@@ -534,8 +534,7 @@ connecting to the host in `origin_url`.
 
 **Spin**: EdgeZero's Spin client cannot send a `Host` that differs from the
 connection target, so Spin ignores this setting and logs a warning at settings
-load. Production Spin builds drop that warning until EdgeZero's Spin
-`init_logger` installs a log backend. Fastly and Axum send it. Cloudflare
+load. Fastly and Axum send it. Cloudflare
 sends it too, which EdgeZero rates best effort because Cloudflare's routing of
 the override is unqualified.
 

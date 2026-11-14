@@ -17,12 +17,12 @@ every route answers with EdgeZero's JSON error body at the startup error's
 status. That is normally 500; a KV store error answers 503, an auction, proxy,
 or integration error 502, and a bad-request error 400.
 
-Production Worker builds install no `log` backend. EdgeZero's Cloudflare
-`init_logger` installs none, and Trusted Server leaves that to EdgeZero, so the
-startup report and every warning are dropped. They are not observable until
-EdgeZero's `init_logger` installs a backend, which Trusted Server has asked for
-on
-[EdgeZero PR 275](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880).
+EdgeZero's Cloudflare `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the Workers console, which `wrangler
+dev` prints and `wrangler tail` streams from a deployed Worker. The level comes
+from the `EDGEZERO__LOGGING__LEVEL` Worker variable and defaults to `info`, so
+the startup report and every warning are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 

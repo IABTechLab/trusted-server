@@ -71,9 +71,8 @@ Fermyon Spin adapter (`wasm32-wasip1` component):
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning
-- No `log` backend in production builds, because EdgeZero's Spin
-  `init_logger` installs none, so warnings and the startup report are dropped
-  until EdgeZero installs one
+- Logs to the component's stderr through EdgeZero's managed backend, at
+  `EDGEZERO__LOGGING__LEVEL` (default `info`)
 - Multi-provider auctions fan out as one EdgeZero request batch
 
 ```bash
