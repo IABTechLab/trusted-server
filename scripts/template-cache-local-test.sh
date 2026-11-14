@@ -468,7 +468,7 @@ check_post_reaches_origin() {
 if [ "$CONFIG_MODE" = "inline" ]; then
   check "inline fetches the origin every time" "$FETCHES" "2"
   check "inline writes no shared template" \
-    "$(grep -c 'template_cache stored' "$WORK/viceroy.log" || true)" "0"
+    "$(template_cache_state "$WORK/r1.html.headers"),$(template_cache_state "$WORK/r2.html.headers")" ","
   check "inline delivers the winning bid" \
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
 else
@@ -620,8 +620,13 @@ fi
 if [ "$CONFIG_MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
-  grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
-    "$WORK/viceroy.log" | sort -u | sed 's/^/    /'
+  # The store line is a debug log. The Fastly build logs at the
+  # [adapters.fastly.logging] level in edgezero.toml, so it may be absent.
+  if ! grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
+    "$WORK/viceroy.log" | sort -u | sed 's/^/    /' | grep .; then
+    echo "    (not logged: the store line is a debug log, and edgezero.toml sets the"
+    echo "    [adapters.fastly.logging] level for this build)"
+  fi
   echo
   echo "  What the reader receives (hole filled, no marker):"
   printf '    %d seam marker(s), %d window.tsjs\n' \
@@ -632,7 +637,8 @@ if [ "$CONFIG_MODE" = "esi" ]; then
   The marker is never visible in page source. It remains inert in the template cache. A cold miss
   converts it to one synthetic ESI include in a private working copy; a warm hit
   byte-splits it directly. Both replace it before sending the response.
-  `seam marker present: true` above proves the stored copy is reader-agnostic.
+  With debug logging, `seam marker present: true` above shows the stored copy is
+  reader-agnostic.
 EOF
 fi
 
