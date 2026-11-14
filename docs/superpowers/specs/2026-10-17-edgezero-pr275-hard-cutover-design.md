@@ -1141,7 +1141,7 @@ After post-delivery work, the callback logs a `FastlyOutboundObservation::curren
 snapshot at info on a dedicated target: configuration count, registration
 count, and total and maximum registration time
 (`edgezero:crates/edgezero-adapter-fastly/src/context.rs:202-265`). Hosted
-Fastly logs at info (`crates/trusted-server-adapter-fastly/src/logging.rs:19-62`),
+Fastly logs at info, the level in `[adapters.fastly.logging]` (section 9),
 and EZ-2's criteria 9 and 15 read it. Taking it after post-delivery work
 includes pull-sync and telemetry registrations.
 
@@ -1611,8 +1611,9 @@ cut uses admits target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
 log once (`app.rs:113-146`).
 
-Since the 2026-11-13 repin, EdgeZero installs the logger on Axum, Cloudflare,
-and Spin, and Trusted Server installs none there:
+Since the 2026-11-13 repin, Trusted Server installs no logger of its own on
+any adapter. EdgeZero installs the logger on Axum, Cloudflare, and Spin, and
+Fastly's entry point installs EdgeZero's managed Fastly logger (below):
 
 - **Axum.** `run_app` installs `simple_logger` at `EDGEZERO__LOGGING__LEVEL`,
   `info` when unset or unrecognized
@@ -1637,19 +1638,31 @@ default `info` level admits the warnings they look for. The startup report and
 every warning this spec names on Cloudflare and Spin, such as the Spin
 `origin_host_header_override` warning, are logged.
 
-Fastly keeps `crates/trusted-server-adapter-fastly/src/logging.rs`, installed
-through `setup_once` (section 3). EdgeZero installs its managed Fastly logger
-only from `run_app`, `run_app_with_hooks`, `serve_app_with_hooks`, and
-`run_app_with_config`, and only when the baked `[adapters.fastly.logging]`
-table sets an endpoint
-(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:183-187`,
-`:237-247`, `:288-291`). Its custom lifecycle, `run_custom` and
-`serve_custom`, which the cut uses, installs none
+On Fastly, the cut uses EdgeZero's custom lifecycle, `run_custom` and
+`serve_custom`, which installs no logger
 (`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lifecycle.rs:139-181`).
-Calling EdgeZero's public `init_logger(endpoint, level, echo_stdout)` from
-`setup_once` instead would drop three behaviors EdgeZero has no equivalent
-for: the `debug` level under Viceroy, the guest-environment level override, and
-the record's target in each line. Which way to go is open (Follow-ups).
+EdgeZero's own `run_app`, `run_app_with_hooks`, `serve_app_with_hooks`, and
+`run_app_with_config` install its managed Fastly logger, and only when the
+baked `[adapters.fastly.logging]` table sets an endpoint
+(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:183-187`,
+`:237-247`, `:288-291`). Trusted Server's `logging.rs` is deleted. Its entry
+point does what `run_app_with_hooks` does: `setup_once` reads
+`FastlyLogging::from(TrustedServerApp::logging_for("fastly"))` and calls
+EdgeZero's public `init_logger(endpoint, level, echo_stdout)`
+(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:122-128`). The
+`app!` macro would bake `logging_for` from the manifest; Trusted Server's
+hand-written `Hooks` parses the compiled-in `edgezero.toml` with EdgeZero's
+`ManifestLoader` instead, so `[adapters.fastly.logging]` (endpoint `tslog`,
+level `info`, `echo_stdout = true`) is the single source. `owns_logging` stays
+false.
+
+Three behaviors of the deleted logger have no EdgeZero equivalent and are
+dropped: the `debug` level under Viceroy, the guest-environment
+`EDGEZERO_LOG_LEVEL` override, and the record's target in each line. EdgeZero's
+Fastly format is `<timestamp> <level> <message>`
+(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/logger.rs:30-42`), so
+the integration test that reads the outbound observation finds the line by its
+message text.
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
@@ -2623,9 +2636,10 @@ old layer. That transient dual path exists only inside the pull request.
 - Dependabot ignore rules for EdgeZero-pinned crates.
 - Moving the pin from the PR 275 commit to an EdgeZero release tag once PR 275
   merges (D5).
-- Fastly logging on EdgeZero's managed logger under the custom lifecycle, or
-  the EdgeZero asks that would let Trusted Server delete `logging.rs`
-  (section 9).
+- EdgeZero asks posted in
+  https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6869073346
+  (managed logger under the custom lifecycle, target in the Fastly format,
+  runtime level).
 - Spin on `wasm32-wasip2`.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
