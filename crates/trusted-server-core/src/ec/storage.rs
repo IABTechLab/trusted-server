@@ -141,7 +141,7 @@ impl Ec {
                 Err(invalid("ec.storage.provider is required outside Fastly"))
             }
             _ => Err(invalid(
-                "EC record storage is unsupported by the selected serving runtime",
+                "ec.storage.provider is unsupported by the selected serving runtime",
             )),
         }
     }
