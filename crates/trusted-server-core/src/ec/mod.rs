@@ -49,6 +49,7 @@ pub mod prebid_eids;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
+pub mod record_backend;
 pub mod registry;
 
 /// Characters of an identifier kept when redacting it for a log.

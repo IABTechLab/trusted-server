@@ -261,10 +261,10 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
     let mut state = build_state_with_settings(settings).map_err(settings_error)?;
     // EC records stay live. Only the validated provider handle is shared, never
     // mutable identity rows in the immutable config/secret snapshot.
-    if let Some(provider) = crate::ec_kv::prepare_from_env().await? {
+    if let Some(provider) = crate::record_ec::acquire(stores)? {
         Arc::get_mut(&mut state)
             .expect("should uniquely own initializing app state")
-            .set_ec_store(provider.as_ref().clone());
+            .set_ec_store(provider);
     }
     let finalize_settings = Arc::clone(&state.settings);
     let router = router_builder(&state).build();
