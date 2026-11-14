@@ -49,6 +49,16 @@ manifest = "fastly.toml"
 target = "wasm32-wasip1"
 profile = "release"
 
+# EdgeZero's managed Fastly logger, which the entry point installs through
+# `edgezero_adapter_fastly::init_logger`. Records go to the `tslog` endpoint
+# and are echoed to stdout. The binary compiles this file in, so a change
+# needs a rebuild. EdgeZero keeps its `edgezero::boot` warnings at warn
+# whatever the level.
+[adapters.fastly.logging]
+endpoint = "tslog"
+level = "info"
+echo_stdout = true
+
 [adapters.fastly.commands]
 auth-login = "fastly profile create"
 auth-logout = "fastly profile delete"

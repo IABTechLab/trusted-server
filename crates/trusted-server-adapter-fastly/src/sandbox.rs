@@ -509,8 +509,8 @@ mod tests {
             .expect("the retry should succeed");
         assert_eq!(attempts.get(), 2, "a failed install should be retried");
 
-        // Once successful, it never runs again. Reinstalling the global logger
-        // panics inside `fern`, which is the failure this guards.
+        // Once successful, it never runs again, so the global logger is
+        // installed once; a second install would fail with `SetLoggerError`.
         sandbox
             .setup_once(|| -> Result<(), &str> {
                 attempts.set(attempts.get() + 1);

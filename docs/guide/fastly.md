@@ -424,6 +424,24 @@ If EC sync returns `kv_unavailable` or identify responses are degraded, first ch
 
 Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
 
+## Logging
+
+The Fastly adapter installs EdgeZero's managed Fastly logger and no logger of
+its own. Its settings come from `[adapters.fastly.logging]` in `edgezero.toml`:
+
+```toml
+[adapters.fastly.logging]
+endpoint = "tslog"
+level = "info"
+echo_stdout = true
+```
+
+Records go to the Fastly log endpoint named `tslog` and are echoed to stdout,
+which `fastly compute serve` prints. Each line reads `<timestamp> <level> <message>`. EdgeZero keeps its
+`edgezero::boot` startup warnings at `warn` whatever the level. The binary
+compiles `edgezero.toml` in, so changing the level needs a rebuild and a
+deploy; no runtime setting or environment variable changes it.
+
 ## Verify the complete local handoff
 
 Run the repository smoke from a clean shell:

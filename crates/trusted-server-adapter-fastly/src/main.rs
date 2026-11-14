@@ -3,7 +3,9 @@
 
 use std::convert::Infallible;
 
+use edgezero_adapter_fastly::FastlyLogging;
 use edgezero_adapter_fastly::context::FastlyOutboundObservation;
+use edgezero_adapter_fastly::logger::InitLoggerError;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
 };
@@ -39,7 +41,6 @@ mod deadline_network;
 mod delivery;
 mod ec_kv;
 mod esi_assembly;
-mod logging;
 mod management_api;
 mod middleware;
 mod platform;
@@ -164,6 +165,25 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
     unreachable!("serve_mode never selects reuse without the reusable-sandbox feature")
 }
 
+/// Installs `EdgeZero`'s managed Fastly logger from `[adapters.fastly.logging]`.
+///
+/// Reads the settings the way `EdgeZero`'s own `run_app_with_hooks` does,
+/// through [`edgezero_core::app::Hooks::logging_for`] and [`FastlyLogging`],
+/// and installs nothing when the table names no endpoint.
+///
+/// # Errors
+///
+/// Returns `EdgeZero`'s error when the Fastly logger cannot be built or a
+/// global logger is already installed. Neither failure installs anything, so
+/// `Sandbox::setup_once` can safely retry it on a later callback.
+fn install_logger() -> Result<(), InitLoggerError> {
+    let logging = FastlyLogging::from(TrustedServerApp::logging_for("fastly"));
+    let Some(endpoint) = logging.endpoint.as_deref() else {
+        return Ok(());
+    };
+    edgezero_adapter_fastly::init_logger(endpoint, logging.level, logging.echo_stdout)
+}
+
 /// Handles one request end to end.
 ///
 /// Native short-circuits answer first. Every other request is assembled into
@@ -194,9 +214,9 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     }
 
     // Marked complete only once installation succeeds, so a failed install is
-    // retried on a later callback. `setup_once` rolls nothing back, so that is
-    // only correct because `init_logger` is harmless to repeat — see its docs.
-    match sandbox.setup_once(crate::logging::init_logger) {
+    // retried on a later callback. `setup_once` rolls nothing back, which is
+    // safe here: see `install_logger`.
+    match sandbox.setup_once(install_logger) {
         Ok(()) => startup.flush(),
         Err(error) => {
             // Logger installation failed, so its own error cannot rely on log.

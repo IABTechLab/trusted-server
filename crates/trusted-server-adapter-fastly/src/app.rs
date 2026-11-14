@@ -96,6 +96,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
+use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -1215,6 +1216,9 @@ fn fallback_route_handler(
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
+/// The repository's `edgezero.toml`, compiled in for [`Hooks::logging_for`].
+const EDGEZERO_MANIFEST: &str = include_str!("../../../edgezero.toml");
+
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
@@ -1338,6 +1342,22 @@ impl Hooks for TrustedServerApp {
         )
     }
 
+    /// Reads `[adapters.<adapter>.logging]` from the compiled-in `edgezero.toml`.
+    ///
+    /// The `app!` macro bakes the same table into a generated `Hooks`; this
+    /// hand-written one parses [`EDGEZERO_MANIFEST`] with `EdgeZero`'s loader,
+    /// so the manifest stays the single source of the Fastly logging settings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the compiled-in manifest does not parse, which
+    /// `logging_for_reads_the_fastly_logging_table` rules out.
+    fn logging_for(adapter: &str) -> ResolvedLoggingConfig {
+        ManifestLoader::load_from_str(EDGEZERO_MANIFEST)
+            .manifest()
+            .logging_or_default(adapter)
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
@@ -1385,6 +1405,7 @@ mod tests {
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_adapter_fastly::FastlyLogging;
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
@@ -1464,6 +1485,26 @@ mod tests {
             assert_eq!(runtime_store.default, manifest_default);
             assert_eq!(runtime_store.ids, manifest_ids);
         }
+    }
+
+    #[test]
+    fn logging_for_reads_the_fastly_logging_table() {
+        let logging = FastlyLogging::from(TrustedServerApp::logging_for("fastly"));
+
+        assert_eq!(
+            logging.endpoint.as_deref(),
+            Some("tslog"),
+            "should log to the manifest's tslog endpoint"
+        );
+        assert_eq!(
+            logging.level,
+            log::LevelFilter::Info,
+            "should log at the manifest's info level"
+        );
+        assert!(
+            logging.echo_stdout,
+            "should echo records to stdout as the manifest says"
+        );
     }
 
     #[test]
