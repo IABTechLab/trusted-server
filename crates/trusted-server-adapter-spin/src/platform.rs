@@ -4,66 +4,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
-use error_stack::{Report, ResultExt as _};
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use http_body_util::BodyExt;
+use error_stack::Report;
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
+    ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-use trusted_server_core::platform::UnavailableHttpClient;
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use std::io::Read as _;
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use trusted_server_core::platform::PlatformHttpRequest;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::platform::{
-    PlatformPendingRequest, PlatformPendingResponse, PlatformResponse, PlatformSelectResult,
-};
-
-// Limit both streamed bytes and decompressed bytes to 8 MiB to preserve
-// headroom in the Spin WASM component heap. The streaming limit rejects an
-// oversized frame before retaining it in the collected response body.
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-type HeaderPairs = Vec<(String, Vec<u8>)>;
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-type BufferedResponseParts = (HeaderPairs, Vec<u8>);
-
-/// Collect an outbound response body, rejecting it once it exceeds
-/// [`MAX_DECOMPRESSED_SIZE`] streamed bytes.
-///
-/// The limit applies frame by frame, so an oversized body fails before it is
-/// fully retained in the component heap.
-///
-/// # Errors
-///
-/// Returns `PlatformError::HttpClient` when the body exceeds the limit or a
-/// frame cannot be read.
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-async fn collect_limited_body<B>(body: B) -> Result<Vec<u8>, Report<PlatformError>>
-where
-    B: BodyExt,
-    B::Data: bytes::Buf,
-    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
-{
-    let collected = http_body_util::Limited::new(body, MAX_DECOMPRESSED_SIZE)
-        .collect()
-        .await
-        .map_err(|error| {
-            Report::new(PlatformError::HttpClient).attach(format!(
-                "failed to read Spin outbound response body: {error}"
-            ))
-        })?;
-    Ok(collected.to_bytes().to_vec())
-}
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
@@ -74,16 +22,17 @@ const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 struct NoopConfigStore;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
 
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
     }
 }
@@ -92,36 +41,18 @@ impl PlatformConfigStore for NoopConfigStore {
 struct NoopSecretStore;
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
-    }
-}
-
-struct NoopBackend;
-
-impl PlatformBackend for NoopBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Spin
-    }
-
-    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.naming_policy()
-            .predict(spec)
-            .map(|prediction| prediction.name)
-            .change_context(PlatformError::Backend)
-    }
-
-    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.predict_name(spec)
     }
 }
 
@@ -136,6 +67,7 @@ impl PlatformBackend for NoopBackend {
 /// typed errors.
 pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
+#[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         futures::executor::block_on(self.0.get(key))
@@ -144,18 +76,19 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
                     "config store lookup failed for key `{key}`: {error}"
                 ))
             })?
+            .map(|value| String::from(value.as_str()))
             .ok_or_else(|| {
                 Report::new(PlatformError::ConfigStore)
                     .attach(format!("key `{key}` not found in Spin config store"))
             })
     }
 
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("config store writes are not supported on Spin"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("config store writes are not supported on Spin"))
     }
@@ -263,414 +196,6 @@ impl KvStore for KvHandleAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Response policy helpers
-// ---------------------------------------------------------------------------
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn sanitize_response_headers(headers: HeaderPairs) -> HeaderPairs {
-    let connection_tokens = connection_header_tokens(&headers);
-
-    headers
-        .into_iter()
-        .filter(|(name, _)| !is_hop_by_hop_response_header(name, &connection_tokens))
-        .collect()
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn connection_header_tokens(headers: &HeaderPairs) -> Vec<String> {
-    headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
-        .filter_map(|(_, value)| std::str::from_utf8(value).ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bool {
-    let lowercase_name = name.to_ascii_lowercase();
-    matches!(
-        lowercase_name.as_str(),
-        "connection"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "keep-alive"
-    ) || connection_tokens
-        .iter()
-        .any(|token| token == &lowercase_name)
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn content_encoding(headers: &HeaderPairs) -> Option<String> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
-        .and_then(|(_, value)| std::str::from_utf8(value).ok())
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn reject_unsupported_request_contracts(
-    request: &PlatformHttpRequest,
-) -> Result<(), Report<PlatformError>> {
-    if request.image_optimizer.is_some() {
-        return Err(Report::new(PlatformError::HttpClient)
-            .attach("Spin outbound HTTP does not support Image Optimizer metadata"));
-    }
-    if request.stream_response {
-        return Err(Report::new(PlatformError::HttpClient)
-            .attach("Spin outbound HTTP does not support streaming responses"));
-    }
-    Ok(())
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn response_must_not_have_body(method: &edgezero_core::http::Method, status: u16) -> bool {
-    method == edgezero_core::http::Method::HEAD
-        || (100..200).contains(&status)
-        || status == 204
-        || status == 304
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn apply_spin_response_policy(
-    method: &edgezero_core::http::Method,
-    status: u16,
-    headers: HeaderPairs,
-    body: Vec<u8>,
-) -> Result<BufferedResponseParts, Report<PlatformError>> {
-    let mut headers = sanitize_response_headers(headers);
-
-    // Bound the buffered body on every path, not just decompressed ones. An
-    // identity response or an unsupported encoding (e.g. zstd) is returned as-is,
-    // so without this check a large origin/ad-server/proxy response would be
-    // forwarded after being fully buffered instead of failing with a typed error.
-    // For gzip/br this also rejects an overlarge compressed body before
-    // decompression; `decompress_body` separately bounds the expanded size.
-    enforce_response_size(body.len())?;
-
-    if response_must_not_have_body(method, status) {
-        return Ok((headers, body));
-    }
-
-    let Some(encoding) = content_encoding(&headers) else {
-        return Ok((headers, body));
-    };
-
-    if !matches!(encoding.as_str(), "gzip" | "br") {
-        return Ok((headers, body));
-    }
-
-    let body = decompress_body(&body, &encoding, MAX_DECOMPRESSED_SIZE)?;
-    headers.retain(|(name, _)| {
-        !name.eq_ignore_ascii_case("content-encoding")
-            && !name.eq_ignore_ascii_case("content-length")
-    });
-    Ok((headers, body))
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn enforce_response_size(len: usize) -> Result<(), Report<PlatformError>> {
-    if len > MAX_DECOMPRESSED_SIZE {
-        return Err(Report::new(PlatformError::HttpClient).attach(format!(
-            "response body exceeded maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn decompress_body(
-    body: &[u8],
-    encoding: &str,
-    max_size: usize,
-) -> Result<Vec<u8>, Report<PlatformError>> {
-    match encoding {
-        "gzip" => {
-            let decoder = flate2::read::GzDecoder::new(body);
-            read_decompressed(decoder, encoding, max_size)
-        }
-        "br" => {
-            let decoder = brotli::Decompressor::new(body, 8192);
-            read_decompressed(decoder, encoding, max_size)
-        }
-        _ => Ok(body.to_vec()),
-    }
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn read_decompressed<R>(
-    reader: R,
-    encoding: &str,
-    max_size: usize,
-) -> Result<Vec<u8>, Report<PlatformError>>
-where
-    R: std::io::Read,
-{
-    let mut decoded = Vec::new();
-    reader
-        .take(max_size as u64 + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|e| {
-            Report::new(PlatformError::HttpClient)
-                .attach(format!("{encoding} decompression failed: {e}"))
-        })?;
-    if decoded.len() > max_size {
-        return Err(Report::new(PlatformError::HttpClient).attach(format!(
-            "{encoding} decompression exceeded maximum size of {max_size} bytes"
-        )));
-    }
-    Ok(decoded)
-}
-
-// ---------------------------------------------------------------------------
-// SpinPlatformHttpClient — WASM target + spin feature only
-// ---------------------------------------------------------------------------
-
-/// Returns `true` for headers forbidden on WASI HTTP outbound requests.
-///
-/// WASI HTTP (wasi:http@0.2) forbids `host` on outgoing requests — the
-/// authority is conveyed separately via `OutgoingRequest::set_authority`.
-/// Hop-by-hop headers (`connection`, `keep-alive`, `transfer-encoding`,
-/// `upgrade`, `proxy-connection`) are HTTP/1.1 transport-layer concerns
-/// that must not appear in WASI HTTP requests.
-// Compiled for tests on native targets so unit tests can exercise the filter
-// without requiring wasm32; the only production call site is inside the
-// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` block below.
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("host")
-        || name.eq_ignore_ascii_case("connection")
-        || name.eq_ignore_ascii_case("keep-alive")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("upgrade")
-        || name.eq_ignore_ascii_case("proxy-connection")
-}
-
-/// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
-///
-/// Auction configuration supports one provider at a time, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
-/// Requests start in a runtime task at dispatch, overlapping publisher-origin work.
-/// Deadline selection bounds waiting for the full send and response body collection.
-/// Dropping the pending operation cancels its WASI asynchronous operations.
-///
-/// Spin's WASI HTTP API sends one request and returns the original response; it
-/// exposes no redirect-follow policy. Each trait call therefore reaches exactly
-/// one `spin_sdk::http::send` boundary and returns an original 3xx to core. Host
-/// tests cannot instantiate Spin's WASI transport, so the common
-/// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
-/// cover request/response policy around that single boundary.
-///
-/// Backend phase timeouts remain unsupported. Callers requiring an absolute
-/// cutoff use [`PlatformHttpClient::select_until`].
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub struct SpinPlatformHttpClient;
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl SpinPlatformHttpClient {
-    async fn execute(
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        reject_unsupported_request_contracts(&request)?;
-
-        let method = request.request.method().clone();
-        let uri = request.request.uri().to_string();
-
-        let mut builder = spin_sdk::http::Request::builder()
-            .method(into_spin_method(&method))
-            .uri(uri.clone());
-
-        for (name, value) in request.request.headers() {
-            // WASI HTTP forbids these headers on outbound requests:
-            // `host` is conveyed via set_authority; hop-by-hop headers are HTTP/1.1 only.
-            if is_wasi_forbidden_outbound_header(name.as_str()) {
-                continue;
-            }
-            match value.to_str() {
-                Ok(value) => {
-                    builder = builder.header(name.as_str(), value);
-                }
-                Err(_) => {
-                    log::warn!(
-                        "dropping non-UTF-8 outbound request header (Spin WASI limitation): {}",
-                        name
-                    );
-                }
-            }
-        }
-
-        let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                // TODO: streaming request bodies unsupported; large proxy POBs (e.g.
-                // /first-party/proxy-rebuild) will fail until Spin WASI HTTP buffering
-                // is added to this client.
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("streaming request bodies are not supported on Spin outbound HTTP"));
-            }
-        };
-        let spin_request = builder
-            .body(spin_sdk::http::FullBody::new(Bytes::from(body_bytes)))
-            .map_err(|error| {
-                Report::new(PlatformError::HttpClient)
-                    .attach(format!("failed to build Spin outbound request: {error}"))
-            })?;
-
-        let spin_response: spin_sdk::http::Response =
-            spin_sdk::http::send(spin_request).await.map_err(|e| {
-                Report::new(PlatformError::HttpClient)
-                    .attach(format!("outbound request to {uri} failed: {e}"))
-            })?;
-
-        let status = spin_response.status().as_u16();
-        let headers: HeaderPairs = spin_response
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-            .collect();
-        let body = collect_limited_body(spin_response.into_body()).await?;
-
-        let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
-        let mut edge_builder = edgezero_core::http::response_builder().status(status);
-        for (name, value) in headers {
-            edge_builder = edge_builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(body))
-            .change_context(PlatformError::HttpClient)?;
-
-        Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
-    }
-}
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-#[async_trait::async_trait(?Send)]
-impl PlatformHttpClient for SpinPlatformHttpClient {
-    fn supports_concurrent_fanout(&self) -> bool {
-        // Requests start concurrently at dispatch, but `select` and
-        // `select_until` collect only one response, so multi-provider fan-out
-        // stays unsupported.
-        false
-    }
-
-    async fn send(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformResponse, Report<PlatformError>> {
-        Self::execute(request).await
-    }
-
-    async fn send_async(
-        &self,
-        request: PlatformHttpRequest,
-    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-        let backend_name = request.backend_name.clone();
-        let pending =
-            PlatformPendingResponse::start(Self::execute(request), spin_sdk::wasip3::spawn);
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
-    }
-
-    async fn select(
-        &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        if pending_requests.is_empty() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("select called with an empty pending_requests list"));
-        }
-
-        if pending_requests.len() >= 2 {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "SpinPlatformHttpClient: multi-provider fan-out is not supported \
-                 ({} providers submitted). Configure a single auction provider \
-                 or use the Fastly adapter for parallel DSP fan-out.",
-                pending_requests.len()
-            )));
-        }
-
-        let ready_platform = pending_requests.remove(0);
-        let mut pending = ready_platform
-            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
-            .map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("unexpected inner type in SpinPlatformHttpClient::select")
-            })?;
-
-        let ready = pending.wait().await.unwrap_or_else(|error| {
-            Err(Report::new(PlatformError::HttpClient)
-                .attach(format!("dispatched response task stopped: {error}")))
-        });
-        Ok(PlatformSelectResult {
-            ready,
-            remaining: pending_requests,
-            failed_backend_name: None,
-        })
-    }
-
-    async fn select_until(
-        &self,
-        mut pending_requests: Vec<PlatformPendingRequest>,
-        deadline: web_time::Instant,
-    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-        if pending_requests.is_empty() {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("select_until called with an empty pending_requests list"));
-        }
-        if pending_requests.len() > 1 {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("multi-provider fan-out is not supported on this adapter"));
-        }
-        let platform_pending = pending_requests.remove(0);
-        let backend_name = platform_pending.backend_name().map(str::to_owned);
-        let mut pending = platform_pending
-            .downcast::<PlatformPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
-            .map_err(|_| {
-                Report::new(PlatformError::HttpClient)
-                    .attach("unexpected pending request type in deadline selection")
-            })?;
-        let result = pending
-            .complete_before_deadline(
-                async {
-                    let remaining = deadline.saturating_duration_since(web_time::Instant::now());
-                    if !remaining.is_zero() {
-                        spin_sdk::time::sleep(remaining).await;
-                    }
-                },
-                deadline,
-                web_time::Instant::now,
-            )
-            .await;
-        Ok(result.map(|result| {
-            let ready = result.unwrap_or_else(|error| {
-                Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("dispatched response task stopped: {error}")))
-            });
-            PlatformSelectResult {
-                failed_backend_name: ready.as_ref().err().and(backend_name),
-                ready,
-                remaining: pending_requests,
-            }
-        }))
-    }
-}
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Method {
-    spin_sdk::http::Method::from_bytes(method.as_str().as_bytes())
-        .expect("should convert valid HTTP method")
-}
-
-// ---------------------------------------------------------------------------
 // SpinSecretStoreAdapter — WASM target + spin feature only
 // ---------------------------------------------------------------------------
 
@@ -691,6 +216,7 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 pub(crate) struct SpinSecretStoreAdapter;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
 impl PlatformSecretStore for SpinSecretStoreAdapter {
     fn get_bytes(
         &self,
@@ -706,12 +232,12 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
         }
     }
 
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store writes are not supported on Spin"))
     }
 
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store deletes are not supported on Spin"))
     }
@@ -726,14 +252,19 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 /// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
 /// before routing. Secrets are read synchronously from Spin component
 /// variables because Trusted Server's platform secret trait is sync.
-#[must_use]
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+///
+/// The outbound client is the one the request context carries, with the proxy
+/// marker turned off, and the clock is the context's monotonic clock.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client.
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     let client_ip = extract_client_ip(ctx);
-
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(SpinPlatformHttpClient);
-    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
+    let outbound_client = request_outbound_client(ctx)?;
 
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
@@ -754,8 +285,8 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .config_store(config_store)
         .secret_store(secret_store)
         .kv_store(kv_store)
-        .backend(Arc::new(NoopBackend))
-        .http_client(http_client)
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
         .geo(Arc::new(NullGeo))
         .client_info(ClientInfo {
             client_ip,
@@ -773,7 +304,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         std::sync::OnceLock::new();
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(SpinTimer))));
-    builder.build()
+    Ok(builder.build())
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +333,8 @@ impl PlatformGeo for NullGeo {
 /// Cloudflare adapters receive. Deployments fronting Spin with such a hop must
 /// account for this.
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    edgezero_adapter_spin::context::SpinRequestContext::get(ctx.request())
+    ctx.extensions()
+        .get::<edgezero_adapter_spin::context::SpinRequestContext>()
         .and_then(|c| c.client_addr)
 }
 
@@ -823,27 +355,42 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
-    use trusted_server_core::platform::AuctionTargetId;
-
-    #[test]
-    fn auction_http_capabilities_are_explicit() {
-        let capabilities = AuctionTargetId::Spin.descriptor().capabilities();
-        assert!(!capabilities.supports_concurrent_provider_fanout());
-    }
+    use edgezero_core::config_store::{
+        BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigValue, finish_bounded_config_read,
+    };
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write as _;
+    use edgezero_core::time::{Deadline, MonotonicClock};
+    use trusted_server_core::platform::HttpClient;
+    use trusted_server_core::test_support::scripted_client::ScriptedHttpClient;
 
     struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for InMemoryConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.0.get(key).cloned())
+        async fn get(&self, key: &str) -> Result<Option<ConfigValue>, ConfigStoreError> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| ConfigValue::from(value.as_str())))
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<ConfigValue>, ConfigStoreError> {
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
@@ -854,64 +401,6 @@ mod tests {
             .body(Body::empty())
             .expect("should build request");
         RequestContext::new(req, PathParams::default())
-    }
-
-    fn gzip_bytes(input: &[u8]) -> Vec<u8> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(input)
-            .expect("should write gzip test payload");
-        encoder.finish().expect("should finish gzip test payload")
-    }
-
-    fn brotli_bytes(input: &[u8]) -> Vec<u8> {
-        let mut compressed = Vec::new();
-        {
-            let mut compressor = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 21);
-            compressor
-                .write_all(input)
-                .expect("should write brotli test payload");
-        }
-        compressed
-    }
-
-    fn platform_request() -> PlatformHttpRequest {
-        let req = request_builder()
-            .method("GET")
-            .uri("https://origin.example/asset.png")
-            .body(Body::empty())
-            .expect("should build platform HTTP request");
-        PlatformHttpRequest::new(req, "origin")
-    }
-
-    fn apply_get_response_policy(
-        headers: HeaderPairs,
-        body: Vec<u8>,
-    ) -> Result<BufferedResponseParts, Report<PlatformError>> {
-        apply_spin_response_policy(&edgezero_core::http::Method::GET, 200, headers, body)
-    }
-
-    #[test]
-    fn response_policy_preserves_original_redirect_at_single_send_boundary() {
-        let (headers, body) = apply_spin_response_policy(
-            &edgezero_core::http::Method::GET,
-            302,
-            vec![(
-                "location".to_string(),
-                b"https://redirect.example/next".to_vec(),
-            )],
-            Vec::new(),
-        )
-        .expect("should preserve redirect response");
-
-        assert_eq!(
-            headers,
-            vec![(
-                "location".to_string(),
-                b"https://redirect.example/next".to_vec(),
-            )]
-        );
-        assert!(body.is_empty());
     }
 
     #[test]
@@ -1073,10 +562,59 @@ mod tests {
         );
     }
 
+    /// Builds a context without a Spin request context whose request carries
+    /// `client`, as `EdgeZero`'s Spin request conversion installs its default
+    /// client.
+    fn make_ctx_with_outbound_client(client: HttpClient) -> RequestContext {
+        let mut req = request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(client);
+        RequestContext::new(req, PathParams::default())
+    }
+
+    #[test]
+    fn build_runtime_services_carries_the_context_client_with_the_proxy_marker_off() {
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let ctx = make_ctx_with_outbound_client(client);
+
+        let services = build_runtime_services(&ctx).expect("should build runtime services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    #[test]
+    fn build_runtime_services_rejects_a_request_without_an_outbound_client() {
+        let ctx = make_ctx_without_spin_context();
+
+        let error = build_runtime_services(&ctx)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_runtime_services_uses_noop_native_stores_without_handles() {
-        let ctx = make_ctx_without_spin_context();
-        let services = build_runtime_services(&ctx);
+        let ctx = make_ctx_with_outbound_client(ScriptedHttpClient::forbidding().http_client());
+        let services = build_runtime_services(&ctx).expect("should build runtime services");
 
         assert!(
             services.client_info().client_ip.is_none(),
@@ -1104,286 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_request_contracts_reject_image_optimizer_metadata() {
-        use trusted_server_core::platform::{
-            PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-        };
-
-        let request = platform_request().with_image_optimizer(PlatformImageOptimizerOptions::new(
-            "us_west",
-            PlatformImageOptimizerParams::default(),
-        ));
-
-        assert!(
-            reject_unsupported_request_contracts(&request).is_err(),
-            "Spin must reject Image Optimizer metadata instead of silently dropping it"
-        );
-    }
-
-    #[test]
-    fn unsupported_request_contracts_reject_stream_response() {
-        let request = platform_request().with_stream_response();
-
-        assert!(
-            reject_unsupported_request_contracts(&request).is_err(),
-            "Spin must reject streaming-response requests instead of buffering silently"
-        );
-    }
-
-    #[test]
-    fn response_policy_strips_transfer_encoding() {
-        let (headers, body) = apply_get_response_policy(
-            vec![
-                ("transfer-encoding".to_string(), b"chunked".to_vec()),
-                ("x-preserve".to_string(), b"yes".to_vec()),
-            ],
-            b"ok".to_vec(),
-        )
-        .expect("should apply response policy");
-
-        assert_eq!(body, b"ok", "should preserve body");
-        assert!(
-            headers.iter().all(|(name, _)| name != "transfer-encoding"),
-            "should strip transfer-encoding"
-        );
-        assert!(
-            headers.iter().any(|(name, _)| name == "x-preserve"),
-            "should preserve ordinary headers"
-        );
-    }
-
-    #[test]
-    fn response_policy_strips_headers_named_by_connection() {
-        let (headers, _) = apply_get_response_policy(
-            vec![
-                ("connection".to_string(), b"keep-alive, x-remove".to_vec()),
-                ("x-remove".to_string(), b"drop".to_vec()),
-                ("x-keep".to_string(), b"keep".to_vec()),
-            ],
-            b"ok".to_vec(),
-        )
-        .expect("should apply response policy");
-
-        assert!(
-            headers.iter().all(|(name, _)| name != "connection"),
-            "should strip connection"
-        );
-        assert!(
-            headers.iter().all(|(name, _)| name != "x-remove"),
-            "should strip headers named by connection"
-        );
-        assert!(
-            headers.iter().any(|(name, _)| name == "x-keep"),
-            "should preserve ordinary response headers"
-        );
-    }
-
-    #[test]
-    fn response_policy_decodes_gzip_and_strips_encoding_headers() {
-        let (headers, body) = apply_get_response_policy(
-            vec![
-                ("content-encoding".to_string(), b"gzip".to_vec()),
-                ("content-length".to_string(), b"999".to_vec()),
-                ("content-type".to_string(), b"text/plain".to_vec()),
-            ],
-            gzip_bytes(b"hello gzip"),
-        )
-        .expect("should decode gzip body");
-
-        assert_eq!(body, b"hello gzip", "should decode gzip payload");
-        assert!(
-            headers.iter().all(|(name, _)| {
-                !name.eq_ignore_ascii_case("content-encoding")
-                    && !name.eq_ignore_ascii_case("content-length")
-            }),
-            "should strip content-encoding and content-length after decode"
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(name, value)| name == "content-type" && value == b"text/plain"),
-            "should preserve ordinary headers"
-        );
-    }
-
-    #[test]
-    fn response_policy_decodes_brotli_and_strips_encoding_headers() {
-        let (headers, body) = apply_get_response_policy(
-            vec![
-                ("content-encoding".to_string(), b"br".to_vec()),
-                ("content-length".to_string(), b"999".to_vec()),
-            ],
-            brotli_bytes(b"hello brotli"),
-        )
-        .expect("should decode brotli body");
-
-        assert_eq!(body, b"hello brotli", "should decode brotli payload");
-        assert!(
-            headers.iter().all(|(name, _)| {
-                !name.eq_ignore_ascii_case("content-encoding")
-                    && !name.eq_ignore_ascii_case("content-length")
-            }),
-            "should strip content-encoding and content-length after decode"
-        );
-    }
-
-    #[test]
-    fn response_policy_preserves_unsupported_encoding() {
-        let (headers, body) = apply_get_response_policy(
-            vec![("content-encoding".to_string(), b"zstd".to_vec())],
-            b"raw body".to_vec(),
-        )
-        .expect("should preserve unsupported encoding");
-
-        assert_eq!(body, b"raw body", "should preserve raw body bytes");
-        assert!(
-            headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("content-encoding") && value == b"zstd"
-            }),
-            "should preserve unsupported encoding header"
-        );
-    }
-
-    #[test]
-    fn response_policy_skips_decoding_for_head_responses() {
-        let (headers, body) = apply_spin_response_policy(
-            &edgezero_core::http::Method::HEAD,
-            200,
-            vec![
-                ("content-encoding".to_string(), b"gzip".to_vec()),
-                ("content-length".to_string(), b"999".to_vec()),
-                ("transfer-encoding".to_string(), b"chunked".to_vec()),
-            ],
-            Vec::new(),
-        )
-        .expect("should apply HEAD response policy without decoding");
-
-        assert!(body.is_empty(), "should preserve the empty HEAD body");
-        assert!(
-            headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("content-encoding") && value.as_slice() == b"gzip"
-            }),
-            "should preserve content-encoding on HEAD responses"
-        );
-        assert!(
-            headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("content-length") && value.as_slice() == b"999"
-            }),
-            "should preserve content-length on HEAD responses"
-        );
-        assert!(
-            headers
-                .iter()
-                .all(|(name, _)| !name.eq_ignore_ascii_case("transfer-encoding")),
-            "should still strip hop-by-hop headers on HEAD responses"
-        );
-    }
-
-    #[test]
-    fn response_policy_skips_decoding_for_no_body_statuses() {
-        for status in [100, 101, 204, 304] {
-            let (headers, body) = apply_spin_response_policy(
-                &edgezero_core::http::Method::GET,
-                status,
-                vec![
-                    ("content-encoding".to_string(), b"gzip".to_vec()),
-                    ("content-length".to_string(), b"999".to_vec()),
-                    ("connection".to_string(), b"close".to_vec()),
-                ],
-                Vec::new(),
-            )
-            .expect("should apply no-body response policy without decoding");
-
-            assert!(
-                body.is_empty(),
-                "status {status} should preserve the empty body"
-            );
-            assert!(
-                headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-encoding") && value.as_slice() == b"gzip"
-                }),
-                "status {status} should preserve content-encoding"
-            );
-            assert!(
-                headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-length") && value.as_slice() == b"999"
-                }),
-                "status {status} should preserve content-length"
-            );
-            assert!(
-                headers
-                    .iter()
-                    .all(|(name, _)| !name.eq_ignore_ascii_case("connection")),
-                "status {status} should still strip hop-by-hop headers"
-            );
-        }
-    }
-
-    #[test]
-    fn response_policy_reports_gzip_decode_failure() {
-        let result = apply_get_response_policy(
-            vec![("content-encoding".to_string(), b"gzip".to_vec())],
-            b"not gzip".to_vec(),
-        );
-
-        assert!(result.is_err(), "should reject invalid gzip payload");
-    }
-
-    #[test]
-    fn response_policy_rejects_oversized_identity_body() {
-        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
-        let result = apply_get_response_policy(Vec::new(), oversized);
-
-        assert!(
-            result.is_err(),
-            "should reject an identity response larger than the size ceiling"
-        );
-    }
-
-    #[test]
-    fn response_policy_rejects_oversized_unsupported_encoding_body() {
-        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
-        let result = apply_get_response_policy(
-            vec![("content-encoding".to_string(), b"zstd".to_vec())],
-            oversized,
-        );
-
-        assert!(
-            result.is_err(),
-            "should reject an unsupported-encoding response larger than the size ceiling"
-        );
-    }
-
-    #[test]
-    fn response_policy_allows_body_at_size_ceiling() {
-        let at_limit = vec![0u8; MAX_DECOMPRESSED_SIZE];
-        let (_, body) = apply_get_response_policy(Vec::new(), at_limit)
-            .expect("should accept an identity body exactly at the ceiling");
-
-        assert_eq!(
-            body.len(),
-            MAX_DECOMPRESSED_SIZE,
-            "should pass through a body at the ceiling unchanged"
-        );
-    }
-
-    #[test]
-    fn decompression_limit_is_enforced() {
-        let compressed = gzip_bytes(b"expanded body");
-        let result = decompress_body(&compressed, "gzip", 4);
-
-        assert!(
-            result.is_err(),
-            "should reject decoded bodies larger than the configured limit"
-        );
-        assert_eq!(
-            MAX_DECOMPRESSED_SIZE,
-            8 * 1024 * 1024,
-            "production limit must stay within Spin WASM heap budget"
-        );
-    }
-
-    #[test]
     fn spin_variable_name_rejects_digit_leading_key() {
         // Encoder enforces the lowercase-letter start contract at the boundary so
         // no caller can produce aliasing (e.g. "1foo" and "n1foo" would collide).
@@ -1400,69 +658,6 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject uppercase-leading key at the encoder boundary"
-        );
-    }
-
-    #[test]
-    fn wasi_forbidden_headers_are_identified() {
-        for header in &[
-            "host",
-            "Host",
-            "HOST",
-            "connection",
-            "keep-alive",
-            "transfer-encoding",
-            "upgrade",
-            "proxy-connection",
-        ] {
-            assert!(
-                is_wasi_forbidden_outbound_header(header),
-                "{header} should be forbidden in WASI HTTP outbound requests"
-            );
-        }
-        for header in &[
-            "user-agent",
-            "accept",
-            "content-type",
-            "x-custom",
-            "authorization",
-        ] {
-            assert!(
-                !is_wasi_forbidden_outbound_header(header),
-                "{header} should be allowed in WASI HTTP outbound requests"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod deadline_tests {
-    use futures::executor::block_on;
-
-    #[test]
-    fn spin_body_collection_rejects_oversized_stream() {
-        let body = http_body_util::Full::new(bytes::Bytes::from(vec![
-            0;
-            super::MAX_DECOMPRESSED_SIZE
-                + 1
-        ]));
-        let result = block_on(super::collect_limited_body(body));
-        assert!(
-            result.is_err(),
-            "should reject a response exceeding the streamed body cap"
-        );
-    }
-
-    #[test]
-    fn spin_body_collection_accepts_body_at_limit() {
-        let body =
-            http_body_util::Full::new(bytes::Bytes::from(vec![0; super::MAX_DECOMPRESSED_SIZE]));
-        let result = block_on(super::collect_limited_body(body))
-            .expect("should collect a body at the limit");
-        assert_eq!(
-            result.len(),
-            super::MAX_DECOMPRESSED_SIZE,
-            "should retain the complete permitted body"
         );
     }
 }

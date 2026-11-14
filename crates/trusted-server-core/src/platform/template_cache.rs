@@ -5,13 +5,13 @@
 //!
 //! | Cache                | Contents                          | Owner                          |
 //! | -------------------- | --------------------------------- | ------------------------------ |
-//! | Origin readthrough   | raw origin bytes                  | The platform. Not this module. |
+//! | Origin readthrough   | raw origin bytes                  | Unavailable. Not this module.  |
 //! | Template cache       | post-`lol_html`, pre-assembly     | **This module.**               |
 //! | Assembled response   | final per-user assembled response | **Must never exist.**          |
 //!
-//! The origin readthrough cache is gated separately by
-//! `creative_opportunities.origin_readthrough_enabled` (issue #852). The two are
-//! independent: one can be on while the other is off.
+//! Origin readthrough is unavailable: validation rejects
+//! `creative_opportunities.origin_readthrough_enabled = true` until `EdgeZero`
+//! surrogate keys (EZ-11) restore it.
 //!
 //! The template cache holds a *shared template*: no per-user bytes, and no decisions that depend on
 //! the request. What may and may not live in it is

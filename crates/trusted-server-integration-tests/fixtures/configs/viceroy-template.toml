@@ -81,6 +81,14 @@
         [[local_server.secret_stores.trusted_server_secrets]]
             key = "integration_partner_token_bravo"
             data = "integration-test-token-bravo-32-bytes-ok"
+        # Example AWS credentials for the S3 SigV4 asset routes. They sign
+        # requests to a loopback test origin only.
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_s3_access_key_id"
+            data = "AKIAIOSFODNN7EXAMPLE"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_s3_secret_access_key"
+            data = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 
     [local_server.config_stores]
         # Generated integration configs inject the manifest-default app-config blob

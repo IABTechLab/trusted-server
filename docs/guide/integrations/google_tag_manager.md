@@ -251,22 +251,28 @@ POST /integrations/google_tag_manager/g/collect?v=2&...
 
 **POST Request Handling**:
 
-The endpoint validates POST request sizes to prevent memory pressure:
+The endpoint bounds POST bodies to prevent memory pressure:
 
-- If `Content-Length` header is present and valid:
-  - Requests exceeding `max_beacon_body_size` are rejected early with `413 Payload Too Large`
-  - Valid requests proceed normally
-- If `Content-Length` header is malformed: `400 Bad Request`
-- If `Content-Length` header is missing: Request is accepted (HTTP/2 compatible)
-  - Body is read in 8KB chunks with size validation
-  - Reading stops immediately if `max_beacon_body_size` is exceeded
-  - Oversized bodies return `413 Payload Too Large` without buffering the full payload
+- A declared `Content-Length` over `max_beacon_body_size` returns
+  `413 Payload Too Large` before any body byte is read.
+- A malformed or duplicate `Content-Length`, or `Content-Length` together with
+  `Transfer-Encoding`, returns `400 Bad Request` from EdgeZero's ingress check
+  before the route runs.
+- A body with no `Content-Length`, or under it, is read through a bounded
+  reader. The read stops as soon as the body would pass
+  `max_beacon_body_size` and returns `413 Payload Too Large`.
+- A body still unread 30 s after the request arrived returns
+  `408 Request Timeout`.
+- A body stream that fails with EdgeZero's framing error returns
+  `400 Bad Request`.
+- Any other failed body read returns `502 Bad Gateway`.
 
 **Memory Protection**:
 
-The implementation uses chunked reading to prevent unbounded memory allocation. Bodies are read in small chunks (8KB), and size is validated incrementally. This ensures that even if a client sends a malicious multi-gigabyte POST (with no Content-Length or an incorrect one), the server will reject it after reading at most `max_beacon_body_size + 8KB` into memory.
-
-This approach maintains compatibility with HTTP/2 and HTTP/3 clients while providing robust protection against memory exhaustion attacks.
+The bounded reader checks the cap before it appends each chunk, so it never
+holds more than `max_beacon_body_size` bytes of a body, whatever length the
+client declares. Bodies without a `Content-Length`, as HTTP/2 and HTTP/3 clients
+send them, are accepted under the same bound.
 
 ## Performance & Caching
 

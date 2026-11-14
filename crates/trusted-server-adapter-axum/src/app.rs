@@ -2,13 +2,14 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+    HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
-use edgezero_core::router::RouterService;
+use edgezero_core::outbound::ResponseDecoding;
+use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -20,15 +21,17 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -38,7 +41,7 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 
-use trusted_server_core::platform::{ClientInfo, RuntimeServices};
+use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
@@ -92,7 +95,6 @@ fn build_state_with_services(
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
@@ -105,30 +107,11 @@ fn build_state_with_services(
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .map_or_else(|| build_runtime_services(ctx), Ok)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -161,8 +144,8 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = state.services_for_request(&ctx);
-    let mut req = ctx.into_request();
+    let services = state.services_for_request(&ctx)?;
+    let mut req = ctx.into_request()?;
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -253,27 +236,36 @@ async fn dispatch_fallback(
         slots: state.settings.creative_opportunity_slots(),
         registry: None,
     };
-    let publisher_response = handle_publisher_request(
+    // Axum has no runtime memory limit of its own, so the publisher setting
+    // alone bounds the origin body this adapter collects before egress.
+    let input_cap = publisher_input_cap(&state.settings, u64::MAX);
+    let (publisher_response, owner) = handle_publisher_request(
         &state.settings,
         services,
         None,
         &mut ec_context,
         auction,
         req,
-        EdgeCacheHeader::SMaxageFallback,
+        PublisherOriginOptions {
+            edge_header: EdgeCacheHeader::SMaxageFallback,
+            input_cap: Some(input_cap),
+            response_decoding: ResponseDecoding::Original,
+        },
     )
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are
     // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
+    let response = buffer_publisher_response_async(
         publisher_response,
         &method,
         &state.settings,
         &state.registry,
         &state.orchestrator,
         services,
+        Some(input_cap),
     )
-    .await
+    .await?;
+    owner.attach(response).map_err(publisher_owner_error)
 }
 
 fn fallback_handler(
@@ -459,7 +451,7 @@ fn named_route_handler(
                         handle_trusted_server_discovery(&state.settings, &services, req)
                     }
                     NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
+                        handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather
@@ -564,7 +556,7 @@ fn named_route_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
+// Publisher fallback methods
 // ---------------------------------------------------------------------------
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -579,34 +571,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make_handler = |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make_handler(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make_handler(Arc::clone(&message)));
-    }
-    router.build()
-}
-
 // ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
@@ -615,20 +579,21 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app, synthesized_response_headers())
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
+    fn routes() -> Result<RouterService, EdgeError> {
+        let state = build_state().map_err(|report| {
+            log::error!("{report:?}");
+            startup_error(&report)
+        })?;
 
-        build_router(&state)
+        Ok(router_builder(&state).build())
     }
 }
 
@@ -647,7 +612,34 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).build())
+    }
+
+    /// Build the full application router from explicit settings, with `client`
+    /// in router state.
+    ///
+    /// Testing seam: `EdgeZero` hands a client in router state to every
+    /// request in place of the adapter's own, so an app served from this
+    /// router on `EdgeZero`'s Axum test server starts no real transport.
+    /// Production installs no client in router state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+    /// let router = TrustedServerApp::routes_with_settings_and_outbound_client(settings, client)?;
+    /// ```
+    pub fn routes_with_settings_and_outbound_client(
+        settings: Settings,
+        client: HttpClient,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(router_builder(&state).with_state(client).build())
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -655,6 +647,8 @@ impl TrustedServerApp {
     /// Each request receives a clone of the supplied services, allowing callers
     /// to exercise production routes with deterministic platform dependencies.
     /// The supplied client metadata applies to every request to this router.
+    /// The services' outbound client also goes into router state, so an app
+    /// served from this router starts no real `EdgeZero` transport.
     ///
     /// # Errors
     ///
@@ -670,12 +664,14 @@ impl TrustedServerApp {
         settings: Settings,
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
+        let client = services.outbound_client().clone();
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).with_state(client).build())
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
+/// Registers every route, middleware, and hook for `state` on a router builder.
+fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let fallback = fallback_handler(Arc::clone(state));
     let trace_state = Arc::clone(state);
 
@@ -722,10 +718,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         router = router.route("/{*rest}", method, fallback.clone());
     }
 
-    router.build()
+    router
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -738,7 +734,9 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
     }
     TraceMetadata {
         client_info: ClientInfo {
-            client_ip: AxumRequestContext::get(request)
+            client_ip: request
+                .extensions
+                .get::<AxumRequestContext>()
                 .and_then(|context| context.remote_addr)
                 .map(|peer| peer.ip()),
             ..ClientInfo::default()

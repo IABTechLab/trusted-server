@@ -33,11 +33,15 @@ struct TerminalInput {
 }
 
 impl TerminalInput {
-    fn new(body: EdgeBody, compression: Compression, limit: usize) -> Self {
-        Self {
-            source: BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(limit),
+    fn new(
+        body: EdgeBody,
+        compression: Compression,
+        limit: usize,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            source: BodyChunkSource::new(body)?.with_max_bytes(limit),
             decoder: Box::new(BodyStreamDecoder::new(compression, limit)),
-        }
+        })
     }
 
     async fn next(
@@ -122,8 +126,8 @@ impl HtmlEofDriver {
             })?;
         processor.set_finish_marker(marker.as_deref());
         let compression = Compression::from_content_encoding(&params.content_encoding);
-        let limit = settings.publisher.max_buffered_body_bytes;
-        let input = TerminalInput::new(body, compression, limit);
+        let limit = params.max_input_bytes(settings);
+        let input = TerminalInput::new(body, compression, limit)?;
         let hold = params.dispatched_auction.take().map(|dispatched| {
             AuctionHoldState::new(
                 DispatchedAuctionGuard::new(dispatched),

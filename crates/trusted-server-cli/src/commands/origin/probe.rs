@@ -661,9 +661,8 @@ fn fronting_cache_verdict(baseline: &Fetched) -> VerdictResult {
     }
 }
 
-/// Readthrough has no equivalent of the template cache's `NoPositiveFreshness` refusal, so
-/// an origin that declares no freshness would be stored on a platform default instead of
-/// being declined.
+/// The template cache declines a response without positive shared freshness
+/// (`NoPositiveFreshness`), so a sample without it describes a page the cache never stores.
 fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
     // Every instance, not just the first. A field may arrive as several lines — a proxy
     // that appends `Cache-Control: private` after the origin's `public, max-age=300` is
@@ -1000,8 +999,7 @@ mod tests {
     fn absent_cache_control_fails_freshness() {
         assert!(
             !freshness_verdict(&fetched(&[])).passed,
-            "readthrough would store this on a platform default where the template cache \
-             declines it"
+            "the template cache declines a response without positive freshness"
         );
     }
 

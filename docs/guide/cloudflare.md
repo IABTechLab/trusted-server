@@ -9,11 +9,20 @@ config that `ts config push` writes into KV to the nested
 
 | Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
 | ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | absent | `500`          | no             | single           | outermost sanitize         | none                  |
+| `cloudflare` | development    | absent | `500`          | no             | multiple         | outermost sanitize         | none                  |
 
 This row is the canonical status summary. Cloudflare has no
-`/health` route, supports one enabled auction provider, and returns 500 on
-every route when startup fails.
+`/health` route and supports multiple auction providers. When startup fails,
+every route answers with EdgeZero's JSON error body at the startup error's
+status. That is normally 500; a KV store error answers 503, an auction, proxy,
+or integration error 502, and a bad-request error 400.
+
+EdgeZero's Cloudflare `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the Workers console, which `wrangler
+dev` prints and `wrangler tail` streams from a deployed Worker. The level comes
+from the `EDGEZERO__LOGGING__LEVEL` Worker variable and defaults to `info`, so
+the startup report and every warning are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 

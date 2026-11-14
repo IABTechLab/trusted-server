@@ -131,8 +131,8 @@ pub struct SiteInfo {
 /// In the **collect path** ([`collect_dispatched_auction`][collect]) the
 /// mediator is invoked with a synthetic placeholder request
 /// (`https://placeholder.invalid/`), because the real client request has
-/// already been consumed by `send_async` during dispatch and the host pipeline
-/// can't lend it across the `.await`. **Mediators must not depend on reading
+/// already been consumed by the publisher origin request during dispatch and
+/// the host pipeline can't lend it across the `.await`. **Mediators must not depend on reading
 /// client state from `context.request`** — the placeholder has none of the
 /// real headers. If a future mediator needs that data, snapshot it into a new
 /// field on this struct at dispatch time and stash it on the
@@ -147,13 +147,10 @@ pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request<EdgeBody>,
     /// Exact logical provider budget used by auction policy and payloads.
-    pub timeout_ms: u32,
-    /// Canonical backend transport timeout used for provider registration.
     ///
-    /// This can be lower than `timeout_ms` on runtimes whose backend names
-    /// encode timers. Providers that register a backend should use this value
-    /// for transport timers while retaining `timeout_ms` for logical policy.
-    pub transport_timeout_ms: u32,
+    /// Requests never take their transport timeout from it. Each provider
+    /// sets its own configured timeout, and the auction deadline bounds it.
+    pub timeout_ms: u32,
     /// Provider responses from the bidding phase, used by mediators.
     /// This is `None` for regular bidders and `Some` when calling a mediator.
     pub provider_responses: Option<&'a [AuctionResponse]>,

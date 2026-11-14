@@ -14,8 +14,8 @@ smoke_require_command() {
 
 smoke_require_spin_version() {
     # `.tool-versions` is the single source of truth for the pinned version, so
-    # the floor is read from there rather than restated here. spin-sdk 7 imports
-    # wasi:http/types@0.3.0, which Spin 4.0.x cannot link.
+    # the floor is read from there rather than restated here. spin-sdk 8 imports
+    # WASI HTTP 0.3, which Spin 4.0.x cannot link.
     local versions="${BASH_SOURCE[0]%/*}/../.tool-versions"
     local minimum
     minimum=$(awk '$1 == "spin" { print $2; exit }' "$versions" 2>/dev/null)
@@ -30,7 +30,7 @@ smoke_require_spin_version() {
     local lowest
     lowest=$(printf '%s\n%s\n' "$minimum" "$found" | sort -V | head -1)
     if [ "$lowest" != "$minimum" ]; then
-        smoke_die "spin $minimum or newer is required (found $found); spin-sdk 7 imports wasi:http/types@0.3.0, which earlier runtimes cannot link. Install from https://spinframework.dev/install"
+        smoke_die "spin $minimum or newer is required (found $found); spin-sdk 8 imports WASI HTTP 0.3, which earlier runtimes cannot link. Install from https://spinframework.dev/install"
     fi
 }
 

@@ -1,8 +1,17 @@
 # EdgeZero Lifecycle and Stores
 
-EdgeZero is the deployment and configuration layer used by the `ts` CLI.
+EdgeZero is the deployment and configuration layer used by the `ts` CLI, and
+the runtime layer under every adapter: each adapter serves requests through
+EdgeZero's request lifecycle and sends outbound HTTP through EdgeZero's client.
 The repository's `edgezero.toml` declares one application, three logical
 stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
+
+## Pinned version
+
+The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
+`IABTechLab/edgezero`: `5c32ae61a3e1bb647c26abbfbbc942768faac8c3`, the head of
+EdgeZero pull request 275. The pin moves with that pull request's head until
+it merges, and then to an EdgeZero release tag.
 
 ## Lifecycle
 
@@ -60,6 +69,51 @@ oversized, reordered, or modified chunk fails configuration loading.
 actual deletion requires `--yes --older-than WINDOW`. The age assertion
 applies to the whole physical store, not one root key; verify the reported
 store before deletion, especially when using `--store` or `--no-env`.
+
+## Request handling
+
+These rules hold on Fastly, Axum, Cloudflare, and Spin.
+
+**Inbound requests.**
+
+- A request target over 8192 bytes returns 414. More than 100 header fields,
+  or more than 64 KiB of header bytes, returns 431.
+- Ambiguous request framing returns 400: a duplicate or malformed
+  `Content-Length`, `Content-Length` with `Transfer-Encoding`, or a
+  `Transfer-Encoding` that is not chunked.
+- Each endpoint reads its body under its own cap and returns 413 above it. A
+  declared `Content-Length` over the cap returns 413 before any body byte is
+  read. A body still unread 30 s after the request arrived returns 408.
+- A publisher request streams its body to the origin under a 16 MiB cap, and a
+  larger upload returns 413. A forwarded `GET` or `HEAD` that carries body bytes
+  returns 400.
+
+**Outbound requests.**
+
+- Every request sets a 1 s connect timeout and a constant total timeout: the
+  configured timeout where a setting names one, such as an auction provider's
+  `timeout_ms`, 2 s for Tinybird, and otherwise 15 s for a buffered response or
+  60 s for a streamed one. A redirect chain also has a 60 s deadline. EdgeZero
+  enforces the connect timeout natively on Fastly only. On Axum, Cloudflare,
+  and Spin it is best effort, and the total timeout still bounds the request.
+- Origin TLS is always verified.
+- A request that sets no `Accept-Encoding` carries `Accept-Encoding: identity`.
+- Hop-by-hop fields, and fields that `Connection` names, never reach an
+  upstream or come back from one. A request or response header whose value is
+  not UTF-8 is dropped whole, with a warning that names the header.
+- The request URI is normalized as a WHATWG URL. A publisher request whose
+  target has a fragment, a backslash, or userinfo returns 400.
+- On Fastly, EdgeZero registers each backend at request time and names it
+  `ez_b31v1_` followed by a hash of the backend configuration.
+
+**Responses.**
+
+- Response egress strips hop-by-hop fields and never sends `Trailer`. A framing
+  error answers 500 before the response is committed.
+- A response body must finish within 60 s after egress starts.
+- Framework errors, such as a 404, 405, 414, or 431, render as EdgeZero JSON
+  and carry `x-ts-version`. A startup failure response carries no
+  `x-ts-version`.
 
 ## Safe operator sequence
 
