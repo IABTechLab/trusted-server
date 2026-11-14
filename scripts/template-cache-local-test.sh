@@ -349,6 +349,17 @@ data = "fictional-local-handler-password-secret-value"
 ''')
 PYEOF
 
+# EdgeZero's runtime level override: the same production-info wasm logs at debug
+# here, so the debug-only template_cache store line reaches viceroy.log.
+cat >> "$WORK/fastly.toml" <<'TOMLEOF'
+
+[local_server.config_stores.edgezero_logging]
+format = "inline-toml"
+
+[local_server.config_stores.edgezero_logging.contents]
+EDGEZERO__LOGGING__LEVEL = "debug"
+TOMLEOF
+
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
@@ -620,13 +631,14 @@ fi
 if [ "$CONFIG_MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
-  # The store line is a debug log. The Fastly build logs at the
-  # [adapters.fastly.logging] level in edgezero.toml, so it may be absent.
-  if ! grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
-    "$WORK/viceroy.log" | sort -u | sed 's/^/    /' | grep .; then
-    echo "    (not logged: the store line is a debug log, and edgezero.toml sets the"
-    echo "    [adapters.fastly.logging] level for this build)"
-  fi
+  STORE_LINES=$(grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
+    "$WORK/viceroy.log" | sort -u || true)
+  printf '%s\n' "$STORE_LINES" | sed 's/^/    /'
+  # Every stored template must keep its seam marker; the edgezero_logging
+  # override above is what makes this debug line visible.
+  check "every stored template keeps its seam marker" \
+    "$(printf '%s\n' "$STORE_LINES" | sed -nE 's/.*seam marker present: ([a-z]+)\)$/\1/p' | sort -u | tr '\n' ' ')" \
+    "true "
   echo
   echo "  What the reader receives (hole filled, no marker):"
   printf '    %d seam marker(s), %d window.tsjs\n' \
@@ -637,8 +649,7 @@ if [ "$CONFIG_MODE" = "esi" ]; then
   The marker is never visible in page source. It remains inert in the template cache. A cold miss
   converts it to one synthetic ESI include in a private working copy; a warm hit
   byte-splits it directly. Both replace it before sending the response.
-  With debug logging, `seam marker present: true` above shows the stored copy is
-  reader-agnostic.
+  `seam marker present: true` above proves the stored copy is reader-agnostic.
 EOF
 fi
 
