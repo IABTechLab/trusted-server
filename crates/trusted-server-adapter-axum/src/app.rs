@@ -742,7 +742,8 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)
+        install_edge_policies(app)?;
+        crate::record_ec::configure(app)
     }
 
     fn name() -> &'static str {
@@ -764,7 +765,7 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: None,
+            kv: crate::record_ec::metadata(),
         }
     }
 

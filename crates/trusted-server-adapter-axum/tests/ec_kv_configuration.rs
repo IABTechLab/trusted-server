@@ -1,36 +1,42 @@
-//! Exercise real environment selection in fresh processes, never mutate the
-//! parent test runner's environment or consult ambient AWS configuration.
+//! Exercise early record declarations in isolated processes without provider I/O.
 
 use std::process::Command;
 
-use trusted_server_adapter_axum::ec_kv::prepare_from_env;
+use edgezero_core::app::{App, Hooks as _};
+use edgezero_core::router::RouterService;
+use trusted_server_adapter_axum::app::TrustedServerApp;
 
 #[test]
 fn ec_kv_configuration_is_process_isolated() {
-    let mut cases = vec!["absent", "false", "empty", "uppercase", "numeric"];
-    #[cfg(not(feature = "aws-dynamodb-ec"))]
-    cases.push("missing-feature");
-    #[cfg(feature = "aws-dynamodb-ec")]
-    cases.extend([
-        "missing-binding",
-        "remote-endpoint",
-        "https-endpoint",
-        "endpoint-userinfo",
-        "endpoint-path",
-        "endpoint-query",
-        "endpoint-fragment",
-        "endpoint-no-port",
-    ]);
-    for case in cases {
+    for case in [
+        "absent",
+        "false",
+        "empty",
+        "uppercase",
+        "numeric",
+        "selected",
+    ] {
         let output =
             Command::new(std::env::current_exe().expect("should locate config test executable"))
                 .args(["--exact", "ec_kv_configuration_subprocess", "--nocapture"])
                 .env_clear()
                 .env("TS_EC_CONFIGURATION_CASE", case)
+                // These old connector settings must not open another provider.
+                .env("TS_EC_DYNAMODB_TABLE", "unused-fixture")
+                .env("TS_EC_DYNAMODB_LOCAL_ENDPOINT", "invalid-unused-endpoint")
+                .env("TS_EC_DYNAMODB_REGION", "unused")
                 .env("AWS_EC2_METADATA_DISABLED", "true")
-                .envs(configuration_bindings(case))
+                .envs(match case {
+                    "absent" => Vec::new(),
+                    "false" => vec![("TS_EC_DYNAMODB_ENABLED", "false")],
+                    "empty" => vec![("TS_EC_DYNAMODB_ENABLED", "")],
+                    "uppercase" => vec![("TS_EC_DYNAMODB_ENABLED", "TRUE")],
+                    "numeric" => vec![("TS_EC_DYNAMODB_ENABLED", "1")],
+                    "selected" => vec![("TS_EC_DYNAMODB_ENABLED", "true")],
+                    _ => unreachable!("should select a known fixture"),
+                })
                 .output()
-                .expect("should execute isolated provider configuration test");
+                .expect("should run isolated declaration test");
         assert!(
             output.status.success(),
             "configuration case {case} failed: {}",
@@ -39,67 +45,40 @@ fn ec_kv_configuration_is_process_isolated() {
     }
 }
 
-fn configuration_bindings(case: &str) -> Vec<(&'static str, &'static str)> {
-    let mut vars = vec![
-        ("TS_EC_DYNAMODB_TABLE", "ec-configuration"),
-        ("TS_EC_DYNAMODB_NAMESPACE", "configuration"),
-        ("TS_EC_DYNAMODB_REGION", "us-east-1"),
-        ("TS_EC_DYNAMODB_LOCAL_ENDPOINT", "invalid-unused-endpoint"),
-    ];
-    match case {
-        "absent" => {}
-        "false" => vars.push(("TS_EC_DYNAMODB_ENABLED", "false")),
-        "empty" => vars.push(("TS_EC_DYNAMODB_ENABLED", "")),
-        "uppercase" => vars.push(("TS_EC_DYNAMODB_ENABLED", "TRUE")),
-        "numeric" => vars.push(("TS_EC_DYNAMODB_ENABLED", "1")),
-        "missing-feature" | "missing-binding" => vars.push(("TS_EC_DYNAMODB_ENABLED", "true")),
-        endpoint_case => {
-            let endpoint = match endpoint_case {
-                "remote-endpoint" => "http://example.com:8000",
-                "https-endpoint" => "https://127.0.0.1:8000",
-                "endpoint-userinfo" => "http://user:secret@127.0.0.1:8000",
-                "endpoint-path" => "http://127.0.0.1:8000/private",
-                "endpoint-query" => "http://127.0.0.1:8000/?secret=value",
-                "endpoint-fragment" => "http://127.0.0.1:8000/#secret",
-                "endpoint-no-port" => "http://127.0.0.1",
-                _ => unreachable!("unknown subprocess fixture case"),
-            };
-            vars.retain(|(name, _)| *name != "TS_EC_DYNAMODB_LOCAL_ENDPOINT");
-            vars.push(("TS_EC_DYNAMODB_ENABLED", "true"));
-            vars.push(("TS_EC_DYNAMODB_LOCAL_ENDPOINT", endpoint));
-        }
-    }
-    if case == "missing-binding" {
-        vars.retain(|(name, _)| *name != "TS_EC_DYNAMODB_TABLE");
-    }
-    vars
-}
-
 #[test]
 fn ec_kv_configuration_subprocess() {
     let Ok(case) = std::env::var("TS_EC_CONFIGURATION_CASE") else {
         return;
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("should build isolated configuration runtime");
-    let result = runtime.block_on(prepare_from_env());
-    if matches!(case.as_str(), "absent" | "false") {
-        assert!(
-            result
-                .expect("unselected backend should remain off")
-                .is_none()
-        );
-    } else {
-        let error = result.expect_err("selected invalid backend should fail closed");
-        let detail = format!("{error:?}");
-        if case == "missing-feature" {
-            assert!(detail.contains("aws-dynamodb-ec build feature is unavailable"));
+    let mut app = App::new(RouterService::builder().build());
+    let result = TrustedServerApp::configure(&mut app);
+    match case.as_str() {
+        "absent" | "false" => {
+            result.expect("should retain ordinary disabled construction");
+            assert!(app.record_store_requirements().is_empty());
+            assert!(TrustedServerApp::stores().kv.is_none());
         }
-        assert!(
-            !detail.contains("secret"),
-            "provider configuration error should not echo input"
-        );
+        "selected" if cfg!(feature = "aws-dynamodb-ec") => {
+            result.expect("should declare records before preparation without opening a provider");
+            let layout = app
+                .record_store_requirements()
+                .get("trusted_server_kv")
+                .expect("should require the declared logical KV store");
+            assert_eq!(layout.id(), "trusted-server-ec");
+            assert_eq!(
+                TrustedServerApp::stores()
+                    .kv
+                    .expect("should declare KV metadata")
+                    .ids,
+                &["trusted_server_kv"]
+            );
+        }
+        _ => {
+            let error = result.expect_err("should reject invalid or unsupported record selection");
+            assert!(
+                !format!("{error:?}").contains("invalid-unused-endpoint"),
+                "should not echo connector inputs"
+            );
+        }
     }
 }
