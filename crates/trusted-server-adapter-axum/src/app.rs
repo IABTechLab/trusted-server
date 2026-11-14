@@ -674,8 +674,22 @@ impl TrustedServerApp {
 fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let fallback = fallback_handler(Arc::clone(state));
     let trace_state = Arc::clone(state);
+    let forwarder_settings = Arc::clone(&state.settings);
 
     let mut router = RouterService::builder()
+        .received_head_preparer(move |headers, extensions| {
+            if extensions
+                .get::<trusted_server_core::forwarder::ForwarderPreparation>()
+                .is_none()
+            {
+                extensions.insert(
+                    trusted_server_core::forwarder::ForwarderPreparation::capture(
+                        headers,
+                        &forwarder_settings,
+                    ),
+                );
+            }
+        })
         .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
             Arc::clone(&state.settings),
             Arc::new(move |request| trace_metadata(&trace_state, request)),
@@ -747,9 +761,17 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
     use futures::executor::block_on;
+    use trusted_server_core::forwarder::{
+        FORWARDER_AUTH_HEADER, ForwarderPreparation, prepare_trusted_forwarder,
+    };
+    use trusted_server_core::http_util::RequestInfo;
     use trusted_server_core::redacted::Redacted;
-    use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::settings::{TrustedClientIpConfig, TrustedForwarderConfig};
     use trusted_server_core::trace::TraceTerminalResponse;
 
     fn trace_settings(enabled: bool) -> Settings {
@@ -776,6 +798,171 @@ mod trace_dispatch_tests {
         "#
         ))
         .expect("should parse trace settings")
+    }
+
+    fn forwarder_settings() -> Settings {
+        let mut settings = trace_settings(true);
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: Redacted::new("fictional-forwarder-secret-0123456789".to_owned()),
+        });
+        settings
+    }
+
+    #[test]
+    fn received_head_preparation_preserves_authenticated_origin_after_sanitation() {
+        let settings = forwarder_settings();
+        let app = App::new(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build the actual application router"),
+        );
+        for (credential, duplicate, authority, accepted) in [
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                None,
+                "publisher.example.com:8443",
+                true,
+            ),
+            (None, None, "publisher.example.com:8443", false),
+            (
+                Some("fictional-wrong-secret"),
+                None,
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some(FORWARDER_AUTH_HEADER),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some("x-forwarded-host"),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some("x-forwarded-proto"),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                None,
+                "other.example.com:8443",
+                false,
+            ),
+        ] {
+            let mut request = edgezero_core::http::request_builder()
+                .uri("http://upstream.example.com/path?example=1")
+                .header(header::HOST, "upstream.example.com")
+                .header(header::ORIGIN, "https://browser.example.com")
+                .header("x-forwarded-host", authority)
+                .header("x-forwarded-proto", "https")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build a fictional forwarded request");
+            if let Some(credential) = credential {
+                request
+                    .headers_mut()
+                    .insert(FORWARDER_AUTH_HEADER, HeaderValue::from_static(credential));
+            }
+            if let Some(name) = duplicate {
+                let value = request.headers()[name].clone();
+                request.headers_mut().append(name, value);
+            }
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                Some(
+                    InboundOrigin::parse("http", "upstream.example.com", OriginSource::RuntimeUri)
+                        .expect("should construct independent transport evidence"),
+                ),
+                HeaderFidelity::default(),
+            ));
+            let (mut parts, body) = request.into_parts();
+            let original_headers = parts.headers.clone();
+            app.prepare_received_head(&parts.headers, &mut parts.extensions);
+            assert!(
+                parts.extensions.get::<ForwarderPreparation>().is_some(),
+                "should freeze an accepted or rejected decision before native sanitation"
+            );
+            assert!(
+                parts.headers == original_headers,
+                "should not mutate received headers"
+            );
+            for name in [
+                FORWARDER_AUTH_HEADER,
+                "x-forwarded-host",
+                "x-forwarded-proto",
+            ] {
+                parts.headers.remove(name);
+            }
+            prepare_trusted_forwarder(&mut parts, &settings);
+            let request = Request::from_parts(parts, body);
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should resolve prepared public metadata");
+            assert_eq!(
+                info.host,
+                if accepted {
+                    "publisher.example.com:8443"
+                } else {
+                    "upstream.example.com"
+                }
+            );
+            assert_eq!(info.scheme, if accepted { "https" } else { "http" });
+            assert_eq!(request.uri(), "http://upstream.example.com/path?example=1");
+            assert_eq!(request.headers()[header::HOST], "upstream.example.com");
+            assert_eq!(
+                request.headers()[header::ORIGIN],
+                "https://browser.example.com"
+            );
+            let ingress = request
+                .extensions()
+                .get::<RequestIngress>()
+                .expect("should retain transport evidence");
+            assert_eq!(
+                ingress
+                    .origin()
+                    .expect("should retain transport origin")
+                    .authority(),
+                "upstream.example.com"
+            );
+            assert_eq!(
+                ingress.header_fidelity(&header::COOKIE),
+                HeaderFidelity::default()
+            );
+        }
+    }
+
+    #[test]
+    fn received_head_preparation_does_not_upgrade_an_existing_rejection() {
+        let settings = forwarder_settings();
+        let app = App::new(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build the actual application router"),
+        );
+        let request = edgezero_core::http::request_builder()
+            .uri("http://upstream.example.com/path")
+            .header(
+                FORWARDER_AUTH_HEADER,
+                "fictional-forwarder-secret-0123456789",
+            )
+            .header("x-forwarded-host", "publisher.example.com:8443")
+            .header("x-forwarded-proto", "https")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a fictional forwarded request");
+        let (mut parts, body) = request.into_parts();
+        parts.extensions.insert(ForwarderPreparation::default());
+        app.prepare_received_head(&parts.headers, &mut parts.extensions);
+        app.prepare_received_head(&parts.headers, &mut parts.extensions);
+        prepare_trusted_forwarder(&mut parts, &settings);
+        let request = Request::from_parts(parts, body);
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should retain the original rejected decision");
+        assert_eq!(info.host, "upstream.example.com");
+        assert_eq!(info.scheme, "http");
+        assert!(!request.headers().contains_key(FORWARDER_AUTH_HEADER));
     }
 
     fn router(enabled: bool) -> RouterService {

@@ -19,12 +19,30 @@ used `8f82547b`. The commits since then change Cloudflare response egress,
 Cloudflare tests, documentation, and CI. They change no public API and no line
 an earlier draft cited. The Fastly guide's same-name paragraph, which Fastly
 differences item 12 cites, is new in `9b31a697`. The cut is stacked on PR 275
-and follows its head, and `main` pins the head the cut was last rebased onto
-(D5, [Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head was
+and follows its head through EdgeZero's `rc/identity` integration branch, and
+`main` pins the branch commit the cut was last rebased onto (D5,
+[Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head was
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
-the answers rely on. The cut now pins `5c32ae61`
-(`5c32ae61a3e1bb647c26abbfbbc942768faac8c3`), PR 275's head later on
-2026-11-13. It is one commit after `737f8452`, the previous pin, and in
+the answers rely on.
+
+The cut now pins `10166628` (`101666286d68fc9e4c7af18e818d78dd66d8e436`), the
+`rc/identity` commit on 2026-11-14 (IABTechLab/edgezero#495). It carries PR
+275's head `e9ffaa8f`, which is `5c32ae61`, the previous pin, with EdgeZero
+`main` merged in. It also carries the PRs stacked on PR 275 (EdgeZero 499, 460,
+406, 407, 409, 414, 422 and 439) and the JA4 request interface (EdgeZero 469).
+The Fastly files this spec cites at `5c32ae61` are unchanged at `10166628`. Two
+of those changes reach Trusted Server:
+
+- EdgeZero 460 adds cache tags to `OutboundCachePolicy`, so the type is no
+  longer `Copy`, and test code clones it.
+- EdgeZero 409 removes `Forwarded` and `X-Forwarded-*` fields on Axum before
+  routing. Trusted Server's Axum router therefore records its authenticated
+  forwarder decision in the received-head preparer that EdgeZero 499 restores,
+  which runs before that removal. Trusted Server already strips those fields
+  itself, so nothing else changes.
+
+`5c32ae61` (`5c32ae61a3e1bb647c26abbfbbc942768faac8c3`) was PR 275's head later
+on 2026-11-13. It is one commit after `737f8452`, the pin before it, and in
 production code it changes only logging, chiefly Fastly's: `run_custom` and `serve_custom` take the `Hooks` type and
 install the managed logger, Fastly lines carry the record's target, and an
 optional `edgezero_logging` Config Store overrides the level (section 9). The
@@ -63,8 +81,9 @@ wider EdgeZero migration.
 Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
-EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b` and
-`737f8452` are earlier pins of the cut, `5c32ae61` is the cut's pin, and
+EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
+`737f8452` and `5c32ae61` are earlier pins of the cut, `10166628` is the cut's
+pin (its cited files match `5c32ae61`), and
 `v0.0.11` is the base's pin.
 
 ## Problem
@@ -165,7 +184,7 @@ until EdgeZero's follow-ups land.
 | D2  | No Trusted Server transport plumbing. Every outbound request uses EdgeZero's `HttpClient`. Where H lacks a feature, Trusted Server takes the requirement's interim.                                                                                                                                                                                                                                                                                                                                          | Maintainer                                         |
 | D3  | Fastly calls `send_request_with_registries_and_hooks` inside the `run_custom` and `serve_custom` loop. Trusted Server logic moves into the callback around it and into `prepare` and `finalize`.                                                                                                                                                                                                                                                                                                             | Maintainer                                         |
 | D4  | Redirect following uses `HttpClient::follow` (EZ-9).                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Maintainer                                         |
-| D5  | The cut is stacked on PR 275. It pins PR 275's head and repins at each rebase. `main` merges it without waiting for EdgeZero's EZ-Q1 record and pins the head the cut was last rebased onto. Production deploys do not wait for qualification.                                                                                                                                                                                                                                                               | Maintainer (Q1, Q5)                                |
+| D5  | The cut is stacked on PR 275. It pins a commit of EdgeZero's `rc/identity` integration branch, which carries PR 275's head, and repins when the branch moves. `main` merges it without waiting for EdgeZero's EZ-Q1 record and pins the branch commit the cut was last rebased onto. Production deploys do not wait for qualification.                                                                                                                                                                       | Maintainer (Q1, Q5)                                |
 | D6  | Requests use the adapter's default client with the proxy marker off. Fastly post-delivery work uses a fresh EdgeZero Fastly client.                                                                                                                                                                                                                                                                                                                                                                          | Spec author                                        |
 | D7  | Every request sets a constant 1 s connect timeout and a per-call `timeout` that never depends on a remaining budget. It is the site's configured timeout where the site map names one, 2 s for Tinybird, and otherwise 60 s streamed and 15 s buffered. Redirect chains get a 60 s deadline. The response write deadline is 60 s after egress starts. Each value is Trusted Server's to set, and EdgeZero exposes every knob for it.                                                                         | Spec author, confirmed by the maintainer (Q2)      |
 | D8  | Sites that relay bytes or run Trusted Server's own rewrite codec use `ResponseDecoding::Original`. Sites that parse a body Trusted Server does not decode itself use `Decode`. One deviation: the Cloudflare publisher origin uses `Decode` (2.5).                                                                                                                                                                                                                                                           | Spec author; Cloudflare deviation: maintainer      |
@@ -191,8 +210,9 @@ decision sits in the section that implements it.
 
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
-they are. The rev is PR 275's head, `5c32ae61` at the second 2026-11-13 repin, and
-the cut repins it at each rebase. At merge, `main` pins the head the cut was
+they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
+which carries PR 275's head: `10166628` at the 2026-11-14 repin. The cut repins
+it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
 **spin-sdk.** Trusted Server's `spin-sdk` must come from the same source as
@@ -1960,10 +1980,12 @@ qualifies Trusted Server's hosted legs by hand
 ([EdgeZero qualification, Trusted Server's part](#edgezero-qualification-trusted-servers-part)).
 
 The cut is stacked on PR 275, because its Axum changes need it (Q5). The cut
-pins PR 275's head, repins whenever that head moves, and rebases onto `main`
-regularly. At each repin it reruns the compile probe's tools to re-diff the
-public API, and reruns the dependents inventory (Static). `main` pins the head
-the cut was last rebased onto.
+pins a commit of EdgeZero's `rc/identity` integration branch
+(IABTechLab/edgezero#495), which merges PR 275's head and the PRs built on it,
+repins whenever that branch moves, and rebases onto `main` regularly. At each
+repin it reruns the compile probe's tools to re-diff the public API, and reruns
+the dependents inventory (Static). `main` pins the branch commit the cut was
+last rebased onto.
 
 This accepts two risks:
 
@@ -1973,16 +1995,18 @@ This accepts two risks:
   rerun
   (`edgezero:docs/superpowers/plans/2026-10-18-trusted-server-outbound-05-qualification.md:416-417`).
   Without the gate, Trusted Server gets such fixes at its next repin.
-- A force-push to the PR branch can orphan the pinned commit, and an orphaned
-  commit breaks `--locked` builds once it is collected. The pin then moves to
-  the new head.
+- The pin also carries the PRs stacked on PR 275, which are reviewed
+  separately and can change before they merge.
 
-Once PR 275 merges, Trusted Server moves from the PR 275 commit to an EdgeZero
-release tag (Follow-ups).
+`rc/identity` only moves forward and is never force-pushed, so a rewrite of PR
+275's branch no longer orphans the pinned commit.
+
+Once PR 275 merges, Trusted Server moves from the `rc/identity` commit to an
+EdgeZero release tag (Follow-ups).
 
 Auctioneer pins EdgeZero `775366fd`, an earlier PR 275 commit. #1505 needs both
-projects on one revision, so Auctioneer moves to Trusted Server's PR 275 commit
-after the cut.
+projects on one revision, so Auctioneer moves to Trusted Server's EdgeZero
+commit after the cut.
 
 ### Open EdgeZero defects at H
 
@@ -2650,8 +2674,8 @@ old layer. That transient dual path exists only inside the pull request.
 - `PlatformTimer` and EdgeZero's clock as one time source.
 - An error renderer that brands framework errors.
 - Dependabot ignore rules for EdgeZero-pinned crates.
-- Moving the pin from the PR 275 commit to an EdgeZero release tag once PR 275
-  merges (D5).
+- Moving the pin from the `rc/identity` commit to an EdgeZero release tag once
+  PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
@@ -2662,7 +2686,9 @@ change are D5, D7, D13, D18, and D20.
 
 - **Q1. Merge gate (D5).** Do not wait for EdgeZero's EZ-Q1 record. `main`
   merges the cut pinned to PR 275, and production deploys do not wait for
-  qualification ([Merge gate and pin](#merge-gate-and-pin)).
+  qualification ([Merge gate and pin](#merge-gate-and-pin)). On 2026-11-14 the
+  maintainer moved the pin to EdgeZero's `rc/identity` integration branch,
+  which carries PR 275's head.
 - **Q2. Timeouts (D7).** Each app that uses EdgeZero sets its own limits.
   EdgeZero already lets it set every one, so EdgeZero needs no change:
   - the per-request `timeout`, `connect_timeout`, and `deadline`
