@@ -7048,6 +7048,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "derive_more",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
