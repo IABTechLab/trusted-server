@@ -22,14 +22,12 @@ path = "src/main.rs"
 default = []
 aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
-aws-dynamodb-ec = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
+aws-dynamodb-ec = ["edgezero-adapter-axum/aws-dynamodb-records"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
-celld-ec = ["dep:edgezero-store-celld"]
+celld-ec = ["edgezero-adapter-axum/celld-records"]
 
 [dependencies]
 async-trait = { workspace = true }
-aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
-aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "native-bindings"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
@@ -42,10 +40,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-edgezero-store-celld = { workspace = true, features = ["records"], optional = true }
-
 [dev-dependencies]
+edgezero-store-celld = { workspace = true, features = ["records-v2"] }
+# SDK use is fixture administration only. Production persistence is EdgeZero-owned.
+aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
@@ -53,5 +52,6 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.2", default-features = false, features = ["dynamodb-records"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

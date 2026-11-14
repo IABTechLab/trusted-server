@@ -1,7 +1,6 @@
-//! Provider input remains pure publication data, not runtime or credential lookup.
+//! Record references remain pure publication data, independent of the CLI host.
 
 use edgezero_core::blob_envelope::BlobEnvelope;
-use serde_json::json;
 use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::config_payload::VerifiedConfigBlob;
 use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
@@ -27,33 +26,28 @@ fn source(storage: &str) -> String {
 }
 
 #[test]
-fn every_runtime_resolves_only_its_supported_explicit_provider() {
-    let rows = [
+fn every_runtime_resolves_only_supported_record_references() {
+    for (input, expected) in [
         ("", ["none", "none", "none", "none"]),
         (
             r#"ec_store = "exact-fixture-binding""#,
-            ["fastly", "none", "none", "none"],
-        ),
-        (
-            "[ec.storage]\nstore = \"exact-fixture-binding\"",
             ["fastly", "error", "error", "error"],
         ),
         (
-            "[ec.storage]\nprovider = \"fastly\"\nstore = \"exact-fixture-binding\"",
+            "[ec.storage]\nstore='exact-fixture-binding'",
             ["fastly", "error", "error", "error"],
         ),
         (
-            "[ec.storage]\nprovider = \"dynamodb\"\nregion = \"us-east-1\"\ntable = \"example-identity\"\nnamespace = \" exact \"",
-            ["error", "dynamodb", "error", "error"],
+            "[ec.storage]\nprovider='fastly'\nstore='exact-fixture-binding'",
+            ["fastly", "error", "error", "error"],
         ),
         (
-            "[ec.storage]\nprovider = \"celld\"\nendpoint = \"http://127.0.0.1:7780\"\nstore = \"identity\"\n[ec.storage.access]\nmode = \"trusted-network\"",
-            ["error", "celld", "error", "error"],
+            "[ec.storage]\nprovider='records'\nstore='exact-fixture-binding'",
+            ["records", "records", "error", "error"],
         ),
-    ];
-    for (input, expected) in rows {
+    ] {
         let settings =
-            Settings::from_toml(&source(input)).expect("should parse shape independent of runtime");
+            Settings::from_toml(&source(input)).expect("should parse without provider I/O");
         for (runtime, expected) in [
             EcRuntime::Fastly,
             EcRuntime::Native,
@@ -69,34 +63,34 @@ fn every_runtime_resolves_only_its_supported_explicit_provider() {
                     assert_eq!(store, "exact-fixture-binding");
                     "fastly"
                 }
-                Ok(Some(EcStorageSelection::DynamoDb(config))) => {
-                    assert_eq!(config.namespace, " exact ");
-                    "dynamodb"
+                Ok(Some(EcStorageSelection::Records(store))) => {
+                    assert_eq!(store, "exact-fixture-binding");
+                    "records"
                 }
-                Ok(Some(EcStorageSelection::Celld(_))) => "celld",
                 Err(_) => "error",
             };
             assert_eq!(
                 actual, expected,
-                "should resolve runtime {runtime:?} for {input}"
+                "should resolve actual runtime {runtime:?}"
             );
         }
-        let value = serde_json::to_value(&settings).expect("should serialize input");
-        let published: TrustedServerAppConfig = serde_json::from_value(value.clone())
-            .expect("should preserve runtime-independent CLI input");
+        let value = serde_json::to_value(&settings).expect("should serialize pure input");
+        let published: TrustedServerAppConfig =
+            serde_json::from_value(value.clone()).expect("should preserve CLI publication input");
         let envelope = BlobEnvelope::new(
             serde_json::to_value(published).expect("should publish typed input"),
             "2026-01-01T00:00:00Z".to_owned(),
         );
         assert_eq!(
             envelope.data, value,
-            "should not inject defaults into published envelope"
+            "should not infer a provider during publication"
         );
-        let encoded = serde_json::to_string(&envelope).expect("should encode existing envelope");
-        VerifiedConfigBlob::parse(&encoded)
-            .expect("should reload and verify unchanged envelope format");
+        VerifiedConfigBlob::parse(
+            &serde_json::to_string(&envelope).expect("should encode envelope"),
+        )
+        .expect("should reload unchanged envelope format");
         let roundtrip =
-            Settings::from_json_value(value.clone()).expect("should reload published shape");
+            Settings::from_json_value(value.clone()).expect("should reload published reference");
         assert_eq!(
             serde_json::to_value(roundtrip).expect("should serialize roundtrip"),
             value
@@ -104,87 +98,47 @@ fn every_runtime_resolves_only_its_supported_explicit_provider() {
         if !input.contains("provider") {
             assert!(
                 value["ec"]["storage"].get("provider").is_none(),
-                "should not publish an inferred provider"
+                "should retain omitted-provider shorthand"
             );
         }
     }
 }
 
 #[test]
-fn ec_storage_published_shape_accepts_explicit_celld_without_credentials() {
-    let settings = Settings::from_toml(&source(
-        r#"
-        [ec.storage]
-        provider = "celld"
-        endpoint = "https://stores.example.com:7780"
-        store = "identity"
-        [ec.storage.access]
-        mode = "authenticated"
-        token_env = "FIXTURE_STORE_TOKEN"
-    "#,
-    ))
-    .expect("should accept pure celld config without reading a token");
-    let value = serde_json::to_value(&settings).expect("should serialize publication input");
-    assert_eq!(value["ec"]["storage"]["provider"], "celld");
-    assert_eq!(
-        value["ec"]["storage"]["access"],
-        json!({"mode":"authenticated","token_env":"FIXTURE_STORE_TOKEN"})
-    );
-}
-
-#[test]
-fn absent_ec_storage_stays_absent_in_json() {
-    let settings = Settings::from_toml(&source("")).expect("should preserve unconfigured settings");
-    let value = serde_json::to_value(settings).expect("should serialize settings");
+fn absent_storage_stays_absent() {
+    let value = serde_json::to_value(
+        Settings::from_toml(&source("")).expect("should parse unconfigured identity"),
+    )
+    .expect("should serialize settings");
     assert!(
         value["ec"].get("storage").is_none(),
-        "should not inject provider defaults or null storage"
+        "should not inject null or provider defaults"
     );
 }
 
 #[test]
-fn ambiguous_incomplete_unknown_and_inappropriate_fields_are_rejected() {
+fn connector_configuration_is_not_accepted_or_echoed_as_identity_data() {
     for input in [
-        "ec_store = \"same\"\n[ec.storage]\nstore = \"same\"",
+        "ec_store='same'\n[ec.storage]\nprovider='records'\nstore='same'",
         "[ec.storage]",
-        "[ec.storage]\nstore = \"\"",
-        "[ec.storage]\nprovider = \"unknown\"\nstore = \"identity\"",
-        "[ec.storage]\nprovider = \"fastly\"\nstore = \"identity\"\nregion = \"us-east-1\"",
-        "[ec.storage]\nprovider = \"dynamodb\"\ntable = \"example-identity\"\nnamespace = \"fixture\"",
-        "[ec.storage]\nprovider = \"dynamodb\"\nregion = \"us-east-1\"\ntable = \"example-identity\"\nnamespace = \"\"",
-        "[ec.storage]\nprovider = \"celld\"\nendpoint = \"https://stores.example.com\"\nstore = \"identity\"",
-        "[ec.storage]\nprovider = \"celld\"\nendpoint = \"http://stores.example.com\"\nstore = \"identity\"\n[ec.storage.access]\nmode = \"authenticated\"\ntoken_env = \"FIXTURE_STORE_TOKEN\"",
+        "[ec.storage]\nprovider='records'\nstore=''",
+        "[ec.storage]\nprovider='unknown'\nstore='identity'",
+        "[ec.storage]\nprovider='records'\nstore='identity'\nendpoint='https://private.example.com/secret-value'",
+        "[ec.storage]\nprovider='records'\nstore='identity'\nregion='secret-value'",
+        "[ec.storage]\nprovider='records'\nstore='identity'\ntoken='secret-value'",
+        "[ec.storage]\nprovider='dynamodb'\nregion='us-east-1'\ntable='example-identity'\nnamespace='fixture'",
+        "[ec.storage]\nprovider='celld'\nendpoint='https://private.example.com/secret-value'\nstore='identity'",
     ] {
         let error = Settings::from_toml(&source(input))
-            .expect_err("should reject invalid provider input without a runtime");
+            .expect_err("should reject misplaced connector configuration");
+        let detail = format!("{error:?}");
         assert!(
-            format!("{error:?}").contains("ec.storage"),
-            "should identify EC storage configuration"
+            detail.contains("ec.storage"),
+            "should identify the configuration field"
         );
-    }
-}
-
-#[test]
-fn typed_local_endpoint_preserves_emulator_restrictions_and_redacts_errors() {
-    for endpoint in [
-        "http://example.com:8000",
-        "https://127.0.0.1:8000",
-        "http://user:secret@127.0.0.1:8000",
-        "http://127.0.0.1:8000/private",
-        "http://127.0.0.1:8000/?secret=value",
-        "http://127.0.0.1:8000/#secret",
-        "http://127.0.0.1",
-    ] {
-        let input = format!(
-            "[ec.storage]\nprovider = \"dynamodb\"\nregion = \"us-east-1\"\ntable = \"example-identity\"\nnamespace = \"fixture\"\nlocal_endpoint = {endpoint:?}"
-        );
-        let error = Settings::from_toml(&source(&input))
-            .expect_err("should reject a nonlocal or ambiguous endpoint");
-        let rendered = format!("{error:?}");
-        assert!(rendered.contains("ec.storage.local_endpoint"));
         assert!(
-            !rendered.contains(endpoint),
-            "should not echo endpoint values"
+            !detail.contains("secret-value"),
+            "should not echo private connector values"
         );
     }
 }

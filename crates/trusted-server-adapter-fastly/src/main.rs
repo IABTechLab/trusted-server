@@ -35,7 +35,6 @@ mod compat;
 #[cfg(test)]
 mod deadline_network;
 mod delivery;
-mod ec_kv;
 mod esi_assembly;
 mod logging;
 mod management_api;
@@ -52,7 +51,6 @@ use crate::app::{
     load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
-use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{
     HEADER_X_TS_FINALIZED, apply_finalize_headers, per_request_synthesized_headers,
     resolve_geo_for_response,
@@ -64,6 +62,8 @@ use crate::sandbox::{
     metrics_enabled,
 };
 use crate::tinybird::TelemetryQueue;
+use edgezero_core::store_registry::KvRegistry;
+use trusted_server_core::ec::record_backend::RecordEcKvStore;
 use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 // Only the reuse path builds a serving loop, so the retirement snapshots have
 // no consumer in the default build.
@@ -598,11 +598,10 @@ async fn apply_edgezero_ec_finalize(
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
-    let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)?
-    } else {
-        None
-    };
+    let finalize_kv_graph = ec_state
+        .finalize_record_store
+        .clone()
+        .map(KvIdentityGraph::new);
     ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
@@ -687,24 +686,39 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(
+pub(crate) fn maybe_identity_store(
     settings: &Settings,
-) -> Result<Option<KvIdentityGraph>, Report<TrustedServerError>> {
-    match settings.ec.resolve_storage(EcRuntime::Fastly)? {
-        Some(EcStorageSelection::Fastly(store_name)) => {
-            Ok(Some(KvIdentityGraph::new(FastlyEcKvStore::new(store_name))))
-        }
-        None => Ok(None),
-        _ => unreachable!("Fastly resolution should select only Fastly storage"),
-    }
+    registry: Option<&KvRegistry>,
+) -> Result<Option<RecordEcKvStore>, Report<TrustedServerError>> {
+    let store_id = match settings.ec.resolve_storage(EcRuntime::Fastly)? {
+        None => return Ok(None),
+        Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
+    };
+    let handle = registry
+        .and_then(|stores| stores.named_ref(store_id))
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_id.to_owned(),
+                message: "configured EC record store is not in the prepared request registry"
+                    .to_owned(),
+            })
+        })?;
+    RecordEcKvStore::new(store_id.to_owned(), handle).map(Some)
 }
 
-/// Constructs a `KvIdentityGraph` from settings, or returns an error if the
-/// `ec_store` config is not set.
+pub(crate) fn maybe_identity_graph(
+    settings: &Settings,
+    registry: Option<&KvRegistry>,
+) -> Result<Option<KvIdentityGraph>, Report<TrustedServerError>> {
+    Ok(maybe_identity_store(settings, registry)?.map(KvIdentityGraph::new))
+}
+
+/// Acquire an identity graph from the existing prepared record binding.
 pub(crate) fn require_identity_graph(
     settings: &Settings,
+    registry: Option<&KvRegistry>,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
-    maybe_identity_graph(settings)?.ok_or_else(|| {
+    maybe_identity_graph(settings, registry)?.ok_or_else(|| {
         Report::new(TrustedServerError::KvStore {
             store_name: "ec.storage".to_owned(),
             message: "EC identity storage is not configured".to_owned(),
@@ -745,7 +759,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use base64::Engine as _;
-    use edgezero_adapter_fastly::request::FastlyService;
     use edgezero_core::app::App;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::context::RequestContext;
@@ -1085,12 +1098,15 @@ mod tests {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
 
-            let _delivery = FastlyService::new(&app).run_request_with_hooks_for_test(
-                req,
-                |_req, _extensions| {},
-                |_| (),
-                committed,
-            );
+            let _delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &app,
+                    TrustedServerApp::stores(),
+                    req,
+                    |_req, _extensions| {},
+                    |_| (),
+                    committed,
+                );
 
             // Admission may refuse an odd target before the hook runs, which
             // keeps it out of ordinary dispatch too.
@@ -1139,26 +1155,31 @@ mod tests {
                 counters: &counters,
             };
 
-            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
-                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
-                |_req, extensions| {
-                    extensions.insert(RequestGeo::default());
-                },
-                |response: &mut HttpResponse| {
-                    statuses.push(response.status());
-                    finalize_response(response, &inputs)
-                },
-                |envelope| {
-                    if request == 0 {
-                        committed_then_failed(
-                            envelope,
-                            edgezero_adapter_fastly::delivery::DeliveryError::Transport,
-                        )
-                    } else {
-                        committed(envelope)
-                    }
-                },
-            );
+            let delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &retained.app,
+                    TrustedServerApp::stores(),
+                    FastlyRequest::get(
+                        "https://publisher.example.com/static/tsjs=tsjs-unified.min.js",
+                    ),
+                    |_req, extensions| {
+                        extensions.insert(RequestGeo::default());
+                    },
+                    |response: &mut HttpResponse| {
+                        statuses.push(response.status());
+                        finalize_response(response, &inputs)
+                    },
+                    |envelope| {
+                        if request == 0 {
+                            committed_then_failed(
+                                envelope,
+                                edgezero_adapter_fastly::delivery::DeliveryError::Transport,
+                            )
+                        } else {
+                            committed(envelope)
+                        }
+                    },
+                );
             handle_delivery(delivery, &counters, |_state| post_delivery += 1);
         }
 
@@ -1209,15 +1230,18 @@ mod tests {
             ),
         ] {
             let capture = WarningCapture::start();
-            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
-                request,
-                |_req, extensions| {
-                    extensions.insert(per_request_synthesized_headers(&settings, None));
-                    extensions.insert(RequestGeo::default());
-                },
-                |response: &mut HttpResponse| finalize_response(response, &inputs),
-                committed,
-            );
+            let delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &retained.app,
+                    TrustedServerApp::stores(),
+                    request,
+                    |_req, extensions| {
+                        extensions.insert(per_request_synthesized_headers(&settings, None));
+                        extensions.insert(RequestGeo::default());
+                    },
+                    |response: &mut HttpResponse| finalize_response(response, &inputs),
+                    committed,
+                );
             handle_delivery(delivery, &counters, |_state| {});
 
             let skipped = capture
@@ -1344,7 +1368,8 @@ mod tests {
             .expect("should build the page response");
         page.extensions_mut().insert(EcFinalizeState {
             ec_context,
-            use_finalize_kv: false,
+            record_store: None,
+            finalize_record_store: None,
             eids_cookie: None,
             sharedid_cookie: None,
             is_real_browser: true,
@@ -1595,33 +1620,52 @@ mod tests {
     }
 
     #[test]
-    fn fastly_graph_selection_preserves_legacy_and_new_binding_input() {
+    fn fastly_graph_selection_uses_the_existing_prepared_record_registry() {
+        fastly::init();
+        let provider = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open_records(
+            "record_ec_fixture",
+            edgezero_core::RecordLayout::new(
+                trusted_server_core::ec::record_backend::EcRecordLayout,
+            )
+            .expect("should declare EC layout"),
+        )
+        .expect("should open the real Viceroy KV fixture");
+        let handle = edgezero_core::key_value_store::KvHandle::new(std::sync::Arc::new(provider));
+        let registry = KvRegistry::single_id("exact-fixture-binding".to_owned(), handle);
         for storage in [
             None,
             Some(serde_json::json!({"store":"exact-fixture-binding"})),
             Some(serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"})),
+            Some(serde_json::json!({"provider":"records","store":"exact-fixture-binding"})),
         ] {
             let mut settings = diagnostics_settings();
             settings.ec.storage = storage
-                .map(|value| serde_json::from_value(value).expect("should parse provider config"));
+                .map(|value| serde_json::from_value(value).expect("should parse record reference"));
             if settings.ec.storage.is_none() {
                 settings.ec.ec_store = Some("exact-fixture-binding".to_owned());
             }
-            assert!(matches!(
-                settings
-                    .ec
-                    .resolve_storage(EcRuntime::Fastly)
-                    .expect("should resolve Fastly input"),
-                Some(EcStorageSelection::Fastly("exact-fixture-binding"))
-            ));
             assert!(
-                maybe_identity_graph(&settings)
-                    .expect("should construct graph lazily")
+                maybe_identity_graph(&settings, Some(&registry))
+                    .expect("should acquire prepared records")
                     .is_some()
             );
-            require_identity_graph(&settings)
-                .expect("should require the configured binding without opening it early");
+            require_identity_graph(&settings, Some(&registry))
+                .expect("should retain the existing provider and layout");
+            assert!(
+                maybe_identity_graph(&settings, None).is_err(),
+                "should not reopen a provider when the prepared registry is missing"
+            );
         }
+        let store = RecordEcKvStore::new(
+            "exact-fixture-binding".to_owned(),
+            registry
+                .named_ref("exact-fixture-binding")
+                .expect("should retain fixture handle"),
+        )
+        .expect("should acquire shared backend");
+        futures::executor::block_on(
+            trusted_server_core::test_support::record_ec::assert_record_ec_lifecycle(&store),
+        );
     }
 
     fn diagnostics_settings() -> Settings {
