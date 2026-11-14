@@ -7080,6 +7080,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "axum",
  "base64",
+ "derive_more",
  "edgezero-adapter-axum",
  "edgezero-core",
  "edgezero-store-aws",
