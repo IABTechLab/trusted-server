@@ -5324,11 +5324,9 @@ mod tests {
     ///
     /// The signed S3 preflight `HEAD`, its raw error-body `GET`, and a signed raw
     /// `HEAD` carry it.
-    fn uncached(transport: ExpectedTransport) -> ExpectedTransport {
-        ExpectedTransport {
-            cache_policy: OutboundCachePolicy::Bypass,
-            ..transport
-        }
+    fn uncached(mut transport: ExpectedTransport) -> ExpectedTransport {
+        transport.cache_policy = OutboundCachePolicy::Bypass;
+        transport
     }
 
     /// Reads an asset response's streamed body, returning the response without it.
@@ -5959,7 +5957,7 @@ mod tests {
             client
                 .requests()
                 .iter()
-                .map(|sent| sent.cache_policy)
+                .map(|sent| sent.cache_policy.clone())
                 .collect::<Vec<_>>(),
             vec![
                 OutboundCachePolicy::Bypass,
