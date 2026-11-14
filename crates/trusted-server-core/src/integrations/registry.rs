@@ -1038,7 +1038,7 @@ impl IntegrationRegistry {
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
             if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv).await {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
