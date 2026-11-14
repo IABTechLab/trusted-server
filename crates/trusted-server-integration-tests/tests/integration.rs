@@ -1752,8 +1752,8 @@ fn twelve_bidder_auction_registers_twelve_backends_fastly() {
 /// The callback logs its observation after delivery, so the line can trail
 /// the response the client already read. Viceroy prints a line once for the
 /// `tslog` endpoint and once more as the guest's stdout echo, so only the
-/// endpoint copy counts. `EdgeZero`'s Fastly format prints no log target, so
-/// the line is found by its own message text.
+/// endpoint copy counts. `EdgeZero`'s Fastly lines read timestamp, level,
+/// target and message, so the line is found by its target.
 fn wait_for_outbound_observations(
     stdout: &environments::fastly::GuestStdout,
     expected: usize,
@@ -1770,7 +1770,9 @@ fn wait_for_outbound_observations(
             .lines()
             .iter()
             .filter_map(|line| line.strip_prefix("tslog :: "))
-            .filter(|line| line.contains(" configurations=") && line.contains(" registrations="))
+            .filter(|line| {
+                line.split_whitespace().nth(2) == Some("trusted_server::outbound_observation")
+            })
             .map(|line| {
                 (
                     count(line, "configurations="),
