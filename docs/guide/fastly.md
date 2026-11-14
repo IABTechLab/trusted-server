@@ -426,8 +426,10 @@ Before upgrading a deployment that used the legacy consent store, remove `[conse
 
 ## Logging
 
-The Fastly adapter installs EdgeZero's managed Fastly logger and no logger of
-its own. Its settings come from `[adapters.fastly.logging]` in `edgezero.toml`:
+EdgeZero's Fastly lifecycle installs its managed logger before Trusted
+Server's request callback runs, and Trusted Server installs no logger of its
+own. The settings come from
+`[adapters.fastly.logging]` in `edgezero.toml`:
 
 ```toml
 [adapters.fastly.logging]
@@ -437,10 +439,34 @@ echo_stdout = true
 ```
 
 Records go to the Fastly log endpoint named `tslog` and are echoed to stdout,
-which `fastly compute serve` prints. Each line reads `<timestamp> <level> <message>`. EdgeZero keeps its
-`edgezero::boot` startup warnings at `warn` whatever the level. The binary
-compiles `edgezero.toml` in, so changing the level needs a rebuild and a
-deploy; no runtime setting or environment variable changes it.
+which `fastly compute serve` prints. Each line reads
+`<timestamp> <level> <target> <message>`. EdgeZero keeps its `edgezero::boot`
+startup warnings at `warn` whatever the level.
+
+### Raising the level at runtime
+
+A Config Store linked as `edgezero_logging` with the key
+`EDGEZERO__LOGGING__LEVEL` overrides the manifest level without a rebuild. The
+value is one of `off`, `error`, `warn`, `info`, `debug`, or `trace`, in any
+case; an invalid value selects `info`. Without the store or the key, the
+manifest level applies. EdgeZero reads the override once per instance, so a
+change reaches new instances only. It changes neither the endpoint nor the
+stdout echo.
+
+To log at `debug` locally with the same production wasm, add this to the local
+Fastly configuration that `fastly compute serve` or Viceroy reads, then restart
+it:
+
+```toml
+[local_server.config_stores.edgezero_logging]
+format = "inline-toml"
+
+[local_server.config_stores.edgezero_logging.contents]
+EDGEZERO__LOGGING__LEVEL = "debug"
+```
+
+On a deployed service, leave `edgezero_logging` unlinked to keep the manifest
+level, or link a Config Store with that key to change it.
 
 ## Verify the complete local handoff
 
