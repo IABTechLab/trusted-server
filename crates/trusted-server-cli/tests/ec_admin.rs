@@ -3,6 +3,9 @@
 //!
 //! Run with `./scripts/test-cli.sh`.
 
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
 mod support_origin;
 
 use base64::Engine as _;
