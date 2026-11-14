@@ -22,14 +22,23 @@ differences item 12 cites, is new in `9b31a697`. The cut is stacked on PR 275
 and follows its head, and `main` pins the head the cut was last rebased onto
 (D5, [Merge gate and pin](#merge-gate-and-pin)). On 2026-11-08 the head was
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
-the answers rely on. The cut now pins `14a6ca8b`
-(`14a6ca8bb5a5cbe055a1f725bdab8f42569a3bf0`), PR 275's head on 2026-11-11. It
-is four commits after `a7d7fd0f`, the previous pin, which was five commits
-after `dcbf622`, the cut's first pin, and changed only the absolute target of
-the Axum native timer in production code. The four commits change production
-code in two places: Spin frames an empty outbound body only for `POST`, `PUT`,
-and `PATCH`, and EdgeZero adds a received-head preparer that no adapter calls
-yet. Every other citation is still at H.
+the answers rely on. The cut now pins `737f8452`
+(`737f845276f89f83452f40394abf2236c05449f0`), PR 275's head on 2026-11-13.
+PR 275's history was rewritten after `14a6ca8b`, the previous pin, PR 275's
+head on 2026-11-11: `737f8452` is three commits after `a7d7fd0f`, and
+`14a6ca8b` is not its ancestor. `a7d7fd0f`, the pin before `14a6ca8b`, was
+five commits after `dcbf622`, the cut's first pin, and changed only the
+absolute target of the Axum native timer in production code. `14a6ca8b` added
+four commits to `a7d7fd0f`. `ac5a6aaa` reapplies their review fixes, so Spin
+still frames an empty outbound body only for `POST`, `PUT`, and `PATCH`, and
+drops the received-head preparer, which Trusted Server never called. `1467e28a`
+and `737f8452` change production code in four places that reach Trusted
+Server. `spin-sdk` moves from the `stackpop/spin-rust-sdk` fork to the
+published `=8.0.0` (section 1). Cloudflare and Spin install a managed log
+backend (section 9). Spin keeps a streamed upload's declared `Content-Length`
+(2.5). The Axum outbound client and request converter take an explicit
+`AxumOutboundExecutorHandle`, which changes only Trusted Server's parity test.
+Every other citation is still at H.
 
 **Trusted Server base:** `main` at `51730bdaf`, which pins EdgeZero `v0.0.11`.
 
@@ -49,7 +58,8 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b` is
-the cut's pin, and `v0.0.11` is the base's pin.
+the cut's previous pin, `737f8452` is the cut's pin, and `v0.0.11` is the
+base's pin.
 
 ## Problem
 
@@ -175,33 +185,41 @@ decision sits in the section that implements it.
 
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
-they are. The rev is PR 275's head, `14a6ca8b` at the 2026-11-11 repin, and
+they are. The rev is PR 275's head, `737f8452` at the 2026-11-13 repin, and
 the cut repins it at each rebase. At merge, `main` pins the head the cut was
 last rebased onto (D5).
 
 **spin-sdk.** Trusted Server's `spin-sdk` must come from the same source as
-EdgeZero's: `version = "=7.0.0"` from the `stackpop/spin-rust-sdk` git fork at
-rev `6c59ed5b4fcb377072763aee0b27a3abdd8edb72` (`edgezero:Cargo.toml:106`).
-With crates.io `~7.0` (`Cargo.toml:111`) the graph holds two `spin-sdk` 7.0.0
-packages, and `check-spin` fails with E0308 at
+EdgeZero's. At H and up to `14a6ca8b` that was `version = "=7.0.0"` from the
+`stackpop/spin-rust-sdk` git fork at rev
+`6c59ed5b4fcb377072763aee0b27a3abdd8edb72` (`edgezero:Cargo.toml:106`). With
+crates.io `~7.0` (`Cargo.toml:111`) the graph held two `spin-sdk` 7.0.0
+packages, and `check-spin` failed with E0308 at
 `crates/trusted-server-adapter-spin/src/lib.rs:18` and E0277 at `:15`. The
-probe confirmed that both errors clear after the switch.
+probe confirmed that both errors clear after the switch. From `737f8452` it is
+the published `version = "=8.0.0"` from crates.io
+(`edgezero@737f8452:Cargo.toml:110`), which includes the fork's executor
+repair, and Trusted Server pins the same. SDK 8 keeps the APIs Trusted Server
+calls (section 8).
 
 **Lockfile.** H's 26 exact pins move these entries:
 
-| Crate                 | Lock today | After  | Why                                   |
-| --------------------- | ---------- | ------ | ------------------------------------- |
-| `async-compression`   | 0.4.42     | 0.4.43 | `=0.4.43`                             |
-| `brotli-decompressor` | 5.0.3      | 5.0.1  | `=5.0.1`, a downgrade                 |
-| `bytes`               | 1.12.0     | 1.12.1 | `=1.12.1`                             |
-| `hyper`               | 1.10.1     | 1.12.0 | `=1.12.0`                             |
-| `want`                | 0.3.1      | 0.3.2  | required by hyper 1.12.0              |
-| `syn`                 | 3.0.4      | 3.0.9  | required by the fork's `wit-bindgen`  |
-| `spin-sdk` stack      | crates.io  | git    | the fork brings `wasip3` 0.10.0 along |
+| Crate                 | Lock today | After              | Why                                  |
+| --------------------- | ---------- | ------------------ | ------------------------------------ |
+| `async-compression`   | 0.4.42     | 0.4.43             | `=0.4.43`                            |
+| `brotli-decompressor` | 5.0.3      | 5.0.1              | `=5.0.1`, a downgrade                |
+| `bytes`               | 1.12.0     | 1.12.1             | `=1.12.1`                            |
+| `hyper`               | 1.10.1     | 1.12.0             | `=1.12.0`                            |
+| `want`                | 0.3.1      | 0.3.2              | required by hyper 1.12.0             |
+| `syn`                 | 3.0.4      | 3.0.9              | required by the fork's `wit-bindgen` |
+| `spin-sdk` stack      | crates.io  | crates.io `=8.0.0` | SDK 8 brings `wasip3` 0.10.0 along   |
 
 A scoped `cargo update -p edgezero-core` also rewrote the `colored` 3.1.1 and
 `winapi-util` 0.1.11 edges from `windows-sys` 0.61.2 to 0.48.0, which no pin
-requires. Restore those by hand and validate with `--locked`. The probe's final
+requires. Restore those by hand and validate with `--locked`. The 2026-11-13
+repin's scoped update likewise moved `gix-imara-diff` 0.2.5 from `hashbrown`
+0.16.1 to 0.17.1 and `prost-build` 0.13.5 and `prost-derive` 0.13.5 and 0.14.4
+from `itertools` 0.10.5 to 0.13.0; those were restored by hand too. The probe's final
 lock removes 25 packages, adds 27, and changes 3 edges, all explained. The
 `esi` patch stays valid, because it accepts `fastly ^0.13`.
 
@@ -450,7 +468,7 @@ cache make no HTTP calls.
   it returns (EZ-6.7). At H it stops at the first slot that completes during
   setup, so later slots wait for the next EdgeZero poll
   ([open defect 1](#open-edgezero-defects-at-h)). Fixed at the pin: EdgeZero's
-  fix is in `598f0a2a`, an ancestor of `14a6ca8b`, and Trusted Server keeps no
+  fix is in `598f0a2a`, an ancestor of `737f8452`, and Trusted Server keeps no
   workaround for it. Axum, Cloudflare, and Spin
   spawn a local task
   (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:268`,
@@ -483,7 +501,7 @@ cache make no HTTP calls.
   unobserved when the cutoff passes fails that way with an internal error
   ([open defect 3](#open-edgezero-defects-at-h)). Trusted Server adds no
   workaround. Fixed at the pin: EdgeZero's fix is in `598f0a2a`, an ancestor
-  of `14a6ca8b`.
+  of `737f8452`.
 - The mediator goes out after the batch finishes, with `client.send(..)`,
   `.timeout(mediator timeout)`, and `.deadline(auction_deadline)`. The guest
   budget takes the earlier of the two
@@ -556,7 +574,7 @@ earlier poll recorded, and never wait
 (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:5456-5494`).
 Cross-cutting requirement 5 and EZ-6.11 require a check to record, so this is
 [open defect 2](#open-edgezero-defects-at-h). Fixed at the pin: EdgeZero's fix
-is in `6f0cc74c`, an ancestor of `14a6ca8b`. At the pin under Viceroy 0.21.0,
+is in `6f0cc74c`, an ancestor of `737f8452`. At the pin under Viceroy 0.21.0,
 a `check` after the cutoff returns `Finished(Cutoff)` (section 8). Collection
 after the cutoff calls `batch.next()`, which also returns `Finished(Cutoff)`
 without a host wait. The
@@ -754,21 +772,23 @@ buffered body is checked before sending
 (`edgezero:crates/edgezero-core/src/outbound.rs:1903-1908`). Today Fastly
 reads the whole inbound body into memory with no cap.
 
-A streamed Spin upload also loses its declared length. The Spin inbound body
-is a stream (`edgezero@14a6ca8b:crates/edgezero-adapter-spin/src/request.rs:97`),
-`from_request` drops `Content-Length` with the other request framing fields
-(`edgezero@14a6ca8b:crates/edgezero-core/src/outbound.rs:2253-2256`), and the
-Spin client sets `Content-Length` only for a buffered body
-(`edgezero@14a6ca8b:crates/edgezero-adapter-spin/src/outbound.rs:900-915`). So
-a Spin publisher POST, PUT, or PATCH reaches the origin chunked, with no
-`Content-Length`, where Trusted Server's Spin client buffered the upload and
-sent its length (`crates/trusted-server-adapter-spin/src/platform.rs:512-523`).
-An origin or WAF that requires a length answers 411 or rejects the request.
-Trusted Server does not buffer the upload to restore the length. EdgeZero is
-asked to keep the declared `Content-Length` for a streamed Spin upload
+A streamed Spin upload keeps its declared length. The Spin inbound body is a
+stream (`edgezero@737f8452:crates/edgezero-adapter-spin/src/request.rs:97`).
+`from_request` still drops `Content-Length` with the other request framing
+fields, but keeps a single valid value, when there is no `Transfer-Encoding`,
+as the streamed body's `forwarded_content_length`
+(`edgezero@737f8452:crates/edgezero-core/src/outbound.rs:1176-1183`,
+`:2106-2135`). The Spin client sends that length with no `Transfer-Encoding`
+(`edgezero@737f8452:crates/edgezero-adapter-spin/src/outbound.rs:916-921`)
+and counts the bytes it streams against it with `OutboundUploadCounter`, which
+fails the upload when they differ (`:1099`, `:1142-1143`). So a Spin publisher
+POST, PUT, or PATCH reaches the origin with its `Content-Length`, as Trusted
+Server's Spin client sent it, and Trusted Server does not buffer the upload.
+At `14a6ca8b` the upload went out chunked with no `Content-Length`, which
+Trusted Server asked EdgeZero to fix
 ([PR 275 comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880)).
-`spin_runtime_publisher_post_body_reaches_origin` asserts the chunked framing,
-so a repin that carries the fix fails it.
+`spin_runtime_publisher_post_body_reaches_origin` asserts that the origin sees
+`Content-Length: 4096` and no `Transfer-Encoding`.
 
 #### 2.6 Redirect following
 
@@ -1418,14 +1438,22 @@ and stay.
 **Axum.**
 
 - `AxumDevServer::with_config(app, config)` now takes an assembled `App`
-  (`edgezero:crates/edgezero-adapter-axum/src/dev_server.rs:166-173`).
-  `crates/trusted-server-adapter-axum/src/main.rs:41-42` passes
-  `App::build::<TrustedServerApp>(AXUM_PLATFORM)` and exits non-zero on error
-  (section 7). Every policy that `configure` installs now applies over real TCP
-  (EZ-23).
-- `AxumDevServerConfig` gains `ingress` (`dev_server.rs:58-64`), set from
-  `AxumIngressConfig::from_env(&EnvConfig::from_env())` (D16). An invalid value
-  fails startup. The variables are in [Configuration](#configuration).
+  (`edgezero:crates/edgezero-adapter-axum/src/dev_server.rs:166-173`). Since
+  the 2026-11-13 repin, `main` calls EdgeZero's
+  `dev_server::run_app::<TrustedServerApp>()`
+  (`edgezero@737f8452:crates/edgezero-adapter-axum/src/dev_server.rs:551-612`)
+  and exits non-zero on its error (section 7). `run_app` installs the logger
+  (section 9), reads the ingress limits, builds the app with
+  `App::build::<A>(AXUM_PLATFORM)`, resolves the listener from
+  `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default
+  `127.0.0.1:8787`, `:590-595`), and serves the app through `AxumDevServer`.
+  These replace `RUST_LOG` and `PORT`. Trusted Server's Axum app declares no
+  stores, so `run_app` attaches no store registry. Every policy that
+  `configure` installs now applies over real TCP (EZ-23).
+- `AxumDevServerConfig` gains `ingress` (`dev_server.rs:58-64`), which
+  `run_app` sets from `AxumIngressConfig::from_env` (`edgezero@737f8452:crates/edgezero-adapter-axum/src/dev_server.rs:578`,
+  D16). An invalid value fails startup. The variables are in
+  [Configuration](#configuration).
 - A request head over the raw-head byte limit or the field limit gets 431
   (`edgezero:crates/edgezero-adapter-axum/src/dev_server.rs:2069-2088`). Only a
   connection over `MAX_CONNECTIONS`, which is dropped on accept
@@ -1487,23 +1515,24 @@ and stay.
   That also removes the deprecated `spin_sdk::wasip3::spawn` call (`:579`).
 - The fork keeps the `spin-sdk` APIs Trusted Server calls (`variables::get`,
   `time::sleep`, and `http_service`, at `platform.rs:701`, `:816`, and
-  `lib.rs`). The probe's `check-spin` reported no error at those uses.
+  `lib.rs`). The probe's `check-spin` reported no error at those uses, and
+  neither does `clippy-spin-wasm` on SDK 8 at `737f8452`.
 - Spin ignores `origin_host_header_override` today and sends the URI authority
   (`platform.rs:449-456`). Whether WASI hosts forbid an explicit `Host` is
   unverified (EZ-13). H's Spin client rejects any override, so Spin's settings
-  load ignores the setting with a warning (D9). Production Spin builds drop
-  that warning until EdgeZero installs a log backend (section 9).
+  load ignores the setting with a warning (D9).
 - At H, Spin's client could send every buffered request body, bidder JSON
   included, chunked with no `Content-Length`. Another reviewer raised this as
-  an open question on PR 275. At `14a6ca8b` the client sets `Content-Length`
-  on a buffered body for every method but GET and HEAD, and frames an empty
-  body only for POST, PUT, and PATCH
-  (`edgezero:crates/edgezero-adapter-spin/src/outbound.rs:900-915`). Test 5's Spin
+  an open question on PR 275. At `737f8452` the client sets `Content-Length`
+  on a buffered body for every method but GET and HEAD, frames an empty body
+  only for POST, PUT, and PATCH, and sends a streamed body's declared length
+  (`edgezero@737f8452:crates/edgezero-adapter-spin/src/outbound.rs:905-921`,
+  2.5). Test 5's Spin
   leg records the framing a loopback bidder receives. Task 6 observed
   `Content-Length: 428` with no `Transfer-Encoding`.
 - Spin config reads go through `block_on(handle.get(..))` with
   `SpinConfigStore::for_label` (`crates/trusted-server-adapter-spin/src/app.rs:86-108`).
-  Whether the fork's key-value future completes there is unverified. The Spin
+  Whether SDK 8's key-value future completes there is unverified. The Spin
   cases in CI prove it (D14).
 - Trusted Server builds `wasm32-wasip1`, and EdgeZero validates `wasm32-wasip2`
   (`edgezero:crates/edgezero-adapter-spin/src/cli.rs:129`). Only a running
@@ -1577,22 +1606,50 @@ backend (`edgezero:crates/edgezero-adapter-fastly/src/outbound.rs:977-1023`).
 
 ### 9. Logging
 
-Trusted Server keeps `owns_logging` false. Its Fastly and Axum loggers already
-admit target `edgezero::boot` at warn
+Trusted Server keeps `owns_logging` false on every adapter. Every logger the
+cut uses admits target `edgezero::boot` at warn
 (`edgezero:crates/edgezero-core/src/logging.rs:10-12`), where assembly failures
 log once (`app.rs:113-146`).
 
-On Cloudflare and Spin, EdgeZero's `init_logger` installs no backend
-(`edgezero:crates/edgezero-adapter-cloudflare/src/lib.rs:86`, `:94`,
-`edgezero:crates/edgezero-adapter-spin/src/lib.rs:139`), and Trusted Server
-installs one only in its `test-utils` fixture builds. Production Cloudflare and
-Spin builds therefore drop every log record, as they do today. The startup
-report and every warning this spec names on those adapters, such as the Spin
-`origin_host_header_override` warning, are not observable until EdgeZero's
-`init_logger` installs a backend. Installing one is EdgeZero's job, so Trusted
-Server adds no logger of its own and asks EdgeZero for one on PR 275 (Open
-EdgeZero defects at H). `scripts/smoke-spin.sh`, which reads the startup
-diagnostic from the component's stderr, fails until then.
+Since the 2026-11-13 repin, EdgeZero installs the logger on Axum, Cloudflare,
+and Spin, and Trusted Server installs none there:
+
+- **Axum.** `run_app` installs `simple_logger` at `EDGEZERO__LOGGING__LEVEL`,
+  `info` when unset or unrecognized
+  (`edgezero@737f8452:crates/edgezero-adapter-axum/src/dev_server.rs:539-543`,
+  `:573-577`). Trusted Server's `SimpleLogger` and its `RUST_LOG` parsing are
+  deleted (section 8).
+- **Cloudflare.** `run_app` reads the level from the Worker's
+  `EDGEZERO__LOGGING__LEVEL` binding and installs a Workers console backend
+  with `init_logger(level)` before assembly
+  (`edgezero@737f8452:crates/edgezero-adapter-cloudflare/src/lib.rs:89-91`,
+  `:158-168`).
+- **Spin.** `run_app` reads the level from the component environment and
+  installs a stderr backend the same way
+  (`edgezero@737f8452:crates/edgezero-adapter-spin/src/lib.rs:138-140`,
+  `:194-200`).
+
+`init_logger(level)` fails when another logger is installed, and `run_app`
+then fails the request. So the `test-utils` fixture loggers Trusted Server
+installed on Cloudflare and Spin are deleted. The EOF harness and
+`scripts/smoke-spin.sh` read EdgeZero's console and stderr output, whose
+default `info` level admits the warnings they look for. The startup report and
+every warning this spec names on Cloudflare and Spin, such as the Spin
+`origin_host_header_override` warning, are logged.
+
+Fastly keeps `crates/trusted-server-adapter-fastly/src/logging.rs`, installed
+through `setup_once` (section 3). EdgeZero installs its managed Fastly logger
+only from `run_app`, `run_app_with_hooks`, `serve_app_with_hooks`, and
+`run_app_with_config`, and only when the baked `[adapters.fastly.logging]`
+table sets an endpoint
+(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lib.rs:183-187`,
+`:237-247`, `:288-291`). Its custom lifecycle, `run_custom` and
+`serve_custom`, which the cut uses, installs none
+(`edgezero@737f8452:crates/edgezero-adapter-fastly/src/lifecycle.rs:139-181`).
+Calling EdgeZero's public `init_logger(endpoint, level, echo_stdout)` from
+`setup_once` instead would drop three behaviors EdgeZero has no equivalent
+for: the `debug` level under Viceroy, the guest-environment level override, and
+the record's target in each line. Which way to go is open (Follow-ups).
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
@@ -1639,12 +1696,12 @@ because its message can hold provider text or a URL.
 
 ## Adapter impact
 
-| Adapter    | Compile changes                                                                                         | Runtime changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ---------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code                    | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`          | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Publisher origin input is capped at `publisher.max_buffered_body_bytes` for every classification, its first input cap, and raw responses are collected before egress (2.5). Startup failure exits the process                                                                                                                                                                                                                                                       |
-| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                         | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip (`Decode`, 2.5) and manual redirect. Publisher origin input still capped at 10 MiB for every classification, and raw responses collected before egress (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error                                                                                                                                                                                                                                                   |
-| Spin       | 34 sites, the `spin-sdk` fork, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Publisher origin input and HTML expansion still capped at 8 MiB for every classification, and raw responses collected before egress (2.5). Publisher responses keep the origin `Content-Encoding` (`Original`), where the old client decoded gzip and br (2.5). A publisher upload reaches the origin chunked, with no `Content-Length`, until EdgeZero keeps the declared length (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check |
+| Adapter    | Compile changes                                                                                  | Runtime changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | 38 sites, the lifecycle rewrite, deletion of the client, backends, and delivery code             | [Fastly differences](#fastly-differences)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Axum       | 10 sites, the dev server `App` and `ingress` field, route and parity tests on `AxumTestServer`   | EdgeZero client in place of Trusted Server's. Ingress caps. Framing, head limits, and `configure` policies apply. Inbound 30 s read deadline. Publisher origin input is capped at `publisher.max_buffered_body_bytes` for every classification, its first input cap, and raw responses are collected before egress (2.5). Startup failure exits the process. EdgeZero's `run_app` installs the logger and binds the listener from `EDGEZERO__LOGGING__LEVEL`, `EDGEZERO__ADAPTER__HOST`, and `EDGEZERO__ADAPTER__PORT`, in place of `RUST_LOG` and `PORT` (sections 8 and 9) |
+| Cloudflare | 22 sites, deletion of the client, two compatibility flags, the deadline example                  | Multi-provider auctions load and fan out. EdgeZero client in place of the encoding strip (`Decode`, 2.5) and manual redirect. Publisher origin input still capped at 10 MiB for every classification, and raw responses collected before egress (2.5). Strict framing. Head limits. Inbound 30 s read deadline. Startup failure answers with the assembly error                                                                                                                                                                                                              |
+| Spin       | 34 sites, `spin-sdk` 8, `SpinResponse`, deletion of the client and decoder, the deadline example | Multi-provider auctions load and fan out. Publisher origin input and HTML expansion still capped at 8 MiB for every classification, and raw responses collected before egress (2.5). Publisher responses keep the origin `Content-Encoding` (`Original`), where the old client decoded gzip and br (2.5). Streamed egress. Head limits. Inbound 30 s read deadline. Startup failure answers 503 with the assembly error. Config open failure at first read. Outbound-host manifest check                                                                                     |
 
 Core carries 63 sites plus the outbound migration. The CLI library compiles
 against H unchanged, and its tests change only for the Axum harness.
@@ -1954,12 +2011,13 @@ Other reviewers' open threads also reach Trusted Server:
 
 Trusted Server's own asks on PR 275 are in
 [one comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6863865880),
-checked against head `1467e28a`. Trusted Server adds no workaround for them:
+checked against head `1467e28a`. Both are answered at `737f8452`, the pin, and
+Trusted Server added no workaround for either:
 
-- A streamed Spin upload goes out chunked and loses its declared
-  `Content-Length` (2.5).
-- Cloudflare and Spin install no `log` backend, so their warnings and startup
-  report are dropped (section 9).
+- A streamed Spin upload went out chunked and lost its declared
+  `Content-Length`. It now keeps the length (2.5).
+- Cloudflare and Spin installed no `log` backend, so their warnings and
+  startup report were dropped. They now install managed backends (section 9).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
@@ -2565,6 +2623,9 @@ old layer. That transient dual path exists only inside the pull request.
 - Dependabot ignore rules for EdgeZero-pinned crates.
 - Moving the pin from the PR 275 commit to an EdgeZero release tag once PR 275
   merges (D5).
+- Fastly logging on EdgeZero's managed logger under the custom lifecycle, or
+  the EdgeZero asks that would let Trusted Server delete `logging.rs`
+  (section 9).
 - Spin on `wasm32-wasip2`.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
