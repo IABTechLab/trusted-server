@@ -46,6 +46,13 @@ rewrite its origin URL to the Axum listener, and remove the original URL. The
 exit trap stops the Axum process and stub origin, then removes the temporary
 config, local-push output, bodies, headers, and logs.
 
+## Listener address
+
+EdgeZero's Axum `run_app` binds the listener at `EDGEZERO__ADAPTER__HOST` and
+`EDGEZERO__ADAPTER__PORT`, `127.0.0.1:8787` when unset. A host that is not an
+IP address or a port that is not a non-zero number falls back to the default
+with a startup warning. The adapter does not read `PORT`.
+
 ## Ingress limits
 
 The listener reads its HTTP/1 ingress limits from the environment at startup.
@@ -69,12 +76,15 @@ connection.
 
 ## Logging
 
-Axum logs to standard output at `info` by default. Set `RUST_LOG` to a single
-level (`trace`, `debug`, `info`, `warn`, `error`, or `off`) to change it, for
-example `RUST_LOG=debug cargo run -p trusted-server-adapter-axum`.
-Unrecognized values, including per-module filters such as
-`trusted_server=debug`, fall back to `info` and print a warning to standard
-error at startup.
+EdgeZero's Axum dev server installs the logger, and Trusted Server installs
+none of its own. It logs to standard output at `info` by default. Set
+`EDGEZERO__LOGGING__LEVEL` to a single level (`trace`, `debug`, `info`,
+`warn`, `error`, or `off`, in any case) to change it, for example
+`EDGEZERO__LOGGING__LEVEL=debug cargo run -p trusted-server-adapter-axum`.
+An unrecognized value, including a per-module filter such as
+`trusted_server=debug`, falls back to `info` without a warning. `RUST_LOG` is
+not read. EdgeZero's startup warnings, logged under the `edgezero::boot`
+target, stay at `warn` whatever the level.
 
 The `trace` level can log auction payloads and TCF consent strings, for example
 the `adserver_mock` mediation request, and the full Prebid Server response

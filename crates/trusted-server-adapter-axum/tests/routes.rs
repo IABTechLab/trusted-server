@@ -243,8 +243,8 @@ fn axum_main_exits_non_zero_when_settings_fail() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
         .env_clear()
         .env(AXUM_CONFIG_ENV, "not-a-trusted-server-config-envelope")
-        .env("PORT", free_loopback_port().to_string())
-        .env("RUST_LOG", "info")
+        .env("EDGEZERO__ADAPTER__PORT", free_loopback_port().to_string())
+        .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -270,11 +270,11 @@ fn axum_main_exits_non_zero_when_settings_fail() {
         "should log the settings failure report; output:\n{output}"
     );
     assert!(
-        output.contains("trusted-server-adapter-axum failed to start"),
+        output.contains("trusted-server-adapter-axum failed"),
         "should log the startup failure before exiting; output:\n{output}"
     );
     assert!(
-        !output.contains("Listening on"),
+        !output.contains("starting axum server"),
         "should not reach the listener; output:\n{output}"
     );
 }

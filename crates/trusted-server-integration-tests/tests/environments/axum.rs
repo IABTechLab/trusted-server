@@ -131,7 +131,7 @@ impl AxumDevServer {
 
         let mut command = Command::new(self.binary_path());
         command
-            .env("PORT", port.to_string())
+            .env("EDGEZERO__ADAPTER__PORT", port.to_string())
             .env(config_variable, app_config)
             .envs(INTEGRATION_SECRET_ENV.iter().copied());
         command

@@ -2315,7 +2315,7 @@ fn axum_invalid_ingress_variable_fails_startup() {
     let mut child = environments::axum::AxumDevServer
         .command(&envelope, port)
         .env("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT", "0")
-        .env("RUST_LOG", "info")
+        .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2347,7 +2347,7 @@ fn axum_invalid_ingress_variable_fails_startup() {
         "should name the invalid ingress setting; output:\n{output}"
     );
     assert!(
-        !output.contains("Listening on"),
+        !output.contains("starting axum server"),
         "should not reach the listener; output:\n{output}"
     );
 }

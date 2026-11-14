@@ -12,8 +12,13 @@ process with a non-zero exit before it listens. Application configuration
 reaches the process through the documented environment bridge; the local
 EdgeZero config-store file is not read directly.
 
-The listener's ingress limits come from `EDGEZERO__ADAPTER__INGRESS__*`
-environment variables, and an invalid value also stops startup. The
+The binary runs through EdgeZero's Axum `run_app`, which installs the logger
+and binds the listener; the adapter installs no logger of its own. The log
+level comes from `EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener
+address from `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default
+`127.0.0.1:8787`). The listener's ingress limits come from
+`EDGEZERO__ADAPTER__INGRESS__*` environment variables, and an invalid value
+also stops startup. The
 [Axum development guide](../../docs/guide/axum-dev.md#ingress-limits) lists
 them.
 

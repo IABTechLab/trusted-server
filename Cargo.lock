@@ -6570,7 +6570,6 @@ dependencies = [
  "futures",
  "log",
  "reqwest 0.12.28",
- "simple_logger",
  "temp-env",
  "tokio",
  "trusted-server-core",

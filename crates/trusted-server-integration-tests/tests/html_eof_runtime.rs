@@ -276,10 +276,12 @@ impl<'a> Harness<'a> {
         match adapter {
             "axum" => {
                 command = self.command(artifact);
-                command.env("PORT", port.to_string()).env(
-                    "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
-                    envelope,
-                );
+                command
+                    .env("EDGEZERO__ADAPTER__PORT", port.to_string())
+                    .env(
+                        "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
+                        envelope,
+                    );
                 for (key, value) in config::SECRETS {
                     command.env(
                         format!(
