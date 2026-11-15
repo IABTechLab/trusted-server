@@ -1773,7 +1773,7 @@ pub async fn buffer_publisher_response_async(
             // A buffered-unmodified response can carry an origin body, which
             // arrives as a stream. A bodiless response (HEAD, 204,
             // 205, 304) must stay bodiless, so drop the body and correct its
-            // framing (204/205 Content-Length; HEAD/304 preserved), matching
+            // framing (205 `Content-Length: 0`; HEAD/304 preserved), matching
             // the streaming finalizer.
             if response_carries_body(method, response.status()) {
                 collect_raw_body(&mut response, input_cap).await?;
@@ -2480,7 +2480,7 @@ pub async fn publisher_response_into_streaming_response(
             // classified, so a buffered-unmodified response can still hold an
             // `EdgeBody::Stream`. Delivery streams any `EdgeBody::Stream` to the
             // client, so a bodiless response (HEAD, 204, 205, 304) drops its body
-            // and corrects its framing (204/205 Content-Length; HEAD/304 preserved).
+            // and corrects its framing (205 `Content-Length: 0`; HEAD/304 preserved).
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
             }

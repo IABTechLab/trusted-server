@@ -953,7 +953,8 @@ async fn dispatch_fallback(
 /// with no cap: the response keeps the origin stream, and `EdgeZero`'s response
 /// delivery commits the headers and pumps the body chunk by chunk, so large
 /// images never materialize in the Wasm heap. A `HEAD`, 204, or 304 carries an
-/// empty body and keeps the origin's `Content-Length`.
+/// empty body. A `HEAD` or 304 keeps the origin's `Content-Length`; a 204 has
+/// none.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
