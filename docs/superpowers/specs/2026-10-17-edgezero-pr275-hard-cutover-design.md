@@ -1,7 +1,7 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08, 2026-11-11, 2026-11-12 and 2026-11-13
+2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13 and 2026-11-14
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -84,7 +84,8 @@ adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
 `737f8452` and `5c32ae61` are earlier pins of the cut, `10166628` is the cut's
 pin (its cited files match `5c32ae61`), and
-`v0.0.11` is the base's pin.
+`v0.0.11` is the base's pin. Dates are US Pacific time (UTC-8). In UTC,
+`5c32ae61`, PR 275's head late on 2026-11-13, is dated 2026-11-14.
 
 ## Problem
 
@@ -2144,8 +2145,9 @@ Trusted Server added no workaround for either:
 
 Its Fastly logging asks are in
 [a second comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6869073346),
-and `5c32ae61`, the pin, answers all three: a managed logger under the custom
-lifecycle, the target in Fastly lines, and a runtime level (section 9).
+and `5c32ae61`, which the pin carries, answers all three: a managed logger
+under the custom lifecycle, the target in Fastly lines, and a runtime level
+(section 9).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
