@@ -12,7 +12,7 @@ use reqwest::blocking::{Client, Response};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -356,6 +356,31 @@ pub fn is_ec_cookie_expired(resp: &Response) -> bool {
 // Minimal origin server
 // ---------------------------------------------------------------------------
 
+/// How long a test origin waits for the rest of a request head.
+const ORIGIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads one request head from a connection a test origin accepted.
+///
+/// Returns the bytes received by the time the blank line that ends the head
+/// arrived, or `None` when the connection closes, fails or times out first.
+fn read_request_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    // Some platforms, macOS among them, hand out accepted sockets in the
+    // listener's nonblocking mode. A nonblocking read can run before the
+    // request bytes arrive, so the read must block, with a bound.
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(ORIGIN_READ_TIMEOUT)).ok()?;
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        head.extend_from_slice(&chunk[..read]);
+    }
+    Some(head)
+}
+
 /// A minimal HTTP origin server that returns `200 OK` with a simple HTML body
 /// for any request. Required for organic route proxying.
 pub struct MinimalOrigin {
@@ -385,8 +410,9 @@ impl MinimalOrigin {
 
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf);
+                        if read_request_head(&mut stream).is_none() {
+                            continue;
+                        }
 
                         let body = "<html><body><h1>Test Origin</h1></body></html>";
                         let response = format!(
@@ -452,11 +478,10 @@ impl CookieVaryingOrigin {
 
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let mut buf = [0u8; 4096];
-                        let Ok(bytes_read) = stream.read(&mut buf) else {
+                        let Some(head) = read_request_head(&mut stream) else {
                             continue;
                         };
-                        let request = String::from_utf8_lossy(&buf[..bytes_read]);
+                        let request = String::from_utf8_lossy(&head);
                         let cookie = request
                             .lines()
                             .find_map(|line| {
