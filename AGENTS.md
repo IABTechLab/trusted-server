@@ -223,7 +223,7 @@ pub struct UserId(Uuid);
 
 ### Crate Preferences
 
-- `log` (with `log-fastly`) for instrumentation.
+- `log` for instrumentation. EdgeZero installs the backend on every adapter.
 
 ---
 
@@ -285,7 +285,8 @@ impl core::error::Error for MyError {}
 - Use `log` crate level-specific macros: `log::info!`, `log::debug!`, `log::trace!`, `log::warn!`, `log::error!`.
 - Provide context in log messages with format strings.
 - Format messages with present-tense verbs.
-- Use `log-fastly` as the backend for Fastly Compute.
+- Never install a logger in Trusted Server. EdgeZero installs the backend on
+  every adapter, and its managed setup fails when another logger is installed.
 
 ## Other guidelines
 
