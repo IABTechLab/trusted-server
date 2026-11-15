@@ -4255,9 +4255,9 @@ pub struct AuctionDispatch<'a> {
 /// Necessary for the template cache, and recorded as the `origin_cache_shareable`
 /// telemetry. Origin readthrough is unavailable until `EdgeZero` surrogate keys (EZ-11)
 /// restore it; the telemetry measures the reach it would have. One type keeps the two
-/// from drifting apart. Keeping the template-only conditions out of it is deliberate: the assembly mode and the reader's
-/// encoding support say whether *this pipeline* can assemble a shared template, not whether
-/// the origin's bytes may be shared at all.
+/// from drifting apart. Keeping the template-only conditions out of it is deliberate:
+/// the assembly mode and the reader's encoding support say whether *this pipeline* can
+/// assemble a shared template, not whether the origin's bytes may be shared at all.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SharedRequestInputs {
     /// The method admits a shared representation. Only `GET` does.
