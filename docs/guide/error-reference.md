@@ -178,11 +178,12 @@ Planned provider 'pbs-main' request failed: ...
 ```
 
 **Cause:** The bidder request did not complete: the connection or TLS
-handshake failed, the provider answered with a protocol error, or Fastly could
-not register the provider's backend. EdgeZero derives Fastly backends from the
-provider endpoint; they are not static Fastly backends. A registration failure
-records `launch_failed` for the provider, and other failures record
-`transport_failed`. The report in this warning carries the provider failure
+handshake failed, the provider answered with a protocol error, Fastly could not
+register the provider's backend, or the Spin or Cloudflare adapter could not
+prepare the request. EdgeZero derives Fastly backends from the provider
+endpoint; they are not static Fastly backends. A registration or preparation
+failure records `launch_failed` for the provider, and other failures record
+`transport`. The report in this warning carries the provider failure
 detail (`outbound provider failure detail: ...`), which holds closed failure
 codes and no URL.
 
