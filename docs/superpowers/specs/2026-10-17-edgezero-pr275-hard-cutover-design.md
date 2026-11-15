@@ -1860,7 +1860,12 @@ Outbound, continued:
     EdgeZero for none. Each cap now applies in EdgeZero's buffered collection,
     so a body over it is classed `transport`. Today the platform collects up
     to 10 MiB, and a body over the profile's cap is classed `parse_response`,
-    or `http_status` for an error status.
+    or `http_status` for an error status. The `transport` classification holds
+    on every adapter, because EdgeZero's buffered collection applies the cap on
+    Axum, Cloudflare, and Spin too. There a non-2xx response whose body is
+    over the cap is also `transport` now, where today it is `http_status`: the
+    Prebid Server parser tolerates a failed body read on an error status, and
+    the Standard parser never reads an error body (`provider.rs:560-572`).
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
