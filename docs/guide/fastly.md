@@ -485,9 +485,9 @@ after printing the failure.
 The usual causes are an `edgezero_logging` Config Store that is linked but
 cannot be opened or read, and an `endpoint` in `[adapters.fastly.logging]`
 that the Fastly logger rejects, such as a name containing `:`. EdgeZero's
-manifest validation does not check the endpoint. The failure lasts for the
-instance. This is an open EdgeZero gap, and Trusted Server does not work
-around it.
+manifest validation does not check the endpoint ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)). The failure lasts for the
+instance. This is an open EdgeZero gap ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and Trusted Server
+does not work around it.
 
 ## Verify the complete local handoff
 

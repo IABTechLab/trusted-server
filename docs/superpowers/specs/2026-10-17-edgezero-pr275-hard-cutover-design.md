@@ -1716,14 +1716,14 @@ failed install prints `logger installation failed, retrying next callback`
 and serves the request
 (`crates/trusted-server-adapter-fastly/src/main.rs:176-195`). This is an
 open EdgeZero gap: EdgeZero's custom runners send no response when
-installation fails. Trusted Server adds no workaround, and the cut repins
+installation fails ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)). Trusted Server adds no workaround, and the cut repins
 when EdgeZero answers such a request itself (Follow-ups).
 
 EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
 `tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
 Trusted Server's hand-written `Hooks` parses the compiled-in `edgezero.toml`
 with EdgeZero's `ManifestLoader` and caches the result, so the manifest is
-parsed once per instance and stays the single source. `owns_logging` stays
+parsed once per instance and stays the single source. Removing that parse waits on an EdgeZero helper for hand-written `Hooks` ([#1611](https://github.com/IABTechLab/trusted-server/issues/1611), [IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)). `owns_logging` stays
 false.
 
 Fastly lines read `<timestamp> <level> <target> <message>`
@@ -1919,7 +1919,7 @@ Logging:
     nothing, `/health` included, and Viceroy 0.21.0 then answers `200` with an
     empty body. Today the health probe answers before logger setup, and a
     failed install is printed on stderr while the request is served. This is
-    an open EdgeZero gap (section 9).
+    an open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)).
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
@@ -2018,33 +2018,33 @@ raises or lowers the log level (section 9).
 
 ## Failure handling
 
-| Failure                                                                              | Behavior                                                                                                                               |
-| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                  |
-| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                   |
-| Ambiguous or malformed request framing                                               | 400 from EdgeZero's ingress, before any handler runs                                                                                   |
-| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                             |
-| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                |
-| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                           |
-| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                  |
-| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                 |
-| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                   |
-| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                            |
-| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                         |
-| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                |
-| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                         |
-| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup |
-| Fastly delivery not committed                                                        | Native 500                                                                                                                             |
-| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                          |
-| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                   |
-| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9)                                          |
-| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                               |
-| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                    |
-| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                         |
-| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                          |
-| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                     |
-| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                            |
-| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                              |
+| Failure                                                                              | Behavior                                                                                                                                                                    |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                                                       |
+| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                                                        |
+| Ambiguous or malformed request framing                                               | 400 from EdgeZero's ingress, before any handler runs                                                                                                                        |
+| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                                                                  |
+| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                                                     |
+| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                                                                |
+| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                                                       |
+| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                                                      |
+| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                                                        |
+| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                                                                 |
+| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                                                              |
+| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                                                     |
+| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                                                              |
+| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup                                      |
+| Fastly delivery not committed                                                        | Native 500                                                                                                                                                                  |
+| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                                                               |
+| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                                                        |
+| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)) |
+| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                                                                    |
+| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                                                         |
+| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                                                              |
+| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                                                               |
+| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                                                          |
+| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                                                                 |
+| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                                                                   |
 
 ## Compatibility and rollout
 
@@ -2148,6 +2148,8 @@ Its Fastly logging asks are in
 and `5c32ae61`, which the pin carries, answers all three: a managed logger
 under the custom lifecycle, the target in Fastly lines, and a runtime level
 (section 9).
+
+The round-2 asks are in [a third comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6889465884), all three filed under EdgeZero's identity epic and open: no response when the Fastly managed logger fails to install ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), manifest validation that accepts endpoint names the Fastly logger rejects ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)), and a compile-time `logging_for` for hand-written `Hooks` ([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
@@ -2661,7 +2663,7 @@ route tests, the whole parity suite, and the CLI proxy test move to
   `smoke-axum.sh` change in section 7. `smoke-cloudflare.sh` is a known
   failure: it exits 1 with `smoke: missing Wrangler pin in .tool-versions`.
   `.tool-versions` pins no Wrangler, and `main`'s has no Wrangler line either
-  (Follow-ups).
+  (Follow-ups, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - **Fastly response diff.** A script under `scripts/` sends a fixed request list
   to a `main` build and to the branch build, both under Viceroy. It diffs
   status, headers, and a body hash. The list covers a publisher page, `HEAD` and
@@ -2758,8 +2760,9 @@ old layer. That transient dual path exists only inside the pull request.
 - EZ-24 published test double, to delete Trusted Server's scripted client.
 - An EdgeZero ask for a version header on assembly-error responses (EZ-19.7).
 - An EdgeZero ask for a response when the Fastly managed logger fails to
-  install, which leaves every request unanswered (section 9), and a repin once
-  EdgeZero answers it.
+  install, which leaves every request unanswered (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and a
+  repin once EdgeZero answers it. A companion ask rejects endpoint names the
+  logger cannot install when the manifest loads ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)).
 - EZ-2 reuse-mode parts, before reusable sandboxes reach production.
 - Streaming publisher responses on Axum, Cloudflare, and Spin.
 - Declaring stores on Cloudflare and Spin, including whether the Cloudflare
@@ -2775,12 +2778,12 @@ old layer. That transient dual path exists only inside the pull request.
   PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
 - A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
-  run (Runtime).
+  run (Runtime, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - One manifest parse for `Hooks::logging_for`. Trusted Server's hand-written
   `Hooks` parses the compiled-in `edgezero.toml` once per instance
   (section 9), and a non-reusable Fastly instance serves one request, so it
-  parses once per request. A build-time bake, or an EdgeZero helper for
-  hand-written `Hooks`, would remove it.
+  parses once per request. An EdgeZero helper for hand-written `Hooks` would
+  remove it ([#1611](https://github.com/IABTechLab/trusted-server/issues/1611), blocked by [IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers
