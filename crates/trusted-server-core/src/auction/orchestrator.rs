@@ -736,6 +736,11 @@ impl AuctionOrchestrator {
             // Fastly registers every bidder backend while it starts the batch,
             // so a registration failure is already recorded here. A launch
             // failure an adapter reports later is settled during collection.
+            // Spin and Cloudflare prepare each request inside the batch task
+            // they spawn, so their preparation failure surfaces there as
+            // `launch_failed` and does not count toward the all-launch-failed
+            // boundary below: an auction whose bidders all fail preparation
+            // completes without bids.
             launch_failure_count += settle_recorded_slots(
                 &mut batch,
                 &mut slot_providers,
@@ -1510,6 +1515,9 @@ mod tests {
     /// but `EdgeZero` builds no outbound request for a target with a backslash.
     const UNBUILDABLE_BIDDER: &str = r"https://failing.example.test/openrtb?x=\";
 
+    /// Endpoint of a second bidder that a launch-failure test makes fail.
+    const SECOND_FAILING_BIDDER: &str = "https://second-failing.example.test/openrtb";
+
     /// Endpoint of the bidder whose backend registration runs out of budget.
     const TIMED_OUT_BIDDER: &str = "https://timed-out.example.test/openrtb";
 
@@ -1670,7 +1678,8 @@ mod tests {
             .collect()
     }
 
-    /// Bidders that fail to launch, through construction or backend registration.
+    /// Bidders that fail to launch: through construction, backend registration,
+    /// or a request the Spin or Cloudflare adapter could not prepare.
     mod launch_failure_tests {
         use super::*;
 
@@ -1822,6 +1831,61 @@ mod tests {
                     ],
                     "should class a request the adapter could not prepare as a launch failure"
                 );
+            }
+        }
+
+        #[test]
+        fn preparation_failures_of_every_bidder_complete_the_auction_without_bids() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            // Spin and Cloudflare report a preparation failure from the batch
+            // task they spawn, so it arrives after the batch has started.
+            for (first, second) in request_preparation_errors()
+                .into_iter()
+                .zip(request_preparation_errors())
+            {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                bidders
+                    .respond_to(
+                        Method::POST,
+                        FAILING_BIDDER,
+                        ScriptedReply::error(first).after(Duration::from_millis(10)),
+                    )
+                    .respond_to(
+                        Method::POST,
+                        SECOND_FAILING_BIDDER,
+                        ScriptedReply::error(second).after(Duration::from_millis(10)),
+                    );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[
+                        ("launch-fail-a", FAILING_BIDDER),
+                        ("launch-fail-b", SECOND_FAILING_BIDDER),
+                    ]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction when every bidder fails preparation");
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail-a",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        (
+                            "launch-fail-b",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                    ],
+                    "should record each preparation failure as a launch failure"
+                );
+                assert_eq!(result.total_bids(), 0, "should complete without bids");
             }
         }
 
