@@ -11,7 +11,10 @@ This guide covers setting up your Fastly account and Compute service for Trusted
 The row above summarizes the
 [adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
 response does not prove that configuration loaded: Fastly serves `/health`
-before it constructs the application.
+before it constructs the application. If EdgeZero's managed logger fails to
+install, Trusted Server answers nothing, `/health` included, so check for the
+`ok` body, not only the status (see
+[When the logger fails to install](#when-the-logger-fails-to-install)).
 
 ## Create a Fastly Account
 
@@ -467,6 +470,24 @@ EDGEZERO__LOGGING__LEVEL = "debug"
 
 On a deployed service, leave `edgezero_logging` unlinked to keep the manifest
 level, or link a Config Store with that key to change it.
+
+### When the logger fails to install
+
+If EdgeZero cannot install its logger, Trusted Server answers nothing on any
+route, `/health` included: EdgeZero's lifecycle returns before Trusted
+Server's callback runs and sends no response, and the guest prints only
+`managed logger installation failed: <reason>` on stderr. Under
+`fastly compute serve` or Viceroy the client then gets `200` with an empty
+body, so a health check that reads only the status passes. Earlier releases
+answered `/health` before installing the logger, and served every request
+after printing the failure.
+
+The usual causes are an `edgezero_logging` Config Store that is linked but
+cannot be opened or read, and an `endpoint` in `[adapters.fastly.logging]`
+that the Fastly logger rejects, such as a name containing `:`. EdgeZero's
+manifest validation does not check the endpoint. The failure lasts for the
+instance. This is an open EdgeZero gap, and Trusted Server does not work
+around it.
 
 ## Verify the complete local handoff
 

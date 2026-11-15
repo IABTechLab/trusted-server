@@ -1076,8 +1076,9 @@ The callback runs these steps in order.
    (`main.rs:172-208`, `:342`, `:362`) answer with native responses before
    EdgeZero runs. At `5c32ae61`, `run_custom` and `serve_custom` install the
    managed logger before the callback, so the old `setup_once(init_logger)`
-   step is gone (section 9). The metrics probe must stay ahead of app
-   assembly. The callback takes `clock = MonotonicClock::default()` and
+   step is gone (section 9). If that install fails, the callback never runs,
+   so none of these answers (section 9). The metrics probe must stay ahead of
+   app assembly. The callback takes `clock = MonotonicClock::default()` and
    `request_start = clock.now()` at entry. Only `send_assembly_error` uses them.
 2. **Assembly.** `sandbox.initialize` builds the router and calls
    `App::from_router::<TrustedServerApp>(router, FASTLY_PLATFORM)`
@@ -1155,7 +1156,8 @@ carries the synthesized set in place of the finalize headers.
 Outcomes of `FastlyRequestDelivery` (`delivery.rs:183-312`). The callback
 handles every delivery the same way, including the one `send_assembly_error`
 returns. Every failure log carries the sandbox counter context
-(`[instance= ordinal= request=]`, as at `main.rs:726-768`).
+(`[instance= ordinal= request=]`, as at `main.rs:726-768`). The last row is
+not a delivery: the lifecycle fails before the callback runs.
 
 | Outcome                                                                       | Callback action                                                                |
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -1167,6 +1169,7 @@ returns. Every failure log carries the sandbox counter context
 | Any other `Detached`                                                          | Log the report at debug, or at warn for a source error                         |
 | `Aborted`                                                                     | Unreachable, because Trusted Server installs no abort policy. Log at error     |
 | Any other variant (`FastlyRequestDelivery` is `#[non_exhaustive]`)            | Log at error                                                                   |
+| Managed logger install fails before the callback (no delivery)                | No callback runs, so nothing is sent, `/health` included (section 9)           |
 
 Outcome handling is one function generic over `FastlyRequestDelivery<S>`. Only
 the routed post-delivery arm needs `FinalizeState`. The assembly-error result
@@ -1687,10 +1690,33 @@ type and install the managed Fastly logger from `A::logging_for("fastly")`
 before each callback, unless the app owns logging
 (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-200`,
 `logger.rs:91-122`). Installation runs once per instance; identical repeats
-succeed. The callback's error type takes `ManagedLoggerError`, which is the
-only error Trusted Server's callbacks can return; `main` reports it on
-stderr, because no logger exists then. Trusted Server's own `logging.rs` and
-its `setup_once` install are deleted.
+succeed. The callback's error type takes `ManagedLoggerError`, the error
+`run_custom` and `serve_custom` return when installation fails; `main`
+reports it on stderr, because no logger exists then. Trusted Server's own
+`logging.rs` and its `setup_once` install are deleted.
+
+A failed installation stops the request before Trusted Server's callback
+runs, so Trusted Server sends nothing, `/health` included. `run_custom`
+returns the error without a response, and `serve_custom` hands it to the SDK
+as the request's result, which ends serving without a send
+(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:31-40`,
+`:159-201`). Under Viceroy 0.21.0 the client then gets `200` with an empty
+body, so a `/health` check that reads only the status passes (review
+5907840090's probe). What hosted Fastly answers is unchecked. The failure is
+kept for the instance
+(`edgezero@5c32ae61:crates/edgezero-core/src/logging.rs:30-61`), and so is
+the `edgezero_logging` read (`logger.rs:110-116`). An unexpected status
+opening or reading a linked `edgezero_logging` store
+(`ConfigurationUnavailable`, `config_store.rs:243-254`) causes it, and so
+does an endpoint name that `log_fastly` rejects, such as one containing `:`
+(`InvalidConfiguration`, `logger.rs:24-35`). Manifest validation does not
+check the endpoint. Today the health probe runs before logger setup, and a
+failed install prints `logger installation failed, retrying next callback`
+and serves the request
+(`crates/trusted-server-adapter-fastly/src/main.rs:176-195`). This is an
+open EdgeZero gap: EdgeZero's custom runners send no response when
+installation fails. Trusted Server adds no workaround, and the cut repins
+when EdgeZero answers such a request itself (Follow-ups).
 
 EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
 `tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
@@ -1888,6 +1914,11 @@ Logging:
     level (`logging.rs:28`, `:59-62`). Neither is read now, so a local run
     logs at `debug` only with that store declared. The maintainer accepted
     both losses.
+28. When EdgeZero's managed logger fails to install, Trusted Server sends
+    nothing, `/health` included, and Viceroy 0.21.0 then answers `200` with an
+    empty body. Today the health probe answers before logger setup, and a
+    failed install is printed on stderr while the request is served. This is
+    an open EdgeZero gap (section 9).
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
@@ -2005,6 +2036,7 @@ raises or lowers the log level (section 9).
 | Fastly delivery not committed                                                        | Native 500                                                                                                                             |
 | Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                          |
 | Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                   |
+| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9)                                          |
 | Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                               |
 | Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                    |
 | `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                         |
@@ -2720,6 +2752,9 @@ old layer. That transient dual path exists only inside the pull request.
   adapter.
 - EZ-24 published test double, to delete Trusted Server's scripted client.
 - An EdgeZero ask for a version header on assembly-error responses (EZ-19.7).
+- An EdgeZero ask for a response when the Fastly managed logger fails to
+  install, which leaves every request unanswered (section 9), and a repin once
+  EdgeZero answers it.
 - EZ-2 reuse-mode parts, before reusable sandboxes reach production.
 - Streaming publisher responses on Axum, Cloudflare, and Spin.
 - Declaring stores on Cloudflare and Spin, including whether the Cloudflare
