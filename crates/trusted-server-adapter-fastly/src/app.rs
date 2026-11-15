@@ -1433,6 +1433,7 @@ mod tests {
         TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+    use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -2083,6 +2084,28 @@ mod tests {
         assert!(
             error.to_string().contains("161") && error.to_string().contains("160"),
             "should name the tuple count and the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn state_builder_warns_once_for_an_unsynthesizable_operator_response_header() {
+        let mut settings = test_settings();
+        settings.response_headers =
+            HashMap::from([("content-type".to_owned(), "text/plain".to_owned())]);
+        let capture = LogCapture::start();
+
+        build_state_from_settings(settings).expect("should build state with the operator header");
+
+        let records = capture.take_all();
+        drop(capture);
+        let naming_content_type: Vec<(log::Level, &str)> = records
+            .iter()
+            .filter(|record| record.message.contains("`content-type`"))
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert!(
+            matches!(naming_content_type.as_slice(), [(log::Level::Warn, _)]),
+            "should warn once, naming `content-type`, as it loads the settings, got {naming_content_type:?}"
         );
     }
 
