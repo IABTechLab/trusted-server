@@ -184,7 +184,8 @@ prepare the request. EdgeZero derives Fastly backends from the provider
 endpoint; they are not static Fastly backends. A registration or preparation
 failure records `launch_failed` for the provider, and other failures record
 `transport`. The report in this warning carries the outbound status and kind,
-never the error's message, and, when EdgeZero reports one, the provider
+such as `outbound failure: 502 Bad Gateway (response_too_large)`, never the
+error's message, and, when EdgeZero reports one, the provider
 failure detail (`outbound provider failure detail: ...`), which holds closed
 failure codes and no URL.
 
