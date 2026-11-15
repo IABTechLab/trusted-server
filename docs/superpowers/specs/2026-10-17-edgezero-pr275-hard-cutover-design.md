@@ -2675,7 +2675,9 @@ route tests, the whole parity suite, and the CLI proxy test move to
   asset, a tsjs bundle, an admin endpoint, `TRACE`, and a trace action. It
   normalizes `x-ts-version`, sandbox counter headers, dates, and generated IDs.
   The expected differences are exactly the [Fastly differences](#fastly-differences)
-  the list exercises. Reviewers can rerun it.
+  the list exercises. Reviewers can rerun it. At `78c06908b` against
+  `1810c763a` it reported `10 requests, 0 unexpected differences, 0 expected
+differences missing`; the 13 listed differences are items 5, 6, and 25.
 - The hosted legs in the qualification table, on Fastly staging.
 
 ## Commit sequence
@@ -3164,5 +3166,13 @@ change are D5, D7, D13, D18, and D20.
     logger install failure that leaves every request unanswered (section 9),
     and the missing Fastly response diff (Runtime). The fix round that
     followed made the outbound report print the status and kind (2.11),
-    recorded the logger failure as an open EdgeZero gap, and corrected this
-    spec, the guides, and the CHANGELOG.
+    dropped the test-only `ClientInfo` fallback in `trace_metadata`, and made
+    the EC test origins read the whole request head, which fixed the
+    cookie-boundary test. It added bad-`Content-Length` cases on Spin and
+    Cloudflare; the Cloudflare case checks only that the request never reaches
+    the origin, because Wrangler 4.162.0 answers 400 and 4.83.0 answers 500.
+    New tests kill the three surviving mutants. The logger failure is
+    recorded as an open EdgeZero gap ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and the
+    Fastly response diff against `1810c763a` showed only listed differences
+    (Runtime). The round also corrected this spec, the guides, and the
+    CHANGELOG.
