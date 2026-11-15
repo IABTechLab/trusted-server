@@ -2656,7 +2656,10 @@ route tests, the whole parity suite, and the CLI proxy test move to
 - `./scripts/integration-tests-browser.sh`, with loopback bidders.
 - `scripts/smoke-fastly.sh`, `scripts/smoke-axum.sh`,
   `scripts/smoke-cloudflare.sh`, and `scripts/smoke-spin.sh`, with the
-  `smoke-axum.sh` change in section 7.
+  `smoke-axum.sh` change in section 7. `smoke-cloudflare.sh` is a known
+  failure: it exits 1 with `smoke: missing Wrangler pin in .tool-versions`.
+  `.tool-versions` pins no Wrangler, and `main`'s has no Wrangler line either
+  (Follow-ups).
 - **Fastly response diff.** A script under `scripts/` sends a fixed request list
   to a `main` build and to the branch build, both under Viceroy. It diffs
   status, headers, and a body hash. The list covers a publisher page, `HEAD` and
@@ -2769,6 +2772,13 @@ old layer. That transient dual path exists only inside the pull request.
 - Moving the pin from the `rc/identity` commit to an EdgeZero release tag once
   PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
+- A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
+  run (Runtime).
+- One manifest parse for `Hooks::logging_for`. Trusted Server's hand-written
+  `Hooks` parses the compiled-in `edgezero.toml` once per instance
+  (section 9), and a non-reusable Fastly instance serves one request, so it
+  parses once per request. A build-time bake, or an EdgeZero helper for
+  hand-written `Hooks`, would remove it.
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers
