@@ -3076,8 +3076,9 @@ async fn stream_html_eof<W: Write>(
 /// # Errors
 ///
 /// Returns an error for missing async HTML operator permission or inconsistent
-/// factory/session capabilities, or if processing fails mid-stream. If headers
-/// are already committed, the caller logs the error and drops the body.
+/// factory/session capabilities, if `body` is not a stream, or if processing
+/// fails mid-stream. If headers are already committed, the caller logs the
+/// error and drops the body.
 pub async fn stream_publisher_body_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
