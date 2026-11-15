@@ -1198,13 +1198,17 @@ mod tests {
             .iter()
             .map(|warning| warning.message.as_str())
             .collect();
+        // The registry keeps partners in a `HashMap`, so the group's order
+        // varies between runs.
         assert!(
             matches!(
                 messages.as_slice(),
                 [message] if message.starts_with("Pull sync failed:")
-                    && message.contains(
+                    && (message.contains(
                         "partner group of 'alpha.example.com', 'beta.example.com' failed before 'alpha.example.com' answered"
-                    )
+                    ) || message.contains(
+                        "partner group of 'beta.example.com', 'alpha.example.com' failed before 'alpha.example.com' answered"
+                    ))
             ),
             "should name every partner of the failed group, the one that answered included, got {messages:?}"
         );
