@@ -89,7 +89,6 @@ use std::sync::{Arc, OnceLock};
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
-use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -1313,13 +1312,7 @@ fn trace_metadata(request: &RequestParts) -> TraceMetadata {
         .extensions
         .get::<ClientInfo>()
         .cloned()
-        .unwrap_or_else(|| ClientInfo {
-            client_ip: request
-                .extensions
-                .get::<FastlyRequestContext>()
-                .and_then(|context| context.client_ip),
-            ..ClientInfo::default()
-        });
+        .unwrap_or_default();
     let geo = request
         .extensions
         .get::<RequestGeo>()
