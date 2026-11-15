@@ -3105,7 +3105,7 @@ change are D5, D7, D13, D18, and D20.
   GitHub refused a formal approval because the reviewer and the author share
   one account, so the verdict is a review comment.
 
-- **Implementation phase (2026-11-08 to 2026-11-13).** The cut was built from
+- **Implementation phase (2026-11-08 to 2026-11-14).** The cut was built from
   the approved spec, and each correction the code forced is folded in above.
   - An internal whole-branch review at `6c39a56a1` (Claude Code, Opus) found
     nothing critical, four important findings, and eight minor ones (M1 to
@@ -3116,7 +3116,11 @@ change are D5, D7, D13, D18, and D20.
     passages in line.
   - GitHub review 5887835958 (2026-11-13, at `9ec4711d3`) asked for the full
     publisher cap and error matrix of test 21 and a Viceroy oracle for test 6's
-    overlap. Both were built (tests 6 and 21).
+    overlap. Test 21's matrix was built. For test 6, a Viceroy test shows that
+    a bid answered while the origin body streams is injected. The overlapped
+    dispatch order has no Viceroy oracle: Viceroy supplies no JA4, so it never
+    takes the overlapped path, and core's scripted-client test pins that order
+    (test 6). The reviewer accepted both halves.
   - GitHub review 5888499941 (2026-11-13, at `9ec4711d3`) left 72 findings: 2
     blocking, 29 should-fix, and 41 nits. The blocking ones were #1516's
     missing port and the 1 MiB Prebid Server and APS cap. The fix round that
@@ -3125,4 +3129,33 @@ change are D5, D7, D13, D18, and D20.
     cut left over, made each outbound failure log once (section 9), added the
     missing tests, and corrected this spec. Two gaps it found are EdgeZero's,
     and Trusted Server asked EdgeZero for both: the Spin upload framing (2.5)
-    and the Cloudflare and Spin log backend (section 9).
+    and the Cloudflare and Spin log backend (section 9). EdgeZero answered
+    both at `737f8452`.
+  - The logging cut followed (2026-11-13). Trusted Server's own Cloudflare
+    and Spin loggers were added (`a10d42d5a`) and reverted (`003f0b7db`),
+    because the gap was EdgeZero's. The cut repinned to `737f8452`
+    (`bba8e6f3e`), which installs managed backends on Cloudflare and Spin,
+    and deleted the `test-utils` fixture loggers. The Axum dev server moved
+    to EdgeZero's `run_app` (`0e199a20b`), and Fastly to EdgeZero's managed
+    logger with the manifest's settings, with `logging.rs` deleted
+    (`a6b37d859`). Trusted Server asked EdgeZero for three Fastly logging
+    changes, `5c32ae61` answered all three, and the cut repinned to it
+    (`9cc76f364`). Trusted Server now installs no logger on any adapter
+    (section 9).
+  - On 2026-11-14 the maintainer repinned to `10166628` on EdgeZero's
+    `rc/identity` branch (`32526960d`, recorded in `858f95087`). It carries
+    PR 275's head `e9ffaa8f`, and the Fastly files this spec cites are
+    unchanged from `5c32ae61`.
+  - GitHub review 5907840090 (2026-11-14, at `cee4acb48`) resolved 70 of the
+    74 threads from the previous round and did not accept the replies on 4:
+    the outbound status and kind, the `trace_metadata` fallback, the
+    startup-failure method statuses, and malformed `Content-Length` on
+    Cloudflare and Spin. It left 25 new findings, 3 should-fix and 22 nits,
+    and one more should-fix in its body: the Cloudflare cookie-boundary test
+    failed on macOS. The other should-fix ones were the Spin and Cloudflare
+    preparation failure the auction guide answered with 502 (2.4), the Fastly
+    logger install failure that leaves every request unanswered (section 9),
+    and the missing Fastly response diff (Runtime). The fix round that
+    followed made the outbound report print the status and kind (2.11),
+    recorded the logger failure as an open EdgeZero gap, and corrected this
+    spec, the guides, and the CHANGELOG.
