@@ -1062,10 +1062,12 @@ log; section 9 says who does.
 
 `main` keeps choosing `run_custom` for single-request sandboxes and
 `serve_custom` for reuse (`crates/trusted-server-adapter-fastly/src/main.rs:96-152`).
-The callback now returns `Result<(), Infallible>`
-(`edgezero:crates/edgezero-adapter-fastly/src/lifecycle.rs:153-181`) and
-always returns `Ok(())`. An `Err` would end the reuse loop with no response
-(`lifecycle.rs:139-149`).
+The callbacks now return `Result<(), ManagedLoggerError>` and always return
+`Ok(())`. `run_custom` and `serve_custom` return `Err` only when the managed
+logger fails to install before the callback
+(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-201`,
+section 9). An `Err` from the callback would end the reuse loop with no
+response (`lifecycle.rs:143-155`).
 
 The callback runs these steps in order.
 
