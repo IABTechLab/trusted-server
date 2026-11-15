@@ -388,10 +388,11 @@ setting covers both cases (EZ-7). Production code installs no client in router
 state, which would override the adapter default
 (`edgezero:crates/edgezero-core/src/router.rs:410-416`). Tests on the Axum test
 server do, so no real transport starts (EZ-23.7). Two exceptions start real
-transport. Test 19's bodiless GET supplies EdgeZero's Axum client. The CLI
-proxy fixture (`crates/trusted-server-cli/tests/proxy_trusted_server.rs`)
-installs no router-state client, so the adapter's default client reaches its
-loopback origin and TLS relay.
+transport. Both install no router-state client, so the adapter's per-request
+client carries the forward: in test 19's bodiless GET it reaches a loopback
+origin, and in the CLI proxy fixture
+(`crates/trusted-server-cli/tests/proxy_trusted_server.rs`) its loopback
+origin and TLS relay.
 
 #### 2.2 Settings every request carries
 
@@ -1516,11 +1517,12 @@ and stay.
   with each app assembled under its own platform metadata (EZ-23.8) and the
   scripted client supplied through router state (EZ-23.7). Their production
   policies then apply, which EZ-23 criterion 13 needs (test 19). For that
-  criterion's bodiless GET, the suite supplies EdgeZero's Axum client
-  (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:55`) instead and
-  records what a loopback origin receives. That client honors `HTTP_PROXY`, so
-  the test runs with the proxy variables unset. The Cloudflare and Spin route tests
-  in `tests/routes.rs` stay on `oneshot` (2.1).
+  criterion's bodiless GET, the suite installs no router-state client, so the
+  adapter's per-request client, EdgeZero's Axum client
+  (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:55`), carries the
+  forward, and the test records what a loopback origin receives. That client
+  honors `HTTP_PROXY`, so the test runs with the proxy variables unset. The
+  Cloudflare and Spin route tests in `tests/routes.rs` stay on `oneshot` (2.1).
 
 **Cloudflare.**
 
