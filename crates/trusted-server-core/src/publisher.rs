@@ -4821,8 +4821,9 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
-            // The reader's own path, not the origin target. Path *and* query: a different query is a different page, and
-            // a purge caller types the whole address.
+            // The reader's own path, not the origin target. Path *and* query: a
+            // different query is a different page, and a purge caller types the
+            // whole address.
             request_path: request_path_and_query.clone(),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
