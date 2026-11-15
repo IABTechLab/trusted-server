@@ -391,7 +391,8 @@ fn log_pull_failure(error: EdgeError, failed: String) {
 ///
 /// The group ends [`PULL_SYNC_GROUP_CUTOFF`] after it starts. A partner that
 /// has not answered by then is logged and skipped. When the group itself
-/// fails, its one failure line names the partners it left unanswered.
+/// fails, its one failure line names the group's partners and those it left
+/// unanswered.
 async fn send_pull_group(
     client: &HttpClient,
     clock: &MonotonicClock,
@@ -406,11 +407,18 @@ async fn send_pull_group(
         .map(|queued| (queued.source_domain, queued.request))
         .unzip();
     let cutoff = clock.deadline_after(PULL_SYNC_GROUP_CUTOFF);
-    let (slots, group_error) = match client.send_all_until(requests, cutoff).await {
+    let (slots, group_failure) = match client.send_all_until(requests, cutoff).await {
         Ok(results) => (results.into_parts().0, None),
         Err(failure) => {
             let (error, slots) = failure.into_parts();
-            (slots, Some(error))
+            // The loop below consumes the domains, so keep the group's
+            // partner list for its failure line.
+            let partners = source_domains
+                .iter()
+                .map(|source_domain| format!("'{source_domain}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (slots, Some((error, partners)))
         }
     };
 
@@ -427,7 +435,7 @@ async fn send_pull_group(
                 }
             },
             OutboundCollectedSlot::Unresolved => {
-                if group_error.is_some() {
+                if group_failure.is_some() {
                     unanswered.push(format!("'{source_domain}'"));
                 } else {
                     log::warn!(
@@ -444,12 +452,12 @@ async fn send_pull_group(
             updates.push(PartnerIdUpdate::new(source_domain, uid));
         }
     }
-    if let Some(error) = group_error {
+    if let Some((error, partners)) = group_failure {
         let failed = if unanswered.is_empty() {
-            "partner group failed".to_owned()
+            format!("partner group of {partners} failed after every partner answered")
         } else {
             format!(
-                "partner group failed before {} answered",
+                "partner group of {partners} failed before {} answered",
                 unanswered.join(", ")
             )
         };
@@ -1129,7 +1137,7 @@ mod tests {
             "should log one line each for the group failure, the request failure, and the build failure, got {messages:?}"
         );
         for step in [
-            "partner group failed before 'alpha.example.com' answered",
+            "partner group of 'alpha.example.com' failed before 'alpha.example.com' answered",
             "request for partner 'beta.example.com' failed",
             "request for partner 'gamma.example.com' could not be built",
         ] {
@@ -1147,6 +1155,67 @@ mod tests {
                 .iter()
                 .all(|warning| !warning.message.contains("provider text")),
             "should keep the provider text out of the logs"
+        );
+    }
+
+    #[test]
+    fn pull_sync_group_failure_names_every_partner_of_the_group() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 2;
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client
+            .respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::failing_batch(EdgeError::bad_gateway("alpha provider text"))
+                    .after(Duration::from_millis(10)),
+            )
+            .respond_to(
+                Method::GET,
+                &pull_url("beta.example.com"),
+                ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"beta-uid"}"#),
+            );
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        let capture = LogCapture::start();
+
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        let warnings = capture.take_all();
+        drop(capture);
+        let messages: Vec<&str> = warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [message] if message.starts_with("Pull sync failed:")
+                    && message.contains(
+                        "partner group of 'alpha.example.com', 'beta.example.com' failed before 'alpha.example.com' answered"
+                    )
+            ),
+            "should name every partner of the failed group, the one that answered included, got {messages:?}"
+        );
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should keep the entry");
+        assert_eq!(
+            entry.ids.get("beta.example.com").map(|id| id.uid.as_str()),
+            Some("beta-uid"),
+            "should keep the UID of the partner that answered before the group failed"
         );
     }
 
