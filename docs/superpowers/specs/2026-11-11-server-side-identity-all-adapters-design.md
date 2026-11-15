@@ -1,8 +1,10 @@
 # Server-side identity on every adapter: design
 
-Status: draft, in review in #1559. Read at Trusted Server main `598a85170` and
-EdgeZero main `e11ea308` (crates at `v0.0.11`) on 2026-11-11 and 2026-11-12.
-Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
+Status: draft, in review in #1559; the plan's GitHub tasks ran on 2026-11-13.
+Read at Trusted Server main `598a85170` and EdgeZero main `e11ea308` (crates at
+`v0.0.11`) on 2026-11-11 and 2026-11-12. [Integration
+branches](#integration-branches) and the State lines that cite it were read on
+2026-11-15, at Trusted Server main `1810c763a`. Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
 [server-side identity
 plan](../plans/2026-11-11-server-side-identity-all-adapters.md).
 
@@ -88,6 +90,28 @@ Main has no server-side providers. The single page-load write, the navigation
 permit and the startup refusal of providers off Fastly exist only on #1487 and
 the PRs stacked on it.
 
+### Integration branches
+
+Read on 2026-11-15. Each repository keeps an integration branch named
+`rc/identity` (DEC-5, DEC-20). Each joins ready pull requests with
+history-preserving merges and moves only forward: a pull request whose head
+moves is merged again on top, and the branch is never force-pushed. Neither
+branch has tags or branch protection. Each included pull request keeps its own
+review and still lands on main by itself.
+
+| Branch                       | Pull request            | Head        | Carries                                                                                                                                                                                                                                                                          | Included heads that moved since                             |
+| ---------------------------- | ----------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| EdgeZero `rc/identity`       | IABTechLab/edgezero#495 | `10166628`  | Main `e11ea308` with IABTechLab/edgezero#275, IABTechLab/edgezero#499, IABTechLab/edgezero#460, IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#409, IABTechLab/edgezero#414, IABTechLab/edgezero#422, IABTechLab/edgezero#439 and IABTechLab/edgezero#469 | IABTechLab/edgezero#275 at `4cbabfee`, which merges cleanly |
+| Trusted Server `rc/identity` | #1608                   | `4bc4c4847` | Main `1810c763a` with #1557, #1525, #1526, #1503 and #1506                                                                                                                                                                                                                       | #1506 at `cc811fc7a`, which conflicts in `ec/pull_sync.rs`  |
+
+#1506 pins EdgeZero's branch at `10166628` by SHA. That revision carries
+IABTechLab/edgezero#275 through IABTechLab/edgezero#439, so it holds R1's
+content (EZI-6), and it becomes Trusted Server main's pin when #1506 merges.
+IABTechLab/edgezero#422 now carries the celld record operations that
+IABTechLab/edgezero#463 held until it closed on 2026-11-13. The provider stack
+(#1487 to #1489) joins Trusted Server's branch once it rebases onto #1506.
+IABTechLab/edgezero#502 (EZI-4a) is the next EdgeZero pull request to join.
+
 ### How the EC record write is split
 
 The record logic is shared. `KvIdentityGraph` in
@@ -110,8 +134,8 @@ and celld backends inside the Axum adapter. EdgeZero's Fastly store drops what
 the record needs: at EdgeZero main and at IABTechLab/edgezero#275's head its
 read calls `lookup` without the generation, `exists` is a read, and inserts
 carry no mode. So the Fastly backend can move onto EdgeZero only once EZI-2a
-covers the Fastly provider. IABTechLab/edgezero#463's `CelldRecordStore` has
-the semantics on a separate API; IABTechLab/edgezero#414's DynamoDB provider
+covers the Fastly provider. IABTechLab/edgezero#463's `CelldRecordStore`, now
+in IABTechLab/edgezero#422, has the semantics on a separate API; IABTechLab/edgezero#414's DynamoDB provider
 has strong existence and listing but no CAS and keeps every key in one
 partition; IABTechLab/edgezero#410 and IABTechLab/edgezero#437 rule out
 conditional writes today; and the `edgezero-store-aws` and
@@ -210,10 +234,11 @@ marks the record contract and geo as supported.
 - **AX-7 Ships from main.** Main never pins an EdgeZero RC tag
   (IABTechLab/edgezero#431, IABTechLab/edgezero#462) or a revision that exists
   only on an RC branch, such as `456313675`, which #1528 pins today. Main may
-  pin IABTechLab/edgezero#275's head under DEC-1, or a tag on EdgeZero's
-  protected integration branch under DEC-5, which carries only work headed for
-  EdgeZero main. Accept: `Cargo.lock` on main resolves every EdgeZero crate to
-  a released tag, IABTechLab/edgezero#275's head or an integration-branch tag.
+  pin IABTechLab/edgezero#275's head under DEC-1, or a commit of EdgeZero's
+  integration branch `rc/identity` under DEC-5, which carries only work headed
+  for EdgeZero main; despite its prefix it is not an RC branch. Accept:
+  `Cargo.lock` on main resolves every EdgeZero crate to a released tag,
+  IABTechLab/edgezero#275's head or an `rc/identity` commit.
 
 ### ID: Server-side identity on every adapter
 
@@ -283,8 +308,9 @@ marks the record contract and geo as supported.
   request filters, because it has no trusted JA4 (EZI-3); Cloudflare and Spin
   create no records yet. CloudFront sends JA4 to the origin only in the
   `CloudFront-Viewer-JA4-Fingerprint` header, which an origin request policy
-  must forward. IABTechLab/edgezero#469's draft design reports Axum as
-  `NotExposed` and leaves the trusted proxy header to its section 13.1.
+  must forward. IABTechLab/edgezero#469 at `52f4a09f`, in EdgeZero's
+  integration branch, fills Axum's `ctx.ja4()` from a trusted proxy header
+  (`Ja4Source::TrustedProxyHeader`) and reports `NotExposed` otherwise.
 - **ID-8 Body EIDs keep being saved.** EIDs sent in the `/auction` body are
   saved to the record. Accept: on each supported adapter a body EID is in the
   record after the request. State: main saves them on Fastly; the provider
@@ -536,18 +562,19 @@ wait on a Cloudflare or Spin part.
   Rate Limiting and
   an in-memory backend for Axum, then Cloudflare and Spin backends per
   DEC-15. Accept: a contract test passes per backend.
-- **EZI-6 Integration points.** EdgeZero keeps a protected integration branch
-  for this work (DEC-5), and each integration point is a tag on it that Trusted
-  Server main pins until EdgeZero releases the work. R1 creates the branch and
-  tags IABTechLab/edgezero#275 through IABTechLab/edgezero#439, so Axum
+- **EZI-6 Integration points.** EdgeZero keeps the integration branch
+  `rc/identity` for this work (DEC-5, IABTechLab/edgezero#495). Each
+  integration point is a commit on it that Trusted Server main pins by SHA
+  until EdgeZero releases the work; there are no tags. R1 is the first commit
+  that carries IABTechLab/edgezero#275 through IABTechLab/edgezero#439, so Axum
   production serving does not wait for the record contract. R1b adds EZI-2a and
   EZI-2b. R2 adds the Fastly and Axum parts of EZI-1. R2b adds EZI-3,
   IABTechLab/edgezero#90, IABTechLab/edgezero#92, the JA4 accessor
   (IABTechLab/edgezero#283) and Axum's geo binding (EZI-4a), so providers never
   wait on JA4. Together R1, R1b, R2 and R2b cover Fastly and Axum. R3 adds the
   Cloudflare parts of EZI-1 to EZI-4, and R4 the Spin parts. EZI-2p and EZI-5
-  follow the MVP (DEC-15). Accept: each tag exists on the protected integration
-  branch and Trusted Server main pins it; R1, R1b, R2 and R2b contain no
+  follow the MVP (DEC-15). Accept: each integration point is a commit on
+  `rc/identity` that Trusted Server main pins; R1, R1b, R2 and R2b contain no
   Cloudflare or Spin part.
 
 ## Configuration
@@ -636,12 +663,16 @@ Decided:
   Spin item. Shared work may touch every adapter (the shared app and the
   rejection, 501 and absence paths in the plan's Global Constraints). Cloudflare
   and Spin follow the MVP.
-- **DEC-5 EdgeZero integration branch** (user, 2026-11-12). EdgeZero keeps an
-  integration branch that carries the unreleased work headed for EdgeZero main:
-  IABTechLab/edgezero#275, the IABTechLab/edgezero#406 to
+- **DEC-5 EdgeZero integration branch** (user, 2026-11-12; no tags,
+  2026-11-14). EdgeZero keeps an integration branch, `rc/identity`
+  (IABTechLab/edgezero#495), that carries the unreleased work headed for
+  EdgeZero main: IABTechLab/edgezero#275, the IABTechLab/edgezero#406 to
   IABTechLab/edgezero#439 chain and the EZI tickets. Trusted Server main pins
-  its tags (R1, R1b, R2 and R2b in the MVP) instead of waiting for an EdgeZero
-  release, and repins to a released tag once EdgeZero publishes one.
+  its commits by SHA (R1, R1b, R2 and R2b in the MVP) instead of waiting for an
+  EdgeZero release, and repins to a released tag once EdgeZero publishes one.
+  The user ruled out tags on the branch on 2026-11-14. It moves only forward,
+  by merges, and is never force-pushed. A fix for an included pull request
+  goes into that pull request, and the branch takes it as a plain merge.
 - **DEC-6 Base for the Axum line** (user, 2026-11-12). Forward-port the RC line
   to main rather than back-port the provider stack to it, which conflicted in 13
   to 23 files at the heads first measured and 21 to 24 at the round-4 heads.
@@ -681,6 +712,12 @@ Decided:
   attestation and package publishing (#1449, #1463, #1543) are not part of
   this work and carry lower priority. The MVP builds the production image
   from source (AX-5) without publishing or attesting it.
+- **DEC-20 Trusted Server integration branch** (user, 2026-11-14). Trusted
+  Server keeps its own `rc/identity` (#1608) under DEC-5's rules: main and the
+  ready Trusted Server pull requests the identity work builds on, joined by
+  merges, on the EdgeZero revision #1506 pins. Its merge commits may resolve
+  conflicts between included pull requests, and #1608 lists each resolution.
+  The provider stack and the A tickets join it as they become ready.
 
 Open:
 
@@ -860,3 +897,29 @@ should-fix, thread 104: at its new head #1540's example inputs already select
 CloudFront geo, so AX-3's State and Part C's "turn geo on" were stale. Both
 now describe that head, and Part C asks #1540 to bind geo through EdgeZero's
 manifest (EZI-4a) instead of `TS_NATIVE_GEO_PROFILE_TOML`.
+
+### Round 8, 2026-11-13
+
+Review 5886170878 at `c7dc9de77` kept all 104 resolutions, found nothing new
+and gave an APPROVE verdict. After it, `10c5e436d` put #1567 in #1246's place
+under #1558, because #1567 is the story the provider stack delivers.
+
+### Plan run, 2026-11-13
+
+At the user's request the plan's Tasks 1 to 8 ran from `c7dc9de77` before
+this PR merged. They moved 26 issues, created 51 (IABTechLab/edgezero#472 to
+IABTechLab/edgezero#493 and #1573 to #1601) and linked 117 blocked-by pairs;
+comment 6845859429 on #1559 records each one.
+
+### State refresh, 2026-11-15
+
+At the user's request, this revision records the state since the run. Both
+repositories now keep an integration branch named `rc/identity`, so
+[Integration branches](#integration-branches) lists what each carries and
+which included heads have moved since. The user ruled out tags, so AX-7, EZI-6
+and DEC-5 describe integration points as commits pinned by SHA. DEC-20 records
+Trusted Server's own branch. ID-7's State records that
+IABTechLab/edgezero#469 now reads Axum's JA4 from a trusted proxy header, and
+EZI-2b's celld work moved from closed IABTechLab/edgezero#463 to
+IABTechLab/edgezero#422. The plan's Part A gains a State section, and its
+counts include the issues filed or moved after the run.

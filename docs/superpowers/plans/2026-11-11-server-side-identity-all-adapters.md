@@ -78,6 +78,53 @@ design](../specs/2026-11-11-server-side-identity-all-adapters-design.md)
 
 ## Part A: merge order
 
+### State, read 2026-11-15
+
+Tasks 1 to 8 ran on 2026-11-13 from `c7dc9de77`; comment 6845859429 on #1559
+records every issue they moved, created and linked. Since then:
+
+- Each repository keeps an integration branch named `rc/identity` (DEC-5,
+  DEC-20): EdgeZero's in IABTechLab/edgezero#495 and Trusted Server's in
+  #1608. Neither has tags; each moves only forward. The spec's [Integration
+  branches](../specs/2026-11-11-server-side-identity-all-adapters-design.md#integration-branches)
+  lists what each carries.
+- IABTechLab/edgezero#460 was not folded into IABTechLab/edgezero#275's
+  branch. It stacks on IABTechLab/edgezero#499, which stacks on
+  IABTechLab/edgezero#275, and the IABTechLab/edgezero#406 to
+  IABTechLab/edgezero#439 chain stacks on it. When IABTechLab/edgezero#275 was
+  rewritten at `e9ffaa8f`, each stack PR merged the one below it, and
+  EdgeZero's branch took IABTechLab/edgezero#439's head and
+  IABTechLab/edgezero#469.
+- #1506 pins EdgeZero's branch at `10166628`, which carries
+  IABTechLab/edgezero#275 through IABTechLab/edgezero#439 and
+  IABTechLab/edgezero#460. Wave 1's fallback no longer applies, and R1's
+  content exists; R1 completes when #1506 merges on main.
+- IABTechLab/edgezero#463 closed on 2026-11-13; IABTechLab/edgezero#422 now
+  carries its celld record operations, so EZI-2b waits on
+  IABTechLab/edgezero#422 instead.
+- IABTechLab/edgezero#469 reads Axum's JA4 from a trusted proxy header, which
+  Part C asked of it for R2b.
+- #1605 closed on 2026-11-15; #1506 carries its forwarder change. #1531 still
+  targets #1605's branch, which stays.
+
+| PR                                                                                                                                                                                                     | Head                                                                                           | In an integration branch         | Next                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| #1557, #1525, #1526, #1503                                                                                                                                                                             | `76e1dd5f6`, `cd8977cad`, `e529e5576`, `5e10c24e4`                                             | Trusted Server's, at those heads | Their reviews, then main                                                                                                 |
+| #1506                                                                                                                                                                                                  | `cc811fc7a`                                                                                    | Trusted Server's, at `858f95087` | Its review round 3; the branch merges `cc811fc7a`, which conflicts in `ec/pull_sync.rs`                                  |
+| #1487, #1488, #1489                                                                                                                                                                                    | `bc8df76cc`, `518f88984`, `7bb9e741d`                                                          | No                               | Rebase onto #1506, then join Trusted Server's branch                                                                     |
+| #1531                                                                                                                                                                                                  | `bf3569dd9`                                                                                    | No                               | Rebase onto #1506 for A1                                                                                                 |
+| IABTechLab/edgezero#275                                                                                                                                                                                | `4cbabfee`                                                                                     | EdgeZero's, at `e9ffaa8f`        | Its review; the branch merges `4cbabfee`, which merges cleanly                                                           |
+| IABTechLab/edgezero#499, IABTechLab/edgezero#460, IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#409, IABTechLab/edgezero#414, IABTechLab/edgezero#422, IABTechLab/edgezero#439 | `cf8003f1`, `03d192fd`, `b3187e1b`, `77fa6772`, `e1350bb2`, `bd6cb7ab`, `f1d85581`, `302697e8` | EdgeZero's, at those heads       | Their reviews, then main after IABTechLab/edgezero#275                                                                   |
+| IABTechLab/edgezero#469                                                                                                                                                                                | `52f4a09f`                                                                                     | EdgeZero's, at that head         | Its review; delivers IABTechLab/edgezero#283                                                                             |
+| IABTechLab/edgezero#502                                                                                                                                                                                | `7ef4766d`                                                                                     | No                               | Merge IABTechLab/edgezero#439's new head into it, then join EdgeZero's branch; delivers EZI-4a (IABTechLab/edgezero#482) |
+
+Board changes after the run: #1507 moved under #1558, and
+IABTechLab/edgezero#436 moved under IABTechLab/edgezero#468, where it blocks
+EZI-2a, EZI-2p, EZI-3, EZI-1, EZI-5 and R1. Cutover follow-ups joined the
+epics: #1610 and #1611 under #1558, and IABTechLab/edgezero#503 to
+IABTechLab/edgezero#506 under IABTechLab/edgezero#468 (Part B). The epics now
+hold 48 and 37 issues.
+
 ### Stacking, read 2026-11-12
 
 Trusted Server:
@@ -137,13 +184,12 @@ Close.
 | 0    | TS #1526, #1522                                                                                                                                        | P1  | PR fix, Merge    | Retarget to main, fix its round-1 review; delivers #1522                                                                                                          | none                                                                                                     |
 | 0    | TS #1516                                                                                                                                               | P1  | Merged           | Merged on main as `1810c763a`                                                                                                                                     | none                                                                                                     |
 | 0    | TS #1189                                                                                                                                               | P1  | Close            | Fixed on main by `56a19229f` (#1157), which deleted the ungated `ingest_*` functions; ask its author to close it                                                  | none                                                                                                     |
-| 0    | IABTechLab/edgezero#460                                                                                                                                | P1  | PR fix           | Part C fixes, then fold into IABTechLab/edgezero#275's branch with `9f090e57` and one CI trigger change                                                           | none                                                                                                     |
+| 0    | IABTechLab/edgezero#460                                                                                                                                | P1  | PR fix           | Part C fixes; stacks on IABTechLab/edgezero#499 and is in EdgeZero's integration branch (State)                                                                   | none                                                                                                     |
 | 0    | IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#414                                                                              | P1  | PR fix           | Move `4ea99467` to IABTechLab/edgezero#406 and `9a985c99` to IABTechLab/edgezero#407                                                                              | none                                                                                                     |
-| 0    | IABTechLab/edgezero#463                                                                                                                                | P1  | PR fix           | Rebase off the commits it carries                                                                                                                                 | none                                                                                                     |
 | 0    | TS #1503, #1432                                                                                                                                        | P2  | Merge            | `ts ec` commands; delivers #1432                                                                                                                                  | none                                                                                                     |
 | 0    | TS #1233                                                                                                                                               | P2  | Move             | `ts-ec` to creative assets                                                                                                                                        | none                                                                                                     |
-| 1    | TS #1506                                                                                                                                               | P1  | PR fix, Merge    | Rebase; repin after the fold-in, or the fallback below; delivers #1507                                                                                            | #1557, #1526, IABTechLab/edgezero#460 fold-in                                                            |
-| 1    | IABTechLab/edgezero#275                                                                                                                                | P1  | PR fix, Merge    | Resolve its review, then merge                                                                                                                                    | IABTechLab/edgezero#460 fold-in                                                                          |
+| 1    | TS #1506                                                                                                                                               | P1  | PR fix, Merge    | Rebase; pin EdgeZero's integration branch, now at `10166628`; delivers #1507                                                                                      | #1557, #1526, IABTechLab/edgezero#460 in the integration branch                                          |
+| 1    | IABTechLab/edgezero#275                                                                                                                                | P1  | PR fix, Merge    | Resolve its review, then merge                                                                                                                                    | none                                                                                                     |
 | 2    | TS #1487                                                                                                                                               | P1  | PR fix, Merge    | Part C fixes                                                                                                                                                      | #1526, #1506                                                                                             |
 | 2    | IABTechLab/edgezero#406 to IABTechLab/edgezero#439; IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432 | P1  | PR fix, Merge    | Resolve reviews, retarget to main, merge in order; delivers IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437 and IABTechLab/edgezero#432 | IABTechLab/edgezero#275                                                                                  |
 | 2    | EZ EZI-2a, EZI-3                                                                                                                                       | P1  | New              | Record contract with Fastly; ClientInfo contract                                                                                                                  | IABTechLab/edgezero#275                                                                                  |
@@ -154,12 +200,12 @@ Close.
 | 3    | TS #1488                                                                                                                                               | P1  | PR fix, Merge    | Part C fixes                                                                                                                                                      | #1487                                                                                                    |
 | 3    | EZ R1                                                                                                                                                  | P1  | Release          | IABTechLab/edgezero#275 through IABTechLab/edgezero#439                                                                                                           | wave 2's EdgeZero chain                                                                                  |
 | 3    | EZ EZI-1                                                                                                                                               | P1  | New              | After-response work for Fastly and Axum                                                                                                                           | IABTechLab/edgezero#275, IABTechLab/edgezero#406                                                         |
-| 3    | IABTechLab/edgezero#463                                                                                                                                | P1  | Merge            | Rebased                                                                                                                                                           | IABTechLab/edgezero#422, IABTechLab/edgezero#439                                                         |
+| 3    | IABTechLab/edgezero#463                                                                                                                                | P1  | Closed           | Closed on 2026-11-13: IABTechLab/edgezero#422, in wave 2's chain, carries its celld record operations                                                             | none                                                                                                     |
 | 3    | EZ EZI-4a                                                                                                                                              | P1  | New              | Axum geo bound from EdgeZero's manifest                                                                                                                           | PR IABTechLab/edgezero#439                                                                               |
 | 3    | IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283                                                                                | P1  | Move             | Fastly and Axum ClientInfo; JA4                                                                                                                                   | EZI-3; IABTechLab/edgezero#397                                                                           |
 | 3    | TS #1553                                                                                                                                               | P2  | Move             | After-response CAS retry                                                                                                                                          | PR #1487                                                                                                 |
 | 4    | TS #1489                                                                                                                                               | P1  | PR fix, Merge    | Cap mirrored-ID expiry                                                                                                                                            | #1488                                                                                                    |
-| 4    | EZ EZI-2b                                                                                                                                              | P1  | New              | DynamoDB and celld providers on Axum                                                                                                                              | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#463                     |
+| 4    | EZ EZI-2b                                                                                                                                              | P1  | New              | DynamoDB and celld providers on Axum                                                                                                                              | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#422                     |
 | 4    | EZ R2, R2b                                                                                                                                             | P1  | Release          | R2: EZI-1 for Fastly and Axum; R2b: EZI-3, ClientInfo, JA4 and Axum's geo binding                                                                                 | EZI-1 (R2); EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-4a (R2b) |
 | 4    | TS A1                                                                                                                                                  | P1  | New, PR fix      | Rebase #1531 onto #1506, repin to R1; #1528 closes                                                                                                                | R1, #1507                                                                                                |
 | 4    | TS T3                                                                                                                                                  | P1  | New              | SharedID cleanup                                                                                                                                                  | PR #1488                                                                                                 |
@@ -204,15 +250,16 @@ waits on a Cloudflare or Spin item, so the MVP ships without waves 10 to 18
 (DEC-4). Waves 10 to 14 (Cloudflare), waves 15 to 18 (Spin) and the `any` rows
 follow the MVP; an `any` row starts when its decision or reviewer is ready.
 
-Fallback for wave 1: if the fold-in has not landed two weeks after #1557 and
-#1526 have both merged on main (#1516 merged on 2026-11-12), #1506 merges pinned
-to IABTechLab/edgezero#275's head as it stands (allowed by AX-7) and keeps its
-readthrough rejection until the repin.
+Fallback for wave 1, no longer needed: if the fold-in had not landed two weeks
+after #1557 and #1526 both merged on main, #1506 would have merged pinned to
+IABTechLab/edgezero#275's head (allowed by AX-7). #1506 now pins EdgeZero's
+integration branch at a revision that carries IABTechLab/edgezero#460 (State,
+above).
 
 The two longest chains:
 
 - Axum identity: IABTechLab/edgezero#460, IABTechLab/edgezero#275,
-  IABTechLab/edgezero#406 to IABTechLab/edgezero#439, IABTechLab/edgezero#463,
+  IABTechLab/edgezero#406 to IABTechLab/edgezero#439,
   EZI-2b, R1b, T6, A2, A10, A5. A1 runs beside it on R1, before the record
   contract lands.
 - SharedID: IABTechLab/edgezero#460, #1506, #1487, #1488, T3, T13 on Fastly,
@@ -237,16 +284,17 @@ Constraints.
 ### EdgeZero, under IABTechLab/edgezero#468
 
 The integration branch is itself an EdgeZero ask (DEC-5): it carries only
-work headed for EdgeZero main, merged in Part A's order. R1 creates it,
-protected against force-push and deletion, and R1 to R4 are tags on it that
-Trusted Server pins.
+work headed for EdgeZero main, merged in Part A's order. It exists as
+`rc/identity` (IABTechLab/edgezero#495). R1 to R4 are commits on it that
+Trusted Server pins by SHA; it has no tags, moves only forward and is never
+force-pushed.
 
 New:
 
 | ID     | Ticket                                                                                                                                                                 | Reqs   | Type    | Size | Pri | Blocked by                                                                                                                                                 | Blocks                                                                                                                               |
 | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------- | ---- | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | EZI-2a | `KvStore` record contract with listing strong within a partition, the Fastly provider and the local persistent store (`PersistentKvStore`)                             | EZI-2a | Feature | L    | P1  | PR IABTechLab/edgezero#275                                                                                                                                 | EZI-2b, EZI-2c, EZI-2s, R1b                                                                                                          |
-| EZI-2b | DynamoDB and celld providers on Axum meet the record contract, each key's partition being its DynamoDB partition key                                                   | EZI-2b | Feature | L    | P1  | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#463                                                                       | R1b, EZI-2p                                                                                                                          |
+| EZI-2b | DynamoDB and celld providers on Axum meet the record contract, each key's partition being its DynamoDB partition key                                                   | EZI-2b | Feature | L    | P1  | EZI-2a, IABTechLab/edgezero#410, IABTechLab/edgezero#437; PR IABTechLab/edgezero#422                                                                       | R1b, EZI-2p                                                                                                                          |
 | EZI-2p | Portable DynamoDB and celld providers over EdgeZero's outbound HTTP, verified on Fastly, with the WASM credential source and a conditional-write latency budget stated | EZI-2p | Feature | XL   | P2  | EZI-2b; PR IABTechLab/edgezero#275                                                                                                                         | EZI-2c, EZI-2s                                                                                                                       |
 | EZI-3  | ClientInfo contract: portable client IP and TLS metadata with explicit absence, the contract part of IABTechLab/edgezero#89                                            | EZI-3  | Feature | M    | P1  | PR IABTechLab/edgezero#275                                                                                                                                 | IABTechLab/edgezero#90, IABTechLab/edgezero#91, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-3s, IABTechLab/edgezero#89, R2b |
 | EZI-1  | Bounded work after the response on Fastly and Axum, drained on Axum SIGTERM                                                                                            | EZI-1  | Feature | M    | P1  | PRs IABTechLab/edgezero#275, IABTechLab/edgezero#406                                                                                                       | EZI-1c, EZI-1s, R2                                                                                                                   |
@@ -261,12 +309,12 @@ New:
 | EZI-3s | Spin ClientInfo, the Spin part of EZI-3                                                                                                                                | EZI-3  | Task    | S    | P3  | EZI-3                                                                                                                                                      | R4, IABTechLab/edgezero#89                                                                                                           |
 | EZI-4s | Geo with country and region through `ctx.geo()` on Spin, from a trusted ingress header or a KV- or API-backed provider                                                 | EZI-4  | Feature | S    | P3  | IABTechLab/edgezero#432                                                                                                                                    | R4                                                                                                                                   |
 | EZI-5s | Rate limiter backend for Spin (after the MVP)                                                                                                                          | EZI-5  | Feature | S    | P3  | EZI-5; DEC-15                                                                                                                                              | none                                                                                                                                 |
-| R1     | Create the protected integration branch and tag IABTechLab/edgezero#275 through IABTechLab/edgezero#439                                                                | EZI-6  | Task    | S    | P1  | IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432; PRs IABTechLab/edgezero#275 to IABTechLab/edgezero#439 | A1                                                                                                                                   |
-| R1b    | Integration-branch tag with the record contract: EZI-2a and EZI-2b                                                                                                     | EZI-6  | Task    | S    | P1  | EZI-2a, EZI-2b                                                                                                                                             | T6                                                                                                                                   |
-| R2     | Integration-branch tag with the Fastly and Axum parts of EZI-1                                                                                                         | EZI-6  | Task    | S    | P1  | EZI-1                                                                                                                                                      | A3, A10, T11                                                                                                                         |
-| R2b    | Integration-branch tag with EZI-3, the Fastly and Axum ClientInfo, the JA4 accessor and Axum's geo binding                                                             | EZI-6  | Task    | S    | P1  | EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-4a                                                                     | A10, T12, #1529                                                                                                                      |
-| R3     | Integration-branch tag with the Cloudflare parts                                                                                                                       | EZI-6  | Task    | S    | P2  | EZI-1c, EZI-2c, EZI-4c, IABTechLab/edgezero#91; DEC-8                                                                                                      | R4, T8, T17, #1518                                                                                                                   |
-| R4     | Integration-branch tag with the Spin parts                                                                                                                             | EZI-6  | Task    | S    | P3  | EZI-1s, EZI-2s, EZI-3s, EZI-4s, R3                                                                                                                         | T9, T18                                                                                                                              |
+| R1     | Integration-branch revision with IABTechLab/edgezero#275 through IABTechLab/edgezero#439                                                                               | EZI-6  | Task    | S    | P1  | IABTechLab/edgezero#397, IABTechLab/edgezero#410, IABTechLab/edgezero#437, IABTechLab/edgezero#432; PRs IABTechLab/edgezero#275 to IABTechLab/edgezero#439 | A1                                                                                                                                   |
+| R1b    | Integration-branch revision with the record contract: EZI-2a and EZI-2b                                                                                                | EZI-6  | Task    | S    | P1  | EZI-2a, EZI-2b                                                                                                                                             | T6                                                                                                                                   |
+| R2     | Integration-branch revision with the Fastly and Axum parts of EZI-1                                                                                                    | EZI-6  | Task    | S    | P1  | EZI-1                                                                                                                                                      | A3, A10, T11                                                                                                                         |
+| R2b    | Integration-branch revision with EZI-3, the Fastly and Axum ClientInfo, the JA4 accessor and Axum's geo binding                                                        | EZI-6  | Task    | S    | P1  | EZI-3, IABTechLab/edgezero#90, IABTechLab/edgezero#92, IABTechLab/edgezero#283, EZI-4a                                                                     | A10, T12, #1529                                                                                                                      |
+| R3     | Integration-branch revision with the Cloudflare parts                                                                                                                  | EZI-6  | Task    | S    | P2  | EZI-1c, EZI-2c, EZI-4c, IABTechLab/edgezero#91; DEC-8                                                                                                      | R4, T8, T17, #1518                                                                                                                   |
+| R4     | Integration-branch revision with the Spin parts                                                                                                                        | EZI-6  | Task    | S    | P3  | EZI-1s, EZI-2s, EZI-3s, EZI-4s, R3                                                                                                                         | T9, T18                                                                                                                              |
 
 Existing, moved under IABTechLab/edgezero#468. IABTechLab/edgezero#89 to
 IABTechLab/edgezero#92 leave IABTechLab/edgezero#88 and the last six leave
@@ -289,6 +337,17 @@ IABTechLab/edgezero#89 stays the umbrella story: EZI-3 carries its contract, and
 it completes with the last adapter's mapping. IABTechLab/edgezero#397,
 IABTechLab/edgezero#410 and IABTechLab/edgezero#432 leave
 IABTechLab/edgezero#391, which stays an epic in place; R1 is linked from it.
+
+Moved or filed after the run, under IABTechLab/edgezero#468. The last four
+are cutover follow-ups that block no ticket here:
+
+| Issue                   | Title                                                                                                                           | Type         | Size | Pri | Blocked by | Blocks                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------ | ---- | --- | ---------- | --------------------------------------- |
+| IABTechLab/edgezero#436 | Portable outbound HTTP and request lifecycle contracts (PR IABTechLab/edgezero#275); moved                                      | Story (keep) | XL   | P1  | none       | EZI-2a, EZI-2p, EZI-3, EZI-1, EZI-5, R1 |
+| IABTechLab/edgezero#503 | Test fixtures that accept from a non-blocking std listener fail on macOS (PRs IABTechLab/edgezero#414, IABTechLab/edgezero#422) | Bug          | S    | P3  | none       | none                                    |
+| IABTechLab/edgezero#504 | Compile-time `logging_for` for applications with a hand-written `Hooks` impl                                                    | Feature      | S    | P3  | none       | none                                    |
+| IABTechLab/edgezero#505 | Fastly custom runners send no response when the managed logger fails to install                                                 | Bug          | S    | P2  | none       | none                                    |
+| IABTechLab/edgezero#506 | Reject Fastly logging endpoint names the logger cannot install when the manifest loads                                          | Bug          | XS   | P2  | none       | none                                    |
 
 ### Axum deployable, under #1558
 
@@ -365,16 +424,24 @@ Existing, moved under #1558:
 | #1233 | Stop forwarding `ts-ec` to static creative assets                           | Task (keep)  | S    | P2  | none                    | none   |
 | #1432 | `ts ec show` and `ts ec eids` (delivered by PR #1503)                       | Task (keep)  | S    | P2  | none                    | none   |
 | #1245 | Spec for non-browser LiveRamp sync                                          | Task         | S    | P3  | DEC-9                   | none   |
-| #1567 | Collect identity provider EIDs server-side for the server-side auction      | Story (keep) | M    | P2  | PRs #1487, #1488, #1489 | none   |
+| #1567 | Collect identity provider EIDs server-side for the server-side auction      | Story (keep) | L    | P2  | PRs #1487, #1488, #1489 | none   |
 | #1192 | Reduce Fastly adapter per-request fixed cost                                | Task (keep)  | M    | P2  | #1507                   | none   |
+
+Moved or filed after the run, under #1558. #1610 and #1611 are cutover
+follow-ups that block no ticket here:
+
+| Issue | Title                                                                   | Type        | Size | Pri | Blocked by | Blocks                        |
+| ----- | ----------------------------------------------------------------------- | ----------- | ---- | --- | ---------- | ----------------------------- |
+| #1507 | Cut Trusted Server over to EdgeZero PR 275 (PR #1506); moved from #1505 | Task (keep) | XL   | P1  | none       | A1, T4, T5, T21, #1192, #1556 |
+| #1610 | Pin Wrangler in `.tool-versions` so `smoke-cloudflare.sh` runs          | Task        | XS   | P2  | none       | none                          |
+| #1611 | Stop parsing `edgezero.toml` on every Fastly request in `logging_for`   | Task        | XS   | P3  | none       | none                          |
 
 Not moved:
 
 - IABTechLab/trusted-server#90 is an epic, so Task 1 Step 3 links it from #1558
   and it is not moved; it and IABTechLab/trusted-server#353 close when PR #1488
   merges.
-- #1507 delivers the cutover and stays under #1505; it blocks A1, T4, T5,
-  T21, #1192 and #1556.
+- #1507 stayed under #1505 in the run; it has since moved (table above).
 - #1246 leaves #1558: #1567 replaces it, and PRs #1487, #1488 and #1489
   deliver #1567.
 - Proposed closures: #1523 with #1527; IABTechLab/trusted-server#353 and #1310
@@ -394,13 +461,14 @@ expiry (#1489). Part C lists them.
 
 Each item names the head it was checked at. Post it as a comment on that PR
 (Tasks 6 and 7); once posted, the PR thread is the source of truth. Task 6
-re-checks each item at the PR's current head before posting.
+re-checks each item at the PR's current head before posting. Tasks 6 and 7
+posted them on 2026-11-13, and Part A's State records what changed since.
 
 ### Trusted Server
 
 - **#1506 at `9ec4711d3` (AX-7).** Rebase after #1557 and #1526; #1516 has
   merged. Keep EdgeZero pinned to IABTechLab/edgezero#275's head or an
-  integration-branch tag (DEC-5): an RC-tag pin pushed to this branch on
+  integration-branch revision (DEC-5): an RC-tag pin pushed to this branch on
   2026-11-12 was reverted. Repin after the fold-in, or under wave 1's fallback;
   drop the `origin_readthrough_enabled` rejection in `config.rs` once cache tags
   return. The current pin already carries IABTechLab/edgezero `b97efec1`, which
@@ -566,7 +634,7 @@ These belong to #1505 and IABTechLab/edgezero#436:
   and #1558 updated; comments on IABTechLab/edgezero#391 and
   IABTechLab/edgezero#88.
 
-- [ ] **Step 1: Move each issue**
+- [x] **Step 1: Move each issue**
 
 For each row, first read the issue's current parent with
 `gh api graphql -f query='{repository(owner:"<owner>",name:"<repo>"){issue(number:<issue>){parent{number}}}}' --jq '.data.repository.issue.parent.number'`.
@@ -579,7 +647,7 @@ and read the parent again.
 Expected: the new epic's number, and every moved issue's parent is now that
 epic.
 
-- [ ] **Step 2: Type, Priority and Size**
+- [x] **Step 2: Type, Priority and Size**
 
 Set "Type (set)" through `updateIssue` where it is not "keep". Add the issue
 to the project through `addProjectV2ItemById` if it is not there, then set
@@ -587,7 +655,7 @@ Priority and Size through `updateProjectV2ItemFieldValue` with the IDs in
 Global Constraints.
 Expected: each mutation returns the item.
 
-- [ ] **Step 3: Update the EdgeZero epics' text**
+- [x] **Step 3: Update the EdgeZero epics' text**
 
 Edit IABTechLab/edgezero#468's Related section to say that IABTechLab/edgezero#391 stays
 the Axum production epic and that the six issues moved from it or with no
@@ -610,13 +678,13 @@ Expected: each command prints the issue or comment URL, and
 - Produces: an issue number per row, recorded in a `CREATOR:` comment on
   IABTechLab/edgezero#468.
 
-- [ ] **Step 1: Search before each row**
+- [x] **Step 1: Search before each row**
 
 For each row in table order, run
 `gh issue list -R IABTechLab/edgezero --state all --search "<two key terms from the row>"`.
 Expected: no open issue other than those Part B links.
 
-- [ ] **Step 2: Create**
+- [x] **Step 2: Create**
 
 Run `gh issue create -R IABTechLab/edgezero --title "<Ticket>" --body-file <file>`.
 The body has Behavior (the spec's EZI text), Acceptance (its Accept line),
@@ -624,14 +692,14 @@ Blocked by (every PR and decision in that column, by reference) and Related
 (IABTechLab/trusted-server#1558).
 Expected: one issue URL per row.
 
-- [ ] **Step 3: Type, parent, Priority and Size**
+- [x] **Step 3: Type, parent, Priority and Size**
 
 Set the row's Type through `updateIssue`, add the issue under
 IABTechLab/edgezero#468 through `addSubIssue`, add it to the project, and set
 Priority and Size.
 Expected: each mutation returns the issue or item.
 
-- [ ] **Step 4: Record the numbers**
+- [x] **Step 4: Record the numbers**
 
 Post a `CREATOR:` comment on IABTechLab/edgezero#468 mapping each ID to its
 issue, and one on IABTechLab/edgezero#391 linking R1, each with
@@ -677,7 +745,7 @@ map in a `CREATOR:` comment on #1558.
   Tasks 1 to 4.
 - Produces: one GitHub blocked-by link per issue pair.
 
-- [ ] **Step 1: Link each pair**
+- [x] **Step 1: Link each pair**
 
 For every issue named in a "Blocked by" cell, run
 `gh api graphql -f query='mutation($i:ID!,$b:ID!){addBlockedBy(input:{issueId:$i,blockingIssueId:$b}){issue{number}}}' -F i=<blocked issue node> -F b=<blocking issue node>`.
@@ -685,7 +753,7 @@ Expected: the blocked issue's number. If GitHub refuses a cross-repository
 pair, add a "Blocked by IABTechLab/edgezero#N" line to the issue body instead
 and list the pair in Step 2's readback.
 
-- [ ] **Step 2: Read back**
+- [x] **Step 2: Read back**
 
 For each issue, run
 `gh api graphql -f query='{repository(owner:"<owner>",name:"<repo>"){issue(number:<n>){blockedBy(first:50){nodes{number repository{nameWithOwner}}}}}}' --jq '.data.repository.issue.blockedBy.nodes'`
@@ -703,14 +771,14 @@ bodies.
   to 4.
 - Produces: one `CREATOR:` comment per mapped PR.
 
-- [ ] **Step 1: Check heads**
+- [x] **Step 1: Check heads**
 
 For each Part C Trusted Server item, run
 `gh pr view <N> --repo IABTechLab/trusted-server --json headRefOid --jq .headRefOid`.
 Expected: the head Part C names. If it moved, re-check the item against the
 new head before posting.
 
-- [ ] **Step 2: Post**
+- [x] **Step 2: Post**
 
 Post one `CREATOR:` comment per PR with its Part C item and its ticket, with
 `gh pr comment <N> --repo IABTechLab/trusted-server --body-file <file>`. Use
@@ -752,13 +820,14 @@ IABTechLab/edgezero#464 get their Part C item with no ticket.
 - Consumes: the results of Tasks 1 to 5.
 - Produces: a pass, or a list of gaps posted as a `CREATOR:` comment on #1558.
 
-- [ ] **Step 1: Count sub-issues**
+- [x] **Step 1: Count sub-issues**
 
 Run `gh api graphql -f query='{repository(owner:"IABTechLab",name:"<repo>"){issue(number:<epic>){subIssues(first:100){totalCount}}}}' --jq '.data.repository.issue.subIssues.totalCount'`
 for #1558 and IABTechLab/edgezero#468.
-Expected: 45 and 32.
+Expected: 45 and 32 at the run, and 48 and 37 after the issues Part A's
+State lists.
 
-- [ ] **Step 2: Check that Fastly and Axum stand alone**
+- [x] **Step 2: Check that Fastly and Axum stand alone**
 
 For every issue in waves 0 to 9, read its blocked-by list and confirm that none
 of its blockers is in wave 10 or later or in an `any` row (a Cloudflare or Spin
@@ -767,7 +836,7 @@ ticket, IABTechLab/edgezero#91, R3, R4, EZI-2p, EZI-5, EZI-5c, EZI-5s, T10, T16,
 Step 2 does.
 Expected: no such blocker (DEC-4).
 
-- [ ] **Step 3: Check bodies**
+- [x] **Step 3: Check bodies**
 
 For every created or moved issue, read its body with
 `gh issue view <n> --repo <owner>/<repo> --json body --jq .body` and confirm
