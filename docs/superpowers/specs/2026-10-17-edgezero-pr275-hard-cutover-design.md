@@ -504,6 +504,16 @@ cache make no HTTP calls.
   `DispatchedAuction` holds the `OutboundBatch` and a slot-to-provider map.
   Bidder requests now leave together after all are built and signed. Today each
   leaves as soon as it is built (`orchestrator.rs:1839-1850`).
+- A provider whose request Trusted Server cannot build, or whose Fastly backend
+  registration fails while the batch starts, records `launch_failed` before
+  collection. When every routed provider fails that way, direct `/auction`
+  answers 502 and split execution records `dispatch_failed`. Spin and
+  Cloudflare prepare each request inside the spawned task, so a preparation
+  failure there reaches collection, which records `launch_failed` for the
+  provider without counting it toward that boundary. Even when every provider
+  fails that way, the auction completes without bids, as today, where the
+  failure surfaces at `select` and is classed `transport`
+  (`orchestrator.rs:2414-2446`).
 - Bidders set `.timeout` to the configured provider timeout, not to today's
   `remaining_budget_ms(..).min(provider.timeout_ms())`
   (`orchestrator.rs:1817-1818`). The batch cutoff bounds them by the remaining
