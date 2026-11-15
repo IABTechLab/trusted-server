@@ -1350,8 +1350,12 @@ and host (`ingress.rs:845`). Adapters check them before admission, and the
 router checks again after the pre-dispatch hook. Violations return 414 or 431.
 Admission also rejects ambiguous request framing with 400: a duplicate or
 malformed `Content-Length`, `Content-Length` with `Transfer-Encoding`, or a
-`Transfer-Encoding` that is not chunked (`ingress.rs:887-942`). Fastly enforces
-all of this now too. Trusted Server keeps the defaults, and test 11 checks that
+`Transfer-Encoding` that is not chunked (`ingress.rs:887-942`). The runtime's
+own HTTP parser can refuse a malformed or conflicting `Content-Length` first:
+Viceroy 0.21.0, Axum, and Spin 4.1.0 answer a 400 with an empty body, and local
+Wrangler refuses it before the Worker runs, with 400 on Wrangler 4.162.0 and
+500 on 4.83.0. Either way the origin sees nothing. Fastly enforces all of this
+now too. Trusted Server keeps the defaults, and test 11 checks that
 realistic traffic fits. If it does not, `Hooks::configure` raises them with
 `App::set_ingress_head_limits` (`app.rs:523`).
 
@@ -1808,7 +1812,7 @@ Inbound:
    to 16 MiB of an aborted upload (2.5).
 4. A request target over 8192 bytes returns 414. More than 100 header fields or
    64 KiB of headers returns 431. Ambiguous or malformed request framing
-   returns 400.
+   returns 400, from EdgeZero or from the runtime's HTTP parser before it.
 
 Responses:
 
@@ -2018,33 +2022,33 @@ raises or lowers the log level (section 9).
 
 ## Failure handling
 
-| Failure                                                                              | Behavior                                                                                                                                                                    |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                                                       |
-| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                                                        |
-| Ambiguous or malformed request framing                                               | 400 from EdgeZero's ingress, before any handler runs                                                                                                                        |
-| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                                                                  |
-| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                                                     |
-| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                                                                |
-| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                                                       |
-| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                                                      |
-| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                                                        |
-| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                                                                 |
-| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                                                              |
-| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                                                     |
-| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                                                              |
-| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup                                      |
-| Fastly delivery not committed                                                        | Native 500                                                                                                                                                                  |
-| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                                                               |
-| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                                                        |
-| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)) |
-| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                                                                    |
-| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                                                         |
-| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                                                              |
-| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                                                               |
-| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                                                          |
-| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                                                                 |
-| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                                                                   |
+| Failure                                                                              | Behavior                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                                                                 |
+| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                                                                  |
+| Ambiguous or malformed request framing                                               | 400 before any handler runs, from EdgeZero's ingress or the runtime's HTTP parser. Local Wrangler refuses a bad `Content-Length` with 400 or 500, by version. The origin sees nothing |
+| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                                                                            |
+| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                                                               |
+| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                                                                          |
+| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                                                                 |
+| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                                                                |
+| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                                                                  |
+| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                                                                           |
+| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                                                                        |
+| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                                                               |
+| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                                                                        |
+| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup                                                |
+| Fastly delivery not committed                                                        | Native 500                                                                                                                                                                            |
+| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                                                                         |
+| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                                                                  |
+| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505))           |
+| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                                                                              |
+| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                                                                   |
+| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                                                                        |
+| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                                                                         |
+| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                                                                    |
+| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                                                                           |
+| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                                                                             |
 
 ## Compatibility and rollout
 
