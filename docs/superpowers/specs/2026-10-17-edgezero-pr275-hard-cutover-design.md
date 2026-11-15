@@ -1708,7 +1708,9 @@ level, read once per instance
 (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/config_store.rs:243-254`,
 `logger.rs:102-122`). `scripts/template-cache-local-test.sh` declares that
 store in its Viceroy configuration to log at `debug` with the production
-`info` wasm, so it reads the debug-only template store line again.
+`info` wasm, so it reads the debug-only template store line again. Fastly
+differences item 27 records how the line format and the local level differ
+from today.
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
@@ -1871,6 +1873,22 @@ Outbound, continued:
     Prebid Server parser tolerates a failed body read on an error status, and
     the Standard parser never reads an error body (`provider.rs:560-572`).
 
+Logging:
+
+27. Lines read `<timestamp> <level> <target> <message>` with the record's
+    full target
+    (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/logger.rs:37-51`).
+    Today they read `<timestamp> <level> [<label>] <message>`, where the label
+    is the target's last `::` segment
+    (`crates/trusted-server-adapter-fastly/src/logging.rs:11-17`, `:105-111`).
+    The level is the manifest's `info` unless a Config Store linked as
+    `edgezero_logging` overrides it (section 9). Today `fastly compute serve`
+    and Viceroy log at `debug`, because the guest sees
+    `FASTLY_HOSTNAME=localhost`, and a guest `EDGEZERO_LOG_LEVEL` sets the
+    level (`logging.rs:28`, `:59-62`). Neither is read now, so a local run
+    logs at `debug` only with that store declared. The maintainer accepted
+    both losses.
+
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
 502 (D17), and `x-compress-hint` on tsjs bundles (`publisher.rs:597`).
@@ -1931,7 +1949,9 @@ Cloudflare client did, so a Cloudflare response carries the origin's
 **Unchanged for operators.** The app-config envelope, the canonical hash, the
 Fastly chunk pointer format (`fastly_config_chunks` version 1,
 `edgezero:crates/edgezero-adapter-fastly/src/chunked_config.rs:11-12`), store
-links, secrets, and deploy flags are unchanged. No re-push is needed.
+links, secrets, and deploy flags are unchanged. No re-push is needed. The only
+new link is optional: a Fastly Config Store linked as `edgezero_logging`
+raises or lowers the log level (section 9).
 
 ## Consent and privacy
 
@@ -2210,6 +2230,12 @@ records the repaired-versus-stock disposition under G4-FASTLY-POLICY
   file exists. Build the subset from `scripts/fastly-response-diff.requests.json`
   by dropping `trace-enable-action`, the `POST /_ts/trace/enable` request, and
   `admin-eids`, the `GET /_ts/admin/eids` request with fixture credentials.
+- On Axum, rename `PORT` to `EDGEZERO__ADAPTER__PORT` and `RUST_LOG` to
+  `EDGEZERO__LOGGING__LEVEL`. An invalid port now falls back to 8787 with a
+  warning, where an invalid `PORT` stopped startup.
+- On Fastly, logs go to the `tslog` endpoint at the level `edgezero.toml` sets
+  (`info`). To raise it without a rebuild, set `EDGEZERO__LOGGING__LEVEL` in
+  an optional Config Store linked as `edgezero_logging`.
 - Then deploy to production.
 
 ### Rollback
@@ -2232,7 +2258,15 @@ wrangler flags revert with the pull request.
 - One info log line per request carries the outbound observation counts
   (section 3).
 - The Axum dev server has ingress caps and its own variables, and exits on a
-  startup failure.
+  startup failure. It reads `EDGEZERO__LOGGING__LEVEL`,
+  `EDGEZERO__ADAPTER__HOST`, and `EDGEZERO__ADAPTER__PORT` in place of
+  `RUST_LOG` and `PORT` (section 8).
+- Fastly log lines carry the record's full target in place of its last
+  segment, and local Viceroy runs log at `info` unless an `edgezero_logging`
+  Config Store raises the level (Fastly differences item 27).
+- Cloudflare and Spin now log through EdgeZero's managed backends, at
+  `EDGEZERO__LOGGING__LEVEL` (section 9). Before, their production builds
+  dropped every record.
 
 ### In-flight work
 
@@ -2775,7 +2809,8 @@ change are D5, D7, D13, D18, and D20.
   doubles in `test_support.rs`; change `traits.rs`, `types.rs`, `mod.rs`)
 - `crates/trusted-server-core/src/test_support.rs`,
   `test_support/scripted_client.rs` (scripted client), `test_support/body_read.rs`,
-  `test_support/logging.rs`, and `test_support/async_html_finalization.rs`
+  `test_support/logging.rs`, `test_support/publisher_input_cap.rs`, and
+  `test_support/async_html_finalization.rs`
 - `crates/trusted-server-core/src/http_util.rs`, `error.rs`, `config.rs`,
   `settings.rs`, `response_privacy.rs`, `auth.rs`, `forwarder.rs`,
   `publisher.rs`, `proxy.rs`, `cache_purge.rs`, `creative_opportunities.rs`,
@@ -2797,8 +2832,8 @@ change are D5, D7, D13, D18, and D20.
 - `crates/trusted-server-adapter-fastly/` (`Cargo.toml`, `src/main.rs`,
   `app.rs`, `middleware.rs`, `platform.rs`, `tinybird.rs`, `management_api.rs`,
   `compat.rs`, `delivery.rs`, `post_delivery.rs`, `sandbox.rs`, a new deadline
-  test module, `tests/deadline-origin.mjs`; delete `backend.rs` and
-  `platform/deadline.rs`)
+  test module, `tests/deadline-origin.mjs`; delete `backend.rs`, `logging.rs`,
+  and `platform/deadline.rs`)
 - `crates/trusted-server-adapter-axum/` (`Cargo.toml`, `src/main.rs`, `app.rs`,
   `middleware.rs`, `platform.rs`, `tests/routes.rs`)
 - `crates/trusted-server-adapter-cloudflare/` (`src/app.rs`, `middleware.rs`,
