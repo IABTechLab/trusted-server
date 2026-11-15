@@ -844,6 +844,7 @@ mod tests {
             "https://test.com/admin/keys/rotate",
             Some(&body_json),
         );
+        let capture = LogCapture::start();
 
         let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response for invalid kid");
@@ -852,6 +853,15 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.starts_with("Key rotation failed: ")
+            ),
+            "should log the rejected rotation once, at warn"
         );
 
         let body = response_body_string(resp);
@@ -998,6 +1008,7 @@ mod tests {
             "https://test.com/admin/keys/deactivate",
             Some(&body_json),
         );
+        let capture = LogCapture::start();
 
         let resp =
             futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
@@ -1007,6 +1018,15 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.starts_with("Key deactivation failed: ")
+            ),
+            "should log the rejected deactivation once, at warn"
         );
 
         let body = response_body_string(resp);
