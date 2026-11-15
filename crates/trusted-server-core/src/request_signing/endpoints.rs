@@ -20,7 +20,8 @@ use crate::settings::Settings;
 /// at error otherwise.
 ///
 /// The response carries only the report's display text, so this line is
-/// where the outbound status, budget source, and provider detail appear.
+/// where an outbound failure's status and kind appear, with its budget source
+/// for a timeout and its provider detail when the adapter reports one.
 fn log_key_operation_failure(operation: &str, report: &Report<TrustedServerError>) {
     if report.current_context().status_code().is_client_error() {
         log::warn!("{operation} failed: {report:?}");
