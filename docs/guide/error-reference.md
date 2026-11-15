@@ -183,15 +183,17 @@ register the provider's backend, or the Spin or Cloudflare adapter could not
 prepare the request. EdgeZero derives Fastly backends from the provider
 endpoint; they are not static Fastly backends. A registration or preparation
 failure records `launch_failed` for the provider, and other failures record
-`transport`. The report in this warning carries the provider failure
-detail (`outbound provider failure detail: ...`), which holds closed failure
-codes and no URL.
+`transport`. The report in this warning carries the outbound status and kind,
+never the error's message, and, when EdgeZero reports one, the provider
+failure detail (`outbound provider failure detail: ...`), which holds closed
+failure codes and no URL.
 
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
   valid certificate; origin TLS is always verified
-- Read the `outbound provider failure detail` line in the warning's report
+- Read the outbound status and kind in the warning's report, and its
+  `outbound provider failure detail` line when it has one
 - On Fastly, check the service's dynamic backend use. Fastly allows 200
   dynamic backends per service; the auction may use up to 160, and the
   publisher origin, integrations, and other outbound sites share the rest

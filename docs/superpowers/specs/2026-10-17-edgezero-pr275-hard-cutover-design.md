@@ -1052,9 +1052,10 @@ forward passes `ClientForward`.
   `BadRequest` with `OutboundRequestSource::Internal`, from a request Trusted
   Server built itself.
 
-The helper attaches the `EdgeError`, its budget source, and its
-`provider_failure_detail()` to the report. It does not log; section 9 says
-who does.
+The helper attaches the `EdgeError`, a printable outbound failure built from
+its status and kind, never its message, and, when the failure has them, its
+budget source and its `provider_failure_detail()` to the report. It does not
+log; section 9 says who does.
 
 ### 3. Fastly on the canonical lifecycle
 
@@ -1707,9 +1708,10 @@ store in its Viceroy configuration to log at `debug` with the production
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
-or partner, and that rendering prints the budget source and
-`provider_failure_detail()` (`error.rs:490`). The helper itself does not log,
-so a failure never logs its detail twice. The detail holds closed enums and
+or partner, and that rendering prints the outbound status and kind and, when
+the failure has them, the budget source and `provider_failure_detail()`
+(`error.rs:490`). It never prints the `EdgeError`'s message. The helper
+itself does not log, so a failure never logs its detail twice. The detail holds closed enums and
 numeric codes, never provider text or URLs (EZ-16). A handler that returns an
 `EdgeError` is logged once on every adapter, with its status and kind only,
 because its message can hold provider text or a URL.
