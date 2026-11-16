@@ -441,22 +441,34 @@ try {
         ["path", "example/table"],
         ["unicode", "example-\u00e9"],
       ]) {
-        const envelope = JSON.parse(
-          fs.readFileSync(path.join(root, "example-envelope.json"), "utf8"),
-        );
-        envelope.data.ec.storage.table = table;
-        const file = `invalid-table-${name}.json`;
-        fs.writeFileSync(path.join(fixture, file), JSON.stringify(envelope));
         contract += `\nrun "ec_storage_reject_${name}" {
           command = plan
           variables {
             ec_storage = {
-              provider = "dynamodb"
+              provider = "aws-dynamodb-records"
               region = "eu-west-2"
               table = ${JSON.stringify(table)}
               namespace = "example-staging"
             }
-            config_envelope_file = "${file}"
+          }
+          expect_failures = [var.ec_storage]
+        }\n`;
+      }
+      for (const [name, namespace] of [
+        ["wildcard", "example-*"],
+        ["question_mark", "example-?"],
+        ["unicode", "example-é"],
+        ["empty", ""],
+      ]) {
+        contract += `\nrun "record_namespace_reject_${name}" {
+          command = plan
+          variables {
+            ec_storage = {
+              provider = "aws-dynamodb-records"
+              region = "eu-west-2"
+              table = "example-retained-ec"
+              namespace = ${JSON.stringify(namespace)}
+            }
           }
           expect_failures = [var.ec_storage]
         }\n`;
@@ -560,12 +572,14 @@ try {
         }\n`;
       }
       for (const [name, change] of [
-        ...["provider", "region", "table", "namespace"].map((field) => [
-          `storage_mismatch_${field}`,
-          (envelope) => {
-            envelope.data.ec.storage[field] = "different";
-          },
-        ]),
+        ...["provider", "store", "region", "table", "namespace"].map(
+          (field) => [
+            `storage_mismatch_${field}`,
+            (envelope) => {
+              envelope.data.ec.storage[field] = "different";
+            },
+          ],
+        ),
         [
           "storage_missing",
           (envelope) => {

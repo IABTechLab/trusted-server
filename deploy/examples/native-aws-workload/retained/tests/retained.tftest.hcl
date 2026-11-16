@@ -42,14 +42,11 @@ run "retained_table_contract" {
 
   assert {
     condition = output.ec_storage == {
-      provider  = "dynamodb"
+      provider  = "aws-dynamodb-records"
       region    = "eu-west-2"
       table     = "example-retained-ec"
       namespace = "example-staging"
-      } && output.table_arn == aws_dynamodb_table.ec.arn && output.owned_partitions == {
-      identity  = "ec:example-staging"
-      allocator = "ec-allocator:example-staging"
-    }
-    error_message = "The retained output must supply the workload and envelope storage binding plus both reserved partitions."
+    } && output.table_arn == aws_dynamodb_table.ec.arn && output.record_partition_pattern == "edgezero-dynamodb-records-v1#15:example-staging17:trusted-server-ec1:*"
+    error_message = "The retained output must supply the native record binding and reserve its value/allocator group partitions."
   }
 }

@@ -40,6 +40,7 @@ console.log(JSON.stringify({
   configDir: process.env.EDGEZERO__ADAPTER__CONFIG_DIR ?? null,
   dataDir: process.env.EDGEZERO__ADAPTER__DATA_DIR ?? null,
   bindingsEnv: process.env.TS_NATIVE_BINDINGS_TOML ?? null,
+  recordsEnabled: process.env.TS_EC_RECORDS_ENABLED ?? null,
   geoEnv: process.env.TS_NATIVE_GEO_PROFILE_TOML ?? null,
   geoFile: process.env.TS_NATIVE_GEO_PROFILE_FILE ?? null,
   geoContents: process.env.TS_NATIVE_GEO_PROFILE_FILE ? readFileSync(process.env.TS_NATIVE_GEO_PROFILE_FILE, 'utf8') : null,
@@ -118,6 +119,22 @@ test("writes TOML literally with mode 0600, removes inherited local roots and ex
   assert.equal(observed.bindingsEnv, null);
   assert.deepEqual(await readdir(runtime), ["native-bindings.toml"]);
 });
+
+for (const declaration of [undefined, "false", "true"]) {
+  test(`forwards explicit record declaration ${declaration ?? "absent"} without inferring it from bindings`, async (t) => {
+    const { start } = await fixture(t);
+    const bindings =
+      'version = 1\n[kv.trusted_server_kv]\nprovider = "aws-dynamodb-records"\nregion = "us-east-1"\ntable = "example-identities"\nnamespace = "example"\n';
+    const env =
+      declaration === undefined ? {} : { TS_EC_RECORDS_ENABLED: declaration };
+    const result = await start(bindings, env).closed;
+    assert.equal(result.code, 0, result.stderr);
+    const observed = JSON.parse(result.stdout);
+    assert.equal(observed.recordsEnabled, declaration ?? null);
+    assert.equal(observed.contents, bindings);
+    assert.equal(observed.bindingsEnv, null);
+  });
+}
 
 test("Geo is Off without a profile, ignoring stale pointers and volume files", async (t) => {
   const { runtime, start } = await fixture(t);

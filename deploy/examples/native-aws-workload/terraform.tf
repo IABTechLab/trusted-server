@@ -40,7 +40,7 @@ resource "terraform_data" "draft_gate" {
     }
     precondition {
       condition     = local.envelope_valid
-      error_message = "Supply a CLI BlobEnvelope with version 1, a SHA-256 checksum field, the selected publisher domain and ec.storage exactly matching ec_storage. Trusted Server validates application policy and checksum."
+      error_message = "Supply a CLI BlobEnvelope with version 1, a SHA-256 checksum field, the selected publisher domain and ec.storage selecting records in logical store trusted_server_kv. Trusted Server validates application policy and checksum."
     }
   }
 }

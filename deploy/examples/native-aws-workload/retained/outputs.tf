@@ -4,19 +4,16 @@ output "table_arn" {
 }
 
 output "ec_storage" {
-  description = "Non-secret ec.storage object to publish in the existing Trusted Server app-config envelope. No credential or execution-role changes."
+  description = "Non-secret native KV record binding to pass to workload ec_storage, not published ec.storage. No credential or execution-role changes."
   value = {
-    provider  = "dynamodb"
+    provider  = "aws-dynamodb-records"
     region    = var.aws_region
     table     = aws_dynamodb_table.ec.name
     namespace = var.namespace
   }
 }
 
-output "owned_partitions" {
-  description = "Reserve both partition values for the named owner. Never reset the allocator while reusing the namespace."
-  value = {
-    identity  = local.identity_partition
-    allocator = local.allocator_partition
-  }
+output "record_partition_pattern" {
+  description = "Reserve these record groups, including their retained allocator rows, for the named owner."
+  value       = local.record_partition_pattern
 }

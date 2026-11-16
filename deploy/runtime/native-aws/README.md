@@ -26,6 +26,16 @@ way. Empty explicitly selected Geo input fails rather than selecting Off. With
 no profile content, inherited pointers cannot enable Geo. The application owns
 validation of both formats.
 
+For shared EC records, supply `TS_EC_RECORDS_ENABLED=true` before the application
+starts. The wrapper passes this declaration through unchanged; it does not infer
+or enable it by parsing the binding file. The application declares the stable
+layout before EdgeZero prepares `kv.trusted_server_kv`. Published application
+configuration then selects `ec.storage.provider="records"` and logical
+`store="trusted_server_kv"`, while the native binding selects
+`aws-dynamodb-records` or `celld-records`. Endpoint, table/namespace and access
+configuration belong to the binding, not to `ec.storage` or image arguments.
+Legacy `TS_EC_DYNAMODB_ENABLED` selection is obsolete and the app rejects it.
+
 After publication the wrapper removes those input-content variables and the
 local-provider directory defaults, then execs the application. It never sources
 or evaluates TOML. SIGTERM reaches the application directly. AWS credentials and

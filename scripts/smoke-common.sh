@@ -194,7 +194,7 @@ smoke_initialize_config() {
 import { readFileSync, writeFileSync } from 'node:fs'
 const file = process.argv[2]
 const source = readFileSync(file, 'utf8')
-const fastlyStorage = '[ec.storage]\nstore = "ec_identity_store"\n'
+const fastlyStorage = '[ec.storage]\nstore = "trusted_server_kv"\n'
 if (!source.includes(fastlyStorage)) throw new Error('Expected the Fastly storage template block')
 writeFileSync(file, source.replace(fastlyStorage, ''))
 JS
