@@ -3219,3 +3219,25 @@ change are D5, D7, D13, D18, and D20.
     Fastly response diff against `1810c763a` showed only listed differences
     (Runtime). The round also corrected this spec, the guides, and the
     CHANGELOG.
+
+- **Repin to `3d92ee38` (2026-11-16).** At the maintainer's request, PR
+  275's head `b65e7144` was merged bottom-up through EdgeZero's stack (499,
+  460, 406, 407, 409, 414, 422 and 439), each PR merging the one below it.
+  409's merge resolved one import conflict in edgezero-core's `app.rs` by
+  keeping both imports. `rc/identity` then took 439's head as a plain merge,
+  `3d92ee38`, after `a77b74d7` had merged EdgeZero 469's JA4 review fixes.
+  The cut repinned to it (`7869ef647`), which changes only EdgeZero's source
+  lines in `Cargo.lock`.
+  - Two of PR 275's four new commits answer the round-2 asks. `4cbabfee`
+    sends EdgeZero's canonical 500 when the Fastly managed logger fails to
+    install, and rejects invalid endpoint names when the manifest loads
+    (IABTechLab/edgezero#505 and #506). `b65e7144` adds `logging_config!`
+    (IABTechLab/edgezero#504), and Trusted Server's Fastly `logging_for` now
+    uses it (`4088c155f`, #1611).
+  - A probe that set `endpoint = "ts:log"` failed `cargo check-fastly` with
+    the manifest error, and passed with the file restored. The 500 is
+    EdgeZero's tested behavior and was not reproduced from Trusted Server
+    (section 9).
+  - `5794ff016`, `9631b6f07` and `18ab253ec` brought the pin, section 9,
+    Fastly differences item 28, Failure handling, the asks, Follow-ups, the
+    Fastly and API guides, and the CHANGELOG in line.
