@@ -26,7 +26,7 @@ const HEADER_REQUEST_ID: &str = "x-ts-sandbox-request-id";
 const INSTANCE_UNAVAILABLE: &str = "unavailable";
 
 /// Paths that never carry counters because they short-circuit before dispatch.
-const NON_WORKLOAD_PATHS: &[&str] = &["/health", "/_ts/debug/sandbox", "/_ts/debug/ja4"];
+const NON_WORKLOAD_PATHS: &[&str] = &["/health", "/ready", "/_ts/debug/sandbox", "/_ts/debug/ja4"];
 
 /// Arguments for `ts dev sandbox-probe`.
 #[derive(Debug, clap::Args)]
@@ -37,7 +37,7 @@ pub struct SandboxProbeArgs {
 
     /// Workload path to exercise.
     ///
-    /// Required, and it must reach the router. `/health` and the debug probes
+    /// Required, and it must reach the router. `/health`, `/ready`, and the debug probes
     /// short-circuit ahead of the point where counters are attached, so
     /// probing one of those reports nothing.
     #[arg(long)]
@@ -516,10 +516,10 @@ mod tests {
 
     #[test]
     fn non_workload_paths_are_rejected_before_connecting() {
-        for path in NON_WORKLOAD_PATHS {
+        for path in ["/health", "/ready", "/_ts/debug/sandbox", "/_ts/debug/ja4"] {
             let args = SandboxProbeArgs {
                 authority: "127.0.0.1:7676".to_owned(),
-                path: (*path).to_owned(),
+                path: path.to_owned(),
                 requests: 2,
                 timeout_ms: 100,
             };

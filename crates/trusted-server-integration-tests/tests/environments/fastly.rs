@@ -15,6 +15,10 @@ use std::process::{Child, Command, Stdio};
 pub struct FastlyViceroy;
 
 impl RuntimeEnvironment for FastlyViceroy {
+    fn health_check_path(&self) -> &str {
+        "/ready"
+    }
+
     fn id(&self) -> &'static str {
         "fastly"
     }
@@ -74,8 +78,6 @@ impl RuntimeEnvironment for FastlyViceroy {
             _runtime_config: runtime_config,
         };
 
-        // Fastly exposes a dedicated `/health` route, so root fallback only
-        // adds redundant requests while the runtime is still starting up.
         super::wait_for_ready(&base_url, self.health_check_path(), false)?;
 
         Ok(RuntimeProcess {

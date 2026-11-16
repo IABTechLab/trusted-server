@@ -117,6 +117,9 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
+};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
@@ -1040,31 +1043,20 @@ fn legacy_admin_alias_denied() -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every registered route with the startup error.
+/// Returns a [`RouterService`] that preserves probes and returns generic 503s on ordinary routes.
 ///
 /// Called when [`build_state`] fails so that request handling degrades to a
 /// structured HTTP error response rather than an unrecoverable panic.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
+fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.request().method());
+        async move { Ok::<Response, EdgeError>(response) }
     };
-
-    let mut router = RouterService::builder();
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
     for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
     }
     router.build()
 }
@@ -1300,10 +1292,13 @@ impl TrustedServerApp {
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(trace_metadata),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(trace_metadata),
+                ))),
+            ))
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
                 Arc::new(FastlyPlatformGeo),
@@ -1862,12 +1857,12 @@ mod tests {
 
         assert_eq!(
             head_response.status(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             "HEAD should use the degraded startup-error response"
         );
         assert_eq!(
             options_response.status(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             "OPTIONS should use the degraded startup-error response"
         );
         assert_eq!(
@@ -3723,5 +3718,85 @@ mod trace_dispatch_tests {
                 .is_some(),
             "should harden disabled feature"
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }

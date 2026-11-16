@@ -60,7 +60,7 @@ impl RuntimeEnvironment for AxumDevServer {
     }
 
     fn health_check_path(&self) -> &str {
-        "/health"
+        "/ready"
     }
 }
 
@@ -108,9 +108,7 @@ impl AxumDevServer {
 
         let handle = AxumHandle { child };
 
-        // The Axum dev server returns 403 at root (no publisher config in test env),
-        // so we poll until we get any HTTP response rather than a specific status.
-        wait_for_any_response(&base_url)?;
+        super::wait_for_ready(&base_url, self.health_check_path(), false)?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
@@ -131,25 +129,6 @@ impl AxumDevServer {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/trusted-server-axum")
     }
-}
-
-/// Poll until the Axum dev server responds with any HTTP status code.
-///
-/// The Axum server returns 403 at root when no publisher config is present,
-/// which is neither success nor 404, so the standard [`super::wait_for_ready`]
-/// helper cannot be used. Any HTTP response means the server is up.
-fn wait_for_any_response(base_url: &str) -> TestResult<()> {
-    use error_stack::Report;
-
-    let url = format!("{base_url}/");
-    for _ in 0..30 {
-        if reqwest::blocking::get(&url).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    Err(Report::new(TestError::RuntimeNotReady)
-        .attach(format!("Axum dev server at {base_url} not ready after 15s")))
 }
 
 /// Process handle for a running Axum dev-server instance.

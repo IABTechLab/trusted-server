@@ -27,6 +27,9 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
+};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
@@ -392,21 +395,6 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
 // Health probe
 // ---------------------------------------------------------------------------
 
-/// Builds the `GET /health` liveness response (`200 ok`, `text/plain`).
-///
-/// Mirrors the Fastly entry point and Axum adapter so deployments reusing
-/// Trusted Server health probes see identical behaviour on Spin. Served from
-/// both the healthy router and the startup-error fallback so the probe answers
-/// even before (or when) application state is usable, leaving Spin's
-/// platform-provided `/.well-known/spin/health` untouched.
-fn health_response() -> Response {
-    let mut resp = Response::new(edgezero_core::body::Body::from("ok"));
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-    resp
-}
-
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
@@ -503,40 +491,21 @@ fn legacy_admin_alias_denied() -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
+/// Returns a [`RouterService`] with liveness/readiness probes and generic
+/// 503 Service Unavailable responses on ordinary routes. The startup error is logged but not echoed in the
 /// response body so that deployment state is not leaked to anonymous callers.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
-
-    let handler = |_ctx: RequestContext| {
-        let body = edgezero_core::body::Body::from("Service Unavailable\n");
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        async move { Ok::<Response, EdgeError>(resp) }
+fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.request().method());
+        async move { Ok::<Response, EdgeError>(response) }
     };
-
-    // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
-    // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
-    // healthy router: every method on `/` and `/{*rest}` returns the generic
-    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
-    let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    // Keep the liveness probe answering 200 even while state construction is
-    // failing, matching the Fastly/Axum health behaviour.
-    builder = builder.get("/health", |_ctx: RequestContext| async {
-        Ok::<Response, EdgeError>(health_response())
-    });
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
     for method in publisher_fallback_methods() {
-        builder = builder.route("/", method.clone(), handler);
-        builder = builder.route("/{*rest}", method, handler);
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
     }
-    builder.build()
+    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -885,10 +854,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let trace_state = Arc::clone(&state);
         let mut builder = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(move |request| trace_metadata(&trace_state, request)),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(move |request| trace_metadata(&trace_state, request)),
+                ))),
+            ))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
@@ -902,11 +874,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // the de-spoofing invariant. Runs after auth so the basic-auth gate
             // continues to see the original request, matching prior behaviour.
             .middleware(NormalizeMiddleware::new())
-            // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
-            // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
-            .get("/health", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(health_response())
-            })
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
@@ -1846,5 +1813,85 @@ mod trace_dispatch_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }

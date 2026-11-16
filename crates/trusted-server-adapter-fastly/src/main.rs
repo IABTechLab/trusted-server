@@ -12,7 +12,6 @@ use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -21,13 +20,16 @@ use trusted_server_core::ec::pull_sync::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::health::{
+    OperationalResponse, Probe, StartupState, probe_response, startup_unavailable_response,
+};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
-use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
+use trusted_server_core::version_header::apply_git_version_header;
 
 mod app;
 mod backend;
@@ -70,16 +72,25 @@ fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandl
 }
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        let mut response = FastlyResponse::from_status(200).with_body_text_plain("ok");
-        // Compiled-in constant: keeps the probe free of settings and app construction.
-        if let Some(version) = git_version_header_value() {
-            response.set_header(HEADER_X_TS_VERSION, version);
-        }
-        return Some(response);
+    if (req.get_method() == FastlyMethod::GET || req.get_method() == FastlyMethod::HEAD)
+        && req.get_path() == "/health"
+    {
+        let method = operational_method(req);
+        return Some(compat::to_fastly_response(probe_response(
+            &method,
+            Probe::Liveness,
+            StartupState::Ready,
+        )));
     }
-
     None
+}
+
+fn operational_method(req: &FastlyRequest) -> edgezero_core::http::Method {
+    if req.get_method() == FastlyMethod::HEAD {
+        edgezero_core::http::Method::HEAD
+    } else {
+        edgezero_core::http::Method::GET
+    }
 }
 
 /// Entry point for the Fastly Compute program.
@@ -204,6 +215,30 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
         .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
 
     edgezero_main(req, sandbox, ordinal, &request_id, trace_path);
+}
+
+enum ApplicationDispatch {
+    Operational(HttpResponse),
+    Ordinary(Option<edgezero_core::app::App>),
+}
+
+fn initialize_dispatch(
+    sandbox: &mut Sandbox,
+    readiness: bool,
+    method: &edgezero_core::http::Method,
+    build: impl FnOnce() -> Result<RetainedApp, edgezero_core::app::App>,
+) -> ApplicationDispatch {
+    let failed_app = sandbox.initialize(build).err();
+    if readiness {
+        let state = if sandbox.state().is_some() {
+            StartupState::Ready
+        } else {
+            StartupState::Unavailable
+        };
+        ApplicationDispatch::Operational(probe_response(method, Probe::Readiness, state))
+    } else {
+        ApplicationDispatch::Ordinary(failed_app)
+    }
 }
 
 /// Builds the counters snapshot response.
@@ -333,6 +368,10 @@ fn edgezero_main(
     request_id: &str,
     trace_path: bool,
 ) {
+    let operational_method = operational_method(&req);
+    let readiness = (req.get_method() == FastlyMethod::GET
+        || req.get_method() == FastlyMethod::HEAD)
+        && req.get_path() == "/ready";
     let runtime_stores = RuntimeStoreConfig::logical();
 
     // Short-circuit the sandbox counters probe before app construction. It must
@@ -383,9 +422,17 @@ fn edgezero_main(
             Ok(cs) => cs,
             Err(e) => {
                 log::error!("failed to open config store: {e}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
+                if matches!(
+                    req.get_method().as_str(),
+                    "GET" | "POST" | "HEAD" | "OPTIONS" | "PUT" | "PATCH" | "DELETE"
+                ) {
+                    compat::to_fastly_response(startup_unavailable_response(&operational_method))
+                        .send_to_client();
+                } else {
+                    FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_body_text_plain("Internal Server Error")
+                        .send_to_client();
+                }
                 return;
             }
         };
@@ -398,15 +445,19 @@ fn edgezero_main(
     // error router as the error payload: that serves this request and is then
     // dropped, so a transient config-store failure cannot pin the sandbox into
     // permanent error mode, and the next callback retries construction.
-    let failed_build = sandbox
-        .initialize(|| {
-            let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
-            match state {
-                Some(state) => Ok(RetainedApp { app, state }),
-                None => Err(app),
-            }
-        })
-        .err();
+    let failed_build = match initialize_dispatch(sandbox, readiness, &operational_method, || {
+        let (app, state) = TrustedServerApp::build_app_with_state(&runtime_stores);
+        match state {
+            Some(state) => Ok(RetainedApp { app, state }),
+            None => Err(app),
+        }
+    }) {
+        ApplicationDispatch::Operational(response) => {
+            compat::to_fastly_response(response).send_to_client();
+            return;
+        }
+        ApplicationDispatch::Ordinary(failed_app) => failed_app,
+    };
 
     let (app, app_state): (&edgezero_core::app::App, Option<Arc<AppState>>) =
         match (failed_build.as_ref(), sandbox.state()) {
@@ -509,6 +560,7 @@ fn edgezero_main(
         .extensions()
         .get::<TraceTerminalResponse>()
         .is_some()
+        || response.extensions().get::<OperationalResponse>().is_some()
     {
         // Trace responses keep their exact hardened headers; no sandbox counters.
         send_response_to_client(response, None);
@@ -624,6 +676,7 @@ fn apply_entry_point_finalize_headers(
         .extensions()
         .get::<TraceTerminalResponse>()
         .is_some()
+        || response.extensions().get::<OperationalResponse>().is_some()
     {
         return;
     }
@@ -781,6 +834,7 @@ fn apply_terminal_response_effects(
         .extensions()
         .get::<TraceTerminalResponse>()
         .is_some()
+        || response.extensions().get::<OperationalResponse>().is_some()
     {
         return;
     }
@@ -1583,5 +1637,66 @@ mod tests {
             body.contains("ch-platform: not sent"),
             "should include sec-ch-ua-platform fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod operational_tests {
+    use super::*;
+    use trusted_server_core::integrations::HeaderMutation;
+
+    #[test]
+    fn native_head_health_is_local_and_uncacheable() {
+        let request = FastlyRequest::head("https://example.com/health?probe=1");
+        let response = health_response(&request).expect("should answer HEAD health locally");
+        assert_eq!(
+            response.get_status().as_u16(),
+            200,
+            "should report liveness"
+        );
+        assert_eq!(
+            response.get_header_str("cache-control"),
+            Some("no-store"),
+            "should prevent caching"
+        );
+        assert!(
+            response.get_header("x-ts-fastly-version").is_none(),
+            "should omit runtime version"
+        );
+    }
+    #[test]
+    fn operational_responses_bypass_native_finalizers_and_filter_effects() {
+        let mut settings = Settings::default();
+        settings.response_headers.insert(
+            "Cache-Control".to_string(),
+            "public, max-age=3600".to_string(),
+        );
+        settings
+            .response_headers
+            .insert("Set-Cookie".to_string(), "fictional=value".to_string());
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public"),
+                HeaderMutation::append("set-cookie", "fictional=effect"),
+            ],
+        };
+        for mut response in [
+            probe_response(
+                &edgezero_core::http::Method::GET,
+                Probe::Readiness,
+                StartupState::Ready,
+            ),
+            startup_unavailable_response(&edgezero_core::http::Method::GET),
+        ] {
+            let headers = response.headers().clone();
+            apply_entry_point_finalize_headers(&settings, &mut response, None);
+            apply_terminal_response_effects(&mut response, Some(&effects));
+            assert_eq!(
+                response.headers(),
+                &headers,
+                "should preserve terminal operational headers"
+            );
+        }
     }
 }

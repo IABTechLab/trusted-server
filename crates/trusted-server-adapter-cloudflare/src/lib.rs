@@ -24,8 +24,7 @@ use worker::{Context, Env, Request, Response, Result, event};
 /// Returns a Workers runtime error when the fallback error response cannot be
 /// constructed.
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    #[cfg(feature = "test-utils")]
-    install_fixture_logger();
+    install_adapter_logger();
     if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
         app::set_cloudflare_config_json(config.to_string());
     }
@@ -40,11 +39,11 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-struct FixtureLogger;
+#[cfg(target_arch = "wasm32")]
+struct AdapterLogger;
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-impl log::Log for FixtureLogger {
+#[cfg(target_arch = "wasm32")]
+impl log::Log for AdapterLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Warn
     }
@@ -58,10 +57,11 @@ impl log::Log for FixtureLogger {
     fn flush(&self) {}
 }
 
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-fn install_fixture_logger() {
-    static LOGGER: FixtureLogger = FixtureLogger;
+#[cfg(target_arch = "wasm32")]
+fn install_adapter_logger() {
+    static LOGGER: AdapterLogger = AdapterLogger;
     if log::set_logger(&LOGGER).is_ok() {
+        #[cfg(feature = "test-utils")]
         std::panic::set_hook(Box::new(|information| {
             worker::console_error!("{}", information);
         }));

@@ -7,13 +7,14 @@ config that `ts config push` writes into KV to the nested
 
 ## Support status
 
-| Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | absent | `500`          | no             | single           | outermost sanitize         | none                  |
+| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | single           | outermost sanitize         | none                  |
 
-This row is the canonical status summary. Cloudflare has no
-`/health` route, supports one enabled auction provider, and returns 500 on
-every route when startup fails.
+Cloudflare supports one enabled auction provider. GET/HEAD `/health` and
+`/ready` are local probes after Worker and SDK application dispatch begins.
+Caught initialization failures preserve liveness and make readiness and ordinary
+routes unavailable. See the [operational response contract](./api-reference#operational-probe-contract).
 
 ## Verify the complete local handoff
 
@@ -35,7 +36,7 @@ the current startup reader.
 The generated local Wrangler files define `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
-secret. Each case requires a 500 response and verifies the exact missing
+secret. Each case requires a 503 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher
 request must return 200, include the stub-origin sentinel, rewrite its origin
 URL to the Worker listener, and omit the original URL.
@@ -43,6 +44,14 @@ URL to the Worker listener, and omit the original URL.
 The exit trap stops Wrangler and the stub origin and removes the isolated KV,
 generated Wrangler manifests, response captures, and logs. It does not modify
 the checked-in manifests.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Configure a deployed Worker
 

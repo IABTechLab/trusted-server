@@ -632,9 +632,9 @@ fn actual_runtime() -> HarnessResult<()> {
                     .attach(format!("runtime exits {status}; see {}", log.display())));
             }
             if ready_client
-                .head(format!("{base_url}/health"))
+                .head(format!("{base_url}/ready"))
                 .send()
-                .is_ok_and(|response| response.status().is_success())
+                .is_ok_and(|response| response.status().as_u16() == 200)
             {
                 ready = true;
                 break;
