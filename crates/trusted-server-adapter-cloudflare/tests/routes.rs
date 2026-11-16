@@ -4,11 +4,15 @@
 //! `TrustedServerApp::routes()` builds without panicking. Does not exercise
 //! the platform layer or outbound network calls.
 
+use std::sync::Arc;
+
 use edgezero_core::app::Hooks as _;
-use edgezero_core::http::{Request, Response, request_builder};
+use edgezero_core::body::Body;
+use edgezero_core::http::{Method, Request, Response, StatusCode, request_builder};
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::capturing_origin::{self, CapturingOrigin};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -22,7 +26,12 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -39,10 +48,7 @@ fn test_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
@@ -272,6 +278,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/first-party/sign"),
         ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
+        ("GET", "/_ts/api/v1/identify"),
+        ("OPTIONS", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/batch-sync"),
     ];
 
     for (method, path) in expected {
@@ -744,5 +753,88 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
     assert!(
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
+    );
+}
+
+fn capturing_router(origin: &Arc<CapturingOrigin>) -> RouterService {
+    TrustedServerApp::routes_with_settings_and_services(
+        test_settings(),
+        capturing_origin::services(Arc::clone(origin)),
+    )
+    .expect("should build router with a capturing origin")
+}
+
+fn partner_api_request(method: Method, path: &str) -> Request {
+    request_builder()
+        .method(method)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .header("authorization", "Bearer fictional-partner-token-0123456789")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mappings":[]}"#))
+        .expect("should build partner API request")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capturing_origin_receives_publisher_fallback_requests() {
+    let origin = Arc::new(CapturingOrigin::default());
+
+    let response = route(
+        capturing_router(&origin),
+        partner_api_request(Method::GET, "/article"),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should proxy the publisher page to the origin"
+    );
+    assert_eq!(
+        origin.requests(),
+        vec![(Method::GET, "/article".to_owned())],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let origin = Arc::new(CapturingOrigin::default());
+
+    let identify = route(
+        capturing_router(&origin),
+        partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+    )
+    .await;
+    let preflight = route(
+        capturing_router(&origin),
+        partner_api_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+    )
+    .await;
+    let batch_sync = route(
+        capturing_router(&origin),
+        partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+    )
+    .await;
+
+    assert_eq!(
+        identify.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "identify should answer 501 locally"
+    );
+    assert_eq!(
+        preflight.status(),
+        StatusCode::OK,
+        "identify preflight should answer locally"
+    );
+    assert_eq!(
+        batch_sync.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "batch sync should answer 501 locally"
+    );
+    assert!(
+        origin.requests().is_empty(),
+        "should send no identify or batch-sync request to the publisher origin: {:?}",
+        origin.requests()
     );
 }

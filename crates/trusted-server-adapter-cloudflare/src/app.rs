@@ -22,6 +22,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::batch_sync_not_supported;
+use trusted_server_core::ec::identify::{cors_preflight_identify, identify_not_supported};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -659,6 +661,22 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
+            // Partner APIs are answered locally so a partner's Bearer token
+            // and mapping body never reach the publisher origin. This adapter
+            // has no EC record store, so identify and batch sync answer 501.
+            .get("/_ts/api/v1/identify", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(identify_not_supported())
+            })
+            .route(
+                "/_ts/api/v1/identify",
+                Method::OPTIONS,
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    cors_preflight_identify(&s.settings, &req)
+                }),
+            )
+            .post("/_ts/api/v1/batch-sync", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(batch_sync_not_supported())
+            })
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
