@@ -43,8 +43,8 @@ use crate::integrations::{
 use crate::openrtb::ToExt;
 #[cfg(test)]
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
-    UserExt, to_openrtb_i32, to_openrtb_user_eids,
+    ApsUserExt, Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site,
+    User, to_openrtb_i32, to_openrtb_user_eids,
 };
 #[cfg(test)]
 use crate::platform::PlatformHttpRequest;
@@ -1122,15 +1122,16 @@ impl ApsAuctionProvider {
 
         let consent = request.user.consent.as_ref();
         let raw_tc = consent.and_then(|value| value.raw_tc_string.clone());
+        let eids = to_openrtb_user_eids(request.user.eids.as_deref());
         let user = Some(User {
             id: request.user.id.clone(),
             consent: raw_tc.clone(),
-            ext: UserExt {
+            ext: ApsUserExt {
                 consent: raw_tc,
-                consented_providers_settings: None,
+                eids: eids.clone(),
             }
             .to_ext(),
-            eids: to_openrtb_user_eids(request.user.eids.as_deref()),
+            eids,
             ..Default::default()
         });
 
@@ -1982,7 +1983,7 @@ pub fn register_providers(
 mod tests {
     use super::*;
     use crate::auction::test_support::{
-        assert_no_user_eids, canonical_parity_auction_request, user_eids,
+        aps_user_eids, assert_no_user_eids, canonical_parity_auction_request,
     };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
@@ -2390,7 +2391,7 @@ mod tests {
         assert_eq!(serialized["user"]["consent"], "fictional-tcf");
         assert_eq!(serialized["user"]["ext"]["consent"], "fictional-tcf");
         assert_eq!(
-            user_eids(&serialized, "aps")[0]["source"],
+            aps_user_eids(&serialized, "aps")[0]["source"],
             "identity.example"
         );
         assert_eq!(serialized["regs"]["gdpr"], 1);
@@ -2411,7 +2412,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&openrtb).expect("should serialize APS request"),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
             "should preserve the complete APS wire shape without a signing extension"
         );
     }

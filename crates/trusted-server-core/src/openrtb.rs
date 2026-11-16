@@ -46,6 +46,24 @@ pub struct UserExt {
 
 impl ToExt for UserExt {}
 
+/// `user.ext` for APS requests.
+///
+/// The Prebid.js APS adapter that these requests mirror sends EIDs in
+/// `user.ext.eids`, the field Prebid's User ID module fills. APS requests
+/// therefore repeat `user.eids` there. No other request writes
+/// `user.ext.eids`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ApsUserExt {
+    /// TCF v2 consent string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) consent: Option<String>,
+    /// Copy of `user.eids`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) eids: Vec<OpenRtbEid>,
+}
+
+impl ToExt for ApsUserExt {}
+
 /// Google Additional Consent (AC) string container.
 ///
 /// Covers ad tech providers not in the IAB Global Vendor List but
@@ -149,8 +167,8 @@ fn object_ext(ext: Option<&Value>) -> Option<trusted_server_openrtb::Object> {
 
 /// Builds the `OpenRTB` 2.6 `user.eids` list from resolved EIDs.
 ///
-/// EIDs go only in `user.eids`; no downstream needs the pre-2.6
-/// `user.ext.eids` placement.
+/// EIDs go in `user.eids`. Only APS also gets the pre-2.6 `user.ext.eids`
+/// placement, through [`ApsUserExt`].
 #[must_use]
 pub(crate) fn to_openrtb_user_eids(eids: Option<&[Eid]>) -> Vec<OpenRtbEid> {
     eids.unwrap_or_default()

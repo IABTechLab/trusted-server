@@ -146,3 +146,20 @@ pub(crate) fn user_eids<'a>(request: &'a Value, context: &str) -> &'a [Value] {
         .as_array()
         .unwrap_or_else(|| panic!("{context}: should write user.eids"))
 }
+
+/// Returns the `user.eids` array of a serialized APS `OpenRTB` request.
+///
+/// # Panics
+///
+/// Panics when `user.eids` is missing or `user.ext.eids` does not mirror it.
+pub(crate) fn aps_user_eids<'a>(request: &'a Value, context: &str) -> &'a [Value] {
+    let eids = request["user"]["eids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: should write user.eids"));
+    assert_eq!(
+        request["user"]["ext"]["eids"].as_array(),
+        Some(eids),
+        "{context}: should mirror user.eids into user.ext.eids for APS"
+    );
+    eids
+}

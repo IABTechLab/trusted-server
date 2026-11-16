@@ -19,8 +19,8 @@ use super::routing::{
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::error::TrustedServerError;
 use crate::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    ApsUserExt, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest,
+    Publisher, Regs, RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
     to_openrtb_user_eids,
 };
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
@@ -356,11 +356,15 @@ fn build_common_request(
     };
     let body_consent = selected_consent.as_deref();
     let raw_tc = body_consent.and_then(|value| value.raw_tc_string.clone());
-    let user = Some(User {
-        id: common.user.id.clone(),
-        consent: raw_tc.clone(),
-        ext: UserExt {
-            consent: raw_tc,
+    let eids = to_openrtb_user_eids(common.user.eids.as_deref());
+    let user_ext = match policy {
+        ProfilePolicy::Aps(_) => ApsUserExt {
+            consent: raw_tc.clone(),
+            eids: eids.clone(),
+        }
+        .to_ext(),
+        ProfilePolicy::Prebid(_) | ProfilePolicy::Standard(_) => UserExt {
+            consent: raw_tc.clone(),
             consented_providers_settings: matches!(policy, ProfilePolicy::Prebid(_))
                 .then(|| {
                     body_consent
@@ -372,7 +376,12 @@ fn build_common_request(
                 .flatten(),
         }
         .to_ext(),
-        eids: to_openrtb_user_eids(common.user.eids.as_deref()),
+    };
+    let user = Some(User {
+        id: common.user.id.clone(),
+        consent: raw_tc,
+        ext: user_ext,
+        eids,
         ..Default::default()
     });
     let language = normalized_language(routed.prebid_transport_headers(), policy);

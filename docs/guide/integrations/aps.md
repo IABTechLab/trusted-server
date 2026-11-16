@@ -185,7 +185,7 @@ Trusted Server builds the APS request independently from its Prebid Server reque
 - `ext.sdk = { "source": "prebid", "version": "2.2.0" }`;
 - secure banner impressions and configured floors;
 - page, site, device, and consent fields allowed by the existing privacy gates; and
-- eligible EIDs only when consent policy permits them.
+- eligible EIDs only when consent policy permits them, in both `user.eids` and `user.ext.eids` (the field the Prebid.js APS adapter uses).
 
 Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. The page URL is a validated publisher-owned URL with query and fragment removed; the raw browser `Referer` is not forwarded as `site.ref`. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
 
