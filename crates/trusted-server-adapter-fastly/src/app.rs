@@ -85,7 +85,7 @@
 //! retains nothing, so the next request retries.
 
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
@@ -95,7 +95,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
-use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
+use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -1216,9 +1216,6 @@ fn fallback_route_handler(
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
-/// The repository's `edgezero.toml`, compiled in for [`Hooks::logging_for`].
-const EDGEZERO_MANIFEST: &str = include_str!("../../../edgezero.toml");
-
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
@@ -1336,24 +1333,15 @@ impl Hooks for TrustedServerApp {
         )
     }
 
-    /// Reads `[adapters.<adapter>.logging]` from the compiled-in `edgezero.toml`.
+    /// Returns `[adapters.<adapter>.logging]` from the repository's `edgezero.toml`.
     ///
     /// `EdgeZero`'s `run_custom` and `serve_custom` call this before every
-    /// callback to install the managed Fastly logger. The `app!` macro bakes the
-    /// same table into a generated `Hooks`; this hand-written one parses
-    /// [`EDGEZERO_MANIFEST`] with `EdgeZero`'s loader once per instance, so the
-    /// manifest stays the single source of the Fastly logging settings.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the compiled-in manifest does not parse, which
-    /// `logging_for_reads_the_fastly_logging_table` rules out.
+    /// callback to install the managed Fastly logger. `EdgeZero`'s
+    /// `logging_config!` resolves and validates the table at compile time, the
+    /// same way the `app!` macro does, so no request parses the manifest and it
+    /// stays the single source of the Fastly logging settings.
     fn logging_for(adapter: &str) -> ResolvedLoggingConfig {
-        static MANIFEST: OnceLock<ManifestLoader> = OnceLock::new();
-        MANIFEST
-            .get_or_init(|| ManifestLoader::load_from_str(EDGEZERO_MANIFEST))
-            .manifest()
-            .logging_or_default(adapter)
+        edgezero_core::logging_config!("../../edgezero.toml", adapter)
     }
 
     fn name() -> &'static str {
