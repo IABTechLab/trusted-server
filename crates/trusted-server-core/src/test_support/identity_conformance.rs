@@ -309,6 +309,7 @@ impl Scenario {
             _ => {
                 let identity = assert_created(&response, store);
                 if matches!(self, Self::UnknownGeo | Self::GeoFailure | Self::Returning) {
+                    let key = normalize_ec_id_for_kv(&identity);
                     let keys = store
                         .list_keys_with_prefix("", 100)
                         .expect("should inspect issued rows");
@@ -328,7 +329,7 @@ impl Scenario {
                         "should retain the reader's cookie"
                     );
                     let (record, _) = graph
-                        .get(&identity)
+                        .get(&key)
                         .expect("should read returning record")
                         .expect("should retain the returning record");
                     assert!(
@@ -346,7 +347,7 @@ impl Scenario {
                         "should preserve identity on replay"
                     );
                     let (record, _) = graph
-                        .get(&identity)
+                        .get(&key)
                         .expect("should inspect replayed identity")
                         .expect("should retain the existing record");
                     assert!(

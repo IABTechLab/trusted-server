@@ -93,6 +93,8 @@ For Fastly, local positive creation through the unmodified artifact is blocked b
 
 These tests cover the EC contract, not the entire provider, SharedID, mirror-cookie or CMP-script program. Those features and their browser tests retain their own tickets.
 
+Application conformance ends when the finalized response is delivered. The Fastly runner does not run post-delivery work (queued telemetry and EC pull sync), and pull sync opens its own store through `require_identity_graph` rather than the recording fixture. The release-ordering assertions therefore cover writes made during finalization only. A post-delivery write or deletion that changes a returning reader's record is outside this suite; pull sync's partner writes keep their own tests.
+
 ### Architecture and CI
 
 Keep a distinct SH-5 check for production adapter source calling EC generation, finalization or identity handlers directly. Implement a narrow syntax-aware check using existing repository tooling, or inspect imports and aliases as well as calls in a scoped script with regression fixtures. Exclude test modules and test targets without excluding production modules. Demonstrate it rejects both a direct call and an imported alias. No broad search for a single function spelling counts as proof of this requirement.

@@ -70,6 +70,11 @@ must be observed before release. Returning scenarios apply cookie expiry rules
 and replay the resulting identity. The missing-metadata expectation describes
 the current pre-T12 policy and must change when #1592 permits absent JA4.
 
+The suite ends when the finalized response is delivered. Post-delivery work
+(queued telemetry and EC pull sync) does not run, and pull sync opens its own
+store rather than the recording fixture, so release-ordering assertions cover
+writes made during finalization only.
+
 This is application conformance, not fresh-browser qualification through an
 unmodified deployed artifact. Viceroy 0.21 does not expose JA4, so the current
 production browser gate prevents fresh issuance over ordinary local HTTP.
