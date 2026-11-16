@@ -25,6 +25,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::batch_sync_not_supported;
+use trusted_server_core::ec::identify::{cors_preflight_identify, identify_not_supported};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
@@ -205,14 +207,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-//
-// The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
-// intentionally absent here, matching the Axum and Cloudflare adapters: those
-// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
-// registry and rate limiter) that the portability adapters do not yet wire.
-// On Spin these paths fall through to the publisher/integration fallback,
-// identical to the other non-Fastly adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -223,7 +217,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -235,6 +229,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/identify", &[Method::GET, Method::OPTIONS]),
+        ("/_ts/api/v1/batch-sync", &[Method::POST]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -659,6 +655,24 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. This adapter has no EC
+        // record store, so identify and batch sync answer 501.
+        let identify_not_supported_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(identify_not_supported()) };
+        let s = Arc::clone(&state);
+        let identify_preflight_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                Ok::<Response, EdgeError>(
+                    cors_preflight_identify(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+        let batch_sync_not_supported_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(batch_sync_not_supported()) };
+
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -928,6 +942,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec", admin_ec_not_supported_handler)
             .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
             .get("/_ts/admin/eids", admin_eids_handler)
+            .get("/_ts/api/v1/identify", identify_not_supported_handler)
+            .route(
+                "/_ts/api/v1/identify",
+                Method::OPTIONS,
+                identify_preflight_handler,
+            )
+            .post("/_ts/api/v1/batch-sync", batch_sync_not_supported_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
