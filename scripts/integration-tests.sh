@@ -11,13 +11,16 @@
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #
 # The Spin runtime cases are skipped unless a test filter names one, as CI's
-# main integration job skips them. Naming one also needs the Spin CLI pinned in
-# .tool-versions, and the script then builds the production Spin component.
+# main integration job skips them. Naming one also needs the Spin CLI at the
+# version pinned in .tool-versions or newer, and the script then builds the
+# production Spin component.
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/smoke-common.sh
+. "$REPO_ROOT/scripts/smoke-common.sh"
 
 # Fixed origin port used by generated Viceroy app_config.
 # Docker containers are mapped to this port so the trusted-server
@@ -77,9 +80,11 @@ if [ "$SPIN_RUNTIME_REQUESTED" = false ]; then
         --skip publisher_head_and_conditional_304_return_real_status_spin
         "${TEST_ARGS[@]}"
     )
-elif ! command -v spin >/dev/null 2>&1; then
-    echo "The Spin runtime cases need the Spin CLI pinned in .tool-versions" >&2
-    exit 1
+else
+    # An older Spin cannot link the production component, so a named case
+    # would fail only inside the test. Check the pinned floor first.
+    smoke_require_command spin
+    smoke_require_spin_version
 fi
 
 # Detect native target from rustc (handles all OS + arch combinations correctly)

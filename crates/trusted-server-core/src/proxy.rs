@@ -374,7 +374,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body_as_reader(body, "proxy")?, &mut output)
+        .process(body_as_reader(body)?, &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;

@@ -1773,7 +1773,7 @@ pub async fn buffer_publisher_response_async(
             // A buffered-unmodified response can carry an origin body, which
             // arrives as a stream. A bodiless response (HEAD, 204,
             // 205, 304) must stay bodiless, so drop the body and correct its
-            // framing (204/205 Content-Length; HEAD/304 preserved), matching
+            // framing (205 `Content-Length: 0`; HEAD/304 preserved), matching
             // the streaming finalizer.
             if response_carries_body(method, response.status()) {
                 collect_raw_body(&mut response, input_cap).await?;
@@ -2480,7 +2480,7 @@ pub async fn publisher_response_into_streaming_response(
             // classified, so a buffered-unmodified response can still hold an
             // `EdgeBody::Stream`. Delivery streams any `EdgeBody::Stream` to the
             // client, so a bodiless response (HEAD, 204, 205, 304) drops its body
-            // and corrects its framing (204/205 Content-Length; HEAD/304 preserved).
+            // and corrects its framing (205 `Content-Length: 0`; HEAD/304 preserved).
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
             }
@@ -3076,8 +3076,9 @@ async fn stream_html_eof<W: Write>(
 /// # Errors
 ///
 /// Returns an error for missing async HTML operator permission or inconsistent
-/// factory/session capabilities, or if processing fails mid-stream. If headers
-/// are already committed, the caller logs the error and drops the body.
+/// factory/session capabilities, if `body` is not a stream, or if processing
+/// fails mid-stream. If headers are already committed, the caller logs the
+/// error and drops the body.
 pub async fn stream_publisher_body_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -4254,9 +4255,9 @@ pub struct AuctionDispatch<'a> {
 /// Necessary for the template cache, and recorded as the `origin_cache_shareable`
 /// telemetry. Origin readthrough is unavailable until `EdgeZero` surrogate keys (EZ-11)
 /// restore it; the telemetry measures the reach it would have. One type keeps the two
-/// from drifting apart. Keeping the template-only conditions out of it is deliberate: the assembly mode and the reader's
-/// encoding support say whether *this pipeline* can assemble a shared template, not whether
-/// the origin's bytes may be shared at all.
+/// from drifting apart. Keeping the template-only conditions out of it is deliberate:
+/// the assembly mode and the reader's encoding support say whether *this pipeline* can
+/// assemble a shared template, not whether the origin's bytes may be shared at all.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SharedRequestInputs {
     /// The method admits a shared representation. Only `GET` does.
@@ -4820,8 +4821,9 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
-            // The reader's own path, not the origin target. Path *and* query: a different query is a different page, and
-            // a purge caller types the whole address.
+            // The reader's own path, not the origin target. Path *and* query: a
+            // different query is a different page, and a purge caller types the
+            // whole address.
             request_path: request_path_and_query.clone(),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,

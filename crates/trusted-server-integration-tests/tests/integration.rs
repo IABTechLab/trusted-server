@@ -1943,17 +1943,35 @@ fn get_root_with_body_returns_400_axum() {
 }
 
 /// A POST whose `Content-Length` is malformed, or repeated with different
-/// values, returns 400 at ingress and never reaches the origin.
+/// values, is refused at ingress with one of `accepted` and never reaches the
+/// origin.
+fn bad_content_length_is_refused(runtime: IngressRuntime, accepted: &[u16]) {
+    init_logger();
+    let _port = lock_origin_port();
+    let origin = RecordingOrigin::start(origin_port(), ORIGIN_PASS_THROUGH_STATUS);
+    let process = runtime.spawn();
+    assert_bad_content_length_refused(
+        &format!("{runtime:?}"),
+        &process.base_url,
+        &origin,
+        accepted,
+    );
+}
+
+/// Sends `base_url` POSTs with a malformed and with a duplicate
+/// `Content-Length`, and asserts that each answers one of `accepted` and that
+/// `origin` records none of them.
 ///
 /// The GTM beacon handler no longer checks the field itself, so this pins the
 /// answer where it moved. The integration config leaves GTM off, so both the
 /// beacon path and the form path reach the publisher fallback, which would
 /// forward a well-framed request to the origin.
-fn bad_content_length_returns_400(runtime: IngressRuntime) {
-    init_logger();
-    let _port = lock_origin_port();
-    let origin = RecordingOrigin::start(origin_port(), ORIGIN_PASS_THROUGH_STATUS);
-    let process = runtime.spawn();
+fn assert_bad_content_length_refused(
+    runtime: &str,
+    base_url: &str,
+    origin: &RecordingOrigin,
+    accepted: &[u16],
+) {
     // Readiness probes may already have fetched the root page from the origin.
     let probes = origin.requests().len();
 
@@ -1969,10 +1987,10 @@ fn bad_content_length_returns_400(runtime: IngressRuntime) {
                 "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n{length_fields}Connection: close\r\n\r\nab"
             );
 
-            assert_eq!(
-                raw_request_status(&process.base_url, request.as_bytes()),
-                Some(400),
-                "{runtime:?} should refuse a POST to {path} with a {framing} Content-Length"
+            let status = raw_request_status(base_url, request.as_bytes());
+            assert!(
+                status.is_some_and(|status| accepted.contains(&status)),
+                "{runtime} should refuse a POST to {path} with a {framing} Content-Length with one of {accepted:?}, got {status:?}"
             );
         }
     }
@@ -1980,7 +1998,7 @@ fn bad_content_length_returns_400(runtime: IngressRuntime) {
     assert_eq!(
         forwarded.len(),
         probes,
-        "{runtime:?} should forward no request with a bad Content-Length to the origin: {:?}",
+        "{runtime} should forward no request with a bad Content-Length to the origin: {:?}",
         &forwarded[probes..]
     );
 }
@@ -1988,13 +2006,42 @@ fn bad_content_length_returns_400(runtime: IngressRuntime) {
 #[test]
 #[ignore = "requires Viceroy, the generated Viceroy config, and the release Fastly WASM"]
 fn bad_content_length_returns_400_fastly() {
-    bad_content_length_returns_400(IngressRuntime::Fastly);
+    bad_content_length_is_refused(IngressRuntime::Fastly, &[400]);
 }
 
 #[test]
 #[ignore = "requires the pre-built trusted-server-axum binary"]
 fn bad_content_length_returns_400_axum() {
-    bad_content_length_returns_400(IngressRuntime::Axum);
+    bad_content_length_is_refused(IngressRuntime::Axum, &[400]);
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn bad_content_length_never_reaches_origin_cloudflare() {
+    // Local Wrangler's host refuses both requests before the Worker runs, so
+    // the status is workerd's, and it differs by version. Wrangler 4.162.0
+    // (workerd 1.20261113.1) answers 400 "invalid content-length parsed".
+    // Wrangler 4.83.0 (workerd 1.20260415.1) answers 500, as EdgeZero at
+    // `10166628` records for a duplicate length: edgezero
+    // `docs/guide/adapters/cloudflare.md:454` and edgezero-test-harness
+    // `fixtures/request-fidelity/observations.json`. Neither reaches the
+    // origin.
+    bad_content_length_is_refused(IngressRuntime::Cloudflare, &[400, 500]);
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_bad_content_length_returns_400() {
+    // Spin answers both with 400, as EdgeZero at `10166628` records. Its
+    // request-fidelity record has Spin answer a conflicting length 400 with
+    // no hook verdict (edgezero-test-harness
+    // `fixtures/request-fidelity/observations.json` and `src/fidelity.rs:958`).
+    // Its ingress check answers a malformed length 400 (edgezero-core
+    // `src/ingress.rs:1020-1031`), which edgezero-adapter-spin tests at
+    // `src/request.rs:733`.
+    with_spin_ingress(ORIGIN_PASS_THROUGH_STATUS, |base_url, origin| {
+        assert_bad_content_length_refused("Spin", base_url, origin, &[400]);
+    });
 }
 
 /// Serves the shared integration app config on Spin, with the recording origin

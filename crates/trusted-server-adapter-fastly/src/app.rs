@@ -85,18 +85,17 @@
 //! retains nothing, so the next request retries.
 
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
-use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
-use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
+use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -959,7 +958,8 @@ async fn dispatch_fallback(
 /// with no cap: the response keeps the origin stream, and `EdgeZero`'s response
 /// delivery commits the headers and pumps the body chunk by chunk, so large
 /// images never materialize in the Wasm heap. A `HEAD`, 204, or 304 carries an
-/// empty body and keeps the origin's `Content-Length`.
+/// empty body. A `HEAD` or 304 keeps the origin's `Content-Length`; a 204 has
+/// none.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -1221,9 +1221,6 @@ fn fallback_route_handler(
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
-/// The repository's `edgezero.toml`, compiled in for [`Hooks::logging_for`].
-const EDGEZERO_MANIFEST: &str = include_str!("../../../edgezero.toml");
-
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
@@ -1318,13 +1315,7 @@ fn trace_metadata(request: &RequestParts) -> TraceMetadata {
         .extensions
         .get::<ClientInfo>()
         .cloned()
-        .unwrap_or_else(|| ClientInfo {
-            client_ip: request
-                .extensions
-                .get::<FastlyRequestContext>()
-                .and_then(|context| context.client_ip),
-            ..ClientInfo::default()
-        });
+        .unwrap_or_default();
     let geo = request
         .extensions
         .get::<RequestGeo>()
@@ -1347,24 +1338,15 @@ impl Hooks for TrustedServerApp {
         )
     }
 
-    /// Reads `[adapters.<adapter>.logging]` from the compiled-in `edgezero.toml`.
+    /// Returns `[adapters.<adapter>.logging]` from the repository's `edgezero.toml`.
     ///
     /// `EdgeZero`'s `run_custom` and `serve_custom` call this before every
-    /// callback to install the managed Fastly logger. The `app!` macro bakes the
-    /// same table into a generated `Hooks`; this hand-written one parses
-    /// [`EDGEZERO_MANIFEST`] with `EdgeZero`'s loader once per instance, so the
-    /// manifest stays the single source of the Fastly logging settings.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the compiled-in manifest does not parse, which
-    /// `logging_for_reads_the_fastly_logging_table` rules out.
+    /// callback to install the managed Fastly logger. `EdgeZero`'s
+    /// `logging_config!` resolves and validates the table at compile time, the
+    /// same way the `app!` macro does, so no request parses the manifest and it
+    /// stays the single source of the Fastly logging settings.
     fn logging_for(adapter: &str) -> ResolvedLoggingConfig {
-        static MANIFEST: OnceLock<ManifestLoader> = OnceLock::new();
-        MANIFEST
-            .get_or_init(|| ManifestLoader::load_from_str(EDGEZERO_MANIFEST))
-            .manifest()
-            .logging_or_default(adapter)
+        edgezero_core::logging_config!("../../edgezero.toml", adapter)
     }
 
     fn name() -> &'static str {
@@ -1445,6 +1427,7 @@ mod tests {
         TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+    use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -2096,6 +2079,28 @@ mod tests {
         assert!(
             error.to_string().contains("161") && error.to_string().contains("160"),
             "should name the tuple count and the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn state_builder_warns_once_for_an_unsynthesizable_operator_response_header() {
+        let mut settings = test_settings();
+        settings.response_headers =
+            HashMap::from([("content-type".to_owned(), "text/plain".to_owned())]);
+        let capture = LogCapture::start();
+
+        build_state_from_settings(settings).expect("should build state with the operator header");
+
+        let records = capture.take_all();
+        drop(capture);
+        let naming_content_type: Vec<(log::Level, &str)> = records
+            .iter()
+            .filter(|record| record.message.contains("`content-type`"))
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert!(
+            matches!(naming_content_type.as_slice(), [(log::Level::Warn, _)]),
+            "should warn once, naming `content-type`, as it loads the settings, got {naming_content_type:?}"
         );
     }
 

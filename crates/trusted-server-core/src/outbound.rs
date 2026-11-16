@@ -184,6 +184,14 @@ pub enum OutboundRequestSource {
 #[display("outbound budget source: {_0:?}")]
 struct OutboundBudgetSource(BudgetSource);
 
+/// Status and kind of a failed outbound request, without its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+#[display("outbound failure: {status} ({kind})")]
+struct OutboundFailure {
+    status: StatusCode,
+    kind: &'static str,
+}
+
 /// Text-free provider evidence for a failed outbound request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 #[display("outbound provider failure detail: {_0:?}")]
@@ -201,11 +209,12 @@ struct OutboundFailureDetail(ProviderFailureDetail);
 /// - Every other failure keeps `context`, the site's own error, which is a
 ///   502 for every outbound site.
 ///
-/// The report carries `error` as an opaque attachment, the budget source of a
-/// timeout, and the error's provider failure detail. It logs nothing: the
-/// caller logs the report once, naming its site or partner, and the report's
-/// `{:?}` rendering prints the budget source and the detail. That rendering
-/// never carries the error's message, which can hold provider text or a URL.
+/// The report carries `error` as an opaque attachment, the error's status and
+/// kind, the budget source of a timeout, and the error's provider failure
+/// detail. It logs nothing: the caller logs the report once, naming its site
+/// or partner, and the report's `{:?}` rendering prints the status and kind,
+/// the budget source and the detail. That rendering never carries the error's
+/// message, which can hold provider text or a URL.
 /// Callers that need the error downcast the report to [`EdgeError`].
 ///
 /// # Examples
@@ -233,6 +242,10 @@ pub fn outbound_error(
     source: OutboundRequestSource,
 ) -> Report<TrustedServerError> {
     let status = error.status();
+    let failure = OutboundFailure {
+        status,
+        kind: error.kind(),
+    };
     let budget_source = match &error {
         EdgeError::GatewayTimeout { cause, .. } => Some(*cause),
         _ => None,
@@ -259,7 +272,7 @@ pub fn outbound_error(
         Some(mapped) => Report::new(mapped).attach(format!("in place of: {context}")),
         None => Report::new(context),
     };
-    let mut report = report.attach_opaque(error);
+    let mut report = report.attach_opaque(error).attach(failure);
     if let Some(budget_source) = budget_source {
         report = report.attach(OutboundBudgetSource(budget_source));
     }
@@ -538,6 +551,11 @@ mod tests {
             site_error(),
             OutboundRequestSource::Internal,
         );
+        let undetailed_report = outbound_error(
+            EdgeError::response_too_large("example body over the cap at https://example.com/bid"),
+            site_error(),
+            OutboundRequestSource::Internal,
+        );
 
         assert!(
             capture.take_all().is_empty(),
@@ -545,12 +563,25 @@ mod tests {
         );
         let rendered = format!("{report:?}");
         assert!(
+            rendered.contains("outbound failure: 502 Bad Gateway (bad_gateway)"),
+            "should render the outbound status and kind, got `{rendered}`"
+        );
+        assert!(
             rendered.contains(&format!("{detail:?}")),
             "should render the provider detail with Debug, got `{rendered}`"
         );
         assert!(
             !rendered.contains("provider said no") && !rendered.contains("example.com"),
             "should never render provider text or URLs, got `{rendered}`"
+        );
+        let rendered = format!("{undetailed_report:?}");
+        assert!(
+            rendered.contains("outbound failure: 502 Bad Gateway (response_too_large)"),
+            "should render the status and kind of a failure with no detail, got `{rendered}`"
+        );
+        assert!(
+            !rendered.contains("example body") && !rendered.contains("example.com"),
+            "should never render the message of a failure with no detail, got `{rendered}`"
         );
     }
 

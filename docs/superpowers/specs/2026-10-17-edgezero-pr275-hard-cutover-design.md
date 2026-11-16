@@ -1,7 +1,7 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08, 2026-11-11, 2026-11-12 and 2026-11-13
+2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14 and 2026-11-16
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -25,13 +25,32 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `10166628` (`101666286d68fc9e4c7af18e818d78dd66d8e436`), the
-`rc/identity` commit on 2026-11-14 (IABTechLab/edgezero#495). It carries PR
-275's head `e9ffaa8f`, which is `5c32ae61`, the previous pin, with EdgeZero
-`main` merged in. It also carries the PRs stacked on PR 275 (EdgeZero 499, 460,
-406, 407, 409, 414, 422 and 439) and the JA4 request interface (EdgeZero 469).
-The Fastly files this spec cites at `5c32ae61` are unchanged at `10166628`. Two
-of those changes reach Trusted Server:
+The cut now pins `3d92ee38` (`3d92ee38d6150ea8ba7567f47f8cbbaf7c2a98b3`), the
+`rc/identity` commit on 2026-11-16 (IABTechLab/edgezero#495). It merges the
+PRs stacked on PR 275 (EdgeZero 499, 460, 406, 407, 409, 414, 422 and 439),
+refreshed to PR 275's head `b65e7144`, four commits after `e9ffaa8f`:
+
+- `4cbabfee` answers a Fastly managed logger setup failure with EdgeZero's
+  canonical 500, and rejects invalid Fastly logging endpoint names when the
+  manifest loads (IABTechLab/edgezero#505 and #506, section 9).
+- `fe32185f` preserves terminal errors and response policies inside EdgeZero,
+  and `c7e3ac97` adds tests.
+- `b65e7144` adds `logging_config!` for hand-written `Hooks`
+  (IABTechLab/edgezero#504), which Trusted Server's Fastly `logging_for` now
+  uses (section 9).
+
+Of the Fastly files this spec cites at `5c32ae61`, only `lifecycle.rs` differs
+at `3d92ee38`. Since the previous pin the branch also merged EdgeZero 469's JA4
+review fixes (`a77b74d7`). Trusted Server calls none of EdgeZero's JA4
+interface.
+
+The previous pin, `10166628` (`101666286d68fc9e4c7af18e818d78dd66d8e436`), was
+the `rc/identity` commit on 2026-11-14. It carries PR 275's head `e9ffaa8f`,
+which is `5c32ae61`, the pin before it, with EdgeZero `main` merged in. It also
+carries the PRs stacked on PR 275 (EdgeZero 499, 460, 406, 407, 409, 414, 422
+and 439) and the JA4 request interface (EdgeZero 469). The Fastly files this
+spec cites at `5c32ae61` are unchanged at `10166628`. Two of those changes
+reach Trusted Server:
 
 - EdgeZero 460 adds cache tags to `OutboundCachePolicy`, so the type is no
   longer `Copy`, and test code clones it.
@@ -82,9 +101,11 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452` and `5c32ae61` are earlier pins of the cut, `10166628` is the cut's
-pin (its cited files match `5c32ae61`), and
-`v0.0.11` is the base's pin.
+`737f8452`, `5c32ae61` and `10166628` are earlier pins of the cut, `3d92ee38`
+is the cut's pin (of the files cited at `5c32ae61`, only `lifecycle.rs`
+differs there), and `v0.0.11` is the base's pin. Dates are US Pacific time
+(UTC-8). In UTC, `5c32ae61`, PR 275's head late on 2026-11-13, is dated
+2026-11-14.
 
 ## Problem
 
@@ -211,7 +232,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `10166628` at the 2026-11-14 repin. The cut repins
+which carries PR 275's head: `3d92ee38` at the 2026-11-16 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
@@ -388,10 +409,11 @@ setting covers both cases (EZ-7). Production code installs no client in router
 state, which would override the adapter default
 (`edgezero:crates/edgezero-core/src/router.rs:410-416`). Tests on the Axum test
 server do, so no real transport starts (EZ-23.7). Two exceptions start real
-transport. Test 19's bodiless GET supplies EdgeZero's Axum client. The CLI
-proxy fixture (`crates/trusted-server-cli/tests/proxy_trusted_server.rs`)
-installs no router-state client, so the adapter's default client reaches its
-loopback origin and TLS relay.
+transport. Both install no router-state client, so the adapter's per-request
+client carries the forward: in test 19's bodiless GET it reaches a loopback
+origin, and in the CLI proxy fixture
+(`crates/trusted-server-cli/tests/proxy_trusted_server.rs`) its loopback
+origin and TLS relay.
 
 #### 2.2 Settings every request carries
 
@@ -504,6 +526,16 @@ cache make no HTTP calls.
   `DispatchedAuction` holds the `OutboundBatch` and a slot-to-provider map.
   Bidder requests now leave together after all are built and signed. Today each
   leaves as soon as it is built (`orchestrator.rs:1839-1850`).
+- A provider whose request Trusted Server cannot build, or whose Fastly backend
+  registration fails while the batch starts, records `launch_failed` before
+  collection. When every routed provider fails that way, direct `/auction`
+  answers 502 and split execution records `dispatch_failed`. Spin and
+  Cloudflare prepare each request inside the spawned task, so a preparation
+  failure there reaches collection, which records `launch_failed` for the
+  provider without counting it toward that boundary. Even when every provider
+  fails that way, the auction completes without bids, as today, where the
+  failure surfaces at `select` and is classed `transport`
+  (`orchestrator.rs:2414-2446`).
 - Bidders set `.timeout` to the configured provider timeout, not to today's
   `remaining_budget_ms(..).min(provider.timeout_ms())`
   (`orchestrator.rs:1817-1818`). The batch cutoff bounds them by the remaining
@@ -1042,18 +1074,22 @@ forward passes `ClientForward`.
   `BadRequest` with `OutboundRequestSource::Internal`, from a request Trusted
   Server built itself.
 
-The helper attaches the `EdgeError`, its budget source, and its
-`provider_failure_detail()` to the report. It does not log; section 9 says
-who does.
+The helper attaches the `EdgeError`, a printable outbound failure built from
+its status and kind, never its message, and, when the failure has them, its
+budget source and its `provider_failure_detail()` to the report. It does not
+log; section 9 says who does.
 
 ### 3. Fastly on the canonical lifecycle
 
 `main` keeps choosing `run_custom` for single-request sandboxes and
 `serve_custom` for reuse (`crates/trusted-server-adapter-fastly/src/main.rs:96-152`).
-The callback now returns `Result<(), Infallible>`
-(`edgezero:crates/edgezero-adapter-fastly/src/lifecycle.rs:153-181`) and
-always returns `Ok(())`. An `Err` would end the reuse loop with no response
-(`lifecycle.rs:139-149`).
+The callbacks now return `Result<(), ManagedLoggerError>` and always return
+`Ok(())`. `run_custom` and `serve_custom` return `Err` only when the managed
+logger fails to install before the callback, after EdgeZero has attempted its
+own 500
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:151-167`,
+`:251-303`, section 9). An `Err` from the callback would end the reuse loop
+with no response (`lifecycle.rs:233-247`).
 
 The callback runs these steps in order.
 
@@ -1062,8 +1098,10 @@ The callback runs these steps in order.
    (`main.rs:172-208`, `:342`, `:362`) answer with native responses before
    EdgeZero runs. At `5c32ae61`, `run_custom` and `serve_custom` install the
    managed logger before the callback, so the old `setup_once(init_logger)`
-   step is gone (section 9). The metrics probe must stay ahead of app
-   assembly. The callback takes `clock = MonotonicClock::default()` and
+   step is gone (section 9). If that install fails, the callback never runs,
+   so none of these answers, and EdgeZero sends its canonical 500 in their
+   place (section 9). The metrics probe must stay ahead of
+   app assembly. The callback takes `clock = MonotonicClock::default()` and
    `request_start = clock.now()` at entry. Only `send_assembly_error` uses them.
 2. **Assembly.** `sandbox.initialize` builds the router and calls
    `App::from_router::<TrustedServerApp>(router, FASTLY_PLATFORM)`
@@ -1141,7 +1179,8 @@ carries the synthesized set in place of the finalize headers.
 Outcomes of `FastlyRequestDelivery` (`delivery.rs:183-312`). The callback
 handles every delivery the same way, including the one `send_assembly_error`
 returns. Every failure log carries the sandbox counter context
-(`[instance= ordinal= request=]`, as at `main.rs:726-768`).
+(`[instance= ordinal= request=]`, as at `main.rs:726-768`). The last row is
+not a delivery: the lifecycle fails before the callback runs.
 
 | Outcome                                                                       | Callback action                                                                |
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -1153,6 +1192,7 @@ returns. Every failure log carries the sandbox counter context
 | Any other `Detached`                                                          | Log the report at debug, or at warn for a source error                         |
 | `Aborted`                                                                     | Unreachable, because Trusted Server installs no abort policy. Log at error     |
 | Any other variant (`FastlyRequestDelivery` is `#[non_exhaustive]`)            | Log at error                                                                   |
+| Managed logger install fails before the callback (no delivery)                | No callback runs. EdgeZero sends its 500, `/health` included (section 9)       |
 
 Outcome handling is one function generic over `FastlyRequestDelivery<S>`. Only
 the routed post-delivery arm needs `FinalizeState`. The assembly-error result
@@ -1332,8 +1372,12 @@ and host (`ingress.rs:845`). Adapters check them before admission, and the
 router checks again after the pre-dispatch hook. Violations return 414 or 431.
 Admission also rejects ambiguous request framing with 400: a duplicate or
 malformed `Content-Length`, `Content-Length` with `Transfer-Encoding`, or a
-`Transfer-Encoding` that is not chunked (`ingress.rs:887-942`). Fastly enforces
-all of this now too. Trusted Server keeps the defaults, and test 11 checks that
+`Transfer-Encoding` that is not chunked (`ingress.rs:887-942`). The runtime's
+own HTTP parser can refuse a malformed or conflicting `Content-Length` first:
+Viceroy 0.21.0, Axum, and Spin 4.1.0 answer a 400 with an empty body, and local
+Wrangler refuses it before the Worker runs, with 400 on Wrangler 4.162.0 and
+500 on 4.83.0. Either way the origin sees nothing. Fastly enforces all of this
+now too. Trusted Server keeps the defaults, and test 11 checks that
 realistic traffic fits. If it does not, `Hooks::configure` raises them with
 `App::set_ingress_head_limits` (`app.rs:523`).
 
@@ -1505,11 +1549,12 @@ and stay.
   with each app assembled under its own platform metadata (EZ-23.8) and the
   scripted client supplied through router state (EZ-23.7). Their production
   policies then apply, which EZ-23 criterion 13 needs (test 19). For that
-  criterion's bodiless GET, the suite supplies EdgeZero's Axum client
-  (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:55`) instead and
-  records what a loopback origin receives. That client honors `HTTP_PROXY`, so
-  the test runs with the proxy variables unset. The Cloudflare and Spin route tests
-  in `tests/routes.rs` stay on `oneshot` (2.1).
+  criterion's bodiless GET, the suite installs no router-state client, so the
+  adapter's per-request client, EdgeZero's Axum client
+  (`edgezero:crates/edgezero-adapter-axum/src/outbound.rs:55`), carries the
+  forward, and the test records what a loopback origin receives. That client
+  honors `HTTP_PROXY`, so the test runs with the proxy variables unset. The
+  Cloudflare and Spin route tests in `tests/routes.rs` stay on `oneshot` (2.1).
 
 **Cloudflare.**
 
@@ -1666,23 +1711,75 @@ default `info` level admits the warnings they look for. The startup report and
 every warning this spec names on Cloudflare and Spin, such as the Spin
 `origin_host_header_override` warning, are logged.
 
-On Fastly, the cut uses EdgeZero's custom lifecycle. At `5c32ae61`,
+On Fastly, the cut uses EdgeZero's custom lifecycle. Since `5c32ae61`,
 `serve_custom::<A, T, F, E>` and `run_custom::<A, T, E, F>` take the `Hooks`
 type and install the managed Fastly logger from `A::logging_for("fastly")`
 before each callback, unless the app owns logging
-(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-200`,
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:251-303`,
 `logger.rs:91-122`). Installation runs once per instance; identical repeats
-succeed. The callback's error type takes `ManagedLoggerError`, which is the
-only error Trusted Server's callbacks can return; `main` reports it on
-stderr, because no logger exists then. Trusted Server's own `logging.rs` and
-its `setup_once` install are deleted.
+succeed. The callback's error type takes `ManagedLoggerError`, the error
+`run_custom` and `serve_custom` return when installation fails; `main`
+reports it on stderr, because no logger exists then. Trusted Server's own
+`logging.rs` and its `setup_once` install are deleted.
+
+A failed installation stops the request before Trusted Server's callback
+runs, so no Trusted Server code answers, `/health` included. Since
+`4cbabfee`, EdgeZero answers in its place
+([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)):
+`run_custom` and `serve_custom` send one canonical, redacted JSON 500 through
+`send_assembly_error`, with no payload for HEAD, and then return the original
+`ManagedLoggerError`
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:151-167`,
+`:218-231`). `main` prints it on stderr
+(`ts@4088c155f:crates/trusted-server-adapter-fastly/src/main.rs:121-123`,
+`:165-167`, `:174-179`). In `serve_custom` it is also the request's result,
+which ends serving without a second send (`lifecycle.rs:38-48`, `:233-247`).
+The 500 carries no Trusted Server header, `x-ts-version` included, because
+no Trusted Server code runs. EdgeZero's Viceroy wire control, a test ignored
+by default, checks that status, the body
+`{"error":{"kind":"internal","message":"internal server error","status":500}}`,
+and the empty HEAD body
+(`edgezero@3d92ee38:crates/edgezero-test-harness/src/runners/assembly/managed_logging.rs:124-174`,
+`:616-671`, `runners/assembly.rs:81-89`). Trusted Server has not reproduced
+it, because no valid Trusted Server configuration makes installation fail,
+and what hosted Fastly answers is unchecked. The failure is kept for the
+instance (`edgezero@5c32ae61:crates/edgezero-core/src/logging.rs:30-61`), and
+so is the `edgezero_logging` read (`logger.rs:110-116`). An unexpected status
+opening or reading a linked `edgezero_logging` store
+(`ConfigurationUnavailable`, `config_store.rs:243-254`) causes it, and so can
+an endpoint the Fastly host rejects when the logger installs
+(`InvalidConfiguration`, `logger.rs:24-35`). Today the health probe runs
+before logger setup, and a failed install prints
+`logger installation failed, retrying next callback` and serves the request
+(`crates/trusted-server-adapter-fastly/src/main.rs:176-195`).
+
+Since `4cbabfee`, manifest loading, `app!`, and `logging_config!` reject an
+effective Fastly logging endpoint name that is empty, contains a line feed or
+`:`, or is exactly `stdout` or `stderr`, naming the field without echoing the
+value (`edgezero@3d92ee38:crates/edgezero-core/src/manifest.rs:1522-1557`,
+[IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)).
+Such a name fails Trusted Server's build. A 2026-11-16 probe set
+`endpoint = "ts:log"`, and `cargo check-fastly` exited 101 when
+`trusted-server-core`'s build script loaded the manifest
+(`ts@4088c155f:crates/trusted-server-core/build.rs:127-135`), with
+`[adapters.fastly.logging].endpoint: invalid Fastly logging configuration; endpoint name is malformed`.
+With the file restored it exited 0. Whether the endpoint exists is still
+checked only when the logger installs.
 
 EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
-`tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
-Trusted Server's hand-written `Hooks` parses the compiled-in `edgezero.toml`
-with EdgeZero's `ManifestLoader` and caches the result, so the manifest is
-parsed once per instance and stays the single source. `owns_logging` stays
-false.
+`tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it.
+Trusted Server's hand-written `Hooks` returns
+`edgezero_core::logging_config!("../../edgezero.toml", adapter)`
+(`ts@4088c155f:crates/trusted-server-adapter-fastly/src/app.rs:1343-1345`),
+the helper `b65e7144` adds for hand-written `Hooks`
+([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
+It resolves and validates the table at compile time as `app!` does, so no
+request parses the manifest and it stays the single source
+(`edgezero@3d92ee38:crates/edgezero-macros/src/lib.rs:21-32`). It replaces
+the cut's earlier `ManifestLoader` parse, which ran once per instance and so
+once per request on non-reusable Fastly
+([#1611](https://github.com/IABTechLab/trusted-server/issues/1611),
+`4088c155f`). `owns_logging` stays false.
 
 Fastly lines read `<timestamp> <level> <target> <message>`
 (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/logger.rs:37-51`), so
@@ -1693,13 +1790,16 @@ level, read once per instance
 (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/config_store.rs:243-254`,
 `logger.rs:102-122`). `scripts/template-cache-local-test.sh` declares that
 store in its Viceroy configuration to log at `debug` with the production
-`info` wasm, so it reads the debug-only template store line again.
+`info` wasm, so it reads the debug-only template store line again. Fastly
+differences item 27 records how the line format and the local level differ
+from today.
 
 Each outbound failure logs one line: the site
 that consumes the helper's report (2.11) logs it with `{:?}`, naming the site
-or partner, and that rendering prints the budget source and
-`provider_failure_detail()` (`error.rs:490`). The helper itself does not log,
-so a failure never logs its detail twice. The detail holds closed enums and
+or partner, and that rendering prints the outbound status and kind and, when
+the failure has them, the budget source and `provider_failure_detail()`
+(`error.rs:490`). It never prints the `EdgeError`'s message. The helper
+itself does not log, so a failure never logs its detail twice. The detail holds closed enums and
 numeric codes, never provider text or URLs (EZ-16). A handler that returns an
 `EdgeError` is logged once on every adapter, with its status and kind only,
 because its message can hold provider text or a URL.
@@ -1763,7 +1863,7 @@ Inbound:
    to 16 MiB of an aborted upload (2.5).
 4. A request target over 8192 bytes returns 414. More than 100 header fields or
    64 KiB of headers returns 431. Ambiguous or malformed request framing
-   returns 400.
+   returns 400, from EdgeZero or from the runtime's HTTP parser before it.
 
 Responses:
 
@@ -1778,10 +1878,12 @@ Responses:
    `Content-Length` and `Transfer-Encoding` can differ from today's (D20).
 8. A startup failure answers with EdgeZero's redacted JSON and carries no
    `x-ts-version`, `x-ts-fastly-version`, or finalize headers (EZ-19.7). Today
-   it carries `x-ts-version`. Its status is unchanged, except for `TRACE` and
-   `CONNECT`. Today's startup-error router registers only the seven publisher
-   methods (`crates/trusted-server-adapter-fastly/src/app.rs:1064-1068`), so
-   they get its 405. Now every method gets the failure's status.
+   it carries `x-ts-version`. Today's startup-error router registers only the
+   seven publisher methods, GET, POST, HEAD, OPTIONS, PUT, PATCH, and DELETE
+   (`crates/trusted-server-adapter-fastly/src/app.rs:294-304`, `:1064-1068`).
+   Its status is unchanged, except for methods outside those seven, such as
+   `TRACE`, `CONNECT`, or an extension method: they got the router's 405 and
+   now get the failure's status.
 9. A response body must finish within 60 s after egress starts.
 
 Outbound:
@@ -1846,7 +1948,34 @@ Outbound, continued:
     EdgeZero for none. Each cap now applies in EdgeZero's buffered collection,
     so a body over it is classed `transport`. Today the platform collects up
     to 10 MiB, and a body over the profile's cap is classed `parse_response`,
-    or `http_status` for an error status.
+    or `http_status` for an error status. The `transport` classification holds
+    on every adapter, because EdgeZero's buffered collection applies the cap on
+    Axum, Cloudflare, and Spin too. There a non-2xx response whose body is
+    over the cap is also `transport` now, where today it is `http_status`: the
+    Prebid Server parser tolerates a failed body read on an error status, and
+    the Standard parser never reads an error body (`provider.rs:560-572`).
+
+Logging:
+
+27. Lines read `<timestamp> <level> <target> <message>` with the record's
+    full target
+    (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/logger.rs:37-51`).
+    Today they read `<timestamp> <level> [<label>] <message>`, where the label
+    is the target's last `::` segment
+    (`crates/trusted-server-adapter-fastly/src/logging.rs:11-17`, `:105-111`).
+    The level is the manifest's `info` unless a Config Store linked as
+    `edgezero_logging` overrides it (section 9). Today `fastly compute serve`
+    and Viceroy log at `debug`, because the guest sees
+    `FASTLY_HOSTNAME=localhost`, and a guest `EDGEZERO_LOG_LEVEL` sets the
+    level (`logging.rs:28`, `:59-62`). Neither is read now, so a local run
+    logs at `debug` only with that store declared. The maintainer accepted
+    both losses.
+28. When EdgeZero's managed logger fails to install, Trusted Server sends
+    nothing, `/health` included, and EdgeZero answers with its redacted JSON
+    500, which, like a startup failure (item 8), carries no Trusted Server
+    headers. Today the health probe answers before logger setup, and a failed
+    install is printed on stderr while the request is served. An empty,
+    malformed, or reserved endpoint name fails the build (section 9).
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
@@ -1908,7 +2037,9 @@ Cloudflare client did, so a Cloudflare response carries the origin's
 **Unchanged for operators.** The app-config envelope, the canonical hash, the
 Fastly chunk pointer format (`fastly_config_chunks` version 1,
 `edgezero:crates/edgezero-adapter-fastly/src/chunked_config.rs:11-12`), store
-links, secrets, and deploy flags are unchanged. No re-push is needed.
+links, secrets, and deploy flags are unchanged. No re-push is needed. The only
+new link is optional: a Fastly Config Store linked as `edgezero_logging`
+raises or lowers the log level (section 9).
 
 ## Consent and privacy
 
@@ -1943,32 +2074,33 @@ links, secrets, and deploy flags are unchanged. No re-push is needed.
 
 ## Failure handling
 
-| Failure                                                                              | Behavior                                                                                                                               |
-| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                  |
-| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                   |
-| Ambiguous or malformed request framing                                               | 400 from EdgeZero's ingress, before any handler runs                                                                                   |
-| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                             |
-| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                |
-| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                           |
-| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                  |
-| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                 |
-| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                   |
-| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                            |
-| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                         |
-| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                |
-| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                         |
-| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup |
-| Fastly delivery not committed                                                        | Native 500                                                                                                                             |
-| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                          |
-| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                   |
-| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                               |
-| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                    |
-| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                         |
-| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                          |
-| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                     |
-| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                            |
-| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                              |
+| Failure                                                                              | Behavior                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inbound body over the endpoint cap, declared or streamed                             | 413 `RequestTooLarge`, logged at warn                                                                                                                                                 |
+| Inbound read after the 30 s read deadline                                            | 408 `RequestTimeout`, logged at warn                                                                                                                                                  |
+| Ambiguous or malformed request framing                                               | 400 before any handler runs, from EdgeZero's ingress or the runtime's HTTP parser. Local Wrangler refuses a bad `Content-Length` with 400 or 500, by version. The origin sees nothing |
+| Any other inbound read failure mid-body, client-caused or host-side                  | 502 `Proxy`, logged at error. Every adapter maps the source error to `EdgeError::internal`                                                                                            |
+| Forwarded GET or HEAD with body bytes, or an invalid forwarded URI                   | 400 `BadRequest` (2.11)                                                                                                                                                               |
+| Publisher upload over 16 MiB                                                         | 413 `RequestTooLarge` (2.11)                                                                                                                                                          |
+| Origin, integration, or connect timeout                                              | The site's 502, as today. The budget source is attached to the report                                                                                                                 |
+| Bidder still pending at the cutoff                                                   | Provider timeout in the auction result                                                                                                                                                |
+| Auction abandoned or page response ends early                                        | In-flight bidder and mediator requests are cancelled                                                                                                                                  |
+| Redirect policy rejection                                                            | Today's `Forbidden`, `AllowlistViolation`, or `Proxy` error                                                                                                                           |
+| Redirect hop failure, a bad `Location`, or a redirect chain past 60 s                | The site's 502                                                                                                                                                                        |
+| Image Optimizer without entitlement, or on Viceroy                                   | The asset proxy's 502, from `ImageOptimizerUnavailable`                                                                                                                               |
+| Fastly `NameInUse`, a backend name collision                                         | The site's 502                                                                                                                                                                        |
+| App assembly fails                                                                   | EdgeZero's assembly error response with today's status (503 on Spin). Not retained, so the next request retries. Axum exits at startup                                                |
+| Fastly delivery not committed                                                        | Native 500                                                                                                                                                                            |
+| Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                                                                         |
+| Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                                                                  |
+| Fastly managed logger fails to install                                               | EdgeZero's redacted JSON 500 on every route, `/health` included, with no Trusted Server headers (section 9)                                                                           |
+| Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                                                                              |
+| Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                                                                   |
+| `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                                                                        |
+| `origin_host_header_override` on Spin                                                | Warning, and the setting is ignored, as today                                                                                                                                         |
+| Invalid `EDGEZERO__ADAPTER__INGRESS__*` on Axum                                      | Startup fails with the parse error                                                                                                                                                    |
+| Spin manifest outbound hosts disagree with `spin.toml`                               | `ts build`, `ts serve`, and `ts deploy --adapter spin` fail with "Spin outbound host drift"                                                                                           |
+| Spin component fails to instantiate                                                  | CI's Spin job fails. Blocks the cut (D14)                                                                                                                                             |
 
 ## Compatibility and rollout
 
@@ -2069,8 +2201,11 @@ Trusted Server added no workaround for either:
 
 Its Fastly logging asks are in
 [a second comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6869073346),
-and `5c32ae61`, the pin, answers all three: a managed logger under the custom
-lifecycle, the target in Fastly lines, and a runtime level (section 9).
+and `5c32ae61`, which the pin carries, answers all three: a managed logger
+under the custom lifecycle, the target in Fastly lines, and a runtime level
+(section 9).
+
+The round-2 asks are in [a third comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6889465884), all three filed under EdgeZero's identity epic: no response when the Fastly managed logger fails to install ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), manifest validation that accepts endpoint names the Fastly logger rejects ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)), and a compile-time `logging_for` for hand-written `Hooks` ([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)). PR 275's head `b65e7144`, which the pin carries, answers all three: `4cbabfee` the first two and `b65e7144` the third (section 9). On 2026-11-16 the three issues and PR 275 were still open.
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
@@ -2187,6 +2322,12 @@ records the repaired-versus-stock disposition under G4-FASTLY-POLICY
   file exists. Build the subset from `scripts/fastly-response-diff.requests.json`
   by dropping `trace-enable-action`, the `POST /_ts/trace/enable` request, and
   `admin-eids`, the `GET /_ts/admin/eids` request with fixture credentials.
+- On Axum, rename `PORT` to `EDGEZERO__ADAPTER__PORT` and `RUST_LOG` to
+  `EDGEZERO__LOGGING__LEVEL`. An invalid port now falls back to 8787 with a
+  warning, where an invalid `PORT` stopped startup.
+- On Fastly, logs go to the `tslog` endpoint at the level `edgezero.toml` sets
+  (`info`). To raise it without a rebuild, set `EDGEZERO__LOGGING__LEVEL` in
+  an optional Config Store linked as `edgezero_logging`.
 - Then deploy to production.
 
 ### Rollback
@@ -2209,7 +2350,15 @@ wrangler flags revert with the pull request.
 - One info log line per request carries the outbound observation counts
   (section 3).
 - The Axum dev server has ingress caps and its own variables, and exits on a
-  startup failure.
+  startup failure. It reads `EDGEZERO__LOGGING__LEVEL`,
+  `EDGEZERO__ADAPTER__HOST`, and `EDGEZERO__ADAPTER__PORT` in place of
+  `RUST_LOG` and `PORT` (section 8).
+- Fastly log lines carry the record's full target in place of its last
+  segment, and local Viceroy runs log at `info` unless an `edgezero_logging`
+  Config Store raises the level (Fastly differences item 27).
+- Cloudflare and Spin now log through EdgeZero's managed backends, at
+  `EDGEZERO__LOGGING__LEVEL` (section 9). Before, their production builds
+  dropped every record.
 
 ### In-flight work
 
@@ -2567,7 +2716,10 @@ route tests, the whole parity suite, and the CLI proxy test move to
 - `./scripts/integration-tests-browser.sh`, with loopback bidders.
 - `scripts/smoke-fastly.sh`, `scripts/smoke-axum.sh`,
   `scripts/smoke-cloudflare.sh`, and `scripts/smoke-spin.sh`, with the
-  `smoke-axum.sh` change in section 7.
+  `smoke-axum.sh` change in section 7. `smoke-cloudflare.sh` is a known
+  failure: it exits 1 with `smoke: missing Wrangler pin in .tool-versions`.
+  `.tool-versions` pins no Wrangler, and `main`'s has no Wrangler line either
+  (Follow-ups, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - **Fastly response diff.** A script under `scripts/` sends a fixed request list
   to a `main` build and to the branch build, both under Viceroy. It diffs
   status, headers, and a body hash. The list covers a publisher page, `HEAD` and
@@ -2575,7 +2727,9 @@ route tests, the whole parity suite, and the CLI proxy test move to
   asset, a tsjs bundle, an admin endpoint, `TRACE`, and a trace action. It
   normalizes `x-ts-version`, sandbox counter headers, dates, and generated IDs.
   The expected differences are exactly the [Fastly differences](#fastly-differences)
-  the list exercises. Reviewers can rerun it.
+  the list exercises. Reviewers can rerun it. At `78c06908b` against
+  `1810c763a` it reported `10 requests, 0 unexpected differences, 0 expected
+differences missing`; the 13 listed differences are items 5, 6, and 25.
 - The hosted legs in the qualification table, on Fastly staging.
 
 ## Commit sequence
@@ -2677,6 +2831,8 @@ old layer. That transient dual path exists only inside the pull request.
 - Moving the pin from the `rc/identity` commit to an EdgeZero release tag once
   PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
+- A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
+  run (Runtime, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers
@@ -2752,7 +2908,8 @@ change are D5, D7, D13, D18, and D20.
   doubles in `test_support.rs`; change `traits.rs`, `types.rs`, `mod.rs`)
 - `crates/trusted-server-core/src/test_support.rs`,
   `test_support/scripted_client.rs` (scripted client), `test_support/body_read.rs`,
-  `test_support/logging.rs`, and `test_support/async_html_finalization.rs`
+  `test_support/logging.rs`, `test_support/publisher_input_cap.rs`, and
+  `test_support/async_html_finalization.rs`
 - `crates/trusted-server-core/src/http_util.rs`, `error.rs`, `config.rs`,
   `settings.rs`, `response_privacy.rs`, `auth.rs`, `forwarder.rs`,
   `publisher.rs`, `proxy.rs`, `cache_purge.rs`, `creative_opportunities.rs`,
@@ -2774,8 +2931,8 @@ change are D5, D7, D13, D18, and D20.
 - `crates/trusted-server-adapter-fastly/` (`Cargo.toml`, `src/main.rs`,
   `app.rs`, `middleware.rs`, `platform.rs`, `tinybird.rs`, `management_api.rs`,
   `compat.rs`, `delivery.rs`, `post_delivery.rs`, `sandbox.rs`, a new deadline
-  test module, `tests/deadline-origin.mjs`; delete `backend.rs` and
-  `platform/deadline.rs`)
+  test module, `tests/deadline-origin.mjs`; delete `backend.rs`, `logging.rs`,
+  and `platform/deadline.rs`)
 - `crates/trusted-server-adapter-axum/` (`Cargo.toml`, `src/main.rs`, `app.rs`,
   `middleware.rs`, `platform.rs`, `tests/routes.rs`)
 - `crates/trusted-server-adapter-cloudflare/` (`src/app.rs`, `middleware.rs`,
@@ -3000,7 +3157,7 @@ change are D5, D7, D13, D18, and D20.
   GitHub refused a formal approval because the reviewer and the author share
   one account, so the verdict is a review comment.
 
-- **Implementation phase (2026-11-08 to 2026-11-13).** The cut was built from
+- **Implementation phase (2026-11-08 to 2026-11-14).** The cut was built from
   the approved spec, and each correction the code forced is folded in above.
   - An internal whole-branch review at `6c39a56a1` (Claude Code, Opus) found
     nothing critical, four important findings, and eight minor ones (M1 to
@@ -3011,7 +3168,11 @@ change are D5, D7, D13, D18, and D20.
     passages in line.
   - GitHub review 5887835958 (2026-11-13, at `9ec4711d3`) asked for the full
     publisher cap and error matrix of test 21 and a Viceroy oracle for test 6's
-    overlap. Both were built (tests 6 and 21).
+    overlap. Test 21's matrix was built. For test 6, a Viceroy test shows that
+    a bid answered while the origin body streams is injected. The overlapped
+    dispatch order has no Viceroy oracle: Viceroy supplies no JA4, so it never
+    takes the overlapped path, and core's scripted-client test pins that order
+    (test 6). The reviewer accepted both halves.
   - GitHub review 5888499941 (2026-11-13, at `9ec4711d3`) left 72 findings: 2
     blocking, 29 should-fix, and 41 nits. The blocking ones were #1516's
     missing port and the 1 MiB Prebid Server and APS cap. The fix round that
@@ -3020,4 +3181,63 @@ change are D5, D7, D13, D18, and D20.
     cut left over, made each outbound failure log once (section 9), added the
     missing tests, and corrected this spec. Two gaps it found are EdgeZero's,
     and Trusted Server asked EdgeZero for both: the Spin upload framing (2.5)
-    and the Cloudflare and Spin log backend (section 9).
+    and the Cloudflare and Spin log backend (section 9). EdgeZero answered
+    both at `737f8452`.
+  - The logging cut followed (2026-11-13). Trusted Server's own Cloudflare
+    and Spin loggers were added (`a10d42d5a`) and reverted (`003f0b7db`),
+    because the gap was EdgeZero's. The cut repinned to `737f8452`
+    (`bba8e6f3e`), which installs managed backends on Cloudflare and Spin,
+    and deleted the `test-utils` fixture loggers. The Axum dev server moved
+    to EdgeZero's `run_app` (`0e199a20b`), and Fastly to EdgeZero's managed
+    logger with the manifest's settings, with `logging.rs` deleted
+    (`a6b37d859`). Trusted Server asked EdgeZero for three Fastly logging
+    changes, `5c32ae61` answered all three, and the cut repinned to it
+    (`9cc76f364`). Trusted Server now installs no logger on any adapter
+    (section 9).
+  - On 2026-11-14 the maintainer repinned to `10166628` on EdgeZero's
+    `rc/identity` branch (`32526960d`, recorded in `858f95087`). It carries
+    PR 275's head `e9ffaa8f`, and the Fastly files this spec cites are
+    unchanged from `5c32ae61`.
+  - GitHub review 5907840090 (2026-11-14, at `cee4acb48`) resolved 70 of the
+    74 threads from the previous round and did not accept the replies on 4:
+    the outbound status and kind, the `trace_metadata` fallback, the
+    startup-failure method statuses, and malformed `Content-Length` on
+    Cloudflare and Spin. It left 25 new findings, 3 should-fix and 22 nits,
+    and one more should-fix in its body: the Cloudflare cookie-boundary test
+    failed on macOS. The other should-fix ones were the Spin and Cloudflare
+    preparation failure the auction guide answered with 502 (2.4), the Fastly
+    logger install failure that leaves every request unanswered (section 9),
+    and the missing Fastly response diff (Runtime). The fix round that
+    followed made the outbound report print the status and kind (2.11),
+    dropped the test-only `ClientInfo` fallback in `trace_metadata`, and made
+    the EC test origins read the whole request head, which fixed the
+    cookie-boundary test. It added bad-`Content-Length` cases on Spin and
+    Cloudflare; the Cloudflare case checks only that the request never reaches
+    the origin, because Wrangler 4.162.0 answers 400 and 4.83.0 answers 500.
+    New tests kill the three surviving mutants. The logger failure is
+    recorded as an open EdgeZero gap ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and the
+    Fastly response diff against `1810c763a` showed only listed differences
+    (Runtime). The round also corrected this spec, the guides, and the
+    CHANGELOG.
+
+- **Repin to `3d92ee38` (2026-11-16).** At the maintainer's request, PR
+  275's head `b65e7144` was merged bottom-up through EdgeZero's stack (499,
+  460, 406, 407, 409, 414, 422 and 439), each PR merging the one below it.
+  409's merge resolved one import conflict in edgezero-core's `app.rs` by
+  keeping both imports. `rc/identity` then took 439's head as a plain merge,
+  `3d92ee38`, after `a77b74d7` had merged EdgeZero 469's JA4 review fixes.
+  The cut repinned to it (`7869ef647`), which changes only EdgeZero's source
+  lines in `Cargo.lock`.
+  - Two of PR 275's four new commits answer the round-2 asks. `4cbabfee`
+    sends EdgeZero's canonical 500 when the Fastly managed logger fails to
+    install, and rejects invalid endpoint names when the manifest loads
+    (IABTechLab/edgezero#505 and #506). `b65e7144` adds `logging_config!`
+    (IABTechLab/edgezero#504), and Trusted Server's Fastly `logging_for` now
+    uses it (`4088c155f`, #1611).
+  - A probe that set `endpoint = "ts:log"` failed `cargo check-fastly` with
+    the manifest error, and passed with the file restored. The 500 is
+    EdgeZero's tested behavior and was not reproduced from Trusted Server
+    (section 9).
+  - `5794ff016`, `9631b6f07` and `18ab253ec` brought the pin, section 9,
+    Fastly differences item 28, Failure handling, the asks, Follow-ups, the
+    Fastly and API guides, and the CHANGELOG in line.

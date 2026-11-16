@@ -1014,7 +1014,10 @@ https://edge.example.com/admin/keys/rotate` must not reach the origin.
 **Contract:** Auth: none. Request and JSON schema: not applicable. Fastly,
 Axum, and Spin return `200 text/plain` with `ok`; Cloudflare has no local health
 route. Fastly short-circuits before application construction, so it stays
-live while startup fails. Spin answers `503` on `/health` while startup fails,
+live while startup fails, but not when EdgeZero's managed logger fails to
+install: EdgeZero then answers every route with its JSON `500`, `/health`
+included (see the
+[Fastly guide](/guide/fastly#when-the-logger-fails-to-install)). Spin answers `503` on `/health` while startup fails,
 like every other route. The route has no configuration gate, dedicated cache or CORS
 policy, or rate limiter. Example: `curl -fsS https://edge.example.com/health`.
 

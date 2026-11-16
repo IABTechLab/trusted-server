@@ -20,7 +20,8 @@ use crate::settings::Settings;
 /// at error otherwise.
 ///
 /// The response carries only the report's display text, so this line is
-/// where the outbound status, budget source, and provider detail appear.
+/// where an outbound failure's status and kind appear, with its budget source
+/// for a timeout and its provider detail when the adapter reports one.
 fn log_key_operation_failure(operation: &str, report: &Report<TrustedServerError>) {
     if report.current_context().status_code().is_client_error() {
         log::warn!("{operation} failed: {report:?}");
@@ -843,6 +844,7 @@ mod tests {
             "https://test.com/admin/keys/rotate",
             Some(&body_json),
         );
+        let capture = LogCapture::start();
 
         let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response for invalid kid");
@@ -851,6 +853,15 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.starts_with("Key rotation failed: ")
+            ),
+            "should log the rejected rotation once, at warn"
         );
 
         let body = response_body_string(resp);
@@ -997,6 +1008,7 @@ mod tests {
             "https://test.com/admin/keys/deactivate",
             Some(&body_json),
         );
+        let capture = LogCapture::start();
 
         let resp =
             futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
@@ -1006,6 +1018,15 @@ mod tests {
             resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.starts_with("Key deactivation failed: ")
+            ),
+            "should log the rejected deactivation once, at warn"
         );
 
         let body = response_body_string(resp);

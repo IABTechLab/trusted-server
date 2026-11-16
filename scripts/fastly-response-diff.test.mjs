@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -198,6 +199,12 @@ function diff(base, head, staging = false) {
   return compare(normalize(base, staging), normalize(head, staging))
 }
 
+/** How `compare` describes a normalized body. */
+function describedBody(text) {
+  const hash = createHash('sha256').update(text, 'latin1').digest('hex')
+  return `sha256 ${hash} (${Buffer.byteLength(text, 'latin1')} bytes)`
+}
+
 test('normalize scrubs UUIDs and EC IDs in headers and bodies', () => {
   const base = response(
     [
@@ -226,6 +233,22 @@ test('normalize scrubs UUIDs and EC IDs in headers and bodies', () => {
     diff(base, head).size,
     0,
     'should find no difference between responses that differ only in generated IDs'
+  )
+})
+
+test('a body that changes beyond its IDs still differs', () => {
+  const base = response([], `<p>${UUID_A} bid 1.50 ${EC_ID_A}</p>`)
+  const head = response([], `<p>${UUID_B} bid 2.50 ${EC_ID_B}</p>`)
+
+  assert.deepEqual(
+    Object.fromEntries(diff(base, head)),
+    {
+      body: {
+        base: describedBody('<p><uuid> bid 1.50 <ec-id></p>'),
+        head: describedBody('<p><uuid> bid 2.50 <ec-id></p>'),
+      },
+    },
+    'should report the body whose content changed, compared after scrubbing'
   )
 })
 
