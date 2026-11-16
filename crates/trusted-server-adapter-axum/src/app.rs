@@ -19,6 +19,8 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::batch_sync_not_supported;
+use trusted_server_core::ec::identify::{cors_preflight_identify, identify_not_supported};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -304,6 +306,8 @@ enum NamedRouteHandler {
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    Identify,
+    BatchSync,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -328,7 +332,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 19] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -396,6 +400,19 @@ fn named_routes() -> [NamedRoute; 17] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. The dev server has no
+        // EC record store, so identify and batch sync answer 501.
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::Identify,
+        },
+        NamedRoute {
+            path: "/_ts/api/v1/batch-sync",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::BatchSync,
         },
         NamedRoute {
             path: "/auction",
@@ -504,6 +521,14 @@ fn named_route_handler(
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::Identify => {
+                        if req.method() == Method::OPTIONS {
+                            cors_preflight_identify(&state.settings, &req)
+                        } else {
+                            Ok(identify_not_supported())
+                        }
+                    }
+                    NamedRouteHandler::BatchSync => Ok(batch_sync_not_supported()),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

@@ -5,11 +5,12 @@
 //! drives it through the Tower `Service` interface.
 
 use axum::body::Body as AxumBody;
-use axum::http::Request;
+use axum::http::{Method, Request};
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::test_support::capturing_origin::{self, CapturingOrigin};
 use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
@@ -136,6 +137,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/first-party/sign"),
         ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
+        ("GET", "/_ts/api/v1/identify"),
+        ("OPTIONS", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/batch-sync"),
     ];
 
     for (method, path) in expected {
@@ -1093,6 +1097,84 @@ async fn nextjs_gtm_html_response_is_complete() {
             .expect("should consume entire adapter body");
         nextjs_auction::assert_script_composition_response(&body, gzip);
     }
+}
+
+fn capturing_service(origin: &Arc<CapturingOrigin>) -> EdgeZeroAxumService {
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        test_settings(),
+        capturing_origin::services(Arc::clone(origin)),
+    )
+    .expect("should build router with a capturing origin");
+    EdgeZeroAxumService::new(router)
+}
+
+async fn call(service: &mut EdgeZeroAxumService, request: Request<AxumBody>) -> u16 {
+    service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should respond")
+        .status()
+        .as_u16()
+}
+
+fn partner_api_request(method: &str, path: &str) -> Request<AxumBody> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "test-publisher.example.com")
+        .header("authorization", "Bearer fictional-partner-token-0123456789")
+        .header("content-type", "application/json")
+        .body(AxumBody::from(r#"{"mappings":[]}"#))
+        .expect("should build partner API request")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capturing_origin_receives_publisher_fallback_requests() {
+    let origin = Arc::new(CapturingOrigin::default());
+    let mut service = capturing_service(&origin);
+
+    let status = call(&mut service, partner_api_request("GET", "/article")).await;
+
+    assert_eq!(status, 200, "should proxy the publisher page to the origin");
+    assert_eq!(
+        origin.requests(),
+        vec![(Method::GET, "/article".to_owned())],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let origin = Arc::new(CapturingOrigin::default());
+    let mut service = capturing_service(&origin);
+
+    let identify = call(
+        &mut service,
+        partner_api_request("GET", "/_ts/api/v1/identify"),
+    )
+    .await;
+    let preflight = call(
+        &mut service,
+        partner_api_request("OPTIONS", "/_ts/api/v1/identify"),
+    )
+    .await;
+    let batch_sync = call(
+        &mut service,
+        partner_api_request("POST", "/_ts/api/v1/batch-sync"),
+    )
+    .await;
+
+    assert_eq!(identify, 501, "identify should answer 501 locally");
+    assert_eq!(preflight, 200, "identify preflight should answer locally");
+    assert_eq!(batch_sync, 501, "batch sync should answer 501 locally");
+    assert!(
+        origin.requests().is_empty(),
+        "should send no identify or batch-sync request to the publisher origin: {:?}",
+        origin.requests()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
