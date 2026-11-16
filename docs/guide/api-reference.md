@@ -42,8 +42,8 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -324,8 +324,11 @@ with `degraded: true`. Every response is `no-store`, varies on `Origin` and
 below `[publisher].domain` receive reflected credentialed CORS for
 `GET, OPTIONS`; every other supplied origin receives `403`. `OPTIONS` returns
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
-The endpoint is Fastly-only and requires the EC store and a statically
-configured `[[ec.partners]]` token.
+The endpoint requires the EC store and a statically configured
+`[[ec.partners]]` token. Without an EC store, `GET` returns
+`501 {"error":"ec_store_not_configured"}` locally and is never proxied to the
+publisher origin; only Fastly has an EC store today, so Axum, Cloudflare and
+Spin always answer `501` (their `OPTIONS` preflight is still answered locally).
 
 **Request:**
 
@@ -367,7 +370,10 @@ item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
 `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
-or CORS headers. It is Fastly-only and requires the EC KV store.
+or CORS headers. It requires the EC KV store; without one it returns
+`501 {"error":"ec_store_not_configured"}` locally and is never proxied to the
+publisher origin. Only Fastly has an EC store today, so Axum, Cloudflare and
+Spin always answer `501`.
 
 **Batch processing behavior:**
 
