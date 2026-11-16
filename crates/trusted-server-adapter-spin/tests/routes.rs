@@ -1055,6 +1055,41 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let origin = Arc::new(CapturingOrigin::default());
+    let cases = [
+        (Method::HEAD, "/_ts/api/v1/identify"),
+        (Method::POST, "/_ts/api/v1/identify"),
+        (Method::PUT, "/_ts/api/v1/identify"),
+        (Method::PATCH, "/_ts/api/v1/identify"),
+        (Method::DELETE, "/_ts/api/v1/identify"),
+        (Method::GET, "/_ts/api/v1/batch-sync"),
+        (Method::HEAD, "/_ts/api/v1/batch-sync"),
+        (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+        (Method::PUT, "/_ts/api/v1/batch-sync"),
+        (Method::PATCH, "/_ts/api/v1/batch-sync"),
+        (Method::DELETE, "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases.clone() {
+        let response = route(capturing_router(&origin), partner_api_request(method, path)).await;
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
+    assert!(
+        origin.requests().is_empty(),
+        "should send no partner API request or Bearer token to the publisher origin: {:?}",
+        origin.requests()
+    );
+}
+
 fn capturing_router(origin: &Arc<CapturingOrigin>) -> RouterService {
     TrustedServerApp::routes_with_settings_and_services(
         test_settings(),

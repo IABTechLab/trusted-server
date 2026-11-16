@@ -19,8 +19,8 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::batch_sync::batch_sync_not_supported;
-use trusted_server_core::ec::identify::{cors_preflight_identify, identify_not_supported};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -402,16 +402,17 @@ fn named_routes() -> [NamedRoute; 19] {
             handler: NamedRouteHandler::LegacyAdminDenied,
         },
         // Partner APIs are answered locally so a partner's Bearer token and
-        // mapping body never reach the publisher origin. The dev server has no
-        // EC record store, so identify and batch sync answer 501.
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: the dev server has no EC record store, so identify and
+        // batch sync answer 501 and any other method answers 405.
         NamedRoute {
             path: "/_ts/api/v1/identify",
-            primary_methods: &[Method::GET, Method::OPTIONS],
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::Identify,
         },
         NamedRoute {
             path: "/_ts/api/v1/batch-sync",
-            primary_methods: &[Method::POST],
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::BatchSync,
         },
         NamedRoute {
@@ -521,14 +522,8 @@ fn named_route_handler(
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
-                    NamedRouteHandler::Identify => {
-                        if req.method() == Method::OPTIONS {
-                            cors_preflight_identify(&state.settings, &req)
-                        } else {
-                            Ok(identify_not_supported())
-                        }
-                    }
-                    NamedRouteHandler::BatchSync => Ok(batch_sync_not_supported()),
+                    NamedRouteHandler::Identify => answer_identify_locally(&state.settings, &req),
+                    NamedRouteHandler::BatchSync => Ok(answer_batch_sync_locally(&req)),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

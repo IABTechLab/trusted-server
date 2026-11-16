@@ -29,7 +29,8 @@
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
-//! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | OPTIONS | `/_ts/api/v1/identify` | [`answer_identify_locally`] (CORS preflight) |
+//! | other | `/_ts/api/v1/identify`, `/_ts/api/v1/batch-sync` | `405` with `Allow` |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -109,12 +110,10 @@ use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::batch_sync::{batch_sync_not_supported, handle_batch_sync};
+use trusted_server_core::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::identify::{
-    cors_preflight_identify, handle_identify, identify_not_supported,
-};
+use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
@@ -669,21 +668,19 @@ async fn run_named_route(
             unreachable!("batch-sync should be handled by run_batch_sync")
         }
         NamedRouteHandler::Identify => {
-            if req.method() == Method::OPTIONS {
-                cors_preflight_identify(&state.settings, &req)
-            } else {
-                let Some(kv) = crate::maybe_identity_graph(&state.settings) else {
-                    return Ok(identify_not_supported());
-                };
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                handle_identify(
-                    &state.settings,
-                    &kv,
-                    &partner_registry,
-                    &req,
-                    &ec.ec_context,
-                )
-            }
+            let identity_graph = crate::maybe_identity_graph(&state.settings)
+                .filter(|_| req.method() == Method::GET);
+            let Some(kv) = identity_graph else {
+                return answer_identify_locally(&state.settings, &req);
+            };
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            handle_identify(
+                &state.settings,
+                &kv,
+                &partner_registry,
+                &req,
+                &ec.ec_context,
+            )
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
@@ -759,8 +756,10 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
-    let mut response = match crate::maybe_identity_graph(&state.settings) {
-        None => batch_sync_not_supported(),
+    let identity_graph =
+        crate::maybe_identity_graph(&state.settings).filter(|_| req.method() == Method::POST);
+    let mut response = match identity_graph {
+        None => answer_batch_sync_locally(&req),
         Some(kv) => PartnerRegistry::from_config(&state.settings.ec.partners)
             .and_then(|partner_registry| {
                 let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
@@ -1200,14 +1199,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
     },
+    // Partner APIs claim every method so no request on these paths, nor the
+    // partner's Bearer token, reaches the publisher. The handlers answer
+    // methods other than the primary ones with 405.
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
-        primary_methods: &[Method::POST],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::BatchSync,
     },
     NamedRoute {
         path: "/_ts/api/v1/identify",
-        primary_methods: &[Method::GET, Method::OPTIONS],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::Identify,
     },
     NamedRoute {
@@ -2459,6 +2461,47 @@ mod tests {
             "should send no identify or batch-sync request to the publisher origin: {:?}",
             origin.requests()
         );
+    }
+
+    #[test]
+    fn identify_and_batch_sync_answer_other_methods_405_locally() {
+        let cases = [
+            (Method::HEAD, "/_ts/api/v1/identify"),
+            (Method::POST, "/_ts/api/v1/identify"),
+            (Method::PUT, "/_ts/api/v1/identify"),
+            (Method::PATCH, "/_ts/api/v1/identify"),
+            (Method::DELETE, "/_ts/api/v1/identify"),
+            (Method::GET, "/_ts/api/v1/batch-sync"),
+            (Method::HEAD, "/_ts/api/v1/batch-sync"),
+            (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+            (Method::PUT, "/_ts/api/v1/batch-sync"),
+            (Method::PATCH, "/_ts/api/v1/batch-sync"),
+            (Method::DELETE, "/_ts/api/v1/batch-sync"),
+        ];
+        for ec_store in [None, Some("ec_identity_store".to_owned())] {
+            let origin = Arc::new(CapturingOrigin::default());
+            let mut settings = test_settings();
+            settings.ec.ec_store = ec_store.clone();
+            let router = capturing_router(settings, &origin);
+
+            let statuses: Vec<StatusCode> = cases
+                .iter()
+                .map(|(method, path)| {
+                    route(&router, partner_api_request(method.clone(), path)).status()
+                })
+                .collect();
+
+            assert_eq!(
+                statuses,
+                vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+                "should answer every other partner API method with 405 (ec_store {ec_store:?}): {cases:?}"
+            );
+            assert!(
+                origin.requests().is_empty(),
+                "should send no partner API request or Bearer token to the publisher origin (ec_store {ec_store:?}): {:?}",
+                origin.requests()
+            );
+        }
     }
 
     #[test]

@@ -25,8 +25,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::batch_sync::batch_sync_not_supported;
-use trusted_server_core::ec::identify::{cors_preflight_identify, identify_not_supported};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
@@ -229,8 +229,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
-        ("/_ts/api/v1/identify", &[Method::GET, Method::OPTIONS]),
-        ("/_ts/api/v1/batch-sync", &[Method::POST]),
+        ("/_ts/api/v1/identify", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/batch-sync", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -656,22 +656,22 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
 
         // Partner APIs are answered locally so a partner's Bearer token and
-        // mapping body never reach the publisher origin. This adapter has no EC
-        // record store, so identify and batch sync answer 501.
-        let identify_not_supported_handler =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(identify_not_supported()) };
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: this adapter has no EC record store, so identify and batch
+        // sync answer 501 and any other method answers 405.
         let s = Arc::clone(&state);
-        let identify_preflight_handler = move |ctx: RequestContext| {
+        let identify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request();
                 Ok::<Response, EdgeError>(
-                    cors_preflight_identify(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
                 )
             }
         };
-        let batch_sync_not_supported_handler =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(batch_sync_not_supported()) };
+        let batch_sync_handler = |ctx: RequestContext| async move {
+            Ok::<Response, EdgeError>(answer_batch_sync_locally(ctx.request()))
+        };
 
         // /auction
         let s = Arc::clone(&state);
@@ -942,13 +942,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec", admin_ec_not_supported_handler)
             .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
             .get("/_ts/admin/eids", admin_eids_handler)
-            .get("/_ts/api/v1/identify", identify_not_supported_handler)
-            .route(
-                "/_ts/api/v1/identify",
-                Method::OPTIONS,
-                identify_preflight_handler,
-            )
-            .post("/_ts/api/v1/batch-sync", batch_sync_not_supported_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -975,6 +968,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 method.clone(),
                 cache_purge_unsupported_handler,
             );
+        }
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/api/v1/identify",
+                method.clone(),
+                identify_handler.clone(),
+            );
+            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {

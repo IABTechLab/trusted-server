@@ -1178,6 +1178,41 @@ async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let origin = Arc::new(CapturingOrigin::default());
+    let mut service = capturing_service(&origin);
+    let cases = [
+        ("HEAD", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/identify"),
+        ("PUT", "/_ts/api/v1/identify"),
+        ("PATCH", "/_ts/api/v1/identify"),
+        ("DELETE", "/_ts/api/v1/identify"),
+        ("GET", "/_ts/api/v1/batch-sync"),
+        ("HEAD", "/_ts/api/v1/batch-sync"),
+        ("OPTIONS", "/_ts/api/v1/batch-sync"),
+        ("PUT", "/_ts/api/v1/batch-sync"),
+        ("PATCH", "/_ts/api/v1/batch-sync"),
+        ("DELETE", "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases {
+        statuses.push(call(&mut service, partner_api_request(method, path)).await);
+    }
+
+    assert_eq!(
+        statuses,
+        vec![405; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
+    assert!(
+        origin.requests().is_empty(),
+        "should send no partner API request or Bearer token to the publisher origin: {:?}",
+        origin.requests()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_reports_git_version() {
     let mut service = make_service();
     let request = Request::builder()
