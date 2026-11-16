@@ -44,7 +44,7 @@ use crate::openrtb::ToExt;
 #[cfg(test)]
 use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
-    UserExt, to_openrtb_i32,
+    UserExt, to_openrtb_i32, to_openrtb_user_eids,
 };
 #[cfg(test)]
 use crate::platform::PlatformHttpRequest;
@@ -1128,9 +1128,9 @@ impl ApsAuctionProvider {
             ext: UserExt {
                 consent: raw_tc,
                 consented_providers_settings: None,
-                eids: request.user.eids.clone(),
             }
             .to_ext(),
+            eids: to_openrtb_user_eids(request.user.eids.as_deref()),
             ..Default::default()
         });
 
@@ -1981,7 +1981,9 @@ pub fn register_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::test_support::canonical_parity_auction_request;
+    use crate::auction::test_support::{
+        assert_no_user_eids, canonical_parity_auction_request, user_eids,
+    };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
@@ -2388,7 +2390,7 @@ mod tests {
         assert_eq!(serialized["user"]["consent"], "fictional-tcf");
         assert_eq!(serialized["user"]["ext"]["consent"], "fictional-tcf");
         assert_eq!(
-            serialized["user"]["ext"]["eids"][0]["source"],
+            user_eids(&serialized, "aps")[0]["source"],
             "identity.example"
         );
         assert_eq!(serialized["regs"]["gdpr"], 1);
@@ -2409,9 +2411,35 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&openrtb).expect("should serialize APS request"),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
             "should preserve the complete APS wire shape without a signing extension"
         );
+    }
+
+    #[test]
+    fn aps_request_omits_eids_when_none() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.eids = None;
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build downstream request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            transport_timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let openrtb = provider.build_openrtb_request(&auction_request, &context);
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize request");
+        assert_no_user_eids(&serialized, "aps without EIDs");
     }
 
     #[test]
