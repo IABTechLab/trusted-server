@@ -1043,8 +1043,7 @@ mod tests {
     fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
         for storage in [
             serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
-            serde_json::json!({"provider":"dynamodb","region":"us-east-1","table":"example-identity","namespace":"fixture"}),
-            serde_json::json!({"provider":"celld","endpoint":"http://127.0.0.1:7780","store":"identity","access":{"mode":"trusted-network"}}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
         ] {
             let mut settings = Settings::default();
             settings.ec.storage =
@@ -1055,13 +1054,10 @@ mod tests {
             assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
         }
         let mut settings = Settings::default();
-        settings.ec.ec_store = Some("legacy-inactive-binding".to_owned());
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
         assert!(
-            settings
-                .ec
-                .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Spin)
-                .expect("should accept inactive legacy field")
-                .is_none()
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
         );
     }
 

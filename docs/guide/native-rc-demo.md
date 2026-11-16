@@ -113,9 +113,11 @@ TS reads the immutable `RequestContext::geo()` result, not raw Geo headers. A
 located country/subdivision supplies one request-local snapshot to Core and
 response finalization. Missing detail is absent rather than empty text or zero
 coordinates. Complete populated Geo fields retain their existing flat wire
-names. Unselected, untrusted and unavailable outcomes supply no location. US
-without a recognized subdivision remains Unknown for existing consent policy.
-Geographic estimates do not grant consent or change TCF/GPC/identity rules.
+names. Unselected, untrusted and unavailable outcomes supply no location.
+Country-only US geography retains Core's existing non-regulated fallback; missing
+geography remains Unknown. Configured GDPR countries and US privacy states keep
+their existing consent rules. This extraction does not change TCF/GPC/identity
+policy.
 
 The admitted-error finalizer retains Geo/TS headers without replacing framework
 status, required headers or failure classification. Pre-admission failures have
@@ -123,48 +125,11 @@ no managed outcome and remain outside that finalizer. The selected serving
 provider is protected CloudFront, not the standalone EdgeZero KV Geo prototype. No
 Geo database, remote lookup or licensed data is imported.
 
-## Optional protected native Geo
-
-Compile `geo-cloudfront` explicitly and set `TS_NATIVE_GEO_PROFILE_FILE` to a
-separately delivered boot profile. Compiling the feature does not select it.
-EdgeZero does not read this TS selection from publisher AppConfig, store bindings
-or an `EDGEZERO__GEO__*` environment variable.
-
-```toml
-version = 1
-
-[geo]
-provider = "cloudfront"
-alb_peer_cidrs = ["10.42.1.0/24", "10.42.2.0/24"]
-origin_credential_header_name = "x-origin-example-removal"
-```
-
-An absent profile keeps Geo Off. An unreadable/invalid selected profile or a
-compiled-out provider fails before readiness. The profile contains admitted
-immediate ALB peer ranges and the credential header's removal name, never its
-expected value. Diagnostics do not retain profile bytes or policy inputs.
-
-This selection requires CloudFront-generated country/subdivision assertions,
-HTTPS to an exact-credential-gated ALB, CloudFront-only ALB ingress and an ALB-only
-private application port. EdgeZero does not authenticate an expected credential
-value itself. The deployment must enforce that boundary. Disable shared caching,
-including cacheable errors. Ordinary forwarding trust and protected Geo source
-admission are independent. Provisioning and staged live-input changes are not
-part of this feature.
-
-TS reads the immutable `RequestContext::geo()` result, not raw Geo headers. A
-located country/subdivision supplies one request-local snapshot to Core and
-response finalization. Missing detail is absent rather than empty text or zero
-coordinates. Complete populated Geo fields retain their existing flat wire
-names. Unselected, untrusted and unavailable outcomes supply no location. US
-without a recognized subdivision remains Unknown for existing consent policy.
-Geographic estimates do not grant consent or change TCF/GPC/identity rules.
-
-The admitted-error finalizer retains Geo/TS headers without replacing framework
-status, required headers or failure classification. Pre-admission failures have
-no managed outcome and remain outside that finalizer. The selected serving
-provider is protected CloudFront, not the standalone EdgeZero KV Geo prototype. No
-Geo database, remote lookup or licensed data is imported.
+The TS boot profile is temporary on this RC baseline. Completing issue #1529
+requires the production startup from #1573 and EdgeZero's manifest Geo binding
+and approved integration tag from EdgeZero #482/#491. That forward-port removes
+this profile loader rather than introducing another selection path. Live
+CloudFront/AWS deployment qualification remains outside this extraction.
 
 ## Request handling
 
