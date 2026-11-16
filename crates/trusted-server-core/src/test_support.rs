@@ -1,6 +1,8 @@
 #[cfg(test)]
 pub(crate) mod body_read;
 #[cfg(any(test, feature = "test-utils"))]
+pub mod identity_conformance;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod logging;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod publisher_input_cap;

@@ -55,6 +55,11 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
 
+      - name: Verify identity conformance selection and Fastly lifecycle
+        run: |
+          node --test scripts/test-identity-conformance.test.mjs
+          node scripts/test-identity-conformance.mjs fastly
+
       - name: Run Fastly absolute deadline slow-network tests
         run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 
@@ -164,6 +169,9 @@ jobs:
 
       - name: Run Axum adapter tests
         run: cargo test-axum
+
+      - name: Verify native identity conformance rejection controls
+        run: cargo test -p trusted-server-core --lib identity_conformance
 
       - name: Verify finalization harness process cleanup
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime

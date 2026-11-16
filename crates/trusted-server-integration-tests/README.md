@@ -41,3 +41,40 @@ gitignored `trusted-server.toml`.
 
 See [Testing](../../TESTING.md) for the complete gate matrix and
 [`scripts/README.md`](../../scripts/README.md) for inputs and cleanup behavior.
+
+## Identity conformance
+
+The reusable EC contract lives in core test support, with the current Fastly
+runner in `trusted-server-adapter-fastly/src/identity_conformance.rs`. Run from
+the repository root with the repository-pinned Rust, Node and Viceroy:
+
+```bash
+node --test scripts/test-identity-conformance.test.mjs
+node scripts/test-identity-conformance.mjs fastly
+cargo test -p trusted-server-core --lib identity_conformance
+```
+
+The launcher lists the required Fastly test before executing it and rejects
+zero-test success. Selecting `axum`, `cloudflare` or `spin` fails explicitly
+until its runner is available. Native core tests check the assertion contract;
+they do not claim Axum identity support.
+
+The Fastly application test executes nine isolated scenarios: fresh creation,
+rejected writes, missing and failed geo, denied and absent GDPR consent,
+subresources, returning readers, and the current missing-browser-metadata gate.
+It uses the real request conversion, router, shared production finalization
+callback composition and consumed HTML response. Platform metadata, record
+storage and the publisher origin are controlled test fixtures. Successful
+issuance requires the matching record before response release; failed writes
+must be observed before release. Returning scenarios apply cookie expiry rules
+and replay the resulting identity. The missing-metadata expectation describes
+the current pre-T12 policy and must change when #1592 permits absent JA4.
+
+This is application conformance, not fresh-browser qualification through an
+unmodified deployed artifact. Viceroy 0.21 does not expose JA4, so the current
+production browser gate prevents fresh issuance over ordinary local HTTP.
+The existing seeded Fastly runtime tests remain useful for their separate
+boundary. Startup capability rejection, removal of adapter-owned identity
+calls (#1600), Axum activation (#1574), later adapter integrations and deployed
+browser/provider qualification remain outstanding under #1586. Infrastructure
+delivery alone must not close that issue.
