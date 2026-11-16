@@ -120,6 +120,16 @@ pub fn handle_batch_sync(
     handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
 }
 
+/// Builds the local `501 Not Implemented` response for
+/// `POST /_ts/api/v1/batch-sync` on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request, with its Bearer token
+/// and mapping body, to the publisher origin.
+#[must_use]
+pub fn batch_sync_not_supported() -> Response<EdgeBody> {
+    error_response(StatusCode::NOT_IMPLEMENTED, "ec_store_not_configured")
+}
+
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
@@ -319,6 +329,22 @@ mod tests {
         let valid = format!("{}.ABC123", "a".repeat(64));
         assert!(is_valid_ec_id(&valid));
         assert!(!is_valid_ec_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn batch_sync_not_supported_returns_501() {
+        let response = batch_sync_not_supported();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
+        );
     }
 
     struct MockRateLimiter {

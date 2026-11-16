@@ -603,5 +603,86 @@ pub mod nextjs_auction {
     }
 }
 
+/// Publisher origin fixture that records every request it receives.
+///
+/// Adapter route tests wire it in as the HTTP client to prove a route is
+/// answered locally: a request that reaches the publisher fallback shows up in
+/// [`capturing_origin::CapturingOrigin::requests`].
+#[cfg(any(test, feature = "test-utils"))]
+pub mod capturing_origin {
+    use std::sync::{Arc, Mutex};
+
+    use error_stack::Report;
+
+    use crate::platform::{
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult, RuntimeServices,
+    };
+
+    /// Origin that answers `200 OK` and records each request's method and path.
+    #[derive(Debug, Default)]
+    pub struct CapturingOrigin {
+        requests: Mutex<Vec<(http::Method, String)>>,
+    }
+
+    impl CapturingOrigin {
+        /// Every `(method, path)` this origin has received, in arrival order.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the request log mutex is poisoned.
+        #[must_use]
+        pub fn requests(&self) -> Vec<(http::Method, String)> {
+            self.requests
+                .lock()
+                .expect("should lock captured origin requests")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for CapturingOrigin {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.requests
+                .lock()
+                .expect("should lock captured origin requests")
+                .push((
+                    request.request.method().clone(),
+                    request.request.uri().path().to_owned(),
+                ));
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/plain")
+                .body(edgezero_core::body::Body::from("captured by origin"))
+                .expect("should build captured origin response");
+            Ok(PlatformResponse::new(response).with_backend_name(request.backend_name))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// Runtime services whose HTTP client is `origin`, with every other
+    /// platform capability stubbed out.
+    #[must_use]
+    pub fn services(origin: Arc<CapturingOrigin>) -> RuntimeServices {
+        super::nextjs_auction::services_with_http_client(origin)
+    }
+}
+
 #[cfg(feature = "test-utils")]
 pub(crate) mod async_html_finalization;

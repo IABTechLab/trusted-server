@@ -182,6 +182,28 @@ pub fn cors_preflight_identify(
     Ok(apply_identify_cache_headers(response))
 }
 
+/// Builds the local `501 Not Implemented` response for `GET /_ts/api/v1/identify`
+/// on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request to the publisher
+/// origin, so a partner's Bearer token never leaves Trusted Server.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn identify_not_supported() -> Response<EdgeBody> {
+    let body = serde_json::json!({ "error": "ec_store_not_configured" });
+    apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build identify not-supported response"),
+    )
+}
+
 #[derive(serde::Serialize)]
 struct IdentifyResponse {
     ec: String,
@@ -349,6 +371,30 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store"),
             "identify responses should not be cached"
+        );
+    }
+
+    #[test]
+    fn identify_not_supported_returns_uncached_501() {
+        let response = identify_not_supported();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_no_store(&response);
+        let body: serde_json::Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer body"),
+        )
+        .expect("should return a JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
         );
     }
 
