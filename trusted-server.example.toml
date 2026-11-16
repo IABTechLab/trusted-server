@@ -99,7 +99,7 @@ pull_sync_concurrency = 3
 # logical KV declaration does not select EC storage. Legacy ec.ec_store remains
 # supported on Fastly, but cannot be combined with this section.
 [ec.storage]
-store = "ec_identity_store"
+store = "trusted_server_kv"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.

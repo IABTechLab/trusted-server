@@ -2,6 +2,9 @@ locals {
   # Plan-known so the external boundary owner can review the same scoped
   # DynamoDB allows without depending on generated AppConfig resource IDs.
   ec_table_arn = "arn:aws:dynamodb:${var.ec_storage.region}:${var.aws_account_id}:table/${var.ec_storage.table}"
+  # Pinned EdgeZero format and TS EC layout. Namespace validation keeps this
+  # IAM pattern literal and makes Terraform length match UTF-8 byte length.
+  ec_partition_pattern = "edgezero-dynamodb-records-v1#${length(var.ec_storage.namespace)}:${var.ec_storage.namespace}17:trusted-server-ec1:*"
   ec_task_policy = {
     Version = "2012-10-17"
     Statement = [
@@ -12,23 +15,13 @@ locals {
         Resource = local.ec_table_arn
       },
       {
-        Sid      = "IdentityRowsOnly"
+        Sid      = "EcRecordGroups"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:UpdateItem"]
         Resource = local.ec_table_arn
         Condition = {
-          "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["ec:${var.ec_storage.namespace}"] }
-          Null                        = { "dynamodb:LeadingKeys" = "false" }
-        }
-      },
-      {
-        Sid      = "AllocateGenerationsOnly"
-        Effect   = "Allow"
-        Action   = ["dynamodb:UpdateItem"]
-        Resource = local.ec_table_arn
-        Condition = {
-          "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["ec-allocator:${var.ec_storage.namespace}"] }
-          Null                        = { "dynamodb:LeadingKeys" = "false" }
+          "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = [local.ec_partition_pattern] }
+          Null                      = { "dynamodb:LeadingKeys" = "false" }
         }
       }
     ]

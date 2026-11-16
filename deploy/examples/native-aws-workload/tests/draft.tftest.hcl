@@ -28,7 +28,7 @@ variables {
   config_envelope_file = "example-envelope.json"
   geo_front_door       = null
   ec_storage = {
-    provider  = "dynamodb"
+    provider  = "aws-dynamodb-records"
     region    = "eu-west-2"
     table     = "example-retained-ec"
     namespace = "example-staging"

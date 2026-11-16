@@ -30,7 +30,6 @@ use trusted_server_core::settings::Settings;
 
 use crate::app::EcFinalizeState;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use crate::require_identity_graph;
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
 
 /// Pull-sync inputs a routed response's finalize step hands to post-delivery work.
@@ -94,7 +93,17 @@ async fn pull_sync(
     let prepared_context = build_pull_sync_context(&ec_state.ec_context, &partner_registry);
     let Some((context, kv)) = prepare_pull_sync_after_send(
         prepared_context,
-        || require_identity_graph(settings),
+        || {
+            ec_state
+                .record_store
+                .map(KvIdentityGraph::new)
+                .ok_or_else(|| {
+                    Report::new(TrustedServerError::KvStore {
+                        store_name: "ec.storage".to_owned(),
+                        message: "prepared EC record view is unavailable after delivery".to_owned(),
+                    })
+                })
+        },
         log_context,
     ) else {
         return;
@@ -113,7 +122,7 @@ async fn pull_sync(
     .await;
 }
 
-/// Opens the identity graph only when there is a pull-sync context to run.
+/// Wraps the retained record view only when there is a pull-sync context to run.
 fn prepare_pull_sync_after_send<F>(
     context: Option<PullSyncContext>,
     graph_factory: F,
@@ -365,14 +374,30 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request_with_geo(settings, &request, &test_services(), Some(&geo))
                 .expect("should read the reader's EC context");
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        fastly::init();
+        let provider = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open_records(
+            "ec_identity_store",
+            edgezero_core::RecordLayout::new(
+                trusted_server_core::ec::record_backend::EcRecordLayout,
+            )
+            .expect("should declare EC layout"),
+        )
+        .expect("should prepare the real local identity fixture");
+        let handle = edgezero_core::key_value_store::KvHandle::new(std::sync::Arc::new(provider));
+        let record_store = trusted_server_core::ec::record_backend::RecordEcKvStore::new(
+            "ec_identity_store".to_owned(),
+            &handle,
+        )
+        .expect("should acquire shared EC view");
+        let kv = KvIdentityGraph::new(record_store.clone());
         ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()).await);
         FinalizeState {
             partner_registry: PartnerRegistry::from_config(&settings.ec.partners)
                 .expect("should build the partner registry"),
             ec_state: EcFinalizeState {
                 ec_context,
-                use_finalize_kv: false,
+                record_store: Some(record_store),
+                finalize_record_store: None,
                 eids_cookie: None,
                 sharedid_cookie: None,
                 is_real_browser: true,

@@ -86,28 +86,16 @@ fn committed_aws_envelopes_pass_runtime_integrity_and_settings_validation() {
             "fictional-publisher-proxy-secret-32-bytes",
             "should resolve the proxy reference without using a real provider"
         );
-        let Some(EcStorageSelection::DynamoDb(storage)) = settings
+        let Some(EcStorageSelection::Records(store)) = settings
             .ec
             .resolve_storage(EcRuntime::Native)
             .expect("should resolve native EC storage")
         else {
-            panic!("should select DynamoDB for the {name} AWS envelope");
+            panic!("should select prepared records for the {name} AWS envelope");
         };
         assert_eq!(
-            storage.region, "eu-west-2",
-            "should use the retained region"
-        );
-        assert_eq!(
-            storage.table, "example-retained-ec",
-            "should select the retained table"
-        );
-        assert_eq!(
-            storage.namespace, "example-staging",
-            "should preserve the stable retained namespace"
-        );
-        assert!(
-            storage.local_endpoint.is_none(),
-            "should not publish a local emulator endpoint"
+            store, "trusted_server_kv",
+            "should select the logical prepared store without publishing connector settings"
         );
         assert_eq!(
             settings

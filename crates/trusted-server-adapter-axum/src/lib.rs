@@ -9,15 +9,12 @@
 
 /// Application routing and handler registration.
 pub mod app;
-#[cfg(all(feature = "celld-ec", not(target_arch = "wasm32")))]
-pub mod celld_ec;
-/// Native live DynamoDB conditional identity storage and provider selection.
-pub mod ec_kv;
 /// Request middleware for authentication and response finalization.
 pub mod middleware;
 /// Explicit native Geo boot profile and provider composition.
 pub mod native_geo;
 /// Native request-scoped platform services.
 pub mod platform;
+mod record_ec;
 /// Prepared-store initialization and immutable native snapshots.
 pub mod startup;
