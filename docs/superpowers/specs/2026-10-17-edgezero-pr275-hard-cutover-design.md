@@ -1085,10 +1085,11 @@ log; section 9 says who does.
 `serve_custom` for reuse (`crates/trusted-server-adapter-fastly/src/main.rs:96-152`).
 The callbacks now return `Result<(), ManagedLoggerError>` and always return
 `Ok(())`. `run_custom` and `serve_custom` return `Err` only when the managed
-logger fails to install before the callback
-(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-201`,
-section 9). An `Err` from the callback would end the reuse loop with no
-response (`lifecycle.rs:143-155`).
+logger fails to install before the callback, after EdgeZero has attempted its
+own 500
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:151-167`,
+`:251-303`, section 9). An `Err` from the callback would end the reuse loop
+with no response (`lifecycle.rs:233-247`).
 
 The callback runs these steps in order.
 
@@ -1098,7 +1099,8 @@ The callback runs these steps in order.
    EdgeZero runs. At `5c32ae61`, `run_custom` and `serve_custom` install the
    managed logger before the callback, so the old `setup_once(init_logger)`
    step is gone (section 9). If that install fails, the callback never runs,
-   so none of these answers (section 9). The metrics probe must stay ahead of
+   so none of these answers, and EdgeZero sends its canonical 500 in their
+   place (section 9). The metrics probe must stay ahead of
    app assembly. The callback takes `clock = MonotonicClock::default()` and
    `request_start = clock.now()` at entry. Only `send_assembly_error` uses them.
 2. **Assembly.** `sandbox.initialize` builds the router and calls
@@ -1190,7 +1192,7 @@ not a delivery: the lifecycle fails before the callback runs.
 | Any other `Detached`                                                          | Log the report at debug, or at warn for a source error                         |
 | `Aborted`                                                                     | Unreachable, because Trusted Server installs no abort policy. Log at error     |
 | Any other variant (`FastlyRequestDelivery` is `#[non_exhaustive]`)            | Log at error                                                                   |
-| Managed logger install fails before the callback (no delivery)                | No callback runs, so nothing is sent, `/health` included (section 9)           |
+| Managed logger install fails before the callback (no delivery)                | No callback runs. EdgeZero sends its 500, `/health` included (section 9)       |
 
 Outcome handling is one function generic over `FastlyRequestDelivery<S>`. Only
 the routed post-delivery arm needs `FinalizeState`. The assembly-error result
@@ -1709,11 +1711,11 @@ default `info` level admits the warnings they look for. The startup report and
 every warning this spec names on Cloudflare and Spin, such as the Spin
 `origin_host_header_override` warning, are logged.
 
-On Fastly, the cut uses EdgeZero's custom lifecycle. At `5c32ae61`,
+On Fastly, the cut uses EdgeZero's custom lifecycle. Since `5c32ae61`,
 `serve_custom::<A, T, F, E>` and `run_custom::<A, T, E, F>` take the `Hooks`
 type and install the managed Fastly logger from `A::logging_for("fastly")`
 before each callback, unless the app owns logging
-(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:159-200`,
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:251-303`,
 `logger.rs:91-122`). Installation runs once per instance; identical repeats
 succeed. The callback's error type takes `ManagedLoggerError`, the error
 `run_custom` and `serve_custom` return when installation fails; `main`
@@ -1721,27 +1723,48 @@ reports it on stderr, because no logger exists then. Trusted Server's own
 `logging.rs` and its `setup_once` install are deleted.
 
 A failed installation stops the request before Trusted Server's callback
-runs, so Trusted Server sends nothing, `/health` included. `run_custom`
-returns the error without a response, and `serve_custom` hands it to the SDK
-as the request's result, which ends serving without a send
-(`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/lifecycle.rs:31-40`,
-`:159-201`). Under Viceroy 0.21.0 the client then gets `200` with an empty
-body, so a `/health` check that reads only the status passes (review
-5907840090's probe). What hosted Fastly answers is unchecked. The failure is
-kept for the instance
-(`edgezero@5c32ae61:crates/edgezero-core/src/logging.rs:30-61`), and so is
-the `edgezero_logging` read (`logger.rs:110-116`). An unexpected status
+runs, so no Trusted Server code answers, `/health` included. Since
+`4cbabfee`, EdgeZero answers in its place
+([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)):
+`run_custom` and `serve_custom` send one canonical, redacted JSON 500 through
+`send_assembly_error`, with no payload for HEAD, and then return the original
+`ManagedLoggerError`
+(`edgezero@3d92ee38:crates/edgezero-adapter-fastly/src/lifecycle.rs:151-167`,
+`:218-231`). `main` prints it on stderr
+(`ts@4088c155f:crates/trusted-server-adapter-fastly/src/main.rs:121-123`,
+`:165-167`, `:174-179`). In `serve_custom` it is also the request's result,
+which ends serving without a second send (`lifecycle.rs:38-48`, `:233-247`).
+The 500 carries no Trusted Server header, `x-ts-version` included, because
+no Trusted Server code runs. EdgeZero's Viceroy wire control, a test ignored
+by default, checks that status, the body
+`{"error":{"kind":"internal","message":"internal server error","status":500}}`,
+and the empty HEAD body
+(`edgezero@3d92ee38:crates/edgezero-test-harness/src/runners/assembly/managed_logging.rs:124-174`,
+`:616-671`, `runners/assembly.rs:81-89`). Trusted Server has not reproduced
+it, because no valid Trusted Server configuration makes installation fail,
+and what hosted Fastly answers is unchecked. The failure is kept for the
+instance (`edgezero@5c32ae61:crates/edgezero-core/src/logging.rs:30-61`), and
+so is the `edgezero_logging` read (`logger.rs:110-116`). An unexpected status
 opening or reading a linked `edgezero_logging` store
-(`ConfigurationUnavailable`, `config_store.rs:243-254`) causes it, and so
-does an endpoint name that `log_fastly` rejects, such as one containing `:`
-(`InvalidConfiguration`, `logger.rs:24-35`). Manifest validation does not
-check the endpoint. Today the health probe runs before logger setup, and a
-failed install prints `logger installation failed, retrying next callback`
-and serves the request
-(`crates/trusted-server-adapter-fastly/src/main.rs:176-195`). This is an
-open EdgeZero gap: EdgeZero's custom runners send no response when
-installation fails ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)). Trusted Server adds no workaround, and the cut repins
-when EdgeZero answers such a request itself (Follow-ups).
+(`ConfigurationUnavailable`, `config_store.rs:243-254`) causes it, and so can
+an endpoint the Fastly host rejects when the logger installs
+(`InvalidConfiguration`, `logger.rs:24-35`). Today the health probe runs
+before logger setup, and a failed install prints
+`logger installation failed, retrying next callback` and serves the request
+(`crates/trusted-server-adapter-fastly/src/main.rs:176-195`).
+
+Since `4cbabfee`, manifest loading, `app!`, and `logging_config!` reject an
+effective Fastly logging endpoint name that is empty, contains a line feed or
+`:`, or is exactly `stdout` or `stderr`, naming the field without echoing the
+value (`edgezero@3d92ee38:crates/edgezero-core/src/manifest.rs:1522-1557`,
+[IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)).
+Such a name fails Trusted Server's build. A 2026-11-16 probe set
+`endpoint = "ts:log"`, and `cargo check-fastly` exited 101 when
+`trusted-server-core`'s build script loaded the manifest
+(`ts@4088c155f:crates/trusted-server-core/build.rs:127-135`), with
+`[adapters.fastly.logging].endpoint: invalid Fastly logging configuration; endpoint name is malformed`.
+With the file restored it exited 0. Whether the endpoint exists is still
+checked only when the logger installs.
 
 EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
 `tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
@@ -1940,10 +1963,11 @@ Logging:
     logs at `debug` only with that store declared. The maintainer accepted
     both losses.
 28. When EdgeZero's managed logger fails to install, Trusted Server sends
-    nothing, `/health` included, and Viceroy 0.21.0 then answers `200` with an
-    empty body. Today the health probe answers before logger setup, and a
-    failed install is printed on stderr while the request is served. This is
-    an open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)).
+    nothing, `/health` included, and EdgeZero answers with its redacted JSON
+    500, which, like a startup failure (item 8), carries no Trusted Server
+    headers. Today the health probe answers before logger setup, and a failed
+    install is printed on stderr while the request is served. An empty,
+    malformed, or reserved endpoint name fails the build (section 9).
 
 Unchanged, and checked by the response diff: routes, other statuses, other
 headers, auction semantics, consent handling, EC cookies, upstream failures as
@@ -2061,7 +2085,7 @@ raises or lowers the log level (section 9).
 | Fastly delivery not committed                                                        | Native 500                                                                                                                                                                            |
 | Fastly delivery unknown or committed with a fallback body                            | Logged. No post-delivery work                                                                                                                                                         |
 | Fastly request head cannot be converted                                              | Native 500, as today                                                                                                                                                                  |
-| Fastly managed logger fails to install                                               | No Trusted Server response on any route, `/health` included. An open EdgeZero gap (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505))           |
+| Fastly managed logger fails to install                                               | EdgeZero's redacted JSON 500 on every route, `/health` included, with no Trusted Server headers (section 9)                                                                           |
 | Framing violation                                                                    | EdgeZero 500 fallback. Unreachable from Trusted Server sources after D10                                                                                                              |
 | Telemetry or pull-sync send fails                                                    | Logged at warn. The client already has its response                                                                                                                                   |
 | `certificate_check = false`, readthrough, or forbidden `response_headers` at runtime | Warning, and the setting is ignored or skipped                                                                                                                                        |
@@ -2173,7 +2197,7 @@ and `5c32ae61`, which the pin carries, answers all three: a managed logger
 under the custom lifecycle, the target in Fastly lines, and a runtime level
 (section 9).
 
-The round-2 asks are in [a third comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6889465884), all three filed under EdgeZero's identity epic and open: no response when the Fastly managed logger fails to install ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), manifest validation that accepts endpoint names the Fastly logger rejects ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)), and a compile-time `logging_for` for hand-written `Hooks` ([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
+The round-2 asks are in [a third comment](https://github.com/IABTechLab/edgezero/pull/275#issuecomment-6889465884), all three filed under EdgeZero's identity epic: no response when the Fastly managed logger fails to install ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), manifest validation that accepts endpoint names the Fastly logger rejects ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)), and a compile-time `logging_for` for hand-written `Hooks` ([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)). PR 275's head `b65e7144`, which the pin carries, answers all three: `4cbabfee` the first two and `b65e7144` the third (section 9). On 2026-11-16 the three issues and PR 275 were still open.
 
 The earlier question on Fastly `NameInUse` is answered (Fastly differences item
 12).
@@ -2785,10 +2809,6 @@ old layer. That transient dual path exists only inside the pull request.
   adapter.
 - EZ-24 published test double, to delete Trusted Server's scripted client.
 - An EdgeZero ask for a version header on assembly-error responses (EZ-19.7).
-- An EdgeZero ask for a response when the Fastly managed logger fails to
-  install, which leaves every request unanswered (section 9, [IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and a
-  repin once EdgeZero answers it. A companion ask rejects endpoint names the
-  logger cannot install when the manifest loads ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)).
 - EZ-2 reuse-mode parts, before reusable sandboxes reach production.
 - Streaming publisher responses on Axum, Cloudflare, and Spin.
 - Declaring stores on Cloudflare and Spin, including whether the Cloudflare
