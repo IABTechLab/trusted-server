@@ -431,7 +431,7 @@ mod tests {
     fn local_identify_request(method: &str, origin: Option<&str>) -> Request<EdgeBody> {
         let mut builder = Request::builder()
             .method(method)
-            .uri("https://edge.test-publisher.com/_ts/api/v1/identify")
+            .uri("https://edge.publisher.example.com/_ts/api/v1/identify")
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         if let Some(origin) = origin {
             builder = builder.header("origin", origin);
@@ -441,10 +441,16 @@ mod tests {
             .expect("should build local identify request")
     }
 
+    fn local_identify_settings() -> Settings {
+        let mut settings = create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings
+    }
+
     #[test]
     fn identify_not_supported_reflects_allowed_origin_on_501() {
-        let settings = create_test_settings();
-        let req = local_identify_request("GET", Some("https://www.test-publisher.com"));
+        let settings = local_identify_settings();
+        let req = local_identify_request("GET", Some("https://www.publisher.example.com"));
 
         let response = identify_not_supported(&settings, &req);
 
@@ -459,14 +465,14 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .and_then(|v| v.to_str().ok()),
-            Some("https://www.test-publisher.com"),
+            Some("https://www.publisher.example.com"),
             "should reflect the allowed origin so the browser can read the 501"
         );
     }
 
     #[test]
     fn identify_not_supported_denies_mismatched_origin() {
-        let settings = create_test_settings();
+        let settings = local_identify_settings();
         let req = local_identify_request("GET", Some("https://evil.example"));
 
         let response = identify_not_supported(&settings, &req);
@@ -488,7 +494,7 @@ mod tests {
 
     #[test]
     fn answer_identify_locally_dispatches_by_method() {
-        let settings = create_test_settings();
+        let settings = local_identify_settings();
 
         let get = answer_identify_locally(&settings, &local_identify_request("GET", None))
             .expect("should answer GET locally");
@@ -520,7 +526,7 @@ mod tests {
 
     #[test]
     fn identify_not_supported_returns_uncached_501() {
-        let settings = create_test_settings();
+        let settings = local_identify_settings();
         let response = identify_not_supported(&settings, &local_identify_request("GET", None));
 
         assert_eq!(

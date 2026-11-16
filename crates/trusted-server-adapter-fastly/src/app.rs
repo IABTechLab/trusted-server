@@ -2399,8 +2399,8 @@ mod tests {
     fn partner_api_request(method: Method, path: &str) -> Request {
         request_builder()
             .method(method)
-            .uri(format!("https://test-publisher.com{path}"))
-            .header(header::HOST, "test-publisher.com")
+            .uri(format!("https://publisher.example.com{path}"))
+            .header(header::HOST, "publisher.example.com")
             .header(
                 header::AUTHORIZATION,
                 "Bearer fictional-partner-token-0123456789",
