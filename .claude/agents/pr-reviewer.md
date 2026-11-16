@@ -1072,18 +1072,20 @@ rendered into the chat instead.
 
 A suggestion is a **proposal**, not a fix — until the author commits it, the
 finding is still open. Verdict logic therefore does not change based on
-whether suggestions were emitted. Apply the rules in order; the **first** one
-that matches wins:
+whether suggestions were emitted. Choose one of two verdicts based on the
+findings selected for submission:
 
 1. Any 🔧 (wrench) **or** ❓ (question) finding included → `REQUEST_CHANGES`.
-   Both are labelled **blocking** in the emoji table (step 5), so the
-   GitHub verdict has to match: `COMMENT` doesn't block merge, but the
-   emoji semantics say the review isn't complete without an answer. If the
-   author resolves the question, they request a re-review and the agent's
-   next invocation can downgrade. Failed required/relevant CI from step 3
-   is represented as a body-level 🔧 finding and therefore uses this branch.
-2. Otherwise, any non-blocking findings (🤔 ♻️ 🌱 📝 ⛏ 🏕 📌) → `COMMENT`.
-3. Otherwise (no findings, or only 👍 praise) → `APPROVE`.
+   Both are labelled **blocking** in the emoji table (step 5). If the author
+   resolves the question, they request a re-review and the agent's next
+   invocation can approve. Failed required/relevant CI from step 3 is
+   represented as a body-level 🔧 finding and therefore uses this branch.
+2. Otherwise → `APPROVE`, including reviews with non-blocking suggestions,
+   nitpicks, notes, praise, or no findings.
+
+Include non-blocking findings as inline comments or in the review body.
+Label them explicitly as optional. Their presence does not prevent approval.
+Submit only `APPROVE` or `REQUEST_CHANGES`, never `COMMENT`.
 
 ##### Build the review body
 
@@ -1238,17 +1240,17 @@ Use the GitHub API to submit. Handle these known issues:
    pr_author=$(gh api "repos/IABTechLab/trusted-server/pulls/$NUMBER" \
        --jq '.user.login')
    viewer=$(gh api user --jq '.login')
-   if [ "$pr_author" = "$viewer" ] && [ "$EVENT" != "COMMENT" ]; then
-       ORIGINAL_EVENT="$EVENT"
-       EVENT=COMMENT
+   if [ "$pr_author" = "$viewer" ]; then
+       SKIP_SUBMISSION=1
+       SKIP_REASON="self-review requires a different GitHub identity"
    fi
    ```
 
-   When downgrading, keep the signal: state the would-have-been verdict at
-   the top of the review body, e.g.
-   "**Verdict: `REQUEST_CHANGES`** _(submitted as `COMMENT` — GitHub rejects
-   self-review verdicts, and the PR author is the authenticated user)_". The
-   findings and their blocking/non-blocking grouping are unchanged.
+   If `SKIP_SUBMISSION` is set, stop before pending-review handling or any
+   submit/delete command. Keep the prepared review intact, render it in chat
+   with the intended `$EVENT`, and report `submission skipped: $SKIP_REASON`
+   in step 10. Explain that a different GitHub identity must submit the
+   review. Keep the findings and their blocking/non-blocking grouping unchanged.
 
 2. **"User can only have one pending review"**: GitHub allows exactly one
    draft per user per PR. Before deleting, **always check whether the pending
@@ -1345,7 +1347,7 @@ to the head you reviewed prevents the review from accidentally attaching to a
 later force-push the agent never saw — without it GitHub attaches the review
 to whatever the head is at submit time.
 
-`$EVENT` is the verdict from 8a (`APPROVE` / `COMMENT` / `REQUEST_CHANGES`).
+`$EVENT` is the verdict from 8a (`APPROVE` / `REQUEST_CHANGES`).
 `$HEAD_OID_EXPECTED` is the OID from step 1, re-verified in the
 head-recheck above.
 
@@ -1360,8 +1362,7 @@ out-of-process script (Python, Node, anything with a real JSON encoder)
 is another. The constraints, not the recipe:
 
 1. `commit_id` must be `$HEAD_OID_EXPECTED` exactly.
-2. `event` must be `$EVENT` exactly (`APPROVE` / `COMMENT` /
-   `REQUEST_CHANGES`).
+2. `event` must be `$EVENT` exactly (`APPROVE` / `REQUEST_CHANGES`).
 3. `body` must contain the 8a markdown verbatim.
 4. Each entry in `comments[]` must contain its inline-comment body
    verbatim, plus the metadata (`path`, `line`, `side`, optionally
@@ -1409,7 +1410,7 @@ review thread.
 - The submitted review's URL.
 - Total findings by category (e.g. "2 🔧, 1 ❓, 3 🤔, 2 ⛏, 1 👍"), with a
   "(suggestion)" tag for each finding emitted as a one-click suggestion.
-- The verdict (`APPROVE` / `COMMENT` / `REQUEST_CHANGES`).
+- The verdict (`APPROVE` / `REQUEST_CHANGES`).
 - Any CI failures encountered (with the exact check name from
   `gh pr checks`, per step 3 / the body template's CI Status section).
 
