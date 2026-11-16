@@ -1,7 +1,7 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13 and 2026-11-14
+2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14 and 2026-11-16
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -25,13 +25,32 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `10166628` (`101666286d68fc9e4c7af18e818d78dd66d8e436`), the
-`rc/identity` commit on 2026-11-14 (IABTechLab/edgezero#495). It carries PR
-275's head `e9ffaa8f`, which is `5c32ae61`, the previous pin, with EdgeZero
-`main` merged in. It also carries the PRs stacked on PR 275 (EdgeZero 499, 460,
-406, 407, 409, 414, 422 and 439) and the JA4 request interface (EdgeZero 469).
-The Fastly files this spec cites at `5c32ae61` are unchanged at `10166628`. Two
-of those changes reach Trusted Server:
+The cut now pins `3d92ee38` (`3d92ee38d6150ea8ba7567f47f8cbbaf7c2a98b3`), the
+`rc/identity` commit on 2026-11-16 (IABTechLab/edgezero#495). It merges the
+PRs stacked on PR 275 (EdgeZero 499, 460, 406, 407, 409, 414, 422 and 439),
+refreshed to PR 275's head `b65e7144`, four commits after `e9ffaa8f`:
+
+- `4cbabfee` answers a Fastly managed logger setup failure with EdgeZero's
+  canonical 500, and rejects invalid Fastly logging endpoint names when the
+  manifest loads (IABTechLab/edgezero#505 and #506, section 9).
+- `fe32185f` preserves terminal errors and response policies inside EdgeZero,
+  and `c7e3ac97` adds tests.
+- `b65e7144` adds `logging_config!` for hand-written `Hooks`
+  (IABTechLab/edgezero#504), which Trusted Server's Fastly `logging_for` now
+  uses (section 9).
+
+Of the Fastly files this spec cites at `5c32ae61`, only `lifecycle.rs` differs
+at `3d92ee38`. Since the previous pin the branch also merged EdgeZero 469's JA4
+review fixes (`a77b74d7`). Trusted Server calls none of EdgeZero's JA4
+interface.
+
+The previous pin, `10166628` (`101666286d68fc9e4c7af18e818d78dd66d8e436`), was
+the `rc/identity` commit on 2026-11-14. It carries PR 275's head `e9ffaa8f`,
+which is `5c32ae61`, the pin before it, with EdgeZero `main` merged in. It also
+carries the PRs stacked on PR 275 (EdgeZero 499, 460, 406, 407, 409, 414, 422
+and 439) and the JA4 request interface (EdgeZero 469). The Fastly files this
+spec cites at `5c32ae61` are unchanged at `10166628`. Two of those changes
+reach Trusted Server:
 
 - EdgeZero 460 adds cache tags to `OutboundCachePolicy`, so the type is no
   longer `Copy`, and test code clones it.
@@ -82,10 +101,11 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452` and `5c32ae61` are earlier pins of the cut, `10166628` is the cut's
-pin (its cited files match `5c32ae61`), and
-`v0.0.11` is the base's pin. Dates are US Pacific time (UTC-8). In UTC,
-`5c32ae61`, PR 275's head late on 2026-11-13, is dated 2026-11-14.
+`737f8452`, `5c32ae61` and `10166628` are earlier pins of the cut, `3d92ee38`
+is the cut's pin (of the files cited at `5c32ae61`, only `lifecycle.rs`
+differs there), and `v0.0.11` is the base's pin. Dates are US Pacific time
+(UTC-8). In UTC, `5c32ae61`, PR 275's head late on 2026-11-13, is dated
+2026-11-14.
 
 ## Problem
 
@@ -212,7 +232,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `10166628` at the 2026-11-14 repin. The cut repins
+which carries PR 275's head: `3d92ee38` at the 2026-11-16 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
