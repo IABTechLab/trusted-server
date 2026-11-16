@@ -23,6 +23,8 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
+        trusted_server_kv = []
+        record_ec_fixture = []
         [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"

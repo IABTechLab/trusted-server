@@ -98,6 +98,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
+use edgezero_core::store_registry::KvRegistry;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::plan::validate_fastly_backend_bound;
@@ -115,6 +116,7 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
@@ -210,9 +212,21 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    settings
+    if let Some(selection) = settings
         .ec
-        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Fastly)?;
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Fastly)?
+    {
+        let (trusted_server_core::ec::storage::EcStorageSelection::Fastly(id)
+        | trusted_server_core::ec::storage::EcStorageSelection::Records(id)) = selection;
+        if !TrustedServerApp::stores()
+            .kv
+            .is_some_and(|metadata| metadata.ids.contains(&id))
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "EC storage must reference a declared logical record store ID".to_owned(),
+            }));
+        }
+    }
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -347,11 +361,10 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so the entry point rebuilds the graph from
-    /// settings when this is set.
-    pub(crate) use_finalize_kv: bool,
+    /// Prepared view for independently gated post-delivery pull sync.
+    pub(crate) record_store: Option<RecordEcKvStore>,
+    /// The same view, retained here only when response finalization may write.
+    pub(crate) finalize_record_store: Option<RecordEcKvStore>,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
@@ -365,6 +378,7 @@ struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
+    record_store: Option<RecordEcKvStore>,
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
@@ -383,7 +397,8 @@ impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            finalize_record_store: self.finalize_kv_graph.and(self.record_store.clone()),
+            record_store: self.record_store,
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
@@ -471,10 +486,12 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let (kv_graph, storage_error) = match crate::maybe_identity_graph(settings) {
-        Ok(graph) => (graph, None),
-        Err(error) => (None, Some(error)),
-    };
+    let (record_store, storage_error) =
+        match crate::maybe_identity_store(settings, req.extensions().get::<KvRegistry>()) {
+            Ok(store) => (store, None),
+            Err(error) => (None, Some(error)),
+        };
+    let kv_graph = record_store.clone().map(KvIdentityGraph::new);
     let setup_error = setup_error.or(storage_error);
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
@@ -489,6 +506,7 @@ fn build_ec_request_state(
         ec_context,
         kv_graph,
         finalize_kv_graph,
+        record_store,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
@@ -619,7 +637,10 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings)?;
+                    let kv = crate::maybe_identity_graph(
+                        &state.settings,
+                        req.extensions().get::<KvRegistry>(),
+                    )?;
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
@@ -697,7 +718,10 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
+                let kv = crate::require_identity_graph(
+                    &state.settings,
+                    req.extensions().get::<KvRegistry>(),
+                )?;
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -790,7 +814,8 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = async {
-        let kv = crate::require_identity_graph(&state.settings)?;
+        let kv =
+            crate::require_identity_graph(&state.settings, req.extensions().get::<KvRegistry>())?;
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req).await
@@ -802,7 +827,8 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     // ec_finalize_response with a default EC context and no finalize KV graph.
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: EcContext::default(),
-        use_finalize_kv: false,
+        record_store: None,
+        finalize_record_store: None,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
@@ -1414,6 +1440,8 @@ impl Hooks for TrustedServerApp {
     /// the response.
     fn configure(app: &mut App) -> Result<(), EdgeError> {
         install_edge_policies(app)?;
+        app.require_record_store("trusted_server_kv", EcRecordLayout)
+            .map_err(|_| EdgeError::validation("invalid Fastly EC record declaration"))?;
         app.set_synthesized_response_headers(version_synthesized_headers(
             std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
         ))
@@ -1555,6 +1583,21 @@ mod tests {
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
         assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
+
+    #[test]
+    fn startup_validates_record_references_against_declared_logical_ids() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("unregistered-physical-name".to_owned());
+        assert!(
+            build_state_from_settings(settings.clone()).is_err(),
+            "should reject undeclared routing before serving a request"
+        );
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        assert!(
+            build_state_from_settings(settings).is_ok(),
+            "should validate the declared reference without provider I/O"
+        );
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {

@@ -5,9 +5,13 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use edgezero_store_celld::settings::{CelldAccess, CelldKvSettings};
+use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::record_store::RecordLayout;
+use edgezero_core::time::MonotonicClock;
+use edgezero_store_celld::settings::{CelldAccess, CelldKvSettings, CelldPreparationLimits};
+use edgezero_store_celld::{CelldPreparation, PreparationError};
 use serde_json::json;
-use trusted_server_adapter_axum::celld_ec::CelldEcKv;
+use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 
 pub struct CelldFixture {
     root: tempfile::TempDir,
@@ -46,6 +50,10 @@ impl CelldFixture {
     fn start(&mut self) {
         let mut child = Command::new(&self.binary)
             .env_clear()
+            .env(
+                "TMPDIR",
+                std::env::var_os("TMPDIR").expect("should use task TMPDIR"),
+            )
             .env("CELLD_TEST_DATA_DIR", self.root.path().join("node-cache"))
             .args([
                 "--listen",
@@ -92,10 +100,24 @@ impl CelldFixture {
             },
         }
     }
-    pub async fn store(&self) -> CelldEcKv {
-        CelldEcKv::prepare(&self.settings(), None)
+    pub async fn record_handle(&self) -> Result<KvHandle, PreparationError> {
+        let mut session =
+            CelldPreparation::new(MonotonicClock::default(), CelldPreparationLimits::default())?;
+        session
+            .prepare_record_store(
+                &self.settings(),
+                &RecordLayout::new(EcRecordLayout).expect("should declare EC key layout"),
+                None,
+            )
             .await
-            .expect("should prepare typed records against real celld")
+    }
+    pub async fn store(&self) -> RecordEcKvStore {
+        let handle = self
+            .record_handle()
+            .await
+            .expect("should prepare v2 records against real celld");
+        RecordEcKvStore::new("trusted_server_kv".to_owned(), &handle)
+            .expect("should acquire the shared EC backend")
     }
 }
 impl Drop for CelldFixture {

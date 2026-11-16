@@ -39,7 +39,7 @@ const ENTRY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Namespace for completion markers written after a withdrawal tombstone.
-const WITHDRAWAL_MARKER_PREFIX: &str = "__ts_ec_withdrawal_complete__:";
+pub(crate) const WITHDRAWAL_MARKER_PREFIX: &str = "__ts_ec_withdrawal_complete__:";
 
 /// Maximum completion markers inspected for one EC ID.
 const WITHDRAWAL_MARKER_LIST_LIMIT: u32 = 100;
@@ -1508,11 +1508,12 @@ impl KvIdentityGraph {
         &self,
         hash_prefix: &str,
     ) -> Result<u32, Report<TrustedServerError>> {
-        // The prefix ensures we only match EC IDs derived from the same
-        // IP+passphrase (i.e. same 64-hex hash). The backend already attaches
-        // store context to list failures, so propagate without re-wrapping.
+        // The delimiter makes this a complete IP-hash partition, not a partial
+        // prefix. The backend already attaches store context to list failures,
+        // so propagate without re-wrapping.
+        let partition_prefix = format!("{hash_prefix}.");
         self.store
-            .count_keys_with_prefix(hash_prefix, CLUSTER_LIST_LIMIT)
+            .count_keys_with_prefix(&partition_prefix, CLUSTER_LIST_LIMIT)
             .await
     }
 
