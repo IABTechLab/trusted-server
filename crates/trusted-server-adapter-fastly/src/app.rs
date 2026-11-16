@@ -109,10 +109,12 @@ use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::batch_sync::{batch_sync_not_supported, handle_batch_sync};
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::identify::{
+    cors_preflight_identify, handle_identify, identify_not_supported,
+};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
@@ -190,6 +192,10 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Services every request uses in place of the Fastly platform services,
+    /// so route tests can dispatch against deterministic fixtures.
+    #[cfg(test)]
+    pub(crate) services_override: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -235,6 +241,8 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        #[cfg(test)]
+        services_override: None,
     }))
 }
 
@@ -262,6 +270,11 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    #[cfg(test)]
+    if let Some(services) = &state.services_override {
+        return services.clone();
+    }
+
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
@@ -659,7 +672,9 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
+                let Some(kv) = crate::maybe_identity_graph(&state.settings) else {
+                    return Ok(identify_not_supported());
+                };
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -744,13 +759,15 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
-
-    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    let mut response = match crate::maybe_identity_graph(&state.settings) {
+        None => batch_sync_not_supported(),
+        Some(kv) => PartnerRegistry::from_config(&state.settings.ec.partners)
+            .and_then(|partner_registry| {
+                let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                handle_batch_sync(&kv, &partner_registry, &limiter, req)
+            })
+            .unwrap_or_else(|e| http_error(&e)),
+    };
     // Legacy parity: batch-sync responses still pass through
     // ec_finalize_response with a default EC context and no finalize KV graph.
     response.extensions_mut().insert(EcFinalizeState {
@@ -1436,6 +1453,7 @@ mod tests {
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+    use trusted_server_core::test_support::capturing_origin::{self, CapturingOrigin};
     use trusted_server_core::test_support::nextjs_auction;
 
     #[test]
@@ -1615,6 +1633,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            services_override: None,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2366,39 +2385,100 @@ mod tests {
         );
     }
 
+    fn capturing_router(settings: Settings, origin: &Arc<CapturingOrigin>) -> RouterService {
+        let mut state = Arc::into_inner(
+            build_state_from_settings(settings).expect("should build capturing state"),
+        )
+        .expect("should own freshly built state");
+        state.services_override = Some(capturing_origin::services(Arc::clone(origin)));
+        TrustedServerApp::routes_for_state(&Arc::new(state))
+    }
+
+    fn partner_api_request(method: Method, path: &str) -> Request {
+        request_builder()
+            .method(method)
+            .uri(format!("https://test-publisher.com{path}"))
+            .header(header::HOST, "test-publisher.com")
+            .header(
+                header::AUTHORIZATION,
+                "Bearer fictional-partner-token-0123456789",
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"mappings":[]}"#))
+            .expect("should build partner API request")
+    }
+
+    fn partner_api_statuses(router: &RouterService) -> [StatusCode; 2] {
+        [
+            route(
+                router,
+                partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+            )
+            .status(),
+            route(
+                router,
+                partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+            )
+            .status(),
+        ]
+    }
+
     #[test]
-    fn dispatch_identify_get_routes_to_identity_handler() {
-        // Parity guard: GET /_ts/api/v1/identify must reach the identify
-        // handler chain. The test settings configure no ec.ec_store, so
-        // require_identity_graph fails with a KvStore error (503) — proving
-        // the request was NOT proxied to the publisher origin.
-        let router = test_router();
-        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
+    fn capturing_origin_receives_publisher_fallback_requests() {
+        let origin = Arc::new(CapturingOrigin::default());
+        let router = capturing_router(test_settings(), &origin);
+
+        let response = route(&router, partner_api_request(Method::GET, "/article"));
 
         assert_eq!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "GET identify without ec_store should fail with the KvStore error, not a publisher proxy error"
+            StatusCode::OK,
+            "should proxy the publisher page to the origin"
+        );
+        assert_eq!(
+            origin.requests(),
+            vec![(Method::GET, "/article".to_owned())],
+            "should record the proxied publisher request"
         );
     }
 
     #[test]
-    fn dispatch_batch_sync_routes_to_batch_sync_handler() {
-        // Parity guard: POST /_ts/api/v1/batch-sync must reach the batch-sync
-        // handler chain instead of forwarding the request (body and
-        // Authorization header included) to the publisher origin. With no
-        // ec.ec_store configured, require_identity_graph fails with a KvStore
-        // error (503).
-        let router = test_router();
-        let response = route(
-            &router,
-            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
-        );
+    fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+        let origin = Arc::new(CapturingOrigin::default());
+        let router = capturing_router(test_settings(), &origin);
+
+        let statuses = partner_api_statuses(&router);
 
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "POST batch-sync without ec_store should fail with the KvStore error, not reach the publisher"
+            statuses,
+            [StatusCode::NOT_IMPLEMENTED; 2],
+            "identify and batch sync should answer 501 without ec.ec_store"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "should send no identify or batch-sync request to the publisher origin: {:?}",
+            origin.requests()
+        );
+    }
+
+    #[test]
+    fn identify_and_batch_sync_run_locally_with_record_store() {
+        let origin = Arc::new(CapturingOrigin::default());
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        let router = capturing_router(settings, &origin);
+
+        let statuses = partner_api_statuses(&router);
+
+        assert_eq!(
+            statuses,
+            [StatusCode::UNAUTHORIZED; 2],
+            "identify and batch sync should run and reject the unknown partner token"
+        );
+        assert!(
+            origin.requests().is_empty(),
+            "should send no identify or batch-sync request to the publisher origin: {:?}",
+            origin.requests()
         );
     }
 
