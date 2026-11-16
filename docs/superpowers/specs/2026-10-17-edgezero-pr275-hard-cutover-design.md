@@ -1767,11 +1767,19 @@ With the file restored it exited 0. Whether the endpoint exists is still
 checked only when the logger installs.
 
 EdgeZero needs `logging_for` to find `[adapters.fastly.logging]` (endpoint
-`tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it;
-Trusted Server's hand-written `Hooks` parses the compiled-in `edgezero.toml`
-with EdgeZero's `ManifestLoader` and caches the result, so the manifest is
-parsed once per instance and stays the single source. Removing that parse waits on an EdgeZero helper for hand-written `Hooks` ([#1611](https://github.com/IABTechLab/trusted-server/issues/1611), [IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)). `owns_logging` stays
-false.
+`tslog`, level `info`, `echo_stdout = true`). The `app!` macro would bake it.
+Trusted Server's hand-written `Hooks` returns
+`edgezero_core::logging_config!("../../edgezero.toml", adapter)`
+(`ts@4088c155f:crates/trusted-server-adapter-fastly/src/app.rs:1343-1345`),
+the helper `b65e7144` adds for hand-written `Hooks`
+([IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
+It resolves and validates the table at compile time as `app!` does, so no
+request parses the manifest and it stays the single source
+(`edgezero@3d92ee38:crates/edgezero-macros/src/lib.rs:21-32`). It replaces
+the cut's earlier `ManifestLoader` parse, which ran once per instance and so
+once per request on non-reusable Fastly
+([#1611](https://github.com/IABTechLab/trusted-server/issues/1611),
+`4088c155f`). `owns_logging` stays false.
 
 Fastly lines read `<timestamp> <level> <target> <message>`
 (`edgezero@5c32ae61:crates/edgezero-adapter-fastly/src/logger.rs:37-51`), so
@@ -2825,11 +2833,6 @@ old layer. That transient dual path exists only inside the pull request.
 - Spin on `wasm32-wasip2`.
 - A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
   run (Runtime, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
-- One manifest parse for `Hooks::logging_for`. Trusted Server's hand-written
-  `Hooks` parses the compiled-in `edgezero.toml` once per instance
-  (section 9), and a non-reusable Fastly instance serves one request, so it
-  parses once per request. An EdgeZero helper for hand-written `Hooks` would
-  remove it ([#1611](https://github.com/IABTechLab/trusted-server/issues/1611), blocked by [IABTechLab/edgezero#504](https://github.com/IABTechLab/edgezero/issues/504)).
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers
