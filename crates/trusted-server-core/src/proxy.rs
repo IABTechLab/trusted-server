@@ -21,12 +21,16 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor, first_party_url};
+use crate::ec::EcContext;
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
     RuntimeServices,
 };
+use crate::proxy_policy::{ProxyChainState, ProxyDisclosureContext, ProxyQueryIdentity};
+use crate::proxy_query::{location_path_allows_identity, rewrite_ec_query};
+use crate::response_privacy::enforce_terminal_private_cache_privacy;
 use crate::s3_sigv4::{self, S3Credentials};
 use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -346,8 +350,10 @@ pub struct ProxyRequestConfig<'a> {
     pub target_url: &'a str,
     /// Whether redirects should be followed automatically.
     pub follow_redirects: bool,
-    /// Whether to append the caller's EC ID as a query param.
-    pub forward_ec_id: bool,
+    /// Explicit permission to evaluate creative identity endpoint rules.
+    pub query_identity: ProxyQueryIdentity,
+    /// Existing request identity authorized for disclosure; never generates one.
+    pub disclosure: Option<ProxyDisclosureContext<'a>>,
     /// Optional body to send to the origin.
     pub body: Option<Vec<u8>>,
     /// Additional headers to forward to the origin.
@@ -375,13 +381,14 @@ pub struct ProxyRequestConfig<'a> {
 }
 
 impl<'a> ProxyRequestConfig<'a> {
-    /// Build a proxy configuration that follows redirects and forwards the EC ID.
+    /// Build a proxy configuration with query identity disabled.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
             target_url,
             follow_redirects: true,
-            forward_ec_id: true,
+            query_identity: ProxyQueryIdentity::Disabled,
+            disclosure: None,
             body: None,
             headers: Vec::new(),
             copy_request_headers: true,
@@ -423,7 +430,8 @@ impl<'a> ProxyRequestConfig<'a> {
     /// Disable EC ID query-param forwarding to the target URL.
     #[must_use]
     pub fn without_ec_id(mut self) -> Self {
-        self.forward_ec_id = false;
+        self.query_identity = ProxyQueryIdentity::Disabled;
+        self.disclosure = None;
         self
     }
 
@@ -570,7 +578,7 @@ fn origin_response_metadata(
             ce_for_log,
             cl_raw,
             accept_raw,
-            target_url
+            proxy_log_target(target_url)
         );
     } else {
         log::info!(
@@ -579,7 +587,7 @@ fn origin_response_metadata(
             ct_for_log,
             cl_raw,
             accept_raw,
-            target_url
+            proxy_log_target(target_url)
         );
     }
 
@@ -644,7 +652,7 @@ fn apply_image_passthrough_metadata(
         log::info!(
             "{}likely pixel image fetched: {} ct={}",
             log_prefix,
-            target_url,
+            proxy_log_target(target_url),
             ct
         );
     }
@@ -760,6 +768,49 @@ fn finalize_response(
     Ok(response)
 }
 
+fn proxy_log_target(target: &str) -> String {
+    url::Url::parse(target).map_or_else(
+        |_| "invalid-target".to_owned(),
+        |target| {
+            format!(
+                "{}://{}{}",
+                target.scheme(),
+                target.host_str().unwrap_or_default(),
+                target.path()
+            )
+        },
+    )
+}
+
+fn finalize_proxy_chain_response(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+    url: &str,
+    upstream: Response<EdgeBody>,
+    streaming: bool,
+    creative: bool,
+    private: bool,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if creative
+        && upstream.status().is_redirection()
+        && upstream.headers().contains_key(header::LOCATION)
+    {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "creative redirect could not be safely followed".to_string(),
+        }));
+    }
+    let mut response = finalize_response(settings, req, url, upstream, streaming)?;
+    if creative {
+        for name in FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS {
+            response.headers_mut().remove(name);
+        }
+    }
+    if private {
+        enforce_terminal_private_cache_privacy(&mut response);
+    }
+    Ok(response)
+}
+
 /// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
 struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
@@ -773,6 +824,8 @@ struct ProxyRedirectPolicy<'a> {
     stream_response: bool,
     allowed_domains: &'a [String],
     require_https: bool,
+    creative: bool,
+    disclosure: Option<ProxyDisclosureContext<'a>>,
 }
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
@@ -801,7 +854,8 @@ pub async fn proxy_request(
     let ProxyRequestConfig {
         target_url,
         follow_redirects,
-        forward_ec_id,
+        query_identity,
+        disclosure,
         body,
         headers,
         copy_request_headers,
@@ -811,15 +865,11 @@ pub async fn proxy_request(
         require_https,
     } = config;
 
-    let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
+    let target_url_parsed = url::Url::parse(target_url).map_err(|_| {
         Report::new(TrustedServerError::Proxy {
             message: "invalid url".to_string(),
         })
     })?;
-
-    if forward_ec_id {
-        append_ec_id(&req, &mut target_url_parsed);
-    }
 
     proxy_with_redirects(
         settings,
@@ -838,6 +888,8 @@ pub async fn proxy_request(
                 && services.http_client().supports_streaming_responses(),
             allowed_domains,
             require_https,
+            creative: query_identity == ProxyQueryIdentity::CreativeEndpoints,
+            disclosure,
         },
     )
     .await
@@ -1231,31 +1283,18 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
     url.set_query(Some(&serializer.finish()));
 }
 
-fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
-    let ec_id_param = match get_ec_id(req) {
-        Ok(id) => id,
-        Err(e) => {
-            log::warn!("failed to extract EC ID for forwarding: {:?}", e);
-            None
-        }
-    };
-
-    if let Some(ec_id) = ec_id_param {
-        upsert_ec_query_param(target_url_parsed, &ec_id);
-        log::debug!(
-            "forwarding EC ID to origin url {}",
-            target_url_parsed.as_str()
-        );
-    } else {
-        log::debug!("no EC ID to forward to origin");
-    }
-}
-
 /// Returns `true` when `host` is permitted by the proxy host policy.
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
-/// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-pub(crate) fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+/// When non-empty the host must match at least one pattern via the proxy's host matcher.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::proxy::is_host_permitted;
+/// assert!(is_host_permitted(&["assets.example.com"], "assets.example.com"));
+/// ```
+pub fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1298,9 +1337,11 @@ async fn proxy_with_redirects(
     let mut current_body = body;
     // Set once a redirect rewrites the request into a bodyless follow-up.
     let mut body_dropped = false;
+    let mut chain = ProxyChainState::default();
+    let mut path_allows_identity = true;
 
     for redirect_attempt in 0..=MAX_REDIRECTS {
-        let parsed_url = url::Url::parse(&current_url).map_err(|_| {
+        let mut parsed_url = url::Url::parse(&current_url).map_err(|_| {
             Report::new(TrustedServerError::Proxy {
                 message: "invalid url".to_string(),
             })
@@ -1313,20 +1354,23 @@ async fn proxy_with_redirects(
             }));
         }
         if redirect_policy.require_https && scheme != "https" {
-            log::warn!("request to `{}` blocked: HTTPS is required", current_url);
+            log::warn!(
+                "request to `{}` blocked: HTTPS is required",
+                proxy_log_target(&current_url)
+            );
             return Err(Report::new(TrustedServerError::Forbidden {
                 message: "non-HTTPS proxy target blocked".to_string(),
             }));
         }
 
-        let host = parsed_url.host_str().unwrap_or("");
+        let host = parsed_url.host_str().unwrap_or("").to_owned();
         if host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "missing host".to_string(),
             }));
         }
 
-        if !is_host_permitted(redirect_policy.allowed_domains, host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, &host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -1335,6 +1379,43 @@ async fn proxy_with_redirects(
                 host: host.to_string(),
             }));
         }
+
+        let matched_identity_endpoint = if redirect_policy.creative {
+            if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: "userinfo is not permitted in creative targets".to_string(),
+                }));
+            }
+            let decision = settings
+                .proxy
+                .identity_policy()
+                .evaluate(&parsed_url, redirect_policy.allowed_domains);
+            let identity = decision
+                .endpoint
+                .filter(|_| path_allows_identity)
+                .and_then(|_| {
+                    redirect_policy
+                        .disclosure
+                        .as_ref()
+                        .and_then(ProxyDisclosureContext::identity)
+                });
+            let matched = decision.endpoint.is_some();
+            log::debug!(
+                "creative proxy destination={} rule={} disclosure={:?}",
+                proxy_log_target(&current_url),
+                decision.endpoint.map_or("none", |rule| rule.id.as_str()),
+                redirect_policy
+                    .disclosure
+                    .as_ref()
+                    .map(ProxyDisclosureContext::reason)
+            );
+            rewrite_ec_query(&mut parsed_url, identity);
+            current_url = parsed_url.to_string();
+            chain.visit(&decision);
+            matched
+        } else {
+            false
+        };
 
         let backend_name = request_headers
             .services
@@ -1364,7 +1445,21 @@ async fn proxy_with_redirects(
         // Collect outbound headers using insert-semantics so additional_headers override any
         // header set by copy_request_headers, matching the old set_header() replace behavior.
         let mut outbound_headers = http::HeaderMap::new();
-        if request_headers.copy_request_headers {
+        if redirect_policy.creative {
+            for name in [HEADER_ACCEPT, HEADER_ACCEPT_LANGUAGE] {
+                if let Some(value) = req.headers().get(&name) {
+                    outbound_headers.insert(name, value.clone());
+                }
+            }
+            outbound_headers.insert(
+                HEADER_USER_AGENT,
+                HeaderValue::from_static("TrustedServer/1.0"),
+            );
+            outbound_headers.insert(
+                HEADER_ACCEPT_ENCODING,
+                HeaderValue::from_static(SUPPORTED_ENCODINGS),
+            );
+        } else if request_headers.copy_request_headers {
             for header_name in PROXY_FORWARD_HEADERS {
                 if let Some(v) = req.headers().get(&header_name) {
                     outbound_headers.insert(header_name, v.clone());
@@ -1396,6 +1491,9 @@ async fn proxy_with_redirects(
                 })?;
 
         let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
+        if matched_identity_endpoint {
+            platform_request = platform_request.with_cache_bypass();
+        }
         if redirect_policy.stream_response {
             platform_request = platform_request.with_stream_response();
         }
@@ -1412,12 +1510,14 @@ async fn proxy_with_redirects(
         let beresp = platform_resp.response;
 
         if !redirect_policy.follow_redirects {
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         }
 
@@ -1432,12 +1532,14 @@ async fn proxy_with_redirects(
         );
 
         if !is_redirect {
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         }
 
@@ -1447,12 +1549,14 @@ async fn proxy_with_redirects(
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         };
 
@@ -1465,32 +1569,37 @@ async fn proxy_with_redirects(
             && current_method != Method::POST
         {
             log::warn!(
-                "not following {} redirect for {current_method} request to {current_url}; returning redirect response",
+                "not following {} redirect for {current_method} request; returning redirect response",
                 status.as_u16()
             );
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         }
 
         if redirect_attempt == MAX_REDIRECTS {
             log::warn!(
                 "redirect limit reached for {}; returning redirect response",
-                current_url
+                proxy_log_target(&current_url)
             );
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         }
 
+        path_allows_identity = location_path_allows_identity(location);
         let next_url = url::Url::parse(location)
             .or_else(|_| parsed_url.join(location))
             .map_err(|_| {
@@ -1501,18 +1610,23 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if redirect_policy.require_https && next_scheme != "https" {
-            log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
+            log::warn!(
+                "redirect to `{}` blocked: HTTPS is required",
+                proxy_log_target(next_url.as_str())
+            );
             return Err(Report::new(TrustedServerError::Forbidden {
                 message: "non-HTTPS redirect blocked".to_string(),
             }));
         }
         if next_scheme != "http" && next_scheme != "https" {
-            return finalize_response(
+            return finalize_proxy_chain_response(
                 settings,
                 req,
                 &current_url,
                 beresp,
                 redirect_policy.stream_passthrough,
+                redirect_policy.creative,
+                chain.is_private(),
             );
         }
 
@@ -1536,8 +1650,8 @@ async fn proxy_with_redirects(
 
         log::info!(
             "following redirect {} => {} (status {})",
-            current_url,
-            next_url,
+            proxy_log_target(&current_url),
+            proxy_log_target(next_url.as_str()),
             status.as_u16()
         );
 
@@ -1551,7 +1665,7 @@ async fn proxy_with_redirects(
         ) {
             if current_body.is_some_and(|bytes| !bytes.is_empty()) {
                 log::warn!(
-                    "dropping {current_method} request body on {} redirect to {current_url}",
+                    "dropping {current_method} request body on {} redirect target",
                     status.as_u16()
                 );
             }
@@ -1587,6 +1701,7 @@ async fn proxy_with_redirects(
 pub async fn handle_first_party_proxy(
     settings: &Settings,
     services: &RuntimeServices,
+    ec: &EcContext,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Parse, reconstruct, and validate the signed target URL
@@ -1599,7 +1714,8 @@ pub async fn handle_first_party_proxy(
         ProxyRequestConfig {
             target_url: &target_url,
             follow_redirects: true,
-            forward_ec_id: true,
+            query_identity: ProxyQueryIdentity::CreativeEndpoints,
+            disclosure: Some(ProxyDisclosureContext::from_ec_context(ec)),
             body: None,
             headers: Vec::new(),
             copy_request_headers: true,
@@ -2254,7 +2370,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
+        AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyQueryIdentity, ProxyRequestConfig,
         SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
         build_asset_proxy_target_url, handle_asset_proxy_request, handle_first_party_click,
         handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -2264,7 +2380,9 @@ mod tests {
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
+    use crate::ec::EcContext;
     use crate::error::{IntoHttpResponse, TrustedServerError};
+    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
         HashMapSecretStore, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_and_http_client, noop_services,
@@ -2274,6 +2392,7 @@ mod tests {
         PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
         StoreId, StoreName,
     };
+    use crate::proxy_policy::ProxyIdentityEndpoint;
     use crate::redacted::Redacted;
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
@@ -2381,6 +2500,7 @@ mod tests {
     #[derive(Default)]
     struct HeaderAwareStubHttpClient {
         responses: Mutex<VecDeque<QueuedHttpResponse>>,
+        requests: Mutex<Vec<(String, http::HeaderMap, PlatformCacheIntent)>>,
     }
 
     impl HeaderAwareStubHttpClient {
@@ -2409,8 +2529,13 @@ mod tests {
     impl PlatformHttpClient for HeaderAwareStubHttpClient {
         async fn send(
             &self,
-            _request: PlatformHttpRequest,
+            request: PlatformHttpRequest,
         ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.requests.lock().expect("should record requests").push((
+                request.request.uri().to_string(),
+                request.request.headers().clone(),
+                request.cache_intent,
+            ));
             let queued = self
                 .responses
                 .lock()
@@ -2563,15 +2688,389 @@ mod tests {
         }
     }
 
+    fn proxy_policy_settings() -> Settings {
+        let mut settings = create_test_settings();
+        settings.proxy.identity_endpoints = vec![ProxyIdentityEndpoint {
+            id: "impression".to_owned(),
+            origin: "https://measurement.example.com".to_owned(),
+            path_exact: Some("/events/impression.gif".to_owned()),
+            path_prefix: None,
+        }];
+        settings
+            .proxy
+            .prepare_runtime()
+            .expect("should compile recipient policy");
+        settings
+    }
+
+    fn proxy_policy_ec_context(
+        settings: &Settings,
+        request: &HttpRequest<EdgeBody>,
+        services: &crate::platform::RuntimeServices,
+    ) -> EcContext {
+        let geo = GeoInfo {
+            city: "Example City".to_owned(),
+            country: "US".to_owned(),
+            continent: "NA".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: Some("CA".to_owned()),
+            asn: None,
+        };
+        EcContext::read_from_request_with_geo(settings, request, services, Some(&geo))
+            .expect("should parse real cookie and consent input")
+    }
+
+    #[test]
+    fn proxy_policy_identity_delivery_and_chain_privacy() {
+        futures::executor::block_on(async {
+            let settings = proxy_policy_settings();
+            let target = "https://measurement.example.com/events/impression.gif?campaign=example";
+            let signed =
+                creative::build_proxy_url(&settings, target, "https://publisher.example.com");
+            let client = Arc::new(HeaderAwareStubHttpClient::new());
+            client.push_response(
+                302,
+                vec![(
+                    header::LOCATION,
+                    HeaderValue::from_static(
+                        "https://cdn.example.com/banner.jpg?size=728&ts-ec=echoed",
+                    ),
+                )],
+                Vec::new(),
+            );
+            client.push_response(
+                200,
+                vec![
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=300"),
+                    ),
+                    (header::ETAG, HeaderValue::from_static("reader-specific")),
+                    (
+                        header::SET_COOKIE,
+                        HeaderValue::from_static("origin_state=forbidden"),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        HeaderValue::from_static("*"),
+                    ),
+                ],
+                b"reader-specific".to_vec(),
+            );
+            let services =
+                build_services_with_http_client(Arc::clone(&client) as Arc<dyn PlatformHttpClient>);
+            let identity = crate::test_support::tests::VALID_SYNTHETIC_ID;
+            let request = HttpRequest::builder()
+                .uri(signed)
+                .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                .body(EdgeBody::empty())
+                .expect("should build event request");
+            let context = proxy_policy_ec_context(&settings, &request, &services);
+            assert!(
+                context.ec_allowed(),
+                "should reach the positive consent path"
+            );
+            let response = handle_first_party_proxy(&settings, &services, &context, request)
+                .await
+                .expect("should deliver allowed identity");
+            let recorded = client.requests.lock().expect("should read origin requests");
+            assert_eq!(
+                recorded[0].0,
+                format!("{target}&ts-ec={identity}"),
+                "should deliver canonical EC once to the authorized pixel"
+            );
+            assert_eq!(
+                recorded[0].2,
+                PlatformCacheIntent::Bypass,
+                "should deliver every event without cache reuse"
+            );
+            assert_eq!(
+                recorded[1].0, "https://cdn.example.com/banner.jpg?size=728",
+                "should remove echoed EC from the static destination"
+            );
+            assert_eq!(
+                recorded[1].2,
+                PlatformCacheIntent::Default,
+                "should classify the static hop independently"
+            );
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("no-store, private"),
+                "should keep whole chain private"
+            );
+            for name in [
+                header::ETAG,
+                header::SET_COOKIE,
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            ] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "should remove origin identity response authority"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_policy_static_redirect_to_event_authorizes_new_destination() {
+        futures::executor::block_on(async {
+            let settings = proxy_policy_settings();
+            let signed = creative::build_proxy_url(
+                &settings,
+                "https://cdn.example.com/start",
+                "https://publisher.example.com",
+            );
+            let client = Arc::new(HeaderAwareStubHttpClient::new());
+            client.push_response(
+                302,
+                vec![(
+                    header::LOCATION,
+                    HeaderValue::from_static(
+                        "https://measurement.example.com/events/impression.gif",
+                    ),
+                )],
+                Vec::new(),
+            );
+            client.push_response(200, Vec::new(), b"event".to_vec());
+            let services =
+                build_services_with_http_client(Arc::clone(&client) as Arc<dyn PlatformHttpClient>);
+            let identity = crate::test_support::tests::VALID_SYNTHETIC_ID;
+            let request = HttpRequest::builder()
+                .uri(signed)
+                .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let context = proxy_policy_ec_context(&settings, &request, &services);
+            let response = handle_first_party_proxy(&settings, &services, &context, request)
+                .await
+                .expect("should follow resource to event");
+            let recorded = client.requests.lock().expect("should read requests");
+            assert_eq!(
+                recorded[0].0, "https://cdn.example.com/start",
+                "should not inject EC at the resource"
+            );
+            assert_eq!(
+                recorded[1].0,
+                format!("https://measurement.example.com/events/impression.gif?ts-ec={identity}"),
+                "should inject EC at a later authorized hop"
+            );
+            assert_eq!(
+                recorded[1].2,
+                PlatformCacheIntent::Bypass,
+                "should bypass cache on later event hop"
+            );
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("no-store, private"),
+                "should enforce event response privacy"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_policy_event_without_authorized_identity_still_delivers_uncached() {
+        futures::executor::block_on(async {
+            let settings = proxy_policy_settings();
+            let target = "https://measurement.example.com/events/impression.gif";
+            let signed =
+                creative::build_proxy_url(&settings, target, "https://publisher.example.com");
+            for cookie in [
+                "us_privacy=1YNN".to_owned(),
+                format!(
+                    "ts-ec={}; us_privacy=1YYN",
+                    crate::test_support::tests::VALID_SYNTHETIC_ID
+                ),
+                "ts-ec=invalid; us_privacy=1YNN".to_owned(),
+            ] {
+                let client = Arc::new(HeaderAwareStubHttpClient::new());
+                client.push_response(200, Vec::new(), b"event".to_vec());
+                let services = build_services_with_http_client(
+                    Arc::clone(&client) as Arc<dyn PlatformHttpClient>
+                );
+                let request = HttpRequest::builder()
+                    .uri(&signed)
+                    .header(header::COOKIE, cookie)
+                    .header("x-ts-ec", crate::test_support::tests::VALID_SYNTHETIC_ID)
+                    .body(EdgeBody::empty())
+                    .expect("should build denied request");
+                let context = proxy_policy_ec_context(&settings, &request, &services);
+                let response = handle_first_party_proxy(&settings, &services, &context, request)
+                    .await
+                    .expect("should deliver an event without identity");
+                let recorded = client.requests.lock().expect("should read request");
+                assert_eq!(
+                    recorded[0].0, target,
+                    "should not use header fallback or disclose denied identity"
+                );
+                assert_eq!(
+                    recorded[0].2,
+                    PlatformCacheIntent::Bypass,
+                    "should preserve event delivery without identity"
+                );
+                assert_eq!(
+                    response_header(&response, header::CACHE_CONTROL),
+                    Some("no-store, private"),
+                    "should not cache events without EC"
+                );
+                assert!(
+                    !response.headers().contains_key(header::SET_COOKIE),
+                    "should not mint an EC from policy evaluation"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_policy_static_readers_share_target() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let target = "https://cdn.example.com/banner.jpg?size=728";
+            let signed =
+                creative::build_proxy_url(&settings, target, "https://publisher.example.com");
+            let client = Arc::new(HeaderAwareStubHttpClient::new());
+            let services =
+                build_services_with_http_client(Arc::clone(&client) as Arc<dyn PlatformHttpClient>);
+            for identity in [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.Cd5678",
+            ] {
+                assert!(
+                    crate::ec::is_valid_ec_id(identity),
+                    "should use a canonical cookie"
+                );
+                client.push_response(200, Vec::new(), b"banner".to_vec());
+                let request = HttpRequest::builder()
+                    .uri(&signed)
+                    .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                    .body(EdgeBody::empty())
+                    .expect("should build proxy request");
+                let context = proxy_policy_ec_context(&settings, &request, &services);
+                handle_first_party_proxy(&settings, &services, &context, request)
+                    .await
+                    .expect("should serve a signed static resource");
+            }
+            let recorded = client.requests.lock().expect("should read requests");
+            assert_eq!(recorded.len(), 2, "should fetch for both reader requests");
+            assert_eq!(
+                recorded[0].0, target,
+                "should not disclose reader A to a resource"
+            );
+            assert_eq!(
+                recorded[1].0, target,
+                "should not disclose reader B to a resource"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_policy_resource_headers_are_restricted() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let signed = creative::build_proxy_url(
+                &settings,
+                "https://cdn.example.com/banner.jpg",
+                "https://publisher.example.com",
+            );
+            let client = Arc::new(HeaderAwareStubHttpClient::new());
+            client.push_response(200, Vec::new(), b"banner".to_vec());
+            let services =
+                build_services_with_http_client(Arc::clone(&client) as Arc<dyn PlatformHttpClient>);
+            let request = HttpRequest::builder()
+                .uri(&signed)
+                .header(header::USER_AGENT, "ExampleBrowser/1.0")
+                .header(header::REFERER, "https://publisher.example.com/private")
+                .header("x-forwarded-for", "192.0.2.10")
+                .header(header::ACCEPT_LANGUAGE, "en")
+                .body(EdgeBody::empty())
+                .expect("should build proxy request");
+            handle_first_party_proxy(
+                &settings,
+                &services,
+                &crate::ec::EcContext::default(),
+                request,
+            )
+            .await
+            .expect("should fetch resource");
+            let recorded = client.requests.lock().expect("should read requests");
+            assert_eq!(
+                recorded[0]
+                    .1
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok()),
+                Some("TrustedServer/1.0"),
+                "should use fixed resource user agent"
+            );
+            assert!(
+                !recorded[0].1.contains_key(header::REFERER),
+                "should withhold page context"
+            );
+            assert!(
+                !recorded[0].1.contains_key("x-forwarded-for"),
+                "should withhold reader IP"
+            );
+            assert_eq!(
+                recorded[0]
+                    .1
+                    .get(header::ACCEPT_LANGUAGE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("en"),
+                "should preserve supported negotiation"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_policy_terminal_redirect_does_not_escape() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let signed = creative::build_proxy_url(
+                &settings,
+                "https://cdn.example.com/start",
+                "https://publisher.example.com",
+            );
+            let client = Arc::new(HeaderAwareStubHttpClient::new());
+            for _ in 0..5 {
+                client.push_response(
+                    302,
+                    vec![(
+                        header::LOCATION,
+                        HeaderValue::from_static("https://cdn.example.com/loop?ts-ec=echoed"),
+                    )],
+                    Vec::new(),
+                );
+            }
+            let services =
+                build_services_with_http_client(Arc::clone(&client) as Arc<dyn PlatformHttpClient>);
+            let request = build_http_request(Method::GET, signed);
+            let result = handle_first_party_proxy(
+                &settings,
+                &services,
+                &crate::ec::EcContext::default(),
+                request,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "should reject a terminal Location instead of navigating the browser"
+            );
+        });
+    }
+
     #[test]
     fn proxy_missing_param_returns_400() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let req = build_http_request(Method::GET, "https://example.com/first-party/proxy");
-            let err: Report<TrustedServerError> =
-                handle_first_party_proxy(&settings, &noop_services(), req)
-                    .await
-                    .expect_err("expected error");
+            let err: Report<TrustedServerError> = handle_first_party_proxy(
+                &settings,
+                &noop_services(),
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await
+            .expect_err("expected error");
             assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
     }
@@ -2585,10 +3084,14 @@ mod tests {
                 Method::GET,
                 "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
             );
-            let err: Report<TrustedServerError> =
-                handle_first_party_proxy(&settings, &noop_services(), req)
-                    .await
-                    .expect_err("expected error");
+            let err: Report<TrustedServerError> = handle_first_party_proxy(
+                &settings,
+                &noop_services(),
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await
+            .expect_err("expected error");
             assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
     }
@@ -3066,7 +3569,11 @@ mod tests {
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
-        assert!(cfg.forward_ec_id, "should forward EC ID by default");
+        assert_eq!(
+            cfg.query_identity,
+            ProxyQueryIdentity::Disabled,
+            "should disable query identity by default"
+        );
         assert_eq!(cfg.body.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(cfg.headers.len(), 1, "should include custom header");
         assert!(
@@ -3532,7 +4039,13 @@ mod tests {
 
             // The signature check runs before any upstream fetch; reaching a
             // non-"Invalid URL" outcome proves origin-form parsing succeeded.
-            let result = handle_first_party_proxy(&settings, &noop_services(), req).await;
+            let result = handle_first_party_proxy(
+                &settings,
+                &noop_services(),
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await;
             if let Err(err) = result {
                 let rendered = format!("{err:?}");
                 assert!(
@@ -3862,10 +4375,14 @@ mod tests {
                 &settings.publisher.effective_public_origin(),
             );
             let req = build_http_request(Method::GET, first_party);
-            let err: Report<TrustedServerError> =
-                handle_first_party_proxy(&settings, &noop_services(), req)
-                    .await
-                    .expect_err("expected error");
+            let err: Report<TrustedServerError> = handle_first_party_proxy(
+                &settings,
+                &noop_services(),
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await
+            .expect_err("expected error");
             assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
     }
@@ -3885,10 +4402,14 @@ mod tests {
                 sig
             );
             let req = build_http_request(Method::GET, &url);
-            let err: Report<TrustedServerError> =
-                handle_first_party_proxy(&settings, &noop_services(), req)
-                    .await
-                    .expect_err("expected error");
+            let err: Report<TrustedServerError> = handle_first_party_proxy(
+                &settings,
+                &noop_services(),
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await
+            .expect_err("expected error");
             assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
     }
@@ -4362,7 +4883,8 @@ mod tests {
                 ProxyRequestConfig {
                     target_url: "https://example.com/resource",
                     follow_redirects: false,
-                    forward_ec_id: false,
+                    query_identity: ProxyQueryIdentity::Disabled,
+                    disclosure: None,
                     body: None,
                     headers: Vec::new(),
                     copy_request_headers: false,
@@ -4404,7 +4926,8 @@ mod tests {
                 ProxyRequestConfig {
                     target_url: "https://blocked.example/resource.js",
                     follow_redirects: false,
-                    forward_ec_id: false,
+                    query_identity: ProxyQueryIdentity::Disabled,
+                    disclosure: None,
                     body: None,
                     headers: Vec::new(),
                     copy_request_headers: false,
@@ -4451,7 +4974,8 @@ mod tests {
                 ProxyRequestConfig {
                     target_url: "https://origin.example/start.js",
                     follow_redirects: true,
-                    forward_ec_id: false,
+                    query_identity: ProxyQueryIdentity::Disabled,
+                    disclosure: None,
                     body: None,
                     headers: Vec::new(),
                     copy_request_headers: false,
@@ -4988,7 +5512,8 @@ mod tests {
                 ProxyRequestConfig {
                     target_url: "https://example.com/resource",
                     follow_redirects: false,
-                    forward_ec_id: false,
+                    query_identity: ProxyQueryIdentity::Disabled,
+                    disclosure: None,
                     body: None,
                     headers: Vec::new(),
                     copy_request_headers: true,
@@ -5054,7 +5579,8 @@ mod tests {
                 ProxyRequestConfig {
                     target_url: "https://example.com/resource",
                     follow_redirects: false,
-                    forward_ec_id: false,
+                    query_identity: ProxyQueryIdentity::Disabled,
+                    disclosure: None,
                     body: None,
                     headers: Vec::new(),
                     copy_request_headers: false,
@@ -7067,9 +7593,14 @@ mod tests {
             );
             let req = build_http_request(Method::GET, url);
             let services = crate::platform::test_support::noop_services();
-            let err = handle_first_party_proxy(&settings, &services, req)
-                .await
-                .expect_err("should block initial target not in allowlist");
+            let err = handle_first_party_proxy(
+                &settings,
+                &services,
+                &crate::ec::EcContext::default(),
+                req,
+            )
+            .await
+            .expect_err("should block initial target not in allowlist");
             assert_eq!(
                 err.current_context().status_code(),
                 StatusCode::FORBIDDEN,

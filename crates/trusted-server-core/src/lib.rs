@@ -61,6 +61,8 @@ pub mod openrtb;
 pub mod platform;
 pub mod price_bucket;
 pub mod proxy;
+pub mod proxy_policy;
+mod proxy_query;
 pub mod publisher;
 pub mod redacted;
 pub mod request_signing;

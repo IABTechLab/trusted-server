@@ -217,10 +217,11 @@ pub(crate) fn load_settings_from_config_store(
 }
 
 pub(crate) fn build_state_from_settings(
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -262,6 +263,11 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    // Internal typed fixture injection is absent from production builds.
+    #[cfg(test)]
+    if let Some(services) = ctx.request().extensions().get::<RuntimeServices>() {
+        return services.clone();
+    }
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
@@ -721,7 +727,7 @@ async fn run_named_route(
             .await
         }
         NamedRouteHandler::FirstPartyProxy => {
-            handle_first_party_proxy(&state.settings, services, req).await
+            handle_first_party_proxy(&state.settings, services, &ec.ec_context, req).await
         }
         NamedRouteHandler::FirstPartyClick => {
             handle_first_party_click(&state.settings, services, req).await
@@ -1423,17 +1429,20 @@ mod tests {
     use futures::executor::block_on;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
+    use trusted_server_core::ec::kv::KvIdentityGraph;
+    use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
-        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
-        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
+        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformGeo,
+        PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult, PlatformTemplateCache,
+        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
+        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
+        TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::nextjs_auction;
@@ -2714,6 +2723,125 @@ mod tests {
             observed.server_region.as_deref(),
             Some("US-East"),
             "filter should see the captured server region"
+        );
+    }
+
+    struct ProxyPolicyGeo;
+
+    impl PlatformGeo for ProxyPolicyGeo {
+        fn lookup(&self, _ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            Ok(Some(GeoInfo {
+                country: "US".to_owned(),
+                region: Some("CA".to_owned()),
+                city: "Example City".to_owned(),
+                continent: "NA".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                asn: None,
+            }))
+        }
+    }
+
+    #[test]
+    fn proxy_policy_named_route_preserves_withdrawal_and_terminal_privacy() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        let graph = KvIdentityGraph::new(crate::ec_kv::FastlyEcKvStore::new("ec_identity_store"));
+        let identity = format!("{}.Pd1234", "9".repeat(64));
+        let mut entry = KvEntry::tombstone(1_700_000_000);
+        entry.consent.ok = true;
+        graph
+            .create(&identity, &entry)
+            .expect("should seed a live test identity");
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(ProxyPolicyGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let state = app_state_for_settings(settings.clone());
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut request = empty_request(
+            Method::GET,
+            "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=invalid",
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-ec={identity}; us_privacy=1YYN"))
+                .expect("should attach withdrawal cookies"),
+        );
+        request
+            .headers_mut()
+            .insert("sec-gpc", HeaderValue::from_static("1"));
+        request.extensions_mut().insert(services);
+        let mut response = route(&router, request);
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should preserve the existing invalid-signature status"
+        );
+        let mut finalize = response
+            .extensions_mut()
+            .remove::<super::EcFinalizeState>()
+            .expect("should retain normal named-route finalization state");
+        assert!(
+            finalize.use_finalize_kv,
+            "should keep authoritative withdrawal writes even without browser signals"
+        );
+        assert!(
+            !finalize.ec_context.ec_generated(),
+            "should not mint identity on an asset request"
+        );
+        crate::apply_edgezero_ec_finalize(&settings, &mut finalize, &mut response)
+            .expect("should run the actual entrypoint EC finalizer");
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, max-age=600"),
+                HeaderMutation::set("etag", "late-filter-validator"),
+            ],
+        };
+        crate::apply_terminal_response_effects(&mut response, Some(&effects));
+        let record = graph
+            .get(&identity)
+            .expect("should read withdrawn record")
+            .expect("should retain a tombstone")
+            .0;
+        assert!(
+            !record.consent.ok,
+            "should tombstone the identity through normal route finalization"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0"))),
+            "should expire the withdrawn EC cookie"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("should set privacy"),
+            "no-store, private",
+            "should retain terminal privacy after late filters"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should remove late identity validators"
         );
     }
 

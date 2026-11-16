@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod proxy_policy_runtime;
+
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;

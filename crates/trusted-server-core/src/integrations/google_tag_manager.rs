@@ -917,7 +917,7 @@ impl GoogleTagManagerIntegration {
         let mut proxy_config = ProxyRequestConfig::new(target_url)
             .with_https_only()
             .with_allowed_domains(&self.proxy_allowed_domains);
-        proxy_config.forward_ec_id = false;
+        proxy_config = proxy_config.without_ec_id();
 
         // If it's a POST request (e.g. /collect beacon), we must manually attach the body
         // because ProxyRequestConfig doesn't automatically copy it from the source request.

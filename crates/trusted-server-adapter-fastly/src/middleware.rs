@@ -70,6 +70,8 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let creative_proxy = ctx.request().uri().path() == "/first-party/proxy"
+            && ctx.request().method() == edgezero_core::http::Method::GET;
         let client_ip = ctx.request().extensions().get::<ClientInfo>().map_or_else(
             || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
             |info| info.client_ip,
@@ -83,6 +85,13 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
+        if creative_proxy
+            && (response.status().is_client_error() || response.status().is_server_error())
+        {
+            trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
+                &mut response,
+            );
+        }
         let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
             self.geo.lookup(ip).unwrap_or_else(|e| {
                 log::warn!("geo lookup failed: {e}");

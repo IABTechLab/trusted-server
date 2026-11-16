@@ -499,6 +499,12 @@ pub(crate) fn allows_eid_persistence(ctx: &ConsentContext) -> bool {
     }
 }
 
+/// Decide whether current-request consent permits creative proxy EC disclosure.
+#[must_use]
+pub(crate) fn allows_proxy_ec_disclosure(ctx: &ConsentContext) -> bool {
+    !ctx.expired && !ctx.gpc && allows_ec_creation(ctx) && allows_eid_persistence(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // EC consent gating
 // ---------------------------------------------------------------------------
@@ -682,9 +688,10 @@ mod tests {
     use http::Request;
 
     use super::{
-        ConsentPipelineInput, allows_ec_creation, allows_eid_persistence, apply_expiration_check,
-        apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
-        consent_allows_server_side_auction, gate_eids_by_consent, has_explicit_ec_withdrawal,
+        ConsentPipelineInput, allows_ec_creation, allows_eid_persistence,
+        allows_proxy_ec_disclosure, apply_expiration_check, apply_tcf_conflict_resolution,
+        build_consent_context, build_context_from_signals, consent_allows_server_side_auction,
+        gate_eids_by_consent, has_explicit_ec_withdrawal,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -692,6 +699,65 @@ mod tests {
     };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
+
+    #[test]
+    fn proxy_disclosure_requires_current_consent_beyond_creation() {
+        let allowed = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_proxy_ec_disclosure(&allowed),
+            "should allow known non-regulated traffic"
+        );
+        for denied in [
+            ConsentContext::default(),
+            ConsentContext {
+                gpc: true,
+                ..allowed.clone()
+            },
+            ConsentContext {
+                expired: true,
+                ..allowed.clone()
+            },
+            ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                ..ConsentContext::default()
+            },
+            ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                tcf: Some(
+                    TcfBuilder::new()
+                        .with_storage(true)
+                        .with_personalized_ads(false)
+                        .build(),
+                ),
+                ..ConsentContext::default()
+            },
+        ] {
+            assert!(
+                !allows_proxy_ec_disclosure(&denied),
+                "should withhold disclosure for denied or insufficient current consent"
+            );
+        }
+        let gdpr_allowed = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(
+                TcfBuilder::new()
+                    .with_storage(true)
+                    .with_personalized_ads(true)
+                    .build(),
+            ),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_proxy_ec_disclosure(&gdpr_allowed),
+            "should honor affirmative storage and personalization consent"
+        );
+    }
 
     fn build_request() -> Request<EdgeBody> {
         Request::builder()

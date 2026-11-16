@@ -88,9 +88,10 @@ fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -546,7 +547,8 @@ fn named_route_handler(
                         }
                     }
                     NamedRouteHandler::FirstPartyProxy => {
-                        handle_first_party_proxy(&state.settings, &services, req).await
+                        let ec = build_ec_context(&state, &services, &req);
+                        handle_first_party_proxy(&state.settings, &services, &ec, req).await
                     }
                     NamedRouteHandler::FirstPartyClick => {
                         handle_first_party_click(&state.settings, &services, req).await

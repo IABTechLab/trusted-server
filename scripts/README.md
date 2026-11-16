@@ -25,6 +25,30 @@ their documented orchestration handles a probe deliberately.
 | `docs-proposal/publish.sh`                | Merge SHA, work dir from `propose.sh`; `gh` with write `GH_TOKEN`               | Re-checks the allowlist without building, pushes `docs/auto/<sha12>` (`docs/auto/<branch-hash12>/<sha12>` off `main`) unless a maintainer added to it, opens or edits its PR, and reviews each new commit per hunk. An empty rerun deletes the branch under a lease, then closes the PR; a failed branch lookup stops the run. Never writes the target branch. |
 | `docs-proposal/test.sh`                   | Git, Node, and `jq`                                                             | Tests the helpers and the propose, validate, and publish flows against a temporary repository with stubbed `copilot`, `gh`, and `npm`; removes it on exit.                                                                                                                                                                                                     |
 
+## Creative proxy policy runtime checks
+
+The origin fixture runs with Node 24.20.0, the Rust WASM target, and
+repository-pinned Viceroy 0.21.0:
+
+```bash
+node crates/trusted-server-adapter-fastly/tests/proxy-policy-origin.mjs "$(command -v viceroy)"
+```
+
+This fixture observes actual HTTP origin URLs through the signed core handler
+and real Fastly transport. It checks that two canonical readers share the same
+static upstream URL, redirects strip carried EC, and exhausted redirects fail
+closed. These HTTP destinations cannot match HTTPS identity rules. Positive
+identity delivery and terminal adapter privacy are covered by separate route
+fixtures; HTTPS delivery and cache hits need staging qualification. Viceroy
+0.21.0 does not implement HTTP readthrough caching. A successful local fixture
+run proves neither production cache reuse nor all adapter finalization behavior.
+
+Real Fastly cache-hit qualification requires separately authorized staging with
+a controlled cacheable origin, two valid reader cookies, an origin counter, and
+recorded binary/config revisions. Do not infer cache hits from identical URLs or
+local compilation. Endpoint configuration and CLI diagnostics are documented in
+[First-Party Proxy](../docs/guide/first-party-proxy.md#inspect-policy-and-migrate).
+
 ## HTML EOF runtime checks
 
 Requires Rust, pinned Node and the selected runtime CLI. Run from the

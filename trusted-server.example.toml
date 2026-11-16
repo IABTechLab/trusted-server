@@ -218,6 +218,24 @@ proxy = "enabled"
 # matches apex).
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
+# Empty allowed_domains permits valid hosts; identity_endpoints is separately
+# DEFAULT OFF: omitted/empty grants no creative-proxy EC disclosure.
+# Explicit opt-in only after reviewing destinations, redirects, and consent.
+# IDs must be unique, 1-64 ASCII letters/digits/underscore/hyphen.
+# Each HTTPS DNS origin requires exactly one path_exact or path_prefix.
+# Prefixes must be / or end in /; query strings do not select a rule.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
+# Matching endpoints always bypass upstream caching and make the final response
+# private/no-store, even without eligible existing-cookie EC. No ID is generated.
+# Deploy compatible binaries first, then publish nonempty endpoint rules.
 #
 # Route first-party asset paths to a different backend origin. Longest matching
 # prefix wins; only GET/HEAD participate; query string is preserved.

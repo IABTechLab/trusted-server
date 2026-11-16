@@ -2433,3 +2433,424 @@ mod trace_parity {
         futures::stream::iter([Ok(Bytes::new()), Ok(Bytes::new())])
     }
 }
+
+#[cfg(test)]
+mod proxy_disclosure_parity {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use http::{StatusCode, header};
+    use trusted_server_core::http_util::compute_encrypted_sha256_token;
+    use trusted_server_core::platform::PlatformCacheIntent;
+    use trusted_server_core::proxy_policy::ProxyIdentityEndpoint;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct ObservedHop {
+        uri: String,
+        cache: PlatformCacheIntent,
+        headers: HeaderMap,
+    }
+
+    #[derive(Default)]
+    struct PolicyOrigin(Mutex<Vec<ObservedHop>>);
+
+    #[async_trait(?Send)]
+    impl PlatformHttpClient for PolicyOrigin {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let uri = request.request.uri().to_string();
+            let path = request.request.uri().path().to_owned();
+            self.0
+                .lock()
+                .expect("should record origin request")
+                .push(ObservedHop {
+                    uri,
+                    cache: request.cache_intent,
+                    headers: request.request.headers().clone(),
+                });
+            if path == "/transport-error" {
+                return Err(Report::new(PlatformError::HttpClient));
+            }
+            let mut response = edgezero_core::http::response_builder()
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .header(header::ETAG, "origin-validator")
+                .header(header::SET_COOKIE, "origin_state=forbidden")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+            if path == "/events/error-chain" {
+                response = response
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, "https://cdn.example.com/transport-error");
+            } else if path == "/events/malformed" {
+                response = response
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .header(header::CONTENT_ENCODING, "gzip");
+            } else if path == "/events/first" {
+                response = response.status(StatusCode::FOUND).header(
+                    header::LOCATION,
+                    "https://measurement.example.com/events/second?ts-ec=old",
+                );
+            } else if path == "/ambiguous" {
+                response = response.status(StatusCode::FOUND).header(
+                    header::LOCATION,
+                    "https://measurement.example.com/%2e/events/impression.gif?ts-ec=old",
+                );
+            } else if path == "/start" {
+                response = response.status(StatusCode::FOUND).header(
+                    header::LOCATION,
+                    "https://measurement.example.com/events/impression.gif",
+                );
+            } else if path == "/loop" {
+                response = response.status(StatusCode::FOUND).header(
+                    header::LOCATION,
+                    "https://cdn.example.com/loop?ts-ec=echoed",
+                );
+            }
+            Ok(PlatformResponse::new(
+                response
+                    .body(edgezero_core::body::Body::from("origin-body"))
+                    .expect("should build origin response"),
+            ))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    fn settings() -> Settings {
+        let mut settings = test_settings();
+        settings.proxy.identity_endpoints = vec![ProxyIdentityEndpoint {
+            id: "impression".to_owned(),
+            origin: "https://measurement.example.com".to_owned(),
+            path_exact: Some("/events/impression.gif".to_owned()),
+            path_prefix: None,
+        }];
+        settings
+            .proxy
+            .identity_endpoints
+            .push(ProxyIdentityEndpoint {
+                id: "event-family".to_owned(),
+                origin: "https://measurement.example.com".to_owned(),
+                path_exact: None,
+                path_prefix: Some("/events/".to_owned()),
+            });
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        settings
+    }
+
+    fn signed(settings: &Settings, target: &str) -> String {
+        let token = compute_encrypted_sha256_token(settings, target);
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("tsurl", target)
+            .append_pair("tstoken", &token)
+            .finish();
+        format!("https://test-publisher.example.com/first-party/proxy?{query}")
+    }
+
+    fn routers(
+        settings: &Settings,
+        origin: Arc<PolicyOrigin>,
+    ) -> Vec<(&'static str, RouterService)> {
+        let services = nextjs_auction::services_with_http_client(origin);
+        vec![
+            (
+                "Axum",
+                AxumApp::routes_with_settings_and_services(settings.clone(), services.clone())
+                    .expect("should build Axum policy routes"),
+            ),
+            (
+                "Cloudflare",
+                CloudflareApp::routes_with_settings_and_services(
+                    settings.clone(),
+                    services.clone(),
+                )
+                .expect("should build Cloudflare policy routes"),
+            ),
+            (
+                "Spin",
+                SpinApp::routes_with_settings_and_services(settings.clone(), services)
+                    .expect("should build Spin policy routes"),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_routes_deliver_authorized_identity_and_reassert_terminal_privacy() {
+        let settings = settings();
+        let origin = Arc::new(PolicyOrigin::default());
+        let endpoint = "https://measurement.example.com/events/impression.gif";
+        for (adapter, router) in routers(&settings, Arc::clone(&origin)) {
+            for (prefix, gpc) in [("a", false), ("b", false), ("c", true)] {
+                let identity = format!("{}.Ab1234", prefix.repeat(64));
+                assert!(
+                    trusted_server_core::ec::is_valid_ec_id(&identity),
+                    "should use a canonical reader cookie"
+                );
+                let mut request = request_builder()
+                    .method("GET")
+                    .uri(signed(&settings, endpoint))
+                    .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                    .header(header::USER_AGENT, "ExampleBrowser/1.0")
+                    .header(header::REFERER, "https://publisher.example.com/private")
+                    .header("sec-gpc", if gpc { "1" } else { "0" })
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build actual policy request");
+                request.headers_mut().insert(
+                    "x-ts-ec",
+                    http::HeaderValue::from_static("untrusted-header"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should execute real named proxy route");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should deliver event even without authorized EC"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should set private cache policy"),
+                    "no-store, private",
+                    "{adapter} should retain privacy after operator headers"
+                );
+                for name in [
+                    header::ETAG,
+                    header::SET_COOKIE,
+                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                ] {
+                    assert!(
+                        !response.headers().contains_key(name),
+                        "{adapter} should strip origin authority and late validators"
+                    );
+                }
+                let observed = origin.0.lock().expect("should inspect sent request");
+                let hop = observed
+                    .last()
+                    .expect("should reach actual origin transport");
+                let expected = if gpc {
+                    endpoint.to_owned()
+                } else {
+                    format!("{endpoint}?ts-ec={identity}")
+                };
+                assert_eq!(
+                    hop.uri, expected,
+                    "{adapter} should use canonical request-specific disclosure"
+                );
+                assert_eq!(
+                    hop.cache,
+                    PlatformCacheIntent::Bypass,
+                    "{adapter} should bypass cache even without EC"
+                );
+                assert!(
+                    !hop.headers.contains_key(header::REFERER),
+                    "{adapter} should withhold page context"
+                );
+                assert_eq!(
+                    hop.headers
+                        .get(header::USER_AGENT)
+                        .expect("should set fixed UA"),
+                    "TrustedServer/1.0"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_routes_apply_later_hop_policy_and_private_errors() {
+        let settings = settings();
+        let origin = Arc::new(PolicyOrigin::default());
+        for (adapter, router) in routers(&settings, Arc::clone(&origin)) {
+            let identity = format!("{}.Ab1234", "a".repeat(64));
+            let request = request_builder()
+                .uri(signed(&settings, "https://cdn.example.com/start"))
+                .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build redirect request");
+            let response = RouterService::oneshot(&router, request)
+                .await
+                .expect("should route redirected event");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{adapter} should follow authorized redirect"
+            );
+            {
+                let observed = origin.0.lock().expect("should inspect redirected requests");
+                let last = observed.last().expect("should reach event after redirect");
+                assert_eq!(
+                    last.uri,
+                    format!(
+                        "https://measurement.example.com/events/impression.gif?ts-ec={identity}"
+                    ),
+                    "{adapter} should classify the later hop"
+                );
+            }
+            for href in [signed(&settings, "https://cdn.example.com/loop"), "https://test-publisher.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com&token=invalid".to_owned()] {
+                let request = request_builder().uri(href).body(edgezero_core::body::Body::empty()).expect("should build terminal request");
+                let response = RouterService::oneshot(&router, request).await.expect("should finalize proxy error");
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{adapter} should reject terminal redirects and bad signatures");
+                assert!(!response.headers().contains_key(header::LOCATION), "{adapter} should not expose terminal Location");
+                assert_eq!(response.headers().get(header::CACHE_CONTROL).expect("should mark error private"), "no-store, private", "{adapter} should protect error after middleware");
+                assert!(!response.headers().contains_key(header::ETAG), "{adapter} should not restore error validators");
+            }
+        }
+    }
+    fn reader_request(
+        settings: &Settings,
+        target: &str,
+    ) -> http::Request<edgezero_core::body::Body> {
+        request_builder()
+            .uri(signed(settings, target))
+            .header(
+                header::COOKIE,
+                format!("ts-ec={}.Ab1234; us_privacy=1YNN", "a".repeat(64)),
+            )
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build canonical reader request")
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_event_failures_remain_private_through_adapter_finalization() {
+        let settings = settings();
+        let origin = Arc::new(PolicyOrigin::default());
+        for (adapter, router) in routers(&settings, Arc::clone(&origin)) {
+            for path in ["error-chain", "malformed"] {
+                let response = RouterService::oneshot(
+                    &router,
+                    reader_request(
+                        &settings,
+                        &format!("https://measurement.example.com/events/{path}"),
+                    ),
+                )
+                .await
+                .expect("should convert event failure at the real adapter boundary");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "{adapter} should preserve event failure status for {path}"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should retain event error privacy"),
+                    "no-store, private"
+                );
+                assert!(
+                    !response.headers().contains_key(header::ETAG),
+                    "{adapter} should remove late error validators"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_event_redirects_and_ambiguous_paths_keep_cache_safety() {
+        let settings = settings();
+        let origin = Arc::new(PolicyOrigin::default());
+        for (adapter, router) in routers(&settings, Arc::clone(&origin)) {
+            for target in [
+                "https://measurement.example.com/events/first",
+                "https://cdn.example.com/ambiguous",
+            ] {
+                let response = RouterService::oneshot(&router, reader_request(&settings, target))
+                    .await
+                    .expect("should dispatch redirect chain");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should deliver the resolved event"
+                );
+                let observed = origin.0.lock().expect("should inspect event hops");
+                let last = observed
+                    .last()
+                    .expect("should have dispatched the final event");
+                if target.contains("ambiguous") {
+                    assert_eq!(
+                        last.uri, "https://measurement.example.com/events/impression.gif",
+                        "{adapter} should withhold identity from ambiguous raw Location"
+                    );
+                } else {
+                    assert_eq!(
+                        last.uri,
+                        format!(
+                            "https://measurement.example.com/events/second?ts-ec={}.Ab1234",
+                            "a".repeat(64)
+                        ),
+                        "{adapter} should replace echoed identity for the next allowed event"
+                    );
+                }
+                assert_eq!(
+                    last.cache,
+                    PlatformCacheIntent::Bypass,
+                    "{adapter} should keep known event dispatch uncached even when identity is withheld"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should retain event privacy"),
+                    "no-store, private"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_old_signed_url_obeys_removed_identity_rule() {
+        let mut settings = settings();
+        settings
+            .proxy
+            .prepare_runtime()
+            .expect("should compile the original live grant");
+        let target = "https://measurement.example.com/events/impression.gif";
+        let href = signed(&settings, target);
+        let mut revoked = settings.clone();
+        revoked.proxy.identity_endpoints.clear();
+        let origin = Arc::new(PolicyOrigin::default());
+        for (adapter, router) in routers(&revoked, Arc::clone(&origin)) {
+            let request = request_builder()
+                .uri(&href)
+                .header(
+                    header::COOKIE,
+                    format!("ts-ec={}.Ab1234; us_privacy=1YNN", "a".repeat(64)),
+                )
+                .body(edgezero_core::body::Body::empty())
+                .expect("should reuse the already signed URL");
+            let response = RouterService::oneshot(&router, request)
+                .await
+                .expect("should evaluate current policy for an old token");
+            assert_eq!(response.status(), StatusCode::OK);
+            let observed = origin
+                .0
+                .lock()
+                .expect("should inspect origin URI after policy removal");
+            assert_eq!(
+                observed.last().expect("should perform resource fetch").uri,
+                target,
+                "{adapter} should not retain a stale compiled grant"
+            );
+        }
+    }
+}
