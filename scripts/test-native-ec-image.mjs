@@ -180,8 +180,6 @@ const dynamo = localEndpoint(opt.dynamodb)
 const id = randomUUID()
 const table = `ts-native-ec-fixture-${id}`
 const namespace = `fixture-${id}`
-const partition = `ec:${namespace}`
-const allocatorPartition = `ec-allocator:${namespace}`
 const work = await mkdtemp(join(tmpdir(), 'ts-native-ec-smoke-'))
 const output = resolve(
   opt.output ?? join(tmpdir(), `ts-native-ec-smoke-${id}.json`)
@@ -259,17 +257,37 @@ async function ddb(operation, payload) {
   )
   return JSON.parse(response.body.toString('utf8'))
 }
-const key = (sk, pk = partition) => ({ pk: { S: pk }, sk: { S: sk } })
-const get = async (sk, pk) =>
+// Observe SDK-selected keys rather than implementing its partition encoding.
+const valueKeys = new Map()
+const allocatorKeys = new Map()
+const nativeKey = (item) => ({ pk: item.pk, sk: item.sk })
+function rememberKey(keys, item) {
+  const key = nativeKey(item)
+  keys.set(JSON.stringify(key), key)
+}
+function observedKey(keys, logicalKey) {
+  // The SDK retains the full logical key after its opaque native prefix.
+  const matches = [...keys.values()].filter((key) =>
+    key.sk.S.endsWith(logicalKey)
+  )
+  assert.equal(matches.length, 1, 'expected exactly one observed native key')
+  return matches[0]
+}
+const getNative = async (key) =>
   (
     await ddb('GetItem', {
       TableName: table,
-      Key: key(sk, pk),
+      Key: key,
       ConsistentRead: true,
     })
   ).Item
+const get = (logicalKey) => getNative(observedKey(valueKeys, logicalKey))
+const getAllocator = (logicalKey) =>
+  getNative(observedKey(allocatorKeys, logicalKey))
+const logicalKeyMatches = (nativeSortKey, logicalKey) =>
+  nativeSortKey.endsWith(logicalKey)
 const decode = (item) =>
-  JSON.parse(Buffer.from(item.body.B, 'base64').toString('utf8'))
+  JSON.parse(Buffer.from(item.v.B, 'base64').toString('utf8'))
 let fault = 'normal'
 const pending = new Set()
 const verifiedPuts = []
@@ -292,22 +310,22 @@ async function proxyRequest(req, res) {
     const operation = String(req.headers['x-amz-target']).split('.').at(-1)
     assert.equal(payload.TableName, table, 'app attempted a non-fixture table')
     const write = operation === 'PutItem'
-    if (write)
-      assert.equal(
-        payload.Item.pk.S,
-        partition,
-        'app attempted a non-fixture identity partition'
-      )
-    if (operation === 'UpdateItem')
-      assert.equal(payload.Key.pk.S, allocatorPartition)
+    if (write) rememberKey(valueKeys, payload.Item)
+    if (operation === 'UpdateItem') rememberKey(allocatorKeys, payload.Key)
     const selectedFault = fault
+    // Hold one EID CAS, not the withdrawal CAS that must race with it.
+    if (
+      write &&
+      selectedFault === 'pause-cas' &&
+      payload.ConditionExpression?.includes(':expected')
+    )
+      fault = 'normal'
     event('ddb-request', {
       operation,
       fault: selectedFault,
       key: payload.Item?.sk?.S ?? payload.Key?.sk?.S,
       condition: payload.ConditionExpression,
       expectedGeneration: payload.ExpressionAttributeValues?.[':expected']?.N,
-      capturedNowMs: payload.ExpressionAttributeValues?.[':now']?.N,
     })
     if (write && selectedFault === 'deny') {
       res.writeHead(400, {
@@ -335,7 +353,6 @@ async function proxyRequest(req, res) {
           condition: payload.ConditionExpression,
           expectedGeneration:
             payload.ExpressionAttributeValues?.[':expected']?.N,
-          capturedNowMs: payload.ExpressionAttributeValues?.[':now']?.N,
         }
         pending.add(entry)
         res.once('close', () => {
@@ -357,10 +374,13 @@ async function proxyRequest(req, res) {
     })
     if (write && response.status === 200) {
       const sk = payload.Item.sk.S
-      const row = await get(sk)
+      const row = await getNative(nativeKey(payload.Item))
       assert(row, 'DynamoDB acknowledged PutItem without a readable row')
-      assert.equal(row.generation.N, payload.Item.generation.N)
-      assert.equal(row.body.B, payload.Item.body.B)
+      assert.deepEqual(
+        row,
+        payload.Item,
+        'stored native value must match the acknowledged write'
+      )
       verifiedPuts.push({
         key: sk,
         sequence: event('put-verified-before-ack', {
@@ -426,13 +446,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
   const fixture = {
     ec: {
       passphrase: 'ec_key',
-      storage: {
-        provider: 'dynamodb',
-        region: 'us-east-1',
-        table,
-        namespace,
-        local_endpoint: proxyEndpoint,
-      },
+      storage: { provider: 'records', store: 'trusted_server_kv' },
       partners: [
         {
           name: 'synthetic fixture',
@@ -459,6 +473,11 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     JSON.stringify({ trusted_server_config: envelope(fixture) })
   )
   await writeFile(
+    join(dir, 'native-bindings.toml'),
+    `version = 1\n[kv.trusted_server_kv]\nprovider = "aws-dynamodb-records"\nregion = "us-east-1"\ntable = "${table}"\nnamespace = "${namespace}"\n`
+  )
+  await chmod(join(dir, 'native-bindings.toml'), 0o444)
+  await writeFile(
     join(dir, 'native-geo.toml'),
     'version = 1\n[geo]\nprovider = "cloudfront"\nalb_peer_cidrs = ["127.0.0.1/32"]\norigin_credential_header_name = "x-origin-synthetic-fixture"\n'
   )
@@ -471,9 +490,17 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     AWS_CONFIG_FILE: `${root}/nonexistent-aws-config`,
     AWS_SHARED_CREDENTIALS_FILE: `${root}/nonexistent-aws-credentials`,
     AWS_EC2_METADATA_DISABLED: 'true',
+    AWS_ACCESS_KEY_ID: 'DUMMYLOCAL',
+    AWS_SECRET_ACCESS_KEY: 'DUMMYLOCAL',
+    AWS_ENDPOINT_URL_DYNAMODB: proxyEndpoint,
+    AWS_ENDPOINT_URL: proxyEndpoint,
+    AWS_ACCOUNT_ID_ENDPOINT_MODE: 'disabled',
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
     TS_NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
+    TS_EC_RECORDS_ENABLED: 'true',
+    EDGEZERO__STORE_BINDINGS_FILE: `${root}/native-bindings.toml`,
+    TMPDIR: opt.binary ? tmpdir() : '/tmp',
     EDGEZERO__ADAPTER__CONFIG_DIR: root,
     EDGEZERO__ADAPTER__DATA_DIR: opt.binary ? dir : '/data',
     EDGEZERO__ADAPTER__HOST: '127.0.0.1',
@@ -620,6 +647,18 @@ try {
       executable: opt['image-binary'] ?? '/usr/local/bin/app',
     }
   }
+  await bounded(
+    async () => {
+      try {
+        await ddb('ListTables', { Limit: 1 })
+        return true
+      } catch {
+        return false
+      }
+    },
+    15000,
+    'DynamoDB Local readiness deadline'
+  )
   // No table can pre-exist under this unpredictable UUID. Register ownership
   // before CreateTable so an ambiguous local response still gets cleanup.
   tableCreated = true
@@ -692,23 +731,18 @@ try {
     'eligible synthetic AU navigation must issue exactly one EC'
   )
   const ec = minted(first)[0]
-  const create = verifiedPuts.find((put) => put.key === ec)
+  const create = verifiedPuts.find((put) => logicalKeyMatches(put.key, ec))
   assert(
     create && create.sequence < first.responseSequence,
     'real row must be verified before SDK ack and cookie response headers'
   )
   const live = await get(ec)
   assert.equal(decode(live).consent.ok, true)
-  assert(Number(live.expires_at_ms.N) > Date.now())
-  assert.equal(
-    BigInt(live.ttl_epoch_s.N),
-    (BigInt(live.expires_at_ms.N) + 999n) / 1000n
-  )
+  assert(Number(live.ttl_epoch_s.N) * 1000 > Date.now())
   assert.match(first.headers['cache-control'], /private/)
-  const allocator = await get('generation', allocatorPartition)
+  const allocator = await getAllocator(ec)
   assert(allocator?.generation?.N)
   assert.equal(allocator.ttl_epoch_s, undefined)
-  assert.equal(allocator.expires_at_ms, undefined)
   record(
     'real DynamoDB row and non-expiring allocator precede new cookie headers'
   )
@@ -742,8 +776,8 @@ try {
   const tombstone = await get(ec)
   assert.equal(decode(tombstone).consent.ok, false)
   assert.equal(Object.keys(decode(tombstone).ids ?? {}).length, 0)
-  assert(BigInt(tombstone.generation.N) > BigInt(live.generation.N))
-  assert(Number(tombstone.expires_at_ms.N) > Date.now())
+  assert.notEqual(tombstone.generation.N, live.generation.N)
+  assert(Number(tombstone.ttl_epoch_s.N) * 1000 > Date.now())
   assert(Number(tombstone.ttl_epoch_s.N) * 1000 < Date.now() + 2 * 86400000)
   assert.equal(
     minted(await document(app, 'AU', { cookie: `ts-ec=${ec}` })).length,
@@ -757,17 +791,15 @@ try {
   record(
     'US TN GPC withdrawal expires cookie, persists a fresh-generation tombstone and resists AU reuse'
   )
-  // Hold a real EID CAS after the client captured :now but before DynamoDB
-  // evaluates it. Let the physical row expire logically, then withdraw it.
-  // Filtering key_exists by logical expiry would skip the protective tombstone
-  // and allow the delayed CAS to match the old physical generation afterward.
+  // Native TTL eligibility does not promise physical deletion. Keep a real
+  // past-TTL row present, hold an EID CAS, then withdraw before releasing it.
+  // Neither local expiry filtering nor the delayed CAS may bypass withdrawal.
   const raceCreated = await document(app)
   assert.equal(minted(raceCreated).length, 1)
   const raceEc = minted(raceCreated)[0]
   const raceItem = await get(raceEc)
-  const raceExpiry = Date.now() + 500
-  raceItem.expires_at_ms = { N: String(raceExpiry) }
-  raceItem.ttl_epoch_s = { N: String(Math.ceil(raceExpiry / 1000)) }
+  const raceExpiry = Math.floor(Date.now() / 1000) - 1
+  raceItem.ttl_epoch_s = { N: String(raceExpiry) }
   await ddb('PutItem', { TableName: table, Item: raceItem })
   const raceEids = Buffer.from(
     JSON.stringify([
@@ -785,28 +817,24 @@ try {
     (error) => ({ error })
   )
   await bounded(
-    () => [...pending].some((entry) => entry.key === raceEc),
+    () => [...pending].some((entry) => logicalKeyMatches(entry.key, raceEc)),
     2500,
-    'EID update must reach the real conditional PutItem before logical expiry'
+    'EID update must reach the real conditional PutItem for a present past-TTL row'
   )
-  const pausedCas = [...pending].find((entry) => entry.key === raceEc)
+  const pausedCas = [...pending].find((entry) =>
+    logicalKeyMatches(entry.key, raceEc)
+  )
   assert(pausedCas.condition.includes(':expected'))
   assert.equal(pausedCas.expectedGeneration, raceItem.generation.N)
   assert(
-    Number(pausedCas.capturedNowMs) < raceExpiry,
-    'CAS must capture its expiry check while the row is live'
+    await get(raceEc),
+    'past-TTL value must remain physically present for the race'
   )
   proof.expiryWithdrawalRace = {
     ec: raceEc,
-    expiresAtMs: raceExpiry,
+    ttlEpochSeconds: raceExpiry,
     expectedGeneration: pausedCas.expectedGeneration,
-    capturedNowMs: pausedCas.capturedNowMs,
   }
-  await bounded(
-    () => Date.now() > raceExpiry + 50,
-    1500,
-    'wait for logical expiry while the physical CAS remains pending'
-  )
   const raceWithdrawal = await document(app, 'US', {
     'cloudfront-viewer-country-region': 'TN',
     cookie: `ts-ec=${raceEc}`,
@@ -835,7 +863,7 @@ try {
   assert.equal(
     afterRaceBody.consent.ok,
     false,
-    'expired physical row must remain withdrawn after a delayed stale-time CAS'
+    'past-TTL physical row must remain withdrawn after a delayed stale-generation CAS'
   )
   assert.equal(
     Object.keys(afterRaceBody.ids ?? {}).length,
@@ -844,7 +872,7 @@ try {
   )
   assert.equal(minted(racedUpdate.value).length, 0)
   record(
-    'logical expiry plus delayed EID CAS cannot bypass US TN withdrawal or restore partner IDs'
+    'present past-TTL row plus delayed EID CAS cannot bypass US TN withdrawal or restore partner IDs'
   )
   fault = 'deny'
   const beforeDenied = verifiedPuts.length
@@ -894,7 +922,8 @@ try {
   assert(
     verifiedPuts.some(
       (put) =>
-        put.key === delayedEc && put.sequence < completed.value.responseSequence
+        logicalKeyMatches(put.key, delayedEc) &&
+        put.sequence < completed.value.responseSequence
     )
   )
   await bounded(
