@@ -854,7 +854,7 @@ mod tests {
     use crate::settings::EcPartner;
     use crate::test_support::logging::LogCapture;
     use crate::test_support::scripted_client::{
-        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+        ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::outbound::{OutboundCachePolicy, ResponseMode};
@@ -1019,6 +1019,90 @@ mod tests {
             response_decoding: ResponseDecoding::Decode,
             cache_policy: OutboundCachePolicy::PlatformDefault,
         });
+    }
+
+    /// Runs pull sync for one partner and returns the request it sent and the stored entry.
+    fn pull_once(settings: &Settings) -> (RecordedRequest, KvEntry) {
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &pull_url("alpha.example.com"),
+            ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+        );
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        run_pull_sync(settings, &graph, &registry, &context, &client, &clock);
+
+        let requests = client.requests();
+        let [request] = requests.as_slice() else {
+            panic!("should send one pull request, got {requests:?}");
+        };
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should keep the entry");
+        (request.clone(), entry)
+    }
+
+    #[test]
+    fn dispatch_pull_sync_ignores_relaxed_certificate_check() {
+        let strict = create_test_settings();
+        assert!(
+            strict.proxy.certificate_check,
+            "should default to verified TLS"
+        );
+        // A live config that still sets `false` loads with a warning and keeps the
+        // value, so pull sync can receive it.
+        let mut relaxed = create_test_settings();
+        relaxed.proxy.certificate_check = false;
+
+        let (strict_request, strict_entry) = pull_once(&strict);
+        let (relaxed_request, relaxed_entry) = pull_once(&relaxed);
+
+        assert_eq!(
+            relaxed_request.method, strict_request.method,
+            "should pull with the same method"
+        );
+        assert_eq!(
+            relaxed_request.uri, strict_request.uri,
+            "should pull the same HTTPS URL"
+        );
+        // Compare without printing header values, which carry the bearer token.
+        assert!(
+            relaxed_request.headers == strict_request.headers,
+            "should send the same headers"
+        );
+        assert_eq!(
+            relaxed_request.body, strict_request.body,
+            "should send the same body"
+        );
+        for request in [&strict_request, &relaxed_request] {
+            request.assert_transport(ExpectedTransport {
+                timeout: PULL_SYNC_GROUP_CUTOFF,
+                response_mode: ResponseMode::Buffered {
+                    max_bytes: MAX_PULL_RESPONSE_BYTES,
+                },
+                response_decoding: ResponseDecoding::Decode,
+                cache_policy: OutboundCachePolicy::PlatformDefault,
+            });
+        }
+        for entry in [&strict_entry, &relaxed_entry] {
+            assert_eq!(
+                entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+                Some("synced-uid"),
+                "should persist the partner UID with either setting"
+            );
+        }
     }
 
     #[test]

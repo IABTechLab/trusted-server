@@ -1972,7 +1972,7 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Must be true. Origin TLS is always verified.
+    /// Must be true. TLS is always verified on every outbound HTTPS request.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the

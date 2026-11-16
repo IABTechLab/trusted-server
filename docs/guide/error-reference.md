@@ -192,7 +192,7 @@ failure codes and no URL.
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
-  valid certificate; origin TLS is always verified
+  valid certificate; TLS is always verified
 - Read the outbound status and kind in the warning's report, and its
   `outbound provider failure detail` line when it has one
 - On Fastly, check the service's dynamic backend use. Fastly allows 200
