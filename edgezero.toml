@@ -13,6 +13,13 @@ entry = "crates/trusted-server-core"
 kind = "http"
 version = "0.1.0"
 
+# -- Capabilities ------------------------------------------------------------
+# Publisher origins and integrations may use HTTP or HTTPS. An absent list means
+# HTTPS only, and `"*"` allows both, matching the Spin manifest's allowed hosts.
+
+[capabilities.outbound]
+hosts = ["*"]
+
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the
 # physical store each adapter binds is overridable out of band (Fastly binds

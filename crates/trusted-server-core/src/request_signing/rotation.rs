@@ -60,7 +60,7 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if key storage or update operations fail.
-    pub fn rotate_key(
+    pub async fn rotate_key(
         &self,
         services: &RuntimeServices,
         kid: Option<String>,
@@ -86,14 +86,16 @@ impl KeyRotationManager {
         let jwk = keypair.get_jwk(new_kid.clone());
 
         // Step 1: write private key. Nothing to roll back on failure.
-        self.store_private_key(services, &new_kid, &keypair.signing_key)?;
+        self.store_private_key(services, &new_kid, &keypair.signing_key)
+            .await?;
 
         // Step 2: write public JWK. Roll back the private key on failure so no
         // orphaned key material is left in the secret store.
-        if let Err(err) = self.store_public_jwk(services, &new_kid, &jwk) {
+        if let Err(err) = self.store_public_jwk(services, &new_kid, &jwk).await {
             if let Err(rollback_err) = services
                 .secret_store()
                 .delete(&self.secret_store_id, &new_kid)
+                .await
             {
                 log::warn!(
                     "rotate_key: rollback of private key '{new_kid}' failed after JWK write error: {rollback_err}"
@@ -110,10 +112,11 @@ impl KeyRotationManager {
         // Step 3: publish the new kid in active-kids BEFORE flipping current-kid.
         // Roll back both artifacts on failure so the new kid never appears in JWKS
         // without a reachable private key.
-        if let Err(err) = self.update_active_kids(services, &active_kids) {
+        if let Err(err) = self.update_active_kids(services, &active_kids).await {
             if let Err(rollback_err) = services
                 .config_store()
                 .delete(&self.config_store_id, &new_kid)
+                .await
             {
                 log::warn!(
                     "rotate_key: rollback of JWK '{new_kid}' failed after active-kids write error: {rollback_err}"
@@ -122,6 +125,7 @@ impl KeyRotationManager {
             if let Err(rollback_err) = services
                 .secret_store()
                 .delete(&self.secret_store_id, &new_kid)
+                .await
             {
                 log::warn!(
                     "rotate_key: rollback of private key '{new_kid}' failed after active-kids write error: {rollback_err}"
@@ -131,8 +135,8 @@ impl KeyRotationManager {
         }
 
         // Step 4: flip current-kid last. A failure here leaves the old kid still
-        // active and the new kid visible in JWKS but unused — a recoverable state.
-        self.update_current_kid(services, &new_kid)?;
+        // active and the new kid visible in JWKS but unused, which is recoverable.
+        self.update_current_kid(services, &new_kid).await?;
 
         Ok(KeyRotationResult {
             new_kid,
@@ -160,7 +164,7 @@ impl KeyRotationManager {
         format!("{base_kid}-{}", Uuid::new_v4().simple())
     }
 
-    fn store_private_key(
+    async fn store_private_key(
         &self,
         services: &RuntimeServices,
         kid: &str,
@@ -174,12 +178,13 @@ impl KeyRotationManager {
         services
             .secret_store()
             .create(&self.secret_store_id, kid, &key_b64)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: format!("failed to store private key '{kid}'"),
             })
     }
 
-    fn store_public_jwk(
+    async fn store_public_jwk(
         &self,
         services: &RuntimeServices,
         kid: &str,
@@ -194,12 +199,13 @@ impl KeyRotationManager {
         services
             .config_store()
             .put(&self.config_store_id, kid, &jwk_json)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: format!("failed to store public JWK '{kid}'"),
             })
     }
 
-    fn update_current_kid(
+    async fn update_current_kid(
         &self,
         services: &RuntimeServices,
         kid: &str,
@@ -207,12 +213,13 @@ impl KeyRotationManager {
         services
             .config_store()
             .put(&self.config_store_id, "current-kid", kid)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: "failed to update current-kid".into(),
             })
     }
 
-    fn update_active_kids(
+    async fn update_active_kids(
         &self,
         services: &RuntimeServices,
         active_kids: &[String],
@@ -222,6 +229,7 @@ impl KeyRotationManager {
         services
             .config_store()
             .put(&self.config_store_id, "active-kids", &active_kids_str)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: "failed to update active-kids".into(),
             })
@@ -244,7 +252,7 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if this would deactivate the last active key, or if the update fails.
-    pub fn deactivate_key(
+    pub async fn deactivate_key(
         &self,
         services: &RuntimeServices,
         kid: &str,
@@ -260,7 +268,7 @@ impl KeyRotationManager {
             }));
         }
 
-        self.update_active_kids(services, &active_kids)
+        self.update_active_kids(services, &active_kids).await
     }
 
     /// Deletes a key by deactivating it and removing it from storage.
@@ -268,13 +276,13 @@ impl KeyRotationManager {
     /// # Errors
     ///
     /// Returns an error if deactivation fails or if the key cannot be deleted from storage.
-    pub fn delete_key(
+    pub async fn delete_key(
         &self,
         services: &RuntimeServices,
         kid: &str,
     ) -> Result<(), Report<TrustedServerError>> {
         self.ensure_not_current_key(services, kid, "delete")?;
-        self.deactivate_key(services, kid)?;
+        self.deactivate_key(services, kid).await?;
 
         // Delete the private key first. A failure here leaves the JWK in the
         // config store but no private key — the key is verifiable but cannot
@@ -283,6 +291,7 @@ impl KeyRotationManager {
         services
             .secret_store()
             .delete(&self.secret_store_id, kid)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: "failed to delete signing key from secret store".into(),
             })?;
@@ -290,6 +299,7 @@ impl KeyRotationManager {
         services
             .config_store()
             .delete(&self.config_store_id, kid)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: "failed to delete JWK from config store".into(),
             })?;
@@ -332,6 +342,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use error_stack::Report;
+    use futures::executor::block_on;
 
     use crate::platform::test_support::build_services_with_config_and_secret;
     use crate::platform::{
@@ -396,6 +407,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for SpyConfigStore {
         fn get(&self, _: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             self.inner
@@ -407,7 +419,7 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::ConfigStore))
         }
 
-        fn put(
+        async fn put(
             &self,
             store_id: &StoreId,
             key: &str,
@@ -433,7 +445,7 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
             self.inner
                 .deletes
                 .lock()
@@ -500,12 +512,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for SpySecretStore {
         fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
             Err(Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             store_id: &StoreId,
             name: &str,
@@ -528,7 +541,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            store_id: &StoreId,
+            name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             self.inner
                 .deletes
                 .lock()
@@ -574,7 +591,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("new-kid".to_owned()));
+        let result = block_on(manager.rotate_key(&services, Some("new-kid".to_owned())));
 
         assert!(result.is_ok(), "should succeed when stores accept writes");
         let rotation = result.expect("should produce rotation result");
@@ -596,8 +613,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let rotation = manager
-            .rotate_key(&services, Some("kid-c".to_owned()))
+        let rotation = block_on(manager.rotate_key(&services, Some("kid-c".to_owned())))
             .expect("should rotate key successfully");
 
         assert_eq!(
@@ -627,8 +643,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let rotation = manager
-            .rotate_key(&services, Some("kid-c".to_owned()))
+        let rotation = block_on(manager.rotate_key(&services, Some("kid-c".to_owned())))
             .expect("should rotate key successfully");
 
         assert_eq!(
@@ -650,7 +665,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("kid-a".to_owned()));
+        let result = block_on(manager.rotate_key(&services, Some("kid-a".to_owned())));
 
         assert!(
             result.is_err(),
@@ -678,8 +693,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let rotation = manager
-            .rotate_key(&services, None)
+        let rotation = block_on(manager.rotate_key(&services, None))
             .expect("should rotate with a uniquified generated kid");
 
         assert_ne!(
@@ -709,7 +723,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.deactivate_key(&services, "only-key");
+        let result = block_on(manager.deactivate_key(&services, "only-key"));
 
         assert!(
             result.is_err(),
@@ -740,7 +754,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("new-kid".to_owned()));
+        let result = block_on(manager.rotate_key(&services, Some("new-kid".to_owned())));
 
         assert!(
             result.is_err(),
@@ -756,7 +770,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("rollback-kid".to_owned()));
+        let result = block_on(manager.rotate_key(&services, Some("rollback-kid".to_owned())));
 
         assert!(result.is_err(), "should fail when JWK write fails");
         assert_eq!(
@@ -778,7 +792,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("rollback-kid".to_owned()));
+        let result = block_on(manager.rotate_key(&services, Some("rollback-kid".to_owned())));
 
         assert!(result.is_err(), "should fail when active-kids write fails");
         assert_eq!(
@@ -805,7 +819,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.deactivate_key(&services, "kid-a");
+        let result = block_on(manager.deactivate_key(&services, "kid-a"));
 
         assert!(result.is_err(), "should reject deactivating current-kid");
         assert!(
@@ -830,7 +844,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.delete_key(&services, "kid-a");
+        let result = block_on(manager.delete_key(&services, "kid-a"));
 
         assert!(result.is_err(), "should reject deleting current-kid");
         assert!(
@@ -857,9 +871,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        manager
-            .delete_key(&services, "kid-a")
-            .expect("should delete key successfully");
+        block_on(manager.delete_key(&services, "kid-a")).expect("should delete key successfully");
 
         // After deletion, the JWK entry should be gone from the config store.
         let jwk_gone = services

@@ -39,20 +39,14 @@ before it constructs the application.
    - Add your domain of the website you'll be testing or using
    - Click **Update**
 
-## Configure Origins
+## Origins
 
-Origins are the backend servers that Trusted Server will communicate with (ad servers, SSPs, etc.).
-
-1. In your Compute service, click on the **Origins** section
-2. For each backend you need to add:
-   - Enter the FQDN or IP address
-   - Click **Add**
-   - Enter a **Name** in the first field - this name will be referenced in your code (e.g., `my_ad_integration_1`)
-   - Configure port numbers and TLS settings as needed
-
-::: tip
-After saving origin information, you can select port numbers and toggle TLS on/off.
-:::
+Trusted Server needs no static origins on the Compute service. For every
+upstream it calls, such as the publisher origin, an auction provider, or an
+integration, EdgeZero registers a dynamic backend at request time from the
+request URL. Each backend is named `ez_b31v1_` followed by a hash of its
+configuration, so dashboards that group by backend name see those names. TLS
+to an HTTPS upstream is always verified.
 
 ## Configure Fastly CLI Profile
 
@@ -447,8 +441,8 @@ through Viceroy. The required keys are `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase`.
 
 The check deliberately proves both halves of startup. With no config entry, it
-requires `/health` to return 200 while the publisher route returns 500 with the
-missing `trusted_server_config` diagnostic. It then removes each required
+requires `/health` to return 200 while the publisher route returns 500 and the
+log names the missing `trusted_server_config` entry. It then removes each required
 secret independently and requires the corresponding setting path to fail.
 Finally, the publisher request must return 200, retain the stub-origin
 sentinel, rewrite an origin URL to the Fastly listener, and omit the original

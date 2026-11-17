@@ -1,6 +1,6 @@
 # Sourcepoint Integration
 
-Sourcepoint provides consent and privacy messaging for publishers. This integration proxies the Sourcepoint CDN endpoint through Trusted Server so the browser loads it from a first-party path.
+Sourcepoint provides consent and privacy messaging for publishers. This integration captures its GPP signals for Trusted Server and can proxy its SDK through a first-party path.
 
 ## Overview
 
@@ -83,7 +83,51 @@ Trusted Server also injects a `window._sp_` property trap that rewrites known So
 
 Single-page apps often insert CMP scripts after the initial HTML response. The `sourcepoint` tsjs module installs a DOM insertion guard so dynamically inserted Sourcepoint script and preload URLs are rewritten to first-party paths before the browser fetches them.
 
+## Consent capture
+
+To capture consent without rewriting the publisher's existing CMP URLs:
+
+```toml
+[integrations.sourcepoint]
+enabled = true
+rewrite_sdk = false
+```
+
+The browser module observes the publisher's existing `__gpp` API. With API 1.1 it subscribes to events and reads callback `ping` snapshots only when `signalStatus` is `ready`. With API 1.0 it uses synchronous `ping` and `getGPPData`. It observes late SDK publication without polling, removes replaced listeners, and ignores superseded asynchronous reads. It does not install a CMP or infer permission from Sourcepoint's accept-all flags.
+
+Actual applicable GPP signals become host-scoped, Secure, SameSite=Lax session cookies named `__gpp` and `__gpp_sid`. The `_ts_gpp_src=sp` marker identifies cookies maintained by this integration. Unready or unusable API state clears only Sourcepoint-owned mirrors. Cookies owned by another writer are not overwritten or cleared. The older localStorage formats remain a compatibility fallback only when no GPP API exists.
+
+```mermaid
+flowchart TD
+    CMP[Publisher CMP readiness or choice event] --> Read[Read current GPP snapshot]
+    Read --> Mirror[Update Sourcepoint-owned consent cookies]
+    Mirror --> POST[POST /_ts/consent with the same snapshot]
+    POST --> Policy[Existing server consent and Geo policy]
+    Policy --> Finalize[Finalize EC and persist authoritative withdrawal]
+```
+
+`POST /_ts/consent` requires a matching same-origin `Origin`. It accepts a bounded JSON snapshot containing `gppString` and `applicableSections`, not identity or partner credentials. Each request carries its own decision so a later cookie update cannot replace an intervening opt-out. It preserves other privacy inputs, including GPC. Missing GPP state is not fabricated into an opt-out or permission grant.
+
+The endpoint never creates or recovers identities, ingests EIDs, or restores a revoked row. Creation remains on eligible publisher navigation after consent cookies are available. This keeps an older grant response from recreating identity after withdrawal. Explicit withdrawal follows the existing server jurisdiction/consent policy and expires the HttpOnly EC cookie while tombstoning its stored identity.
+
+Only `204` confirms processing; generic publisher `200` responses do not. Store absence or a failed withdrawal write returns `503`. Responses are private and no-store. Fastly uses its EC identity graph; native reconciliation requires native EC persistence. Adapters without an identity graph reserve the path and report failure rather than forwarding its payload to the publisher. Network failures are reported without logging consent values and can retry on a later CMP or focus event.
+
+Deploy the server endpoint and persistence support before enabling capture. Reload already-open pages to load the new observer. Validate actual CMP readiness, same-tab opt-out, EC expiry, and the backing tombstone before treating withdrawal as verified.
+
 ## Cookie Forwarding and Caching
+
+On HTTPS publisher pages, the browser integration also listens to Sourcepoint's
+TCF API. When the CMP has a settled GDPR decision and has not supplied
+`euconsent-v2`, it mirrors the original TC string into the host-only session
+cookie `__Host-ts-tcf`. Trusted Server prefers `euconsent-v2` when present and
+otherwise decodes the mirror through its existing TCF consent rules. The
+mirror is independent of GPP and does not create or change consent.
+
+A grant can permit Edge Cookie issuance on the next eligible page navigation.
+A later denial replaces the grant so subsequent requests can reconcile
+withdrawal. The browser integration neither reloads the page nor issues an Edge
+Cookie itself. In Prebid cookie forwarding modes, the selected TCF signal is
+sent as `euconsent-v2` rather than using the bridge cookie name.
 
 Trusted Server forwards only Sourcepoint's documented cookie names upstream, plus the optional `auth_cookie_name` when configured. Unrelated publisher cookies are deliberately excluded so first-party application state is not leaked to Sourcepoint.
 

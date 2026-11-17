@@ -222,7 +222,11 @@ impl AuctionObservationContext {
     }
 
     #[cfg(test)]
-    fn for_test(auction_source: AuctionSource, page_path: &str, slot_count: u16) -> Self {
+    pub(crate) fn for_test(
+        auction_source: AuctionSource,
+        page_path: &str,
+        slot_count: u16,
+    ) -> Self {
         Self {
             auction_id: Uuid::new_v4(),
             auction_source,

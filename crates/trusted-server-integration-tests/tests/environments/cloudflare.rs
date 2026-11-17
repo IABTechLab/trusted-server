@@ -115,14 +115,27 @@ impl CloudflareWorkers {
     /// written or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+        self.spawn_with_config_json_and_readiness(config_json, |base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
+    }
+
+    /// Retargets the fixture's public origin before using a custom readiness probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns configuration, runtime spawn or readiness-probe failures.
+    pub(crate) fn spawn_with_config_json_and_readiness(
+        &self,
+        config_json: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
         let public_origin = format!("http://127.0.0.1:{port}");
         let config_json = cloudflare_config_with_public_origin(config_json, &public_origin)?;
         let wrangler_dir = self.wrangler_dir();
         let config = write_generated_ci_config(&wrangler_dir, &config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config, port, |base_url| {
-            super::wait_for_ready(base_url, self.health_check_path(), true)
-        })
+        self.spawn_wrangler(&wrangler_dir, &config, port, ready)
     }
 
     fn spawn_wrangler(

@@ -218,6 +218,7 @@ mod tests {
         entries: BTreeMap<String, String>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for MemoryConfigStore {
         fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             self.entries.get(key).cloned().ok_or_else(|| {
@@ -225,7 +226,7 @@ mod tests {
             })
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
@@ -234,13 +235,18 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
         fn get_bytes(
             &self,
@@ -254,7 +260,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -263,7 +269,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }

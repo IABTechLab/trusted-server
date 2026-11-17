@@ -21,30 +21,30 @@
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "placeholder"
             data = "placeholder"
 
         # Pre-seeded EC rows for KV-backed EC lifecycle tests. Each scenario
         # uses a separate row so withdrawal tombstones do not leak across
         # sequential scenario execution in the same Viceroy instance.
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.test02"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.test03"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.test04"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.test05"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
@@ -81,6 +81,14 @@
         [[local_server.secret_stores.trusted_server_secrets]]
             key = "integration_partner_token_bravo"
             data = "integration-test-token-bravo-32-bytes-ok"
+        # Example AWS credentials for the S3 SigV4 asset routes. They sign
+        # requests to a loopback test origin only.
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_s3_access_key_id"
+            data = "AKIAIOSFODNN7EXAMPLE"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_s3_secret_access_key"
+            data = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 
     [local_server.config_stores]
         # Generated integration configs inject the manifest-default app-config blob

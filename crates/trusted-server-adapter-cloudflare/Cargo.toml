@@ -31,14 +31,12 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
-web-time = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 worker = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
-js-sys = { workspace = true }
 worker = { workspace = true }
 
 [dev-dependencies]
@@ -46,6 +44,7 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
 toml = { workspace = true }
+web-time = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

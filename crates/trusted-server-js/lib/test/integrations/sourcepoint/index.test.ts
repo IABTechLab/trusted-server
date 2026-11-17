@@ -47,6 +47,24 @@ describe('Sourcepoint integration initialization', () => {
     expect(guard.isGuardInstalled()).toBe(false);
   });
 
+  it('disposes the TCF mirror before reinitializing the existing consent lifecycle', async () => {
+    vi.resetModules();
+    const tcf = await import('../../../src/integrations/sourcepoint/tcf_mirror');
+    const dispose = vi.fn();
+    const install = vi.spyOn(tcf, 'installSourcepointTcfMirror').mockReturnValue(dispose);
+    const integration = await import('../../../src/integrations/sourcepoint/index');
+    try {
+      expect(install).toHaveBeenCalledTimes(1);
+      integration.disposeSourcepointConsentMirror();
+      expect(dispose).toHaveBeenCalledTimes(1);
+      integration.initializeSourcepointConsentMirror();
+      expect(install).toHaveBeenCalledTimes(2);
+    } finally {
+      integration.disposeSourcepointConsentMirror();
+      install.mockRestore();
+    }
+  });
+
   it('defaults to installing the guard when rewriteSdk is missing for backward compatibility', async () => {
     vi.resetModules();
 

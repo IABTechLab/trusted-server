@@ -8,21 +8,27 @@
 //! present in the EC identity entry, it is not periodically refreshed because
 //! the entry no longer stores per-partner sync timestamps.
 
-use edgezero_core::body::Body as EdgeBody;
+use std::time::Duration;
+
+use edgezero_core::error::EdgeError;
+use edgezero_core::outbound::{
+    HttpClient, OutboundCollectedSlot, OutboundRequest, OutboundResponse, ResponseDecoding,
+};
+use edgezero_core::time::MonotonicClock;
 use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
 use crate::consent::allows_eid_persistence;
-use crate::platform::{
-    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, RuntimeServices,
+use crate::error::TrustedServerError;
+use crate::outbound::{
+    BUFFERED_TIMEOUT, OutboundRequestSource, buffered, outbound_error, outbound_request,
 };
 use crate::settings::Settings;
 
 use super::generation::{ec_hash, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
-use super::kv_types::KvEntry;
+use super::kv_types::{KvEntry, MAX_UID_LENGTH};
 use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
 
@@ -46,10 +52,16 @@ impl PullSyncContext {
     }
 }
 
-struct InFlightPull {
+/// One partner request waiting for its group to be sent.
+struct QueuedPull {
     source_domain: String,
-    pending: PlatformPendingRequest,
+    request: OutboundRequest,
 }
+
+/// How long a group of partner requests may run before it is cut off.
+///
+/// Each request also carries it as its own timeout.
+const PULL_SYNC_GROUP_CUTOFF: Duration = BUFFERED_TIMEOUT;
 
 #[derive(Debug, Deserialize)]
 struct PullSyncResponse {
@@ -97,6 +109,11 @@ pub fn build_pull_sync_context(
 ///
 /// This function is best-effort: all errors are logged and swallowed.
 ///
+/// Partners are sent in groups of `ec.pull_sync_concurrency` through
+/// [`HttpClient::send_all_until`]. Each group is cut off
+/// [`PULL_SYNC_GROUP_CUTOFF`] after it starts, on `clock`, and a partner that
+/// has not answered by then is skipped.
+///
 /// # Consent revalidation
 ///
 /// Pull sync runs *after* the page response has been flushed to the browser and
@@ -108,18 +125,14 @@ pub fn build_pull_sync_context(
 /// snapshot-based eligibility filter, so a request with nothing to pull still
 /// costs no KV operation, and the fresh snapshot is reused for the write-back
 /// instead of the stale one.
-///
-/// # Panics
-///
-/// Panics if the HTTP request builder produces an invalid request, which
-/// cannot happen with the hardcoded method and well-formed URI used here.
-pub fn dispatch_pull_sync(
+pub async fn dispatch_pull_sync(
     settings: &Settings,
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     context: &PullSyncContext,
-    services: &RuntimeServices,
+    client: &HttpClient,
+    clock: &MonotonicClock,
 ) {
     let now = current_timestamp();
     let mut pull_partners = registry.pull_enabled_partners();
@@ -163,7 +176,7 @@ pub fn dispatch_pull_sync(
         return;
     }
 
-    let live_snapshot = kv.load_snapshot(context.ec_id());
+    let live_snapshot = kv.load_snapshot(context.ec_id()).await;
     let Some(live_entry) = live_snapshot.entry_for(context.ec_id()) else {
         log::warn!(
             "Pull sync: skipping dispatch for '{}' because the live identity row could not be \
@@ -182,7 +195,7 @@ pub fn dispatch_pull_sync(
     }
 
     let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
-    let mut in_flight: Vec<InFlightPull> = Vec::new();
+    let mut group: Vec<QueuedPull> = Vec::new();
     let mut updates = Vec::new();
 
     for partner in pull_partners {
@@ -225,69 +238,38 @@ pub fn dispatch_pull_sync(
         };
 
         let request_url = build_pull_request_url(url, context.ec_id());
-        let scheme = request_url.scheme().to_string();
-        let host = request_url.host_str().unwrap_or_default().to_string();
-        let port = request_url.port();
-
-        let backend_name = match services.backend().ensure(&PlatformBackendSpec {
-            scheme,
-            host,
-            port,
-            host_header_override: None,
-            certificate_check: settings.proxy.certificate_check,
-            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            discriminator: None,
-        }) {
-            Ok(name) => name,
+        let request = match pull_request(&request_url, token.expose()) {
+            Ok(request) => request,
             Err(err) => {
-                log::warn!(
-                    "Pull sync: failed to resolve backend for partner '{}': {err:?}",
-                    partner.source_domain
+                log_pull_failure(
+                    err,
+                    format!(
+                        "request for partner '{}' could not be built",
+                        partner.source_domain
+                    ),
                 );
                 continue;
             }
         };
 
-        let request = http::Request::builder()
-            .method(Method::GET)
-            .uri(request_url.as_str())
-            .header("authorization", format!("Bearer {}", token.expose()))
-            .body(EdgeBody::empty())
-            .expect("should build pull sync request");
-
-        let pending = match futures::executor::block_on(
-            services
-                .http_client()
-                .send_async(PlatformHttpRequest::new(request, backend_name)),
-        ) {
-            Ok(pending) => pending,
-            Err(err) => {
-                log::warn!(
-                    "Pull sync: failed to dispatch partner '{}': {err:?}",
-                    partner.source_domain
-                );
-                continue;
-            }
-        };
-
-        in_flight.push(InFlightPull {
+        group.push(QueuedPull {
             source_domain: partner.source_domain.clone(),
-            pending,
+            request,
         });
 
-        if in_flight.len() >= max_concurrency {
-            drain_pull_batch(&mut in_flight, services, &mut updates);
+        if group.len() >= max_concurrency {
+            send_pull_group(client, clock, &mut group, &mut updates).await;
         }
     }
 
-    drain_pull_batch(&mut in_flight, services, &mut updates);
+    send_pull_group(client, clock, &mut group, &mut updates).await;
     if !updates.is_empty() {
         // Write back from the revalidated snapshot, not the request one: its
         // generation is current, so the first CAS attempt is not spent losing a
         // conflict against the read that authorized this dispatch.
-        let outcome =
-            kv.upsert_partner_ids_from_snapshot(context.ec_id(), &updates, live_snapshot.clone());
+        let outcome = kv
+            .upsert_partner_ids_from_snapshot(context.ec_id(), &updates, live_snapshot.clone())
+            .await;
         if matches!(outcome, EcKvSnapshot::Failed { .. }) {
             log::warn!(
                 "Pull sync: failed to persist partner updates for '{}'",
@@ -374,77 +356,113 @@ fn pull_rate_limit_key(source_domain: &str, ec_id: &str) -> String {
     format!("pull:{source_domain}:{}", ec_hash(ec_id))
 }
 
-fn drain_pull_batch(
-    in_flight: &mut Vec<InFlightPull>,
-    services: &RuntimeServices,
+/// Builds one partner's pull-sync request.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] that building the request or its
+/// `Authorization` header raised.
+fn pull_request(url: &Url, token: &str) -> Result<OutboundRequest, EdgeError> {
+    let request = outbound_request(Method::GET, url.as_str())?
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))?;
+    Ok(buffered(
+        request,
+        PULL_SYNC_GROUP_CUTOFF,
+        MAX_PULL_RESPONSE_BYTES,
+        ResponseDecoding::Decode,
+    ))
+}
+
+/// Logs one failed pull-sync step at warn, through [`outbound_error`].
+///
+/// `outbound_error` logs the failure's status, kind, budget source, and
+/// provider detail, never the error's message, which can hold provider text
+/// or a URL. This then logs the report with the `failed` step.
+fn log_pull_failure(error: EdgeError, failed: String) {
+    let report = outbound_error(
+        error,
+        TrustedServerError::EdgeCookie { message: failed },
+        OutboundRequestSource::Internal,
+    );
+    log::warn!("Pull sync failed: {report:?}");
+}
+
+/// Sends the queued `group` and collects the UIDs its partners answer with.
+///
+/// The group ends [`PULL_SYNC_GROUP_CUTOFF`] after it starts. A partner that
+/// has not answered by then is logged and skipped.
+async fn send_pull_group(
+    client: &HttpClient,
+    clock: &MonotonicClock,
+    group: &mut Vec<QueuedPull>,
     updates: &mut Vec<PartnerIdUpdate>,
 ) {
-    for pending in in_flight.drain(..) {
-        let source_domain = pending.source_domain;
-        // All requests were dispatched up front via send_async, so waiting on
-        // each in turn does not change concurrency.
-        let response =
-            match futures::executor::block_on(services.http_client().wait(pending.pending)) {
+    if group.is_empty() {
+        return;
+    }
+    let (source_domains, requests): (Vec<String>, Vec<OutboundRequest>) = group
+        .drain(..)
+        .map(|queued| (queued.source_domain, queued.request))
+        .unzip();
+    let cutoff = clock.deadline_after(PULL_SYNC_GROUP_CUTOFF);
+    let slots = match client.send_all_until(requests, cutoff).await {
+        Ok(results) => results.into_parts().0,
+        Err(failure) => {
+            let (error, slots) = failure.into_parts();
+            log_pull_failure(error, "partner group failed".to_owned());
+            slots
+        }
+    };
+
+    for (source_domain, slot) in source_domains.into_iter().zip(slots) {
+        let response = match slot {
+            OutboundCollectedSlot::Resolved(result) => match result.outcome {
                 Ok(response) => response,
                 Err(err) => {
-                    log::warn!(
-                        "Pull sync: request failed for partner '{}': {err:?}",
-                        source_domain
-                    );
+                    log_pull_failure(err, format!("request for partner '{source_domain}' failed"));
                     continue;
                 }
-            };
-
-        let Some(uid) = extract_pull_uid(response, &source_domain) else {
-            continue;
+            },
+            OutboundCollectedSlot::Unresolved => {
+                log::warn!(
+                    "Pull sync: partner '{source_domain}' did not answer within the {}s group cutoff",
+                    PULL_SYNC_GROUP_CUTOFF.as_secs()
+                );
+                continue;
+            }
+            OutboundCollectedSlot::AlreadyDelivered => continue,
         };
 
-        updates.push(PartnerIdUpdate::new(source_domain, uid));
+        if let Some(uid) = extract_pull_uid(response, &source_domain).await {
+            updates.push(PartnerIdUpdate::new(source_domain, uid));
+        }
     }
 }
 
 /// Maximum response body size accepted from pull sync partners (64 KiB).
 ///
 /// The expected response is `{"uid":"<string>"}`, so 64 KiB is generous.
-/// This prevents a misbehaving partner from exhausting WASM memory.
-const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024;
+/// Each request carries it as its response cap, so a misbehaving partner
+/// cannot exhaust WASM memory.
+const MAX_PULL_RESPONSE_BYTES: u64 = 64 * 1024;
 
-fn response_content_length_exceeds_limit(response: &PlatformResponse, source_domain: &str) -> bool {
-    let Some(value) = response.response.headers().get(header::CONTENT_LENGTH) else {
-        return false;
+async fn extract_pull_uid(response: OutboundResponse, source_domain: &str) -> Option<String> {
+    let status = response.status();
+    let body = match response.into_bytes_bounded(MAX_PULL_RESPONSE_BYTES).await {
+        Ok(body) => body,
+        Err(err) => {
+            log_pull_failure(
+                err,
+                format!("response from partner '{source_domain}' could not be read"),
+            );
+            return None;
+        }
     };
-
-    let Some(value) = value.to_str().ok() else {
-        log::warn!(
-            "Pull sync: partner '{}' returned invalid Content-Length header, rejecting",
-            source_domain
-        );
-        return true;
-    };
-
-    let Ok(length) = value.parse::<usize>() else {
-        log::warn!(
-            "Pull sync: partner '{}' returned malformed Content-Length header, rejecting",
-            source_domain
-        );
-        return true;
-    };
-
-    if length > MAX_PULL_RESPONSE_BYTES {
-        log::warn!(
-            "Pull sync: partner '{}' returned oversized Content-Length ({} bytes), rejecting",
-            source_domain,
-            length
-        );
-        return true;
-    }
-
-    false
+    pull_uid(status, &body, source_domain)
 }
 
-fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<String> {
-    let status = response.response.status();
-
+/// Reads the UID a partner answered with `status` and `body`.
+fn pull_uid(status: StatusCode, body: &[u8], source_domain: &str) -> Option<String> {
     if status == StatusCode::NOT_FOUND {
         log::debug!(
             "Pull sync: partner '{}' returned 404, treating as no-op",
@@ -462,24 +480,7 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
         return None;
     }
 
-    if response_content_length_exceeds_limit(&response, source_domain) {
-        return None;
-    }
-
-    let body = response
-        .response
-        .into_body()
-        .into_bytes()
-        .unwrap_or_default();
-    if body.len() > MAX_PULL_RESPONSE_BYTES {
-        log::warn!(
-            "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",
-            source_domain,
-            body.len()
-        );
-        return None;
-    }
-    let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
+    let payload = match serde_json::from_slice::<PullSyncResponse>(body) {
         Ok(payload) => payload,
         Err(err) => {
             log::warn!(
@@ -489,8 +490,6 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
             return None;
         }
     };
-
-    use super::kv_types::MAX_UID_LENGTH;
 
     let uid = payload.uid.filter(|value| !value.trim().is_empty());
     match uid {
@@ -518,33 +517,8 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
-    use crate::ec::kv_types::KvEntry;
-    use crate::platform::PlatformResponse;
     use crate::redacted::Redacted;
     use crate::test_support::tests::purpose_one_only_consent;
-
-    fn make_response(status: u16, body: &[u8]) -> PlatformResponse {
-        PlatformResponse::new(
-            edgezero_core::http::response_builder()
-                .status(status)
-                .body(EdgeBody::from(body.to_vec()))
-                .expect("should build test response"),
-        )
-    }
-
-    fn make_response_with_content_length(
-        status: u16,
-        content_length: usize,
-        body: &[u8],
-    ) -> PlatformResponse {
-        PlatformResponse::new(
-            edgezero_core::http::response_builder()
-                .status(status)
-                .header(header::CONTENT_LENGTH, content_length.to_string())
-                .body(EdgeBody::from(body.to_vec()))
-                .expect("should build test response"),
-        )
-    }
 
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
@@ -563,8 +537,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_pull_sync_context_returns_context_when_valid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_returns_context_when_valid() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
@@ -572,7 +546,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id).await);
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
@@ -602,8 +576,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
         // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
         // writes and leaves partner slots empty. Pull sync must not read those
         // empty slots as eligible and disclose the EC ID to partners.
@@ -611,7 +585,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id).await);
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
         assert!(
@@ -627,8 +601,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
@@ -636,7 +610,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        let mut snapshot = seed_present_snapshot(&graph, &ec_id);
+        let mut snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
@@ -784,77 +758,34 @@ mod tests {
     }
 
     #[test]
-    fn extract_pull_uid_treats_404_as_noop() {
-        let response = make_response(404, b"");
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
+    fn pull_uid_treats_404_as_noop() {
+        let uid = pull_uid(StatusCode::NOT_FOUND, b"", "ssp.example.com");
         assert!(uid.is_none(), "should treat 404 as no-op");
     }
 
     #[test]
-    fn extract_pull_uid_treats_uid_null_as_noop() {
-        let response = make_response(200, b"{\"uid\":null}");
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
+    fn pull_uid_treats_uid_null_as_noop() {
+        let uid = pull_uid(StatusCode::OK, b"{\"uid\":null}", "ssp.example.com");
         assert!(uid.is_none(), "should treat uid=null as no-op");
     }
 
     #[test]
-    fn extract_pull_uid_rejects_oversized_uid() {
+    fn pull_uid_rejects_oversized_uid() {
         let long_uid = "x".repeat(513);
         let body = format!("{{\"uid\":\"{long_uid}\"}}");
-        let response = make_response(200, body.as_bytes());
 
-        let uid = extract_pull_uid(response, "ssp.example.com");
+        let uid = pull_uid(StatusCode::OK, body.as_bytes(), "ssp.example.com");
         assert!(uid.is_none(), "should reject uid exceeding 512 bytes");
     }
 
     #[test]
-    fn extract_pull_uid_reads_uid_from_success_body() {
-        let response = make_response(200, b"{\"uid\":\"abc123\"}");
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
+    fn pull_uid_reads_uid_from_success_body() {
+        let uid = pull_uid(StatusCode::OK, b"{\"uid\":\"abc123\"}", "ssp.example.com");
         assert_eq!(
             uid.as_deref(),
             Some("abc123"),
             "should parse uid from 200 body"
         );
-    }
-
-    #[test]
-    fn extract_pull_uid_rejects_oversized_content_length_before_body_read() {
-        let response = make_response_with_content_length(
-            200,
-            MAX_PULL_RESPONSE_BYTES + 1,
-            b"{\"uid\":\"abc123\"}",
-        );
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
-        assert!(
-            uid.is_none(),
-            "should reject oversized Content-Length before parsing body"
-        );
-    }
-
-    #[test]
-    fn extract_pull_uid_accepts_small_body_without_content_length() {
-        let response = make_response(200, b"{\"uid\":\"abc123\"}");
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
-        assert_eq!(
-            uid.as_deref(),
-            Some("abc123"),
-            "should accept small valid response without Content-Length"
-        );
-    }
-
-    #[test]
-    fn extract_pull_uid_rejects_body_larger_than_limit() {
-        let body = format!("{{\"uid\":\"{}\"}}", "x".repeat(MAX_PULL_RESPONSE_BYTES));
-        let response = make_response(200, body.as_bytes());
-
-        let uid = extract_pull_uid(response, "ssp.example.com");
-        assert!(uid.is_none(), "should reject body larger than limit");
     }
 
     #[test]
@@ -894,12 +825,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::ec::kv::TombstoneOutcome;
-    use crate::error::TrustedServerError;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::EcPartner;
+    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseMode};
     use error_stack::Report;
-    use std::sync::Arc;
 
     struct AllowAllRateLimiter;
 
@@ -936,15 +869,93 @@ mod tests {
         format!("{}.ABC123", "a".repeat(64))
     }
 
-    fn seed_present_snapshot(graph: &KvIdentityGraph, ec_id: &str) -> EcKvSnapshot {
+    /// The pull-sync URL `source_domain`'s partner receives for [`snapshot_ec_id`].
+    fn pull_url(source_domain: &str) -> String {
+        format!("https://{source_domain}/sync?ec_id={}", snapshot_ec_id())
+    }
+
+    async fn seed_present_snapshot(graph: &KvIdentityGraph, ec_id: &str) -> EcKvSnapshot {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
-        graph.create(ec_id, &entry).expect("should seed live entry");
-        graph.load_snapshot(ec_id)
+        graph
+            .create(ec_id, &entry)
+            .await
+            .expect("should seed live entry");
+        graph.load_snapshot(ec_id).await
+    }
+
+    /// Runs pull sync to completion on `clock`, advancing it as the requests wait.
+    fn run_pull_sync(
+        settings: &Settings,
+        graph: &KvIdentityGraph,
+        registry: &PartnerRegistry,
+        context: &PullSyncContext,
+        client: &ScriptedHttpClient,
+        clock: &TestClock,
+    ) {
+        clock.drive(dispatch_pull_sync(
+            settings,
+            graph,
+            registry,
+            &AllowAllRateLimiter,
+            context,
+            &client.http_client(),
+            &clock.monotonic_clock(),
+        ));
     }
 
     #[test]
-    fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
+    fn dispatch_pull_sync_runs_inside_the_fastly_executor_boundary() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                    .expect("should build registry");
+            let graph = KvIdentityGraph::in_memory("pull_store");
+            let ec_id = snapshot_ec_id();
+            let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::new(&clock);
+            client.respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+            );
+            let context = PullSyncContext {
+                ec_id: ec_id.clone(),
+                snapshot,
+            };
+
+            dispatch_pull_sync(
+                &settings,
+                &graph,
+                &registry,
+                &AllowAllRateLimiter,
+                &context,
+                &client.http_client(),
+                &clock.monotonic_clock(),
+            )
+            .await;
+
+            assert_eq!(
+                client.requests().len(),
+                1,
+                "should dispatch once through the direct client"
+            );
+            let (entry, _) = graph
+                .get(&ec_id)
+                .await
+                .expect("should read row")
+                .expect("row should exist");
+            assert_eq!(
+                entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+                Some("synced-uid"),
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
         let mut settings = create_test_settings();
         // Force one partner per concurrency batch so responses span batches.
         settings.ec.pull_sync_concurrency = 1;
@@ -956,31 +967,30 @@ mod tests {
 
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
 
-        let stub = Arc::new(StubHttpClient::new());
-        // One JSON response per partner, drained across two concurrency batches.
-        stub.push_response(200, br#"{"uid":"synced-uid"}"#.to_vec());
-        stub.push_response(200, br#"{"uid":"synced-uid"}"#.to_vec());
-        let services = build_services_with_http_client(stub.clone());
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        // One JSON response per partner, collected across two concurrency batches.
+        for source_domain in ["alpha.example.com", "beta.example.com"] {
+            client.respond_to(
+                Method::GET,
+                &pull_url(source_domain),
+                ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+            );
+        }
 
         let context = PullSyncContext {
             ec_id: ec_id.clone(),
             snapshot,
         };
-        dispatch_pull_sync(
-            &settings,
-            &graph,
-            &registry,
-            &AllowAllRateLimiter,
-            &context,
-            &services,
-        );
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
         let (entry, generation) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
-            .expect("entry should exist");
+            .expect("should keep the entry");
         assert_eq!(
             entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
             Some("synced-uid"),
@@ -997,8 +1007,226 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_sends_each_partner_its_bearer_token_and_transport() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &pull_url("alpha.example.com"),
+            ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+        );
+
+        let context = PullSyncContext { ec_id, snapshot };
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        let requests = client.requests();
+        let [request] = requests.as_slice() else {
+            panic!("should send one pull request, got {requests:?}");
+        };
+        assert_eq!(request.method, Method::GET, "should pull with GET");
+        assert_eq!(
+            request.uri.to_string(),
+            pull_url("alpha.example.com"),
+            "should append the EC ID to the partner's pull URL"
+        );
+        request.assert_headers(&[("authorization", "Bearer outbound-token")]);
+        request.assert_transport(ExpectedTransport {
+            timeout: PULL_SYNC_GROUP_CUTOFF,
+            response_mode: ResponseMode::Buffered {
+                max_bytes: MAX_PULL_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Decode,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_group_ends_at_fifteen_second_cutoff() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 2;
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+        let clock = TestClock::new();
+        let started = clock.monotonic_clock().now();
+        let client = ScriptedHttpClient::new(&clock);
+        client
+            .respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::status(StatusCode::OK)
+                    .body(r#"{"uid":"fast-uid"}"#)
+                    .after(Duration::from_millis(100)),
+            )
+            .respond_to(
+                Method::GET,
+                &pull_url("beta.example.com"),
+                ScriptedReply::status(StatusCode::OK)
+                    .body(r#"{"uid":"slow-uid"}"#)
+                    .after(Duration::from_secs(20)),
+            );
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        assert_eq!(
+            clock
+                .monotonic_clock()
+                .now()
+                .saturating_duration_since(started),
+            Duration::from_secs(15),
+            "should stop waiting for the group at its 15 s cutoff"
+        );
+        let cutoff = started
+            .checked_add(Duration::from_secs(15))
+            .expect("should represent the cutoff");
+        for request in client.requests() {
+            assert_eq!(
+                request.budget.deadline.instant(),
+                cutoff,
+                "should bound {} by the group cutoff",
+                request.uri
+            );
+        }
+        let (entry, _) = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .expect("should keep the entry");
+        assert_eq!(
+            entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+            Some("fast-uid"),
+            "should keep the partner that answered before the cutoff"
+        );
+        assert!(
+            !entry.ids.contains_key("beta.example.com"),
+            "should drop the partner that answered after the cutoff"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_failures_log_through_outbound_error() {
+        let mut settings = create_test_settings();
+        // One partner per group, so the failing batch ends only its own group.
+        settings.ec.pull_sync_concurrency = 1;
+        let mut unbuildable = pull_enabled_ec_partner("gamma.example.com");
+        unbuildable.ts_pull_token = Some(Redacted::new("outbound\ntoken".to_owned()));
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+            unbuildable,
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client
+            .respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::failing_batch(EdgeError::bad_gateway("alpha provider text")),
+            )
+            .respond_to(
+                Method::GET,
+                &pull_url("beta.example.com"),
+                ScriptedReply::error(EdgeError::bad_gateway("beta provider text")),
+            );
+        let context = PullSyncContext { ec_id, snapshot };
+        let capture = WarningCapture::start();
+
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        let warnings = capture.take();
+        let typed = warnings
+            .iter()
+            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
+            .count();
+        assert_eq!(
+            typed, 3,
+            "should log the group failure, the request failure, and the build failure through outbound_error"
+        );
+        for step in [
+            "partner group failed",
+            "request for partner 'beta.example.com' failed",
+            "request for partner 'gamma.example.com' could not be built",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.message.starts_with("Pull sync failed:")
+                        && warning.message.contains(step)
+                }),
+                "should log the report for `{step}`"
+            );
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains("provider text")),
+            "should keep the provider text out of the logs"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_drops_a_response_over_the_pull_cap() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let oversized = format!(
+            "{{\"uid\":\"{}\"}}",
+            "x".repeat(usize::try_from(MAX_PULL_RESPONSE_BYTES).expect("should fit usize"))
+        );
+        client.respond_to(
+            Method::GET,
+            &pull_url("alpha.example.com"),
+            ScriptedReply::status(StatusCode::OK).body(oversized),
+        );
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
+
+        let (entry, generation) = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .expect("should keep the entry");
+        assert!(
+            entry.ids.is_empty(),
+            "should persist no UID from a response over the 64 KiB cap"
+        );
+        assert_eq!(generation, 1, "should not write the row back");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry = PartnerRegistry::from_config(&[
@@ -1013,34 +1241,38 @@ mod tests {
                 &ec_id,
                 &KvEntry::minimal("alpha.example.com", "existing-alpha", 1_000),
             )
+            .await
             .expect("should seed partial entry");
-        let snapshot = graph.load_snapshot(&ec_id);
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"uid":"new-beta"}"#.to_vec());
-        let services = build_services_with_http_client(stub.clone());
+        let snapshot = graph.load_snapshot(&ec_id).await;
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &pull_url("beta.example.com"),
+            ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"new-beta"}"#),
+        );
         let context = PullSyncContext {
             ec_id: ec_id.clone(),
             snapshot,
         };
 
-        dispatch_pull_sync(
-            &settings,
-            &graph,
-            &registry,
-            &AllowAllRateLimiter,
-            &context,
-            &services,
-        );
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
+        let requested: Vec<String> = client
+            .requests()
+            .iter()
+            .map(|request| request.uri.to_string())
+            .collect();
         assert_eq!(
-            stub.recorded_backend_names().len(),
-            1,
+            requested,
+            vec![pull_url("beta.example.com")],
             "should call only the missing partner"
         );
         let (entry, generation) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
-            .expect("entry should exist");
+            .expect("should keep the entry");
         assert_eq!(
             entry
                 .ids
@@ -1060,8 +1292,8 @@ mod tests {
         assert_eq!(generation, 2, "missing UID should use one bulk CAS write");
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_non_present_snapshots() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_non_present_snapshots() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1069,8 +1301,8 @@ mod tests {
                 .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let stub = Arc::new(StubHttpClient::new());
-        let services = build_services_with_http_client(stub.clone());
+        let client = ScriptedHttpClient::forbidding();
+        let clock = TestClock::new();
 
         for snapshot in [
             EcKvSnapshot::NotRead,
@@ -1085,28 +1317,22 @@ mod tests {
                 ec_id: ec_id.clone(),
                 snapshot,
             };
-            dispatch_pull_sync(
-                &settings,
-                &graph,
-                &registry,
-                &AllowAllRateLimiter,
-                &context,
-                &services,
-            );
+            run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
         }
 
+        client.assert_no_requests();
         assert!(
-            stub.recorded_backend_names().is_empty(),
-            "not-read, missing, and failed snapshots must not dispatch pull sync"
-        );
-        assert!(
-            graph.get(&ec_id).expect("should read store").is_none(),
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read store")
+                .is_none(),
             "no snapshot state should create a missing root"
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_tombstone_snapshot() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_tombstone_snapshot() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1119,29 +1345,20 @@ mod tests {
             entry: Box::new(KvEntry::tombstone(1000)),
             generation: Some(1),
         };
-        let stub = Arc::new(StubHttpClient::new());
-        let services = build_services_with_http_client(stub.clone());
+        let client = ScriptedHttpClient::forbidding();
+        let clock = TestClock::new();
 
         let context = PullSyncContext {
             ec_id: ec_id.clone(),
             snapshot,
         };
-        dispatch_pull_sync(
-            &settings,
-            &graph,
-            &registry,
-            &AllowAllRateLimiter,
-            &context,
-            &services,
-        );
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
-        assert!(
-            stub.recorded_backend_names().is_empty(),
-            "a tombstone snapshot must not dispatch pull sync"
-        );
+        client.assert_no_requests();
     }
-    #[test]
-    fn dispatch_pull_sync_skips_dispatch_when_ec_is_tombstoned_after_snapshot_capture() {
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_dispatch_when_ec_is_tombstoned_after_snapshot_capture() {
         // The request snapshot authorized pull sync, then a concurrent request
         // completed a CMP withdrawal while the page response was in flight.
         // Pull sync runs post-send and discloses the raw `ec_id` to partners, so
@@ -1154,50 +1371,41 @@ mod tests {
                 .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
 
         // Concurrent withdrawal lands after the snapshot was captured.
         assert_eq!(
             graph
                 .write_withdrawal_tombstone(&ec_id, drop)
+                .await
                 .expect("should tombstone the row"),
             TombstoneOutcome::Written,
             "should tombstone the row the snapshot still reports as present"
         );
 
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, br#"{"uid":"leaked-uid"}"#.to_vec());
-        let services = build_services_with_http_client(stub.clone());
+        let client = ScriptedHttpClient::forbidding();
+        let clock = TestClock::new();
 
         let context = PullSyncContext {
             ec_id: ec_id.clone(),
             snapshot,
         };
-        dispatch_pull_sync(
-            &settings,
-            &graph,
-            &registry,
-            &AllowAllRateLimiter,
-            &context,
-            &services,
-        );
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
-        assert!(
-            stub.recorded_backend_names().is_empty(),
-            "a withdrawal that lands after snapshot capture must cancel post-send pull sync"
-        );
+        client.assert_no_requests();
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
-            .expect("tombstone should remain");
+            .expect("should keep the tombstone");
         assert!(
             entry.ids.is_empty(),
             "no partner UID may be written back onto a tombstoned row"
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_revalidation_read_when_no_partner_is_eligible() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_revalidation_read_when_no_partner_is_eligible() {
         // Every pull-enabled partner already has a UID in the request snapshot,
         // so there is nothing to dispatch. The revalidation read exists to
         // authorize outbound calls; with no calls to authorize it must not cost
@@ -1219,6 +1427,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &entry)
+            .await
             .expect("should seed live entry");
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),
@@ -1226,25 +1435,15 @@ mod tests {
             generation: Some(1),
         };
 
-        let stub = Arc::new(StubHttpClient::new());
-        let services = build_services_with_http_client(stub.clone());
+        let client = ScriptedHttpClient::forbidding();
+        let clock = TestClock::new();
 
         let context = PullSyncContext {
             ec_id: ec_id.clone(),
             snapshot,
         };
-        dispatch_pull_sync(
-            &settings,
-            &graph,
-            &registry,
-            &AllowAllRateLimiter,
-            &context,
-            &services,
-        );
+        run_pull_sync(&settings, &graph, &registry, &context, &client, &clock);
 
-        assert!(
-            stub.recorded_backend_names().is_empty(),
-            "a fully synced entry must not dispatch pull sync"
-        );
+        client.assert_no_requests();
     }
 }

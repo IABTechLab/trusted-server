@@ -2,51 +2,38 @@ use crate::common::config::{envelope_with_public_origin, integration_app_config_
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
-use error_stack::ResultExt as _;
+use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use trusted_server_adapter_axum::platform::config_env_var;
-use trusted_server_core::settings_data::{default_config_key, default_config_store_name};
+use std::time::{Duration, Instant};
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
-/// Default port the Axum dev server binds to when no `PORT` env var is supplied.
-const AXUM_DEFAULT_PORT: u16 = 8787;
-
-/// Secret-store entries referenced by the integration app-config fixture.
-const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
+/// Local prepared-secret entries referenced by the integration app-config fixture.
+const INTEGRATION_SECRETS: &[(&str, &str)] = &[
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_ADMIN_PASSWORD",
+        "EDGEZERO__SECRETS__INTEGRATION_ADMIN_PASSWORD",
         "integration-admin-password-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PROXY_SECRET",
+        "EDGEZERO__SECRETS__INTEGRATION_PROXY_SECRET",
         "integration-test-proxy-secret-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_EC_PASSPHRASE",
+        "EDGEZERO__SECRETS__INTEGRATION_EC_PASSPHRASE",
         "integration-test-ec-secret-padded-32",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_ALPHA",
+        "EDGEZERO__SECRETS__INTEGRATION_PARTNER_TOKEN_ALPHA",
         "integration-test-token-alpha-32-bytes-ok",
     ),
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_BRAVO",
+        "EDGEZERO__SECRETS__INTEGRATION_PARTNER_TOKEN_BRAVO",
         "integration-test-token-bravo-32-bytes-ok",
     ),
 ];
 
-/// Axum native dev-server runtime environment.
-///
-/// Spawns the pre-built `trusted-server-axum` binary directly (no WASM, no
-/// Viceroy). The binary must have been built before running integration tests:
-///
-/// ```sh
-/// cargo build -p trusted-server-adapter-axum
-/// ```
-///
-/// The WASM binary path argument is unused — it exists only to satisfy the
-/// [`RuntimeEnvironment`] trait shared with Fastly.
+/// Native runtime with finite prepared config and secret inputs.
 pub struct AxumDevServer;
 
 impl RuntimeEnvironment for AxumDevServer {
@@ -56,7 +43,7 @@ impl RuntimeEnvironment for AxumDevServer {
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let app_config = integration_app_config_envelope(origin_port())?;
-        self.spawn_with_app_config(&app_config)
+        self.spawn_with_app_config(&app_config, &[])
     }
 
     fn health_check_path(&self) -> &str {
@@ -65,40 +52,31 @@ impl RuntimeEnvironment for AxumDevServer {
 }
 
 impl AxumDevServer {
-    /// Spawn the real native binary with an isolated app-config envelope.
-    ///
-    /// Normal [`RuntimeEnvironment::spawn`] retains its disabled baseline config.
+    /// Spawn with an isolated app-config envelope and explicit environment overrides.
     ///
     /// # Errors
     ///
-    /// Returns a spawn or readiness error if the native process is unavailable.
-    pub(crate) fn spawn_with_app_config(&self, app_config: &str) -> TestResult<RuntimeProcess> {
-        let binary = self.binary_path();
-        let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
-
+    /// Returns an error if preparing inputs, spawning, or readiness fails.
+    pub(crate) fn spawn_with_app_config(
+        &self,
+        app_config: &str,
+        env: &[(&str, &str)],
+    ) -> TestResult<RuntimeProcess> {
+        let port = super::find_available_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let app_config = envelope_with_public_origin(app_config, &base_url)?;
-        let store_name = default_config_store_name();
-        let config_key = default_config_key();
-        let config_variable = config_env_var(store_name.as_ref(), &config_key);
-
-        let mut child = Command::new(&binary)
-            .env("PORT", port.to_string())
-            .env(config_variable, app_config)
-            .envs(INTEGRATION_SECRET_ENV.iter().copied())
+        let (mut command, workspace) = self.command(&app_config, port)?;
+        let mut child = command
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .change_context(TestError::RuntimeSpawn)
-            .attach(format!(
-                "Failed to spawn trusted-server-axum binary at {}",
-                binary.display()
-            ))?;
+            .attach("Failed to spawn the prepared native runtime")?;
 
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if !line.is_empty() {
                         log::debug!("axum: {line}");
                     }
@@ -106,57 +84,93 @@ impl AxumDevServer {
             });
         }
 
-        let handle = AxumHandle { child };
-
-        // The Axum dev server returns 403 at root (no publisher config in test env),
-        // so we poll until we get any HTTP response rather than a specific status.
-        wait_for_any_response(&base_url)?;
-
+        // Own both resources before readiness so errors tear them down together.
+        let mut handle = AxumHandle {
+            child,
+            _workspace: workspace,
+        };
+        wait_for_health(&base_url, &mut handle.child)?;
         Ok(RuntimeProcess {
             inner: Box::new(handle),
             base_url,
         })
     }
 
-    /// Resolve the path to the compiled `trusted-server-axum` binary.
+    /// Prepare a command and its config directory. The caller must retain the
+    /// directory until the child exits.
     ///
-    /// Respects the `AXUM_BINARY_PATH` environment variable for CI overrides.
-    /// Falls back to the workspace `target/debug/` directory.
+    /// # Errors
+    ///
+    /// Returns an error if the isolated local config cannot be written.
+    pub(crate) fn command(
+        &self,
+        app_config: &str,
+        port: u16,
+    ) -> TestResult<(Command, tempfile::TempDir)> {
+        let workspace = tempfile::tempdir().change_context(TestError::ConfigGeneration)?;
+        let root = workspace
+            .path()
+            .canonicalize()
+            .change_context(TestError::ConfigGeneration)?;
+        let config = serde_json::to_vec(&serde_json::json!({ CONFIG_BLOB_KEY: app_config }))
+            .change_context(TestError::ConfigGeneration)?;
+        std::fs::write(
+            root.join(format!("local-config-{DEFAULT_CONFIG_STORE_ID}.json")),
+            config,
+        )
+        .change_context(TestError::ConfigGeneration)?;
+        let mut command = Command::new(self.binary_path());
+        command
+            .env_clear()
+            .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
+            .env("EDGEZERO__ADAPTER__PORT", port.to_string())
+            .env("EDGEZERO__ADAPTER__CONFIG_DIR", &root)
+            .env("EDGEZERO__ADAPTER__DATA_DIR", &root)
+            .env("EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS", "1")
+            .envs(INTEGRATION_SECRETS.iter().copied());
+        Ok((command, workspace))
+    }
+
     fn binary_path(&self) -> std::path::PathBuf {
         if let Ok(path) = std::env::var("AXUM_BINARY_PATH") {
             return std::path::PathBuf::from(path);
         }
-
-        // CARGO_MANIFEST_DIR is crates/trusted-server-integration-tests -> go up two levels to workspace root
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/trusted-server-axum")
     }
 }
 
-/// Poll until the Axum dev server responds with any HTTP status code.
-///
-/// The Axum server returns 403 at root when no publisher config is present,
-/// which is neither success nor 404, so the standard [`super::wait_for_ready`]
-/// helper cannot be used. Any HTTP response means the server is up.
-fn wait_for_any_response(base_url: &str) -> TestResult<()> {
-    use error_stack::Report;
-
-    let url = format!("{base_url}/");
-    for _ in 0..30 {
-        if reqwest::blocking::get(&url).is_ok() {
+fn wait_for_health(base_url: &str, child: &mut Child) -> TestResult<()> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .change_context(TestError::RuntimeNotReady)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Some(status) = child
+            .try_wait()
+            .change_context(TestError::RuntimeNotReady)?
+        {
+            return Err(Report::new(TestError::RuntimeNotReady)
+                .attach(format!("Axum exited before readiness: {status}")));
+        }
+        if let Ok(response) = client.get(format!("{base_url}/health")).send()
+            && response.status().as_u16() == 200
+            && response.text().is_ok_and(|body| body == "ok")
+        {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(100));
     }
-    Err(Report::new(TestError::RuntimeNotReady)
-        .attach(format!("Axum dev server at {base_url} not ready after 15s")))
+    Err(Report::new(TestError::RuntimeNotReady).attach(format!(
+        "Axum at {base_url} did not return HTTP 200 /health body ok within 15s"
+    )))
 }
 
-/// Process handle for a running Axum dev-server instance.
-///
-/// Implements [`Drop`] to ensure the process is killed on test cleanup.
 struct AxumHandle {
     child: Child,
+    _workspace: tempfile::TempDir,
 }
 
 impl RuntimeProcessHandle for AxumHandle {}
@@ -164,6 +178,13 @@ impl RuntimeProcessHandle for AxumHandle {}
 impl Drop for AxumHandle {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        log::error!("Axum child did not exit within bounded kill deadline");
     }
 }

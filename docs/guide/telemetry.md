@@ -10,14 +10,16 @@ The request entry point derives coarse `DeviceSignals`. Auction execution
 combines those signals with request and navigation facts in an
 `AuctionObservationContext`. The terminal auction outcome is converted into
 an `AuctionEventBatch` containing summary, provider-call, and bid rows.
-Fastly serializes the batch as NDJSON and starts one Tinybird Events API
-request to the configured auction datasource.
+Fastly serializes the batch as NDJSON and queues it for the request. After the
+response is delivered, the entry point sends one Tinybird Events API request
+per queued batch to the configured auction datasource. It sends nothing when
+delivery did not commit the application's response body.
 
-Emission is best effort. Failure to construct or start telemetry is logged and
-must not change the customer response. The sink drops the in-flight handle
-after dispatch; it does not wait for Tinybird's response. Each batch is limited
-to 512 rows and `tinybird.max_body_bytes` bytes. The Fastly backend uses
-two-second first-byte and between-byte timeouts.
+Emission is best effort. Failure to construct, queue, or send telemetry is
+logged and does not change the customer response, which the client already
+has. Each batch is limited to 512 rows and `tinybird.max_body_bytes` bytes.
+Each request has a 2 s total timeout and a 1 s connect timeout, and bypasses
+the cache.
 
 ## Privacy boundary
 

@@ -130,7 +130,8 @@ inventory, CSP, iframe/script creative behavior, impression reporting, and
 click-through behavior with the APS account team before production rollout.
 
 The common provider `endpoint` is required and must be an absolute HTTPS URL
-with a host and no credentials or fragment. The legacy `/e/dtb/bid` path is
+with a host and no credentials or fragment; plain HTTP is accepted only for
+`127.0.0.1` and `[::1]`, which local test bidders use. The legacy `/e/dtb/bid` path is
 rejected. `timeout_ms` belongs beside `endpoint`; when omitted, the `aps`
 profile default is 800 ms. Runtime caps it by the remaining auction budget.
 

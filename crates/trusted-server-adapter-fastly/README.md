@@ -3,12 +3,12 @@
 Production Fastly Compute adapter for Trusted Server, targeting
 `wasm32-wasip1`.
 
-This crate owns the Fastly entry point, dynamic backend construction, edge
-cache behavior, config and secret-store access, EC KV operations, rate limits,
-streaming template assembly, and Fastly-only Tinybird auction emission. Its
-`/health` response is served before application construction, so liveness does
-not prove that configuration loaded. Platform-neutral routing, settings,
-auctions, integrations, and rewrites remain in `trusted-server-core`.
+This crate owns the Fastly entry point, edge cache behavior, config and
+secret-store access, EC KV operations, rate limits, streaming template
+assembly, and Fastly-only Tinybird auction emission. Its `/health` response is
+served before application construction, so liveness does not prove that
+configuration loaded. Platform-neutral routing, settings, auctions,
+integrations, and rewrites remain in `trusted-server-core`.
 
 Build and test from the repository root:
 

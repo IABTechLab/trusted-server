@@ -24,8 +24,9 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::outbound::OutboundResponse;
 use error_stack::{Report, ResultExt};
-use http::header::{self, HeaderValue};
+use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
@@ -33,13 +34,16 @@ use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    collect_response_bounded, ensure_integration_backend,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_response_bounded,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::outbound::{
+    OutboundRequestSource, STREAMED_TIMEOUT, outbound_error, outbound_request, streamed,
+};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
@@ -368,12 +372,12 @@ impl SourcepointIntegration {
         &self,
         client_ip: Option<IpAddr>,
         original_req: &Request<EdgeBody>,
-        proxy_req: &mut Request<EdgeBody>,
+        proxy_headers: &mut HeaderMap,
     ) -> bool {
         if let Some(client_ip) = client_ip
             && let Ok(val) = HeaderValue::from_str(&client_ip.to_string())
         {
-            proxy_req.headers_mut().insert("x-forwarded-for", val);
+            proxy_headers.insert("x-forwarded-for", val);
         }
 
         // Accept-Encoding is deliberately omitted here and handled in the
@@ -393,14 +397,14 @@ impl SourcepointIntegration {
             header::HeaderName::from_static("access-control-request-headers"),
         ] {
             if let Some(value) = original_req.headers().get(&header_name) {
-                proxy_req.headers_mut().insert(header_name, value.clone());
+                proxy_headers.insert(header_name, value.clone());
             }
         }
 
         if let Some(filtered_cookie_header) = self.filtered_sourcepoint_cookie_header(original_req)
         {
             if let Ok(val) = HeaderValue::from_str(&filtered_cookie_header) {
-                proxy_req.headers_mut().insert(header::COOKIE, val);
+                proxy_headers.insert(header::COOKIE, val);
             }
             return true;
         }
@@ -836,26 +840,29 @@ impl IntegrationProxy for SourcepointIntegration {
         let (req_parts, req_body) = req.into_parts();
 
         let request_body = if method == Method::POST {
-            let bytes = collect_body_bounded(
-                req_body,
-                INTEGRATION_MAX_BODY_BYTES,
-                SOURCEPOINT_INTEGRATION_ID,
-            )
-            .await?;
+            let bytes =
+                read_request_body(&req_parts.headers, req_body, INTEGRATION_MAX_BODY_BYTES).await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
         };
 
-        let mut proxy_req = http::Request::builder()
-            .method(method.clone())
-            .uri(&target_url)
-            .body(request_body)
-            .change_context(Self::error("Failed to build Sourcepoint proxy request"))?;
+        let mut proxy_req = outbound_request(method.clone(), &target_url)
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error("Failed to build Sourcepoint proxy request"),
+                    OutboundRequestSource::Internal,
+                )
+            })?
+            .body(request_body);
 
         let source_req = http::Request::from_parts(req_parts, EdgeBody::empty());
-        let forwarded_cookies =
-            self.copy_headers(services.client_info.client_ip, &source_req, &mut proxy_req);
+        let forwarded_cookies = self.copy_headers(
+            services.client_info.client_ip,
+            &source_req,
+            proxy_req.headers_mut(),
+        );
 
         // Request uncompressed content only for paths that are likely
         // JavaScript or HTML (the files we need to regex-rewrite).  All other CDN
@@ -883,30 +890,25 @@ impl IntegrationProxy for SourcepointIntegration {
                 .insert(header::CONTENT_TYPE, content_type.clone());
         }
 
-        let backend_name = ensure_integration_backend(
-            services,
-            &self.config.cdn_origin,
-            SOURCEPOINT_INTEGRATION_ID,
-            None,
-        )?;
-
         let requested_identity_encoding = proxy_req
             .headers()
             .get(header::ACCEPT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"));
-        // Keep the body streaming where supported so the rewrite collector
-        // enforces its limit before the adapter buffers the entire response.
-        let mut platform_request = PlatformHttpRequest::new(proxy_req, backend_name);
-        if services.http_client().supports_streaming_responses() {
-            platform_request = platform_request.with_stream_response();
-        }
+        // Stream the body, so the rewrite collector enforces its limit before
+        // anything buffers the entire response.
         let mut response = services
-            .http_client()
-            .send(platform_request)
+            .outbound_client()
+            .send(streamed(proxy_req, STREAMED_TIMEOUT))
             .await
-            .change_context(Self::error("Sourcepoint upstream request failed"))?
-            .response;
+            .and_then(OutboundResponse::into_response)
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    Self::error("Sourcepoint upstream request failed"),
+                    OutboundRequestSource::Internal,
+                )
+            })?;
 
         log::info!(
             "Sourcepoint: upstream responded with status {}",
@@ -1144,74 +1146,215 @@ impl IntegrationHeadInjector for SourcepointIntegration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
+    use serde_json::json;
+
     use super::*;
     use crate::error::IntoHttpResponse as _;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::platform::{
-        PlatformError, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult,
+    use crate::outbound::STREAMED_TIMEOUT;
+    use crate::platform::test_support::build_services_with_outbound_client;
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
     use crate::test_support::tests::create_test_settings;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TEST_CHUNK_SIZE: usize = 8192;
 
-    struct StreamingHttpClient {
-        stub: StubHttpClient,
+    /// A scripted Sourcepoint CDN that counts how much of each reply body is read.
+    struct Cdn {
+        client: ScriptedHttpClient,
+        clock: TestClock,
         reads: Arc<AtomicUsize>,
     }
 
-    impl StreamingHttpClient {
+    impl Cdn {
         fn new() -> Self {
+            let clock = TestClock::new();
             Self {
-                stub: StubHttpClient::new(),
-                reads: Arc::new(AtomicUsize::new(0)),
+                client: ScriptedHttpClient::new(&clock),
+                clock,
+                reads: Arc::default(),
             }
+        }
+
+        /// Answers one `method` request to the CDN `path` with `status`, `headers`, and
+        /// `body` delivered in [`TEST_CHUNK_SIZE`] chunks.
+        fn respond(
+            &self,
+            method: Method,
+            path: &str,
+            status: u16,
+            body: Vec<u8>,
+            headers: &[(&str, &str)],
+        ) {
+            let body = Bytes::from(body);
+            let chunks = (0..body.len())
+                .step_by(TEST_CHUNK_SIZE)
+                .map(|offset| body.slice(offset..(offset + TEST_CHUNK_SIZE).min(body.len())))
+                .collect();
+            let status = StatusCode::from_u16(status).expect("should use a valid test status");
+            let reply = headers.iter().fold(
+                ScriptedReply::status(status)
+                    .chunks(chunks)
+                    .counting_body_polls(&self.reads),
+                |reply, (name, value)| reply.header(name, value),
+            );
+            self.client.respond_to(
+                method,
+                &format!("https://{SOURCEPOINT_CDN_HOST}{path}"),
+                reply,
+            );
+        }
+
+        fn services(&self) -> RuntimeServices {
+            build_services_with_outbound_client(&self.client, &self.clock)
+        }
+
+        /// Polls of every reply body so far, end-of-stream polls included.
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.client.requests()
         }
     }
 
-    #[async_trait(?Send)]
-    impl PlatformHttpClient for StreamingHttpClient {
-        fn supports_streaming_responses(&self) -> bool {
-            true
+    #[test]
+    fn sourcepoint_request_readback() {
+        let cdn = Cdn::new();
+        cdn.respond(
+            Method::GET,
+            "/wrapper.js?v=1",
+            200,
+            b"var x = 1;".to_vec(),
+            &[("content-type", "application/javascript")],
+        );
+        cdn.respond(
+            Method::POST,
+            "/consent/tcfv2",
+            200,
+            b"{}".to_vec(),
+            &[("content-type", "application/json")],
+        );
+        let mut services = cdn.services();
+        services.client_info.client_ip =
+            Some("203.0.113.10".parse().expect("should parse test IP"));
+        let settings = create_test_settings();
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let browser_headers = [
+            (header::ACCEPT, "*/*"),
+            (header::ACCEPT_LANGUAGE, "en"),
+            (header::USER_AGENT, "example-agent"),
+            (header::REFERER, "https://publisher.example.com/page"),
+            (header::ORIGIN, "https://publisher.example.com"),
+            (header::COOKIE, "consentUUID=example; session=secret"),
+            (header::AUTHORIZATION, "Bearer publisher-token"),
+        ];
+        let mut get = make_req(
+            Method::GET,
+            "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js?v=1",
+        );
+        set_req_header(&mut get, header::ACCEPT_ENCODING, "gzip, br");
+        let mut post = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/integrations/sourcepoint/cdn/consent/tcfv2")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, "7")
+            .body(EdgeBody::from(r#"{"a":1}"#))
+            .expect("should build POST request");
+        for request in [&mut get, &mut post] {
+            for (name, value) in &browser_headers {
+                set_req_header(request, name.clone(), value);
+            }
         }
 
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let mut response = self.stub.send(request).await?;
-            let body = std::mem::replace(response.response.body_mut(), EdgeBody::empty());
-            let EdgeBody::Once(bytes) = body else {
-                panic!("should receive a buffered stub body");
-            };
-            let reads = Arc::clone(&self.reads);
-            let chunks = futures::stream::unfold((bytes, 0), move |(bytes, offset)| {
-                reads.fetch_add(1, Ordering::Relaxed);
-                let end = (offset + TEST_CHUNK_SIZE).min(bytes.len());
-                futures::future::ready(
-                    (offset < bytes.len()).then(|| (bytes.slice(offset..end), (bytes, end))),
-                )
+        futures::executor::block_on(async {
+            for request in [get, post] {
+                let response = integration
+                    .handle(&settings, &services, request)
+                    .await
+                    .expect("should proxy the Sourcepoint request");
+                assert_eq!(response.status(), StatusCode::OK, "should relay the status");
+            }
+        });
+
+        let requests = cdn.requests();
+        assert_eq!(requests.len(), 2, "should send the GET and the POST");
+        let shared = [
+            ("x-forwarded-for", "203.0.113.10"),
+            ("accept", "*/*"),
+            ("accept-language", "en"),
+            ("user-agent", "example-agent"),
+            ("referer", "https://publisher.example.com/page"),
+            ("origin", "https://publisher.example.com"),
+            ("cookie", "consentUUID=example"),
+        ];
+        let (get, post) = (&requests[0], &requests[1]);
+        assert_eq!(
+            (&get.method, get.uri.to_string()),
+            (
+                &Method::GET,
+                format!("https://{SOURCEPOINT_CDN_HOST}/wrapper.js?v=1")
+            ),
+            "should fetch the CDN path and query"
+        );
+        get.assert_headers(&[shared.as_slice(), &[("accept-encoding", "identity")]].concat());
+        assert_eq!(
+            (&post.method, post.uri.to_string(), post.body.as_ref()),
+            (
+                &Method::POST,
+                format!("https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2"),
+                br#"{"a":1}"#.as_slice()
+            ),
+            "should forward the POST path and body"
+        );
+        post.assert_headers(&[shared.as_slice(), &[("content-type", "application/json")]].concat());
+        for request in [get, post] {
+            request.assert_transport(ExpectedTransport {
+                timeout: STREAMED_TIMEOUT,
+                response_mode: ResponseMode::Streamed,
+                response_decoding: ResponseDecoding::Original,
+                cache_policy: OutboundCachePolicy::PlatformDefault,
             });
-            *response.response.body_mut() = EdgeBody::stream(chunks);
-            Ok(response)
         }
+    }
 
-        async fn send_async(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            self.stub.send_async(request).await
-        }
+    #[test]
+    fn sourcepoint_drops_non_utf8_request_header() {
+        let cdn = Cdn::new();
+        cdn.respond(
+            Method::GET,
+            "/asset",
+            200,
+            b"unchanged".to_vec(),
+            &[("content-type", "image/png")],
+        );
+        let settings = create_test_settings();
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut request = make_req(
+            Method::GET,
+            "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+        );
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes(b"example-agent/\xff").expect("should build obs-text value"),
+        );
+        set_req_header(&mut request, header::ACCEPT, "image/png");
 
-        async fn select(
-            &self,
-            pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            self.stub.select(pending_requests).await
-        }
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &cdn.services(), request))
+                .expect("should proxy despite a header value that is not UTF-8");
+
+        assert_eq!(response.status(), StatusCode::OK, "should relay the status");
+        let requests = cdn.requests();
+        assert_eq!(requests.len(), 1, "should send one CDN request");
+        requests[0].assert_headers(&[("accept", "image/png")]);
     }
 
     #[test]
@@ -1219,19 +1362,20 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
-            let client = Arc::new(StreamingHttpClient::new());
+            let cdn = Cdn::new();
             let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
-            client.stub.push_response_with_headers(
+            cdn.respond(
+                Method::GET,
+                "/wrapper.js",
                 200,
                 input.into_bytes(),
-                vec![("content-type", "application/javascript")],
+                &[("content-type", "application/javascript")],
             );
-            let services = build_services_with_http_client(client.clone());
 
             let response = integration
                 .handle(
                     &settings,
-                    &services,
+                    &cdn.services(),
                     make_req(
                         Method::GET,
                         "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
@@ -1251,8 +1395,8 @@ mod tests {
                 "should rewrite a streamed CDN URL without Content-Length"
             );
             assert_eq!(
-                client.stub.recorded_stream_response_flags(),
-                vec![true],
+                cdn.requests()[0].response_mode,
+                ResponseMode::Streamed,
                 "should request streaming before collecting the upstream body"
             );
         });
@@ -1276,7 +1420,7 @@ mod tests {
                     vec!["gzip", "identity"],
                 ] {
                     for oversized in [false, true] {
-                        let client = Arc::new(StreamingHttpClient::new());
+                        let cdn = Cdn::new();
                         // Valid UTF-8 with a rewrite target must still pass through
                         // when the encoding header does not identify plain text.
                         let mut bytes =
@@ -1291,15 +1435,12 @@ mod tests {
                             ("vary", "Accept-Encoding, Origin"),
                         ];
                         headers.extend(encodings.iter().map(|value| ("content-encoding", *value)));
-                        client
-                            .stub
-                            .push_response_with_headers(200, bytes.clone(), headers);
-                        let services = build_services_with_http_client(client.clone());
+                        cdn.respond(Method::GET, "/asset", 200, bytes.clone(), &headers);
 
                         let response = integration
                             .handle(
                                 &settings,
-                                &services,
+                                &cdn.services(),
                                 make_req(
                                     Method::GET,
                                     "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
@@ -1309,11 +1450,11 @@ mod tests {
                             .expect("should pass through encoded responses regardless of size");
 
                         assert!(
-                            matches!(response.body(), EdgeBody::Stream(_)),
+                            response.body().is_stream(),
                             "should leave encoded response bodies streaming"
                         );
                         assert_eq!(
-                            client.reads.load(Ordering::Relaxed),
+                            cdn.reads(),
                             0,
                             "should not read encoded bodies for rewriting"
                         );
@@ -1362,7 +1503,7 @@ mod tests {
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
             for content_type in ["application/javascript", "text/html"] {
                 for encoding in ["identity", " IdEnTiTy "] {
-                    let client = Arc::new(StreamingHttpClient::new());
+                    let cdn = Cdn::new();
                     let (input, expected): (Vec<u8>, &[u8]) = if content_type == "text/html" {
                         (
                             br#"<script src="/PrivacyManagerUS.js"></script>"#.to_vec(),
@@ -1375,19 +1516,20 @@ mod tests {
                             br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
                         )
                     };
-                    client.stub.push_response_with_headers(
+                    cdn.respond(
+                        Method::GET,
+                        "/asset",
                         200,
                         input,
-                        vec![
+                        &[
                             ("content-type", content_type),
                             ("content-encoding", encoding),
                         ],
                     );
-                    let services = build_services_with_http_client(client.clone());
                     let response = integration
                         .handle(
                             &settings,
-                            &services,
+                            &cdn.services(),
                             make_req(
                                 Method::GET,
                                 "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
@@ -1401,7 +1543,7 @@ mod tests {
                         "should drop {encoding:?} Content-Encoding after rewriting"
                     );
                     assert!(
-                        client.reads.load(Ordering::Relaxed) > 0,
+                        cdn.reads() > 0,
                         "should collect {encoding:?} bodies for rewriting"
                     );
                     assert_eq!(
@@ -1419,18 +1561,19 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
-            let client = Arc::new(StreamingHttpClient::new());
-            client.stub.push_response_with_headers(
+            let cdn = Cdn::new();
+            cdn.respond(
+                Method::GET,
+                "/us_pm/index.html",
                 200,
                 br#"<script src="/PrivacyManagerUS.js"></script><link href="/PrivacyManagerUS.css">"#.to_vec(),
-                vec![("content-type", "text/html"), ("cache-control", "no-store")],
+                &[("content-type", "text/html"), ("cache-control", "no-store")],
             );
-            let services = build_services_with_http_client(client.clone());
 
             let response = integration
                 .handle(
                     &settings,
-                    &services,
+                    &cdn.services(),
                     make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/us_pm/index.html"),
                 )
                 .await
@@ -1458,21 +1601,22 @@ mod tests {
             for content_type in ["application/javascript", "text/html"] {
                 for declared_length in [None, Some("1")] {
                     for extra_bytes in [0, 1, TEST_CHUNK_SIZE * 2] {
-                        let client = Arc::new(StreamingHttpClient::new());
+                        let cdn = Cdn::new();
                         let mut headers = vec![("content-type", content_type)];
                         if let Some(length) = declared_length {
                             headers.push(("content-length", length));
                         }
-                        client.stub.push_response_with_headers(
+                        cdn.respond(
+                            Method::GET,
+                            "/asset",
                             200,
                             vec![b' '; limit + extra_bytes],
-                            headers,
+                            &headers,
                         );
-                        let services = build_services_with_http_client(client.clone());
 
                         let result = integration.handle(
                             &settings,
-                            &services,
+                            &cdn.services(),
                             make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/asset"),
                         ).await;
 
@@ -1501,7 +1645,7 @@ mod tests {
                             );
                         }
                         assert_eq!(
-                            client.reads.load(Ordering::Relaxed),
+                            cdn.reads(),
                             limit / TEST_CHUNK_SIZE + 1,
                             "should stop at EOF or the first overflowing chunk without draining the stream"
                         );
@@ -1517,23 +1661,24 @@ mod tests {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
             for content_type in ["application/javascript", "text/html"] {
-                let client = Arc::new(StreamingHttpClient::new());
+                let cdn = Cdn::new();
                 let length = (MAX_REWRITE_BODY_SIZE + 1).to_string();
-                client.stub.push_response_with_headers(
+                cdn.respond(
+                    Method::GET,
+                    "/asset",
                     200,
                     vec![b' '; MAX_REWRITE_BODY_SIZE as usize + 1],
-                    vec![
+                    &[
                         ("content-type", content_type),
                         ("content-length", &length),
                         ("cache-control", "no-store"),
                     ],
                 );
-                let services = build_services_with_http_client(client.clone());
 
                 let response = integration
                     .handle(
                         &settings,
-                        &services,
+                        &cdn.services(),
                         make_req(
                             Method::GET,
                             "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
@@ -1543,14 +1688,10 @@ mod tests {
                     .expect("should pass through a declared oversized response");
 
                 assert!(
-                    matches!(response.body(), EdgeBody::Stream(_)),
+                    response.body().is_stream(),
                     "should retain the original stream"
                 );
-                assert_eq!(
-                    client.reads.load(Ordering::Relaxed),
-                    0,
-                    "should not poll a declared oversized body"
-                );
+                assert_eq!(cdn.reads(), 0, "should not poll a declared oversized body");
                 assert_eq!(
                     get_header_str(&response, header::CONTENT_LENGTH),
                     Some(length.as_str()),
@@ -1583,42 +1724,42 @@ mod tests {
                 let mut cfg = config(true);
                 cfg.rewrite_sdk = rewrite_sdk;
                 let integration = SourcepointIntegration::new(Arc::new(cfg));
-                let client = Arc::new(StreamingHttpClient::new());
-                client.stub.push_response_with_headers(
+                let cdn = Cdn::new();
+                cdn.respond(
+                    method.clone(),
+                    "/asset",
                     status,
                     b"unchanged".to_vec(),
-                    vec![
+                    &[
                         ("content-type", content_type),
                         ("content-encoding", "identity"),
                         ("cache-control", "no-store"),
                     ],
                 );
-                let services = build_services_with_http_client(client.clone());
                 let expected_body: &[u8] = if method == Method::HEAD {
                     b""
                 } else {
                     b"unchanged"
                 };
                 let mut request = make_req(
-                    method,
+                    method.clone(),
                     "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
                 );
                 set_req_header(&mut request, header::ACCEPT_ENCODING, "gzip, br");
 
                 let response = integration
-                    .handle(&settings, &services, request)
+                    .handle(&settings, &cdn.services(), request)
                     .await
                     .expect("should pass through an ineligible response");
 
-                assert!(
-                    matches!(response.body(), EdgeBody::Stream(_)),
-                    "should leave ineligible bodies streaming"
-                );
-                assert_eq!(
-                    client.reads.load(Ordering::Relaxed),
-                    0,
-                    "should not poll an ineligible body"
-                );
+                // EdgeZero drops a HEAD body before the response reaches the proxy.
+                if method != Method::HEAD {
+                    assert!(
+                        response.body().is_stream(),
+                        "should leave ineligible bodies streaming"
+                    );
+                }
+                assert_eq!(cdn.reads(), 0, "should not poll an ineligible body");
                 assert_eq!(
                     get_header_str(&response, header::CONTENT_ENCODING),
                     Some("identity"),
@@ -1639,10 +1780,12 @@ mod tests {
                     expected_body,
                     "should preserve pass-through bytes or omit them for HEAD"
                 );
-                assert!(
-                    client.stub.recorded_request_headers()[0]
-                        .iter()
-                        .any(|(name, value)| name == "accept-encoding" && value == "gzip, br"),
+                assert_eq!(
+                    cdn.requests()[0]
+                        .headers
+                        .get(header::ACCEPT_ENCODING)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("gzip, br"),
                     "should forward the client's encoding for non-script paths"
                 );
             }
@@ -1650,12 +1793,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_rewrites_on_buffered_adapters_with_or_without_content_length() {
+    fn handle_rewrite_drops_stale_length_encoding_and_vary_accept_encoding() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
             for has_length in [false, true] {
-                let client = Arc::new(StubHttpClient::new());
+                let cdn = Cdn::new();
                 let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
                 let length = input.len().to_string();
                 let mut headers = vec![
@@ -1666,26 +1809,26 @@ mod tests {
                 if has_length {
                     headers.push(("content-length", &length));
                 }
-                client.push_response_with_headers(200, input.into_bytes(), headers);
-                let services = build_services_with_http_client(client.clone());
+                cdn.respond(
+                    Method::GET,
+                    "/wrapper.js",
+                    200,
+                    input.into_bytes(),
+                    &headers,
+                );
 
                 let response = integration
                     .handle(
                         &settings,
-                        &services,
+                        &cdn.services(),
                         make_req(
                             Method::GET,
                             "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
                         ),
                     )
                     .await
-                    .expect("should rewrite a buffered response");
+                    .expect("should rewrite the response");
 
-                assert_eq!(
-                    client.recorded_stream_response_flags(),
-                    vec![false],
-                    "should respect adapters without streaming support"
-                );
                 assert!(
                     response.headers().get(header::CONTENT_LENGTH).is_none(),
                     "should not forward a stale upstream length"
@@ -1713,46 +1856,6 @@ mod tests {
                     take_body_bytes(response),
                     br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
                     "should rewrite with either header state"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn handle_rejects_buffered_overflow_without_content_length() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let integration = SourcepointIntegration::new(Arc::new(config(true)));
-            for content_type in ["application/javascript", "text/html"] {
-                let client = Arc::new(StubHttpClient::new());
-                client.push_response_with_headers(
-                    200,
-                    vec![b' '; MAX_REWRITE_BODY_SIZE as usize + 1],
-                    vec![("content-type", content_type)],
-                );
-                let services = build_services_with_http_client(client.clone());
-
-                let error = integration
-                    .handle(
-                        &settings,
-                        &services,
-                        make_req(
-                            Method::GET,
-                            "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
-                        ),
-                    )
-                    .await
-                    .expect_err("should reject a buffered body over the rewrite limit");
-
-                assert_eq!(
-                    client.recorded_stream_response_flags(),
-                    vec![false],
-                    "should exercise the buffered adapter path"
-                );
-                assert_eq!(
-                    error.current_context().status_code(),
-                    StatusCode::BAD_GATEWAY,
-                    "should return 502 for buffered {content_type} overflow"
                 );
             }
         });
@@ -1789,7 +1892,7 @@ mod tests {
                     ),
                 ] {
                     for has_length in [false, true] {
-                        let client = Arc::new(StreamingHttpClient::new());
+                        let cdn = Cdn::new();
                         let input =
                             format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
                         let length = input.len().to_string();
@@ -1803,10 +1906,8 @@ mod tests {
                         if sets_cookie {
                             headers.push(("set-cookie", "consentUUID=example; Path=/"));
                         }
-                        client
-                            .stub
-                            .push_response_with_headers(200, input.into_bytes(), headers);
-                        let services = build_services_with_http_client(client.clone());
+                        cdn.respond(Method::GET, path, 200, input.into_bytes(), &headers);
+                        let services = cdn.services();
                         let mut request = make_req(
                             Method::GET,
                             &format!("https://publisher.example.com{SOURCEPOINT_CDN_PREFIX}{path}"),
@@ -1864,7 +1965,7 @@ mod tests {
                     "private, no-store",
                 ),
             ] {
-                let client = Arc::new(StreamingHttpClient::new());
+                let cdn = Cdn::new();
                 let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
                 let mut headers = vec![("content-type", "application/javascript")];
                 if let Some(cache) = upstream_cache {
@@ -1873,10 +1974,14 @@ mod tests {
                 if sets_cookie {
                     headers.push(("set-cookie", "consentUUID=example; Path=/"));
                 }
-                client
-                    .stub
-                    .push_response_with_headers(200, input.into_bytes(), headers);
-                let services = build_services_with_http_client(client.clone());
+                cdn.respond(
+                    Method::GET,
+                    "/mms/v2/get_site_data?account_id=123",
+                    200,
+                    input.into_bytes(),
+                    &headers,
+                );
+                let services = cdn.services();
                 let mut request = make_req(
                     Method::GET,
                     "https://publisher.example.com/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=123",
@@ -1892,9 +1997,11 @@ mod tests {
                     .expect("should rewrite dynamic site data");
 
                 assert!(
-                    client.stub.recorded_request_headers()[0]
-                        .iter()
-                        .any(|(name, value)| name == "accept-encoding" && value == "identity"),
+                    cdn.requests()[0]
+                        .headers
+                        .get(header::ACCEPT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("identity"),
                     "should request uncompressed site data despite its extensionless path"
                 );
                 assert_eq!(
@@ -1916,18 +2023,20 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
-            let client = Arc::new(StreamingHttpClient::new());
+            let cdn = Cdn::new();
             let bytes = vec![b'a', 0xff, b'b'];
-            client.stub.push_response_with_headers(
+            cdn.respond(
+                Method::GET,
+                "/wrapper.js",
                 200,
                 bytes.clone(),
-                vec![
+                &[
                     ("content-type", "application/javascript"),
                     ("content-encoding", "identity"),
                     ("cache-control", "no-store"),
                 ],
             );
-            let services = build_services_with_http_client(client.clone());
+            let services = cdn.services();
 
             let response = integration
                 .handle(
@@ -1942,7 +2051,7 @@ mod tests {
                 .expect("should retain non-UTF-8 content unchanged");
 
             assert!(
-                client.reads.load(Ordering::Relaxed) > 0,
+                cdn.reads() > 0,
                 "should exercise UTF-8 fallback after bounded collection"
             );
 
@@ -2656,10 +2765,10 @@ mod tests {
     }
 
     fn take_body_bytes(resp: Response<EdgeBody>) -> Vec<u8> {
-        match resp.into_body() {
-            EdgeBody::Once(b) => b.to_vec(),
-            EdgeBody::Stream(_) => vec![],
-        }
+        resp.into_body()
+            .into_bytes()
+            .expect("should buffer the response body")
+            .to_vec()
     }
 
     #[test]
@@ -2670,7 +2779,7 @@ mod tests {
         let client_ip = "203.0.113.10".parse().expect("should parse test IP");
 
         let forwarded_cookies =
-            integration.copy_headers(Some(client_ip), &original_req, &mut proxy_req);
+            integration.copy_headers(Some(client_ip), &original_req, proxy_req.headers_mut());
 
         assert!(
             !forwarded_cookies,
@@ -2696,7 +2805,7 @@ mod tests {
         );
         let mut proxy_req = make_req(Method::OPTIONS, "https://cdn.privacy-mgmt.com/wrapper.js");
 
-        integration.copy_headers(None, &original_req, &mut proxy_req);
+        integration.copy_headers(None, &original_req, proxy_req.headers_mut());
 
         assert_eq!(
             get_req_header_str(&proxy_req, "access-control-request-method"),
@@ -3060,5 +3169,26 @@ mod tests {
             Some("/integrations/sourcepoint/cdn/consent/tcfv2/new-path"),
             "should rewrite relative redirect resolved against CDN base"
         );
+    }
+
+    #[test]
+    fn sourcepoint_cdn_body_read_failures_map_to_statuses() {
+        let settings = create_test_settings();
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        for case in body_read_failure_cases(INTEGRATION_MAX_BODY_BYTES) {
+            let client = ScriptedHttpClient::forbidding();
+            let services = build_services_with_outbound_client(&client, &TestClock::new());
+            let (req, expectation) = case.into_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example.com/integrations/sourcepoint/cdn/asset"),
+            );
+
+            let outcome =
+                futures::executor::block_on(integration.handle(&settings, &services, req));
+
+            expectation.assert_outcome("Sourcepoint CDN", &outcome);
+            client.assert_no_requests();
+        }
     }
 }

@@ -13,8 +13,6 @@ mod routes;
 mod shell;
 mod types;
 
-#[cfg(test)]
-pub(crate) use actions::action_response;
 pub use auction::{
     DiagnosticAuctionId, TraceAuctionEvidenceV1, TraceAuctionSource, TraceAuctionTerminalReason,
     TraceAuctionTerminalStatus, TraceAuctionTransportV1, TraceProviderRole, TraceProviderStatus,

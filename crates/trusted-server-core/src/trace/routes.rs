@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::RequestParts;
+use http::{HeaderValue, Method, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 
 use crate::auth::{TraceAuthLogPolicy, enforce_basic_auth};
@@ -232,20 +233,20 @@ pub fn is_trace_path(path: &str) -> bool {
 /// # Examples
 ///
 /// ```ignore
-/// match trusted_server_core::trace::preflight(&settings, &mut request) {
+/// match trusted_server_core::trace::preflight(&settings, request.parts_mut()) {
 ///     trusted_server_core::trace::TracePreflight::Response(response) => return response,
 ///     trusted_server_core::trace::TracePreflight::NotTrace => continue_dispatch(request),
 ///     trusted_server_core::trace::TracePreflight::Ready(context) => handle_trace(context, request),
 /// }
 /// ```
 #[must_use]
-pub fn preflight(settings: &Settings, request: &mut Request<EdgeBody>) -> TracePreflight {
-    let classification = classify_path(request.uri().path());
+pub fn preflight(settings: &Settings, request: &mut RequestParts) -> TracePreflight {
+    let classification = classify_path(request.uri.path());
     if classification == Classification::NotTrace {
         return TracePreflight::NotTrace;
     }
-    let head = request.method() == Method::HEAD;
-    request.extensions_mut().insert(TraceAuthLogPolicy);
+    let head = request.method == Method::HEAD;
+    request.extensions.insert(TraceAuthLogPolicy);
     match enforce_basic_auth(settings, request) {
         Ok(Some(mut response)) => {
             *response.body_mut() = error_response(StatusCode::UNAUTHORIZED).into_body();
@@ -268,14 +269,14 @@ pub fn preflight(settings: &Settings, request: &mut Request<EdgeBody>) -> TraceP
         Classification::Rejected(status) => return reject(error_response(status), head),
         Classification::NotTrace => return TracePreflight::NotTrace,
     };
-    if !route.allows(request.method()) {
+    if !route.allows(&request.method) {
         let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
         response
             .headers_mut()
             .insert(header::ALLOW, HeaderValue::from_static(route.allow()));
         return reject(response, head);
     }
-    let protected = match settings.handler_for_path(request.uri().path()) {
+    let protected = match settings.handler_for_path(request.uri.path()) {
         Ok(handler) => handler.is_some(),
         Err(_) => return reject(error_response(StatusCode::INTERNAL_SERVER_ERROR), head),
     };
@@ -404,14 +405,14 @@ mod tests {
     use super::*;
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use http::{HeaderValue, header};
+    use http::{HeaderValue, Request, header};
     use serde_json::json;
 
     use crate::auth::EdgeTerminatedAuthorization;
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
     use crate::settings::Handler;
     use crate::test_support::logging::WarningCapture;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, with_request_parts};
     use crate::trace::TraceTerminalResponse;
 
     fn handler(pattern: &str, username: &str, password: &str) -> Handler {
@@ -452,14 +453,14 @@ mod tests {
     }
 
     fn rejected(settings: &Settings, request: &mut Request<EdgeBody>) -> Response<EdgeBody> {
-        match preflight(settings, request) {
+        match with_request_parts(request, |parts| preflight(settings, parts)) {
             TracePreflight::Response(response) => response,
             _ => panic!("should terminate the rejected trace request"),
         }
     }
 
     fn ready(settings: &Settings, request: &mut Request<EdgeBody>) -> TraceDispatch {
-        match preflight(settings, request) {
+        match with_request_parts(request, |parts| preflight(settings, parts)) {
             TracePreflight::Ready(dispatch) => dispatch,
             _ => panic!("should dispatch the accepted trace request"),
         }
@@ -808,9 +809,11 @@ mod tests {
             request.headers()[header::AUTHORIZATION].clone(),
         );
         assert!(
-            enforce_basic_auth(&settings(true, Some("^/")), &mut ordinary)
-                .expect("should evaluate ordinary auth")
-                .is_some(),
+            with_request_parts(&mut ordinary, |parts| {
+                enforce_basic_auth(&settings(true, Some("^/")), parts)
+            })
+            .expect("should evaluate ordinary auth")
+            .is_some(),
             "should retain ordinary credential rejection"
         );
         assert!(
@@ -888,7 +891,10 @@ mod tests {
         let before_uri = request.uri().clone();
         let before_headers = request.headers().clone();
         assert!(
-            matches!(preflight(&settings, &mut request), TracePreflight::NotTrace),
+            matches!(
+                with_request_parts(&mut request, |parts| preflight(&settings, parts)),
+                TracePreflight::NotTrace
+            ),
             "should continue ordinary dispatch without parsing trace configuration"
         );
         assert_eq!(request.uri(), &before_uri, "should retain the ordinary URI");

@@ -33,6 +33,7 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
+use crate::response_privacy::is_forbidden_operator_response_header;
 use crate::settings::{AssetOriginAuth, IntegrationConfig, IntegrationSettings, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
@@ -322,6 +323,10 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     }
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
+    reject_disabled_certificate_check(settings)?;
+    reject_origin_readthrough(settings)?;
+    reject_origin_url_userinfo(settings)?;
+    reject_forbidden_operator_response_headers(settings)?;
     validate_js_asset_proxy_config(settings)?;
     validate_gpt_diagnostics_config(settings)?;
 
@@ -344,6 +349,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    warn_ignored_certificate_check(settings);
+    settings.warn_ignored_origin_readthrough();
     for id in unknown_integration_ids(settings) {
         log::warn!(
             "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
@@ -357,6 +364,105 @@ pub fn validate_settings_for_runtime(
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
+}
+
+/// Rejects `proxy.certificate_check = false`, because origin TLS is always verified.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the setting is `false`.
+fn reject_disabled_certificate_check(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.proxy.certificate_check {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "proxy.certificate_check = false is not supported; origin TLS is always verified"
+            .to_owned(),
+    }))
+}
+
+/// Rejects `creative_opportunities.origin_readthrough_enabled = true`, because origin
+/// readthrough is unavailable.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the setting is `true`.
+fn reject_origin_readthrough(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let enabled = settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(|config| config.origin_readthrough_enabled == Some(true));
+    if !enabled {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "creative_opportunities.origin_readthrough_enabled = true is not supported; origin readthrough is unavailable"
+            .to_owned(),
+    }))
+}
+
+/// Rejects a `publisher.origin_url` that carries userinfo.
+///
+/// The publisher forward refuses such a target, so every publisher request would
+/// answer 400. The error never echoes the URL, which holds the credentials.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the URL has a username or password.
+fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let has_userinfo = url::Url::parse(&settings.publisher.origin_url)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+    if !has_userinfo {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message:
+            "publisher.origin_url must not contain userinfo; put credentials in a header instead"
+                .to_owned(),
+    }))
+}
+
+/// Rejects operator `response_headers` entries that Trusted Server never sends:
+/// `Trailer`, `Content-Length`, and the hop-by-hop fields.
+///
+/// Response egress owns message framing, so such an entry would fail the
+/// response or silently change it. Runtime skips one with a warning instead.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming every such entry.
+fn reject_forbidden_operator_response_headers(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut names: Vec<String> = settings
+        .response_headers
+        .keys()
+        .filter(|name| is_forbidden_operator_response_header(name))
+        .map(|name| format!("`{name}`"))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort_unstable();
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "response_headers must not set {}; framing and hop-by-hop fields belong to response egress",
+            names.join(", ")
+        ),
+    }))
+}
+
+/// Warns that a live `proxy.certificate_check = false` is ignored.
+///
+/// A config that predates the rejection keeps serving, and origin TLS stays verified.
+fn warn_ignored_certificate_check(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "proxy.certificate_check = false is ignored; origin TLS is always verified. Remove the setting before the next config push"
+        );
+    }
 }
 
 fn unknown_integration_ids(settings: &Settings) -> Vec<&str> {
@@ -643,6 +749,7 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::test_support::logging::WarningCapture;
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -926,6 +1033,7 @@ formats = [{ width = 300, height = 250 }]
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example.com/e/pb/bid".to_string(),
@@ -1614,6 +1722,177 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
         );
+    }
+
+    #[test]
+    fn validate_rejects_certificate_check_false() {
+        let mut settings = valid_settings();
+        settings.proxy.certificate_check = false;
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject certificate_check = false at deploy");
+        assert!(
+            format!("{error:?}").contains("proxy.certificate_check"),
+            "should name the rejected setting: {error:?}"
+        );
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject certificate_check = false on validate and push");
+        assert!(
+            error.to_string().contains("proxy.certificate_check"),
+            "should name the rejected setting on validate and push: {error:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_ignores_certificate_check_false_with_warning() {
+        let mut settings = valid_settings();
+        let capture = WarningCapture::start();
+        validate_settings_for_runtime(&settings)
+            .expect("should accept the default certificate check at runtime");
+        assert!(
+            !capture
+                .take()
+                .iter()
+                .any(|warning| warning.message.contains("proxy.certificate_check")),
+            "should not warn when certificate_check keeps its default"
+        );
+
+        settings.proxy.certificate_check = false;
+        validate_settings_for_runtime(&settings)
+            .expect("should keep serving a config that sets certificate_check = false");
+
+        let warnings = capture.take();
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.message.contains("proxy.certificate_check")
+                    && warning.message.contains("ignored")
+            }),
+            "should warn that certificate_check = false is ignored"
+        );
+    }
+
+    #[test]
+    fn runtime_keeps_loading_operator_framing_headers() {
+        // Deploy validation rejects these entries, but a live config pushed
+        // before the rejection still has to load. The response-header helper
+        // skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            validate_settings_for_runtime(&settings)
+                .expect("should keep loading a live config that predates the rejection");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_origin_url_with_userinfo() {
+        for origin_url in [
+            "https://example-user@origin.test-publisher.example.com",
+            "https://example-user:example-pass@origin.test-publisher.example.com",
+        ] {
+            let mut settings = valid_settings();
+            settings.publisher.origin_url = origin_url.to_owned();
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an origin URL with userinfo at deploy");
+            assert!(
+                format!("{error:?}").contains("publisher.origin_url"),
+                "should name the rejected setting: {error:?}"
+            );
+            assert!(
+                !format!("{error:?}").contains("example-pass"),
+                "should never echo the credentials: {error:?}"
+            );
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should reject an origin URL with userinfo on validate and push");
+            assert!(
+                error.to_string().contains("publisher.origin_url"),
+                "should name the rejected setting on validate and push: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_origin_readthrough_enabled() {
+        let mut settings = valid_settings();
+        let readthrough = |enabled: bool| {
+            serde_json::from_value::<crate::creative_opportunities::CreativeOpportunitiesConfig>(
+                serde_json::json!({
+                    "gam_network_id": "12345",
+                    "origin_readthrough_enabled": enabled,
+                }),
+            )
+            .expect("should build a creative opportunities config")
+        };
+        settings.creative_opportunities = Some(readthrough(false));
+        validate_settings_for_deploy(&settings)
+            .expect("should accept origin readthrough explicitly disabled");
+
+        settings.creative_opportunities = Some(readthrough(true));
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject origin readthrough at deploy");
+        assert!(
+            format!("{error:?}").contains("creative_opportunities.origin_readthrough_enabled"),
+            "should name the rejected setting: {error:?}"
+        );
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject origin readthrough on validate and push");
+        assert!(
+            error
+                .to_string()
+                .contains("creative_opportunities.origin_readthrough_enabled"),
+            "should name the rejected setting on validate and push: {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_operator_trailer_and_connection_entries() {
+        let mut settings = valid_settings();
+        settings
+            .response_headers
+            .insert("x-example".to_owned(), "example-value".to_owned());
+        validate_settings_for_deploy(&settings)
+            .expect("should accept an operator header that is not a framing field");
+
+        for name in [
+            "Trailer",
+            "Content-Length",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), "example-value".to_owned());
+
+            let quoted = format!("`{name}`");
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("should reject an operator framing or hop-by-hop header at deploy");
+            assert!(
+                format!("{error:?}").contains(&quoted),
+                "should name the rejected header {name}: {error:?}"
+            );
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should reject an operator framing or hop-by-hop header on push");
+            assert!(
+                error.to_string().contains(&quoted),
+                "should name the rejected header {name} on validate and push: {error:?}"
+            );
+        }
     }
 
     #[test]

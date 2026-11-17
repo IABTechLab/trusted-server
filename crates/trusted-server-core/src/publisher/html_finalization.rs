@@ -122,7 +122,7 @@ impl HtmlEofDriver {
             })?;
         processor.set_finish_marker(marker.as_deref());
         let compression = Compression::from_content_encoding(&params.content_encoding);
-        let limit = settings.publisher.max_buffered_body_bytes;
+        let limit = params.max_input_bytes(settings);
         let input = TerminalInput::new(body, compression, limit);
         let hold = params.dispatched_auction.take().map(|dispatched| {
             AuctionHoldState::new(

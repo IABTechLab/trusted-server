@@ -62,11 +62,12 @@ pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 /// names the application-specific payload it retains.
 pub(crate) type Sandbox = edgezero_adapter_fastly::lifecycle::Sandbox<RetainedApp>;
 
-/// The application state a retained sandbox carries.
+/// The application a retained sandbox carries: the assembled app and its state.
 ///
-/// Only ever reachable after a successful build: a failed build returns the
-/// error router as the `initialize` error instead, so it is served for the
-/// current request and dropped rather than retained.
+/// Only ever reachable after a successful assembly. A failed assembly returns
+/// its error from `initialize` instead, which the entry point answers with
+/// `EdgeZero`'s assembly-error response for the current request only, so the
+/// next request retries.
 pub(crate) struct RetainedApp {
     pub(crate) app: App,
     pub(crate) state: Arc<AppState>,
@@ -146,10 +147,12 @@ impl RetirementCounters {
     }
 }
 
-/// Counter values captured for one response.
+/// Counter values captured for one request.
 ///
 /// An owned snapshot rather than a borrow of [`Sandbox`], so attaching counters
-/// never competes with the mutable borrow the request path holds.
+/// never competes with the mutable borrow the request path holds. Every
+/// request captures them, because every delivery failure log carries them.
+/// They reach a response only when [`metrics_enabled`] says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SandboxCounters {
     pub(crate) ordinal: u64,
@@ -158,24 +161,62 @@ pub(crate) struct SandboxCounters {
 }
 
 impl SandboxCounters {
-    /// Captures the current counters, or `None` when metrics are disabled.
-    ///
-    /// Returning `None` is what keeps the counters off every response in the
-    /// default configuration, including the correlation id.
-    pub(crate) fn capture(
-        sandbox: &Sandbox,
-        ordinal: u64,
-        request_id: &str,
-        settings: Option<&Settings>,
-    ) -> Option<Self> {
-        settings
-            .filter(|settings| metrics_enabled(settings))
-            .map(|_| Self {
-                ordinal,
-                builds: sandbox.initialization_attempts(),
-                request_id: request_id.to_owned(),
-            })
+    /// Captures the current counters.
+    pub(crate) fn capture(sandbox: &Sandbox, ordinal: u64, request_id: &str) -> Self {
+        Self {
+            ordinal,
+            builds: sandbox.initialization_attempts(),
+            request_id: request_id.to_owned(),
+        }
     }
+
+    /// The ` [instance=.. ordinal=.. request=..]` suffix of a delivery failure log.
+    ///
+    /// It matches the counters a committed response carries, so a failure
+    /// after commitment can be reconciled with that response.
+    pub(crate) fn log_context(&self) -> LogContext<'_> {
+        LogContext::new(self.ordinal, &self.request_id)
+    }
+}
+
+/// The ` [instance=.. ordinal=.. request=..]` suffix of a failure log.
+///
+/// It is formatted only when a log writes it, so a request that logs no
+/// failure pays nothing for it. The entry point builds one before the
+/// counters are captured, so the assembly failure log matches
+/// [`SandboxCounters::log_context`].
+#[derive(Debug, Clone, Copy, derive_more::Display)]
+#[display(" [instance={} ordinal={ordinal} request={request_id}]", instance_id())]
+pub(crate) struct LogContext<'a> {
+    ordinal: u64,
+    request_id: &'a str,
+}
+
+impl<'a> LogContext<'a> {
+    /// The suffix for request `ordinal`, identified by `request_id`.
+    pub(crate) fn new(ordinal: u64, request_id: &'a str) -> Self {
+        Self {
+            ordinal,
+            request_id,
+        }
+    }
+}
+
+/// Guest-instance identifier used to attribute requests to a sandbox.
+///
+/// `FASTLY_TRACE_ID` describes the sandbox, which is exactly what is wanted
+/// here and exactly why it must not be used as a request id. An absent value
+/// is reported rather than synthesized, so a measurement run cannot silently
+/// claim reuse it never observed.
+pub(crate) fn instance_id() -> String {
+    // The SDK documents this as the per-sandbox identifier; on wasm32-wasip1
+    // it resolves to `FASTLY_TRACE_ID`, which is why that value must never be
+    // used as a request id.
+    let id = fastly::compute_runtime::sandbox_id();
+    if id.is_empty() {
+        return INSTANCE_ID_UNAVAILABLE.to_owned();
+    }
+    id.to_owned()
 }
 
 /// Whether the counters endpoint and response counters are enabled.
@@ -773,14 +814,14 @@ mod tests {
         let builds = Cell::new(0_u32);
 
         // Request 1: the build fails. The error payload stands in for the
-        // error router `build_app_with_state` returns when state is `None`.
+        // assembly error the entry point answers the request with.
         let failed = sandbox.initialize(|| {
             builds.set(builds.get() + 1);
-            Err::<RetainedApp, &str>("error router")
+            Err::<RetainedApp, &str>("assembly error")
         });
         assert_eq!(
             failed.err(),
-            Some("error router"),
+            Some("assembly error"),
             "a failed build must be handed back for this request only"
         );
         assert!(
@@ -843,7 +884,7 @@ mod tests {
         counters.observe(&mut sandbox, |sandbox| {
             sandbox
                 .initialize(|| Ok::<_, &str>(test_retained()))
-                .expect("the build should succeed");
+                .expect("should build the app");
         });
         assert_eq!(
             counters.attempts(),
@@ -861,10 +902,10 @@ mod tests {
         // in `initialization_attempts()` until the sandbox is dropped. What a
         // stale snapshot loses is the report, not the count.
         counters.observe(&mut sandbox, |sandbox| {
-            let failed = sandbox.initialize(|| Err::<RetainedApp, &str>("error router"));
+            let failed = sandbox.initialize(|| Err::<RetainedApp, &str>("assembly error"));
             assert_eq!(
                 failed.err(),
-                Some("error router"),
+                Some("assembly error"),
                 "the failed build should be handed back"
             );
         });
@@ -907,32 +948,42 @@ mod tests {
     }
 
     #[test]
-    fn counters_are_captured_only_when_metrics_are_enabled() {
-        let sandbox = Sandbox::default();
-        let mut settings = Settings::default();
+    fn counters_capture_the_ordinal_builds_and_request_id() {
+        let mut sandbox = Sandbox::default();
+        sandbox
+            .initialize(|| Ok::<_, &str>(test_retained()))
+            .expect("should build the app");
+
+        let counters = SandboxCounters::capture(&sandbox, 7, "req-7");
 
         assert_eq!(
-            SandboxCounters::capture(&sandbox, 1, "req-1", None),
-            None,
-            "no settings should mean no counters"
+            counters,
+            SandboxCounters {
+                ordinal: 7,
+                builds: 1,
+                request_id: "req-7".to_owned(),
+            },
+            "should capture the current counters whatever the metrics setting"
         );
-
-        settings.debug.sandbox_metrics_enabled = false;
         assert_eq!(
-            SandboxCounters::capture(&sandbox, 1, "req-1", Some(&settings)),
-            None,
-            "counters must stay off in the default configuration"
+            counters.log_context().to_string(),
+            format!(" [instance={} ordinal=7 request=req-7]", instance_id()),
+            "should name the instance, ordinal, and request in failure logs"
+        );
+    }
+
+    #[test]
+    fn metrics_follow_the_debug_setting() {
+        let mut settings = Settings::default();
+        assert!(
+            !metrics_enabled(&settings),
+            "counters must stay off responses in the default configuration"
         );
 
         settings.debug.sandbox_metrics_enabled = true;
-        assert_eq!(
-            SandboxCounters::capture(&sandbox, 7, "req-7", Some(&settings)),
-            Some(SandboxCounters {
-                ordinal: 7,
-                builds: 0,
-                request_id: "req-7".to_owned(),
-            }),
-            "enabling the flag should capture the current counters"
+        assert!(
+            metrics_enabled(&settings),
+            "enabling the flag should put counters on responses"
         );
     }
 

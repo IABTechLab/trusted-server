@@ -1,3 +1,6 @@
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 // The `cloudflare` feature activates the `worker` crate which requires
 // wasm-bindgen and only compiles for `wasm32-unknown-unknown`. Enabling it on
 // a native target produces cryptic linker errors — catch it early instead.

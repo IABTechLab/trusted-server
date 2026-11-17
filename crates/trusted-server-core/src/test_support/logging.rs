@@ -1,4 +1,4 @@
-//! Thread-local warning capture behind the single process-wide test logger.
+//! Thread-local warning and error capture behind the single process-wide test logger.
 
 use std::cell::RefCell;
 use std::sync::Once;
@@ -7,8 +7,13 @@ thread_local! {
     static WARNINGS: RefCell<Option<Vec<CapturedWarning>>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct CapturedWarning {
+/// One warning or error a [`WarningCapture`] recorded.
+pub struct CapturedWarning {
+    /// Level of the record, [`log::Level::Warn`] or [`log::Level::Error`].
+    pub level: log::Level,
+    /// Log target of the warning.
     pub target: String,
+    /// Rendered warning message.
     pub message: String,
 }
 
@@ -16,7 +21,7 @@ struct TestLogger;
 
 impl log::Log for TestLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() == log::Level::Warn
+        metadata.level() <= log::Level::Warn
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -24,6 +29,7 @@ impl log::Log for TestLogger {
             WARNINGS.with(|warnings| {
                 if let Some(warnings) = warnings.borrow_mut().as_mut() {
                     warnings.push(CapturedWarning {
+                        level: record.level(),
                         target: record.target().to_owned(),
                         message: record.args().to_string(),
                     });
@@ -35,9 +41,20 @@ impl log::Log for TestLogger {
     fn flush(&self) {}
 }
 
-pub(crate) struct WarningCapture;
+/// Records the warnings and errors logged on the current thread until it is dropped.
+///
+/// The first capture installs one process-wide logger that keeps only warnings and errors,
+/// so a test binary that installs another logger cannot use it. Captures do not nest.
+pub struct WarningCapture;
 
 impl WarningCapture {
+    /// Starts capturing the warnings and errors logged on this thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another logger is already installed or a capture is already active on this
+    /// thread.
+    #[must_use]
     pub fn start() -> Self {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
@@ -55,6 +72,12 @@ impl WarningCapture {
         Self
     }
 
+    /// Returns the warnings and errors captured since the start or the last take.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capture is no longer active on this thread.
+    #[must_use]
     pub fn take(&self) -> Vec<CapturedWarning> {
         WARNINGS.with(|warnings| {
             std::mem::take(
