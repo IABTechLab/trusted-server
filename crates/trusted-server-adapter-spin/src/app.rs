@@ -28,6 +28,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
@@ -188,14 +190,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-//
-// The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
-// intentionally absent here, matching the Axum and Cloudflare adapters: those
-// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
-// registry and rate limiter) that the portability adapters do not yet wire.
-// On Spin these paths fall through to the publisher/integration fallback,
-// identical to the other non-Fastly adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -206,7 +200,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -218,6 +212,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/identify", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/batch-sync", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -618,6 +614,25 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             }
         };
 
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: this adapter has no EC record store, so identify and batch
+        // sync answer 501 and any other method answers 405.
+        let s = Arc::clone(&state);
+        let identify_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+        let batch_sync_handler = |ctx: RequestContext| async move {
+            let req = ctx.into_request()?;
+            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
+        };
+
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -926,6 +941,15 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 method.clone(),
                 cache_purge_unsupported_handler,
             );
+        }
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/api/v1/identify",
+                method.clone(),
+                identify_handler.clone(),
+            );
+            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
