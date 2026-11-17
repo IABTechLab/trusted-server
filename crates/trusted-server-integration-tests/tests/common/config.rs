@@ -366,23 +366,29 @@ mod tests {
 
     #[test]
     fn fastly_ec_fixture_selects_the_declared_logical_store() {
-        let settings = toml::from_str::<TrustedServerAppConfig>(APP_CONFIG)
-            .expect("should parse the integration configuration")
-            .into_settings();
-        let selected = settings
-            .ec
-            .resolve_storage(EcRuntime::Fastly)
-            .expect("should resolve Fastly storage without provider preparation");
-        assert!(
-            matches!(
-                selected,
-                Some(
-                    EcStorageSelection::Fastly("trusted_server_kv")
-                        | EcStorageSelection::Records("trusted_server_kv")
-                )
-            ),
-            "should select the logical record store declared by the Fastly application"
-        );
+        for config in [
+            APP_CONFIG,
+            include_str!("../../fixtures/configs/trusted-server.trace.toml"),
+            include_str!("../../fixtures/configs/trusted-server.trace-auth.toml"),
+        ] {
+            let settings = toml::from_str::<TrustedServerAppConfig>(config)
+                .expect("should parse the integration configuration")
+                .into_settings();
+            let selected = settings
+                .ec
+                .resolve_storage(EcRuntime::Fastly)
+                .expect("should resolve Fastly storage without provider preparation");
+            assert!(
+                matches!(
+                    selected,
+                    Some(
+                        EcStorageSelection::Fastly("trusted_server_kv")
+                            | EcStorageSelection::Records("trusted_server_kv")
+                    )
+                ),
+                "should select the logical record store declared by the Fastly application"
+            );
+        }
     }
 
     #[test]
