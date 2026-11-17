@@ -12,6 +12,40 @@ The Prebid integration enables server-side header bidding through Prebid Server 
 
 Prebid is the leading open-source header bidding solution that allows publishers to offer ad inventory to multiple demand sources simultaneously, maximizing revenue through competition.
 
+## Identity-only mode
+
+Set `mode = "identity"` in `[integrations.prebid]` to use Prebid for identity
+without Trusted Server's browser auction integration. The default, `"auction"`,
+keeps the existing Trusted Server bidder and GPT refresh behavior. Unknown modes
+fail configuration parsing.
+
+Identity mode still loads the configured external Prebid bundle and applies
+managed User ID configuration and its existing consent handling. Publisher
+bidders, ad units and GPT refresh remain under publisher control: no
+`trustedServer` bidder is registered or added. Include the publisher's required
+bidder and User ID modules in the external bundle as usual. Identity mode leaves
+publisher auction timeout/debug settings untouched; configure them through Prebid.
+
+Before each publisher auction, tsjs reads `__Host-ts-eids-mirror` and adds its live
+IDs to that auction's first-party data. Existing publisher IDs and other data are
+preserved, and Prebid's normal activity controls apply before bidder delivery.
+The server writes this mirror only for eligible provider-owned IDs from partners
+with `bidstream_enabled` and `mirror_enabled`. Malformed mirrors and expired IDs
+are ignored. Removing or replacing the cookie takes effect on the next auction;
+mirror IDs are never stored in global Prebid configuration.
+
+After an auction, native Prebid User ID module IDs are captured into the existing
+one-day `ts-eids` cookie for server ingestion. Mirrored IDs are not copied back
+into this cookie. This mode does not call an EC endpoint or independently grant
+consent. It does not disable server auctions configured elsewhere.
+
+```toml
+[integrations.prebid]
+enabled = true
+mode = "identity"
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
+```
+
 ## Configuration
 
 Prebid configuration has two independent owners:
