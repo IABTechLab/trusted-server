@@ -13,6 +13,13 @@ entry = "crates/trusted-server-core"
 kind = "http"
 version = "0.1.0"
 
+# -- Capabilities ------------------------------------------------------------
+# Publisher origins and integrations may use HTTP or HTTPS. An absent list means
+# HTTPS only, and `"*"` allows both, matching the Spin manifest's allowed hosts.
+
+[capabilities.outbound]
+hosts = ["*"]
+
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the
 # physical store each adapter binds is overridable out of band (Fastly binds
@@ -41,6 +48,17 @@ manifest = "fastly.toml"
 [adapters.fastly.build]
 target = "wasm32-wasip1"
 profile = "release"
+
+# EdgeZero's managed Fastly logger, which its Fastly lifecycle installs before
+# the request callback. Records go to the `tslog` endpoint and are echoed to
+# stdout. The binary compiles this file in, so a change needs a rebuild; an
+# `edgezero_logging` Config Store with `EDGEZERO__LOGGING__LEVEL` overrides the
+# level at runtime (docs/guide/fastly.md). EdgeZero keeps its `edgezero::boot`
+# warnings at warn whatever the level.
+[adapters.fastly.logging]
+endpoint = "tslog"
+level = "info"
+echo_stdout = true
 
 [adapters.fastly.commands]
 auth-login = "fastly profile create"

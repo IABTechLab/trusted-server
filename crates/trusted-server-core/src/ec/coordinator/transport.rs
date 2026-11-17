@@ -1,49 +1,52 @@
-//! Sends provider lookups and gathers responses before a shared deadline.
+//! Sends provider lookups and gathers responses before a shared cutoff.
+//!
+//! Lookups take the shape of the auction fan-out: every request is built
+//! first, then all of them start together in one `EdgeZero` batch with
+//! [`HttpClient::start_batch_until`], and collection reads the batch until
+//! every slot finishes or the cutoff passes. A slot the cutoff leaves
+//! unresolved is a timeout.
 
-use std::cell::Cell;
 use std::time::Duration;
 
-use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt as _};
+use edgezero_core::error::EdgeError;
+use edgezero_core::outbound::{
+    HttpClient, OutboundBatch, OutboundBatchNext, OutboundCachePolicy, OutboundRequest,
+    OutboundResponse, OutboundSlotResult, ResponseDecoding,
+};
+use error_stack::Report;
+use http::Uri;
 
 use crate::ec::provider::ProviderRequest;
-use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    RuntimeServices,
-};
+use crate::error::TrustedServerError;
+use crate::outbound::{OutboundRequestSource, buffered, outbound_error};
+use crate::platform::RuntimeServices;
 
 /// Largest provider response body accepted.
 pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Smallest transport timeout registered for a lookup backend, in
-/// milliseconds; the shared deadline still bounds collection.
-const MIN_TRANSPORT_TIMEOUT_MS: u32 = 50;
+/// [`MAX_PROVIDER_RESPONSE_BYTES`] as the response cap `EdgeZero` takes.
+const MAX_PROVIDER_RESPONSE_CAP: u64 = 64 * 1024;
 
-/// Sends provider lookups and gathers their responses before a deadline.
+/// Sends provider lookups and gathers their responses before a cutoff.
 #[allow(async_fn_in_trait)]
 pub trait LookupTransport {
-    /// An in-flight request.
+    /// Requests started together and not yet gathered.
     type Pending;
 
-    /// Starts one request without waiting for its response.
+    /// Starts every request at once, without waiting for a response.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::Send`] when the request cannot be started.
-    async fn start(
-        &self,
-        request: ProviderRequest,
-        deadline: Deadline,
-    ) -> Result<Self::Pending, Report<TransportError>>;
+    /// The cutoff is `budget` from now, and each request carries `budget` as
+    /// its own timeout. A request that cannot be started is reported as
+    /// [`TransportError::Send`] by [`Self::gather`].
+    fn start(&self, requests: Vec<Tagged<ProviderRequest>>, budget: Duration) -> Self::Pending;
 
-    /// Waits for in-flight requests until all finish or `deadline` passes.
+    /// Waits for the started requests until all finish or the cutoff passes.
     ///
-    /// Requests still in flight at the deadline are abandoned and reported as
+    /// Requests still in flight at the cutoff are abandoned and reported as
     /// [`TransportError::Timeout`].
     async fn gather(
         &self,
-        pending: Vec<Tagged<Self::Pending>>,
-        deadline: Deadline,
+        pending: Self::Pending,
     ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>>;
 }
 
@@ -88,37 +91,13 @@ pub struct TransportResponse {
     pub body: bytes::Bytes,
 }
 
-/// End of the shared lookup budget.
-#[derive(Debug, Clone, Copy)]
-pub struct Deadline(web_time::Instant);
-
-impl Deadline {
-    /// A deadline `budget` from now.
-    #[must_use]
-    pub fn after(budget: Duration) -> Self {
-        Self(web_time::Instant::now() + budget)
-    }
-
-    /// The deadline instant.
-    #[must_use]
-    pub fn instant(self) -> web_time::Instant {
-        self.0
-    }
-
-    /// Time left before the deadline; zero once it has passed.
-    #[must_use]
-    pub fn remaining(self) -> Duration {
-        self.0.saturating_duration_since(web_time::Instant::now())
-    }
-}
-
 /// Why a lookup produced no response.
 #[derive(Debug, derive_more::Display)]
 pub enum TransportError {
     /// The request could not be sent.
     #[display("lookup request could not be sent")]
     Send,
-    /// No response before the deadline.
+    /// No response before the cutoff.
     #[display("lookup did not complete before the deadline")]
     Timeout,
     /// The body exceeded [`MAX_PROVIDER_RESPONSE_BYTES`].
@@ -128,182 +107,224 @@ pub enum TransportError {
 
 impl core::error::Error for TransportError {}
 
-/// [`LookupTransport`] over the platform HTTP client.
+/// [`LookupTransport`] over `EdgeZero`'s outbound client.
 ///
-/// Each request gets its own backend name (a per-transport sequence number is
-/// the backend discriminator), so a ready response maps back to its provider
-/// by backend name. Names repeat across requests and the transport timeout is
-/// canonicalized, keeping the number of registered dynamic backends bounded.
-pub struct PlatformLookupTransport<'s> {
-    services: &'s RuntimeServices,
-    next: Cell<u32>,
+/// Every lookup always verifies the provider's certificate: `EdgeZero` has no
+/// way to turn verification off, and lookups carry the EC ID and the
+/// provider's credential. Lookups bypass the cache and decode the response.
+/// The cutoff is taken on the client's own clock, the clock its batch
+/// records arrivals on.
+pub struct OutboundLookupTransport {
+    client: HttpClient,
 }
 
-impl<'s> PlatformLookupTransport<'s> {
-    /// Borrows the request's runtime services.
-    ///
-    /// Lookups always verify the provider's certificate: they carry the EC ID
-    /// and the provider's credential, so `proxy.certificate_check` (meant for
-    /// development origins) does not apply to them.
+impl OutboundLookupTransport {
+    /// Sends through `client`.
     #[must_use]
-    pub fn new(services: &'s RuntimeServices) -> Self {
+    pub fn new(client: &HttpClient) -> Self {
         Self {
-            services,
-            next: Cell::new(0),
+            client: client.clone(),
         }
     }
 
-    fn transport_timeout(&self, deadline: Deadline) -> Duration {
-        let remaining_ms = u32::try_from(deadline.remaining().as_millis()).unwrap_or(u32::MAX);
-        let canonical = self
-            .services
-            .backend()
-            .canonicalize_transport_timeout_ms(remaining_ms, u32::MAX);
-        Duration::from_millis(u64::from(canonical.max(MIN_TRANSPORT_TIMEOUT_MS)))
+    /// Sends through the request's outbound client.
+    #[must_use]
+    pub fn for_services(services: &RuntimeServices) -> Self {
+        Self::new(services.outbound_client())
     }
 }
 
-impl LookupTransport for PlatformLookupTransport<'_> {
-    type Pending = PlatformPendingRequest;
+/// Lookups an [`OutboundLookupTransport`] started and has not gathered.
+///
+/// Dropping it cancels every request still in flight.
+pub struct InFlightLookups {
+    batch: Option<OutboundBatch>,
+    /// The provider of each batch slot, by slot position.
+    slots: Vec<ProviderIndex>,
+    /// Providers whose request could not be built.
+    not_started: Vec<ProviderIndex>,
+}
 
-    async fn start(
-        &self,
-        request: ProviderRequest,
-        deadline: Deadline,
-    ) -> Result<PlatformPendingRequest, Report<TransportError>> {
-        let ProviderRequest {
-            method,
-            url,
-            headers,
-            body,
-            context: _,
-        } = request;
-        let host = url
-            .host_str()
-            .ok_or_else(|| Report::new(TransportError::Send))?
-            .to_owned();
-        let timeout = self.transport_timeout(deadline);
-        let sequence = self.next.get();
-        self.next.set(sequence.wrapping_add(1));
-        let backend = self
-            .services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: url.scheme().to_owned(),
-                host,
-                port: url.port(),
-                host_header_override: None,
-                certificate_check: true,
-                first_byte_timeout: timeout,
-                between_bytes_timeout: timeout,
-                discriminator: Some(format!("ts-identity-{sequence}")),
-            })
-            .change_context(TransportError::Send)?;
-        let mut builder = http::Request::builder().method(method).uri(url.as_str());
-        if let Some(target) = builder.headers_mut() {
-            *target = headers;
+impl std::fmt::Debug for InFlightLookups {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlightLookups")
+            .field("slots", &self.slots.len())
+            .field("not_started", &self.not_started.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LookupTransport for OutboundLookupTransport {
+    type Pending = InFlightLookups;
+
+    fn start(&self, requests: Vec<Tagged<ProviderRequest>>, budget: Duration) -> InFlightLookups {
+        let mut slots = Vec::with_capacity(requests.len());
+        let mut outbound = Vec::with_capacity(requests.len());
+        let mut not_started = Vec::new();
+        for Tagged { provider, value } in requests {
+            match lookup_request(value, budget) {
+                Ok(request) => {
+                    slots.push(provider);
+                    outbound.push(request);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Identity lookup: request could not be built: {:?}",
+                        lookup_failure(error)
+                    );
+                    not_started.push(provider);
+                }
+            }
         }
-        let edge_request = builder
-            .body(EdgeBody::from(body.to_vec()))
-            .change_context(TransportError::Send)?;
-        self.services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(edge_request, backend).with_cache_bypass())
-            .await
-            .change_context(TransportError::Send)
+        // Every lookup leaves together, as auction bidders do. The cutoff is
+        // taken here so it starts with the batch.
+        let batch = (!outbound.is_empty()).then(|| {
+            let cutoff = self.client.time().clock().deadline_after(budget);
+            self.client.start_batch_until(outbound, cutoff)
+        });
+        InFlightLookups {
+            batch,
+            slots,
+            not_started,
+        }
     }
 
     async fn gather(
         &self,
-        pending: Vec<Tagged<PlatformPendingRequest>>,
-        deadline: Deadline,
+        pending: InFlightLookups,
     ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
-        // Names are captured before the first select: some adapters drop
-        // them from the requests that remain in flight.
-        let mut outstanding: Vec<(String, ProviderIndex)> = Vec::with_capacity(pending.len());
-        let mut remaining = Vec::with_capacity(pending.len());
-        let mut results = Vec::with_capacity(pending.len());
-        for Tagged { provider, value } in pending {
-            match value.backend_name() {
-                Some(name) => {
-                    outstanding.push((name.to_owned(), provider));
-                    remaining.push(value);
-                }
-                None => results.push(Tagged {
-                    provider,
-                    value: Err(Report::new(TransportError::Send)),
-                }),
-            }
-        }
-        while !remaining.is_empty() {
-            match self
-                .services
-                .http_client()
-                .select_until(remaining, deadline.instant())
-                .await
-            {
-                Ok(Some(selected)) => {
-                    remaining = selected.remaining;
-                    let (name, value) = match selected.ready {
-                        Ok(response) => {
-                            (response.backend_name.clone(), read_response(response).await)
-                        }
-                        Err(report) => (
-                            selected.failed_backend_name,
-                            Err(report.change_context(TransportError::Send)),
-                        ),
+        let InFlightLookups {
+            batch,
+            slots,
+            not_started,
+        } = pending;
+        let mut results: Vec<_> = not_started
+            .into_iter()
+            .map(|provider| Tagged {
+                provider,
+                value: Err(Report::new(TransportError::Send)),
+            })
+            .collect();
+        let Some(mut batch) = batch else {
+            return results;
+        };
+        let mut unresolved: Vec<Option<ProviderIndex>> = slots.into_iter().map(Some).collect();
+        let failed = loop {
+            match batch.next().await {
+                Ok(OutboundBatchNext::Item(item)) => {
+                    let (index, result) = item.into_parts();
+                    let Some(provider) = unresolved.get_mut(index).and_then(Option::take) else {
+                        log::warn!(
+                            "Identity lookup: batch reported unknown slot {index}, ignoring"
+                        );
+                        continue;
                     };
-                    match name.and_then(|name| take_provider(&mut outstanding, &name)) {
-                        Some(provider) => results.push(Tagged { provider, value }),
-                        None => {
-                            log::warn!("Identity lookup: dropping response with unknown backend");
-                        }
-                    }
+                    results.push(Tagged {
+                        provider,
+                        value: read_slot(result).await,
+                    });
                 }
-                Ok(None) => break,
-                Err(report) => {
-                    log::warn!("Identity lookup: select failed: {report:?}");
-                    break;
+                Ok(OutboundBatchNext::Finished(_termination)) => break false,
+                Err(error) => {
+                    log::warn!("Identity lookup: batch failed: {:?}", lookup_failure(error));
+                    break true;
                 }
             }
-        }
-        // Every request not yet answered timed out or was abandoned.
-        results.extend(outstanding.into_iter().map(|(_, provider)| Tagged {
+        };
+        // A cutoff leaves a late lookup unresolved, and a failed batch leaves
+        // every slot it had not reported.
+        results.extend(unresolved.into_iter().flatten().map(|provider| Tagged {
             provider,
-            value: Err(Report::new(TransportError::Timeout)),
+            value: Err(Report::new(if failed {
+                TransportError::Send
+            } else {
+                TransportError::Timeout
+            })),
         }));
         results
     }
 }
 
-/// Removes the first outstanding request with backend `name`.
-fn take_provider(
-    outstanding: &mut Vec<(String, ProviderIndex)>,
-    name: &str,
-) -> Option<ProviderIndex> {
-    let index = outstanding
-        .iter()
-        .position(|(candidate, _)| candidate == name)?;
-    Some(outstanding.remove(index).1)
+/// Builds the outbound request for one lookup.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] that parsing the URL or building the request
+/// raised.
+fn lookup_request(
+    request: ProviderRequest,
+    budget: Duration,
+) -> Result<OutboundRequest, EdgeError> {
+    let ProviderRequest {
+        method,
+        url,
+        headers,
+        body,
+        context: _,
+    } = request;
+    let uri = url
+        .as_str()
+        .parse::<Uri>()
+        .map_err(|_| EdgeError::bad_request("lookup URL is not a valid URI"))?;
+    let mut outbound = OutboundRequest::new(method, uri)?.body(body);
+    *outbound.headers_mut() = headers;
+    Ok(buffered(
+        outbound,
+        budget,
+        MAX_PROVIDER_RESPONSE_CAP,
+        ResponseDecoding::Decode,
+    )
+    .cache_policy(OutboundCachePolicy::Bypass))
+}
+
+/// A printable report of an outbound failure that never carries its message,
+/// which can hold the lookup URL and so the EC ID.
+fn lookup_failure(error: EdgeError) -> Report<TrustedServerError> {
+    outbound_error(
+        error,
+        TrustedServerError::EdgeCookie {
+            message: "identity lookup failed".to_owned(),
+        },
+        OutboundRequestSource::Internal,
+    )
+}
+
+/// Turns one batch slot into a lookup response.
+async fn read_slot(
+    result: OutboundSlotResult,
+) -> Result<TransportResponse, Report<TransportError>> {
+    let OutboundSlotResult { outcome, .. } = result;
+    match outcome {
+        Ok(response) => read_response(response).await,
+        Err(error) => Err(transport_error(error)),
+    }
+}
+
+/// Classifies a failed lookup, keeping a message-free report of the cause.
+fn transport_error(error: EdgeError) -> Report<TransportError> {
+    let kind = match &error {
+        EdgeError::GatewayTimeout { .. } => TransportError::Timeout,
+        EdgeError::ResponseTooLarge { .. } => TransportError::BodyTooLarge,
+        _ => TransportError::Send,
+    };
+    lookup_failure(error).change_context(kind)
 }
 
 async fn read_response(
-    response: PlatformResponse,
+    response: OutboundResponse,
 ) -> Result<TransportResponse, Report<TransportError>> {
-    let (parts, body) = response.response.into_parts();
-    let body = match body {
-        EdgeBody::Once(bytes) => bytes,
-        stream => stream
-            .into_bytes_bounded(MAX_PROVIDER_RESPONSE_BYTES)
-            .await
-            .change_context(TransportError::BodyTooLarge)?,
-    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .into_bytes_bounded(MAX_PROVIDER_RESPONSE_CAP)
+        .await
+        .map_err(transport_error)?;
     if body.len() > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(Report::new(TransportError::BodyTooLarge));
     }
     Ok(TransportResponse {
-        status: parts.status,
-        headers: parts.headers,
+        status,
+        headers,
         body,
     })
 }
@@ -311,8 +332,10 @@ async fn read_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use std::sync::Arc;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
+    use edgezero_core::outbound::ResponseMode;
+
+    const BUDGET: Duration = Duration::from_millis(200);
 
     fn request(path: &str) -> ProviderRequest {
         ProviderRequest {
@@ -324,61 +347,41 @@ mod tests {
         }
     }
 
+    fn tagged(index: usize, path: &str) -> Tagged<ProviderRequest> {
+        Tagged {
+            provider: ProviderIndex::new(index),
+            value: request(path),
+        }
+    }
+
     fn gather_one(
-        transport: &PlatformLookupTransport<'_>,
-        deadline: Deadline,
+        client: &ScriptedHttpClient,
+        clock: &TestClock,
+        budget: Duration,
     ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
-        futures::executor::block_on(async {
-            let pending = transport
-                .start(request("a"), deadline)
-                .await
-                .expect("should start");
-            transport
-                .gather(
-                    vec![Tagged {
-                        provider: ProviderIndex::new(0),
-                        value: pending,
-                    }],
-                    deadline,
-                )
-                .await
-        })
+        let transport = OutboundLookupTransport::new(&client.http_client());
+        let pending = transport.start(vec![tagged(0, "a")], budget);
+        clock.drive(transport.gather(pending))
     }
 
     #[test]
     fn gather_returns_tagged_responses() {
-        let client = Arc::new(StubHttpClient::new());
-        client.push_response(200, b"{\"a\":1}".to_vec());
-        client.push_response(204, Vec::new());
-        let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services);
-        let deadline = Deadline::after(Duration::from_millis(200));
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            http::Method::GET,
+            "https://ids.example.com/a",
+            ScriptedReply::status(http::StatusCode::OK).body(&b"{\"a\":1}"[..]),
+        );
+        client.respond_to(
+            http::Method::GET,
+            "https://ids.example.com/b",
+            ScriptedReply::status(http::StatusCode::NO_CONTENT),
+        );
+        let transport = OutboundLookupTransport::new(&client.http_client());
 
-        let results = futures::executor::block_on(async {
-            let first = transport
-                .start(request("a"), deadline)
-                .await
-                .expect("should start");
-            let second = transport
-                .start(request("b"), deadline)
-                .await
-                .expect("should start");
-            transport
-                .gather(
-                    vec![
-                        Tagged {
-                            provider: ProviderIndex::new(0),
-                            value: first,
-                        },
-                        Tagged {
-                            provider: ProviderIndex::new(1),
-                            value: second,
-                        },
-                    ],
-                    deadline,
-                )
-                .await
-        });
+        let pending = transport.start(vec![tagged(0, "a"), tagged(1, "b")], BUDGET);
+        let results = clock.drive(transport.gather(pending));
 
         assert_eq!(results.len(), 2, "should return one result per request");
         let first = results
@@ -397,25 +400,54 @@ mod tests {
             http::StatusCode::NO_CONTENT,
             "should map provider 1"
         );
+        let sent = client.requests();
         assert_eq!(
-            client.recorded_request_uris(),
+            sent.iter()
+                .map(|request| request.uri.to_string())
+                .collect::<Vec<_>>(),
             [
                 "https://ids.example.com/a".to_owned(),
                 "https://ids.example.com/b".to_owned()
             ],
             "should send both requests"
         );
+        for request in &sent {
+            assert_eq!(
+                request.mode,
+                edgezero_core::outbound::OutboundSendMode::Batch,
+                "should send every lookup in one batch"
+            );
+            assert_eq!(
+                request.timeout,
+                Some(BUDGET),
+                "should time out at the budget"
+            );
+            assert_eq!(
+                request.response_mode,
+                ResponseMode::Buffered {
+                    max_bytes: MAX_PROVIDER_RESPONSE_CAP
+                },
+                "should cap the buffered response"
+            );
+            assert_eq!(
+                request.cache_policy,
+                OutboundCachePolicy::Bypass,
+                "should bypass the cache"
+            );
+        }
     }
 
     #[test]
     fn gather_reports_timeout_for_requests_past_the_deadline() {
-        let client = Arc::new(StubHttpClient::new());
-        client.push_response(200, Vec::new());
-        client.push_select_delay(Duration::from_millis(50));
-        let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services);
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            http::Method::GET,
+            "https://ids.example.com/a",
+            ScriptedReply::status(http::StatusCode::OK).after(Duration::from_millis(50)),
+        );
 
-        let results = gather_one(&transport, Deadline::after(Duration::from_millis(1)));
+        let results = gather_one(&client, &clock, Duration::from_millis(1));
 
         let error = results[0].value.as_ref().expect_err("should time out");
         assert!(
@@ -426,12 +458,16 @@ mod tests {
 
     #[test]
     fn gather_rejects_oversized_bodies() {
-        let client = Arc::new(StubHttpClient::new());
-        client.push_response(200, vec![b'x'; MAX_PROVIDER_RESPONSE_BYTES + 1]);
-        let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services);
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            http::Method::GET,
+            "https://ids.example.com/a",
+            ScriptedReply::status(http::StatusCode::OK)
+                .body(vec![b'x'; MAX_PROVIDER_RESPONSE_BYTES + 1]),
+        );
 
-        let results = gather_one(&transport, Deadline::after(Duration::from_millis(200)));
+        let results = gather_one(&client, &clock, BUDGET);
 
         let error = results[0]
             .value
@@ -445,19 +481,43 @@ mod tests {
 
     #[test]
     fn gather_with_no_requests_returns_nothing() {
-        let client = Arc::new(StubHttpClient::new());
-        let services = build_services_with_http_client(client.clone());
-        let transport = PlatformLookupTransport::new(&services);
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let transport = OutboundLookupTransport::new(&client.http_client());
 
-        let results = futures::executor::block_on(
-            transport.gather(Vec::new(), Deadline::after(Duration::from_millis(1))),
-        );
+        let pending = transport.start(Vec::new(), BUDGET);
+        let results = futures::executor::block_on(transport.gather(pending));
 
         assert!(results.is_empty(), "should return nothing");
-        assert_eq!(
-            client.recorded_select_count(),
-            0,
-            "should not select an empty list"
+        client.assert_no_requests();
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_built_reports_a_send_failure() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        let transport = OutboundLookupTransport::new(&client.http_client());
+        let mut unbuildable = request("a");
+        unbuildable.url = url::Url::parse("https://user:secret@ids.example.com/a")
+            .expect("should parse a URL with userinfo");
+
+        let pending = transport.start(
+            vec![Tagged {
+                provider: ProviderIndex::new(0),
+                value: unbuildable,
+            }],
+            BUDGET,
         );
+        let results = futures::executor::block_on(transport.gather(pending));
+
+        let error = results[0]
+            .value
+            .as_ref()
+            .expect_err("should not send the request");
+        assert!(
+            matches!(error.current_context(), TransportError::Send),
+            "should report a send failure"
+        );
+        client.assert_no_requests();
     }
 }

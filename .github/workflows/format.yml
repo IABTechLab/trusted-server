@@ -63,6 +63,20 @@ jobs:
       - name: Verify jobs pin Node before compiling Rust
         run: node scripts/check-ci-node-pin.mjs
 
+  fastly-response-diff:
+    name: Fastly response diff script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the response comparison
+        run: node --test scripts/fastly-response-diff.test.mjs
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest

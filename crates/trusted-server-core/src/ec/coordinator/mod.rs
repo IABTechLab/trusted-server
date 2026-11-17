@@ -1,7 +1,7 @@
 //! Server-side identity lookup coordination (spec §8).
 //!
 //! [`ProviderCoordinator`] owns eligibility, consent, destination checks, a
-//! deadline-bounded fan-out through a [`LookupTransport`], validation and
+//! cutoff-bounded fan-out through a [`LookupTransport`], validation and
 //! planning of the navigation's single row change. Providers stay pure.
 
 pub mod results;
@@ -16,9 +16,7 @@ use std::time::Duration;
 use error_stack::Report;
 
 use self::results::{LookupResults, LookupStatus, OptOutMemory, ProviderLookup, SkipReason};
-use self::transport::{
-    Deadline, LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse,
-};
+use self::transport::{LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse};
 use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
@@ -56,7 +54,7 @@ pub trait IdentityCoordinator {
         lookup: &LookupContext<'_>,
     ) -> PendingLookups<T::Pending>;
 
-    /// Waits for dispatched lookups until all finish or the deadline passes,
+    /// Waits for dispatched lookups until all finish or the cutoff passes,
     /// then parses and validates each response.
     ///
     /// Never fails: per-provider failures are recorded in [`LookupResults`].
@@ -97,8 +95,10 @@ pub struct LookupContext<'a> {
 /// (empty) and `Debug` (counts only) are implemented by hand so they do not
 /// require bounds on `Pending`.
 pub struct PendingLookups<Pending> {
-    requests: Vec<Tagged<Pending>>,
-    deadline: Option<Deadline>,
+    /// Requests the transport started together, if any.
+    in_flight: Option<Pending>,
+    /// How many requests were started.
+    started: usize,
     /// EC ID the lookups were dispatched for.
     ec_id: String,
     /// Request time, for validating `exp` and resolving relative expiry.
@@ -118,8 +118,8 @@ pub struct PendingLookups<Pending> {
 impl<Pending> Default for PendingLookups<Pending> {
     fn default() -> Self {
         Self {
-            requests: Vec::new(),
-            deadline: None,
+            in_flight: None,
+            started: 0,
             ec_id: String::new(),
             now: UnixSeconds::new(0),
             early: Vec::new(),
@@ -134,7 +134,7 @@ impl<Pending> Default for PendingLookups<Pending> {
 impl<Pending> std::fmt::Debug for PendingLookups<Pending> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingLookups")
-            .field("requests", &self.requests.len())
+            .field("requests", &self.started)
             .field("early", &self.early.len())
             .field("generated", &self.generated.len())
             .field("from_cookies", &self.from_cookies.len())
@@ -146,7 +146,7 @@ impl<Pending> PendingLookups<Pending> {
     /// Whether nothing was dispatched, generated or skipped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+        self.started == 0
             && self.early.is_empty()
             && self.generated.is_empty()
             && self.from_cookies.is_empty()
@@ -599,8 +599,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
-        let deadline = Deadline::after(self.budget);
-        pending.deadline = Some(deadline);
+        let mut requests = Vec::new();
         let mut pull_sync_dispatched = 0_usize;
         for index in self.dispatch_order(lookup.now) {
             let registered = &self.providers[index];
@@ -809,27 +808,20 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Destination));
                 continue;
             }
-            let context = request.context.take();
-            match transport.start(request, deadline).await {
-                Ok(value) => {
-                    pull_sync_dispatched += usize::from(registered.policy.pull_sync);
-                    pending.requests.push(Tagged { provider, value });
-                    if let Some(value) = context {
-                        pending.contexts.push(Tagged { provider, value });
-                    }
-                }
-                Err(report) => {
-                    log::warn!(
-                        "Identity lookup: provider={} send failed: {}",
-                        registered.id,
-                        report.current_context()
-                    );
-                    pending.early.push(Tagged {
-                        provider,
-                        value: LookupStatus::TransportFailed,
-                    });
-                }
+            if let Some(value) = request.context.take() {
+                pending.contexts.push(Tagged { provider, value });
             }
+            pull_sync_dispatched += usize::from(registered.policy.pull_sync);
+            requests.push(Tagged {
+                provider,
+                value: request,
+            });
+        }
+        // Every request is built before any leaves, and all leave together
+        // under one cutoff.
+        if !requests.is_empty() {
+            pending.started = requests.len();
+            pending.in_flight = Some(transport.start(requests, self.budget));
         }
         pending
     }
@@ -840,8 +832,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults {
         let PendingLookups {
-            requests,
-            deadline,
+            in_flight,
+            started: _,
             ec_id,
             now,
             early,
@@ -850,9 +842,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             contexts,
             from_cookies,
         } = pending;
-        let responses = match deadline {
-            Some(deadline) if !requests.is_empty() => transport.gather(requests, deadline).await,
-            _ => Vec::new(),
+        let responses = match in_flight {
+            Some(in_flight) => transport.gather(in_flight).await,
+            None => Vec::new(),
         };
         let mut slots: Vec<Option<ProviderLookup>> =
             (0..self.providers.len()).map(|_| None).collect();
@@ -1203,26 +1195,30 @@ mod tests {
     }
 
     impl LookupTransport for CannedTransport {
-        type Pending = ();
+        type Pending = Vec<ProviderIndex>;
 
-        async fn start(
+        fn start(
             &self,
-            request: ProviderRequest,
-            _deadline: Deadline,
-        ) -> Result<(), Report<TransportError>> {
-            self.sent.borrow_mut().push(request.url.to_string());
-            Ok(())
+            requests: Vec<Tagged<ProviderRequest>>,
+            _budget: Duration,
+        ) -> Vec<ProviderIndex> {
+            requests
+                .into_iter()
+                .map(|Tagged { provider, value }| {
+                    self.sent.borrow_mut().push(value.url.to_string());
+                    provider
+                })
+                .collect()
         }
 
         async fn gather(
             &self,
-            pending: Vec<Tagged<()>>,
-            _deadline: Deadline,
+            pending: Vec<ProviderIndex>,
         ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
             pending
                 .into_iter()
-                .map(|tagged| Tagged {
-                    provider: tagged.provider,
+                .map(|provider| Tagged {
+                    provider,
                     value: (self.reply)(),
                 })
                 .collect()
@@ -1405,10 +1401,13 @@ mod tests {
             .status
     }
 
+    /// Reads back `entry` from a store seeded with it, at a synchronous test boundary.
     fn seeded_snapshot(entry: &KvEntry) -> EcKvSnapshot {
-        let graph = KvIdentityGraph::in_memory("coord");
-        graph.create(EC_ID, entry).expect("should seed");
-        graph.load_snapshot(EC_ID)
+        futures::executor::block_on(async {
+            let graph = KvIdentityGraph::in_memory("coord");
+            graph.create(EC_ID, entry).await.expect("should seed");
+            graph.load_snapshot(EC_ID).await
+        })
     }
 
     #[test]
