@@ -15,27 +15,28 @@
 //! extends only the sandbox's lifetime.
 
 use std::fmt;
+use std::sync::Arc;
 
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::time::MonotonicClock;
 use error_stack::Report;
+use trusted_server_core::ec::app::IdentityApp;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::settings::Settings;
 
 use crate::app::EcFinalizeState;
-use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::require_identity_graph;
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
 
 /// Pull-sync inputs a routed response's finalize step hands to post-delivery work.
 pub(crate) struct FinalizeState {
-    pub(crate) partner_registry: PartnerRegistry,
+    /// The identity app built once with the retained application state.
+    pub(crate) identity: Arc<IdentityApp>,
     pub(crate) ec_state: EcFinalizeState,
 }
 
@@ -90,29 +91,25 @@ async fn pull_sync(
     clock: &MonotonicClock,
     log_context: &dyn fmt::Display,
 ) {
-    let FinalizeState {
-        partner_registry,
-        ec_state,
-    } = state;
+    let FinalizeState { identity, ec_state } = state;
     if !ec_state.is_real_browser {
         return;
     }
 
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, &partner_registry);
+    let prepared_context = build_pull_sync_context(&ec_state.ec_context, identity.partners());
     let Some((context, kv)) = prepare_pull_sync_after_send(
         prepared_context,
-        || require_identity_graph(settings),
+        || require_identity_graph(&identity),
         log_context,
     ) else {
         return;
     };
 
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     dispatch_pull_sync(
         settings,
         &kv,
-        &partner_registry,
-        &limiter,
+        identity.partners(),
+        identity.rate_limiter(),
         &context,
         client,
         clock,
@@ -382,11 +379,12 @@ mod tests {
             Some(&geo),
         )
         .expect("should read the reader's EC context");
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app");
+        let kv = require_identity_graph(&identity).expect("should open the local identity store");
         ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()));
         FinalizeState {
-            partner_registry: PartnerRegistry::from_config(&settings.ec.partners)
-                .expect("should build the partner registry"),
+            identity,
             ec_state: EcFinalizeState {
                 ec_context,
                 use_finalize_kv: false,

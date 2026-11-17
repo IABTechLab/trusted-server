@@ -1,6 +1,8 @@
 // Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+use std::sync::Arc;
+
 use edgezero_adapter_fastly::context::FastlyOutboundObservation;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
@@ -16,10 +18,10 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::app::IdentityApp;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
@@ -52,7 +54,6 @@ use crate::app::{
     load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
-use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{
     HEADER_X_TS_FINALIZED, apply_finalize_headers, per_request_synthesized_headers,
     resolve_geo_for_response,
@@ -348,7 +349,7 @@ fn serve(
         values.prepare(extensions, settings, &queue);
     };
     let inputs = FinalizeInputs {
-        settings,
+        identity: &retained.state.identity,
         geo: request_geo.geo(),
         counters,
     };
@@ -460,7 +461,9 @@ impl ClientRequestValues {
 
 /// What the `finalize` step reads besides the routed response.
 struct FinalizeInputs<'a> {
-    settings: &'a Settings,
+    /// The identity app built once with the retained application state; its
+    /// settings are the request's settings.
+    identity: &'a Arc<IdentityApp>,
     /// The geo lookup the entry point ran once for this request.
     geo: Option<&'a GeoInfo>,
     counters: &'a SandboxCounters,
@@ -476,7 +479,7 @@ struct FinalizeInputs<'a> {
 /// sandbox counters.
 ///
 /// Returns the pull-sync inputs post-delivery work needs, or `None` when the
-/// response carries no EC state or its partner registry cannot be built.
+/// response carries no EC state.
 fn finalize_response(
     response: &mut HttpResponse,
     inputs: &FinalizeInputs<'_>,
@@ -490,37 +493,30 @@ fn finalize_response(
         return None;
     }
 
+    let settings = inputs.identity.settings().as_ref();
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
     if !take_finalize_sentinel(response) {
         let geo = resolve_geo_for_response(response, inputs.geo);
-        apply_finalize_headers(inputs.settings, geo, response);
+        apply_finalize_headers(settings, geo, response);
     }
 
     if let Some(policy) = asset_cache_policy {
         policy.apply_after_route_finalization(response, EdgeCacheHeader::SurrogateControl);
     }
 
-    let state = ec_state.and_then(|mut ec_state| {
-        match apply_edgezero_ec_finalize(inputs.settings, &mut ec_state, response) {
-            Ok(partner_registry) => Some(FinalizeState {
-                partner_registry,
-                ec_state,
-            }),
-            Err(e) => {
-                log::error!(
-                    "EC finalize skipped: failed to build partner registry: {e:?}{}",
-                    inputs.counters.log_context()
-                );
-                None
-            }
+    let state = ec_state.map(|mut ec_state| {
+        apply_edgezero_ec_finalize(inputs.identity, &mut ec_state, response);
+        FinalizeState {
+            identity: Arc::clone(inputs.identity),
+            ec_state,
         }
     });
 
     apply_terminal_response_effects(response, request_filter_effects.as_ref());
-    if metrics_enabled(inputs.settings) {
+    if metrics_enabled(settings) {
         attach_sandbox_counters(response, inputs.counters);
     }
     state
@@ -636,26 +632,24 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 }
 
 fn apply_edgezero_ec_finalize(
-    settings: &Settings,
+    identity: &IdentityApp,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+) {
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        identity.identity_graph()
     } else {
         None
     };
     ec_finalize_response(
-        settings,
+        identity.settings(),
         &mut ec_state.ec_context,
-        finalize_kv_graph.as_ref(),
-        &partner_registry,
+        finalize_kv_graph,
+        identity.partners(),
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
     );
-    Ok(partner_registry)
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -729,26 +723,17 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings
-        .ec
-        .ec_store
-        .as_ref()
-        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
-}
-
-/// Constructs a `KvIdentityGraph` from settings, or returns an error if the
+/// Returns the identity graph held by the identity app, or an error if the
 /// `ec_store` config is not set.
 pub(crate) fn require_identity_graph(
-    settings: &Settings,
+    identity: &IdentityApp,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
-    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+    identity.identity_graph().cloned().ok_or_else(|| {
         Report::new(TrustedServerError::KvStore {
             store_name: "ec.ec_store".to_owned(),
             message: "ec.ec_store is not configured".to_owned(),
         })
-    })?;
-    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+    })
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -782,6 +767,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn identity_for(settings: &Settings) -> Arc<IdentityApp> {
+        crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app")
+    }
 
     use base64::Engine as _;
     use edgezero_adapter_fastly::request::FastlyService;
@@ -902,7 +892,7 @@ mod tests {
         let state = finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                identity: &identity_for(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1052,7 +1042,7 @@ mod tests {
             let state = finalize_response(
                 &mut response,
                 &FinalizeInputs {
-                    settings: &settings,
+                    identity: &identity_for(&settings),
                     geo: None,
                     counters: &counters,
                 },
@@ -1178,7 +1168,7 @@ mod tests {
             let retained = retained_app(&sandbox).expect("should retain the app");
             let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
             let inputs = FinalizeInputs {
-                settings: &settings,
+                identity: &identity_for(&settings),
                 geo: None,
                 counters: &counters,
             };
@@ -1236,7 +1226,7 @@ mod tests {
         let retained = retained_app(&sandbox).expect("should retain the app");
         let counters = SandboxCounters::capture(&sandbox, 1, "request-example");
         let inputs = FinalizeInputs {
-            settings: &settings,
+            identity: &identity_for(&settings),
             geo: None,
             counters: &counters,
         };
@@ -1402,7 +1392,7 @@ mod tests {
         let geo = sample_geo();
         let counters = counters();
         let inputs = FinalizeInputs {
-            settings: &settings,
+            identity: &identity_for(&settings),
             geo: Some(&geo),
             counters: &counters,
         };
@@ -1521,7 +1511,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                identity: &identity_for(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1548,7 +1538,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                identity: &identity_for(&settings),
                 geo: None,
                 counters: &counters,
             },
