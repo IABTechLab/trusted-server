@@ -2783,8 +2783,8 @@ mod tests {
     fn partner_api_request(method: Method, path: &str) -> edgezero_core::http::Request {
         request_builder()
             .method(method)
-            .uri(format!("https://test-publisher.com{path}"))
-            .header("host", "test-publisher.com")
+            .uri(format!("https://publisher.example.com{path}"))
+            .header("host", "publisher.example.com")
             .header("authorization", "Bearer fictional-partner-token-0123456789")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"mappings":[]}"#))
@@ -2817,7 +2817,7 @@ mod tests {
         let origin = ScriptedHttpClient::new(&clock);
         origin.respond_to(
             Method::GET,
-            "https://origin.test-publisher.com/article",
+            &format!("{}/article", test_settings().publisher.origin_url),
             ScriptedReply::status(StatusCode::OK)
                 .header("content-type", "text/plain")
                 .body("served by origin"),
