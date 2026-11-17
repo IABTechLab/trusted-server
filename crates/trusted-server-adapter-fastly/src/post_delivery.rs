@@ -319,7 +319,7 @@ mod tests {
     // Pull sync after delivery, against the local identity store
     // -----------------------------------------------------------------------
 
-    /// EC ID `fastly.toml` seeds, consented, in the local `ec_identity_store`.
+    /// EC ID `fastly.toml` seeds, consented, in logical `trusted_server_kv`.
     fn seeded_ec_id() -> String {
         format!("{}.test01", "a".repeat(64))
     }
@@ -332,7 +332,7 @@ mod tests {
     /// Settings with Tinybird, the local identity store, and one pull-sync partner.
     fn pull_sync_settings() -> Settings {
         let mut settings = settings_with_tinybird();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings.ec.partners = vec![EcPartner {
             name: "Example partner".to_owned(),
             source_domain: "partner.example.com".to_owned(),
@@ -376,7 +376,7 @@ mod tests {
                 .expect("should read the reader's EC context");
         fastly::init();
         let provider = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open_records(
-            "ec_identity_store",
+            "trusted_server_kv",
             edgezero_core::RecordLayout::new(
                 trusted_server_core::ec::record_backend::EcRecordLayout,
             )
@@ -385,7 +385,7 @@ mod tests {
         .expect("should prepare the real local identity fixture");
         let handle = edgezero_core::key_value_store::KvHandle::new(std::sync::Arc::new(provider));
         let record_store = trusted_server_core::ec::record_backend::RecordEcKvStore::new(
-            "ec_identity_store".to_owned(),
+            "trusted_server_kv".to_owned(),
             &handle,
         )
         .expect("should acquire shared EC view");
