@@ -737,7 +737,7 @@ Attacker tries:
 Trusted Server:
   1. Computes expected token for https://untrusted.example.com
   2. Compares with provided token
-  3. Rejects if mismatch (502 Bad Gateway)
+  3. Rejects if mismatch (403 Forbidden)
 ```
 
 ### Content Security

@@ -38,20 +38,23 @@ gitignored `trusted-server.toml`.
 
 ## Creative proxy policy qualification
 
-The planned Fastly network fixture is separate from native route parity:
+The Fastly network fixture is separate from native route parity:
 
 ```bash
 node crates/trusted-server-adapter-fastly/tests/proxy-policy-origin.mjs "$(command -v viceroy)"
 ```
 
-Use pinned Node 24.20.0 and Viceroy 0.21.0. Actual origin URL observations can
-qualify two-reader static URL equivalence, event disclosure, redirect handling,
-and response privacy. Viceroy does not implement HTTP readthrough caching, so
-this command cannot qualify Fastly cache hits. The planned command is not a
-claim of a completed runtime run. Real Fastly cache reuse needs separately
-authorized staging with a controlled cacheable origin and origin counter; record
-the exact binary/config revision and results. Native parity or target builds
-alone also do not establish real Cloudflare or Spin runtime qualification.
+Use pinned Node 24.20.0 and Viceroy 0.21.0. This fixture observes actual HTTP
+origin URLs through the signed core handler and real Fastly transport. It checks
+two-reader static URL equivalence, removal of carried EC on redirects, and
+rejection of exhausted redirects. These HTTP destinations cannot match HTTPS
+identity rules. Positive identity delivery and terminal adapter privacy are
+covered by separate route fixtures; this command does not qualify them. Viceroy
+does not implement HTTP readthrough caching. HTTPS delivery and real Fastly
+cache reuse need separately authorized staging with a controlled cacheable
+origin and origin counter; record the exact binary/config revision and results.
+Native parity or target builds alone also do not establish real Cloudflare or
+Spin runtime qualification.
 
 See [Testing](../../TESTING.md) for the complete gate matrix and
 [`scripts/README.md`](../../scripts/README.md) for inputs and cleanup behavior.
