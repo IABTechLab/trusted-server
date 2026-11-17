@@ -1,8 +1,6 @@
 // Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-use std::convert::Infallible;
-
 use edgezero_adapter_fastly::context::FastlyOutboundObservation;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
@@ -10,6 +8,7 @@ use edgezero_adapter_fastly::request::{
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -110,13 +109,16 @@ fn main() {
             // The callback always returns `Ok`: `EdgeZero` or the callback has
             // already answered, so there is no error for the SDK to turn into a
             // second response.
-            let Ok(()) = edgezero_adapter_fastly::lifecycle::run_custom(
+            let result = edgezero_adapter_fastly::lifecycle::run_custom::<TrustedServerApp, _, _, _>(
                 FastlyRequest::from_client(),
                 |request, sandbox: &mut Sandbox| {
                     handle_request(request, sandbox, &mut startup);
-                    Ok::<(), Infallible>(())
+                    Ok::<(), ManagedLoggerError>(())
                 },
             );
+            if let Err(error) = result {
+                log::error!("Fastly lifecycle setup failed: {error}");
+            }
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
@@ -134,7 +136,7 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
     // performed by the final callback is included.
     let mut counters = RetirementCounters::default();
 
-    let summary = edgezero_adapter_fastly::lifecycle::serve_custom(
+    let summary = edgezero_adapter_fastly::lifecycle::serve_custom::<TrustedServerApp, _, _, _>(
         fastly::http::serve::Serve::new()
             .with_max_requests(limits.max_requests)
             .with_max_memory(limits.max_memory_mib)
@@ -146,7 +148,7 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
             });
             // An `Err` would end serving with no response, so the callback
             // reports none, whatever happened to this request's delivery.
-            Ok::<(), Infallible>(())
+            Ok::<(), ManagedLoggerError>(())
         },
     );
 
@@ -156,6 +158,9 @@ fn serve_loop(limits: crate::sandbox::SandboxLimits, mut startup: StartupDiagnos
         counters.requests(),
         counters.attempts()
     );
+    if let Err(error) = summary.into_result() {
+        log::error!("Fastly serving lifecycle failed: {error}");
+    }
 }
 
 #[cfg(not(feature = "reusable-sandbox"))]

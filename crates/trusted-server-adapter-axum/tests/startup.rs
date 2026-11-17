@@ -26,7 +26,7 @@ mod celld_fixture;
 
 #[cfg(feature = "celld-ec")]
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires CELLD_EC_TEST_BINARY pointing to the built real conditional-record server"]
+#[ignore = "requires official CELLD_EC_TEST_BINARY and matching EDGEZERO_CELLD_STORE_SERVICE"]
 async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_on_outage() {
     let mut celld = celld_fixture::CelldFixture::new();
     for _ in 0..2 {
@@ -45,7 +45,7 @@ async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_o
                 &format!("{}.neverissued", "a".repeat(64))
             )
             .await
-            .expect("should strongly read the real records-v2 service")
+            .expect("should strongly read the stock celld store service")
         );
         drop(server);
         celld.restart();
