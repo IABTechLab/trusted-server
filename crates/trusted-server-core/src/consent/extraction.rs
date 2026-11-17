@@ -8,16 +8,15 @@ use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 
-use crate::constants::{
-    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY, HEADER_SEC_GPC,
-};
+use crate::constants::{COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY, HEADER_SEC_GPC};
+use crate::cookies::tcf_consent_cookie;
 
 use super::types::RawConsentSignals;
 
 /// Extracts raw consent signals from a [`CookieJar`] and a [`Request`].
 ///
 /// Reads the following consent cookies (if present):
-/// - `euconsent-v2` — IAB TCF v2 consent string
+/// - `euconsent-v2` — IAB TCF v2 consent string, falling back to `__Host-ts-tcf`
 /// - `__gpp` — IAB Global Privacy Platform string
 /// - `__gpp_sid` — GPP section IDs (comma-separated)
 /// - `us_privacy` — IAB US Privacy / CCPA string
@@ -30,7 +29,7 @@ pub fn extract_consent_signals(
     req: &Request<EdgeBody>,
 ) -> RawConsentSignals {
     let raw_tc_string = jar
-        .and_then(|j| j.get(COOKIE_EUCONSENT_V2))
+        .and_then(tcf_consent_cookie)
         .map(|c| c.value().to_owned());
 
     let raw_gpp_string = jar
