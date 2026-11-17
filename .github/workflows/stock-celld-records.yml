@@ -1,0 +1,99 @@
+name: Stock celld record integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  stock-celld-records:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
+
+      - name: Select the service source from the Rust dependency tag
+        id: sdk
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const manifest = readFileSync('Cargo.toml', 'utf8');
+          const tag = manifest.match(/^edgezero-core\s*=\s*\{[^\n]*\btag\s*=\s*"([^"\r\n]+)"/m)?.[1];
+          if (!tag) throw new Error('Expected an immutable EdgeZero dependency tag');
+          appendFileSync(process.env.GITHUB_OUTPUT, `ref=${tag}\n`);
+          JS
+
+      - uses: actions/checkout@v4
+        with:
+          repository: IABTechLab/edgezero
+          ref: ${{ steps.sdk.outputs.ref }}
+          path: edgezero-celld-service
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: x86_64-unknown-linux-gnu
+          components: clippy
+          cache-key: cargo-stock-celld-records
+
+      - name: Install the official pinned celld runtime
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/denoland/celld/releases/download/v0.6.3/celld-x86_64-unknown-linux-gnu.gz \
+            --output "$RUNNER_TEMP/celld.gz"
+          gzip --decompress --stdout "$RUNNER_TEMP/celld.gz" > "$RUNNER_TEMP/celld"
+          echo "eb0a8158421b69d68dd5d28f2298a7d411dde498295833deeb1cc5ce53b7eb75  $RUNNER_TEMP/celld" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/celld"
+          "$RUNNER_TEMP/celld" --version
+          echo "CELLD_EC_TEST_BINARY=$RUNNER_TEMP/celld" >> "$GITHUB_ENV"
+          echo "EDGEZERO_CELLD_STORE_SERVICE=$GITHUB_WORKSPACE/edgezero-celld-service/services/celld-store" >> "$GITHUB_ENV"
+
+      - name: Check and identify the matching service
+        shell: bash
+        run: |
+          git -C edgezero-celld-service rev-parse HEAD > "$RUNNER_TEMP/stock-celld-provenance.txt"
+          sha256sum "$CELLD_EC_TEST_BINARY" "$EDGEZERO_CELLD_STORE_SERVICE/src/index.js" >> "$RUNNER_TEMP/stock-celld-provenance.txt"
+          node --test "$EDGEZERO_CELLD_STORE_SERVICE"/test/*.test.mjs
+
+      - name: Fetch the locked dependency inputs
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Exercise actual record lifecycle and native startup
+        env:
+          TMPDIR: ${{ runner.temp }}
+          RUST_TEST_THREADS: '1'
+          CARGO_BUILD_JOBS: '4'
+        shell: bash
+        run: |
+          sentinels=$'real_celld_persists_routes_withdrawal_restart_and_outage_without_fallback\nreal_celld_provider_prepares_from_published_envelope_and_fails_closed_on_outage\nreal_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage'
+          edgezero-celld-service/scripts/run_test_nonzero.sh --ignored "$sentinels" \
+            cargo test --locked --offline --target x86_64-unknown-linux-gnu \
+            -p trusted-server-adapter-axum --all-features \
+            --test native_ec --test startup --test native_acceptance real_celld \
+            | tee "$RUNNER_TEMP/stock-celld-integration.log"
+
+      - name: Lint the native integration targets
+        run: cargo clippy --locked --target x86_64-unknown-linux-gnu -p trusted-server-adapter-axum --all-targets --all-features -- -D warnings
+
+      - name: Upload proof diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-celld-record-proof
+          path: |
+            ${{ runner.temp }}/stock-celld-provenance.txt
+            ${{ runner.temp }}/stock-celld-integration.log
+          if-no-files-found: ignore
