@@ -422,10 +422,10 @@ fn edgezero_main(
             Ok(cs) => cs,
             Err(e) => {
                 log::error!("failed to open config store: {e}");
-                if matches!(
-                    req.get_method().as_str(),
-                    "GET" | "POST" | "HEAD" | "OPTIONS" | "PUT" | "PATCH" | "DELETE"
-                ) {
+                if app::publisher_fallback_methods()
+                    .iter()
+                    .any(|method| method.as_str() == req.get_method().as_str())
+                {
                     compat::to_fastly_response(startup_unavailable_response(&operational_method))
                         .send_to_client();
                 } else {

@@ -6,10 +6,11 @@ deployment target.
 
 The crate owns Axum route registration, middleware, outbound HTTP through
 `reqwest`, and environment-backed platform services. Its route surface follows
-the shared core contract, but request-time KV operations are unavailable and a
-startup error makes every route, including `/health`, return 500. Application
-configuration reaches the process through the documented environment bridge;
-the local EdgeZero config-store file is not read directly.
+the shared core contract, but request-time KV operations are unavailable.
+Its `/health`, `/ready`, and startup-failure responses follow the shared
+[operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
+Application configuration reaches the process through the documented environment
+bridge; the local EdgeZero config-store file is not read directly.
 
 Build and test from the repository root:
 

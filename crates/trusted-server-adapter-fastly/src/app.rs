@@ -294,7 +294,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .build()
 }
 
-fn publisher_fallback_methods() -> [Method; 7] {
+/// Returns the methods supported by publisher fallback and startup responses.
+pub(super) fn publisher_fallback_methods() -> [Method; 7] {
     [
         Method::GET,
         Method::POST,

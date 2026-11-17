@@ -5,8 +5,9 @@ Experimental Fermyon Spin adapter for Trusted Server. The component targets
 platform tests.
 
 The crate maps Spin HTTP, variables, and the `default` key-value store into the
-shared runtime. Startup failures install a restricted 503 router that keeps
-`/health` live. The adapter permits one enabled auction provider. Request-time
+shared runtime. Its `/health`, `/ready`, and startup-failure responses follow the
+shared [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
+The adapter permits one enabled auction provider. Request-time
 KV services beyond startup config loading remain unavailable. Its entry point
 uses `anyhow::Result` only because the EdgeZero Spin FFI requires that type.
 
