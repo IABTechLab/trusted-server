@@ -13,7 +13,7 @@ use crate::error::TrustedServerError;
 ///
 /// Used by batch sync (`/_ts/api/v1/batch-sync`) and pull sync for
 /// per-partner request rate enforcement.
-pub trait RateLimiter {
+pub trait RateLimiter: Send + Sync {
     /// Returns `true` when the rate limit has been exceeded for the given key.
     ///
     /// `hourly_limit` is currently approximated via a 60-second counter
