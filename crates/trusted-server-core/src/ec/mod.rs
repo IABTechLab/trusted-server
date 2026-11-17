@@ -429,7 +429,7 @@ impl EcContext {
     ///
     /// Returns an error if the client IP is unavailable and generation is
     /// needed, or if HMAC generation fails.
-    pub fn generate_if_needed(
+    pub async fn generate_if_needed(
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
@@ -863,8 +863,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
         let settings = create_test_settings();
         let mut ec_context = EcContext::new_for_test_with_ip(
             None,
@@ -875,11 +875,12 @@ mod tests {
 
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint EC");
 
         let ec_id = ec_context.ec_value().expect("should set EC").to_owned();
         assert!(
-            graph.get(&ec_id).expect("should read").is_none(),
+            graph.get(&ec_id).await.expect("should read").is_none(),
             "should not write during generation"
         );
         assert!(
@@ -1112,8 +1113,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_skips_when_ec_exists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
         let cookie = format!("ts-ec={ec_id}");
@@ -1122,6 +1123,7 @@ mod tests {
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
+            .await
             .expect("should not error when EC already exists");
 
         assert_eq!(

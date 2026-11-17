@@ -53,7 +53,7 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
-pub fn ec_finalize_response(
+pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
@@ -84,7 +84,8 @@ pub fn ec_finalize_response(
             registry,
             consent_withdrawn,
             response,
-        );
+        )
+        .await;
         return;
     }
 
@@ -110,9 +111,9 @@ pub fn ec_finalize_response(
             had_eid_updates,
         };
         let page_write_ok = if ec_context.ec_generated() {
-            commit_generated(&commit, ec_context, permit, response)
+            commit_generated(&commit, ec_context, permit, response).await
         } else if ec_context.ec_was_present() {
-            commit_returning(&commit, ec_context, permit, response)
+            commit_returning(&commit, ec_context, permit, response).await
         } else {
             false
         };
@@ -174,7 +175,7 @@ fn present_snapshot(ec_id: &str, entry: KvEntry) -> EcKvSnapshot {
 /// Creates the row of a newly generated EC and issues its cookie on success.
 ///
 /// Returns whether the row was created.
-fn commit_generated(
+async fn commit_generated(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: Option<PageLoadWrite>,
@@ -197,7 +198,11 @@ fn commit_generated(
         log::warn!("Skipping generated EC: no row change was planned");
         return false;
     };
-    match commit.graph.commit_page_load(permit, commit.ec_id, change) {
+    match commit
+        .graph
+        .commit_page_load(permit, commit.ec_id, change)
+        .await
+    {
         Ok(committed) => {
             ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed));
             set_ec_cookie_on_response(commit.settings, ec_context, response);
@@ -218,7 +223,7 @@ fn commit_generated(
 ///
 /// Returns whether the row is live afterwards: written, recovered, or left
 /// unchanged because there was nothing to write.
-fn commit_returning(
+async fn commit_returning(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: Option<PageLoadWrite>,
@@ -235,24 +240,24 @@ fn commit_returning(
     if matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead)
         && (has_changes || (commit.had_eid_updates && ec_context.recovery_eligible()))
     {
-        let snapshot = commit.graph.load_snapshot(commit.ec_id);
+        let snapshot = commit.graph.load_snapshot(commit.ec_id).await;
         ec_context.set_kv_snapshot(snapshot);
     }
     if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. }) {
         return ec_context.recovery_eligible()
-            && confirm_then_recover_orphaned_ec(commit, ec_context, permit, response);
+            && confirm_then_recover_orphaned_ec(commit, ec_context, permit, response).await;
     }
     if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Failed { .. }) {
         return false;
     }
-    update_returning(commit, ec_context, permit)
+    update_returning(commit, ec_context, permit).await
 }
 
 /// Writes the planned update for a returning EC whose row snapshot is held.
 ///
 /// Returns `false` when a planned write failed, or when there was nothing to
 /// write because the row is withdrawn.
-fn update_returning(
+async fn update_returning(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: PageLoadWrite,
@@ -265,7 +270,11 @@ fn update_returning(
             .entry_for(commit.ec_id)
             .is_none_or(|entry| entry.consent.ok);
     };
-    match commit.graph.commit_page_load(permit, commit.ec_id, change) {
+    match commit
+        .graph
+        .commit_page_load(permit, commit.ec_id, change)
+        .await
+    {
         Ok(committed) => {
             ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed));
             true
@@ -327,7 +336,7 @@ fn gate_eid_updates_by_consent(
 /// Replaces a proven-orphaned EC with a new ID whose row is created by this
 /// navigation's single write. One attempt: a collision leaves the orphan in
 /// place for a later navigation.
-fn recover_orphaned_ec(
+async fn recover_orphaned_ec(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: PageLoadWrite,
@@ -364,7 +373,7 @@ fn recover_orphaned_ec(
         log::warn!("Orphan EC recovery skipped: no row change was planned");
         return;
     };
-    match commit.graph.commit_page_load(permit, &new_id, change) {
+    match commit.graph.commit_page_load(permit, &new_id, change).await {
         Ok(committed) => {
             let snapshot = present_snapshot(&new_id, committed);
             ec_context.replace_with_generated(new_id, snapshot);
@@ -401,24 +410,25 @@ fn recover_orphaned_ec(
 ///
 /// Returns whether the navigation's write succeeded or had nothing to change,
 /// which is what allows the after-response follow-up write.
-fn confirm_then_recover_orphaned_ec(
+async fn confirm_then_recover_orphaned_ec(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
     permit: PageLoadWrite,
     response: &mut Response<EdgeBody>,
 ) -> bool {
-    let confirmed = commit.graph.load_snapshot(commit.ec_id);
+    let confirmed = commit.graph.load_snapshot(commit.ec_id).await;
     match confirmed {
         EcKvSnapshot::Present { .. } => {
             // The row became visible after the origin round trip: adopt it and
             // plan the navigation's write against it rather than rotating a
             // valid identity.
             ec_context.set_kv_snapshot(confirmed);
-            update_returning(commit, ec_context, permit)
+            update_returning(commit, ec_context, permit).await
         }
-        EcKvSnapshot::Missing { .. } => match commit.graph.key_exists_confirmed(commit.ec_id) {
+        EcKvSnapshot::Missing { .. } => match commit.graph.key_exists_confirmed(commit.ec_id).await
+        {
             Ok(false) => {
-                recover_orphaned_ec(commit, ec_context, permit, response);
+                recover_orphaned_ec(commit, ec_context, permit, response).await;
                 matches!(ec_context.kv_snapshot(), EcKvSnapshot::Present { .. })
             }
             Ok(true) => {
@@ -498,7 +508,7 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBod
 /// navigation. The EC cookie is expired once every row is tombstoned or
 /// proven absent; a failed tombstone keeps the cookie so the next request
 /// retries.
-fn finalize_unusable_consent(
+async fn finalize_unusable_consent(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
@@ -527,7 +537,9 @@ fn finalize_unusable_consent(
         } else {
             EcKvSnapshot::NotRead
         };
-        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, initial);
+        let outcome = graph
+            .tombstone_existing_from_snapshot(&ec_id, initial)
+            .await;
         if matches!(outcome, EcKvSnapshot::Failed { .. }) {
             log::warn!(
                 "EC withdrawal tombstone for '{}' failed; keeping the cookie so the next \
@@ -695,8 +707,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_does_not_create_a_row_for_an_unheld_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_does_not_create_a_row_for_an_unheld_identity() {
         let settings = create_test_settings();
         // The cookie value is chosen by the client, so a withdrawal naming an
         // identity this deployment never issued must not put a row in the
@@ -723,10 +735,11 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
-            kv.get(&ec_id).expect("should read back").is_none(),
+            kv.get(&ec_id).await.expect("should read back").is_none(),
             "should not write a tombstone for an identity that was never issued"
         );
         assert!(
@@ -740,8 +753,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_a_held_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_tombstones_a_held_identity() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("held01");
         let consent = ConsentContext {
@@ -757,8 +770,9 @@ mod tests {
             &ec_id,
             &crate::ec::kv_types::KvEntry::minimal("p.example", "uid", 1),
         )
+        .await
         .expect("should seed the identity");
-        ec_context.set_kv_snapshot(kv.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(kv.load_snapshot(&ec_id).await);
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
         assert!(matches!(
             ec_context.kv_snapshot(),
@@ -776,10 +790,12 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (entry, _) = kv
             .get(&ec_id)
+            .await
             .expect("should read back")
             .expect("should still hold the identity");
         assert!(
@@ -798,8 +814,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn withdrawal_keeps_the_cookie_when_the_tombstone_write_fails() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn withdrawal_keeps_the_cookie_when_the_tombstone_write_fails() {
         // A tombstone write that still fails after its bounded CAS retries
         // keeps the EC cookie, so the next request that carries it retries;
         // clearing it would orphan a live row (spec §9.2).
@@ -832,7 +848,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
@@ -848,8 +865,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_clears_cookie_and_headers() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
         let consent = ConsentContext {
@@ -877,7 +894,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -906,8 +924,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
@@ -929,7 +947,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -941,8 +960,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_sets_no_header_or_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_returning_user_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mtch01");
         let mut ec_context = make_context(
@@ -963,7 +982,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -975,8 +995,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("gen123");
         let mut ec_context = make_context(
@@ -997,7 +1017,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1009,8 +1030,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_rotates_orphaned_cookie_to_new_backed_ec() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_rotates_orphaned_cookie_to_new_backed_ec() {
         let settings = create_test_settings();
         let orphaned_ec = sample_ec_id("orphn1");
         let consent = ConsentContext {
@@ -1039,13 +1060,15 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect("should rotate orphan");
         assert_ne!(replacement, orphaned_ec);
         assert!(
             graph
                 .get(replacement)
+                .await
                 .expect("should read replacement")
                 .is_some(),
             "replacement cookie should have a backing row"
@@ -1056,8 +1079,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
         // Regression test: this request has real EID data (a configured
         // partner and a captured client EID), but TCF Purpose 4 denial gates
         // it away, emptying the update list. That must not also suppress the
@@ -1101,7 +1124,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect(
             "should rotate the orphan even though Purpose 4 denial emptied the gated update list",
@@ -1109,6 +1133,7 @@ mod tests {
         assert_ne!(replacement, &orphaned_ec);
         let (stored, _) = graph
             .get(replacement)
+            .await
             .expect("should read replacement")
             .expect("replacement cookie should have a backing row");
         assert!(
@@ -1121,8 +1146,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
         let settings = create_test_settings();
         let orphaned_ec = sample_ec_id("orphn2");
         let consent = ConsentContext {
@@ -1157,7 +1182,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_eq!(
             ec_context.ec_value(),
@@ -1174,8 +1200,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("subeid");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1187,8 +1213,10 @@ mod tests {
         );
         graph
             .create(&ec_id, &live)
+            .await
             .expect("should seed the live row");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), false);
+        let mut ec_context =
+            returning_user_context(&ec_id, graph.load_snapshot(&ec_id).await, false);
         let partners = vec![make_partner("sharedid.org")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();
@@ -1201,10 +1229,12 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the row");
         assert!(
@@ -1213,8 +1243,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_persists_returning_user_eid_updates_only_on_navigation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_persists_returning_user_eid_updates_only_on_navigation() {
         // `/_ts/page-bids` belongs to a page load whose navigation already
         // made the write, so it never receives a permit (spec D1).
         for (source, suffix, cookie_id, permit) in [
@@ -1242,10 +1272,11 @@ mod tests {
             );
             graph
                 .create(&ec_id, &live)
+                .await
                 .expect("should seed the live row");
             // A recovery-eligible context is a navigation and carries a permit.
             let mut ec_context =
-                returning_user_context(&ec_id, graph.load_snapshot(&ec_id), permit);
+                returning_user_context(&ec_id, graph.load_snapshot(&ec_id).await, permit);
             ec_context.set_eid_sync_source(source);
             let partners = vec![make_partner("sharedid.org")];
             let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -1259,10 +1290,12 @@ mod tests {
                 None,
                 Some(cookie_id),
                 &mut response,
-            );
+            )
+            .await;
 
             let (stored, _) = graph
                 .get(&ec_id)
+                .await
                 .expect("should read store")
                 .expect("should keep the row");
             assert_eq!(
@@ -1273,8 +1306,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finalize_generated_ec_persists_eid_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_generated_ec_persists_eid_updates() {
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("test_store");
         let mut ec_context = EcContext::new_for_test_with_ip(
@@ -1284,6 +1317,7 @@ mod tests {
         );
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint a new EC");
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
@@ -1299,10 +1333,12 @@ mod tests {
             None,
             Some("generated-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should create the row");
         assert_eq!(
@@ -1312,8 +1348,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_auction_transient_miss_does_not_persist_eid_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_auction_transient_miss_does_not_persist_eid_updates() {
         // `/auction` never writes KV (spec D1): browser EIDs are persisted only
         // by the page load's navigation write, whatever its snapshot says.
         let settings = create_test_settings();
@@ -1327,6 +1363,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &live)
+            .await
             .expect("should seed the live row the endpoint lookup missed");
         let mut ec_context = returning_user_context(
             &ec_id,
@@ -1348,11 +1385,13 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &ec_id, &response);
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the row");
         assert!(
@@ -1361,8 +1400,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_never_persists_auction_body_eids() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_never_persists_auction_body_eids() {
         // `/auction` body EIDs go to bidders on that request only and are
         // never persisted (spec §5.1); neither is the `ts-eids` cookie on a
         // non-navigation request.
@@ -1377,6 +1416,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &live)
+            .await
             .expect("should seed the live row this request updates");
         let mut ec_context = returning_user_context(
             &ec_id,
@@ -1424,10 +1464,12 @@ mod tests {
             Some(&eids_cookie),
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the row");
         assert!(
@@ -1436,8 +1478,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
         // A GDPR user can grant TCF Purpose 1 (storage/EC) while denying
         // Purpose 4 (personalized ads). `gate_eids_by_consent` already strips
         // EIDs from the outbound /auction bid request in that case; the KV
@@ -1455,6 +1497,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &live)
+            .await
             .expect("should seed the live row this request updates");
         let mut ec_context = EcContext::new_for_test_with_cookie(
             Some(ec_id.clone()),
@@ -1463,7 +1506,7 @@ mod tests {
             false,
             purpose1_only_consent,
         );
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         ec_context.set_client_eids(vec![Eid::new(
@@ -1486,10 +1529,12 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the row");
         assert!(
@@ -1499,8 +1544,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withholds_provider_owned_fallback_when_purpose_four_is_denied() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withholds_provider_owned_fallback_when_purpose_four_is_denied() {
         // Arrange
         let settings = create_test_settings();
         let ec_id = sample_ec_id("purp4o");
@@ -1514,6 +1559,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &live)
+            .await
             .expect("should seed the live row this request updates");
         let mut ec_context = EcContext::new_for_test_with_cookie(
             Some(ec_id.clone()),
@@ -1522,7 +1568,7 @@ mod tests {
             false,
             purpose1_only_consent,
         );
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         ec_context.set_client_eids(vec![Eid::new(
@@ -1550,11 +1596,13 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the row");
         assert!(
@@ -1563,8 +1611,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_skips_browser_uid_for_provider_owned_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_skips_browser_uid_for_provider_owned_source() {
         // Arrange
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1575,6 +1623,7 @@ mod tests {
         );
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint a new EC");
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
@@ -1595,11 +1644,13 @@ mod tests {
             None,
             Some("fallback-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should create the row");
         assert!(
@@ -1608,8 +1659,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_auction_confirmed_miss_does_not_create_a_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_auction_confirmed_miss_does_not_create_a_row() {
         // The same path with a genuinely absent row must stay a no-op: a route
         // without orphan recovery must never mint an identity-graph entry.
         let settings = create_test_settings();
@@ -1635,17 +1686,22 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &ec_id, &response);
         assert!(
-            graph.get(&ec_id).expect("should read store").is_none(),
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read store")
+                .is_none(),
             "a confirmed miss must not create a root entry"
         );
     }
 
-    #[test]
-    fn finalize_transient_missing_row_confirms_present_and_does_not_rotate() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_transient_missing_row_confirms_present_and_does_not_rotate() {
         // The origin-overlapped preload transiently read `Missing` on an
         // eventually-consistent store, but the row actually exists. The
         // confirming re-read at finalize must adopt the live row instead of
@@ -1661,6 +1717,7 @@ mod tests {
         );
         graph
             .create(&orphan, &live)
+            .await
             .expect("should seed the live row the preload missed");
         let mut ec_context = returning_user_context(
             &orphan,
@@ -1679,7 +1736,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert!(
@@ -1688,8 +1746,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_two_missing_reads_do_not_rotate_a_row_the_store_still_lists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_two_missing_reads_do_not_rotate_a_row_the_store_still_lists() {
         // Both the origin-overlapped preload and the confirming re-read missed,
         // but the row is live — the point reads were stale. Two stale reads are
         // not an absence proof, so the identity graph must be left intact and
@@ -1708,6 +1766,7 @@ mod tests {
         );
         graph
             .create(&orphan, &live)
+            .await
             .expect("should seed the live row both point reads miss");
         let mut ec_context = returning_user_context(
             &orphan,
@@ -1726,12 +1785,14 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert_eq!(
             graph
                 .get(&orphan)
+                .await
                 .expect("should read store")
                 .map(|(entry, _)| entry.consent.ok),
             Some(true),
@@ -1739,8 +1800,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_rotates_when_only_a_longer_key_shares_the_orphan_prefix() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_rotates_when_only_a_longer_key_shares_the_orphan_prefix() {
         // `key_exists_confirmed` gates orphan recovery as well as withdrawal.
         // It matches whole keys, so a neighbouring key that merely starts with
         // the orphaned ID cannot answer for it. Under the prefix count this
@@ -1759,10 +1820,12 @@ mod tests {
         );
         graph
             .create(&neighbour, &live)
+            .await
             .expect("should seed the neighbouring row");
         assert!(
             !graph
                 .key_exists_confirmed(&orphan)
+                .await
                 .expect("should confirm against the store"),
             "a longer key sharing the prefix must not prove the orphan exists"
         );
@@ -1783,7 +1846,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect("should rotate the orphan");
         assert_ne!(
@@ -1793,6 +1857,7 @@ mod tests {
         assert!(
             graph
                 .get(replacement)
+                .await
                 .expect("should read the replacement")
                 .is_some(),
             "the replacement cookie should have a backing row"
@@ -1800,14 +1865,15 @@ mod tests {
         assert!(
             graph
                 .get(&neighbour)
+                .await
                 .expect("should read the neighbour")
                 .is_some(),
             "the neighbouring identity must be left untouched"
         );
     }
 
-    #[test]
-    fn finalize_does_not_rotate_when_the_existence_check_fails() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_does_not_rotate_when_the_existence_check_fails() {
         // Absence is unprovable when the list itself errors. Rotation abandons a
         // year-lived identity, so it must not run on an unproven miss.
         let settings = create_test_settings();
@@ -1830,13 +1896,14 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_generated_ec_does_not_emit_cookie_for_authoritative_missing_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_generated_ec_does_not_emit_cookie_for_authoritative_missing_row() {
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("genmis");
         let mut ec_context = make_context(
@@ -1861,7 +1928,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
@@ -1869,8 +1937,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_denied_without_cookie_is_noop() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_denied_without_cookie_is_noop() {
         let settings = create_test_settings();
         let mut ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
         let mut response = empty_response();
@@ -1884,7 +1952,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1896,8 +1965,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_unknown_jurisdiction_strips_headers_without_expiring_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_unknown_jurisdiction_strips_headers_without_expiring_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("unk001");
         let mut ec_context = make_context(
@@ -1920,7 +1989,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1981,8 +2051,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_not_read_snapshot_does_not_rotate() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_not_read_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("notrd1");
         let mut ec_context = returning_user_context(&orphan, EcKvSnapshot::NotRead, true);
@@ -1997,13 +2067,14 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_failed_snapshot_does_not_rotate() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_failed_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("faild1");
         let mut ec_context = returning_user_context(
@@ -2024,13 +2095,14 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_tombstone_snapshot_does_not_rotate() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_tombstone_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("tomb01");
         let tombstone = EcKvSnapshot::Present {
@@ -2050,13 +2122,14 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_subresource_missing_row_does_not_rotate() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_subresource_missing_row_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("subrs1");
         // Missing row, but the request is not a recovery-eligible browser navigation.
@@ -2078,17 +2151,22 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert!(
-            graph.get(&orphan).expect("should read store").is_none(),
+            graph
+                .get(&orphan)
+                .await
+                .expect("should read store")
+                .is_none(),
             "a non-eligible request must not create the missing root"
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_present_id_and_skips_missing_other() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_tombstones_present_id_and_skips_missing_other() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ2");
         let cookie_ec = sample_ec_id("cook2e");
@@ -2105,8 +2183,9 @@ mod tests {
         let graph = KvIdentityGraph::in_memory("test_store");
         graph
             .create(&active_ec, &live_entry())
+            .await
             .expect("should seed active row");
-        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec).await);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let mut response = empty_response();
 
@@ -2118,10 +2197,12 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (active_stored, _) = graph
             .get(&active_ec)
+            .await
             .expect("should read active row")
             .expect("active row should remain as a tombstone");
         assert!(
@@ -2129,13 +2210,17 @@ mod tests {
             "the present active ID should be tombstoned after strong confirmation"
         );
         assert!(
-            graph.get(&cookie_ec).expect("should read store").is_none(),
+            graph
+                .get(&cookie_ec)
+                .await
+                .expect("should read store")
+                .is_none(),
             "a missing second ID must never be created by withdrawal"
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_the_active_and_cookie_ids_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_tombstones_the_active_and_cookie_ids_once() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ3");
         let cookie_ec = sample_ec_id("cook3e");
@@ -2153,14 +2238,16 @@ mod tests {
                 &active_ec,
                 &KvEntry::minimal("active.example.com", "active-uid", 1_000),
             )
+            .await
             .expect("should seed active row");
         graph
             .create(
                 &cookie_ec,
                 &KvEntry::minimal("cookie.example.com", "cookie-uid", 1_000),
             )
+            .await
             .expect("should seed cookie row");
-        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec).await);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let mut response = empty_response();
 
@@ -2172,14 +2259,17 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (active_tombstone, active_generation) = graph
             .get(&active_ec)
+            .await
             .expect("should read active row")
             .expect("should retain active tombstone");
         let (cookie_tombstone, cookie_generation) = graph
             .get(&cookie_ec)
+            .await
             .expect("should read cookie row")
             .expect("should retain cookie tombstone");
         assert!(
@@ -2205,11 +2295,13 @@ mod tests {
             None,
             None,
             &mut repeated_response,
-        );
+        )
+        .await;
 
         assert_eq!(
             graph
                 .get(&active_ec)
+                .await
                 .expect("should read active row")
                 .expect("should retain active tombstone")
                 .1,
@@ -2219,6 +2311,7 @@ mod tests {
         assert_eq!(
             graph
                 .get(&cookie_ec)
+                .await
                 .expect("should read cookie row")
                 .expect("should retain cookie tombstone")
                 .1,
@@ -2227,8 +2320,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_keeps_ec_cookie_but_expires_marker_on_kv_failure() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withdrawal_keeps_ec_cookie_but_expires_marker_on_kv_failure() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("failw1");
         let consent = ConsentContext {
@@ -2254,7 +2347,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let cookies = response
             .headers()
@@ -2279,8 +2373,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("compl1");
         let mut partner = make_partner("ssp.example.com");
@@ -2316,7 +2410,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let cookies = response
             .headers()
@@ -2332,8 +2427,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
         let settings = create_test_settings();
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
@@ -2352,7 +2447,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             response.headers().get(http::header::SET_COOKIE).is_none(),
@@ -2360,8 +2456,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_withdrawal_expires_marker_without_ec_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_withdrawal_expires_marker_without_ec_cookie() {
         let settings = create_test_settings();
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
@@ -2383,7 +2479,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let cookies = response
             .headers()
@@ -2414,17 +2511,18 @@ mod tests {
         )
     }
 
-    #[test]
-    fn auction_request_never_writes_browser_eids() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn auction_request_never_writes_browser_eids() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("auc001");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), granting_consent());
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         let cookie = eids_cookie("partner.example.com", "u-1");
         let mut response = empty_response();
 
@@ -2436,10 +2534,12 @@ mod tests {
             Some(&cookie),
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read")
             .expect("should exist");
         assert!(
@@ -2448,17 +2548,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn navigation_writes_browser_eids_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_writes_browser_eids_once() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("nav001");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), granting_consent());
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let cookie = eids_cookie("partner.example.com", "u-1");
         let mut response = empty_response();
@@ -2471,10 +2572,12 @@ mod tests {
             Some(&cookie),
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read")
             .expect("should exist");
         assert_eq!(
@@ -2487,17 +2590,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redirect_navigation_does_not_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_navigation_does_not_write() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("red001");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), granting_consent());
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let cookie = eids_cookie("partner.example.com", "u-1");
         let mut response = empty_response();
@@ -2511,17 +2615,19 @@ mod tests {
             Some(&cookie),
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read")
             .expect("should exist");
         assert!(entry.ids.is_empty(), "should not write on a redirect");
     }
 
-    #[test]
-    fn generated_ec_without_permit_gets_no_cookie_or_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generated_ec_without_permit_gets_no_cookie_or_row() {
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
         let mut ec_context = EcContext::new_for_test_with_ip(
@@ -2531,6 +2637,7 @@ mod tests {
         );
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint");
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
         let mut response = empty_response();
@@ -2543,10 +2650,11 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
-            graph.get(&ec_id).expect("should read").is_none(),
+            graph.get(&ec_id).await.expect("should read").is_none(),
             "should not create without a permit"
         );
         assert!(
@@ -2555,8 +2663,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generated_ec_with_permit_creates_row_and_sets_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generated_ec_with_permit_creates_row_and_sets_cookie() {
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
         let mut ec_context = EcContext::new_for_test_with_ip(
@@ -2566,6 +2674,7 @@ mod tests {
         );
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint");
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
@@ -2579,10 +2688,11 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
-            graph.get(&ec_id).expect("should read").is_some(),
+            graph.get(&ec_id).await.expect("should read").is_some(),
             "should create the row"
         );
         assert!(
@@ -2591,8 +2701,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generated_ec_collision_is_not_retried_or_issued() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generated_ec_collision_is_not_retried_or_issued() {
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
         let mut ec_context = EcContext::new_for_test_with_ip(
@@ -2602,10 +2712,12 @@ mod tests {
         );
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint");
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed a colliding row");
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let mut response = empty_response();
@@ -2618,7 +2730,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
@@ -2627,7 +2740,7 @@ mod tests {
     }
 
     /// A minted EC with a page-phase lookup that found one UID.
-    fn minted_context_with_lookup(
+    async fn minted_context_with_lookup(
         settings: &Settings,
         graph: &KvIdentityGraph,
     ) -> (EcContext, String) {
@@ -2638,6 +2751,7 @@ mod tests {
         );
         ec_context
             .generate_if_needed(settings, Some(graph))
+            .await
             .expect("should mint");
         let ec_id = ec_context.ec_value().expect("should mint").to_owned();
         let uid = KvUid::new(
@@ -2666,12 +2780,12 @@ mod tests {
         (ec_context, ec_id)
     }
 
-    #[test]
-    fn minted_ec_row_is_created_with_its_lookup_results() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn minted_ec_row_is_created_with_its_lookup_results() {
         // Arrange
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
-        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph);
+        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph).await;
         let mut response = empty_response();
 
         // Act
@@ -2683,11 +2797,13 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read row")
             .expect("should create row");
         assert!(
@@ -2700,14 +2816,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn minted_ec_collision_drops_its_lookup_results() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn minted_ec_collision_drops_its_lookup_results() {
         // Arrange
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
-        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph);
+        let (mut ec_context, ec_id) = minted_context_with_lookup(&settings, &graph).await;
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed a colliding row");
         let mut response = empty_response();
 
@@ -2720,11 +2837,13 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read row")
             .expect("should keep the colliding row");
         assert!(
@@ -2747,9 +2866,10 @@ mod tests {
         make_context_with_consent(Some(ec_id), Some(ec_id), true, false, consent)
     }
 
-    fn assert_withdrawn(graph: &KvIdentityGraph, ec_id: &str, response: &Response<EdgeBody>) {
+    async fn assert_withdrawn(graph: &KvIdentityGraph, ec_id: &str, response: &Response<EdgeBody>) {
         let (entry, _) = graph
             .get(ec_id)
+            .await
             .expect("should read")
             .expect("should keep the tombstone");
         assert!(!entry.consent.ok, "should tombstone the row");
@@ -2760,13 +2880,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn withdrawal_without_permit_tombstones_row_and_expires_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn withdrawal_without_permit_tombstones_row_and_expires_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("wd0001");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = withdrawing_context(&ec_id);
         let mut response = empty_response();
@@ -2780,25 +2901,27 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
-        assert_withdrawn(&graph, &ec_id, &response);
+        assert_withdrawn(&graph, &ec_id, &response).await;
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
             "should still strip EC response headers"
         );
     }
 
-    #[test]
-    fn withdrawal_on_a_redirect_tombstones_row_and_expires_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn withdrawal_on_a_redirect_tombstones_row_and_expires_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("wd0002");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = withdrawing_context(&ec_id);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         ec_context.set_navigation_permit(NavigationPermit::for_test());
         let mut response = empty_response();
         *response.status_mut() = http::StatusCode::FOUND;
@@ -2811,23 +2934,26 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
-        assert_withdrawn(&graph, &ec_id, &response);
+        assert_withdrawn(&graph, &ec_id, &response).await;
     }
 
-    #[test]
-    fn withdrawal_retries_after_a_concurrent_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn withdrawal_retries_after_a_concurrent_write() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("wd0003");
         let graph = KvIdentityGraph::in_memory("finalize");
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
         let mut ec_context = withdrawing_context(&ec_id);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
         graph
             .upsert_partner_id(&ec_id, "partner.example.com", "late-uid")
+            .await
             .expect("should write concurrently after the snapshot");
         let mut response = empty_response();
 
@@ -2839,9 +2965,10 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
-        assert_withdrawn(&graph, &ec_id, &response);
+        assert_withdrawn(&graph, &ec_id, &response).await;
     }
 
     fn live_entry() -> KvEntry {
@@ -2850,14 +2977,15 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn finalize_withholds_after_response_lookups_when_the_confirmed_write_fails() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withholds_after_response_lookups_when_the_confirmed_write_fails() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("after3");
         let graph = KvIdentityGraph::write_failing_with(
             &ec_id,
             &crate::ec::kv_types::KvEntry::minimal("p.example", "uid", 1),
-        );
+        )
+        .await;
         // The preload missed a row the confirmation read then finds, and the
         // navigation's write against it fails.
         let mut ec_context = returning_user_context(
@@ -2879,7 +3007,8 @@ mod tests {
             Some(&cookie),
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             ec_context.take_after_response_permit().is_none(),
@@ -2887,8 +3016,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_allows_after_response_lookups_on_a_live_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_allows_after_response_lookups_on_a_live_row() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("after1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -2897,8 +3026,10 @@ mod tests {
                 &ec_id,
                 &crate::ec::kv_types::KvEntry::minimal("p.example", "uid", 1),
             )
+            .await
             .expect("should seed the identity");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        let mut ec_context =
+            returning_user_context(&ec_id, graph.load_snapshot(&ec_id).await, true);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -2909,7 +3040,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             ec_context.take_after_response_permit().is_some(),
@@ -2917,8 +3049,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withholds_after_response_lookups_when_the_row_read_failed() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withholds_after_response_lookups_when_the_row_read_failed() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("after2");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -2939,7 +3071,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             ec_context.take_after_response_permit().is_none(),
@@ -2947,16 +3080,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withholds_after_response_lookups_on_a_tombstoned_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_withholds_after_response_lookups_on_a_tombstoned_row() {
         // Arrange: a consented navigation reads a withdrawn row.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("after4");
         let graph = KvIdentityGraph::in_memory("test_store");
         graph
             .create(&ec_id, &KvEntry::tombstone(1000))
+            .await
             .expect("should seed the tombstone");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+        let mut ec_context =
+            returning_user_context(&ec_id, graph.load_snapshot(&ec_id).await, true);
         let mut response = empty_response();
 
         // Act
@@ -2968,7 +3103,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         assert!(
@@ -2977,8 +3113,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_adopted_row_keeps_a_concurrent_provider_opt_out() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_adopted_row_keeps_a_concurrent_provider_opt_out() {
         // Arrange: the preload missed the row; meanwhile another request
         // recorded provider P's opt-out on it, and P's lookup found a UID.
         let settings = create_test_settings();
@@ -2988,7 +3124,10 @@ mod tests {
         let mut live = live_entry();
         live.opt_outs
             .insert(provider.clone(), current_timestamp() + 86_400);
-        graph.create(&ec_id, &live).expect("should seed the row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the row");
         let mut ec_context = returning_user_context(
             &ec_id,
             EcKvSnapshot::Missing {
@@ -3029,11 +3168,13 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         // Assert
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read row")
             .expect("should keep row");
         assert!(

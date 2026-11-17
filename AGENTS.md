@@ -224,7 +224,7 @@ pub struct UserId(Uuid);
 
 ### Crate Preferences
 
-- `log` (with `log-fastly`) for instrumentation.
+- `log` for instrumentation. EdgeZero installs the backend on every adapter.
 
 ---
 
@@ -286,7 +286,8 @@ impl core::error::Error for MyError {}
 - Use `log` crate level-specific macros: `log::info!`, `log::debug!`, `log::trace!`, `log::warn!`, `log::error!`.
 - Provide context in log messages with format strings.
 - Format messages with present-tense verbs.
-- Use `log-fastly` as the backend for Fastly Compute.
+- Never install a logger in Trusted Server. EdgeZero installs the backend on
+  every adapter, and its managed setup fails when another logger is installed.
 
 ## Other guidelines
 
@@ -379,6 +380,7 @@ Every PR must pass:
 14. Fastly absolute-deadline network fixtures under Viceroy (the harness builds the adapter test binary itself): `node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"`
 15. Worker auction-deadline runtime fixtures (`worker-auction-deadlines.yml`): build and lint the runtime fixture, then run it under the local runtime. For Cloudflare, `cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare` and `node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"` (requires wrangler and the `Cargo.lock` wasm-bindgen CLI). For Spin, `cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin` and `node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"`. CI lints each fixture with the same `cargo clippy` arguments plus `-- -D warnings`
 16. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
+17. Fastly response diff script: `node --test scripts/fastly-response-diff.test.mjs` with the `.tool-versions` Node
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

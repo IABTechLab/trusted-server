@@ -354,10 +354,10 @@ mod tests {
         entry
     }
 
-    fn present(entry: &KvEntry) -> EcKvSnapshot {
+    async fn present(entry: &KvEntry) -> EcKvSnapshot {
         let graph = KvIdentityGraph::in_memory("plan");
-        graph.create(EC_ID, entry).expect("should seed row");
-        graph.load_snapshot(EC_ID)
+        graph.create(EC_ID, entry).await.expect("should seed row");
+        graph.load_snapshot(EC_ID).await
     }
 
     fn found(source: &str, ids: &[&str]) -> LookupResults {
@@ -473,14 +473,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unchanged_returning_row_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchanged_returning_row_plans_no_write() {
         let registry = registry(&[]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("browser.example.com".to_owned(), KvPartnerId::single("b-1"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let ingest = [PartnerIdUpdate::new("browser.example.com", "b-2")];
         let lookups = LookupResults::default();
 
@@ -490,14 +490,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookup_replaces_provider_source_with_cas_update() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookup_replaces_provider_source_with_cas_update() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("legacy"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let lookups = found("ids.example.com", &["p-1", "p-2"]);
 
         let change = plan_write(&input(&snapshot, None, &[], &lookups, &registry))
@@ -513,10 +513,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tombstoned_row_plans_nothing() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn tombstoned_row_plans_nothing() {
         let registry = registry(&[]);
-        let snapshot = present(&KvEntry::tombstone(1000));
+        let snapshot = present(&KvEntry::tombstone(1000)).await;
         let lookups = found("ids.example.com", &["p-1"]);
         assert!(
             plan_write(&input(&snapshot, None, &[], &lookups, &registry)).is_none(),
@@ -620,11 +620,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&provider_entry(&["p-1"]));
+        let snapshot = present(&provider_entry(&["p-1"])).await;
         let ingest = ingest_owned();
         let lookups = LookupResults::new(
             EC_ID,
@@ -650,8 +650,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opt_out_is_remembered_without_extending_it() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opt_out_is_remembered_without_extending_it() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
@@ -660,7 +660,7 @@ mod tests {
 
         // Act: the first opt-out is remembered.
         let first = plan_write(&input(
-            &present(&provider_entry(&["p-1"])),
+            &present(&provider_entry(&["p-1"])).await,
             None,
             &ingest,
             &lookups,
@@ -680,14 +680,20 @@ mod tests {
         );
 
         // Act: a skip because of the remembered opt-out changes nothing.
-        let again = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let again = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         assert!(again.is_none(), "should not extend a remembered opt-out");
     }
 
-    #[test]
-    fn lapsed_opt_out_alone_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lapsed_opt_out_alone_plans_no_write() {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let mut entry = live_entry();
@@ -696,13 +702,19 @@ mod tests {
             .insert(ProviderId::new("example-provider"), 1000);
         let lookups = LookupResults::default();
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         assert!(change.is_none(), "should not write only to prune");
     }
 
-    #[test]
-    fn lapsed_opt_out_is_pruned_with_a_real_change() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lapsed_opt_out_is_pruned_with_a_real_change() {
         let registry = registry(&["ids.example.com"]);
         let ingest = [PartnerIdUpdate::new("browser.example.com", "b-1")];
         let mut entry = live_entry();
@@ -711,8 +723,14 @@ mod tests {
             .insert(ProviderId::new("example-provider"), 1000);
         let lookups = LookupResults::default();
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
-            .expect("should plan update");
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
 
         let RowChange::Update { entry, .. } = change else {
             panic!("should update existing row")
@@ -720,8 +738,8 @@ mod tests {
         assert!(entry.opt_outs.is_empty(), "should forget a lapsed opt-out");
     }
 
-    #[test]
-    fn not_due_skip_with_an_expired_uid_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_due_skip_with_an_expired_uid_plans_no_write() {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let mut entry = live_entry();
@@ -750,7 +768,13 @@ mod tests {
             }],
         );
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         assert!(
             change.is_none(),
@@ -758,8 +782,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_ingest_fills_a_slot_freed_by_an_expired_record() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_fills_a_slot_freed_by_an_expired_record() {
         // The source is not provider-owned (its provider was disabled), so the
         // browser may fill it once the expired provider record is pruned.
         let registry = registry(&[]);
@@ -782,7 +806,13 @@ mod tests {
             .expect("should build provider record"),
         );
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         let Some(RowChange::Update { entry, .. }) = change else {
             panic!("should plan an update that fills the freed slot");
@@ -808,11 +838,11 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn browser_ingest_skips_a_provider_owned_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_skips_a_provider_owned_source() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
 
         for status in [
@@ -833,11 +863,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn opted_out_source_is_not_refilled_from_the_browser_on_the_next_navigation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opted_out_source_is_not_refilled_from_the_browser_on_the_next_navigation() {
         // Arrange: the row after an opt-out holds nothing for the source.
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
         let lookups = LookupResults::default();
 
@@ -879,10 +909,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_fallback_is_not_stored_when_provider_found_the_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_is_not_stored_when_provider_found_the_source() {
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
         let lookups = found("ids.example.com", &["p-1"]);
 
@@ -897,10 +927,10 @@ mod tests {
         assert!(record.is_provider_written(), "should keep provider eids");
     }
 
-    #[test]
-    fn browser_fallback_never_overwrites_a_live_provider_uid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_never_overwrites_a_live_provider_uid() {
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&provider_entry(&["p-1"]));
+        let snapshot = present(&provider_entry(&["p-1"])).await;
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::NoMatch);
 
@@ -910,14 +940,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_fallback_does_not_overwrite_an_existing_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_does_not_overwrite_an_existing_fallback() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("older"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::NoMatch);
 
@@ -927,15 +957,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn later_provider_result_replaces_browser_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_provider_result_replaces_browser_fallback() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry.ids.insert(
             "ids.example.com".to_owned(),
             KvPartnerId::single("browser-id"),
         );
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let lookups = found("ids.example.com", &["p-1"]);
 
         let change = plan_write(&input(
@@ -1084,8 +1114,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provider_uid_wins_over_browser_uid_when_only_one_fits() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_uid_wins_over_browser_uid_when_only_one_fits() {
         // Arrange: room for either new UID alone, not both.
         let registry = registry(&["ids.example.com"]);
         let entry = fill_to(live_entry(), MAX_ENTRY_BYTES - 800);
@@ -1094,7 +1124,13 @@ mod tests {
         let lookups = found("ids.example.com", &[provider_uid.as_str()]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         let Some(RowChange::Update { entry, .. }) = change else {
@@ -1115,8 +1151,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_that_no_longer_fits_keeps_the_stored_provider_record() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_that_no_longer_fits_keeps_the_stored_provider_record() {
         // Arrange: the stored provider UID fits; its larger refresh does not.
         let registry = registry(&["ids.example.com"]);
         let entry = fill_to(provider_entry(&["p-old"]), MAX_ENTRY_BYTES - 300);
@@ -1124,7 +1160,13 @@ mod tests {
         let lookups = found("ids.example.com", &[fresh.as_str()]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &[],
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         assert!(
@@ -1133,8 +1175,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_ingest_never_evicts_a_stored_record_to_fit() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_never_evicts_a_stored_record_to_fit() {
         // Arrange: a stored provider record plus fillers, just under the cap.
         let registry = registry(&["ids.example.com"]);
         let big: Vec<String> = (0..18)
@@ -1163,7 +1205,13 @@ mod tests {
         let lookups = LookupResults::default();
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         // Assert: the browser UID is dropped, so nothing changes.
         assert!(
@@ -1172,8 +1220,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn found_result_never_restores_uids_over_a_newer_opt_out() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn found_result_never_restores_uids_over_a_newer_opt_out() {
         // Arrange: another request recorded the opt-out after this lookup ran.
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
@@ -1184,7 +1232,13 @@ mod tests {
         let lookups = found("ids.example.com", &["p-restored"]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &[],
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         assert!(
