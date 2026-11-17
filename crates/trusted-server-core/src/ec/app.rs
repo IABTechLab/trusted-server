@@ -19,6 +19,7 @@ use edgezero_core::router::RouterBuilder;
 use error_stack::Report;
 
 use crate::error::{TrustedServerError, http_error};
+use crate::integrations::gpt_diagnostics::prepare_request;
 use crate::settings::Settings;
 
 use super::admin::{
@@ -118,10 +119,12 @@ impl IdentityApp {
     ///
     /// Registers `GET` on `/_ts/admin/ec`, `/_ts/admin/ec/{id}` and
     /// `/_ts/admin/eids`. Admin EC lookup answers from the record store, or
-    /// with `501 Not Implemented` when the adapter supplied none. The routes
-    /// run no EC lifecycle, so a read-only diagnostic never ingests the
-    /// operator's cookies. Other methods on these paths reach the adapter's
-    /// fallback, which denies admin diagnostics.
+    /// with `501 Not Implemented` when the adapter supplied none. Every route
+    /// first runs GPT diagnostics request preparation, which strips the
+    /// reserved console query and cookie and answers with an error response
+    /// when preparation fails. The routes run no EC lifecycle, so a read-only
+    /// diagnostic never ingests the operator's cookies. Other methods on these
+    /// paths reach the adapter's fallback, which denies admin diagnostics.
     ///
     /// # Examples
     ///
@@ -136,30 +139,42 @@ impl IdentityApp {
         router
             .route(ADMIN_EC_PATH, Method::GET, move |ctx: RequestContext| {
                 let app = Arc::clone(&ec_lookup);
-                async move { Ok::<_, EdgeError>(app.admin_ec_lookup(&ctx.into_request()?)) }
+                async move { Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?)) }
             })
             .route(
                 ADMIN_EC_BY_ID_PATH,
                 Method::GET,
                 move |ctx: RequestContext| {
                     let app = Arc::clone(&ec_lookup_by_id);
-                    async move { Ok::<_, EdgeError>(app.admin_ec_lookup(&ctx.into_request()?)) }
+                    async move { Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?)) }
                 },
             )
             .route(ADMIN_EIDS_PATH, Method::GET, move |ctx: RequestContext| {
                 let app = Arc::clone(&eids_lookup);
-                async move { Ok::<_, EdgeError>(app.admin_eids_lookup(&ctx.into_request()?)) }
+                async move { Ok::<_, EdgeError>(app.admin_eids_lookup(ctx.into_request()?)) }
             })
     }
 
-    fn admin_ec_lookup(&self, req: &Request) -> Response {
-        handle_admin_ec_lookup(self.identity_graph.as_ref(), &self.partners, req)
+    fn admin_ec_lookup(&self, request: Request) -> Response {
+        self.prepare(request)
+            .and_then(|request| {
+                handle_admin_ec_lookup(self.identity_graph.as_ref(), &self.partners, &request)
+            })
             .unwrap_or_else(|report| http_error(&report))
     }
 
-    fn admin_eids_lookup(&self, req: &Request) -> Response {
-        handle_admin_eids_lookup(&self.partners, req)
+    fn admin_eids_lookup(&self, request: Request) -> Response {
+        self.prepare(request)
+            .and_then(|request| handle_admin_eids_lookup(&self.partners, &request))
             .unwrap_or_else(|report| http_error(&report))
+    }
+
+    /// Runs GPT diagnostics request preparation, as every adapter route does
+    /// before its handler, so the reserved console query and cookie never
+    /// reach an identity handler.
+    fn prepare(&self, mut request: Request) -> Result<Request, Report<TrustedServerError>> {
+        prepare_request(&self.settings, &mut request)?;
+        Ok(request)
     }
 }
 
@@ -168,13 +183,17 @@ const ADMIN_EC_BY_ID_PATH: &str = "/_ts/admin/ec/{id}";
 #[cfg(test)]
 mod tests {
     use edgezero_core::body::Body;
-    use edgezero_core::http::StatusCode;
+    use edgezero_core::http::{StatusCode, header};
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
+    use serde_json::json;
 
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_types::KvEntry;
+    use crate::integrations::gpt_diagnostics::{
+        GPT_DIAGNOSTICS_COOKIE, GPT_DIAGNOSTICS_INTEGRATION_ID, GPT_DIAGNOSTICS_QUERY,
+    };
     use crate::test_support::tests::create_test_settings;
 
     const MISSING_EC_ID: &str =
@@ -231,6 +250,74 @@ mod tests {
                 response.status(),
                 StatusCode::NOT_IMPLEMENTED,
                 "should answer 501 for {path} without a record store"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_strips_the_reserved_console_query_and_cookie() {
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build the identity app");
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/_ts/admin/eids?{GPT_DIAGNOSTICS_QUERY}=true&keep=1"
+            ))
+            .header(
+                header::COOKIE,
+                format!("{GPT_DIAGNOSTICS_COOKIE}=1; other=2"),
+            )
+            .body(Body::empty())
+            .expect("should build request");
+
+        let prepared = app.prepare(request).expect("should prepare the request");
+
+        assert_eq!(
+            prepared.uri().query(),
+            Some("keep=1"),
+            "should strip the reserved console query"
+        );
+        let cookies = prepared
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            !cookies.contains(GPT_DIAGNOSTICS_COOKIE),
+            "should strip the reserved console cookie"
+        );
+    }
+
+    #[test]
+    fn mounted_admin_routes_fail_closed_when_diagnostics_preparation_fails() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                GPT_DIAGNOSTICS_INTEGRATION_ID,
+                &json!({ "enabled": true, "unknown_field": true }),
+            )
+            .expect("should insert an invalid diagnostics configuration");
+        let app = IdentityApp::build(Arc::new(settings), store_platform())
+            .expect("should build the identity app");
+        let router = app.mount(RouterService::builder()).build();
+
+        for path in [
+            "/_ts/admin/eids".to_owned(),
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{MISSING_EC_ID}"),
+        ] {
+            let response = get(&router, &path);
+
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should answer {path} with the preparation error instead of the handler"
             );
         }
     }
