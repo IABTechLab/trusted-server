@@ -1417,6 +1417,11 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
+    fn owns_logging() -> bool {
+        // The entry point retains TS's existing per-sandbox logger setup.
+        true
+    }
+
     fn routes() -> Result<RouterService, EdgeError> {
         let state = startup_state(
             load_settings_from_config_store(&RuntimeStoreConfig::logical()),
@@ -1497,6 +1502,14 @@ mod tests {
 
     use crate::platform::RequestGeo;
     use crate::tinybird::TelemetryQueue;
+
+    #[test]
+    fn hooks_keep_ts_logging_application_owned() {
+        assert!(
+            TrustedServerApp::owns_logging(),
+            "should retain TS logger setup rather than install a second SDK logger"
+        );
+    }
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
