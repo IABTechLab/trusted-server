@@ -124,7 +124,7 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
@@ -394,7 +394,6 @@ pub(crate) struct EcFinalizeState {
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
-    pub(crate) is_real_browser: bool,
 }
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
@@ -415,6 +414,7 @@ pub(crate) struct AfterResponseLookups {
     pub(crate) ec_id: String,
     pub(crate) client_ip: Option<IpAddr>,
     pub(crate) user_agent: Option<String>,
+    pub(crate) cookie_header: String,
 }
 
 /// Identity work a navigation hands to the entry point.
@@ -449,6 +449,7 @@ pub(crate) fn take_navigation_lookups() -> NavigationLookups {
 struct ProviderRequestSignals<'a> {
     client_ip: Option<IpAddr>,
     user_agent: Option<&'a str>,
+    cookie_header: String,
 }
 
 impl<'a> ProviderRequestSignals<'a> {
@@ -461,14 +462,28 @@ impl<'a> ProviderRequestSignals<'a> {
                 .headers()
                 .get(header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
+            cookie_header: joined_cookie_header(req),
         }
     }
+}
+
+/// Joins every `Cookie` header on the request into one `; `-separated value.
+///
+/// HTTP/2 and HTTP/3 clients may split cookies across several headers.
+fn joined_cookie_header(req: &Request) -> String {
+    req.headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Captures the request signals for after-response identity lookups on a
 /// permitted publisher navigation.
 ///
-/// Returns `None` when no after-response provider is enabled, the request has
+/// Returns `None` when no after-response provider (including a pull-sync
+/// partner) is enabled, the client failed the browser check, the request has
 /// no EC, or the identity graph is unavailable.
 fn prepare_after_response_lookups(
     state: &AppState,
@@ -477,6 +492,11 @@ fn prepare_after_response_lookups(
     ec: &EcRequestState,
 ) -> Option<AfterResponseLookups> {
     let coordinator = Arc::clone(state.after_response_identity.as_ref()?);
+    // Bot gate: pull sync and other after-response lookups disclose the EC ID
+    // to partners, so they run only for recognized browsers.
+    if !ec.is_real_browser {
+        return None;
+    }
     ec.kv_graph.as_ref()?;
     let ec_id = ec.ec_context.ec_value()?.to_owned();
     let signals = ProviderRequestSignals::read(req, services);
@@ -485,6 +505,7 @@ fn prepare_after_response_lookups(
         ec_id,
         client_ip: signals.client_ip,
         user_agent: signals.user_agent.map(str::to_owned),
+        cookie_header: signals.cookie_header,
     })
 }
 
@@ -526,6 +547,7 @@ async fn dispatch_identity_lookups(
                     user_agent: signals.user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
+                cookies: RequestCookies::new(&signals.cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(now),
             },
@@ -567,7 +589,6 @@ impl EcRequestState {
             use_finalize_kv: self.finalize_kv_graph.is_some(),
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
-            is_real_browser: self.is_real_browser,
         }
     }
 }
@@ -941,8 +962,6 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 async fn run_batch_sync(state: &AppState, req: Request) -> Response {
-    let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
@@ -965,7 +984,6 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
         use_finalize_kv: false,
         eids_cookie,
         sharedid_cookie,
-        is_real_browser,
     });
     response
 }
@@ -1631,7 +1649,7 @@ mod tests {
     use trusted_server_core::ec::provider::{
         EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;
@@ -3352,6 +3370,29 @@ mod tests {
         request
     }
 
+    #[test]
+    fn provider_cookies_join_every_cookie_header() {
+        // Arrange: HTTP/2 clients may split cookies across headers.
+        let mut request = navigation_request("/article");
+        let headers = request.headers_mut();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
+        headers.append(header::COOKIE, HeaderValue::from_static("vendor_id=c-1"));
+
+        // Act
+        let joined = super::joined_cookie_header(&request);
+
+        // Assert
+        assert_eq!(
+            joined, "a=1; b=2; vendor_id=c-1",
+            "should join every Cookie header"
+        );
+        assert_eq!(
+            RequestCookies::new(&joined).get("vendor_id"),
+            Some("c-1"),
+            "should let providers read a cookie from a later header"
+        );
+    }
+
     fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
         response
             .extensions_mut()
@@ -3975,8 +4016,69 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            finalize.is_real_browser,
+            finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_run_only_for_real_browsers() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Pull partner",
+                "source_domain": "partner.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build pull-sync partner"),
+        ];
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let browser_request = || {
+            let mut req = request_builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/article")
+                .header(header::COOKIE, format!("ts-ec={}.test01", "a".repeat(64)))
+                .body(Body::empty())
+                .expect("should build request");
+            req.extensions_mut().insert(DeviceSignals::derive(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+                Some("1:65536;2:0;4:6291456;6:262144"),
+            ));
+            req
+        };
+        let context = context_with_client(
+            browser_request(),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+        let req = browser_request();
+        let mut ec = super::build_ec_request_state(&state.settings, &services, &req);
+        assert!(
+            ec.is_real_browser,
+            "should classify the request as a browser"
+        );
+
+        let browser = super::prepare_after_response_lookups(&state, &services, &req, &ec);
+        ec.is_real_browser = false;
+        let bot = super::prepare_after_response_lookups(&state, &services, &req, &ec);
+
+        assert!(
+            browser.is_some(),
+            "should prepare pull sync for a real browser"
+        );
+        assert!(
+            bot.is_none(),
+            "should never prepare pull sync for a client that fails the browser check"
         );
     }
 
@@ -3994,7 +4096,10 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            !finalize.is_real_browser,
+            !finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "a request without captured device signals should not be classified as a real browser"
         );
     }

@@ -15,7 +15,7 @@ use url::{Host, Url};
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use crate::ec::provider::validate_enabled_configs;
-use crate::ec::registry::PartnerRegistry;
+use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig,
@@ -349,28 +349,10 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    // Provider kinds are registered outside core, so `ts config` refuses an
+    // enabled provider whose kind is not registered by building it.
     validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
-    reject_providers_without_a_kind(&settings.ec)?;
     Ok(())
-}
-
-/// Rejects every enabled identity provider at deploy time.
-///
-/// This release registers no provider kind, so every runtime refuses to start
-/// with an enabled provider. Rejecting it here keeps a config push from
-/// taking a running service down. The provider-kind PR replaces this with a
-/// check of the registered kinds and the target adapter.
-fn reject_providers_without_a_kind(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
-    match ec.identity_providers.iter().find(|config| config.enabled) {
-        Some(config) => Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "ec.identity_providers: provider `{}` is enabled, but this release registers no \
-                 provider kinds; set `enabled = false`",
-                config.id
-            ),
-        })),
-        None => Ok(()),
-    }
 }
 
 /// Runs Trusted Server runtime validation after secret references are resolved.
@@ -567,7 +549,8 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
 /// Deploy validation runs before secret references are resolved, so partner
 /// tokens still hold secret key names that would fail the runtime length
 /// check when the partner registry is built.
-fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
+#[must_use]
+pub fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
     let mut ec = ec.clone();
     for (index, partner) in ec.partners.iter_mut().enumerate() {
         if partner.api_token.is_some() {
@@ -588,6 +571,20 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
     if ec.identity_providers.is_empty() {
         return Ok(());
     }
+    // Pull-sync providers come only from partner config, which carries the
+    // pull token and rate limit; configuring the kind directly bypasses both.
+    if let Some(config) = ec
+        .identity_providers
+        .iter()
+        .find(|config| config.kind() == PULL_SYNC_KIND)
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.identity_providers: provider `{}` uses kind `{PULL_SYNC_KIND}`; configure pull sync on its [[ec.partners]] entry instead",
+                config.id
+            ),
+        }));
+    }
     let partners = PartnerRegistry::from_ec(ec)?;
     validate_enabled_configs(&ec.identity_providers, &partners).map_err(|report| {
         let detail = report
@@ -599,7 +596,24 @@ fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>
         report.change_context(TrustedServerError::Configuration {
             message: format!("ec.identity_providers: {detail}"),
         })
-    })
+    })?;
+    // Pull-sync partners run as providers too; a source claimed by both would
+    // fail the coordinator build at startup.
+    for config in ec.identity_providers.iter().filter(|config| config.enabled) {
+        if let Some(source) = config.sources.iter().find(|source| {
+            partners
+                .find_by_source_domain(source)
+                .is_some_and(|partner| partner.runs_pull_sync)
+        }) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "ec.identity_providers: source `{source}` of provider `{}` is also claimed by a pull-sync partner",
+                    config.id
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -1773,16 +1787,11 @@ gam_network_id = "99999"
     }
 
     #[test]
-    fn deploy_validation_rejects_an_enabled_provider_while_no_kind_is_registered() {
+    fn deploy_validation_accepts_an_enabled_provider() {
         let settings = settings_with_identity_provider(serde_json::json!({}));
 
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject an enabled provider at deploy time");
-
-        assert!(
-            err.to_string().contains("registers no provider kinds"),
-            "should explain why the provider is rejected: {err:?}"
-        );
+        validate_settings_for_deploy(&settings)
+            .expect("should leave the registered-kind check to the provider crate");
     }
 
     #[test]
@@ -1807,6 +1816,88 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("allowed_domains"),
             "should explain the allowlist rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_provider_and_pull_sync() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a source claimed twice");
+
+        assert!(
+            err.to_string().contains("pull-sync partner"),
+            "should explain the double claim: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_accepts_disabled_provider_sharing_a_pull_sync_source() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        validate_settings_for_runtime(&settings)
+            .expect("should accept a disabled provider sharing a pull-sync source");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_pull_token_invalid_in_a_header() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token\n32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a pull token that cannot form a header");
+
+        assert!(
+            format!("{err:?}").contains("Authorization header"),
+            "should name the Authorization header problem: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_directly_configured_pull_sync_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "kind": PULL_SYNC_KIND,
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject the pull-sync kind in identity providers");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should point to partner config: {err:?}"
         );
     }
 

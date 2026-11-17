@@ -136,7 +136,9 @@ pub async fn commit_after_response_lookups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::coordinator::results::{DropCounts, LookupStatus, ProviderLookup, SkipReason};
+    use crate::ec::coordinator::results::{
+        DropCounts, LookupStatus, OptOutMemory, ProviderLookup, SkipReason,
+    };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
     use crate::ec::kv::TombstoneOutcome;
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
@@ -192,6 +194,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), vec![uid])],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
@@ -202,6 +205,42 @@ mod tests {
             .await
             .entry_for(EC_ID)
             .and_then(|entry| entry.ids.get(source).map(|record| record.uid.clone()))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn results_with_nothing_to_persist_skip_the_row_read() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph = KvIdentityGraph::counting("counting-store", std::sync::Arc::clone(&reads));
+        let not_due = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::Skipped(SkipReason::NotDue),
+                entries: Vec::new(),
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        );
+
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &not_due,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Unchanged,
+            "should report nothing to write"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "should not re-read the row when every provider was not due"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -546,6 +585,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::NotDue),
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -623,6 +663,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::OptedOut),
                 entries: Vec::new(),
                 cleared,
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }

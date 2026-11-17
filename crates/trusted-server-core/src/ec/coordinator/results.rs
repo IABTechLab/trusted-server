@@ -63,9 +63,18 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
-    /// The vendor reports an opt-out; the provider's stored UIDs are
-    /// removed.
+    /// Pull sync already dispatched `pull_sync_concurrency` partners on this
+    /// navigation.
+    ConcurrencyCap,
+    /// The vendor or its cookies report an opt-out; the provider's stored
+    /// UIDs are removed.
     OptedOut,
+    /// Every source of the provider is excluded where GDPR applies; the
+    /// provider's stored UIDs are removed.
+    Region,
+    /// The row snapshot read failed, so consent state (such as a withdrawal
+    /// tombstone) is unknown.
+    SnapshotUnavailable,
 }
 
 /// One outcome per provider per navigation.
@@ -111,10 +120,27 @@ impl LookupStatus {
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
+            Self::Skipped(SkipReason::Region) => "skipped_region",
+            Self::Skipped(SkipReason::ConcurrencyCap) => "skipped_concurrency_cap",
+            Self::Skipped(SkipReason::SnapshotUnavailable) => "skipped_snapshot_unavailable",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }
     }
+}
+
+/// What a lookup does to the provider's remembered opt-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptOutMemory {
+    /// Leaves it as it is.
+    #[default]
+    Unchanged,
+    /// Remembers an opt-out the vendor's server reported, so the vendor is
+    /// not called again for the memory period.
+    Remember,
+    /// Forgets it: the vendor's cookies hold an ID again, so the visitor
+    /// opted back in.
+    Forget,
 }
 
 /// One provider's outcome and validated entries.
@@ -129,6 +155,8 @@ pub struct ProviderLookup {
     /// Sources whose stored records are removed, because the user opted
     /// out of the provider; empty unless `Skipped(OptedOut)`.
     pub cleared: Vec<SourceDomain>,
+    /// What this lookup does to the provider's remembered opt-out.
+    pub opt_out: OptOutMemory,
 }
 
 /// Validated results of one navigation's lookups.

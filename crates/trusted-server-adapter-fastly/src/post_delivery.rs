@@ -1,27 +1,24 @@
 //! Work the Fastly entry point runs after a response is delivered.
 //!
 //! [`run_post_delivery`] sends the request's queued auction telemetry, then
-//! runs EC pull sync, then the navigation's after-response identity lookups.
-//! Telemetry goes first because its requests are short, while a pull-sync
-//! group can take its whole cutoff. All of them run only after a committed
-//! application body (see [`crate::delivery`]).
+//! runs the navigation's after-response identity lookups, pull sync among
+//! them. Telemetry goes first because its requests are short. Both run only
+//! after a committed application body (see [`crate::delivery`]).
 //!
-//! They use a fresh `EdgeZero` client and clock, because the request's client
-//! went away with the request. They run under
-//! [`futures::executor::block_on`] inside the serving callback, after
-//! `send_request_with_registries_and_hooks` returned. That is the only safe
-//! place: dispatch itself runs under `block_on`, and nesting there panics.
-//! `EdgeZero` releases callback-owned batch drivers when the callback returns,
-//! so both finish before it does. The client already has its response; each
-//! extends only the sandbox's lifetime.
+//! They use a fresh `EdgeZero` client, because the request's client went away
+//! with the request. They run under [`futures::executor::block_on`] inside
+//! the serving callback, after `send_request_with_registries_and_hooks`
+//! returned. That is the only safe place: dispatch itself runs under
+//! `block_on`, and nesting there panics. `EdgeZero` releases callback-owned
+//! batch drivers when the callback returns, so both finish before it does.
+//! The client already has its response; each extends only the sandbox's
+//! lifetime.
 
 use std::fmt;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
-use edgezero_core::time::MonotonicClock;
-use error_stack::Report;
 use trusted_server_core::ec::after_response::{
     after_response_lookups_allowed, commit_after_response_lookups,
 };
@@ -29,19 +26,14 @@ use trusted_server_core::ec::coordinator::transport::OutboundLookupTransport;
 use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupContext};
 use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::UnixSeconds;
-use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::provider::ClientSignals;
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
-};
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::settings::Settings;
 
 use crate::app::{AfterResponseLookups, EcFinalizeState};
+use crate::maybe_identity_graph;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
-use crate::{maybe_identity_graph, require_identity_graph};
 
 /// Inputs a routed response's finalize step hands to post-delivery work.
 pub(crate) struct FinalizeState {
@@ -51,8 +43,8 @@ pub(crate) struct FinalizeState {
     pub(crate) after_response: Option<AfterResponseLookups>,
 }
 
-/// Sends the queued telemetry, then runs pull sync and after-response lookups
-/// for `state`, on a fresh client and clock.
+/// Sends the queued telemetry, then runs after-response lookups for `state`,
+/// on a fresh client.
 ///
 /// `log_context` ends each failure log, so it matches the delivered response.
 pub(crate) fn run_post_delivery(
@@ -62,32 +54,30 @@ pub(crate) fn run_post_delivery(
     log_context: &dyn fmt::Display,
 ) {
     let client = post_delivery_client();
-    let clock = MonotonicClock::default();
     futures::executor::block_on(post_delivery_work(
         state,
         queue,
         settings,
         &client,
-        &clock,
         log_context,
     ));
 }
 
 /// A fresh Fastly client for post-delivery work, with the proxy marker off.
 ///
-/// Tinybird and the pull-sync partners never receive `x-edgezero-proxy`.
+/// Tinybird and the after-response providers, pull-sync partners included,
+/// never receive `x-edgezero-proxy`.
 fn post_delivery_client() -> HttpClient {
     HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false)
 }
 
-/// The post-delivery work itself, on `client` and `clock`: telemetry, pull
-/// sync, then after-response lookups.
+/// The post-delivery work itself, on `client`: telemetry, then
+/// after-response lookups.
 async fn post_delivery_work(
     state: Option<FinalizeState>,
     queue: &TelemetryQueue,
     settings: &Settings,
     client: &HttpClient,
-    clock: &MonotonicClock,
     log_context: &dyn fmt::Display,
 ) {
     send_queued_batches(client, &settings.tinybird, queue, log_context).await;
@@ -97,15 +87,6 @@ async fn post_delivery_work(
             mut ec_state,
             after_response,
         } = state;
-        pull_sync(
-            &partner_registry,
-            &ec_state,
-            settings,
-            client,
-            clock,
-            log_context,
-        )
-        .await;
         run_after_response_lookups(
             &mut ec_state,
             after_response,
@@ -115,41 +96,6 @@ async fn post_delivery_work(
         )
         .await;
     }
-}
-
-/// Runs pull sync for a real browser whose EC state still has partners to fill.
-async fn pull_sync(
-    partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
-    settings: &Settings,
-    client: &HttpClient,
-    clock: &MonotonicClock,
-    log_context: &dyn fmt::Display,
-) {
-    if !ec_state.is_real_browser {
-        return;
-    }
-
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) = prepare_pull_sync_after_send(
-        prepared_context,
-        || require_identity_graph(settings),
-        log_context,
-    ) else {
-        return;
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
-        settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        client,
-        clock,
-    )
-    .await;
 }
 
 /// Runs after-response identity lookups and applies their follow-up write.
@@ -176,6 +122,17 @@ pub(crate) async fn run_after_response_lookups(
     };
     if ec_state.ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
         log::debug!("After-response lookups skipped: EC changed during the request");
+        return;
+    }
+    // The request snapshot holds the row as finalize left it. A source held
+    // there is still held in the live row unless consent was withdrawn, which
+    // blocks the lookup anyway, so the live read is skipped when nothing is due.
+    // Only pull sync can be skipped: configured providers always run, so their
+    // cookie opt-outs and regional exclusions are processed.
+    let now = UnixSeconds::new(current_timestamp());
+    let request_entry = ec_state.ec_context.kv_snapshot().entry_for(&lookups.ec_id);
+    if !lookups.coordinator.any_due(request_entry, now) {
+        log::debug!("After-response lookups skipped: nothing due");
         return;
     }
     let Some(graph) = maybe_identity_graph(settings) else {
@@ -206,8 +163,9 @@ pub(crate) async fn run_after_response_lookups(
                     user_agent: lookups.user_agent.as_deref(),
                 },
                 publisher_domain: &settings.publisher.domain,
+                cookies: RequestCookies::new(&lookups.cookie_header),
                 rate_limiter: &limiter,
-                now: UnixSeconds::new(current_timestamp()),
+                now,
             },
         )
         .await;
@@ -221,32 +179,14 @@ pub(crate) async fn run_after_response_lookups(
     log::info!("After-response lookups: write outcome={outcome}");
 }
 
-/// Opens the identity graph only when there is a pull-sync context to run.
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
-    graph_factory: F,
-    log_context: &dyn fmt::Display,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
-where
-    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
-{
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}{log_context}");
-            return None;
-        }
-    };
-    Some((context, kv))
-}
-
 #[cfg(test)]
 mod tests {
     use edgezero_adapter_fastly::delivery::DeliveryError;
     use edgezero_core::http::{Method, StatusCode};
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
     use trusted_server_core::ec::EcContext;
+    use trusted_server_core::ec::finalize::ec_finalize_response;
+    use trusted_server_core::ec::page_load::NavigationPermit;
     use trusted_server_core::geo::GeoInfo;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::EcPartner;
@@ -260,6 +200,7 @@ mod tests {
         routed_delivery, unknown_commit,
     };
     use crate::delivery::{DeliveryAction, delivery_action, handle_delivery};
+    use crate::require_identity_graph;
     use crate::tinybird::QueueingTelemetrySink;
     use crate::tinybird::tests::{
         EVENTS_URI, assert_events_request, enabled_config, test_row, test_services,
@@ -307,7 +248,6 @@ mod tests {
                 &queue,
                 &settings,
                 &client.http_client(),
-                &clock.monotonic_clock(),
                 &"",
             ));
         });
@@ -323,7 +263,7 @@ mod tests {
     fn post_delivery_client_turns_the_proxy_marker_off() {
         assert!(
             !post_delivery_client().proxy_marker_enabled(),
-            "should send telemetry and pull-sync requests without the proxy marker"
+            "should send telemetry and after-response lookups without the proxy marker"
         );
     }
 
@@ -339,7 +279,6 @@ mod tests {
                 &queue,
                 &settings,
                 &client.http_client(),
-                &clock.monotonic_clock(),
                 &"",
             ));
         };
@@ -372,7 +311,6 @@ mod tests {
             &queue,
             &settings_with_tinybird(),
             &client.http_client(),
-            &clock.monotonic_clock(),
             &"",
         ));
 
@@ -385,27 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
-        let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(
-            None,
-            || {
-                calls.set(calls.get() + 1);
-                Err(Report::new(TrustedServerError::KvStore {
-                    store_name: "unexpected".to_owned(),
-                    message: "graph factory should not run".to_owned(),
-                }))
-            },
-            &"",
-        );
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
-        );
-        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
-    }
-
-    #[test]
     fn post_delivery_with_nothing_queued_makes_no_request() {
         let client = ScriptedHttpClient::forbidding();
         let clock = TestClock::new();
@@ -415,7 +332,6 @@ mod tests {
             &TelemetryQueue::default(),
             &settings_with_tinybird(),
             &client.http_client(),
-            &clock.monotonic_clock(),
             &"",
         ));
 
@@ -455,6 +371,7 @@ mod tests {
             pull_sync_ttl_sec: 3600,
             pull_sync_rate_limit: 100,
             ts_pull_token: Some(Redacted::new("example-pull-token".to_owned())),
+            mirror_enabled: false,
         }];
         settings
     }
@@ -497,10 +414,54 @@ mod tests {
                 use_finalize_kv: false,
                 eids_cookie: None,
                 sharedid_cookie: None,
-                is_real_browser: true,
             },
             after_response: None,
         }
+    }
+
+    /// [`returning_reader_state`] after finalize confirmed the reader's
+    /// navigation, with the after-response pull-sync lookups the entry point
+    /// captured for it.
+    fn returning_reader_after_response_state(settings: &Settings) -> FinalizeState {
+        let app = crate::app::build_state_from_settings(settings.clone())
+            .expect("should build the app state");
+        let mut state = returning_reader_state(settings);
+        let navigation = edgezero_core::http::request_builder()
+            .uri("https://test-publisher.example.com/article")
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the navigation");
+        state.ec_state.ec_context.set_navigation_permit(
+            NavigationPermit::classify(&navigation).expect("should permit a navigation"),
+        );
+        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let mut response = edgezero_core::http::response_builder()
+            .status(StatusCode::OK)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the page response");
+        futures::executor::block_on(ec_finalize_response(
+            settings,
+            &mut state.ec_state.ec_context,
+            Some(&kv),
+            &app.partner_registry,
+            None,
+            None,
+            &mut response,
+        ));
+        state.partner_registry = app.partner_registry();
+        state.after_response = Some(AfterResponseLookups {
+            coordinator: Arc::clone(
+                app.after_response_identity
+                    .as_ref()
+                    .expect("should run pull sync after the response"),
+            ),
+            ec_id: seeded_ec_id(),
+            client_ip: None,
+            user_agent: None,
+            cookie_header: String::new(),
+        });
+        state
     }
 
     #[test]
@@ -520,7 +481,7 @@ mod tests {
             );
         let settings = pull_sync_settings();
         let (queue, _body) = queue_with_one_auction(&client);
-        let state = returning_reader_state(&settings);
+        let state = returning_reader_after_response_state(&settings);
 
         // The origin aborted after the page head was committed.
         handle_delivery(
@@ -532,7 +493,6 @@ mod tests {
                     &queue,
                     &settings,
                     &client.http_client(),
-                    &clock.monotonic_clock(),
                     &"",
                 ));
             },
@@ -570,7 +530,6 @@ mod tests {
                     &TelemetryQueue::default(),
                     &settings,
                     &client.http_client(),
-                    &clock.monotonic_clock(),
                     &"",
                 ));
             },
