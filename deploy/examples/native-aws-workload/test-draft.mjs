@@ -8,8 +8,11 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const terraform = process.env.TERRAFORM_BIN || "terraform";
 const data = path.resolve(root, process.env.TF_DATA_DIR || ".terraform");
-const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ts-terraform-draft-"));
+const temporary = fs.mkdtempSync(
+  path.join(os.tmpdir(), "ts-terraform-contract-"),
+);
 const sourceFiles = [
+  "certificates.tf",
   "config.tf",
   "ecs.tf",
   "geo.tf",
@@ -58,23 +61,6 @@ try {
     sourceFiles,
     "only reviewed public Terraform source belongs in the mock fixture",
   );
-  const localsPath = path.join(root, "locals.tf");
-  const locals = fs.readFileSync(localsPath, "utf8");
-  const gate = /deployment_blockers\s*=\s*toset\(\[[\s\S]*?\]\)/g;
-  assert.equal(
-    [...locals.matchAll(gate)].length,
-    1,
-    "production source must contain one explicit qualification-blocker set",
-  );
-  for (const blocker of [
-    "scoped-operator-and-locked-state-qualification",
-    "provider-enabled-final-image-and-nonroot-volume-runtime",
-    "alb-forwarding-host-scheme-auth-and-health-acceptance",
-  ])
-    assert.ok(
-      locals.includes(JSON.stringify(blocker)),
-      `required deployment blocker: ${blocker}`,
-    );
   const variables = fs.readFileSync(path.join(root, "variables.tf"), "utf8");
   const geoVariable = variables
     .split('variable "geo_front_door" {')[1]
@@ -85,6 +71,21 @@ try {
     "Geo must require an explicit profile or null, never silently select Off",
   );
   assert.doesNotMatch(
+    geoVariable,
+    /origin_credential_value|cloudfront_ipv4_cidrs/,
+    "Geo credentials and AWS forwarding ranges must not remain operator inputs",
+  );
+  assert.match(
+    fs.readFileSync(path.join(root, "network.tf"), "utf8"),
+    /certificate_arn\s*=\s*aws_acm_certificate_validation\.regional\.certificate_arn/,
+    "ALB HTTPS must depend on regional certificate issuance",
+  );
+  assert.match(
+    fs.readFileSync(path.join(root, "geo.tf"), "utf8"),
+    /acm_certificate_arn\s*=\s*aws_acm_certificate_validation\.viewer\[0\]\.certificate_arn/,
+    "CloudFront HTTPS must depend on viewer certificate issuance",
+  );
+  assert.doesNotMatch(
     fs.readFileSync(path.join(root, "ecs.tf"), "utf8"),
     /^moved\s*\{/m,
     "The new public root has no historical service address to migrate",
@@ -92,26 +93,26 @@ try {
   let resources = 0;
   for (const file of sourceFiles) {
     const text = fs.readFileSync(path.join(root, file), "utf8");
+    assert.doesNotMatch(
+      text,
+      /\bdeployment_blockers\b|\bdraft_gate\b/,
+      `${file}: production source must not contain the unconditional draft gate`,
+    );
     for (const match of text.matchAll(
       /^resource "(aws_[^"]+)" "[^"]+" \{([\s\S]*?)(?=^resource |$(?![\s\S]))/gm,
     )) {
       resources++;
-      assert.match(
-        match[2],
-        /depends_on\s*=\s*\[[^\]]*terraform_data\.draft_gate/s,
-        `${file}: ${match[1]} must depend directly on the draft gate`,
-      );
       assert.notEqual(
         match[1],
         "aws_secretsmanager_secret_version",
-        "secret values must not enter Terraform state",
+        "application and Agent secret values must not enter Terraform state",
       );
     }
   }
   assert.equal(
     resources,
-    40,
-    "all workload resource blocks must be directly gated",
+    42,
+    "all workload AWS resource blocks must retain the no-secret-values check",
   );
   assert.ok(
     fs.existsSync(path.join(data, "providers")),
@@ -120,15 +121,12 @@ try {
   const cliConfig = path.join(temporary, "mirror.tfrc");
   fs.writeFileSync(
     cliConfig,
-    `provider_installation {\n  filesystem_mirror {\n    path = ${JSON.stringify(path.join(data, "providers"))}\n    include = ["registry.terraform.io/hashicorp/aws"]\n  }\n}\n`,
+    `provider_installation {\n  filesystem_mirror {\n    path = ${JSON.stringify(path.join(data, "providers"))}\n    include = ["registry.terraform.io/hashicorp/aws", "registry.terraform.io/hashicorp/random"]\n  }\n}\n`,
   );
-  for (const qualified of [false, true]) {
-    // Both plans run only public-source copies with fictional test variables,
-    // never the checkout's backend, state, credentials or automatic var files.
-    const fixture = path.join(
-      temporary,
-      qualified ? "task-contract" : "production-gate",
-    );
+  {
+    // Plan unchanged public-source copies with fictional test variables, never
+    // the checkout's backend, state, credentials or automatic var files.
+    const fixture = path.join(temporary, "workload-contract");
     fs.mkdirSync(path.join(fixture, "tests"), { recursive: true });
     for (const file of [
       ...sourceFiles,
@@ -137,9 +135,7 @@ try {
       "example-noindex-envelope.json",
     ])
       fs.copyFileSync(path.join(root, file), path.join(fixture, file));
-    const testFile = qualified
-      ? "task-contract.tftest.hcl.fixture"
-      : "draft.tftest.hcl";
+    const testFile = "task-contract.tftest.hcl.fixture";
     let contract = fs.readFileSync(path.join(root, "tests", testFile), "utf8");
     assert.match(contract, /^mock_provider "aws"/);
     assert.doesNotMatch(
@@ -153,9 +149,6 @@ try {
         viewer_certificate_arn:
           "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000",
         origin_credential_header_name: "x-fictional-origin-check",
-        origin_credential_value:
-          "fictional_only_00000000000000000000000000000000",
-        cloudfront_ipv4_cidrs: ["192.0.2.0/24", "198.51.100.0/24"],
         ...overrides,
       };
       return `{${Object.entries(fields)
@@ -167,7 +160,7 @@ try {
       `mock_provider "aws" {
       mock_data "aws_ec2_managed_prefix_list" {
         override_during = plan
-        defaults = { id = "pl-0123456789abcdef0" }
+        defaults = { id = "pl-0123456789abcdef0", entries = [{ cidr = "192.0.2.0/24", description = "fictional origin range" }, { cidr = "198.51.100.0/24", description = "fictional origin range" }] }
       }
       mock_resource "aws_security_group" {
         override_during = plan
@@ -200,9 +193,7 @@ try {
     const check = (condition, message) =>
       `assert {\ncondition = ${condition}\nerror_message = ${JSON.stringify(message)}\n}\n`;
     // Omit the new input for demo identity to exercise its actual default.
-    const phases = qualified
-      ? ["staged", "origin-enabled", "dns-cutover"]
-      : ["staged"];
+    const phases = ["staged", "origin-enabled", "dns-cutover"];
     for (const { preservePublisher, phase } of [false, true].flatMap(
       (preservePublisher) =>
         phases.map((phase) => ({ preservePublisher, phase })),
@@ -216,66 +207,82 @@ try {
           geo_front_door = ${geoInput(phase)}
           ${preservePublisher ? "preserve_publisher_hostname = true" : ""}
         }
-        ${qualified ? "" : "expect_failures = [terraform_data.draft_gate]"}
-        ${
-          qualified
-            ? [
-                check(
-                  `aws_cloudfront_distribution.geo[0].enabled == ${phase !== "staged"} && !aws_cloudfront_distribution.geo[0].is_ipv6_enabled && aws_cloudfront_distribution.geo[0].tags.RunId == var.run_id`,
-                  "Traffic must be separate from opt-in; IPv6 is not enabled.",
-                ),
-                check(
-                  `length(aws_ecs_service.review) == 0 && aws_ecs_service.geo[0].desired_count == 1 && aws_ecs_service.geo[0].name == "review-example-geo" && aws_lb_target_group.geo[0].name == "review-example-geo" && one(aws_ecs_service.geo[0].load_balancer).target_group_arn == aws_lb_target_group.geo[0].arn`,
-                  "Old Off tasks must never join the credential-bearing target group.",
-                ),
-                check(
-                  `one(aws_lb_listener_rule.publisher.action).type == "fixed-response" && length(aws_vpc_security_group_ingress_rule.reviewers) == 0 && aws_vpc_security_group_ingress_rule.cloudfront[0].prefix_list_id == data.aws_ec2_managed_prefix_list.cloudfront[0].id`,
-                  "Geo opt-in must immediately remove the unprotected ALB bypass.",
-                ),
-                check(
-                  `length(aws_lb_listener_rule.geo[0].condition) == 2 && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(one(c.http_header).http_header_name == var.geo_front_door.origin_credential_header_name && toset(one(c.http_header).values) == toset([var.geo_front_door.origin_credential_value]), false)]) && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(toset(one(c.host_header).values) == toset([var.demo_hostname]), false)]) && one(aws_lb_listener_rule.geo[0].action).target_group_arn == aws_lb_target_group.geo[0].arn`,
-                  "Only exact credential plus demo Host may reach the isolated Geo targets.",
-                ),
-                check(
-                  `strcontains(local.native_geo_profile, "alb_peer_cidrs = ") && strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_header_name) && !strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_value) && !strcontains(aws_ecs_task_definition.review.container_definitions, var.geo_front_door.origin_credential_value) && !strcontains(local.native_geo_profile, "192.0.2.0/24") && strcontains(local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS, "192.0.2.0/24")`,
-                  "Geo ALB peers and ordinary proxy networks must stay distinct, and the credential value must never reach ECS.",
-                ),
-                check(
-                  `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == 2 && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == var.geo_front_door.origin_credential_value])`,
-                  "Origin custom headers must be exactly the private credential and deployment-fixed forwarded Host override, never arbitrary viewer values or extra headers.",
-                ),
-                check(
-                  `toset(aws_cloudfront_distribution.geo[0].aliases) == toset([var.demo_hostname]) && one(aws_cloudfront_distribution.geo[0].viewer_certificate).acm_certificate_arn == var.geo_front_door.viewer_certificate_arn && aws_lb_listener.https.certificate_arn == var.certificate_arn && one(one(aws_lb_listener.https.default_action).fixed_response).status_code == "404"`,
-                  "Publisher browser identity must not change demo TLS/DNS identity or fail-closed ALB admission.",
-                ),
-                check(
-                  `one(aws_cloudfront_origin_request_policy.geo[0].headers_config).header_behavior == "allViewerAndWhitelistCloudFront" && toset(one(one(aws_cloudfront_origin_request_policy.geo[0].headers_config).headers).items) == toset(["CloudFront-Viewer-Country", "CloudFront-Viewer-Country-Region"]) && one(aws_cloudfront_origin_request_policy.geo[0].cookies_config).cookie_behavior == "all" && one(aws_cloudfront_origin_request_policy.geo[0].query_strings_config).query_string_behavior == "all"`,
-                  "Generated Geo, Host, Authorization, cookies and queries must be explicitly forwarded.",
-                ),
-                check(
-                  `aws_cloudfront_cache_policy.geo[0].min_ttl == 0 && aws_cloudfront_cache_policy.geo[0].default_ttl == 0 && aws_cloudfront_cache_policy.geo[0].max_ttl == 0 && length(aws_cloudfront_distribution.geo[0].custom_error_response) == 11 && alltrue([for e in aws_cloudfront_distribution.geo[0].custom_error_response : e.error_caching_min_ttl == 0])`,
-                  "No response or error may be cached between viewers.",
-                ),
-                check(
-                  `one(aws_cloudfront_distribution.geo[0].default_cache_behavior).viewer_protocol_policy == "https-only" && one(one(aws_cloudfront_distribution.geo[0].origin).custom_origin_config).origin_protocol_policy == "https-only" && one(aws_cloudfront_distribution.geo[0].origin).domain_name == aws_lb.review.dns_name && one(aws_route53_record.review.alias).evaluate_target_health == ${phase !== "dns-cutover"}`,
-                  "Both public hops require HTTPS; origin DNS must not recurse into the viewer alias.",
-                ),
-                check(
-                  `one(aws_route53_record.review.alias).name == ${phase === "dns-cutover" ? "aws_cloudfront_distribution.geo[0].domain_name" : "aws_lb.review.dns_name"}`,
-                  "DNS must cut over only after separate protected-origin acceptance.",
-                ),
-              ].join("\n")
-            : ""
-        }
+        ${[
+          check(
+            `random_password.origin_credential[0].length == 43 && !random_password.origin_credential[0].special && random_password.origin_credential[0].keepers == null && issensitive(local.geo_credential_value) && length(local.geo_credential_value) == 43`,
+            "The workload must own one stable, sensitive, header-safe origin credential without update-triggered rotation.",
+          ),
+          check(
+            `aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_acm_certificate_validation.viewer) == 1 && aws_acm_certificate_validation.viewer[0].certificate_arn == var.geo_front_door.viewer_certificate_arn`,
+            "Geo requires issued regional and viewer certificates before its HTTPS consumers.",
+          ),
+          check(
+            `local.cloudfront_ipv4_cidrs == sort([for entry in data.aws_ec2_managed_prefix_list.cloudfront[0].entries : entry.cidr]) && local.trusted_proxy_cidrs == concat(local.alb_subnet_cidrs, local.cloudfront_ipv4_cidrs)`,
+            "Checked forwarding must use the entries of the exact managed prefix list used by ingress.",
+          ),
+          check(
+            `aws_cloudfront_distribution.geo[0].enabled == ${phase !== "staged"} && !aws_cloudfront_distribution.geo[0].is_ipv6_enabled && aws_cloudfront_distribution.geo[0].tags.RunId == var.run_id && output.deployment_metadata.geo.phase == "${phase}" && output.deployment_metadata.manual_shutdown_required`,
+            "Traffic must be separate from opt-in; IPv6 is not enabled.",
+          ),
+          check(
+            `length(aws_ecs_service.review) == 0 && aws_ecs_service.geo[0].desired_count == 1 && aws_ecs_service.geo[0].name == "review-example-geo" && aws_lb_target_group.geo[0].name == "review-example-geo" && one(aws_ecs_service.geo[0].load_balancer).target_group_arn == aws_lb_target_group.geo[0].arn`,
+            "Old Off tasks must never join the credential-bearing target group.",
+          ),
+          check(
+            `one(aws_lb_listener_rule.publisher.action).type == "fixed-response" && length(aws_vpc_security_group_ingress_rule.reviewers) == 0 && aws_vpc_security_group_ingress_rule.cloudfront[0].prefix_list_id == data.aws_ec2_managed_prefix_list.cloudfront[0].id`,
+            "Geo opt-in must immediately remove the unprotected ALB bypass.",
+          ),
+          check(
+            `length(aws_lb_listener_rule.geo[0].condition) == 2 && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(one(c.http_header).http_header_name == var.geo_front_door.origin_credential_header_name && toset(one(c.http_header).values) == toset([local.geo_credential_value]), false)]) && anytrue([for c in aws_lb_listener_rule.geo[0].condition : try(toset(one(c.host_header).values) == toset([var.demo_hostname]), false)]) && one(aws_lb_listener_rule.geo[0].action).target_group_arn == aws_lb_target_group.geo[0].arn`,
+            "Only exact credential plus demo Host may reach the isolated Geo targets.",
+          ),
+          check(
+            `strcontains(local.native_geo_profile, "alb_peer_cidrs = ") && strcontains(local.native_geo_profile, var.geo_front_door.origin_credential_header_name) && !strcontains(local.native_geo_profile, local.geo_credential_value) && !strcontains(aws_ecs_task_definition.review.container_definitions, local.geo_credential_value) && !strcontains(local.native_geo_profile, "192.0.2.0/24") && strcontains(local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS, "192.0.2.0/24")`,
+            "Geo ALB peers and ordinary proxy networks must stay distinct, and the credential value must never reach ECS.",
+          ),
+          check(
+            `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == 2 && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == local.geo_credential_value])`,
+            "Origin custom headers must be exactly the private credential and deployment-fixed forwarded Host override, never arbitrary viewer values or extra headers.",
+          ),
+          check(
+            `toset(aws_cloudfront_distribution.geo[0].aliases) == toset([var.demo_hostname]) && one(aws_cloudfront_distribution.geo[0].viewer_certificate).acm_certificate_arn == var.geo_front_door.viewer_certificate_arn && aws_lb_listener.https.certificate_arn == var.certificate_arn && one(one(aws_lb_listener.https.default_action).fixed_response).status_code == "404"`,
+            "Publisher browser identity must not change demo TLS/DNS identity or fail-closed ALB admission.",
+          ),
+          check(
+            `one(aws_cloudfront_origin_request_policy.geo[0].headers_config).header_behavior == "allViewerAndWhitelistCloudFront" && toset(one(one(aws_cloudfront_origin_request_policy.geo[0].headers_config).headers).items) == toset(["CloudFront-Viewer-Country", "CloudFront-Viewer-Country-Region"]) && one(aws_cloudfront_origin_request_policy.geo[0].cookies_config).cookie_behavior == "all" && one(aws_cloudfront_origin_request_policy.geo[0].query_strings_config).query_string_behavior == "all"`,
+            "Generated Geo, Host, Authorization, cookies and queries must be explicitly forwarded.",
+          ),
+          check(
+            `aws_cloudfront_cache_policy.geo[0].min_ttl == 0 && aws_cloudfront_cache_policy.geo[0].default_ttl == 0 && aws_cloudfront_cache_policy.geo[0].max_ttl == 0 && length(aws_cloudfront_distribution.geo[0].custom_error_response) == 11 && alltrue([for e in aws_cloudfront_distribution.geo[0].custom_error_response : e.error_caching_min_ttl == 0])`,
+            "No response or error may be cached between viewers.",
+          ),
+          check(
+            `one(aws_cloudfront_distribution.geo[0].default_cache_behavior).viewer_protocol_policy == "https-only" && one(one(aws_cloudfront_distribution.geo[0].origin).custom_origin_config).origin_protocol_policy == "https-only" && one(aws_cloudfront_distribution.geo[0].origin).domain_name == aws_lb.review.dns_name && one(aws_route53_record.review.alias).evaluate_target_health == ${phase !== "dns-cutover"}`,
+            "Both public hops require HTTPS; origin DNS must not recurse into the viewer alias.",
+          ),
+          check(
+            `one(aws_route53_record.review.alias).name == ${phase === "dns-cutover" ? "aws_cloudfront_distribution.geo[0].domain_name" : "aws_lb.review.dns_name"}`,
+            "DNS must cut over only after separate protected-origin acceptance.",
+          ),
+        ].join("\n")}
       }\n`;
     }
-    contract += `\nrun "auction_egress_gated" {
+    contract += `\nrun "managed_origin_ranges_follow_aws" {
+      command = plan
+      variables { geo_front_door = ${geoInput("dns-cutover")} }
+      override_data {
+        target = data.aws_ec2_managed_prefix_list.cloudfront[0]
+        override_during = plan
+        values = { id = "pl-0123456789abcdef1", entries = [{ cidr = "198.51.100.0/24", description = "fictional" }, { cidr = "192.0.2.128/25", description = "fictional" }] }
+      }
+      ${check('local.cloudfront_ipv4_cidrs == tolist(["192.0.2.128/25", "198.51.100.0/24"]) && aws_vpc_security_group_ingress_rule.cloudfront[0].prefix_list_id == "pl-0123456789abcdef1" && local.application_environment.EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS == join(",", concat(local.alb_subnet_cidrs, local.cloudfront_ipv4_cidrs))', "Refreshed AWS list entries must drive checked forwarding and the same list must drive network ingress.")}
+    }\n`;
+    contract += `\nrun "auction_egress_scoped" {
       command = plan
       variables { auction_egress = { cidr_ipv4 = "192.0.2.80/32", port = 8000 } }
-      ${qualified ? "" : "expect_failures = [terraform_data.draft_gate]"}
-      ${qualified ? check('length(aws_vpc_security_group_egress_rule.auction) == 1 && aws_vpc_security_group_egress_rule.auction[0].security_group_id == aws_security_group.task.id && aws_vpc_security_group_egress_rule.auction[0].ip_protocol == "tcp" && aws_vpc_security_group_egress_rule.auction[0].from_port == 8000 && aws_vpc_security_group_egress_rule.auction[0].to_port == 8000 && aws_vpc_security_group_egress_rule.auction[0].cidr_ipv4 == "192.0.2.80/32"', "Auction egress must target only the owned task SG and exact TCP endpoint.") : ""}
+      ${check('length(aws_vpc_security_group_egress_rule.auction) == 1 && aws_vpc_security_group_egress_rule.auction[0].security_group_id == aws_security_group.task.id && aws_vpc_security_group_egress_rule.auction[0].ip_protocol == "tcp" && aws_vpc_security_group_egress_rule.auction[0].from_port == 8000 && aws_vpc_security_group_egress_rule.auction[0].to_port == 8000 && aws_vpc_security_group_egress_rule.auction[0].cidr_ipv4 == "192.0.2.80/32"', "Auction egress must target only the owned task SG and exact TCP endpoint.")}
     }\n`;
-    if (qualified) {
+    {
       // Keep the identity projection wired to the same plan-known local as all
       // credential-removal/admission consumers, never computed AppConfig data.
       const geo = fs.readFileSync(path.join(root, "geo.tf"), "utf8");
@@ -430,7 +437,7 @@ try {
         contract += `\nrun "explicit_off_unchanged_${preservePublisher ? "publisher" : "demo_default"}" {
           command = plan
           variables { ${preservePublisher ? "preserve_publisher_hostname = true" : ""} }
-          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
+          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(random_password.origin_credential) == 0 && length(aws_acm_certificate_validation.viewer) == 0 && aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
         }\n`;
       }
       for (const [name, table] of [
@@ -475,11 +482,6 @@ try {
       }
       for (const [name, overrides] of [
         ["invalid_phase", { rollout_phase: "invalid" }],
-        ["unbounded_proxy_trust", { cloudfront_ipv4_cidrs: ["0.0.0.0/0"] }],
-        [
-          "wildcard_credential",
-          { origin_credential_value: "fictional_credential_000000000000000*" },
-        ],
         ["reserved_header", { origin_credential_header_name: "authorization" }],
         ...[
           "fictional-origin",
@@ -511,7 +513,7 @@ try {
         expect_failures = [var.geo_front_door]
       }\n`;
     }
-    if (qualified) {
+    {
       // Synthetic envelopes exercise only Terraform's structural boundary. They
       // do not claim valid TS application policy or native feature support;
       // the matching real CLI remains mandatory before deployment.
@@ -618,7 +620,7 @@ try {
         contract += `\nrun "envelope_reject_${name}" {
           command = plan
           variables { config_envelope_file = "${file}" }
-          expect_failures = [terraform_data.draft_gate]
+          expect_failures = [aws_appconfig_hosted_configuration_version.review]
         }\n`;
       }
     }
@@ -629,15 +631,28 @@ try {
       variables {
         ${fs.readFileSync(path.join(root, "terraform.tfvars.example"), "utf8")}
       }
-      ${qualified ? "" : "expect_failures = [terraform_data.draft_gate]"}
-      ${qualified ? check('local.geo_enabled && local.geo_phase == "dns-cutover" && aws_cloudfront_distribution.geo[0].enabled && length(aws_ecs_service.review) == 0 && length(aws_ecs_service.geo) == 1 && one(aws_route53_record.review.alias).name == aws_cloudfront_distribution.geo[0].domain_name && local.envelope_valid', "Committed example inputs must select protected CloudFront and its DNS alias, never silently default Off.") : ""}
+      ${check('local.geo_enabled && local.geo_phase == "dns-cutover" && aws_cloudfront_distribution.geo[0].enabled && length(aws_ecs_service.review) == 0 && length(aws_ecs_service.geo) == 1 && one(aws_route53_record.review.alias).name == aws_cloudfront_distribution.geo[0].domain_name && local.envelope_valid', "Committed example inputs must select protected CloudFront and its DNS alias, never silently default Off.")}
     }\n`;
     fs.writeFileSync(path.join(fixture, "tests/contract.tftest.hcl"), contract);
-    // This source change exists ONLY in the disposable mock-provider copy.
-    if (qualified)
-      fs.writeFileSync(
-        path.join(fixture, "locals.tf"),
-        locals.replace(gate, "deployment_blockers = toset([])"),
+    const validation = fs.readFileSync(
+      path.join(root, "tests/draft.tftest.hcl"),
+      "utf8",
+    );
+    assert.match(validation, /^mock_provider "aws"/);
+    assert.doesNotMatch(
+      validation,
+      /command\s*=\s*apply/,
+      "offline validation checks must not apply even mocked workload",
+    );
+    fs.writeFileSync(
+      path.join(fixture, "tests/validation.tftest.hcl"),
+      validation,
+    );
+    for (const file of sourceFiles)
+      assert.equal(
+        fs.readFileSync(path.join(fixture, file), "utf8"),
+        fs.readFileSync(path.join(root, file), "utf8"),
+        `${file}: mock plans must exercise unchanged production source`,
       );
     const fixtureEnv = {
       TF_DATA_DIR: path.join(fixture, ".terraform"),
@@ -718,106 +733,67 @@ try {
     "PASS retained table-only layout, protected lifetime and storage outputs",
   );
 
-  // Prove Terraform's actual destroy semantics without applying anything.
-  // The fictional checkpoint contains only the built-in gate resource. Its
-  // exact production preconditions remain closed throughout this test.
-  const destroyFixture = path.join(temporary, "destroy-gate");
-  fs.mkdirSync(destroyFixture);
-  const gateSource = fs.readFileSync(path.join(root, "terraform.tf"), "utf8");
-  fs.writeFileSync(
-    path.join(destroyFixture, "main.tf"),
-    `
-    variable "run_id" { default = "review-example" }
-    locals {
-      ${locals.match(gate)[0]}
-      envelope_valid = true
-    }
-    ${gateSource.slice(gateSource.indexOf('resource "terraform_data" "draft_gate"'))}
-  `,
+  // Bootstrap uses the same credential-free mirror and unchanged source-copy
+  // boundary. Its local backend and any operator migration override stay unused.
+  const bootstrapRoot = path.join(root, "bootstrap");
+  const bootstrap = path.join(temporary, "bootstrap");
+  fs.mkdirSync(path.join(bootstrap, "tests"), { recursive: true });
+  const bootstrapSources = [
+    "main.tf",
+    "outputs.tf",
+    "terraform.tf",
+    "variables.tf",
+  ];
+  assert.deepEqual(
+    fs
+      .readdirSync(bootstrapRoot)
+      .filter(
+        (name) =>
+          (name.endsWith(".tf") || name.endsWith(".tf.json")) &&
+          name !== "backend_override.tf",
+      )
+      .sort(),
+    bootstrapSources,
+    "bootstrap mock checks accept only reviewed public Terraform sources",
+  );
+  for (const file of [...bootstrapSources, ".terraform.lock.hcl"])
+    fs.copyFileSync(path.join(bootstrapRoot, file), path.join(bootstrap, file));
+  const bootstrapTest = fs.readFileSync(
+    path.join(bootstrapRoot, "tests/bootstrap.tftest.hcl"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    bootstrapTest,
+    /command\s*=\s*apply/,
+    "bootstrap offline checks must not apply even mocked resources",
   );
   fs.writeFileSync(
-    path.join(destroyFixture, "checkpoint.tfstate"),
-    JSON.stringify({
-      version: 4,
-      terraform_version: "1.16.2",
-      serial: 1,
-      lineage: "00000000-0000-0000-0000-000000000000",
-      outputs: {},
-      resources: [
-        {
-          mode: "managed",
-          type: "terraform_data",
-          name: "draft_gate",
-          provider: 'provider["terraform.io/builtin/terraform"]',
-          instances: [
-            {
-              schema_version: 0,
-              attributes: {
-                id: "00000000-0000-0000-0000-000000000001",
-                input: {
-                  value: { run_id: "review-example" },
-                  type: ["object", { run_id: "string" }],
-                },
-                output: {
-                  value: { run_id: "review-example" },
-                  type: ["object", { run_id: "string" }],
-                },
-                triggers_replace: null,
-              },
-              sensitive_attributes: [],
-            },
-          ],
-        },
-      ],
-    }),
+    path.join(bootstrap, "tests/bootstrap.tftest.hcl"),
+    bootstrapTest,
   );
-  const destroyEnv = { TF_DATA_DIR: path.join(destroyFixture, ".terraform") };
-  run(
-    ["init", "-backend=false", "-input=false", "-no-color"],
-    destroyFixture,
-    destroyEnv,
-  );
-  run(["validate", "-no-color"], destroyFixture, destroyEnv);
+  const bootstrapEnv = {
+    TF_DATA_DIR: path.join(bootstrap, ".terraform"),
+    TF_CLI_CONFIG_FILE: cliConfig,
+  };
   run(
     [
-      "plan",
-      "-destroy",
-      "-refresh=false",
+      "init",
+      "-backend=false",
       "-input=false",
+      "-lockfile=readonly",
       "-no-color",
-      "-state=checkpoint.tfstate",
-      "-out=destroy.tfplan",
     ],
-    destroyFixture,
-    destroyEnv,
+    bootstrap,
+    bootstrapEnv,
   );
-  const destroyJson = spawnSync(
-    terraform,
-    ["show", "-json", "destroy.tfplan"],
-    {
-      cwd: destroyFixture,
-      env: { ...env, ...destroyEnv },
-      encoding: "utf8",
-      timeout: 30_000,
-    },
-  );
-  assert.equal(destroyJson.status, 0, "built-in gate destroy plan must export");
-  assert.deepEqual(
-    JSON.parse(destroyJson.stdout).resource_changes.map(
-      ({ address, change }) => ({ address, actions: change.actions }),
-    ),
-    [{ address: "terraform_data.draft_gate", actions: ["delete"] }],
-  );
+  run(["validate", "-no-color"], bootstrap, bootstrapEnv);
+  run(["test", "-no-color"], bootstrap, bootstrapEnv);
   console.log(
-    "PASS exact closed production gate allows an isolated delete-only destroy plan, no apply",
+    "PASS bootstrap ownership, state settings, single DNS validation record and empty secret containers",
   );
-  assert.equal(
-    fs.readFileSync(localsPath, "utf8"),
-    locals,
-    "the real qualification gate must remain unchanged",
-  );
+
   console.log(
-    `PASS ${resources} guarded AWS resource blocks, fail-closed mock plans and isolated task-contract mock plans`,
+    `PASS ${resources} unchanged AWS resource blocks, valid mock plans and contract rejection cases without an unconditional draft gate`,
   );
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });

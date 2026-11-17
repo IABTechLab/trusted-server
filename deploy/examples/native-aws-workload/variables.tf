@@ -89,8 +89,8 @@ variable "reviewer_ipv4_cidrs" {
   description = "HTTPS access CIDRs for direct ALB ingress. Application authentication belongs to TS; application and Agent ports remain ALB-only and loopback-only respectively."
   type        = set(string)
   validation {
-    condition     = length(var.reviewer_ipv4_cidrs) > 0 && length(var.reviewer_ipv4_cidrs) <= 32 && alltrue([for cidr in var.reviewer_ipv4_cidrs : can(cidrnetmask(cidr)) && (cidr == "0.0.0.0/0" || try(tonumber(split("/", cidr)[1]) >= 16, false))])
-    error_message = "Supply at most 32 explicit IPv4 CIDRs: /16 or narrower, or 0.0.0.0/0 for public HTTPS protected by Basic auth."
+    condition     = (length(var.reviewer_ipv4_cidrs) > 0 || var.geo_front_door != null) && alltrue([for cidr in var.reviewer_ipv4_cidrs : can(cidrnetmask(cidr))])
+    error_message = "Direct ALB ingress needs at least one valid IPv4 CIDR. CloudFront may use an empty set because these CIDRs do not restrict viewers."
   }
 }
 
@@ -115,13 +115,11 @@ variable "auction_egress" {
 }
 
 variable "geo_front_door" {
-  description = "Explicit protected CloudFront opt-in. Null preserves Geo Off. Approved exception: origin credential name/value enter encrypted, access-scoped Terraform state. Never publish plans/state. Viewer certificate covers demo_hostname in us-east-1; regional certificate_arn covers the forwarded demo Host. CloudFront CIDRs are reviewed literal origin-facing IPv4 ranges for ordinary proxy trust only."
+  description = "Explicit protected CloudFront opt-in. Null preserves Geo Off. Terraform generates the origin credential and derives forwarding CIDRs from the managed origin-facing prefix list. The credential enters restricted Terraform state/plans, never ECS. Viewer certificate covers demo_hostname in us-east-1; regional certificate_arn covers the forwarded demo Host."
   type = object({
     rollout_phase                 = optional(string, "staged")
     viewer_certificate_arn        = string
     origin_credential_header_name = string
-    origin_credential_value       = string
-    cloudfront_ipv4_cidrs         = set(string)
   })
   sensitive = true
   validation {
@@ -132,12 +130,9 @@ variable "geo_front_door" {
       # removal policy, also excluding CloudFront-prohibited origin headers.
       can(regex("^x-[a-z0-9-]{1,38}$", var.geo_front_door.origin_credential_header_name)) &&
       !can(regex("^(x-amz-|x-amzn-|x-edge-|x-forwarded-)", var.geo_front_door.origin_credential_header_name)) &&
-      !contains(["x-real-ip", "x-request-id", "x-correlation-id", "host", "authorization", "cookie", "connection", "content-length", "expect", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "max-forwards", "proxy-authenticate", "proxy-authorization", "proxy-connection", "range", "request-range", "te", "trailer", "transfer-encoding", "upgrade", "via", "cache-control", "pragma"], var.geo_front_door.origin_credential_header_name) &&
-      can(regex("^[A-Za-z0-9_-]{32,128}$", var.geo_front_door.origin_credential_value)) &&
-      length(var.geo_front_door.cloudfront_ipv4_cidrs) > 0 &&
-      alltrue([for cidr in var.geo_front_door.cloudfront_ipv4_cidrs : can(cidrnetmask(cidr)) && try(tonumber(split("/", cidr)[1]) > 0, false)])
+      !contains(["x-real-ip", "x-request-id", "x-correlation-id", "host", "authorization", "cookie", "connection", "content-length", "expect", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "max-forwards", "proxy-authenticate", "proxy-authorization", "proxy-connection", "range", "request-range", "te", "trailer", "transfer-encoding", "upgrade", "via", "cache-control", "pragma"], var.geo_front_door.origin_credential_header_name)
     )
-    error_message = "Supply a same-account us-east-1 viewer certificate, a dedicated private lowercase x- header name excluding forwarding/AWS/real-IP/correlation fields, a separately generated 32-128-character base64url credential, and explicit non-/0 CloudFront IPv4 CIDRs."
+    error_message = "Supply a same-account us-east-1 viewer certificate and a dedicated lowercase x- origin header name excluding forwarding/AWS/real-IP/correlation fields."
   }
 }
 
@@ -210,14 +205,17 @@ variable "agent_token" {
 }
 
 variable "runtime_boundaries" {
-  description = "Exact retained task/execution permission ceilings from the bootstrap. ARN presence is not document or runtime qualification."
+  description = "Optional organisation-required task/execution permission ceilings. Null creates roles without boundaries; supplied boundaries remain independently owned and must permit the scoped runtime calls."
   type = object({
     execution = string
     task      = string
   })
+  default = null
   validation {
-    condition     = var.runtime_boundaries.execution != var.runtime_boundaries.task && alltrue([for arn in values(var.runtime_boundaries) : can(regex("^arn:aws:iam::${var.aws_account_id}:policy/[A-Za-z0-9/+=,.@_-]+$", arn))])
-    error_message = "Supply two distinct same-account managed-policy ARNs from the retained bootstrap."
+    condition = var.runtime_boundaries == null ? true : (
+      alltrue([for arn in values(var.runtime_boundaries) : can(regex("^arn:aws:iam::${var.aws_account_id}:policy/[A-Za-z0-9/+=,.@_-]+$", arn))])
+    )
+    error_message = "Omit runtime_boundaries or supply same-account managed-policy ARNs required by your organisation. Both roles may use the same boundary."
   }
 }
 
