@@ -19,14 +19,11 @@ const ADAPTER_CRATES: &[&str] = &[
 
 const IDENTITY_ENTRY_POINTS: &[&str] = &[
     "PartnerRegistry::from_config",
-    "admin_ec_lookup_not_supported",
     "answer_batch_sync_locally",
     "answer_identify_locally",
     "dispatch_pull_sync",
     "ec_finalize_response",
     "generate_if_needed",
-    "handle_admin_ec_lookup",
-    "handle_admin_eids_lookup",
     "handle_batch_sync",
     "handle_identify",
 ];

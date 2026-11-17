@@ -273,7 +273,7 @@ struct SkippedPartnerId {
 ///
 /// Returns [`TrustedServerError::KvStore`] when the store open or read
 /// fails.
-pub fn handle_admin_ec_lookup(
+pub(super) fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     req: &Request<EdgeBody>,
@@ -307,7 +307,7 @@ pub fn handle_admin_ec_lookup(
 
 /// Returns the portable response used when an adapter has no EC KV backend.
 #[must_use]
-pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
+fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
     json_error(
         StatusCode::NOT_IMPLEMENTED,
         "EC identity graph is not configured on this deployment",
@@ -574,7 +574,7 @@ enum DroppedEidReason {
 ///
 /// Returns [`TrustedServerError::Configuration`] only when the response
 /// payload fails JSON serialization.
-pub fn handle_admin_eids_lookup(
+pub(super) fn handle_admin_eids_lookup(
     registry: &PartnerRegistry,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
