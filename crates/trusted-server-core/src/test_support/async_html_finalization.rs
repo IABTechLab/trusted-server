@@ -1,32 +1,46 @@
 //! Fictional terminal HTTP consumer, available only with `test-utils`.
+//!
+//! It also answers [`FRAMING_TRAILER_PATH`] with a `Trailer` field, which
+//! `EdgeZero`'s response framing rejects, so the runtime checks can reach a
+//! framing fallback that Trusted Server itself never produces.
 
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use edgezero_core::body::Body;
-use edgezero_core::http::{Uri, request_builder};
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::error::EdgeError;
+use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding};
 use error_stack::{Report, ResultExt as _};
 use futures::future::LocalBoxFuture;
+use http::{HeaderValue, Request, Response, header};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+    IntegrationProxy, IntegrationRegistration,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest};
+use crate::outbound::{buffered, outbound_request};
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::streaming_processor::StreamProcessor;
 use crate::streaming_processor::finish::{StreamFinish, StreamFinishError, StreamFinishInput};
 
 pub(crate) const ID: &str = "html_finalization_fixture";
+/// Path the fixture answers with a `Trailer` field.
+pub(crate) const FRAMING_TRAILER_PATH: &str =
+    "/integrations/html_finalization_fixture/framing-trailer";
 const EOF_SENTINEL: &[u8] = b"<!--example-document-eof-->";
 const ORIGINAL: &[u8] = b"EXAMPLE_UNSIGNED";
 const REPLACEMENT: &[u8] = b"EXAMPLE_FINALIZED";
+
+/// Largest lookup reply the fixture reads.
+const MAX_LOOKUP_RESPONSE_BYTES: u64 = 64;
 
 #[derive(Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +80,7 @@ pub(crate) fn register(
         IntegrationRegistration::builder(ID)
             .without_js()
             .with_html_stream_processor(Arc::new(FixtureFactory(config)))
+            .with_proxy(Arc::new(FramingTrailerProxy))
             .build(),
     ))
 }
@@ -124,71 +139,57 @@ impl StreamProcessor for FixtureSession {
             if !self.saw_eof_sentinel || !self.synchronous_eof {
                 return Err(Report::new(StreamFinishError::Rejected));
             }
-            let url =
-                Url::parse(&self.config.lookup_url).change_context(StreamFinishError::Rejected)?;
-            // Fastly cannot interrupt a blocking host call. Bound its transport
-            // by the remaining chain budget; timer adapters deliberately test
-            // cancellation against a longer transport timeout.
-            let timeout = if input.deadline.has_cooperative_timer() {
-                Duration::from_millis(u64::from(self.config.transport_timeout_ms))
+            // Fastly cannot interrupt a blocking host call, so its request also
+            // carries the remaining chain budget as a deadline. The constant
+            // timeout keeps the backend identity stable; the reported timeout is
+            // the bound the request actually runs under.
+            let transport_timeout =
+                Duration::from_millis(u64::from(self.config.transport_timeout_ms));
+            let cooperative = input.deadline.has_cooperative_timer();
+            let reported_timeout = if cooperative {
+                transport_timeout
             } else {
-                input
-                    .deadline
-                    .remaining()
-                    .min(Duration::from_millis(u64::from(
-                        self.config.transport_timeout_ms,
-                    )))
+                input.deadline.remaining().min(transport_timeout)
             };
-            let backend = input
-                .services
-                .backend()
-                .ensure(&PlatformBackendSpec {
-                    scheme: url.scheme().to_string(),
-                    host: url
-                        .host_str()
-                        .ok_or_else(|| Report::new(StreamFinishError::Rejected))?
-                        .to_string(),
-                    port: url.port(),
-                    host_header_override: None,
-                    certificate_check: true,
-                    first_byte_timeout: timeout,
-                    between_bytes_timeout: timeout,
-                    discriminator: Some(ID.to_string()),
-                })
-                .change_context(StreamFinishError::Unavailable)?;
             let payload = serde_json::to_vec(&json!({
                 "complete": true,
                 "sha256": hex::encode(self.digest.clone().finalize()),
                 "bytes": self.bytes,
-                "transport_timeout_ms": timeout.as_millis(),
+                "transport_timeout_ms": reported_timeout.as_millis(),
             }))
             .change_context(StreamFinishError::Rejected)?;
-            let request = request_builder()
-                .method(http::Method::POST)
-                .uri(
-                    self.config
-                        .lookup_url
-                        .parse::<Uri>()
-                        .change_context(StreamFinishError::Rejected)?,
-                )
-                .header(http::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(payload))
-                .change_context(StreamFinishError::Rejected)?;
+            let mut request = buffered(
+                outbound_request(http::Method::POST, &self.config.lookup_url)
+                    .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?,
+                transport_timeout,
+                MAX_LOOKUP_RESPONSE_BYTES,
+                ResponseDecoding::Decode,
+            )
+            .cache_policy(OutboundCachePolicy::Bypass)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?
+            .body(payload);
+            if !cooperative {
+                request = request.deadline(
+                    input
+                        .services
+                        .clock()
+                        .deadline_after(input.deadline.remaining()),
+                );
+            }
             let response = input
                 .services
-                .http_client()
-                .send(PlatformHttpRequest::new(request, backend).with_cache_bypass())
+                .outbound_client()
+                .send(request)
                 .await
-                .change_context(StreamFinishError::Unavailable)?;
-            if !response.response.status().is_success() {
+                .map_err(|error| fixture_error(error, StreamFinishError::Unavailable))?;
+            if !response.is_success() {
                 return Err(Report::new(StreamFinishError::Unavailable));
             }
             let reply = response
-                .response
-                .into_body()
-                .into_bytes_bounded(64)
+                .into_bytes_bounded(MAX_LOOKUP_RESPONSE_BYTES)
                 .await
-                .change_context(StreamFinishError::Rejected)?;
+                .map_err(|error| fixture_error(error, StreamFinishError::Rejected))?;
             if reply.as_ref() != b"EXAMPLE_APPROVED" {
                 return Err(Report::new(StreamFinishError::Rejected));
             }
@@ -212,6 +213,41 @@ impl StreamProcessor for FixtureSession {
             Ok(StreamFinish::Replace)
         }))
     }
+}
+
+/// Answers [`FRAMING_TRAILER_PATH`] with a `Trailer` field.
+///
+/// `EdgeZero` rejects any `Trailer` before commit and delivers its framing
+/// fallback 500 in place of this response.
+struct FramingTrailerProxy;
+
+#[async_trait(?Send)]
+impl IntegrationProxy for FramingTrailerProxy {
+    fn integration_name(&self) -> &'static str {
+        ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![IntegrationEndpoint::get(FRAMING_TRAILER_PATH)]
+    }
+
+    async fn handle(
+        &self,
+        _settings: &Settings,
+        _services: &RuntimeServices,
+        _req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut response = Response::new(EdgeBody::from("example body with a trailer"));
+        response
+            .headers_mut()
+            .insert(header::TRAILER, HeaderValue::from_static("x-example"));
+        Ok(response)
+    }
+}
+
+/// Reports an outbound failure as `context`, carrying the `EdgeError` for diagnosis.
+fn fixture_error(error: EdgeError, context: StreamFinishError) -> Report<StreamFinishError> {
+    Report::new(context).attach_opaque(error)
 }
 
 #[cfg(test)]
@@ -239,6 +275,27 @@ mod tests {
                 !registry.js_module_ids().contains(&ID),
                 "should never add a fictional browser bundle"
             );
+            assert_eq!(
+                registry.has_route(&http::Method::GET, FRAMING_TRAILER_PATH),
+                enabled,
+                "should route the framing fixture only when enabled"
+            );
         }
+    }
+
+    #[test]
+    fn framing_route_answers_with_a_trailer_field() {
+        let response = futures::executor::block_on(FramingTrailerProxy.handle(
+            &create_test_settings(),
+            &crate::platform::test_support::noop_services(),
+            Request::new(EdgeBody::empty()),
+        ))
+        .expect("should answer the framing route");
+
+        assert_eq!(
+            response.headers().get(header::TRAILER),
+            Some(&HeaderValue::from_static("x-example")),
+            "should carry the Trailer field EdgeZero rejects"
+        );
     }
 }

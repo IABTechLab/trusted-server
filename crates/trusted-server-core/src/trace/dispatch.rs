@@ -5,9 +5,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
+use edgezero_core::http::RequestParts;
 use edgezero_core::ingress::RequestIngress;
+use edgezero_core::pre_dispatch::PreDispatchRequest;
 use edgezero_core::router::PreDispatchHook;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Response, StatusCode};
 use trusted_server_js::trace_assets::trace_asset;
 
 use super::actions::action_response;
@@ -87,7 +89,7 @@ pub struct TraceMetadata {
     pub geo: Option<GeoInfo>,
 }
 
-type MetadataSupplier = dyn Fn(&Request<Body>) -> TraceMetadata + Send + Sync;
+type MetadataSupplier = dyn Fn(&RequestParts) -> TraceMetadata + Send + Sync;
 
 /// Intercept the trace namespace before ordinary router lookup and middleware.
 pub struct TracePreDispatchHook {
@@ -117,7 +119,7 @@ impl TracePreDispatchHook {
 impl PreDispatchHook for TracePreDispatchHook {
     async fn handle(
         &self,
-        request: &mut Request<Body>,
+        request: &mut PreDispatchRequest,
     ) -> Result<Option<Response<Body>>, EdgeError> {
         self.handle_with_clock(request, Utc::now).await
     }
@@ -126,15 +128,15 @@ impl PreDispatchHook for TracePreDispatchHook {
 impl TracePreDispatchHook {
     async fn handle_with_clock(
         &self,
-        request: &mut Request<Body>,
+        request: &mut PreDispatchRequest,
         clock: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<Option<Response<Body>>, EdgeError> {
         // Resolve before origin preparation removes headers that may also be
         // configured as client-IP credentials. Retain only the authenticated IP.
         let forwarded_client_ip =
             authenticated_client_ip(request.headers(), self.settings.trusted_client_ip.as_ref());
-        prepare_trusted_forwarder(request, &self.settings);
-        let dispatch = match preflight(&self.settings, request) {
+        prepare_trusted_forwarder(request.parts_mut(), &self.settings);
+        let dispatch = match preflight(&self.settings, request.parts_mut()) {
             TracePreflight::NotTrace => {
                 let enabled = self
                     .settings
@@ -187,7 +189,7 @@ impl TracePreDispatchHook {
                         geo: None,
                     }
                 } else {
-                    let mut metadata = (self.metadata)(request);
+                    let mut metadata = (self.metadata)(request.parts());
                     if let Some(client_ip) = forwarded_client_ip {
                         if metadata.client_info.client_ip != Some(client_ip) {
                             // Runtime geolocation describes the forwarder when
@@ -246,6 +248,7 @@ fn unavailable_response() -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::TimeZone as _;
@@ -253,14 +256,59 @@ mod tests {
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
-    use http::{HeaderValue, Method, StatusCode, header};
+    use http::{HeaderValue, Method, Request, StatusCode, header};
     use serde_json::json;
 
     use crate::redacted::Redacted;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, run_pre_dispatch_hook};
     use crate::trace::TraceTerminalResponse;
 
     use super::*;
+
+    /// Runs the trace hook at a fixed clock and records the head it leaves.
+    ///
+    /// The router drops the request after a terminal response, so tests that
+    /// check sanitation on every outcome read the recorded head instead.
+    struct ObservedHook {
+        hook: TracePreDispatchHook,
+        clock: DateTime<Utc>,
+        headers: Arc<Mutex<Option<HeaderMap>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for ObservedHook {
+        async fn handle(
+            &self,
+            request: &mut PreDispatchRequest,
+        ) -> Result<Option<Response<Body>>, EdgeError> {
+            let clock = self.clock;
+            let outcome = self.hook.handle_with_clock(request, move || clock).await;
+            *self.headers.lock().expect("should lock the observed head") =
+                Some(request.headers().clone());
+            outcome
+        }
+    }
+
+    fn observed(
+        hook: TracePreDispatchHook,
+        clock: DateTime<Utc>,
+    ) -> (ObservedHook, Arc<Mutex<Option<HeaderMap>>>) {
+        let headers = Arc::new(Mutex::new(None));
+        let observed = ObservedHook {
+            hook,
+            clock,
+            headers: Arc::clone(&headers),
+        };
+        (observed, headers)
+    }
+
+    fn observed_headers(headers: &Mutex<Option<HeaderMap>>) -> HeaderMap {
+        headers
+            .lock()
+            .expect("should lock the observed head")
+            .take()
+            .expect("should observe the hook request")
+    }
 
     fn hook(enabled: bool, calls: Arc<AtomicUsize>) -> TracePreDispatchHook {
         let mut settings = create_test_settings();
@@ -351,15 +399,15 @@ mod tests {
                     asn: None,
                 }),
             });
-            let mut request = Request::builder()
+            let request = Request::builder()
                 .uri("/_ts/trace")
                 .header("x-example-client-ip", "198.51.100.7")
                 .header("x-ts-forwarder-auth", "fictional-client-secret-0123456789")
                 .body(Body::empty())
                 .expect("should build setup request");
-            let response = block_on(hook.handle(&mut request))
-                .expect("should dispatch trace")
-                .expect("should intercept setup");
+            let (hook, headers) = observed(hook, Utc::now());
+            let response =
+                block_on(run_pre_dispatch_hook(hook, request)).expect_err("should intercept setup");
             let bytes = response
                 .into_body()
                 .into_bytes()
@@ -375,7 +423,7 @@ mod tests {
                 "should retain geo only when it describes the authenticated reader"
             );
             assert!(
-                !request.headers().contains_key("x-ts-forwarder-auth"),
+                !observed_headers(&headers).contains_key("x-ts-forwarder-auth"),
                 "should still strip forwarding credentials"
             );
         }
@@ -384,14 +432,13 @@ mod tests {
     #[test]
     fn forwarding_credentials_are_removed_before_every_preflight_outcome() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let hook = hook(false, calls);
         for path in [
             "/_ts/trace/enable",
             "/_ts/trace/trace.js",
             "/publisher",
             "/_ts/trace/missing",
         ] {
-            let mut request = Request::builder()
+            let request = Request::builder()
                 .uri(path)
                 .header(
                     "x-ts-forwarder-auth",
@@ -399,10 +446,16 @@ mod tests {
                 )
                 .body(Body::empty())
                 .expect("should construct a preflight request");
-            let _response =
-                block_on(hook.handle(&mut request)).expect("should complete local preflight");
+            let (hook, headers) = observed(hook(false, Arc::clone(&calls)), Utc::now());
+            let outcome = block_on(run_pre_dispatch_hook(hook, request));
+            if let Ok(continued) = &outcome {
+                assert!(
+                    !continued.headers().contains_key("x-ts-forwarder-auth"),
+                    "should route the sanitized request"
+                );
+            }
             assert!(
-                !request.headers().contains_key("x-ts-forwarder-auth"),
+                !observed_headers(&headers).contains_key("x-ts-forwarder-auth"),
                 "should sanitize credentials before any preflight return"
             );
         }
@@ -411,7 +464,6 @@ mod tests {
     #[test]
     fn trace_shell_head_matches_get_status_with_unrepresentable_clock() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let hook = hook(true, Arc::clone(&calls));
         let clock = Utc
             .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
             .single()
@@ -420,14 +472,14 @@ mod tests {
         for method in [Method::GET, Method::HEAD] {
             calls.store(0, Ordering::SeqCst);
             let is_head = method == Method::HEAD;
-            let mut request = Request::builder()
+            let request = Request::builder()
                 .method(method)
                 .uri("/_ts/trace")
                 .body(Body::empty())
                 .expect("should construct a shell request");
-            let response = block_on(hook.handle_with_clock(&mut request, || clock))
-                .expect("should dispatch the trace shell")
-                .expect("should intercept the shell");
+            let (hook, _headers) = observed(hook(true, Arc::clone(&calls)), clock);
+            let response = block_on(run_pre_dispatch_hook(hook, request))
+                .expect_err("should intercept the shell");
             assert_eq!(
                 response.status(),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -456,7 +508,6 @@ mod tests {
     #[test]
     fn trace_dispatch_terminal_routes_only_project_get_shell_metadata() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let hook = hook(true, Arc::clone(&calls));
         for (method, path, status, projected) in [
             (Method::GET, "/_ts/trace", StatusCode::OK, 1),
             (Method::HEAD, "/_ts/trace", StatusCode::OK, 0),
@@ -476,14 +527,16 @@ mod tests {
         ] {
             calls.store(0, Ordering::SeqCst);
             let is_head = method == Method::HEAD;
-            let mut request = Request::builder()
+            let request = Request::builder()
                 .method(method)
                 .uri(path)
                 .body(Body::empty())
                 .expect("should build trace request");
-            let response = block_on(hook.handle(&mut request))
-                .expect("should return local policy response")
-                .expect("should intercept namespace before lookup");
+            let response = block_on(run_pre_dispatch_hook(
+                hook(true, Arc::clone(&calls)),
+                request,
+            ))
+            .expect_err("should intercept namespace before lookup");
             assert_eq!(
                 response.status(),
                 status,
@@ -523,13 +576,12 @@ mod tests {
     fn trace_dispatch_disabled_namespace_avoids_metadata() {
         let calls = Arc::new(AtomicUsize::new(0));
         let hook = hook(false, Arc::clone(&calls));
-        let mut request = Request::builder()
+        let request = Request::builder()
             .uri("/_ts/trace")
             .body(Body::empty())
             .expect("should build disabled request");
-        let response = block_on(hook.handle(&mut request))
-            .expect("should produce local response")
-            .expect("should reserve disabled namespace");
+        let response = block_on(run_pre_dispatch_hook(hook, request))
+            .expect_err("should reserve disabled namespace");
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -557,17 +609,13 @@ mod tests {
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let hook = hook(enabled, Arc::clone(&calls));
-            let mut request = Request::builder()
+            let request = Request::builder()
                 .uri("/article")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .expect("should build ordinary request");
-            assert!(
-                block_on(hook.handle(&mut request))
-                    .expect("should continue ordinary dispatch")
-                    .is_none(),
-                "should continue ordinary requests"
-            );
+            let mut request = block_on(run_pre_dispatch_hook(hook, request))
+                .expect("should continue ordinary requests");
             let gate = request.extensions().get::<TraceCaptureGate>().copied();
             assert_eq!(
                 gate.map(|gate| gate.base_active()),
@@ -674,6 +722,7 @@ mod tests {
             ),
         ] {
             let hook = hook(true, Arc::new(AtomicUsize::new(0)));
+            let settings = Arc::clone(&hook.settings);
             let mut request = Request::builder()
                 .uri(format!("https://publisher.example.com/article{query}"))
                 .header("accept", "text/html")
@@ -685,15 +734,14 @@ mod tests {
                     http::HeaderValue::from_str(cookie).expect("should parse example cookie"),
                 );
             }
-            let _ =
-                block_on(hook.handle(&mut request)).expect("should continue ordinary navigation");
+            let mut request = block_on(run_pre_dispatch_hook(hook, request))
+                .expect("should continue ordinary navigation");
             let gate = *request
                 .extensions()
                 .get::<TraceCaptureGate>()
                 .expect("should freeze incoming gate");
-            let _ =
-                crate::integrations::gpt_diagnostics::prepare_request(&hook.settings, &mut request)
-                    .expect("should preserve console preparation");
+            let _ = crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
+                .expect("should preserve console preparation");
             let decision = request
                 .extensions()
                 .get::<GptDiagnosticsRequestDecision>()

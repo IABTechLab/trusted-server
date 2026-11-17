@@ -78,7 +78,7 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `enable_protection`                    | boolean | `false`                          | Call the Protection API before route matching                           |
 | `server_side_key_secret_name`          | string  | none                             | Default-store secret reference required when protection is enabled      |
 | `protection_api_origin`                | string  | `https://api-fastly.datadome.co` | Protection API origin                                                   |
-| `timeout_ms`                           | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls             |
+| `timeout_ms`                           | integer | `1500`                           | Total timeout for each Protection API call                              |
 | `protection_excluded_methods`          | array   | `["OPTIONS"]`                    | HTTP methods skipped before the Protection API call                     |
 | `protection_excluded_asns`             | array   | `[]`                             | Client autonomous system numbers skipped before the Protection API call |
 | `protection_excluded_ip_cidrs`         | array   | `[]`                             | Inline client IP CIDR ranges skipped before the Protection API call     |

@@ -33,8 +33,5 @@ secret_store_id = "secrets"
 enabled = true
 trace_page_enabled = true
 
-[proxy]
-certificate_check = false
-
 [auction]
 enabled = false
