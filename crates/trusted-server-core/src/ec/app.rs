@@ -186,10 +186,13 @@ mod tests {
 
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_types::KvEntry;
     use crate::test_support::tests::create_test_settings;
 
     const MISSING_EC_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123";
+    const SEEDED_EC_ID: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.abc123";
 
     fn store_platform() -> IdentityPlatform {
         IdentityPlatform {
@@ -312,19 +315,27 @@ mod tests {
     }
 
     #[test]
-    fn partner_registry_is_built_once() {
-        let app = IdentityApp::build(
-            Arc::new(create_test_settings()),
-            IdentityPlatform::default(),
-        )
-        .expect("should build the identity app");
+    fn mounted_routes_share_the_supplied_store_across_requests() {
+        let graph = KvIdentityGraph::in_memory("ec_store");
+        let router = router_for(IdentityPlatform {
+            identity_graph: Some(graph.clone()),
+            rate_limiter: Some(Arc::new(NoRateLimit)),
+        });
+        graph
+            .create(
+                SEEDED_EC_ID,
+                &KvEntry::minimal("partner.example", "uid-1", 1_741_824_000),
+            )
+            .expect("should seed the supplied record store");
 
-        let first = Arc::clone(app.partners());
-        let second = Arc::clone(app.partners());
+        let statuses: Vec<_> = (0..2)
+            .map(|_| get(&router, &format!("/_ts/admin/ec/{SEEDED_EC_ID}")).status())
+            .collect();
 
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "should share one partner registry across requests"
+        assert_eq!(
+            statuses,
+            vec![StatusCode::OK, StatusCode::OK],
+            "should read the record written after mounting on every request, so no request builds its own store"
         );
     }
 }

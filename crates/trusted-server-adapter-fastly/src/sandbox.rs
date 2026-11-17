@@ -778,7 +778,7 @@ mod tests {
         let mut sandbox = Sandbox::default();
         sandbox
             .initialize(|| Ok::<_, &str>(test_retained()))
-            .expect("the first build should succeed");
+            .expect("should build the first request");
         let first = Arc::clone(
             &sandbox
                 .state()
@@ -791,7 +791,7 @@ mod tests {
             .initialize(|| -> Result<RetainedApp, &str> {
                 panic!("the second request must not rebuild a retained application")
             })
-            .expect("a retained application should be reused");
+            .expect("should reuse the retained application");
         let second = Arc::clone(
             &sandbox
                 .state()
@@ -802,22 +802,7 @@ mod tests {
 
         assert!(
             Arc::ptr_eq(&first, &second),
-            "should share one identity app across requests"
-        );
-        assert!(
-            Arc::ptr_eq(first.partners(), second.partners()),
-            "should share one partner registry across requests"
-        );
-        assert!(
-            std::ptr::eq(
-                first
-                    .identity_graph()
-                    .expect("should hold the EC record store"),
-                second
-                    .identity_graph()
-                    .expect("should hold the EC record store"),
-            ),
-            "should share one EC record store across requests"
+            "should share one identity app, and so one partner registry and record store, across requests"
         );
     }
 
