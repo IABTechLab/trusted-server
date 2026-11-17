@@ -1969,7 +1969,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "base16ct 1.0.0",
  "edgezero-core",
@@ -1983,7 +1983,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2023,7 +2023,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2050,7 +2050,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2082,7 +2082,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2109,7 +2109,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "chrono",
  "clap",
@@ -2134,7 +2134,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "adler2",
  "alloc-no-stdlib",
@@ -2178,7 +2178,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "edgezero-store-aws"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2216,7 +2216,7 @@ dependencies = [
 [[package]]
 name = "edgezero-store-celld"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-records.202611.2#121450b4f1ffa9ff64be9824a97e3c6526138505"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "async-trait",
  "base64",

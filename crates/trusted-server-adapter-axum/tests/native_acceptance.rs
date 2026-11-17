@@ -13,9 +13,18 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "geo-kv")]
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::blob_envelope::BlobEnvelope;
+#[cfg(feature = "geo-kv")]
+use edgezero_core::{
+    geo::kv::{Location, Range, Source, build},
+    key_value_store::KvHandle,
+};
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
+#[cfg(feature = "geo-kv")]
+use std::sync::Arc;
 use tempfile::TempDir;
 use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::config_payload::{
@@ -38,6 +47,64 @@ const PROXY_SECRET: &str = "native-proxy-secret-32-bytes-example";
 const EC_PASSPHRASE: &str = "native-ec-passphrase-32-bytes-example";
 const FORWARDER_AUTH_HEADER: &str = "x-ts-forwarder-auth";
 const FORWARDER_SECRET: &str = "native-forwarder-secret-32-bytes-example";
+
+#[cfg(feature = "geo-kv")]
+#[test]
+fn kv_geo_reaches_trusted_server_response() {
+    let fixture = Prepared::new("http://127.0.0.1:1");
+    // EdgeZero's local file name for the declared geo_index binding.
+    let path = fixture
+        .workspace
+        .path()
+        .join("kv-geo-index-e370db00ebd0decd.redb");
+    let store = KvHandle::new(Arc::new(
+        PersistentKvStore::new(path).expect("should open local Geo KV"),
+    ));
+    let range = Range {
+        start: u32::from(std::net::Ipv4Addr::new(192, 0, 2, 1)).into(),
+        end: u32::from(std::net::Ipv4Addr::new(192, 0, 2, 1)).into(),
+        location: Location::new("US", "CA").expect("should encode the fixture region"),
+    };
+    let (receipt, manifest, _) = futures::executor::block_on(build(
+        &store,
+        Source {
+            edition: "fixture".to_owned(),
+            files: vec![],
+        },
+        &[range],
+        &[],
+        16384,
+    ))
+    .expect("should publish the test index");
+    drop(store);
+    let hash: String = receipt
+        .manifest_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let pin = format!("{}@{hash}", manifest.generation);
+    let mut app = fixture.spawn_with_geo_inputs(true, None, Some(&pin));
+    app.ready();
+    let response = client(None)
+        .get(format!("{}/health", app.base_url()))
+        .header("forwarded", "for=192.0.2.1;proto=https")
+        .send()
+        .expect("should use the running native application");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-geo-country")
+            .expect("should expose Geo country"),
+        "US"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-geo-region")
+            .expect("should expose Geo region"),
+        "CA"
+    );
+}
 
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
 fn ec_response_cookie(response: &Response) -> Option<String> {
@@ -293,6 +360,15 @@ impl Prepared {
         trusted_proxy: bool,
         geo_profile: Option<&std::path::Path>,
     ) -> Running {
+        self.spawn_with_geo_inputs(trusted_proxy, geo_profile, None)
+    }
+
+    fn spawn_with_geo_inputs(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+        geo_pin: Option<&str>,
+    ) -> Running {
         let port = reserve_port()
             .local_addr()
             .expect("should read reserved port")
@@ -361,6 +437,15 @@ impl Prepared {
         }
         if let Some(profile) = geo_profile {
             command.env("TS_NATIVE_GEO_PROFILE_FILE", profile);
+        }
+        if let Some(pin) = geo_pin {
+            command
+                .env("EDGEZERO__ADAPTER__GEO__PROVIDER", "kv")
+                .env("EDGEZERO__ADAPTER__GEO__STORE_ID", "geo_index")
+                .env("EDGEZERO__ADAPTER__GEO__READER_IP", "forwarded-required")
+                .env("EDGEZERO__ADAPTER__GEO__LOOKUP_TIMEOUT_MS", "1000")
+                .env("EDGEZERO__ADAPTER__GEO__MAX_IN_FLIGHT", "4")
+                .env("EDGEZERO__ADAPTER__GEO__PIN", pin);
         }
         Running {
             child: command

@@ -24,6 +24,7 @@ aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 aws-dynamodb-ec = ["edgezero-adapter-axum/aws-dynamodb-records"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
 celld-ec = ["edgezero-adapter-axum/celld-records"]
 
 [dependencies]
@@ -42,6 +43,7 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+edgezero-core = { workspace = true, features = ["geo-kv-build"] }
 edgezero-store-celld = { workspace = true, features = ["records"] }
 # SDK use is fixture administration only. Production persistence is EdgeZero-owned.
 aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
@@ -53,6 +55,6 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
-edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-records.202611.2", default-features = false, features = ["dynamodb-records"] }
+edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-axum.202611.3", default-features = false, features = ["dynamodb-records"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

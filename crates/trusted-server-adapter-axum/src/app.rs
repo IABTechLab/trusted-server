@@ -799,7 +799,20 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: crate::record_ec::metadata(),
+            kv: match (
+                crate::record_ec::metadata(),
+                crate::native_geo::kv_selected(),
+            ) {
+                (Some(records), true) => Some(StoreMetadata {
+                    default: records.default,
+                    ids: &[crate::record_ec::STORE_ID, crate::native_geo::GEO_STORE_ID],
+                }),
+                (None, true) => Some(StoreMetadata {
+                    default: crate::native_geo::GEO_STORE_ID,
+                    ids: &[crate::native_geo::GEO_STORE_ID],
+                }),
+                (records, false) => records,
+            },
         }
     }
 
