@@ -79,7 +79,7 @@ jobs:
             -jar DynamoDBLocal.jar -inMemory -sharedDb
           port=$(docker port "$DYNAMODB_CONTAINER" 8000/tcp | awk -F: '{ print $NF }')
           test -n "$port"
-          echo "DYNAMODB_ENDPOINT=http://127.0.0.1:$port" >> "$GITHUB_ENV"
+          echo "DYNAMODB_ENDPOINT=http://127.0.0.1:${port}" >> "$GITHUB_ENV"
       - name: Check record acknowledgement, withdrawal, faults and drain
         env:
           REVISION: ${{ github.sha }}
