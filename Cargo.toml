@@ -106,7 +106,7 @@ serde_yaml_ng = "0.10"
 sha2 = "0.11"
 similar = "2.7"
 simple_logger = "5"
-spin-sdk = { version = "=7.0.0", git = "https://github.com/stackpop/spin-rust-sdk.git", rev = "6c59ed5b4fcb377072763aee0b27a3abdd8edb72", default-features = false, features = ["http", "key-value", "variables"] }
+spin-sdk = { version = "=8.0.0", default-features = false, features = ["http", "key-value", "variables"] }
 subtle = "2.6"
 temp-env = "0.3.6"
 tempfile = "3.24"
