@@ -31,13 +31,16 @@ use super::registry::PartnerRegistry;
 
 /// Platform services an adapter supplies to the [`IdentityApp`].
 ///
-/// Each field is optional: an adapter without an EC record store or a rate
-/// limiter leaves it `None`, and the app answers or skips accordingly.
+/// An adapter without an EC record store leaves both fields `None`, and the
+/// app answers locally. An adapter that supplies a record store must also
+/// supply a rate limiter, so store-backed sync endpoints are never unlimited
+/// by omission.
 #[derive(Default)]
 pub struct IdentityPlatform {
     /// EC record store backing the identity graph, when the adapter has one.
     pub identity_graph: Option<KvIdentityGraph>,
-    /// Rate limiter for sync endpoints. `None` applies no limit.
+    /// Rate limiter for sync endpoints. `None` applies no limit and is only
+    /// accepted when `identity_graph` is also `None`.
     pub rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
@@ -62,15 +65,24 @@ impl IdentityApp {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when the partner
-    /// configuration cannot build a [`PartnerRegistry`].
+    /// configuration cannot build a [`PartnerRegistry`], or when the platform
+    /// supplies a record store without a rate limiter.
     pub fn build(
         settings: Arc<Settings>,
         platform: IdentityPlatform,
     ) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        let rate_limiter = match (&platform.identity_graph, platform.rate_limiter) {
+            (Some(_), None) => {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message:
+                        "identity app needs a rate limiter when an EC record store is supplied"
+                            .to_string(),
+                }));
+            }
+            (_, Some(rate_limiter)) => rate_limiter,
+            (None, None) => Arc::new(NoRateLimit) as Arc<dyn RateLimiter>,
+        };
         let partners = Arc::new(PartnerRegistry::from_config(&settings.ec.partners)?);
-        let rate_limiter = platform
-            .rate_limiter
-            .unwrap_or_else(|| Arc::new(NoRateLimit));
         Ok(Arc::new(Self {
             settings,
             partners,
@@ -179,6 +191,13 @@ mod tests {
     const MISSING_EC_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123";
 
+    fn store_platform() -> IdentityPlatform {
+        IdentityPlatform {
+            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
+            rate_limiter: Some(Arc::new(NoRateLimit)),
+        }
+    }
+
     fn router_for(platform: IdentityPlatform) -> RouterService {
         let app = IdentityApp::build(Arc::new(create_test_settings()), platform)
             .expect("should build the identity app");
@@ -196,10 +215,7 @@ mod tests {
 
     #[test]
     fn mounted_admin_ec_lookup_reads_the_record_store() {
-        let router = router_for(IdentityPlatform {
-            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
-            rate_limiter: None,
-        });
+        let router = router_for(store_platform());
 
         let response = get(&router, &format!("/_ts/admin/ec/{MISSING_EC_ID}"));
 
@@ -263,17 +279,35 @@ mod tests {
     #[test]
     fn build_keeps_the_supplied_record_store() {
         let settings = Arc::new(create_test_settings());
-        let platform = IdentityPlatform {
-            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
-            rate_limiter: None,
-        };
-
-        let app = IdentityApp::build(settings, platform).expect("should build the identity app");
+        let app =
+            IdentityApp::build(settings, store_platform()).expect("should build the identity app");
 
         assert_eq!(
             app.identity_graph().map(KvIdentityGraph::store_name),
             Some("ec_store"),
             "should keep the supplied record store"
+        );
+    }
+
+    #[test]
+    fn build_refuses_a_record_store_without_a_rate_limiter() {
+        let settings = Arc::new(create_test_settings());
+        let platform = IdentityPlatform {
+            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
+            rate_limiter: None,
+        };
+
+        let result = IdentityApp::build(settings, platform);
+
+        let Err(report) = result else {
+            panic!("should refuse a record store without a rate limiter");
+        };
+        assert!(
+            matches!(
+                report.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should report a configuration error"
         );
     }
 
