@@ -13,6 +13,7 @@
 //!
 //! # Module structure
 //!
+//! - [`app`] — Identity app built once and shared by every adapter
 //! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
@@ -32,6 +33,7 @@
 mod auth;
 
 pub mod admin;
+pub mod app;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;

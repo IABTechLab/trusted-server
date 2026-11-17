@@ -46,3 +46,16 @@ pub trait RateLimiter: Send + Sync {
         self.exceeded(key, per_minute_limit.saturating_mul(60))
     }
 }
+
+/// Rate limiter that never refuses a request.
+///
+/// Used when an adapter supplies no limiter, such as the Axum dev server,
+/// whose deployer limits traffic at the load balancer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoRateLimit;
+
+impl RateLimiter for NoRateLimit {
+    fn exceeded(&self, _key: &str, _hourly_limit: u32) -> Result<bool, Report<TrustedServerError>> {
+        Ok(false)
+    }
+}
