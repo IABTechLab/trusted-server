@@ -182,6 +182,77 @@ pub(crate) mod test_support {
 
     use super::*;
 
+    /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
+    /// store that becomes unwritable mid-request.
+    pub(crate) struct WriteFailingEcKv {
+        inner: InMemoryEcKv,
+    }
+
+    impl WriteFailingEcKv {
+        pub(crate) fn new() -> Self {
+            Self {
+                inner: InMemoryEcKv::new("write-failing-store"),
+            }
+        }
+
+        /// Stores a row directly, bypassing the failing write path.
+        pub(crate) async fn seed(&self, key: &str, body: &str, metadata: &str) {
+            self.inner
+                .insert(
+                    key,
+                    EcKvWrite {
+                        body,
+                        metadata,
+                        ttl: Duration::from_secs(60),
+                        mode: EcKvWriteMode::Overwrite,
+                    },
+                )
+                .await
+                .expect("should seed the in-memory store");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for WriteFailingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
+        }
+
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
+            &self,
+            _key: &str,
+            _write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: self.inner.store_name().to_owned(),
+                message: "write failing test store".to_owned(),
+            }))
+        }
+
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
+
     /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
     /// so tests can prove exactly how many reads a flow performs.
     pub(crate) struct CountingEcKv {
