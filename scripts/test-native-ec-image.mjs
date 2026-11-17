@@ -791,13 +791,24 @@ try {
   record(
     'US TN GPC withdrawal expires cookie, persists a fresh-generation tombstone and resists AU reuse'
   )
-  // Native TTL eligibility does not promise physical deletion. Keep a real
-  // past-TTL row present, hold an EID CAS, then withdraw before releasing it.
-  // Neither local expiry filtering nor the delayed CAS may bypass withdrawal.
+  // Native TTL eligibility does not promise physical deletion. Hold Local's
+  // collector so this case owns its required physically present past-TTL row.
+  // Then hold an EID CAS and withdraw before releasing it. This does not test
+  // native TTL collection; restore the collector after the race assertions.
   const raceCreated = await document(app)
   assert.equal(minted(raceCreated).length, 1)
   const raceEc = minted(raceCreated)[0]
   const raceItem = await get(raceEc)
+  await ddb('UpdateTimeToLive', {
+    TableName: table,
+    TimeToLiveSpecification: { AttributeName: 'ttl_epoch_s', Enabled: false },
+  })
+  assert.equal(
+    (await ddb('DescribeTimeToLive', { TableName: table }))
+      .TimeToLiveDescription.TimeToLiveStatus,
+    'DISABLED',
+    'Local TTL collection must be held while a physical expired row is required'
+  )
   const raceExpiry = Math.floor(Date.now() / 1000) - 1
   raceItem.ttl_epoch_s = { N: String(raceExpiry) }
   await ddb('PutItem', { TableName: table, Item: raceItem })
@@ -832,6 +843,7 @@ try {
   )
   proof.expiryWithdrawalRace = {
     ec: raceEc,
+    localTtlSweepHeld: true,
     ttlEpochSeconds: raceExpiry,
     expectedGeneration: pausedCas.expectedGeneration,
   }
@@ -871,6 +883,16 @@ try {
     'delayed CAS must not restore partner IDs after withdrawal'
   )
   assert.equal(minted(racedUpdate.value).length, 0)
+  await ddb('UpdateTimeToLive', {
+    TableName: table,
+    TimeToLiveSpecification: { AttributeName: 'ttl_epoch_s', Enabled: true },
+  })
+  assert.equal(
+    (await ddb('DescribeTimeToLive', { TableName: table }))
+      .TimeToLiveDescription.TimeToLiveStatus,
+    'ENABLED',
+    'Local TTL collection must resume after the physical-expiry race'
+  )
   record(
     'present past-TTL row plus delayed EID CAS cannot bypass US TN withdrawal or restore partner IDs'
   )
