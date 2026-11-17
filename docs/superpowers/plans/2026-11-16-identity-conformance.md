@@ -100,7 +100,7 @@ Expected: selected Fastly scenarios execute and pass. Full acceptance is still p
 - [x] Document the exact invocation, required artifacts, supported adapter list and outstanding issue dependencies. Early suite delivery selects Fastly explicitly; this is not an assertion that Axum is supported.
 - [ ] Include the runtime commands added in Task 5 in the runtime workflow only when they execute the advertised scenarios. An ignored test must have an explicit invocation with failures propagated.
 - [x] Verify deliberately selecting an unavailable Axum lifecycle runner fails with an actionable message. CI must not convert it to a pass or silently omit it from a claimed MVP matrix.
-- [ ] Run the available conformance targets and required checks before a suite-only handoff. Report remaining #1586 criteria without closing the issue.
+- [x] Run the available conformance targets and required checks before a suite-only handoff. Report remaining #1586 criteria without closing the issue.
 
 Suite launcher command:
 
@@ -162,10 +162,17 @@ Validate Markdown formatting and relative links for the two planning documents. 
 ## Suite delivery progress
 
 Tasks 1–3 and Task 4's selector, CI and documentation wiring are implemented.
-The shared suite currently executes nine Fastly scenarios. Eight native tests
-check the assertion/store contract, including rejected tombstones, late writes,
-late failures and expired returning cookies; a portable store test also executes
-under WASM. Five launcher tests reject unavailable adapters and vacuous success.
+The shared suite currently executes nine Fastly scenarios through the
+production native request read and `prepare`. Nine native tests check the
+assertion/store contract: eight rejection controls, covering rejected
+tombstones, late writes, late failures, expired returning cookies and a write
+attempted by a refused scenario, plus a conditional-write store test that also
+executes under WASM. Five launcher tests reject unavailable adapters and vacuous
+success.
+
+Removing the device-signals insertion from production `prepare` made the Fastly
+suite fail at "should issue exactly one EC cookie"; it passed again after
+restoration.
 
 An isolated copy passed conformance, failed at the missing-cookie assertion when
 the shared production finalization callback was disconnected, and passed again

@@ -1,6 +1,6 @@
 # Identity conformance across adapters
 
-Status: approved for suite implementation on 2026-11-16. Tasks 1–4 are in progress; later integration and production qualification remain outstanding.
+Status: approved for suite implementation on 2026-11-16. Tasks 1–4 are implemented for suite delivery; later integration and production qualification remain outstanding.
 
 Issue: [#1586](https://github.com/IABTechLab/trusted-server/issues/1586) (T5).
 Implementation plan: [identity conformance](../plans/2026-11-16-identity-conformance.md).
@@ -67,7 +67,7 @@ Use existing EC clients, minimal origins, process cleanup helpers and settings c
 
 C1/C2/C5 use an explicitly GDPR-regulated location and consent encoded in the request representation consumed by the real parser, never a hand-built `ConsentContext`. Verify both denied and missing consent variants in C5. Absence of consent in a non-regulated jurisdiction currently permits creation; preserve that policy and its existing tests.
 
-C3 checks raw response headers and a replaying cookie jar: an omitted response cookie is acceptable; deletion, rotation or replacement is not. Check both unknown-geo forms. C2 and C5 cannot pass by taking the non-browser fallback: they inherit C1's successful ingress setup and assert the relevant gate or failed operation was reached.
+C3 checks raw response headers and a replaying cookie jar: an omitted response cookie is acceptable; deletion, rotation or replacement is not. Check both unknown-geo forms. C2 and C5 cannot pass by taking the non-browser fallback: they inherit C1's successful ingress setup and change one input. C2 asserts the rejected creation write occurred; C5 asserts creation was refused before any write was attempted.
 
 Identity startup validation must distinguish identity enablement from ordinary EC cryptographic settings used by consent-only adapters. Reuse the configuration contract delivered by the shared-app/store work; do not invent a second enablement key in T5. A disabled identity startup control must succeed with otherwise valid settings.
 

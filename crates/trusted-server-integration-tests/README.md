@@ -62,12 +62,16 @@ they do not claim Axum identity support.
 The Fastly application test executes nine isolated scenarios: fresh creation,
 rejected writes, missing and failed geo, denied and absent GDPR consent,
 subresources, returning readers, and the current missing-browser-metadata gate.
-It uses the real request conversion, router, shared production finalization
-callback composition and consumed HTML response. Platform metadata, record
-storage and the publisher origin are controlled test fixtures. Successful
+It uses the production native request read and `prepare`, the real request
+conversion, router, shared production finalization callback composition and
+consumed HTML response. The client IP, geo result, browser device signals,
+record storage and publisher origin are controlled test fixtures. Successful
 issuance requires the matching record before response release; failed writes
-must be observed before release. Returning scenarios apply cookie expiry rules
-and replay the resulting identity. The missing-metadata expectation describes
+must be observed before release. Refused scenarios must stop before any write
+is attempted. Returning scenarios apply cookie expiry rules and replay the
+resulting identity. Fastly's production geo lookup reports a failure as missing
+geo, so the failed-geo scenario uses a test-only failing lookup to check the
+shared contract that other platforms' error results must also preserve. The missing-metadata expectation describes
 the current pre-T12 policy and must change when #1592 permits absent JA4.
 
 The suite ends when the finalized response is delivered. Post-delivery work

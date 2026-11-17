@@ -21,9 +21,12 @@ use trusted_server_core::test_support::scripted_client::{
 use edgezero_core::outbound::HttpClient;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{FinalizeInputs, assemble_app, handle_delivery, with_finalization};
+use super::{
+    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, with_finalization,
+};
 use crate::platform::RequestGeo;
 use crate::sandbox::SandboxCounters;
+use crate::tinybird::TelemetryQueue;
 use fastly::Request as FastlyRequest;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::geo::GeoInfo;
@@ -169,7 +172,7 @@ impl Adapter for FastlyAdapter {
         if let Some(identity) = &navigation.ec_cookie {
             cookies.push(format!("ts-ec={identity}"));
         }
-        let request = FastlyRequest::get("https://publisher.example.com/article")
+        let mut request = FastlyRequest::get("https://publisher.example.com/article")
             .with_header("sec-fetch-dest", navigation.destination)
             .with_header(
                 "accept",
@@ -181,30 +184,36 @@ impl Adapter for FastlyAdapter {
             )
             .with_header("user-agent", USER_AGENT)
             .with_header("cookie", cookies.join("; "));
+        // Production's native read and `prepare` run unchanged. The fixture
+        // replaces only the values Viceroy cannot supply: a routable client IP,
+        // its geo result and, for browser scenarios, JA4-backed device signals.
+        let mut values = ClientRequestValues::read(&mut request, &self.settings, false);
+        let ip = Some("192.0.2.7".parse().expect("should parse fixture IP"));
+        values.client_info = ClientInfo {
+            client_ip: ip,
+            ..ClientInfo::default()
+        };
+        values.request_geo = if navigation.geo == Geo::Failed {
+            RequestGeo::failing(ip)
+        } else {
+            RequestGeo::new(ip, geo.clone())
+        };
+        if navigation.browser {
+            values.device_signals = Some(DeviceSignals::derive(
+                USER_AGENT,
+                Some("t13d1516h2_example_example"),
+                None,
+            ));
+        }
+        let queue = TelemetryQueue::default();
         let mut observation = None;
         let origin = self.origin.clone();
         let delivery = with_finalization(&inputs, |finalize| {
             FastlyService::new(&self.retained.app).run_request_with_hooks_for_test(
                 request,
                 |_request, extensions| {
+                    values.prepare(extensions, &self.settings, &queue);
                     extensions.insert(HttpClient::with_client(origin));
-                    let ip = Some("192.0.2.7".parse().expect("should parse fixture IP"));
-                    extensions.insert(ClientInfo {
-                        client_ip: ip,
-                        ..ClientInfo::default()
-                    });
-                    extensions.insert(if navigation.geo == Geo::Failed {
-                        RequestGeo::failing(ip)
-                    } else {
-                        RequestGeo::new(ip, geo.clone())
-                    });
-                    if navigation.browser {
-                        extensions.insert(DeviceSignals::derive(
-                            USER_AGENT,
-                            Some("t13d1516h2_example_example"),
-                            None,
-                        ));
-                    }
                 },
                 finalize,
                 |envelope| {

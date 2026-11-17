@@ -288,6 +288,18 @@ impl Scenario {
                         .is_empty(),
                     "should not persist an identity"
                 );
+                if self != Self::WriteFailure {
+                    // These scenarios share Fresh's successful setup and change
+                    // one input, so its gate must refuse before any write; a
+                    // creation attempt that merely failed would not satisfy it.
+                    assert!(
+                        !store
+                            .events()
+                            .iter()
+                            .any(|event| matches!(event, Event::Persisted(_) | Event::Rejected(_))),
+                        "should refuse creation before attempting a write"
+                    );
+                }
                 if self == Self::WriteFailure {
                     let events = store.events();
                     let rejected = events
@@ -619,6 +631,13 @@ mod tests {
     fn identity_conformance_rejects_late_failure() {
         let store = RecordingStore::new(true);
         Scenario::WriteFailure.verify(&mut LateRejectionAdapter(store.clone()), &store);
+    }
+
+    #[test]
+    #[should_panic(expected = "should refuse creation before attempting a write")]
+    fn identity_conformance_rejects_denied_consent_write_attempt() {
+        let store = RecordingStore::new(true);
+        Scenario::DeniedConsent.verify(&mut LateRejectionAdapter(store.clone()), &store);
     }
 }
 
