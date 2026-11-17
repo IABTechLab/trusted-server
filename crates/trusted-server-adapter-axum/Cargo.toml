@@ -23,6 +23,7 @@ default = []
 aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
 
 [dependencies]
 async-trait = { workspace = true }

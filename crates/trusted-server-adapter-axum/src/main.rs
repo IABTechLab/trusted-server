@@ -77,11 +77,16 @@ fn native_options() -> Result<AxumRunOptions, Report<NativeHostingError>> {
     // The SDK guarantees redacted setting diagnostics. Retain that message,
     // not the SDK source-error graph or environment values.
     let options = AxumRunOptions::from_env()
-        .map_err(|error| Report::new(NativeHostingError::Environment(error.to_string())))?
-        .with_geo(selection);
-    options.geo_capability().map_err(|error| {
-        Report::new(error).change_context(NativeHostingError::GeoCapability(error))
-    })?;
+        .map_err(|error| Report::new(NativeHostingError::Environment(error.to_string())))?;
+    let options = match selection {
+        Some(selection) => options.with_geo(selection),
+        None => options,
+    };
+    options
+        .geo_capability_for::<TrustedServerApp>()
+        .map_err(|error| {
+            Report::new(error).change_context(NativeHostingError::GeoCapability(error))
+        })?;
     Ok(options)
 }
 

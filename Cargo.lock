@@ -1942,7 +1942,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "base16ct 1.0.0",
  "edgezero-core",
@@ -1956,7 +1956,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1996,7 +1996,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2006,6 +2006,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "fern",
  "flate2",
  "futures",
  "futures-util",
@@ -2022,7 +2023,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2054,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2063,13 +2064,14 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "fern",
  "futures",
  "futures-util",
  "log",
  "rusqlite",
  "serde",
  "serde_json",
- "spin-sdk",
+ "spin-sdk 8.0.0",
  "subtle",
  "thiserror 2.0.18",
  "toml",
@@ -2080,7 +2082,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "chrono",
  "clap",
@@ -2105,7 +2107,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "adler2",
  "alloc-no-stdlib",
@@ -2149,7 +2151,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2164,7 +2166,7 @@ dependencies = [
 [[package]]
 name = "edgezero-store-aws"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2185,10 +2187,20 @@ dependencies = [
 [[package]]
 name = "edgezero-store-celld"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.3#63c0a5a4755c686f5d2ab4de294ef00bbee8cabc"
 dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "edgezero-core",
+ "futures-util",
+ "getrandom 0.4.2",
+ "reqwest 0.13.4",
  "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.18",
+ "tokio",
  "url",
 ]
 
@@ -6425,6 +6437,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin-macro"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45fefea15ed93ab2b6830a0249ce7cae2300202f569e013e12d39f3fba519ecc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "spin-sdk"
 version = "7.0.0"
 source = "git+https://github.com/stackpop/spin-rust-sdk.git?rev=6c59ed5b4fcb377072763aee0b27a3abdd8edb72#6c59ed5b4fcb377072763aee0b27a3abdd8edb72"
@@ -6435,7 +6458,24 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "spin-macro",
+ "spin-macro 7.0.0",
+ "thiserror 2.0.18",
+ "wasip3 0.10.0+wasi-0.3.2",
+]
+
+[[package]]
+name = "spin-sdk"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df1f876031b7906a9e802a8bbadf599a423f49adacde532535c6270dc4f11a1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "spin-macro 8.0.0",
  "thiserror 2.0.18",
  "wasip3 0.10.0+wasi-0.3.2",
 ]
@@ -7124,7 +7164,7 @@ dependencies = [
  "error-stack",
  "futures",
  "log",
- "spin-sdk",
+ "spin-sdk 7.0.0",
  "tokio",
  "trusted-server-core",
  "web-time",

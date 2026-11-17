@@ -582,7 +582,10 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: None,
+            kv: crate::native_geo::kv_selected().then_some(StoreMetadata {
+                default: crate::native_geo::GEO_STORE_ID,
+                ids: &[crate::native_geo::GEO_STORE_ID],
+            }),
         }
     }
 
