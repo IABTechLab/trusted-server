@@ -1,7 +1,8 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14 and 2026-11-16
+2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14, 2026-11-16 and
+2026-11-17
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -25,8 +26,17 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `3d92ee38` (`3d92ee38d6150ea8ba7567f47f8cbbaf7c2a98b3`), the
-`rc/identity` commit on 2026-11-16 (IABTechLab/edgezero#495). It merges the
+The cut now pins `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`), the
+`rc/identity` commit on 2026-11-17 (IABTechLab/edgezero#495). It merges the
+same stack refreshed to PR 275's head `ea2549fb`, 16 fix and docs commits after
+`b65e7144` inside EdgeZero (Fastly response handles and progress wakers,
+retained outbound failures, body checkpoints, harness supervision and CLI
+target pinning), and #422's stock-celld store service. None of the files this
+spec cites at `3d92ee38` changes, and the Trusted Server build needs no code
+change.
+
+The previous pin, `3d92ee38` (`3d92ee38d6150ea8ba7567f47f8cbbaf7c2a98b3`), was
+the `rc/identity` commit on 2026-11-16. It merges the
 PRs stacked on PR 275 (EdgeZero 499, 460, 406, 407, 409, 414, 422 and 439),
 refreshed to PR 275's head `b65e7144`, four commits after `e9ffaa8f`:
 
@@ -101,9 +111,10 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452`, `5c32ae61` and `10166628` are earlier pins of the cut, `3d92ee38`
-is the cut's pin (of the files cited at `5c32ae61`, only `lifecycle.rs`
-differs there), and `v0.0.11` is the base's pin. Dates are US Pacific time
+`737f8452`, `5c32ae61`, `10166628` and `3d92ee38` are earlier pins of the
+cut, `f84ffbbb` is the cut's pin (of the files cited at `5c32ae61`, only
+`lifecycle.rs` differs there, and every file cited at `3d92ee38` is
+unchanged), and `v0.0.11` is the base's pin. Dates are US Pacific time
 (UTC-8). In UTC, `5c32ae61`, PR 275's head late on 2026-11-13, is dated
 2026-11-14.
 
@@ -232,7 +243,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `3d92ee38` at the 2026-11-16 repin. The cut repins
+which carries PR 275's head: `f84ffbbb` at the 2026-11-17 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
@@ -3241,3 +3252,11 @@ change are D5, D7, D13, D18, and D20.
   - `5794ff016`, `9631b6f07` and `18ab253ec` brought the pin, section 9,
     Fastly differences item 28, Failure handling, the asks, Follow-ups, the
     Fastly and API guides, and the CHANGELOG in line.
+- **Repin to `f84ffbbb` (2026-11-17).** At the maintainer's request, PR
+  275's head `ea2549fb` was merged bottom-up through EdgeZero 499, 460, 406,
+  407, 409, 414, 422 and 439 again, with no conflicts, after #422 added a
+  stock-celld store service that #439 merged. Each layer passed EdgeZero's
+  fmt, check, clippy and workspace tests (2,787 tests at 499, 2,997 at 439),
+  and `rc/identity` took 439's head as a plain merge, `f84ffbbb` (3,014
+  tests). The repin changes only EdgeZero's source lines in `Cargo.lock`; no
+  Trusted Server code changes.
