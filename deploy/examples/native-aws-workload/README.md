@@ -73,7 +73,7 @@ Scope writes to installation resource ARNs, DNS names, prefixes and supported ta
 
 The workload creates separate task and execution roles with the policies in `iam.tf`. The operator does not need application-secret values merely to apply ARN/version references. Secret seeding, browser credential retrieval, certificates, state infrastructure and permission-boundary ownership can remain with separate owners. Existing SCP, boundary, resource and endpoint-policy denies still apply.
 
-See [S3 backend permissions](https://developer.hashicorp.com/terraform/language/backend/s3#s3-bucket-permissions) and [IAM PassRole](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html).
+For details, consult HashiCorp's S3 backend permissions documentation and AWS's IAM PassRole documentation.
 
 ## Ordered configuration handoff
 
