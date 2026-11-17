@@ -35,7 +35,7 @@ mod celld_fixture;
 
 #[cfg(feature = "celld-ec")]
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires CELLD_EC_TEST_BINARY pointing to the built real conditional-record server"]
+#[ignore = "requires official CELLD_EC_TEST_BINARY and matching EDGEZERO_CELLD_STORE_SERVICE"]
 async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallback() {
     let mut celld = celld_fixture::CelldFixture::new();
     let store = celld.store().await;
