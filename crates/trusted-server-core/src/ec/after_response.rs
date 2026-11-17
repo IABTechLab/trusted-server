@@ -66,8 +66,7 @@ pub fn after_response_lookups_allowed(
 /// At most one KV read, skipped when no lookup can change the row, and at
 /// most one conditional KV write. Runs after the response has been sent, so
 /// it adds no page latency.
-#[must_use]
-pub fn commit_after_response_lookups(
+pub async fn commit_after_response_lookups(
     graph: &KvIdentityGraph,
     permit: AfterResponseWrite,
     registry: &PartnerRegistry,
@@ -84,7 +83,7 @@ pub fn commit_after_response_lookups(
     if !can_change {
         return AfterResponseOutcome::Unchanged;
     }
-    let snapshot = &graph.load_snapshot(ec_id);
+    let snapshot = &graph.load_snapshot(ec_id).await;
     if !matches!(snapshot, EcKvSnapshot::Present { .. }) {
         log::info!(
             "After-response lookups: no row for '{}', skipping write",
@@ -115,7 +114,10 @@ pub fn commit_after_response_lookups(
         );
         return AfterResponseOutcome::NoRow;
     };
-    match graph.commit_after_response(permit, ec_id, &entry, expected) {
+    match graph
+        .commit_after_response(permit, ec_id, &entry, expected)
+        .await
+    {
         Ok(()) => AfterResponseOutcome::Written,
         Err(report) => {
             log::warn!(
@@ -197,22 +199,23 @@ mod tests {
         )
     }
 
-    fn stored_uid(graph: &KvIdentityGraph, source: &str) -> Option<String> {
+    async fn stored_uid(graph: &KvIdentityGraph, source: &str) -> Option<String> {
         graph
             .load_snapshot(EC_ID)
+            .await
             .entry_for(EC_ID)
             .and_then(|entry| entry.ids.get(source).map(|record| record.uid.clone()))
     }
 
-    #[test]
-    fn writes_after_response_results_to_an_existing_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_after_response_results_to_an_existing_row() {
         let graph = KvIdentityGraph::in_memory("after-response");
         let mut entry = live_entry();
         entry.ids.insert(
             "browser.example.com".to_owned(),
             KvPartnerId::single("b-1".to_owned()),
         );
-        graph.create(EC_ID, &entry).expect("should seed row");
+        graph.create(EC_ID, &entry).await.expect("should seed row");
 
         let outcome = commit_after_response_lookups(
             &graph,
@@ -220,7 +223,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -228,28 +232,32 @@ mod tests {
             "should write the row"
         );
         assert_eq!(
-            stored_uid(&graph, "ids.example.com").as_deref(),
+            stored_uid(&graph, "ids.example.com").await.as_deref(),
             Some("p-1"),
             "should store the provider UID"
         );
         assert_eq!(
-            stored_uid(&graph, "browser.example.com").as_deref(),
+            stored_uid(&graph, "browser.example.com").await.as_deref(),
             Some("b-1"),
             "should keep the browser UID written by the page load"
         );
     }
 
-    #[test]
-    fn writes_against_the_row_as_read_just_before_the_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_against_the_row_as_read_just_before_the_write() {
         // Arrange
         let graph = KvIdentityGraph::in_memory("after-response-reread");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
-        let read_before_dispatch = graph.load_snapshot(EC_ID);
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
+        let read_before_dispatch = graph.load_snapshot(EC_ID).await;
         graph
             .upsert_partner_id(EC_ID, "browser.example.com", "b-2")
+            .await
             .expect("should rewrite the row as another request would");
         assert_ne!(
-            graph.load_snapshot(EC_ID),
+            graph.load_snapshot(EC_ID).await,
             read_before_dispatch,
             "should change the row after the dispatch read"
         );
@@ -261,7 +269,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         // Assert
         assert_eq!(
@@ -270,35 +279,41 @@ mod tests {
             "should not conflict with a write made while the lookups ran"
         );
         assert_eq!(
-            stored_uid(&graph, "browser.example.com").as_deref(),
+            stored_uid(&graph, "browser.example.com").await.as_deref(),
             Some("b-2"),
             "should keep the other request's write"
         );
         assert_eq!(
-            stored_uid(&graph, "ids.example.com").as_deref(),
+            stored_uid(&graph, "ids.example.com").await.as_deref(),
             Some("p-1"),
             "should store the provider UID"
         );
     }
 
-    #[test]
-    fn follow_up_write_conflicts_when_the_row_changed_after_its_read() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn follow_up_write_conflicts_when_the_row_changed_after_its_read() {
         // Arrange
         let graph = KvIdentityGraph::in_memory("after-response-conflict");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
-        let read = graph.load_snapshot(EC_ID);
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
+        let read = graph.load_snapshot(EC_ID).await;
         let expected = Generation::of(&read, EC_ID).expect("should read a generation");
         graph
             .upsert_partner_id(EC_ID, "browser.example.com", "b-2")
+            .await
             .expect("should rewrite the row as another request would");
 
         // Act
-        let result = graph.commit_after_response(
-            AfterResponseWrite::for_test(),
-            EC_ID,
-            &live_entry(),
-            expected,
-        );
+        let result = graph
+            .commit_after_response(
+                AfterResponseWrite::for_test(),
+                EC_ID,
+                &live_entry(),
+                expected,
+            )
+            .await;
 
         // Assert
         let report = result.expect_err("should refuse a stale generation");
@@ -307,55 +322,62 @@ mod tests {
             "should report a conflict"
         );
         assert_eq!(
-            stored_uid(&graph, "browser.example.com").as_deref(),
+            stored_uid(&graph, "browser.example.com").await.as_deref(),
             Some("b-2"),
             "should keep the other request's write"
         );
     }
 
-    #[test]
-    fn follow_up_write_never_revives_a_row_withdrawn_after_its_read() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn follow_up_write_never_revives_a_row_withdrawn_after_its_read() {
         // Arrange: scenario 23, the row is tombstoned between read and CAS.
         let graph = KvIdentityGraph::in_memory("after-response-withdrawn");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
-        let read = graph.load_snapshot(EC_ID);
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
+        let read = graph.load_snapshot(EC_ID).await;
         let expected = Generation::of(&read, EC_ID).expect("should read a generation");
         assert_eq!(
             graph
                 .write_withdrawal_tombstone(EC_ID, drop)
+                .await
                 .expect("should withdraw the row"),
             TombstoneOutcome::Written,
             "should tombstone the row"
         );
 
         // Act
-        let result = graph.commit_after_response(
-            AfterResponseWrite::for_test(),
-            EC_ID,
-            &live_entry(),
-            expected,
-        );
+        let result = graph
+            .commit_after_response(
+                AfterResponseWrite::for_test(),
+                EC_ID,
+                &live_entry(),
+                expected,
+            )
+            .await;
 
         // Assert
         assert!(result.is_err(), "should refuse to overwrite the tombstone");
         assert!(
             graph
                 .load_snapshot(EC_ID)
+                .await
                 .entry_for(EC_ID)
                 .is_none_or(|entry| !entry.consent.ok),
             "should leave the row withdrawn"
         );
     }
 
-    #[test]
-    fn replaces_a_browser_fallback_for_an_owned_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn replaces_a_browser_fallback_for_an_owned_source() {
         let graph = KvIdentityGraph::in_memory("after-response");
         let mut entry = live_entry();
         entry.ids.insert(
             "ids.example.com".to_owned(),
             KvPartnerId::single("from-browser".to_owned()),
         );
-        graph.create(EC_ID, &entry).expect("should seed row");
+        graph.create(EC_ID, &entry).await.expect("should seed row");
 
         let outcome = commit_after_response_lookups(
             &graph,
@@ -363,7 +385,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -371,23 +394,27 @@ mod tests {
             "should write the row"
         );
         assert_eq!(
-            stored_uid(&graph, "ids.example.com").as_deref(),
+            stored_uid(&graph, "ids.example.com").await.as_deref(),
             Some("p-1"),
             "should replace the browser fallback with the provider UID"
         );
     }
 
-    #[test]
-    fn skips_the_write_when_the_row_already_holds_the_results() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn skips_the_write_when_the_row_already_holds_the_results() {
         let graph = KvIdentityGraph::in_memory("after-response");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
         let first = commit_after_response_lookups(
             &graph,
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
         assert_eq!(first, AfterResponseOutcome::Written, "should write first");
 
         let second = commit_after_response_lookups(
@@ -396,7 +423,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             second,
@@ -405,8 +433,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn writes_nothing_without_a_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_nothing_without_a_row() {
         let graph = KvIdentityGraph::in_memory("after-response");
 
         let outcome = commit_after_response_lookups(
@@ -415,7 +443,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -423,16 +452,17 @@ mod tests {
             "should not create a row"
         );
         assert!(
-            graph.load_snapshot(EC_ID).entry_for(EC_ID).is_none(),
+            graph.load_snapshot(EC_ID).await.entry_for(EC_ID).is_none(),
             "should leave the row absent"
         );
     }
 
-    #[test]
-    fn writes_nothing_to_a_withdrawn_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_nothing_to_a_withdrawn_row() {
         let graph = KvIdentityGraph::in_memory("after-response");
         graph
             .create(EC_ID, &KvEntry::tombstone(1000))
+            .await
             .expect("should seed tombstone");
 
         let outcome = commit_after_response_lookups(
@@ -441,7 +471,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -449,15 +480,18 @@ mod tests {
             "should not revive a tombstone"
         );
         assert!(
-            stored_uid(&graph, "ids.example.com").is_none(),
+            stored_uid(&graph, "ids.example.com").await.is_none(),
             "should not store the provider UID on a tombstone"
         );
     }
 
-    #[test]
-    fn drops_results_made_for_another_ec() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn drops_results_made_for_another_ec() {
         let graph = KvIdentityGraph::in_memory("after-response");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
         let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ABC123";
 
         let outcome = commit_after_response_lookups(
@@ -466,7 +500,8 @@ mod tests {
             &registry(),
             EC_ID,
             &found(other, "p-1"),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -474,15 +509,18 @@ mod tests {
             "should discard results dispatched for another EC"
         );
         assert!(
-            stored_uid(&graph, "ids.example.com").is_none(),
+            stored_uid(&graph, "ids.example.com").await.is_none(),
             "should not store results for another EC"
         );
     }
 
-    #[test]
-    fn skips_the_write_without_results() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn skips_the_write_without_results() {
         let graph = KvIdentityGraph::in_memory("after-response");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
 
         let outcome = commit_after_response_lookups(
             &graph,
@@ -490,7 +528,8 @@ mod tests {
             &registry(),
             EC_ID,
             &LookupResults::new(EC_ID, Vec::new()),
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -499,8 +538,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn skipped_results_need_no_re_read() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn skipped_results_need_no_re_read() {
         // Arrange: no row, so a re-read would report `NoRow`.
         let graph = KvIdentityGraph::in_memory("after-response");
         let skipped = LookupResults::new(
@@ -521,7 +560,8 @@ mod tests {
             &registry(),
             EC_ID,
             &skipped,
-        );
+        )
+        .await;
 
         // Assert
         assert_eq!(
@@ -531,18 +571,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_opt_out_alone_still_re_reads_and_clears_the_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_opt_out_alone_still_re_reads_and_clears_the_source() {
         // Arrange: the provider's UID is stored, then it reports an opt-out.
         let graph = KvIdentityGraph::in_memory("after-response");
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
         let seeded = commit_after_response_lookups(
             &graph,
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
             &found(EC_ID, "p-1"),
-        );
+        )
+        .await;
         assert_eq!(
             seeded,
             AfterResponseOutcome::Written,
@@ -559,7 +603,8 @@ mod tests {
             &registry(),
             EC_ID,
             &opted_out,
-        );
+        )
+        .await;
 
         // Assert
         assert_eq!(
@@ -568,7 +613,7 @@ mod tests {
             "should write the opt-out"
         );
         assert_eq!(
-            stored_uid(&graph, "ids.example.com"),
+            stored_uid(&graph, "ids.example.com").await,
             None,
             "should clear the opted-out provider's source"
         );
@@ -587,8 +632,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_remembered_opt_out_with_nothing_to_clear_skips_the_re_read() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remembered_opt_out_with_nothing_to_clear_skips_the_re_read() {
         // Arrange: no row, so a re-read would report `NoRow`.
         let graph = KvIdentityGraph::in_memory("after-response");
 
@@ -599,7 +644,8 @@ mod tests {
             &registry(),
             EC_ID,
             &opt_out(Vec::new()),
-        );
+        )
+        .await;
 
         // Assert
         assert_eq!(
@@ -609,18 +655,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookups_run_only_for_an_existing_consented_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookups_run_only_for_an_existing_consented_row() {
         // Arrange
         let graph = KvIdentityGraph::in_memory("after_response_allowed");
-        let missing = graph.load_snapshot(EC_ID);
-        graph.create(EC_ID, &live_entry()).expect("should seed row");
-        let present = graph.load_snapshot(EC_ID);
+        let missing = graph.load_snapshot(EC_ID).await;
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
+        let present = graph.load_snapshot(EC_ID).await;
         let withdrawn_graph = KvIdentityGraph::in_memory("after_response_withdrawn");
         withdrawn_graph
             .create(EC_ID, &KvEntry::tombstone(1000))
+            .await
             .expect("should seed tombstone");
-        let withdrawn = withdrawn_graph.load_snapshot(EC_ID);
+        let withdrawn = withdrawn_graph.load_snapshot(EC_ID).await;
 
         // Act + Assert
         assert!(

@@ -177,10 +177,12 @@ Notes:
 
 - The budget is measured from dispatch. If the origin takes longer than the
   budget, provider collection adds no latency.
-- The added delay never exceeds the budget. Collection uses
-  `PlatformHttpClient::select_until` (added by PR #1433), which bounds both
-  header waits and body reads by an absolute deadline on every adapter, so a
-  slow or byte-trickling provider cannot hold the response.
+- The added delay never exceeds the budget. Lookups go out as one `EdgeZero`
+  request batch (`HttpClient::start_batch_until`) whose cutoff is the budget,
+  as auction bidders do, and collection reads the batch until every lookup
+  finishes or the cutoff passes. The cutoff bounds header waits and body reads
+  on every adapter, so a slow or byte-trickling provider cannot hold the
+  response.
 - Response headers, including cookies, depend on the write result, so the write
   completes before headers are sent. This is today's behaviour for new ECs.
 - A navigation with nothing due and nothing new from the browser makes no
@@ -204,8 +206,8 @@ browser             TS (navigation)                          providers   KV
 
 - Default is `collect = "page"`; with no provider set to `after_response`,
   behaviour is exactly §5.2. No existing behaviour changes.
-- Dispatch happens only after the response is sent, because `select_until`
-  abandons requests still pending at the page deadline on every adapter.
+- Dispatch happens only after the response is sent, because a lookup still in
+  flight at the page cutoff is abandoned on every adapter.
 - The budget is `ec.identity_after_response_budget_ms` (default 2000),
   measured from the after-response dispatch. Late responses are dropped as in
   §8.1.1.
@@ -321,15 +323,15 @@ never write. They do not receive a permit, so the write API cannot be called
   | --------------------- | --------------------------- | ------------------------- | --------------------------------- |
   | `IdentityProvider`    | vendor                      | one per provider kind     | test providers                    |
   | `ProviderKind`        | vendor (typed construction) | one per provider kind     | —                                 |
-  | `LookupTransport`     | runtime / environment       | `PlatformLookupTransport` | test transport; F4 mock transport |
+  | `LookupTransport`     | runtime / environment       | `OutboundLookupTransport` | test transport; F4 mock transport |
   | `IdentityCoordinator` | orchestration policy        | `ProviderCoordinator<P>`  | test fake for navigation tests    |
   | `EcKvStore` (exists)  | KV backend                  | Fastly KV                 | existing in-memory test store     |
 
 - **Static dispatch on the request path.** The coordinator, transport and
   navigation code are generic. The new traits use native `async fn` (with
   `#[allow(async_fn_in_trait)]`), not `async_trait`, so they add no boxed
-  futures; the existing `PlatformHttpClient` underneath keeps its own
-  `async_trait` boxing. The only trait objects are the configured providers: operators choose a
+  futures; `EdgeZero`'s `HttpClient` underneath keeps its own boxed
+  futures. The only trait objects are the configured providers: operators choose a
   heterogeneous set, so each is boxed once at startup. `ProviderCoordinator<P>`
   stays generic over `P`, so tests and single-provider builds use a concrete
   type with no boxing.
@@ -610,9 +612,9 @@ The in-process `crate::openrtb::Eid` gains optional `inserter`, `matcher`,
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `trusted-server-core` `ec::eid_types`      | Value types and stored row types (§6).                                                                                                                   |
 | `trusted-server-core` `ec::provider`       | `IdentityProvider`, `ProviderKind`, the generic `build_kind` helper, input and output types, errors. No vendor code.                                     |
-| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `PlatformLookupTransport`, validation, merge, mirror encoding.                       |
+| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`, validation, merge, mirror encoding.                       |
 | `crates/trusted-server-identity-providers` | One module per provider kind, each implementing `ProviderKind` and `IdentityProvider`, and one `build` function that matches `kind` to a `ProviderKind`. |
-| `trusted-server-adapter-fastly`            | Builds providers through the provider crate and a `ProviderCoordinator` at startup, and drives the navigation path with `PlatformLookupTransport`.       |
+| `trusted-server-adapter-fastly`            | Builds providers through the provider crate and a `ProviderCoordinator` at startup, and drives the navigation path with `OutboundLookupTransport`.       |
 
 Dependencies point one way: the provider crate depends on core; core never
 depends on the provider crate. Adding a provider means adding a module and one
@@ -945,37 +947,32 @@ The coordinator owns, for every provider:
 
 #### 8.1.1 `LookupTransport`
 
-The transport sends provider requests and gathers responses within a deadline.
+The transport sends provider requests and gathers responses within a cutoff.
 It is the only coordinator dependency that touches the network, so swapping it
 is how tests and the future debug mode (F4) run real providers and the real
 coordinator against mock responses.
 
 ```rust
-/// Sends provider lookups and gathers their responses before a deadline.
+/// Sends provider lookups and gathers their responses before a cutoff.
 #[allow(async_fn_in_trait)]
 pub trait LookupTransport {
-    /// An in-flight request.
+    /// Requests started together and not yet gathered.
     type Pending;
 
-    /// Starts one request without waiting for its response.
+    /// Starts every request at once, without waiting for a response.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::Send`] when the request cannot be started.
-    async fn start(
-        &self,
-        request: ProviderRequest,
-        deadline: Deadline,
-    ) -> Result<Self::Pending, Report<TransportError>>;
+    /// The cutoff is `budget` from now, and each request carries `budget` as
+    /// its own timeout. A request that cannot be started is reported as
+    /// [`TransportError::Send`] by [`Self::gather`].
+    fn start(&self, requests: Vec<Tagged<ProviderRequest>>, budget: Duration) -> Self::Pending;
 
-    /// Waits for in-flight requests until all finish or `deadline` passes.
+    /// Waits for the started requests until all finish or the cutoff passes.
     ///
-    /// Requests still in flight at the deadline are abandoned and reported as
+    /// Requests still in flight at the cutoff are abandoned and reported as
     /// [`TransportError::Timeout`].
     async fn gather(
         &self,
-        pending: Vec<Tagged<Self::Pending>>,
-        deadline: Deadline,
+        pending: Self::Pending,
     ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>>;
 }
 
@@ -994,10 +991,6 @@ pub struct TransportResponse {
     pub body: bytes::Bytes,
 }
 
-/// End of the shared lookup budget.
-#[derive(Debug, Clone, Copy)]
-pub struct Deadline(web_time::Instant);
-
 /// Position of a provider in the coordinator's configured list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderIndex(u16);
@@ -1015,14 +1008,19 @@ pub enum TransportError {
 impl core::error::Error for TransportError {}
 ```
 
-`Deadline` wraps the `web_time::Instant` that `select_until` takes, because
-core is built into the Cloudflare Worker (CI wasm clock lint).
-`PlatformLookupTransport<'s>` borrows `RuntimeServices` and is a thin adapter
-over the platform client: `start` calls `send_async`, and `gather` calls
-`select_until` with the shared deadline while requests remain in flight,
-stopping when none remain (it rejects an empty list) or it returns `Ok(None)`,
-and tags each result with its provider. It adds no timing logic of its own. Response
-bodies are capped at 64 KiB.
+`OutboundLookupTransport` holds an `EdgeZero` `HttpClient` and its
+`MonotonicClock`, as the auction fan-out does. `start` builds every lookup as a
+buffered request with the budget as its total timeout, a 64 KiB response cap,
+response decoding and a cache bypass, then starts them all with
+`HttpClient::start_batch_until` and a cutoff of `clock.deadline_after(budget)`.
+`gather` reads the batch with `next()` until it reports `Finished`, maps each
+slot back to its provider by position, and reports a slot the cutoff left
+unresolved as `Timeout` (every unresolved slot of a failed batch as `Send`). It
+adds no timing logic of its own. Dropping the pending batch cancels every lookup
+still in flight. On a navigation the request's own client starts the batch
+during routing; the batch stays bound to the serving callback's outbound scope
+and is gathered in `finalize`. After-response lookups use the post-delivery
+client and clock.
 
 #### 8.1.2 `IdentityCoordinator`
 
@@ -1090,8 +1088,8 @@ pub struct LookupContext<'a> {
 /// create a non-empty value. `Default` (empty) and `Debug` (counts only) are
 /// implemented by hand so they do not require bounds on `Pending`.
 pub struct PendingLookups<Pending> {
-    requests: Vec<Tagged<Pending>>,
-    deadline: Option<Deadline>,
+    /// Requests the transport started together, if any.
+    in_flight: Option<Pending>,
     /// Request time, for validating `exp` and resolving `ProviderExpiry::After`.
     now: UnixSeconds,
     skipped: Vec<Tagged<SkipReason>>,
@@ -1581,8 +1579,9 @@ PR A changes behaviour that operators and integrators can observe:
 The work below is delivered as two pull requests:
 
 - **PR A** — the work units PR1 to PR4, on top of the merged platform PR
-  #1433, which provides the deadline-bounded `select_until` that
-  `PlatformLookupTransport` uses.
+  #1433, which provided the deadline-bounded `select_until` the first
+  transport used. After the `EdgeZero` cutover (#1506) the transport is
+  `OutboundLookupTransport`, over `EdgeZero`'s request batch.
 - **PR B** — the work units PR5 and PR6, stacked on PR A.
 
 PR A alone keeps the old post-send pull-sync write as a separate channel
@@ -1595,7 +1594,7 @@ request the units are separate, ordered commits so they stay reviewable.
 | PR0 | Spec                                     | This document.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | —               |
 | PR1 | Full-fidelity EID storage and resolution | `ec::eid_types` value types (§6.2); `KvEid`/`KvUid` additive schema; EID-level fields on `crate::openrtb::Eid`; resolver drops UIDs that are not live; auction merge (§11.1); `x-ts-eids` and identify use it. No new writers.                                                                                                                                                                                                                                                           | PR0             |
 | PR2 | Page-load write permit                   | Navigation classifier; `PageLoadWrite` and `commit_page_load`; single attempt; non-navigation requests read-only except withdrawal tombstones; browser ingest on navigation only; withdrawal handling (§3.1, §5.7); integration-proxy EC minting stops.                                                                                                                                                                                                                                  | PR0             |
-| PR3 | Provider trait and coordinator           | `ec::provider` (`IdentityProvider`, `ProviderKind`), `ec::coordinator` (`IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `PlatformLookupTransport`), provider crate with no kinds, config and validation, consent, allowlist, budgeted fan-out, validation, merge into the navigation write, provider-owned skip in ingest, metrics, example config.                                                                                                                  | PR1, PR2, #1433 |
+| PR3 | Provider trait and coordinator           | `ec::provider` (`IdentityProvider`, `ProviderKind`), `ec::coordinator` (`IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`), provider crate with no kinds, config and validation, consent, allowlist, budgeted fan-out, validation, merge into the navigation write, provider-owned skip in ingest, metrics, example config.                                                                                                                  | PR1, PR2, #1433 |
 | PR4 | Batch sync on provider-owned sources     | Reject and count records for sources an enabled provider claims.                                                                                                                                                                                                                                                                                                                                                                                                                         | PR3             |
 | PR5 | Pull sync as a provider                  | `pull-sync` kind built from existing `[[ec.partners]]` pull-sync settings with no config change; existing per-partner rate limit kept as provider-scoped eligibility; post-send dispatcher and completeness marker removed, leftover marker cookies expired. Behaviour change for existing pull-sync partners: their sources become provider-owned, so browser ingest skips them and, with PR4, batch sync rejects them; once PR6 lands their IDs are mirrored when `bidstream_enabled`. | PR3             |
 | PR6 | Mirror cookie                            | Adds `IdentityCoordinator::mirror` (PR3 ships the trait without it); encoding, fill order, set and expiry rules (§10).                                                                                                                                                                                                                                                                                                                                                                   | PR3             |
