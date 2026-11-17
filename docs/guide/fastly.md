@@ -377,7 +377,7 @@ When upgrading an existing service:
   entries only after no active, staged, or rollback version depends on them.
   A version-linked selector on an older staged version still reads
   `<logical-store-id>_staging`, so removing the entry while that version is
-  deployed makes its publisher routes return 503. This release no longer
+  deployed makes its publisher routes return 500. This release no longer
   reads that store. If you set the optional `TS__SANDBOX__*` reuse bounds
   there, move them into the app-config store under the logical ID
   `trusted_server_config`, without the `EDGEZERO__SERVICES__<SERVICE_ID>__`

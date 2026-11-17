@@ -80,11 +80,11 @@
 //! # Startup error handling
 //!
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
-//! that responds to all routes with the startup error. This router does **not**
-//! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
-//! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! that keeps liveness available and returns a fixed unavailable response for
+//! readiness and ordinary supported routes. This router does **not** attach
+//! middleware. Operational responses bypass entry-point finalization and settings
+//! reloads; they include only the compiled TS version when available, without
+//! runtime or geo headers.
 
 use std::sync::Arc;
 
