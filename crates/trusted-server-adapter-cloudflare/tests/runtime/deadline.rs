@@ -1,14 +1,29 @@
-//! Local runtime fixture exercising the production HTTP client implementation.
-
-#[cfg(target_arch = "wasm32")]
-#[allow(dead_code)]
-#[path = "../../src/platform.rs"]
-mod platform;
+//! Local runtime fixture exercising `EdgeZero`'s Cloudflare HTTP client.
+//!
+//! `scripts/test-worker-auction-deadlines.mjs` calls it with a delayed
+//! upstream. It starts one buffered request in a batch, sleeps for the
+//! simulated publisher work, then collects the batch at the auction cutoff.
 
 #[cfg(target_arch = "wasm32")]
 use std::time::Duration;
+
 #[cfg(target_arch = "wasm32")]
-use trusted_server_core::platform::{PlatformHttpClient as _, PlatformHttpRequest};
+use edgezero_adapter_cloudflare::outbound::CloudflareOutboundClient;
+#[cfg(target_arch = "wasm32")]
+use edgezero_core::error::EdgeError;
+#[cfg(target_arch = "wasm32")]
+use edgezero_core::http::Method;
+#[cfg(target_arch = "wasm32")]
+use edgezero_core::outbound::{
+    HttpClient, OutboundBatchTermination, OutboundCachePolicy, OutboundCollectedSlot,
+    ResponseDecoding,
+};
+#[cfg(target_arch = "wasm32")]
+use edgezero_core::time::Deadline;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::outbound::{
+    BUFFERED_TIMEOUT, DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request,
+};
 
 #[cfg(target_arch = "wasm32")]
 #[worker::event(fetch)]
@@ -25,9 +40,7 @@ async fn main(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn exercise(
-    uri: &str,
-) -> Result<String, error_stack::Report<trusted_server_core::platform::PlatformError>> {
+async fn exercise(uri: &str) -> Result<String, EdgeError> {
     let parameter = |name: &str| {
         uri.split_once('?').and_then(|(_, query)| {
             query
@@ -46,30 +59,41 @@ async fn exercise(
         .expect("should supply origin delay")
         .parse()
         .expect("should parse origin delay");
-    let client = platform::CloudflareHttpClient;
-    let request = edgezero_core::http::request_builder()
-        .uri(upstream)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should construct fixture request");
+    let client = HttpClient::with_client(CloudflareOutboundClient::new());
+    let request = buffered(
+        outbound_request(Method::GET, upstream)?,
+        BUFFERED_TIMEOUT,
+        DEFAULT_BUFFERED_RESPONSE_BYTES,
+        ResponseDecoding::Decode,
+    )
+    .cache_policy(OutboundCachePolicy::Bypass);
     let started = web_time::Instant::now();
-    let pending = client
-        .send_async(PlatformHttpRequest::new(request, "fixture"))
-        .await?;
+    let batch = client.start_batch_until(
+        vec![request],
+        Deadline::after(Duration::from_millis(budget_ms)),
+    );
     worker::Delay::from(Duration::from_millis(origin_ms)).await;
-    let collected = client
-        .select_until(vec![pending], started + Duration::from_millis(budget_ms))
-        .await?;
-    let status = match collected {
-        Some(result) => {
-            let response = result.ready?;
+    let (slots, termination) = batch
+        .collect()
+        .await
+        .map_err(|failure| failure.into_parts().0)?
+        .into_parts();
+    let status = match (slots.into_iter().next(), termination) {
+        (Some(OutboundCollectedSlot::Resolved(result)), _) => {
+            let response = result.outcome?;
             assert_eq!(
-                response.response.body().as_bytes(),
+                response.body().as_bytes(),
                 Some(b"okay".as_slice()),
                 "should retain the complete nonempty upstream body"
             );
             "complete"
         }
-        None => "timeout",
+        (Some(OutboundCollectedSlot::Unresolved), OutboundBatchTermination::Cutoff) => "timeout",
+        (slot, termination) => {
+            return Err(EdgeError::internal(std::io::Error::other(format!(
+                "unexpected batch outcome {slot:?} with {termination:?}"
+            ))));
+        }
     };
     Ok(format!("{status}:{}", started.elapsed().as_millis()))
 }

@@ -1,64 +1,68 @@
 name: Documentation proposal
 
-# Proposes documentation edits with Copilot CLI after code merges to main and
-# opens one reviewable pull request per merge. See
+# Proposes documentation edits with Copilot CLI for the code changes since a
+# chosen commit and opens one reviewable pull request. Run it manually from the
+# Actions tab; "Use workflow from" picks the branch to propose documentation
+# for and to open the pull request against. See
 # docs/superpowers/specs/2026-10-01-docs-proposal-automation-design.md.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "trusted-server.example.toml"
-      - "edgezero.toml"
-      - "fastly.toml"
-      - ".cargo/config.toml"
-      - "scripts/**"
-      - "!scripts/docs-proposal/**"
   workflow_dispatch:
     inputs:
-      sha:
-        description: Full SHA of a commit on main to propose documentation for
+      since:
+        description: >-
+          Commit on the branch to propose documentation since (exclusive); the run
+          covers every change after it
         required: true
         type: string
-      base:
+      sha:
         description: >-
-          Full SHA of main before the push that added the commit, when that
-          push added several commits; defaults to the commit's first parent
+          Full SHA of the last commit on the branch to include; defaults to
+          the branch head
         required: false
         type: string
 
 permissions: {}
 
-# Sequential merges are proposed one at a time, in order. The default queue
-# keeps only one pending run and cancels older ones, so keep them all. Every
-# job has a timeout so a hung run cannot hold the queue for hours.
+# Runs are proposed one at a time, in order. The default queue keeps only one
+# pending run and cancels older ones, so keep them all. Every job has a
+# timeout so a hung run cannot hold the queue for hours.
 concurrency:
   group: docs-proposal
   cancel-in-progress: false
   queue: max
 
 # Each job runs the proposal scripts from the workflow's own revision in
-# `tools/` against a checkout of the merge commit in `source/`, so retrying a
-# merge that predates this tooling, or a later fix to it, still works. A push
-# that adds several commits is inspected from the previous main head; a manual
-# retry of such a push needs that head as its `base` input.
+# `tools/` against a checkout of the chosen commit in `source/`, so a range
+# that predates this tooling, or a later fix to it, still works. Copilot
+# inspects `since`..`sha`. The propose job resolves `sha` once, so later jobs
+# use the same commit even if the branch moves during the run.
 env:
-  MERGE_SHA: ${{ inputs.sha || github.sha }}
-  BASE_SHA: ${{ github.event_name == 'push' && github.event.before || inputs.base }}
+  DOCS_PROPOSAL_BRANCH: ${{ github.ref_name }}
+  BASE_SHA: ${{ inputs.since }}
 
 jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.
   # Copilot can write files that later steps execute, so treat this job as
   # untrusted: it uses no dependency cache that later runs would restore.
-  # Because untrusted code runs on the main ref, it can still write other
-  # main-scoped caches, so privileged workflows must never restore caches.
+  # Because untrusted code runs on the dispatched branch's ref, it can still
+  # write caches scoped to that branch, so privileged workflows must never
+  # restore caches.
   propose:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       copilot-requests: write
+    outputs:
+      merge_sha: ${{ steps.resolve.outputs.merge_sha }}
     steps:
+      - name: Require a branch
+        run: |
+          if [ "$GITHUB_REF_TYPE" != branch ]; then
+            printf '::error::Run the workflow from a branch, not %s %s.\n' "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
       - name: Checkout tools
         uses: actions/checkout@v4
         with:
@@ -69,10 +73,15 @@ jobs:
       - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.MERGE_SHA }}
+          ref: ${{ inputs.sha || github.sha }}
           path: source
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Resolve merge commit
+        id: resolve
+        working-directory: source
+        run: echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Retrieve Node.js version
         id: node-version
@@ -90,6 +99,7 @@ jobs:
         working-directory: source
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.resolve.outputs.merge_sha }}
         run: ../tools/scripts/docs-proposal/propose.sh "$MERGE_SHA" .docs-proposal "$BASE_SHA"
 
       - name: Upload proposal
@@ -119,7 +129,7 @@ jobs:
       - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.MERGE_SHA }}
+          ref: ${{ needs.propose.outputs.merge_sha }}
           path: source
           fetch-depth: 0
           persist-credentials: false
@@ -141,12 +151,14 @@ jobs:
 
       - name: Validate proposal
         working-directory: source
+        env:
+          MERGE_SHA: ${{ needs.propose.outputs.merge_sha }}
         run: ../tools/scripts/docs-proposal/validate.sh "$MERGE_SHA" .docs-proposal
 
   # Copilot does not run here, and neither does any proposal content: this job
   # re-checks the path allowlist on a fresh checkout and publishes the patch.
   publish:
-    needs: validate
+    needs: [propose, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -163,7 +175,7 @@ jobs:
       - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.MERGE_SHA }}
+          ref: ${{ needs.propose.outputs.merge_sha }}
           path: source
           fetch-depth: 0
 
@@ -186,4 +198,5 @@ jobs:
         working-directory: source
         env:
           GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.propose.outputs.merge_sha }}
         run: ../tools/scripts/docs-proposal/publish.sh "$MERGE_SHA" .docs-proposal

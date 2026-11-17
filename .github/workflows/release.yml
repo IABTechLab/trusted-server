@@ -1,0 +1,104 @@
+name: Binary attestations
+# Pull requests run the release Node suite in format.yml. The release builds
+# run on every push to main, so they need no input path list, and on tags.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: binary-attestations-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    uses: ./.github/workflows/release-build.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-trusted-server-fastly.wasm
+          path: build/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@v7
+        with:
+          name: signed-trusted-server-fastly.wasm
+          path: signed/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-ts-aarch64-apple-darwin
+          path: build/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@v7
+        with:
+          name: signed-ts-aarch64-apple-darwin
+          path: signed/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-ts-x86_64-apple-darwin
+          path: build/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@v7
+        with:
+          name: signed-ts-x86_64-apple-darwin
+          path: signed/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-ts-x86_64-unknown-linux-gnu
+          path: build/ts-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@v7
+        with:
+          name: signed-ts-x86_64-unknown-linux-gnu
+          path: signed/ts-x86_64-unknown-linux-gnu
+      # Run only the publisher and its notes template from the tagged commit;
+      # never check out build inputs here.
+      - uses: actions/checkout@v5
+        with:
+          path: publisher
+          persist-credentials: false
+          sparse-checkout: |
+            .tool-versions
+            scripts/release/publish.mjs
+            scripts/release/release-notes.md
+          sparse-checkout-cone-mode: false
+      - name: Read pinned Node version
+        id: tools
+        run: echo "node=$(awk '$1 == "nodejs" { print $2 }' publisher/.tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned GitHub CLI
+        env:
+          GH_VERSION: 2.102.0
+          GH_SHA256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+        run: |
+          set -euo pipefail
+          archive="gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" \
+            --output "$RUNNER_TEMP/$archive"
+          printf '%s  %s\n' "$GH_SHA256" "$RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64/bin" >> "$GITHUB_PATH"
+      - name: Verify handoff, create once, publish by release ID and verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
+          NODE_VERSION: ${{ steps.tools.outputs.node }}
+        run: |
+          set -euo pipefail
+          test "$(gh --version | head -1 | cut -d' ' -f3)" = 2.102.0
+          # publish.mjs runs only where import.meta.main exists; an older Node
+          # would exit 0 without publishing.
+          test "$(node --version)" = "v$NODE_VERSION"
+          node publisher/scripts/release/publish.mjs

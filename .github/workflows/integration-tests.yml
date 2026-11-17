@@ -105,6 +105,9 @@ jobs:
           -- --include-ignored
           --skip test_wordpress_fastly --skip test_nextjs_fastly
           --skip trace_browser_workflow --skip trace_runtime_boundary
+          --skip multi_provider_auction_runs_spin --skip spin_runtime_
+          --skip navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin
+          --skip publisher_head_and_conditional_304_return_real_status_spin
           --test-threads=1
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
@@ -229,6 +232,7 @@ jobs:
         run: |
           cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test integration trace_runtime_boundary -- --ignored --test-threads=1 --nocapture
           cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test integration trace_browser_workflow -- --ignored --test-threads=1 --nocapture
+          cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test integration -- --ignored --test-threads=1 --nocapture multi_provider_auction_runs_spin spin_runtime_ navigation_bids_include_180_and_320_ms_and_exclude_600_ms_spin publisher_head_and_conditional_304_return_real_status_spin
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}

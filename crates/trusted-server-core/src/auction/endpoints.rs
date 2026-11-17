@@ -20,6 +20,7 @@ use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -45,6 +46,23 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
+/// Builds the `text/plain` 413 answered for an auction body over [`MAX_AUCTION_BODY_SIZE`].
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Auction`] when the response cannot be built.
+fn auction_body_too_large_response() -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(EdgeBody::from(format!(
+            "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+        )))
+        .change_context(TrustedServerError::Auction {
+            message: "Auction request body exceeded maximum size".to_string(),
+        })
+}
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -115,6 +133,8 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// # Errors
 ///
 /// Returns an error if:
+/// - The request body cannot be read (see [`read_request_body`]); a body over
+///   256 KiB is answered with a `text/plain` 413 instead
 /// - The request body cannot be parsed
 /// - The auction request conversion fails (e.g., invalid ad units)
 /// - The auction execution fails
@@ -128,40 +148,23 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Reject oversized bodies before core buffers/parses them. The Content-Length
-    // pre-check stops well-behaved clients early; the post-read check defends
-    // against clients that lie about (or omit) the header.
-    let content_length_exceeded = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
-    if content_length_exceeded {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
-
+    // The bounded read rejects a declared overflow before polling the body and
+    // stops a streamed body at the first chunk past the cap, so a client that
+    // omits or understates `Content-Length` is still held to it.
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
+    let body_bytes = match read_request_body(&parts.headers, body, MAX_AUCTION_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(report)
+            if matches!(
+                report.current_context(),
+                TrustedServerError::RequestTooLarge { .. }
+            ) =>
+        {
+            log::warn!("Rejecting auction request: {report:?}");
+            return auction_body_too_large_response();
+        }
+        Err(report) => return Err(report),
+    };
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
             message: "Failed to parse auction request body".to_string(),
@@ -392,7 +395,6 @@ pub async fn handle_auction(
         settings,
         request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
-        transport_timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
     };
@@ -695,24 +697,31 @@ pub(crate) fn merge_auction_eids(
 mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
-    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
-    use crate::auction::types::{AuctionRequest, AuctionResponse};
+
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::error::IntoHttpResponse as _;
+
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
+    use crate::platform::ClientInfo;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubBackend,
-        StubHttpClient, noop_services,
+        NoopConfigStore, NoopGeo, NoopSecretStore, build_services_with_outbound_client,
+        noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
+    use crate::test_support::tests::{
+        crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
+    };
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use edgezero_core::router::PreDispatchHook as _;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
+    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -742,12 +751,22 @@ mod tests {
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    /// Endpoint of the `eid-capture` provider that `legacy_provider_map` configures.
+    const EID_CAPTURE_ENDPOINT: &str = "https://eid-capture.example/openrtb2/auction";
+
+    /// Builds the plan-backed orchestrator for test settings with `auction` in place.
+    fn orchestrator_with(auction: AuctionConfig) -> AuctionOrchestrator {
+        let mut settings = create_test_settings();
+        settings.auction = auction;
+        crate::auction::build_orchestrator(&settings).expect("should build the orchestrator")
     }
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
@@ -787,16 +806,13 @@ mod tests {
         // read: before the snapshot was shared, finalization saw `NotRead` and
         // paid for a second lookup.
         let settings = create_test_settings();
-        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+        let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         });
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
-        }));
         let registry = PartnerRegistry::from_config(&[counting_test_partner("sharedid.org")])
             .expect("should build partner registry");
 
@@ -890,16 +906,13 @@ mod tests {
         // hand its parsed body EIDs to `ec_context` so finalization ingests
         // them regardless of what the cookie carried.
         let settings = create_test_settings();
-        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+        let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         });
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
-        }));
         let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
             .expect("should build partner registry");
 
@@ -979,99 +992,6 @@ mod tests {
         );
     }
 
-    /// Provider that fails the test if it is ever contacted. Used to prove the
-    /// `/auction` consent gate short-circuits before any outbound bid request.
-    struct PanicOnBidProvider;
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for PanicOnBidProvider {
-        fn provider_name(&self) -> &str {
-            "panic_provider"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            panic!("provider must not be contacted when the consent gate denies the auction");
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("provider must not parse a response when the auction is gated off");
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("panic-backend".to_string())
-        }
-    }
-
-    /// Provider used to prove that direct `/auction` remains available when
-    /// publisher server-side ad templates are disabled.
-    struct TemplateSwitchProbeProvider {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for TemplateSwitchProbeProvider {
-        fn provider_name(&self) -> &'static str {
-            "template-switch-probe"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.calls.lock().expect("should lock provider call count") += 1;
-            let request = Request::builder()
-                .method("POST")
-                .uri("https://bidder.example/auction")
-                .body(EdgeBody::empty())
-                .expect("should build probe provider request");
-            context
-                .services
-                .http_client()
-                .send_async(
-                    PlatformHttpRequest::new(request, "template-switch-probe-backend")
-                        .with_cache_bypass(),
-                )
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "probe provider launch failed".to_string(),
-                })
-                .map(ProviderRequestOutcome::pending)
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            Ok(AuctionResponse::success(
-                self.provider_name(),
-                Vec::new(),
-                0,
-            ))
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("template-switch-probe-backend".to_string())
-        }
-    }
-
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
@@ -1080,23 +1000,16 @@ mod tests {
         );
         let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
-        let calls = Arc::new(Mutex::new(0));
-        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
-            calls: Arc::clone(&calls),
-        }));
-
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"probe response".to_vec());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
-            .build();
+        let orchestrator =
+            crate::auction::build_orchestrator(&settings).expect("should build the orchestrator");
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            "https://bidder.example/auction",
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1125,7 +1038,7 @@ mod tests {
         .expect("direct auction should remain available");
 
         assert_eq!(
-            *calls.lock().expect("should lock provider call count"),
+            bidders.requests().len(),
             1,
             "disabling publisher templates must not disable direct /auction"
         );
@@ -1133,19 +1046,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
+        // The plan accepts a backslash in the endpoint query, but `EdgeZero`
+        // builds no request for it. The other endpoint gets the error Fastly
+        // reports when it cannot register the bidder backend.
+        let unbuildable = r"https://failing.example/auction?x=\";
+        let unregistered = "https://failing.example/auction";
+        for endpoint in [unbuildable, unregistered] {
+            let settings_toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = '{endpoint}'\nrouting = \"all_eligible\"\n",
+                crate_test_settings_str()
+            );
+            let settings =
+                Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the orchestrator");
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            bidders.respond_to(
+                http::Method::POST,
+                unregistered,
+                ScriptedReply::error(EdgeError::bad_gateway_with_detail(
+                    "Fastly failed to register a dynamic backend",
+                    BadGatewayReason::Unspecified,
+                    ProviderFailureDetail::Fastly {
+                        phase: ProviderFailurePhase::BackendRegistration,
+                        cause: FastlyFailureCause::BackendHostError { status: 1 },
+                    },
+                )),
+            );
+            let services = RuntimeServices {
+                outbound_client: bidders.http_client(),
+                clock: clock.monotonic_clock(),
+                ..services_with_telemetry(Arc::clone(&telemetry_sink))
+            };
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize launch-failure body"),
+                ))
+                .expect("should build launch-failure request");
+
+            let error = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await
+            .expect_err("should fail the auction endpoint when every planned launch fails");
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "{endpoint} should answer 502"
+            );
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert_eq!(
+                batches.len(),
+                1,
+                "{endpoint} should emit one telemetry batch"
+            );
+            let rows = batches[0].rows();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{endpoint} should emit one execution-failure summary"
+            );
+            assert_eq!(rows[0].event_kind, "summary");
+            assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
+            assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work() {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: false,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1192,6 +1197,7 @@ mod tests {
             Some("auction_disabled"),
             "should identify the disabled auction policy"
         );
+        bidders.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1222,20 +1228,21 @@ mod tests {
             ..Default::default()
         });
         let orchestrator = AuctionOrchestrator::from_plan(plan, Some(Arc::new(mediator)));
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(204, Vec::new());
-        http.push_response(204, Vec::new());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(StubBackend))
-            .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
-            .build();
+        let clock = TestClock::new();
+        let http = ScriptedHttpClient::new(&clock);
+        for endpoint in [
+            "https://bidder.example.com/auction",
+            "https://mediator.example.com/auction",
+        ] {
+            http.respond_to(
+                http::Method::POST,
+                endpoint,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
+        }
+        let services = build_services_with_outbound_client(&http, &clock);
         let body = json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SLOT_REF}}}]});
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri("https://publisher.example.com/auction")
             .header(header::COOKIE, "__Host-ts-console=1")
@@ -1243,11 +1250,13 @@ mod tests {
                 serde_json::to_vec(&body).expect("should encode source token"),
             ))
             .expect("should build request");
-        TracePreDispatchHook::new(
-            Arc::clone(&settings),
-            Arc::new(|_| panic!("should not load API setup metadata")),
+        let request = run_pre_dispatch_hook(
+            TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load API setup metadata")),
+            ),
+            request,
         )
-        .handle(&mut request)
         .await
         .expect("should freeze trace gate");
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
@@ -1283,14 +1292,15 @@ mod tests {
             evidence["slots"][0]["candidate"], "no_candidate",
             "should observe no delivered candidate"
         );
-        let bodies = http.recorded_request_bodies();
+        let sent = http.requests();
         assert_eq!(
-            bodies.len(),
+            sent.len(),
             2,
             "should actually serialize bidder and mediator requests"
         );
-        for bytes in bodies {
-            let body = String::from_utf8(bytes).expect("should serialize UTF-8 outbound JSON");
+        for request in sent {
+            let body = String::from_utf8(request.body.to_vec())
+                .expect("should serialize UTF-8 outbound JSON");
             for private in [
                 SLOT_REF,
                 auction_token,
@@ -1320,7 +1330,7 @@ mod tests {
                 )
                 .expect("should enable trace feature");
             let settings = Arc::new(settings);
-            let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            let orchestrator = orchestrator_with(AuctionConfig {
                 enabled: false,
                 ..Default::default()
             });
@@ -1345,11 +1355,13 @@ mod tests {
                     "__Host-ts-console=1".parse().expect("should build cookie"),
                 );
             }
-            TracePreDispatchHook::new(
-                Arc::clone(&settings),
-                Arc::new(|_| panic!("should not load API setup metadata")),
+            let request = run_pre_dispatch_hook(
+                TracePreDispatchHook::new(
+                    Arc::clone(&settings),
+                    Arc::new(|_| panic!("should not load API setup metadata")),
+                ),
+                request,
             )
-            .handle(&mut request)
             .await
             .expect("should freeze cookie gate");
             let response = handle_auction(
@@ -1443,15 +1455,18 @@ mod tests {
 
         let config = AuctionConfig {
             enabled: false,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1459,7 +1474,7 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .header("cookie", "__Host-ts-console=1")
             .uri("https://test-publisher.example/auction")
@@ -1472,13 +1487,9 @@ mod tests {
             Arc::clone(&settings),
             Arc::new(|_| panic!("should not load setup metadata on API capture")),
         );
-        assert!(
-            hook.handle(&mut request)
-                .await
-                .expect("should freeze API cookies")
-                .is_none(),
-            "should retain ordinary API routing"
-        );
+        let request = run_pre_dispatch_hook(hook, request)
+            .await
+            .expect("should retain ordinary API routing");
 
         let response = handle_auction(
             &settings,
@@ -1525,64 +1536,7 @@ mod tests {
             response["ext"]["trusted_server"]["trace_auction"], facts,
             "should deliver the same checked terminal facts"
         );
-    }
-
-    #[tokio::test]
-    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
-        let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
-            crate_test_settings_str()
-        );
-        let settings =
-            Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
-        let plan = Arc::new(
-            crate::auction::compile_auction_plan(&settings)
-                .expect("should compile launch-failure plan"),
-        );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
-        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
-        let body = json!({
-            "adUnits": [{
-                "code": "div-gpt-ad-1",
-                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
-            }]
-        });
-        let request = Request::builder()
-            .method("POST")
-            .uri("https://test-publisher.example/auction")
-            .body(EdgeBody::from(
-                serde_json::to_vec(&body).expect("should serialize launch-failure body"),
-            ))
-            .expect("should build launch-failure request");
-
-        let error = handle_auction(
-            &settings,
-            &orchestrator,
-            None,
-            None,
-            &mut ec_context,
-            &services,
-            request,
-        )
-        .await
-        .expect_err("all planned launch failures should fail the auction endpoint");
-
-        assert_eq!(
-            error.current_context().status_code(),
-            StatusCode::BAD_GATEWAY
-        );
-        let batches = telemetry_sink
-            .batches
-            .lock()
-            .expect("should lock telemetry batches");
-        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
-        let rows = batches[0].rows();
-        assert_eq!(rows.len(), 1, "should emit one execution-failure summary");
-        assert_eq!(rows[0].event_kind, "summary");
-        assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
-        assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        bidders.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1594,15 +1548,18 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
@@ -1668,47 +1625,7 @@ mod tests {
             !ndjson.contains(&ec_id),
             "telemetry must not serialize EC identifiers"
         );
-    }
-
-    /// Provider that records whether the auction request it received carried
-    /// EIDs, then fails its launch so no real transport handle is needed.
-    struct EidCapturingProvider {
-        had_eids: Arc<std::sync::Mutex<Option<bool>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for EidCapturingProvider {
-        fn provider_name(&self) -> &str {
-            "eid_capturing_provider"
-        }
-
-        async fn request_bids(
-            &self,
-            request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.had_eids.lock().expect("should lock captured eids") =
-                Some(request.user.eids.is_some());
-            Err(Report::new(TrustedServerError::Auction {
-                message: "capture only".to_string(),
-            }))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("parse_response must not run when the launch fails");
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("capture-backend".to_string())
-        }
+        bidders.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1722,17 +1639,20 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        let had_eids = Arc::new(std::sync::Mutex::new(None));
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::clone(&had_eids),
-        }));
-        let services = noop_services();
+        let orchestrator = orchestrator_with(config);
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
 
         // US-state jurisdiction with an explicit GPC opt-out: auction allowed,
         // EC identity denied.
@@ -1777,8 +1697,7 @@ mod tests {
             ))
             .expect("should build auction request");
 
-        // The capturing provider fails its launch, so the auction errors overall;
-        // the assertion is on the EIDs observed by the provider, not the result.
+        // The assertion is on the EIDs the bidder received, not the auction result.
         let _ = handle_auction(
             &settings,
             &orchestrator,
@@ -1790,10 +1709,17 @@ mod tests {
         )
         .await;
 
+        let sent = bidders.requests();
         assert_eq!(
-            *had_eids.lock().expect("should lock captured eids"),
-            Some(false),
-            "outgoing auction request must carry no EIDs when EC identity is denied"
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
+        assert!(
+            body["user"]["ext"]["eids"].is_null(),
+            "outgoing auction request must carry no EIDs when EC identity is denied: {body}"
         );
     }
 
@@ -2209,50 +2135,111 @@ mod tests {
         });
     }
 
+    /// Returns an orchestrator with the auction disabled, so a parsed body gets a 200 no-bid.
+    fn disabled_orchestrator() -> AuctionOrchestrator {
+        orchestrator_with(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }
+
     #[test]
-    fn auction_rejects_streaming_body_instead_of_treating_as_empty() {
+    fn auction_reads_a_streamed_body() {
         futures::executor::block_on(async {
-            use bytes::Bytes;
-            use edgezero_core::body::Body as EdgeBody;
-            use http::{Method, Request as HttpRequest};
-
-            use crate::auction::build_orchestrator;
-            use crate::consent::ConsentContext;
-            use crate::ec::EcContext;
-            use crate::error::TrustedServerError;
-            use crate::platform::test_support::noop_services;
-            use crate::test_support::tests::create_test_settings;
-
             let settings = create_test_settings();
-            let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+            let orchestrator = disabled_orchestrator();
             let services = noop_services();
             let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
-            let stream = futures::stream::iter([Bytes::from_static(br#"{}"#)]);
-            let req = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("https://test.com/auction")
-                .body(EdgeBody::stream(stream))
-                .expect("should build request");
+            let body = serde_json::to_vec(&json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            }))
+            .expect("should serialize the auction body");
+            let (head, tail) = body.split_at(body.len() / 2);
+            let chunks = [
+                bytes::Bytes::copy_from_slice(head),
+                bytes::Bytes::copy_from_slice(tail),
+            ];
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::stream(futures::stream::iter(chunks)))
+                .expect("should build the streamed auction request");
 
-            let result = handle_auction(
+            let response = handle_auction(
                 &settings,
                 &orchestrator,
                 None,
                 None,
                 &mut ec_context,
                 &services,
-                req,
+                request,
             )
-            .await;
+            .await
+            .expect("should parse a streamed auction body");
 
-            let err = match result {
-                Ok(_) => panic!("streaming body should be rejected"),
-                Err(err) => err,
-            };
-            assert!(
-                matches!(err.current_context(), TrustedServerError::BadRequest { .. }),
-                "streaming request body should fail as bad request"
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should answer a streamed body as it answers a buffered one"
             );
+        });
+    }
+
+    #[test]
+    fn auction_body_read_failures_map_to_statuses() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let orchestrator = disabled_orchestrator();
+            let services = noop_services();
+
+            for case in body_read_failure_cases(MAX_AUCTION_BODY_SIZE) {
+                let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let (request, expectation) = case.into_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://test-publisher.example/auction"),
+                );
+
+                let capture = LogCapture::start();
+                let outcome = handle_auction(
+                    &settings,
+                    &orchestrator,
+                    None,
+                    None,
+                    &mut ec_context,
+                    &services,
+                    request,
+                )
+                .await;
+
+                expectation.assert_outcome("/auction", &outcome);
+                if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                    let levels: Vec<log::Level> = capture
+                        .take_all()
+                        .iter()
+                        .map(|record| record.level)
+                        .collect();
+                    assert_eq!(
+                        levels,
+                        [log::Level::Warn],
+                        "should log the {} case once, at warn",
+                        expectation.name()
+                    );
+                    let response = outcome.expect("should answer an overflow with a response");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("text/plain"),
+                        "should keep the text/plain 413 body for the {} case",
+                        expectation.name()
+                    );
+                }
+            }
         });
     }
 }

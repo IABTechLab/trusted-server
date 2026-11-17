@@ -1,5 +1,7 @@
 # Trusted Server CLI
 
+Prebuilt release binaries must pass the [release verification procedure](/guide/release-verification) before execution or deployment. That guide lists the Linux/macOS baselines and the manual Fastly route that preserves verified wasm bytes.
+
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 
@@ -56,6 +58,13 @@ commands are shown explicitly.
 | `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
 
 ## Install from source
+
+`cargo install-cli` builds `ts` from source. The resulting local binary is not
+covered by the release attestation. Operators who need an attested CLI should
+download the matching `ts-<target>` release asset, verify it with the documented
+`gh attestation verify` and `gh release verify-asset` commands in the
+[release verification guide](/guide/release-verification), and install that
+verified file.
 
 From the repository root, install the `ts` binary with the workspace Cargo alias:
 
@@ -219,9 +228,14 @@ adapter flags directly need the `--` added. Trusted Server declares Config, KV,
 and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
 requires a verified application release root via `--application-release`; a
 bare `ts deploy --adapter fastly` without a release is accepted only for
-store-free applications. The CLI loads `edgezero.toml` from the working
-directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
-manifest outside the release root, so select the release's own manifest.
+store-free applications.
+
+`ts build`, `ts serve`, and `ts deploy` find the manifest in this order: the
+file `EDGEZERO_MANIFEST` names, the nearest `edgezero.toml` in the working
+directory or one of its parents, and then the nearest `edgezero.toml` under
+the workspace root. Two manifests equally near the working directory are an
+error. A managed deploy rejects a manifest outside the release root, so set
+`EDGEZERO_MANIFEST` to the release's own manifest.
 
 Managed deployment also requires a nonempty `FASTLY_API_TOKEN` in the process
 environment; signing in with `ts auth login` or a Fastly CLI profile alone
