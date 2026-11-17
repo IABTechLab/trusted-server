@@ -5,14 +5,26 @@
 //! An adapter builds it once per process or isolate from the platform
 //! services it supplies through [`IdentityPlatform`], so no identity route
 //! rebuilds that state per request.
+//!
+//! [`IdentityApp::mount`] registers the identity routes the core app owns on
+//! the adapter's router. Today these are the admin lookups; identify and
+//! batch sync stay in the adapters until the EC lifecycle moves into core.
 
 use std::sync::Arc;
 
+use edgezero_core::body::Body;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
+use edgezero_core::router::RouterBuilder;
 use error_stack::Report;
 
-use crate::error::TrustedServerError;
+use crate::error::{IntoHttpResponse as _, TrustedServerError};
 use crate::settings::Settings;
 
+use super::admin::{
+    ADMIN_EC_PATH, ADMIN_EIDS_PATH, handle_admin_ec_lookup, handle_admin_eids_lookup,
+};
 use super::kv::KvIdentityGraph;
 use super::rate_limiter::{NoRateLimit, RateLimiter};
 use super::registry::PartnerRegistry;
@@ -90,13 +102,144 @@ impl IdentityApp {
     pub fn rate_limiter(&self) -> &dyn RateLimiter {
         self.rate_limiter.as_ref()
     }
+
+    /// Registers the identity routes the core app owns on `router`.
+    ///
+    /// Registers `GET` on `/_ts/admin/ec`, `/_ts/admin/ec/{id}` and
+    /// `/_ts/admin/eids`. Admin EC lookup answers from the record store, or
+    /// with `501 Not Implemented` when the adapter supplied none. The routes
+    /// run no EC lifecycle, so a read-only diagnostic never ingests the
+    /// operator's cookies. Other methods on these paths reach the adapter's
+    /// fallback, which denies admin diagnostics.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = app.mount(RouterService::builder()).build();
+    /// ```
+    #[must_use]
+    pub fn mount(self: &Arc<Self>, router: RouterBuilder) -> RouterBuilder {
+        let ec_lookup = Arc::clone(self);
+        let ec_lookup_by_id = Arc::clone(self);
+        let eids_lookup = Arc::clone(self);
+        router
+            .route(ADMIN_EC_PATH, Method::GET, move |ctx: RequestContext| {
+                let app = Arc::clone(&ec_lookup);
+                async move { Ok::<_, EdgeError>(app.admin_ec_lookup(&ctx.into_request()?)) }
+            })
+            .route(
+                ADMIN_EC_BY_ID_PATH,
+                Method::GET,
+                move |ctx: RequestContext| {
+                    let app = Arc::clone(&ec_lookup_by_id);
+                    async move { Ok::<_, EdgeError>(app.admin_ec_lookup(&ctx.into_request()?)) }
+                },
+            )
+            .route(ADMIN_EIDS_PATH, Method::GET, move |ctx: RequestContext| {
+                let app = Arc::clone(&eids_lookup);
+                async move { Ok::<_, EdgeError>(app.admin_eids_lookup(&ctx.into_request()?)) }
+            })
+    }
+
+    fn admin_ec_lookup(&self, req: &Request) -> Response {
+        handle_admin_ec_lookup(self.identity_graph.as_ref(), &self.partners, req)
+            .unwrap_or_else(|report| error_response(&report))
+    }
+
+    fn admin_eids_lookup(&self, req: &Request) -> Response {
+        handle_admin_eids_lookup(&self.partners, req)
+            .unwrap_or_else(|report| error_response(&report))
+    }
+}
+
+const ADMIN_EC_BY_ID_PATH: &str = "/_ts/admin/ec/{id}";
+
+fn error_response(report: &Report<TrustedServerError>) -> Response {
+    let root_error = report.current_context();
+    log::error!("Error occurred: {report:?}");
+    let mut response = Response::new(Body::from(format!("{}\n", root_error.user_message())));
+    *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::http::StatusCode;
+    use edgezero_core::router::RouterService;
+    use futures::executor::block_on;
+
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::test_support::tests::create_test_settings;
+
+    const MISSING_EC_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123";
+
+    fn router_for(platform: IdentityPlatform) -> RouterService {
+        let app = IdentityApp::build(Arc::new(create_test_settings()), platform)
+            .expect("should build the identity app");
+        app.mount(RouterService::builder()).build()
+    }
+
+    fn get(router: &RouterService, path: &str) -> Response {
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("should build request");
+        block_on(router.oneshot(request)).expect("should dispatch request")
+    }
+
+    #[test]
+    fn mounted_admin_ec_lookup_reads_the_record_store() {
+        let router = router_for(IdentityPlatform {
+            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
+            rate_limiter: None,
+        });
+
+        let response = get(&router, &format!("/_ts/admin/ec/{MISSING_EC_ID}"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should look the EC up in the record store"
+        );
+    }
+
+    #[test]
+    fn mounted_admin_ec_lookup_without_store_answers_not_implemented() {
+        let router = router_for(IdentityPlatform::default());
+
+        for path in [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{MISSING_EC_ID}"),
+        ] {
+            let response = get(&router, &path);
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "should answer 501 for {path} without a record store"
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_admin_eids_lookup_answers_locally() {
+        let router = router_for(IdentityPlatform::default());
+
+        let response = get(&router, "/_ts/admin/eids");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should answer the EIDs echo without a record store"
+        );
+    }
 
     #[test]
     fn build_without_platform_services_has_no_store_and_no_limit() {

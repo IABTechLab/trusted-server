@@ -43,10 +43,10 @@ use super::prebid_eids::{
 use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
-const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
+pub(super) const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
 
 /// Route used by the request-only EID cookie diagnostic.
-const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
+pub(super) const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
 
 /// Reserved Trusted Server admin prefix.
 ///
