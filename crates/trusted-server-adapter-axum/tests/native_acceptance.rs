@@ -59,15 +59,15 @@ fn ec_response_cookie(response: &Response) -> Option<String> {
 
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
 #[test]
-#[ignore = "requires CELLD_EC_TEST_BINARY and celld-ec,geo-cloudfront features; real disposable servers only"]
+#[ignore = "requires official CELLD_EC_TEST_BINARY, matching EDGEZERO_CELLD_STORE_SERVICE and celld-ec,geo-cloudfront"]
 fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage() {
     let mut celld = celld_fixture::CelldFixture::new();
     let origin = origin::Origin::start("celld-ec-http");
     let mut prepared = Prepared::new(&origin.base_url);
-    let mut storage =
-        serde_json::to_value(celld.settings()).expect("should serialize pure selected binding");
-    storage["provider"] = json!("celld");
-    prepared.data["ec"]["storage"] = storage;
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.record_binding(
+        serde_json::to_value(celld.settings()).expect("should serialize native binding"),
+    );
     prepared.data["ec"]["partners"] = json!([{"name":"Fixture partner","source_domain":"partner.example.com","bidstream_enabled":true,"pull_sync_enabled":false}]);
     prepared.publish();
     let profile = prepared.workspace.path().join("native-geo.toml");
@@ -161,7 +161,10 @@ fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage
     );
     drop(app);
     celld.restart();
-    prepared.data["ec"]["storage"]["endpoint"] = json!(celld.endpoint);
+    prepared.record_binding(
+        serde_json::to_value(celld.settings())
+            .expect("should update native endpoint after restart"),
+    );
     prepared.publish();
     app = prepared.spawn_with_geo(true, Some(&profile));
     app.ready();
@@ -270,6 +273,17 @@ impl Prepared {
         .expect("should publish local prepared config");
     }
 
+    #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+    fn record_binding(&self, mut binding: Value) {
+        binding["provider"] = json!("celld-records");
+        fs::write(
+            self.workspace.path().join("native-bindings.toml"),
+            toml::to_string(&json!({"version":1,"kv":{"trusted_server_kv":binding}}))
+                .expect("should encode native connector settings"),
+        )
+        .expect("should write native connector settings");
+    }
+
     fn spawn(&self, trusted_proxy: bool) -> Running {
         self.spawn_with_geo(trusted_proxy, None)
     }
@@ -333,6 +347,12 @@ impl Prepared {
                 format!("EDGEZERO__SECRETS__{}", key.to_ascii_uppercase()),
                 value,
             );
+        }
+        let bindings = root.join("native-bindings.toml");
+        if bindings.is_file() {
+            command
+                .env("TS_EC_RECORDS_ENABLED", "true")
+                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
         }
         if trusted_proxy {
             command

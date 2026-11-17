@@ -42,7 +42,7 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-edgezero-store-celld = { workspace = true, features = ["records-v2"] }
+edgezero-store-celld = { workspace = true, features = ["records"] }
 # SDK use is fixture administration only. Production persistence is EdgeZero-owned.
 aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
