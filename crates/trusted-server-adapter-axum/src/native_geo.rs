@@ -58,7 +58,7 @@ enum GeoSelection {
 
 /// Capture the application-owned selection once before starting the runner.
 ///
-/// An absent profile defers provider selection to EdgeZero. A supplied
+/// An absent profile defers provider selection to `EdgeZero`. A supplied
 /// unreadable or invalid file is an error, never a silent fallback.
 ///
 /// # Errors
