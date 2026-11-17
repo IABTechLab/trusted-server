@@ -371,10 +371,8 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so the entry point rebuilds the graph from
-    /// settings when this is set.
+    /// Whether EC finalization may write to the KV identity graph, which the
+    /// entry point takes from the identity app built once per sandbox.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
@@ -388,7 +386,7 @@ pub(crate) struct EcFinalizeState {
 struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
-    finalize_kv_graph: Option<KvIdentityGraph>,
+    use_finalize_kv: bool,
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
@@ -407,7 +405,7 @@ impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            use_finalize_kv: self.use_finalize_kv,
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
@@ -496,20 +494,19 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = identity.identity_graph().cloned();
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
+    let use_finalize_kv = identity.identity_graph().is_some()
+        && setup_error.is_none()
+        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()));
+    let kv_graph = if is_real_browser {
+        identity.identity_graph().cloned()
     } else {
         None
     };
-    let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
         ec_context,
         kv_graph,
-        finalize_kv_graph,
+        use_finalize_kv,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
