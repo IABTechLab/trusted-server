@@ -31,7 +31,7 @@ use axum::http::Request as AxumRequest;
 use base64::Engine as _;
 use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
-use edgezero_adapter_axum::outbound::AxumOutboundClient;
+use edgezero_adapter_axum::outbound_executor::AxumOutboundExecutor;
 use edgezero_adapter_axum::request::into_core_request;
 use edgezero_adapter_axum::test_utils::AxumTestServer;
 use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
@@ -1076,14 +1076,14 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
     let origin = RecordingOrigin::start().await;
     let mut settings = test_settings();
     settings.publisher.origin_url = format!("http://{}", origin.address);
-    // EdgeZero's own Axum client goes in router state instead of a script, and
-    // the publisher forward runs through it.
-    // `bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin`
-    // proves the router-state client is the one that carries the forward.
-    let client = HttpClient::with_client(
-        AxumOutboundClient::try_new().expect("should build EdgeZero's Axum outbound client"),
-    );
-    let server = serve(Adapter::Axum.app(settings, client)).await;
+    // Let the runner create its native client on the serving thread that owns
+    // its executor. The forbidding-router-client companion test still proves
+    // that an explicit router-state client overrides this production client.
+    let router =
+        AxumApp::routes_with_settings(settings).expect("should build the native Axum routes");
+    let app = App::from_router::<AxumApp>(router, AXUM_PLATFORM)
+        .expect("should assemble the native Axum app");
+    let server = serve(app).await;
 
     // A chunked body that holds only its terminating chunk is bodiless, but
     // the listener learns that only by reading it, so the app receives the
@@ -2326,6 +2326,7 @@ mod trace_parity {
             HttpClient::with_client(outbound.clone()),
         )
         .expect("should build native Axum forwarded routes");
+        let executor = AxumOutboundExecutor::new();
         for duplicate in [false, true] {
             let request = forwarded_request("/_ts/trace/enable");
             let (mut parts, _) = request.into_parts();
@@ -2340,9 +2341,12 @@ mod trace_parity {
                     http::HeaderValue::from_static(FORWARDER_SECRET),
                 );
             }
-            let request = into_core_request(AxumRequest::from_parts(parts, AxumBody::empty()))
-                .await
-                .expect("should convert the native Axum request");
+            let request = into_core_request(
+                AxumRequest::from_parts(parts, AxumBody::empty()),
+                executor.handle(),
+            )
+            .await
+            .expect("should convert the native Axum request");
             let response = RouterService::oneshot(&router, request)
                 .await
                 .expect("should dispatch forwarded action");
