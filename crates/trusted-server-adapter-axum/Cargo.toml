@@ -53,6 +53,6 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
-edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-records.202611.1", default-features = false, features = ["dynamodb-records"] }
+edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-records.202611.2", default-features = false, features = ["dynamodb-records"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
