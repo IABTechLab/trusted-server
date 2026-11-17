@@ -398,7 +398,7 @@ The Prebid provider extracts metadata from the Prebid Server response and attach
 
 ### Upstream HTTP errors
 
-When Prebid Server returns a non-2xx status, the provider detail always includes a safe error classification, HTTP status, and generic message:
+When Prebid Server returns a non-2xx status whose body fits the 2 MiB response cap, the provider detail always includes a safe error classification, HTTP status, and generic message:
 
 ```json
 {
@@ -407,6 +407,8 @@ When Prebid Server returns a non-2xx status, the provider detail always includes
   "message": "Prebid Server returned HTTP 400"
 }
 ```
+
+A non-2xx response whose body is over the cap fails in transport instead: its `error_type` is `transport`, with no HTTP status ([Timeout behavior](/guide/auction-orchestration#timeout-behavior)).
 
 With `debug = true`, Trusted Server also extracts the first error message from allowlisted JSON fields (`message`, `error`, `errors`, `detail`, `title`, or `reason`) or a plain-text response. The message is normalized to one line and limited to 500 characters:
 

@@ -12,6 +12,7 @@
 //! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
+//! - [`outbound`]: Outbound request settings and failure mapping
 //! - [`integrations::prebid`]: Prebid integration and real-time bidding support
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
@@ -19,6 +20,8 @@
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
 
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 #![cfg_attr(
     test,
     allow(
@@ -47,6 +50,7 @@ pub mod cookies;
 pub mod creative;
 pub mod creative_opportunities;
 pub mod ec;
+pub mod edge_app;
 pub(crate) mod edge_cookie;
 pub mod error;
 pub mod forwarder;
@@ -58,6 +62,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod openrtb;
+pub mod outbound;
 pub mod platform;
 pub mod price_bucket;
 pub mod proxy;

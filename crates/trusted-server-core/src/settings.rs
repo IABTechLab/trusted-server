@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::asset_image_optimizer::image_optimizer_region;
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
@@ -24,7 +25,6 @@ use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
-use crate::platform::PlatformImageOptimizerRegion;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -34,10 +34,13 @@ pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 /// Build inputs that share the settings prefix but are not settings.
 ///
-/// The core build script exports these with `cargo:rustc-env`, and Cargo sets
-/// them on every `cargo test` run of this crate.
+/// Cargo sets the source version through `cargo:rustc-env`; release controls
+/// may also be inherited by test processes. Neither is runtime configuration.
 #[cfg(test)]
-const BUILD_ENVIRONMENT_VARIABLES: [&str; 1] = ["TRUSTED_SERVER__GIT_VERSION"];
+const BUILD_ENVIRONMENT_VARIABLES: [&str; 2] = [
+    "TRUSTED_SERVER__GIT_VERSION",
+    "TRUSTED_SERVER__RELEASE_BUILD",
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -175,6 +178,19 @@ impl Publisher {
         "replace-with-random-proxy-secret",
     ];
 
+    /// Drops `origin_host_header_override` on Spin, with a warning.
+    ///
+    /// Spin sends the origin URI authority as `Host` and cannot override it, so
+    /// the Spin adapter calls this when it loads settings. A config that sets
+    /// the override keeps serving there, with the URI authority.
+    pub fn drop_origin_host_header_override_for_spin(&mut self) {
+        if self.origin_host_header_override.take().is_some() {
+            log::warn!(
+                "publisher.origin_host_header_override is ignored on Spin; the origin receives its URI authority as Host"
+            );
+        }
+    }
+
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
     /// Per spec §5.2, EC cookies derive their domain from
@@ -295,14 +311,6 @@ impl Publisher {
             .clone()
             .unwrap_or_else(|| format!("https://{}", self.domain))
     }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
-    }
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -344,6 +352,23 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 }
 
 impl IntegrationSettings {
+    /// Builds the redacted parse error shared by every integration config parser.
+    pub(crate) fn parse_error(
+        integration_id: &str,
+        error: serde_json::Error,
+    ) -> Report<TrustedServerError> {
+        let detail = error.to_string();
+        let mut message =
+            format!("Integration '{integration_id}' configuration could not be parsed");
+        // Field diagnostics identify schema keys. Other serde errors can echo
+        // configuration values, so retain them only in the report's cause chain.
+        if detail.starts_with("unknown field ") || detail.starts_with("missing field ") {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        Report::new(error).change_context(TrustedServerError::Configuration { message })
+    }
+
     /// Inserts a configuration value for an integration.
     ///
     /// # Errors
@@ -414,21 +439,13 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
-            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            })?;
+            T::validate_disabled_schema(raw)
+                .map_err(|error| Self::parse_error(integration_id, error))?;
             return Ok(None);
         }
 
-        let config: T = serde_json::from_value(raw.clone()).change_context(
-            TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            },
-        )?;
+        let config: T = serde_json::from_value(raw.clone())
+            .map_err(|error| Self::parse_error(integration_id, error))?;
 
         // Field validation runs only for integrations that resolve to enabled.
         // An integration whose `enabled` flag is omitted falls back to its
@@ -1179,7 +1196,7 @@ impl AssetImageOptimizerConfig {
                         .to_string(),
             }));
         }
-        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+        if image_optimizer_region(&self.region).is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "proxy.asset_routes image_optimizer region `{}` is not supported",
@@ -1955,9 +1972,7 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Enable TLS certificate verification when proxying to HTTPS origins.
-    /// Defaults to true for secure production use.
-    /// Set to false for local development with self-signed certificates.
+    /// Must be true. Origin TLS is always verified.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the
@@ -2092,6 +2107,7 @@ impl Proxy {
 
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TinybirdSettings {
     /// Master enablement for auction telemetry ingestion.
     #[serde(default)]
@@ -2998,6 +3014,7 @@ pub enum AuctionDebugCommentFormat {
 
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
@@ -4309,7 +4326,7 @@ mod tests {
     use super::*;
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
+        IntegrationRegistry, gpt::GptConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
     };
     use crate::redacted::Redacted;
@@ -6520,8 +6537,8 @@ origin_host_header_override = "www.example.com:8443""#,
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
-            "www.example.com:8443",
+            settings.publisher.origin_host_header_override.as_deref(),
+            Some("www.example.com:8443"),
             "should use configured host header override"
         );
     }
@@ -6573,6 +6590,63 @@ origin_host_header_overide = "www.example.com""#,
             assert!(
                 result.is_err(),
                 "origin_host_header_override {override_value:?} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_parse_errors_hide_invalid_values() {
+        for enabled in [true, false] {
+            let mut integrations = IntegrationSettings::default();
+            integrations.insert(
+                "gpt".to_string(),
+                json!({
+                    "enabled": enabled,
+                    "gam_attribution_enabled": "fictional-private-value",
+                }),
+            );
+
+            let error = integrations
+                .get_typed::<GptConfig>("gpt")
+                .expect_err("should reject an invalid boolean for enabled and disabled configs");
+            let message = error.to_string();
+            assert!(
+                message.contains("Integration 'gpt' configuration could not be parsed"),
+                "should retain integration context"
+            );
+            assert!(
+                !message.contains("fictional-private-value"),
+                "should not echo invalid values in the outer error message"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_parse_errors_name_missing_fields() {
+        let mut integrations = IntegrationSettings::default();
+        integrations.insert("lockr".to_string(), json!({ "enabled": true }));
+
+        let error = integrations
+            .get_typed::<LockrConfig>("lockr")
+            .expect_err("should reject missing required integration fields");
+        assert!(
+            error.to_string().contains("missing field"),
+            "should retain missing-field diagnostics"
+        );
+    }
+
+    #[test]
+    fn settings_reject_unknown_tester_cookie_and_tinybird_fields() {
+        for section in ["tester_cookie", "tinybird"] {
+            let source = format!(
+                "{}\n[{section}]\nmade_up_key = true\n",
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&source)
+                .expect_err("should reject unknown keys in strict settings sections");
+            assert!(
+                format!("{error:?}").contains("made_up_key"),
+                "should name offending {section} key: {error:?}"
             );
         }
     }
@@ -7286,19 +7360,21 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn legacy_env_loader_ignores_build_time_git_version() {
+    fn legacy_env_loader_ignores_build_time_inputs() {
         let toml_str = crate_test_settings_str();
 
         for key in [
             "TRUSTED_SERVER__GIT_VERSION",
             "trusted_server__git_version",
             "Trusted_Server__Git_Version",
+            "TRUSTED_SERVER__RELEASE_BUILD",
+            "trusted_server__release_build",
+            "Trusted_Server__Release_Build",
         ] {
-            for value in ["v0.0.0-example", ""] {
+            for value in ["v0.0.0-example", "1", ""] {
                 temp_env::with_var(key, Some(value), || {
-                    Settings::from_toml_and_env(&toml_str).expect(
-                        "should ignore the build-time git version input regardless of case",
-                    );
+                    Settings::from_toml_and_env(&toml_str)
+                        .expect("should ignore build-time inputs regardless of case");
                 });
             }
         }
@@ -7321,7 +7397,6 @@ source_domain = "partner.example.com"
                 settings.publisher.origin_host_header_override.as_deref(),
                 Some("www.example.com")
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
@@ -7429,40 +7504,6 @@ source_domain = "partner.example.com"
             allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            public_origin: None,
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            public_origin: None,
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]

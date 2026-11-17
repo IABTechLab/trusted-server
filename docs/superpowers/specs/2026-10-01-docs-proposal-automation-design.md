@@ -7,29 +7,31 @@
 
 ## Purpose
 
-When a merge to `main` changes behavior that the public documentation
-describes, a reviewable pull request with the proposed documentation diff
-should appear automatically. Today `deploy-docs.yml` only builds and deploys
+When code merged to `main` or a release branch changes behavior that the
+public documentation describes, a maintainer should be able to get a
+reviewable pull request with the proposed documentation diff for any range of
+those changes. Today `deploy-docs.yml` only builds and deploys
 the VitePress site after documentation changes land; nothing proposes edits
 after a code merge.
 
-This design adds a proposal path that never writes to `main`. It is a
+This design adds a proposal path that never writes to the target branch. It is a
 deliberate, scoped addition to the documentation refresh design
 (`2026-08-19-documentation-refresh-design.md`), which excluded automated
-tracked-file write paths. The exclusion still holds for `main`: automation
-only ever writes to a dedicated proposal branch and a pull request.
+tracked-file write paths. The exclusion still holds for `main` and every
+other target branch: automation only ever writes to a dedicated proposal
+branch and a pull request.
 
 ## Decisions
 
-| Question                                     | Decision                                                                                                                                  |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| How is prose produced?                       | GitHub Copilot CLI, run headless in GitHub Actions with the workflow `GITHUB_TOKEN` (`copilot-requests: write`), billed to the org.       |
-| Which code changes are examined?             | Pushes to `main` touching `crates/**`, `trusted-server.example.toml`, `edgezero.toml`, `fastly.toml`, `.cargo/config.toml`, `scripts/**`. |
-| Which pages may change?                      | `docs/guide/**` and `docs/index.md` only — the public site validated by the docs gates.                                                   |
-| How is prose checked against merged code?    | Copilot cites the merged source for every hunk; a per-hunk review exposes the evidence and a one-click revert; a human approves.          |
-| How do sequential or overlapping merges map? | One pull request per merge commit on branch `docs/auto/<short-sha>`; runs are serialized.                                                 |
-| What happens on an empty diff?               | No pull request. An existing proposal pull request for that SHA is closed.                                                                |
-| What prevents duplicates on retry?           | The branch name is derived from the merge SHA; a retry updates that branch and pull request, but never over maintainer commits.           |
+| Question                                     | Decision                                                                                                                                    |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| How is prose produced?                       | GitHub Copilot CLI, run headless in GitHub Actions with the workflow `GITHUB_TOKEN` (`copilot-requests: write`), billed to the org.         |
+| Which code changes are examined?             | The commits after a maintainer-chosen `since` up to `sha` on the branch the workflow is dispatched on.                                      |
+| Which pages may change?                      | `docs/guide/**` and `docs/index.md` only — the public site validated by the docs gates.                                                     |
+| How is prose checked against merged code?    | Copilot cites the merged source for every hunk; a per-hunk review exposes the evidence and a one-click revert; a human approves.            |
+| How do sequential or overlapping ranges map? | One pull request per target branch and `sha`; runs are serialized. Overlapping ranges open separate proposals, so maintainers pick `since`. |
+| What happens on an empty diff?               | No pull request. An existing proposal pull request for that branch and SHA is closed.                                                       |
+| What prevents duplicates on retry?           | The branch name is derived from the target branch and `sha`; a retry updates that branch and pull request, but never maintainer commits.    |
 
 ## Workflow shape
 
@@ -37,23 +39,24 @@ only ever writes to a dedicated proposal branch and a pull request.
 token that can push or open pull requests, and proposal content is never built
 or executed in a job that can.
 
-Every job checks out the workflow's own revision into `tools/` and the merge
+Every job checks out the workflow's own revision into `tools/` and the chosen
 commit into `source/`, then runs the scripts from `tools/` against `source/`.
-Retrying a merge that predates this tooling therefore works, and a retry runs
-the current scripts rather than historical ones.
+A range that predates this tooling therefore works, and a retry runs the
+branch's current scripts rather than historical ones.
 
 ### Trigger
 
-- `push` to `main`, filtered to the source paths above. `docs/**` and
-  `scripts/docs-proposal/**` are not included, so a merged documentation
-  proposal or a change to this tooling never retriggers the workflow.
-- `workflow_dispatch` with a required `sha` input and an optional `base`
-  input, for retries and for the first end-to-end validation. All three
-  scripts require a full 40-character SHA reachable from `origin/main`.
+- `workflow_dispatch` only. "Use workflow from" picks the target branch
+  (`github.ref_name`): the branch whose changes are proposed and that the pull
+  request targets, so it must contain this workflow. A dispatch from a tag
+  fails. Inputs are a required `since`, the last commit already documented,
+  and an optional `sha`, the last commit to include, defaulting to the
+  branch head at dispatch. The propose job resolves `sha` once and the later
+  jobs reuse it. All three scripts require a full 40-character SHA reachable
+  from `origin/<target branch>`.
 - `concurrency` with `group: docs-proposal`, `cancel-in-progress: false`, and
-  `queue: max` so sequential merges are processed one at a time, in order.
-  The default queue keeps one pending run and cancels the rest, which would
-  skip merges.
+  `queue: max` so runs are processed one at a time, in order. The default
+  queue keeps one pending run and cancels the rest.
 
 ### Job `propose`
 
@@ -63,12 +66,12 @@ Permissions: `contents: read`, `copilot-requests: write`.
 2. Install Copilot CLI (`@github/copilot`) at a pinned version.
 3. `scripts/docs-proposal/propose.sh <sha> .docs-proposal <base>`:
    1. Renders `.docs-proposal/prompt.md` from `scripts/docs-proposal/prompt.md`,
-      the merge SHA, its base, its subject, and the Sources-of-truth table from
-      the refresh design. The base is the push's previous `main` head, or the
-      manual dispatch's optional `base` input, falling back to the first
-      parent when it is missing or not an ancestor, so Copilot inspects
-      `git diff <base> <sha>`: a multi-commit push is covered in full, and a
-      clean merge commit is not hidden by `git show`'s empty combined diff.
+      the target branch, `sha`, its base, its subject, and the Sources-of-truth
+      table from the refresh design. The base is `since`; one that is not an
+      earlier commit of `sha` fails the run. Called without a base, the script
+      falls back to the first parent. Copilot inspects `git diff <base> <sha>`,
+      so a multi-commit range is covered in full, and a clean merge commit is
+      not hidden by `git show`'s empty combined diff.
    2. Runs `copilot -p` with `--no-ask-user`, `--allow-tool=write`, and
       `git show`, `git diff`, and `git log` shell tools; `git push` and
       `git commit` are denied, and file reads need no permission. `git grep`
@@ -110,14 +113,17 @@ and nothing installs, builds, or executes proposal content.
 
 `scripts/docs-proposal/publish.sh <sha> .docs-proposal`:
 
-1. If a closed or merged pull request already exists for
-   `docs/auto/<short-sha>`, leave it alone and exit successfully: a
+1. The proposal branch is `docs/auto/<short-sha>` for `main`, and
+   `docs/auto/<branch-hash>/<short-sha>` for any other target branch, where
+   `<branch-hash>` is a short `git hash-object` of the branch name, so the
+   same commit on two branches gets two proposals. If a closed or merged pull
+   request already exists for it, leave it alone and exit successfully: a
    maintainer's decision is never reopened or recreated. Pull requests from
    forks that reuse the branch name are ignored.
 2. If an open pull request records a different base in its body, fail: the
-   retry inspected another range, such as a manual dispatch without the base
-   of a multi-commit push, and must not narrow or close the proposal. The
-   error names the recorded base to rerun with.
+   retry inspected another range, such as one with another `since`, and must
+   not narrow or close the proposal. The error names the recorded base to
+   rerun with as `since`.
 3. Look up the remote branch with `git ls-remote --exit-code`. Only a
    verified absent branch counts as new; any other lookup or fetch failure
    fails the run, so an error never hides maintainer commits. If the remote
@@ -135,14 +141,17 @@ and nothing installs, builds, or executes proposal content.
    checkout of the merge commit.
 5. Reject the proposal again if any changed path is outside `docs/guide/**` or
    `docs/index.md`, or any changed entry is not a regular file.
-6. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
+6. Commit as `github-actions[bot]` on the proposal branch. If the remote
    branch already exists and its tree equals the new tree, reuse the remote
    commit and skip the push, so a retry resumes any later step that failed.
    Otherwise push with a lease on the fetched head.
-7. Find the originating pull request with
-   `gh api repos/{owner}/{repo}/commits/<sha>/pulls`. Create the pull request,
-   or edit the existing one, with a body that links the merge commit and the
-   originating pull request, records the inspected base, includes `rationale.md` as a
+7. For a single-commit range, find the originating pull request with
+   `gh api repos/{owner}/{repo}/commits/<sha>/pulls` and title the proposal
+   after the commit's subject. A longer range is titled
+   `<n> commits on <branch>, latest: <subject>` and links no single pull
+   request. Create the pull request against the target branch, or edit the
+   existing one, with a body that links `sha` and any originating pull
+   request, records the inspected base, includes `rationale.md` as a
    fenced `text` block with its `@` mentions neutralized, so links, HTML,
    issue references, and closing keywords in it stay inert, and states that
    a human must verify the prose against the code before merging.
@@ -197,11 +206,14 @@ Documented in `scripts/README.md`:
   is treated as able to run arbitrary code. Its token is read-only, neither it
   nor `validate` restores or saves a dependency cache, and its artifact is
   re-checked by `validate.sh` and `publish.sh`.
-- Both jobs run on the `main` ref, and code running in a job can save cache
-  entries scoped to `main` without declaring a cache. `deploy-docs.yml`, the
-  only privileged workflow that restored a cache, therefore installs docs
-  dependencies without one.
-- Input is code already merged to `main`, so no untrusted fork content reaches
+- Both jobs run on the target branch's ref, and code running in a job can
+  save cache entries scoped to that branch without declaring a cache. For
+  `main`, `deploy-docs.yml`, the only privileged workflow that restored a
+  cache, therefore installs docs dependencies without one.
+- Input is code already on the target branch, and the scripts and workflow
+  come from that same branch. Dispatching needs write access, which can
+  already push and dispatch any workflow on an unprotected branch, so the
+  workflow grants no new reach to that branch's code. No fork content reaches
   the agent.
 - The path allowlist is enforced by `validate.sh` and again by `publish.sh`,
   not by the prompt.
@@ -223,17 +235,19 @@ Documented in `scripts/README.md`:
   rerun that leaves maintainer commits in place, an empty rerun that races a
   maintainer push, a failed branch fetch on both the empty and push paths,
   deleting an unmaintained branch before closing its proposal, retries over a different or
-  unrecorded range, a closed proposal, PR body rendering, and how
-  `propose.sh` resolves the base of a multi-commit push, renders the work
-  dir into prompts, and runs, or survives a failure of, the evidence half.
+  unrecorded range, a closed proposal, PR body rendering, how
+  `propose.sh` resolves or rejects the base of a range, renders the work
+  dir and branch into prompts, and runs, or survives a failure of, the
+  evidence half, and, for a non-`main` branch, reachability, the pull request
+  base, a branch-scoped proposal, and a multi-commit title.
 - `shellcheck` passes for every script.
 - The `docs-proposal-scripts` job in `format.yml` runs all three on every
   pull request.
 - Copilot cannot run locally; the first `workflow_dispatch` run against a
-  recent merge SHA is the end-to-end test.
+  recent range is the end-to-end test.
 
 ## Out of scope
 
 - Crate READMEs, `docs/internal/**`, and `docs/superpowers/**`.
-- Rolling or merged proposals across several merges.
+- Merging or rebasing proposals whose ranges overlap.
 - A GitHub App token to trigger regular CI on proposal pull requests.

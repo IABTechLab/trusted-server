@@ -369,8 +369,8 @@ fn a_url_carrying_credentials_is_refused() {
 
 #[test]
 fn an_rsc_varying_origin_fails_the_rsc_axis() {
-    // RSC fetches already flow through the readthrough cache while HTML navigations are
-    // passed, so this is the axis specific to removing the bypass.
+    // The origin answers an RSC request with a different body and sends no `Vary: rsc`,
+    // so one shared entry could serve either body in place of the other.
     let server = FixtureServer::start(|request| {
         let body = if request.header("rsc").is_some() {
             "<html>flight payload</html>"
@@ -425,7 +425,7 @@ fn an_origin_without_freshness_fails_its_verdict() {
     assert!(!ok);
     assert!(
         !verdict(&report, "freshness").passed,
-        "readthrough would store this on a platform default where the template cache declines it"
+        "the template cache declines a response without positive freshness"
     );
 }
 

@@ -385,6 +385,7 @@ for (const mode of ['selected', 'empty'] as const) {
       'example-creative',
       'Trace fixture creative',
       'bidder.example.com',
+      '/api/trace-bidder',
     ])
       expect(publicEvidence).not.toContain(forbidden)
     if (mode === 'selected') {

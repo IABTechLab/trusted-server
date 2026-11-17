@@ -32,14 +32,15 @@ pub const HEADER_X_COMPRESS_HINT: HeaderName = HeaderName::from_static("x-compre
 pub const HEADER_X_DEBUG_FASTLY_POP: HeaderName = HeaderName::from_static("x-debug-fastly-pop");
 
 // Staging / version identification headers
-/// Deployed git version: tag, else branch, else 6-char commit (see [`TS_GIT_VERSION`]).
+/// Release source commit, or development ref/short commit (see [`TS_GIT_VERSION`]).
 pub const HEADER_X_TS_VERSION: HeaderName = HeaderName::from_static("x-ts-version");
 /// Fastly service version (`FASTLY_SERVICE_VERSION`), formerly sent as `x-ts-version`.
 pub const HEADER_X_TS_FASTLY_VERSION: HeaderName = HeaderName::from_static("x-ts-fastly-version");
 pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 
 /// Deployed git version compiled in by `build.rs`, from the deploy pipeline's
-/// `TRUSTED_SERVER__GIT_VERSION` or local git. `None` when unknown.
+/// `TRUSTED_SERVER__GIT_VERSION` or local git. Release mode requires the full
+/// lowercase commit; development retains ref/short-commit display. `None` when unknown.
 pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_VERSION") {
     Some(version) if !version.is_empty() => Some(version),
     _ => None,
