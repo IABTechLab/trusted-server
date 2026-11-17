@@ -4,7 +4,7 @@ Status: draft, in review in #1559; the plan's GitHub tasks ran on 2026-11-13.
 Read at Trusted Server main `598a85170` and EdgeZero main `e11ea308` (crates at
 `v0.0.11`) on 2026-11-11 and 2026-11-12. [Integration
 branches](#integration-branches) and the State lines that cite it were read on
-2026-11-15, at Trusted Server main `1810c763a`. Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
+2026-11-17, at Trusted Server main `1810c763a`. Epics: #1558 (Trusted Server) and IABTechLab/edgezero#468 (EdgeZero). Plan:
 [server-side identity
 plan](../plans/2026-11-11-server-side-identity-all-adapters.md).
 
@@ -92,25 +92,31 @@ the PRs stacked on it.
 
 ### Integration branches
 
-Read on 2026-11-15. Each repository keeps an integration branch named
+Read on 2026-11-17. Each repository keeps an integration branch named
 `rc/identity` (DEC-5, DEC-20). Each joins ready pull requests with
 history-preserving merges and moves only forward: a pull request whose head
 moves is merged again on top, and the branch is never force-pushed. Neither
 branch has tags or branch protection. Each included pull request keeps its own
-review and still lands on main by itself.
+review and still lands on main by itself. Each branch carries every pull
+request that delivers an in-review issue under its epic and is not a draft.
 
-| Branch                       | Pull request            | Head        | Carries                                                                                                                                                                                                                                                                          | Included heads that moved since                             |
-| ---------------------------- | ----------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| EdgeZero `rc/identity`       | IABTechLab/edgezero#495 | `10166628`  | Main `e11ea308` with IABTechLab/edgezero#275, IABTechLab/edgezero#499, IABTechLab/edgezero#460, IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#409, IABTechLab/edgezero#414, IABTechLab/edgezero#422, IABTechLab/edgezero#439 and IABTechLab/edgezero#469 | IABTechLab/edgezero#275 at `4cbabfee`, which merges cleanly |
-| Trusted Server `rc/identity` | #1608                   | `4bc4c4847` | Main `1810c763a` with #1557, #1525, #1526, #1503 and #1506                                                                                                                                                                                                                       | #1506 at `cc811fc7a`, which conflicts in `ec/pull_sync.rs`  |
+| Branch                       | Pull request            | Head        | Carries                                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ----------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EdgeZero `rc/identity`       | IABTechLab/edgezero#495 | `b6ada1cc`  | Main `e11ea308` with IABTechLab/edgezero#275, IABTechLab/edgezero#499, IABTechLab/edgezero#460, IABTechLab/edgezero#406, IABTechLab/edgezero#407, IABTechLab/edgezero#409, IABTechLab/edgezero#414, IABTechLab/edgezero#422, IABTechLab/edgezero#439, IABTechLab/edgezero#469 and IABTechLab/edgezero#502 |
+| Trusted Server `rc/identity` | #1608                   | `7b4a43f00` | Main `1810c763a` with #1557, #1503 and the chain #1506, #1614, #1525, #1526, #1487, #1488 and #1489 (DEC-21)                                                                                                                                                                                              |
 
-#1506 pins EdgeZero's branch at `10166628` by SHA. That revision carries
+#1506 pins EdgeZero's branch at `f84ffbbb` by SHA. That revision carries
 IABTechLab/edgezero#275 through IABTechLab/edgezero#439, so it holds R1's
 content (EZI-6), and it becomes Trusted Server main's pin when #1506 merges.
 IABTechLab/edgezero#422 now carries the celld record operations that
-IABTechLab/edgezero#463 held until it closed on 2026-11-13. The provider stack
-(#1487 to #1489) joins Trusted Server's branch once it rebases onto #1506.
-IABTechLab/edgezero#502 (EZI-4a) is the next EdgeZero pull request to join.
+IABTechLab/edgezero#463 held until it closed on 2026-11-13.
+IABTechLab/edgezero#502 delivers EZI-4a and reports Fastly and Cloudflare geo
+through `ctx.geo()`.
+
+The provider stack now sends its lookups through EdgeZero's outbound client and
+keeps its records on #1526's async store. A lookup response first observed
+after the batch cutoff is dropped, as the cutover already does for auction
+bids, and #1489 runs pull sync as an after-response provider on that client.
 
 ### How the EC record write is split
 
@@ -712,12 +718,22 @@ Decided:
   attestation and package publishing (#1449, #1463, #1543) are not part of
   this work and carry lower priority. The MVP builds the production image
   from source (AX-5) without publishing or attesting it.
-- **DEC-20 Trusted Server integration branch** (user, 2026-11-14). Trusted
-  Server keeps its own `rc/identity` (#1608) under DEC-5's rules: main and the
-  ready Trusted Server pull requests the identity work builds on, joined by
-  merges, on the EdgeZero revision #1506 pins. Its merge commits may resolve
-  conflicts between included pull requests, and #1608 lists each resolution.
-  The provider stack and the A tickets join it as they become ready.
+- **DEC-20 Trusted Server integration branch** (user, 2026-11-14; fixes
+  upstream, 2026-11-17). Trusted Server keeps its own `rc/identity` (#1608)
+  under DEC-5's rules: main and the ready Trusted Server pull requests the
+  identity work builds on, joined by merges, on the EdgeZero revision #1506
+  pins. Since 2026-11-17 a conflict between included pull requests is fixed in
+  the pull request that lands second, which merges the one below it, and the
+  branch takes plain merges; an issue under the epic is filed only when no open
+  pull request can carry the fix. The earlier resolutions in its own merges
+  (`30a74def1`, `4a414a00b`, `6b32d2b61`) stay in its history, and #1608 lists
+  them.
+- **DEC-21 Merge order: the cutover first** (user, 2026-11-17). The Trusted
+  Server pull requests stack linearly on #1506: #1614 (T1), #1525, #1526,
+  #1487, #1488 and #1489, each based on the one before it, with #1487 also
+  merging #1557. On GitHub the chain is stack 1621. Each pull request carries
+  its own adaptation to the ones below it, so T1, #1525 and #1526 now land after
+  #1506 instead of before it.
 
 Open:
 
@@ -923,3 +939,12 @@ IABTechLab/edgezero#469 now reads Axum's JA4 from a trusted proxy header, and
 EZI-2b's celld work moved from closed IABTechLab/edgezero#463 to
 IABTechLab/edgezero#422. The plan's Part A gains a State section, and its
 counts include the issues filed or moved after the run.
+
+### Chain and resync, 2026-11-17
+
+At the user's request both integration branches now carry every in-review
+issue's non-draft pull request, with each conflict fixed in the pull request
+that owns it. DEC-20 records that rule, and DEC-21 the merge order the user
+chose for it. [Integration branches](#integration-branches) lists the new
+heads and the provider stack's move onto EdgeZero's outbound client and #1526's
+async store.
