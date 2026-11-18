@@ -59,7 +59,9 @@ jobs:
         if: matrix.adapter == 'cloudflare'
         shell: bash
         run: |
-          npm install --global wrangler@4.83.0
+          wrangler_version=$(awk '$1 == "wrangler" { print $2; exit }' "$GITHUB_WORKSPACE/.tool-versions")
+          test -n "$wrangler_version"
+          npm install --global "wrangler@$wrangler_version"
           mkdir -p "$RUNNER_TEMP/bindgen"
           # Digests are published with the upstream GitHub release assets.
           # Update the digest alongside the pinned version.
