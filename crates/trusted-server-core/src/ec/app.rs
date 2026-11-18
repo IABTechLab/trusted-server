@@ -12,14 +12,13 @@
 
 use std::sync::Arc;
 
-use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
+use edgezero_core::http::{Method, Request, Response};
 use edgezero_core::router::RouterBuilder;
 use error_stack::Report;
 
-use crate::error::{IntoHttpResponse as _, TrustedServerError};
+use crate::error::{TrustedServerError, http_error};
 use crate::settings::Settings;
 
 use super::admin::{
@@ -155,31 +154,20 @@ impl IdentityApp {
 
     fn admin_ec_lookup(&self, req: &Request) -> Response {
         handle_admin_ec_lookup(self.identity_graph.as_ref(), &self.partners, req)
-            .unwrap_or_else(|report| error_response(&report))
+            .unwrap_or_else(|report| http_error(&report))
     }
 
     fn admin_eids_lookup(&self, req: &Request) -> Response {
         handle_admin_eids_lookup(&self.partners, req)
-            .unwrap_or_else(|report| error_response(&report))
+            .unwrap_or_else(|report| http_error(&report))
     }
 }
 
 const ADMIN_EC_BY_ID_PATH: &str = "/_ts/admin/ec/{id}";
 
-fn error_response(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {report:?}");
-    let mut response = Response::new(Body::from(format!("{}\n", root_error.user_message())));
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 #[cfg(test)]
 mod tests {
+    use edgezero_core::body::Body;
     use edgezero_core::http::StatusCode;
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
