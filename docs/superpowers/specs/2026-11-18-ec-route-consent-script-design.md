@@ -292,3 +292,7 @@ them.
   answer to a call queued after it lifts it, while a repeated withdrawal that
   is already queued does not. Removed two test-only members and made the
   no-route preservation test cover both modes.
+- Fix re-review: a withdrawal with an unsendable TC string now fences even when
+  its GPP part is still sent, because the server answers that call from the
+  stale `euconsent-v2` cookie; and after a fence, a reading equal to the last
+  call is sent again so its answer can lift suppression.

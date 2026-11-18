@@ -298,6 +298,36 @@ describe('EcRouteClient', () => {
     expect(client.mirrorSource(), 'a later valid reading lifts it').toEqual([cookieId]);
   });
 
+  it('resends an earlier state after an unsendable withdrawal and lifts on its answer', async () => {
+    client.report(tcf('CPa.AA'));
+    calls[0].resolve(json([routeId]));
+    await settle();
+    client.report(tcf('', []));
+    expect(client.mirrorSource()).toEqual([]);
+    client.report(tcf('CPa.AA'));
+    expect(calls, 'the repeat of A is sent again').toHaveLength(2);
+    calls[1].resolve(json([routeId]));
+    await settle();
+    expect(client.mirrorSource()).toEqual([routeId]);
+  });
+
+  it('keeps a TCF withdrawal sent without its TC string suppressed after its answer', async () => {
+    const gpp = { gppString: 'DBA', applicableSections: [7] };
+    client.report({ ...tcf('CPa.AA'), gpp });
+    calls[0].resolve(json([routeId]));
+    await settle();
+    client.report({ ...tcf('bad;', ['p4']), gpp });
+    expect(calls, 'the GPP part is still reported').toHaveLength(2);
+    calls[1].resolve(json([routeId]));
+    await settle();
+    expect(client.mirrorSource(), 'a cookie-based answer must not lift it').toEqual([]);
+
+    client.report({ ...tcf('CPb.AA'), gpp });
+    calls[2].resolve(json([cookieId]));
+    await settle();
+    expect(client.mirrorSource()).toEqual([cookieId]);
+  });
+
   it('lifts suppression after a repeated withdrawal is answered', async () => {
     client.report(tcf('CPa.AA', ['p1']));
     client.report(tcf('CPa.AA', ['p1']));

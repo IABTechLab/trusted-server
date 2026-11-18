@@ -4,7 +4,7 @@ import {
   ConsentQueue,
   isKnownWithdrawal,
   readConsentCookies,
-  requestBody,
+  sendableSnapshot,
   type ConsentSnapshot,
   type CookieView,
   type QueueEntry,
@@ -63,11 +63,13 @@ export class EcRouteClient {
   private readonly queue = new ConsentQueue();
   private sending = false;
   private suppressed = false;
-  // A known withdrawal that cannot be sent queues nothing, so the grant
-  // already in flight would otherwise lift its suppression when answered. An
-  // answer lifts suppression only when its call was queued after the latest
-  // such fence.
+  // A known withdrawal the server cannot receive as a TCF signal (its TC
+  // string is unsendable) must not be lifted by the answer to an earlier call,
+  // or to its own GPP-only call, which the server answers from the stale
+  // `euconsent-v2` cookie. Such a withdrawal fences suppression: only an
+  // answer to a call queued after the fence lifts it.
   private fenceEpoch = 0;
+  private lastQueuedEpoch = 0;
   private readonly entryEpochs = new WeakMap<QueueEntry, number>();
   private applied?: { eids: MirrorEid[]; cookie: string | undefined };
 
@@ -79,15 +81,25 @@ export class EcRouteClient {
 
   /** Records a new CMP snapshot and sends it when its turn comes. */
   report(snapshot: ConsentSnapshot): void {
-    if (isKnownWithdrawal(snapshot)) {
+    const knownWithdrawal = isKnownWithdrawal(snapshot);
+    if (knownWithdrawal) {
       // A grant in flight may still deliver the mirror before this is answered.
       this.suppress();
       expireMirrorCookie();
-      if (requestBody(snapshot) === undefined) this.fenceEpoch++;
     }
-    const entry = this.queue.offer(snapshot, consentCookies());
+    // After a fence, a state equal to the last call must be sent again: the
+    // earlier answer to it can no longer lift suppression.
+    const entry = this.queue.offer(
+      snapshot,
+      consentCookies(),
+      this.lastQueuedEpoch !== this.fenceEpoch
+    );
     if (entry?.kind === 'barrier') this.suppress();
-    if (entry) this.entryEpochs.set(entry, this.fenceEpoch);
+    if (entry) {
+      this.entryEpochs.set(entry, this.fenceEpoch);
+      this.lastQueuedEpoch = this.fenceEpoch;
+    }
+    if (knownWithdrawal && !sendableSnapshot(snapshot).tcf) this.fenceEpoch++;
     this.pump();
   }
 
