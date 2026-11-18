@@ -326,35 +326,29 @@ describe('EcRouteClient', () => {
     expect(client.mirrorSource()).toEqual([routeId]);
   });
 
-  it('does not resend an identical fenced withdrawal', async () => {
-    const gpp = { gppString: 'DBA', applicableSections: [7] };
-    client.report({ ...tcf('CPa.AA'), gpp });
-    calls[0].resolve(json([]));
-    await settle();
-    for (let i = 0; i < 3; i++) client.report({ ...tcf('bad;', ['p4']), gpp });
-    expect(calls, 'pending: one call').toHaveLength(2);
-    calls[1].resolve(json([]));
-    await settle();
-    for (let i = 0; i < 3; i++) client.report({ ...tcf('bad;', ['p4']), gpp });
-    expect(calls, 'answered: still one call').toHaveLength(2);
-    expect(client.mirrorSource(), 'and still suppressed').toEqual([]);
-  });
-
-  it('keeps a TCF withdrawal sent without its TC string suppressed after its answer', async () => {
+  it('sends no call for a withdrawal without its TC string, and stays suppressed', async () => {
     const gpp = { gppString: 'DBA', applicableSections: [7] };
     client.report({ ...tcf('CPa.AA'), gpp });
     calls[0].resolve(json([routeId]));
     await settle();
-    client.report({ ...tcf('bad;', ['p4']), gpp });
-    expect(calls, 'the GPP part is still reported').toHaveLength(2);
-    calls[1].resolve(json([routeId]));
-    await settle();
-    expect(client.mirrorSource(), 'a cookie-based answer must not lift it').toEqual([]);
+    for (let i = 0; i < 3; i++) client.report({ ...tcf('bad;', ['p4']), gpp });
+    expect(calls, 'a GPP-only call would be answered from the stale cookie').toHaveLength(1);
+    expect(client.mirrorSource()).toEqual([]);
 
     client.report({ ...tcf('CPb.AA'), gpp });
-    calls[2].resolve(json([cookieId]));
+    calls[1].resolve(json([cookieId]));
     await settle();
-    expect(client.mirrorSource()).toEqual([cookieId]);
+    expect(client.mirrorSource(), 'a later valid reading lifts it').toEqual([cookieId]);
+  });
+
+  it('does not let a matching call queued before the withdrawal lift it', async () => {
+    const gpp = { gppString: 'DBA', applicableSections: [7] };
+    client.report({ gpp });
+    client.report({ ...tcf('bad;', ['p4']), gpp });
+    calls[0].resolve(json([routeId]));
+    await settle();
+    setMirror([routeId]);
+    expect(client.mirrorSource()).toEqual([]);
   });
 
   it('lifts suppression after a repeated withdrawal is answered', async () => {

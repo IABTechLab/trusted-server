@@ -4,7 +4,6 @@ import {
   ConsentQueue,
   isKnownWithdrawal,
   readConsentCookies,
-  requestBody,
   sendableSnapshot,
   type ConsentSnapshot,
   type CookieView,
@@ -65,11 +64,11 @@ export class EcRouteClient {
   private sending = false;
   private suppressed = false;
   // A known withdrawal the server cannot receive as a TCF signal (its TC
-  // string is unsendable) must not be lifted by the answer to an earlier call,
-  // or to its own GPP-only call, which the server answers from the stale
-  // `euconsent-v2` cookie. Such a withdrawal fences suppression: only an
-  // answer to a call queued after the fence lifts it, and the last answered
-  // state no longer deduplicates, so an unchanged later reading is sent.
+  // string is unsendable) is not sent at all: without its TC string the
+  // server would answer from the stale `euconsent-v2` cookie. It fences
+  // suppression instead: only an answer to a call queued after the fence
+  // lifts it, and the last answered state no longer deduplicates, so an
+  // unchanged later reading is sent.
   private fenceEpoch = 0;
   private readonly entryEpochs = new WeakMap<QueueEntry, number>();
   private applied?: { eids: MirrorEid[]; cookie: string | undefined };
@@ -82,22 +81,20 @@ export class EcRouteClient {
 
   /** Records a new CMP snapshot and sends it when its turn comes. */
   report(snapshot: ConsentSnapshot): void {
-    const knownWithdrawal = isKnownWithdrawal(snapshot);
-    if (knownWithdrawal) {
+    if (isKnownWithdrawal(snapshot)) {
       // A grant in flight may still deliver the mirror before this is answered.
       this.suppress();
       expireMirrorCookie();
+      if (!sendableSnapshot(snapshot).tcf) {
+        this.fenceEpoch++;
+        this.queue.forgetSent();
+        this.pump();
+        return;
+      }
     }
     const entry = this.queue.offer(snapshot, consentCookies());
     if (entry?.kind === 'barrier') this.suppress();
     if (entry) this.entryEpochs.set(entry, this.fenceEpoch);
-    // A repeat already represented by a pending or answered call is not a new
-    // fence; fencing it again would forget that call and resend it.
-    const repeated = !entry && requestBody(snapshot) !== undefined;
-    if (knownWithdrawal && !sendableSnapshot(snapshot).tcf && !repeated) {
-      this.fenceEpoch++;
-      this.queue.forgetSent();
-    }
     this.pump();
   }
 

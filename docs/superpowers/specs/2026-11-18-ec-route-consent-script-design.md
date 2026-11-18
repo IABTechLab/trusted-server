@@ -76,11 +76,12 @@ would release IDs a navigation withholds. `applicableSections` appears only
 with `gppString`, and GPP values use #1535's cookie-safe validation.
 
 A snapshot with nothing to send makes no call. A TCF reading with
-`gdprApplies === true` and an invalid `tcString` is not sent; any GPP reading
-in the same snapshot still is. When that TCF reading is a known withdrawal
-(below), the server cannot receive it, so the page fences suppression (see
-Merging) and keeps its merged IDs cleared until a later valid reading is
-answered.
+`gdprApplies === true` and an invalid `tcString` is not sent; a GPP reading in
+the same snapshot still is, unless that TCF reading is a known withdrawal
+(below). Such a snapshot makes no call at all, because without its TC string
+the server would answer from the stale `euconsent-v2` cookie. The page fences
+suppression instead (see Merging) and keeps its merged IDs cleared until a later
+valid reading is answered.
 
 Responses: `200` with a JSON body `{"v":1,"eids":[...]}` in the mirror
 envelope's decoded shape, including any `exp` (WB-4's view for that request,
@@ -176,13 +177,12 @@ Queuing a barrier also suppresses merging until a result is applied, which
 happens only when nothing is waiting, so suppression lasts through every call
 after the barrier.
 
-A known withdrawal whose TCF reading cannot be sent sets a fence: every call is
-stamped with the fence count when queued, the fence count rises after this
-withdrawal's own call (if any) is queued, and an answer lifts suppression only
-when its call carries the current count. The answer to a call queued before the
-fence, including the withdrawal's own GPP-only call that the server answers
-from the stale `euconsent-v2` cookie, therefore cannot lift it. A repeat of the
-same withdrawal that is already pending or answered sets no new fence.
+A known withdrawal whose TCF reading cannot be sent queues nothing and sets a
+fence: every call is stamped with the fence count when queued, the fence count
+rises with each such withdrawal, and an answer lifts suppression only when its
+call carries the current count. The answer to any call queued before the
+withdrawal therefore cannot lift it, and only a later valid reading's answer
+can.
 
 A known withdrawal also expires `__Host-ts-eids-mirror` from script at once
 (`Path=/; Secure; Max-Age=0`), because a grant in flight may still deliver that
@@ -314,3 +314,7 @@ them.
   the repeat flag with forgetting the last answered state at a fence, and
   stopped an identical fenced withdrawal from re-fencing and resending. Moved
   the fence rules into the Request contract, Ordering and Merging sections.
+- Fence re-review: skipping the fence for a withdrawal whose GPP-only body
+  matched an earlier call let that earlier call's answer lift suppression.
+  Such a withdrawal is now not sent at all, so it has no cookie-based answer
+  and needs no repeat rule; each report re-fences without a call.
