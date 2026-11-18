@@ -33,6 +33,7 @@ import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace
 import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
 import { mergeIdentityMirror } from './identity';
+import { installNativeIdCapture } from './native_capture';
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
   userIdConfigNameAliases,
@@ -2339,7 +2340,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (ortb2 !== opts.ortb2) opts.ortb2 = ortb2 as typeof opts.ortb2;
       const originalBidsBack = opts.bidsBackHandler;
       opts.bidsBackHandler = function (...args: unknown[]) {
-        syncPrebidEidsCookie();
+        syncPrebidEidsCookie(true);
         if (typeof originalBidsBack === 'function') {
           return originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
         }
@@ -2347,6 +2348,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       return originalRequestBids.call(this, opts);
     };
     pbjs.processQueue();
+    installNativeIdCapture(() => syncPrebidEidsCookie(true));
     recordUserIdModuleDiagnostics();
     return pbjs;
   }
@@ -3093,37 +3095,48 @@ function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<s
   );
 }
 
+let nativeCaptureFailureWarned = false;
+
 /**
  * Collects EIDs from Prebid's User ID Module and writes them as a
  * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
  * and auction fallback on later requests.
  */
-function syncPrebidEidsCookie(): void {
+function syncPrebidEidsCookie(onlyChanges = false): void {
+  const currentValue = (): string | undefined =>
+    document.cookie
+      .split('; ')
+      .find((part) => part.startsWith(`${EID_COOKIE_NAME}=`))
+      ?.slice(EID_COOKIE_NAME.length + 1);
+  const clearStale = (): void => {
+    if (!onlyChanges || currentValue() !== undefined) clearPrebidEidsCookie();
+  };
   try {
-    if (typeof pbjs.getUserIdsAsEids !== 'function') {
-      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
-      clearPrebidEidsCookie();
-      return;
-    }
-
     const eids = collectAuctionEids();
-    if (!eids) {
-      clearPrebidEidsCookie();
-      return;
-    }
-
-    const payload = fitAuctionEidsToCookie(eids);
+    const payload = eids ? fitAuctionEidsToCookie(eids) : undefined;
     if (!payload) {
-      clearPrebidEidsCookie();
+      clearStale();
+      nativeCaptureFailureWarned = false;
       return;
     }
-
     const encoded = btoa(JSON.stringify(payload));
-    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
-
-    log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
+    if (!onlyChanges || encoded !== currentValue()) {
+      document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+      log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
+    }
+    nativeCaptureFailureWarned = false;
   } catch (err) {
-    log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+    if (!onlyChanges || !nativeCaptureFailureWarned) {
+      log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+    }
+    if (onlyChanges) {
+      nativeCaptureFailureWarned = true;
+      try {
+        clearStale();
+      } catch {
+        // Browsers that block cookie access may also reject stale-cookie cleanup.
+      }
+    }
   }
 }
 

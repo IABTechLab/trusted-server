@@ -13,8 +13,9 @@ Existing configurations retain the auction shim.
 In identity mode, leave publisher bidders, ad units, GPT refresh and targeting
 alone, including publisher auction timeout/debug settings. Register no Trusted
 Server bidder. Capture Prebid User ID module EIDs into
-`ts-eids` after auction completion, using the existing sanitization, size limit,
-expiry and empty-result clearing. Do not change `getUserIdsAsEids` or capture
+`ts-eids` automatically when native IDs become available, using the existing
+sanitization, size limit, expiry and empty-result clearing. Auctions remain an
+additional capture opportunity, not a prerequisite. Do not change `getUserIdsAsEids` or capture
 server mirror values back into this cookie.
 
 Before each publisher auction, read `__Host-ts-eids-mirror`, the unpadded
@@ -44,6 +45,37 @@ The wrapper preserves request options, callback receiver/arguments, return value
 exceptions and default-auction behavior when options are omitted (a generated
 options object supplies capture). Never mutate publisher request/global data. Installation is idempotent. Common managed User
 ID setup precedes mode selection; auction-specific state and hooks follow it.
+
+## Automatic native capture
+
+Identity-only pages may initialize native User ID modules without ever calling
+`requestBids`. Prebid 10.26 has no supported ID-update event, and its
+`getUserIdsAsync` promise can wait for auction completion when `auctionDelay` is
+zero. Configuration callbacks cannot establish that asynchronous IDs or consent
+have settled. Waiting only for that promise or for an auction misses this path.
+
+Sample the unmodified, consent-filtered native getter immediately after the
+publisher queue runs, then once per second while this document is active.
+Visibility changes request an immediate fresh read; browsers may throttle
+background timers. Stop on `pagehide`, resume once on BFCache `pageshow`, and
+remove listeners on permanent navigation. Never start auctions, force ID
+refreshes, change Prebid's synchronization timing, or patch its getter.
+
+Write only when the encoded native cookie differs from the browser's current
+value. An empty, missing, invalid or failing getter clears stale capture once;
+a repeated failure warns once until recovery. Resume and cookie expiry/removal
+must recheck actual browser state, rather than a retained in-memory ID result.
+Mirrored IDs remain outside the native getter and capture path. Auction mode
+retains its existing callback-based capture and cookie refresh behavior.
+
+Add no-auction, delayed-ID/configuration, consent denial/restoration, failure
+recovery, unchanged-write, missing-cookie, visibility, BFCache and repeated
+installation controls. Run a real generated Prebid bundle with `auctionDelay: 0`, without calling
+`requestBids`; an available native ID must reach `ts-eids` automatically while
+`getUserIdsAsync` remains pending. Denial must clear an already captured cookie
+and restoration must recapture it. Permanent navigation removes all capture
+listeners, repeated BFCache restoration leaves one timer, and auction mode
+installs no sampler while retaining its unchanged-result cookie refresh.
 
 ## Alternatives and scope
 
@@ -82,3 +114,14 @@ reconstruct unstated expiries.
   metadata precedence, and added a real activity-redaction control.
 - Round 2 (Codex): no blocking findings. Specified the exact size and expiry
   rules, default-options behavior and publisher-data immutability checks.
+
+- Automatic-capture round 1: independent review found no blocking or optional
+  findings after checking the native getter and current consent activity rules.
+- Automatic-capture round 2: no blocking findings. Accepted optional controls
+  proving capture while the async helper remains pending, withdrawal clearing an
+  existing cookie, permanent navigation cleanup, a single BFCache timer and
+  unchanged auction-mode cookie refresh behavior.
+- Automatic-capture implementation review: contained cookie-access failures so
+  initial capture and publisher callbacks remain safe when browser policy blocks
+  cookies. Getter/setter failure and recovery regressions pass. Independent
+  re-review found no remaining blocking or optional findings.

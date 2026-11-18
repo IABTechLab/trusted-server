@@ -33,6 +33,7 @@ let install: typeof import('../../../src/integrations/prebid/index').installPreb
 let refresh: ReturnType<typeof vi.fn>;
 beforeEach(async () => {
   vi.resetModules();
+  vi.useFakeTimers();
   clearMirror();
   document.cookie = 'ts-eids=; Path=/; Max-Age=0';
   delete page.__tsjsPrebidShimInstalled;
@@ -45,16 +46,174 @@ beforeEach(async () => {
   install = (await import('../../../src/integrations/prebid/index')).installPrebidNpm;
 });
 afterEach(() => {
+  window.dispatchEvent(new PageTransitionEvent('pagehide'));
   clearMirror();
   delete page.__tsjs_prebid;
   delete page.googletag;
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 function options(): Record<string, unknown> {
   return original.mock.calls[original.mock.calls.length - 1][0]!;
 }
 
+function capturedEids(): unknown {
+  const cookie = document.cookie.split('; ').find((part) => part.startsWith('ts-eids='));
+  return cookie ? JSON.parse(atob(cookie.slice('ts-eids='.length))) : undefined;
+}
+
 describe('identity-only Prebid integration', () => {
+  it('captures available native IDs without starting an auction', () => {
+    expect(capturedEids()).toEqual(prebid.getUserIdsAsEids());
+    expect(original).not.toHaveBeenCalled();
+    expect(prebid.processQueue).toHaveBeenCalledOnce();
+  });
+  it('captures delayed IDs and clears withdrawn IDs without any auction', () => {
+    prebid.getUserIdsAsEids.mockReturnValue([]);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toBeUndefined();
+    const delayed = [{ source: 'delayed.example', uids: [{ id: 'later', atype: 1 }] }];
+    prebid.getUserIdsAsEids.mockReturnValue(delayed);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toEqual(delayed);
+    prebid.getUserIdsAsEids.mockReturnValue([]);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toBeUndefined();
+    prebid.getUserIdsAsEids.mockReturnValue(delayed);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toEqual(delayed);
+    expect(original).not.toHaveBeenCalled();
+  });
+
+  it('does not rewrite unchanged cookies and restores a removed cookie', () => {
+    const write = vi.spyOn(document, 'cookie', 'set');
+    vi.advanceTimersByTime(3000);
+    expect(write).not.toHaveBeenCalled();
+    document.cookie = 'ts-eids=; Path=/; Secure; Max-Age=0';
+    write.mockClear();
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toEqual(prebid.getUserIdsAsEids());
+    expect(write).toHaveBeenCalledOnce();
+  });
+
+  it('clears stale capture on getter failure and recovers on the next sample', () => {
+    const native = prebid.getUserIdsAsEids();
+    prebid.getUserIdsAsEids.mockImplementation(() => {
+      throw new Error('getter unavailable');
+    });
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toBeUndefined();
+    const write = vi.spyOn(document, 'cookie', 'set');
+    vi.advanceTimersByTime(2000);
+    expect(write).not.toHaveBeenCalled();
+    prebid.getUserIdsAsEids.mockReturnValue(native);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toEqual(native);
+  });
+
+  it('warns once per getter failure streak and retries after recovery', async () => {
+    const { log } = await import('../../../src/core/log');
+    const warn = vi.spyOn(log, 'warn');
+    const native = prebid.getUserIdsAsEids();
+    prebid.getUserIdsAsEids.mockImplementation(() => {
+      throw new Error('unavailable');
+    });
+    vi.advanceTimersByTime(3000);
+    expect(warn).toHaveBeenCalledOnce();
+    prebid.getUserIdsAsEids.mockReturnValue(native);
+    vi.advanceTimersByTime(1000);
+    prebid.getUserIdsAsEids.mockImplementation(() => {
+      throw new Error('unavailable again');
+    });
+    vi.advanceTimersByTime(3000);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(capturedEids()).toBeUndefined();
+  });
+
+  it.each(['get', 'set'] as const)(
+    'contains blocked cookie %s access during installation and publisher callbacks',
+    async (accessor) => {
+      const { log } = await import('../../../src/core/log');
+      const warn = vi.spyOn(log, 'warn');
+      window.dispatchEvent(new PageTransitionEvent('pagehide'));
+      delete page.__tsjsPrebidShimInstalled;
+      document.cookie = 'ts-eids=stale; Path=/; Secure';
+      const blocked = vi.spyOn(document, 'cookie', accessor).mockImplementation(() => {
+        throw new DOMException('Cookie access denied', 'SecurityError');
+      });
+      try {
+        expect(() => install()).not.toThrow();
+        const callback = vi.fn();
+        prebid.requestBids({ bidsBackHandler: callback });
+        expect(() => (options().bidsBackHandler as () => void)()).not.toThrow();
+        expect(callback).toHaveBeenCalledOnce();
+        expect(() => vi.advanceTimersByTime(3000)).not.toThrow();
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        blocked.mockRestore();
+      }
+      vi.advanceTimersByTime(1000);
+      expect(capturedEids()).toEqual(prebid.getUserIdsAsEids());
+    }
+  );
+
+  it('captures the publisher queue result before any timer runs', () => {
+    window.dispatchEvent(new PageTransitionEvent('pagehide'));
+    delete page.__tsjsPrebidShimInstalled;
+    prebid.processQueue.mockImplementation(() => {
+      prebid.getUserIdsAsEids.mockReturnValue([
+        { source: 'queued.example', uids: [{ id: 'queued-id', atype: 1 }] },
+      ]);
+    });
+    install();
+    expect(capturedEids()).toEqual(prebid.getUserIdsAsEids());
+    expect(original).not.toHaveBeenCalled();
+  });
+
+  it('clears stale capture for a missing or invalid getter and accepts a late module', () => {
+    const getter = prebid.getUserIdsAsEids;
+    delete (prebid as Partial<typeof prebid>).getUserIdsAsEids;
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toBeUndefined();
+    prebid.getUserIdsAsEids = getter;
+    getter.mockReturnValue({ invalid: true } as unknown as ReturnType<typeof getter>);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toBeUndefined();
+    getter.mockReturnValue([{ source: 'late.example', uids: [{ id: 'ready', atype: 1 }] }]);
+    vi.advanceTimersByTime(1000);
+    expect(capturedEids()).toEqual(getter());
+  });
+
+  it('reads fresh consent-filtered IDs on visibility changes', () => {
+    prebid.getUserIdsAsEids.mockReturnValue([]);
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(capturedEids()).toBeUndefined();
+    expect(original).not.toHaveBeenCalled();
+  });
+
+  it('pauses in BFCache and resumes once without duplicating installation', () => {
+    const getter = prebid.getUserIdsAsEids;
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+    getter.mockClear();
+    vi.advanceTimersByTime(3000);
+    expect(getter).not.toHaveBeenCalled();
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    install();
+    getter.mockClear();
+    vi.advanceTimersByTime(1000);
+    expect(getter).toHaveBeenCalledOnce();
+  });
+
+  it('removes lifecycle listeners and stops sampling after permanent navigation', () => {
+    window.dispatchEvent(new PageTransitionEvent('pagehide'));
+    prebid.getUserIdsAsEids.mockClear();
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(3000);
+    expect(prebid.getUserIdsAsEids).not.toHaveBeenCalled();
+  });
+
   it('leaves publisher bidders, ad units, GPT and auction hooks untouched and installs once', () => {
     const remove = prebid.removeAdUnit;
     const wrapped = prebid.requestBids;

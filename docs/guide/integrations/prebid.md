@@ -34,10 +34,18 @@ with `bidstream_enabled` and `mirror_enabled`. Malformed mirrors and expired IDs
 are ignored. Removing or replacing the cookie takes effect on the next auction;
 mirror IDs are never stored in global Prebid configuration.
 
-After an auction, native Prebid User ID module IDs are captured into the existing
-one-day `ts-eids` cookie for server ingestion. Mirrored IDs are not copied back
-into this cookie. This mode does not call an EC endpoint or independently grant
-consent. It does not disable server auctions configured elsewhere.
+Native Prebid User ID module IDs are captured into the existing one-day
+`ts-eids` cookie for server ingestion, including pages that never run an auction.
+Identity mode samples Prebid's unmodified, consent-filtered native getter after
+the publisher queue runs and once per second. It writes changed values only and
+clears stale capture when the native getter returns no usable IDs or fails.
+Visibility changes trigger a fresh read; background timers may be throttled by
+the browser. Sampling pauses on `pagehide` and resumes after a BFCache restore.
+No auction or forced ID refresh is started to obtain IDs.
+
+Mirrored IDs are not copied back into this cookie. This mode does not call an
+EC endpoint or independently grant consent. It does not disable server auctions
+configured elsewhere.
 
 ```toml
 [integrations.prebid]

@@ -55,3 +55,35 @@ including JS/docs formatting, domain lint and native build-digest tests.
   conflict and identity-mode late/replaced consent tests.
 - Code-quality review: no blocking findings. Updated installation comments to
   describe both modes.
+
+## Automatic-capture follow-up
+
+Two independent amendment reviews found no blocking findings. Optional
+strengthening was accepted: hold the real SDK async helper pending without an
+auction, clear an existing cookie on denial, prove navigation cleanup and one
+BFCache timer, and retain auction-mode cookie refresh without a sampler.
+
+- [x] Add a failing no-auction capture test with native IDs already available;
+      add delayed IDs, stale clearing and lifecycle regression cases.
+- [x] Add an identity-only page-lifecycle sampler in
+      `crates/trusted-server-js/lib/src/integrations/prebid/native_capture.ts`.
+      Capture immediately and every second; preserve native consent checks,
+      clear stale/failed values and deduplicate cookie writes in `index.ts`.
+- [x] Prove real Prebid no-auction capture and consent withdrawal/restoration in
+      `test/prebid-artifact-integration.test.mjs`. Retain auction-mode behavior.
+- [x] Document automatic capture, including background timer throttling and
+      absence of forced identity synchronization.
+- [x] Independently review the amendment and implementation, resolve findings,
+      and run relevant/full gates. Cookie getter/setter failures are contained
+      and covered by regression tests.
+- [x] Repeat browser verification on Fastly and Axum without a manual
+      `requestBids` trigger. Both execute the changed served bundle; controlled
+      bidder tests cover replacement/removal, expiry, malformed data, consent
+      denial/restoration and capture without mirror echo.
+
+Normal provider issuance remains a separate runtime qualification: local
+Viceroy omits JA4 metadata required by the existing browser gate, and Axum
+does not support enabled identity providers. Backend provider/finalizer tests
+and fixture-issued mirror browser tests establish their respective boundaries.
+
+Local operator task/configuration fixes remain outside this shared change.

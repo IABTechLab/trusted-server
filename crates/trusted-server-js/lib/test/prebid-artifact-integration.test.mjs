@@ -331,9 +331,9 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // Trace lifecycle and identity mirror support keep the shim below 55 KB.
+    // Trace lifecycle and identity capture keep the shim below 55.5 KB.
     // Importing the separate Prebid runtime (above 200 KB) must fail this guard.
-    expect(shimCode.length).toBeLessThan(55_000);
+    expect(shimCode.length).toBeLessThan(55_500);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
@@ -787,6 +787,84 @@ describe('active trace through real Prebid 10.26 registered adapters', () => {
 });
 
 describe('identity-only mode through the production Prebid bidder consumer', () => {
+  it('captures native IDs without an auction and follows actual native consent filtering', async () => {
+    const dom = createPage();
+    try {
+      const pageWindow = dom.window;
+      const stubs = installNetworkAndConsoleStubs(pageWindow);
+      installServerState(pageWindow);
+      pageWindow.__tsjs_prebid.mode = 'identity';
+      pageWindow.eval(managedUserIdArtifact.bundleCode);
+      // A publisher ATS callback that has not completed keeps Prebid's actual
+      // async initialization pending while the synchronous shared ID is usable.
+      pageWindow.ats = { retrieveEnvelope: vi.fn() };
+      const pbjs = pageWindow.pbjs;
+      const consent = (allowed) => ({
+        consentManagement: {
+          gdpr: {
+            cmpApi: 'static',
+            consentData: {
+              gdprApplies: true,
+              tcString: 'CPexampleConsent',
+              purpose: { consents: { 1: allowed }, legitimateInterests: {} },
+              vendor: { consents: { 123: allowed }, legitimateInterests: {} },
+              publisher: { restrictions: {} },
+              specialFeatureOptins: {},
+            },
+            rules: [{ purpose: 'storage', enforcePurpose: true, enforceVendor: true }],
+          },
+        },
+      });
+      pbjs.setConfig({
+        ...consent(true),
+        gvlMapping: { sharedId: 123, identityLink: 123 },
+        userSync: {
+          auctionDelay: 0,
+          syncDelay: 3000,
+          autoRefresh: true,
+          userIds: [
+            { name: 'sharedId', value: { pubcid: 'no-auction-native' } },
+            { name: 'identityLink', params: { pid: 'example-publisher-id', notUse3P: true } },
+          ],
+        },
+      });
+      const requestBids = vi.spyOn(pbjs, 'requestBids');
+      let asyncIdsSettled = false;
+      pbjs.getUserIdsAsync().then(() => {
+        asyncIdsSettled = true;
+      });
+      pageWindow.eval(shimCode);
+      const cookieEids = () => {
+        const encoded = pageWindow.document.cookie
+          .split('; ')
+          .find((part) => part.startsWith('ts-eids='))
+          ?.slice('ts-eids='.length);
+        return encoded === undefined ? undefined : JSON.parse(pageWindow.atob(encoded));
+      };
+      await expect
+        .poll(cookieEids, { timeout: 5000 })
+        .toEqual([{ source: 'pubcid.org', uids: [{ id: 'no-auction-native', atype: 1 }] }]);
+      expect(asyncIdsSettled).toBe(false);
+      expect(pbjs.getConfig('userSync.auctionDelay')).toBe(0);
+      const mirror = [{ source: 'mirror.example', uids: [{ id: 'not-native', atype: 1 }] }];
+      pageWindow.document.cookie = `__Host-ts-eids-mirror=${Buffer.from(JSON.stringify({ v: 1, eids: mirror })).toString('base64url')}; Path=/; Secure`;
+      pbjs.setConfig(consent(false));
+      await expect.poll(() => pbjs.getUserIdsAsEids(), { timeout: 5000 }).toEqual([]);
+      await expect.poll(cookieEids, { timeout: 5000 }).toBeUndefined();
+      pbjs.setConfig(consent(true));
+      await expect
+        .poll(cookieEids, { timeout: 5000 })
+        .toEqual([{ source: 'pubcid.org', uids: [{ id: 'no-auction-native', atype: 1 }] }]);
+      expect(requestBids).not.toHaveBeenCalled();
+      expect(asyncIdsSettled).toBe(false);
+      expect(stubs.requests).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.dispatchEvent(new dom.window.PageTransitionEvent('pagehide'));
+      dom.window.close();
+    }
+  }, 20000);
+
   it.each([false, true])(
     'keeps mirror data request-local and honors transmitEids denial=%s',
     async (denied) => {
