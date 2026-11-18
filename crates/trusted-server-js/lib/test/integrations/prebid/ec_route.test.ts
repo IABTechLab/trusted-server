@@ -311,6 +311,35 @@ describe('EcRouteClient', () => {
     expect(client.mirrorSource()).toEqual([routeId]);
   });
 
+  it('resends an unchanged reading after a post-fence grant fails', async () => {
+    client.report(tcf('CPa.AA'));
+    calls[0].resolve(json([routeId]));
+    await settle();
+    client.report(tcf('', []));
+    client.report(tcf('CPa.AA'));
+    calls[1].reject(new TypeError('network'));
+    await settle();
+    client.report(tcf('CPa.AA'));
+    expect(calls, 'the unchanged reading is sent again').toHaveLength(3);
+    calls[2].resolve(json([routeId]));
+    await settle();
+    expect(client.mirrorSource()).toEqual([routeId]);
+  });
+
+  it('does not resend an identical fenced withdrawal', async () => {
+    const gpp = { gppString: 'DBA', applicableSections: [7] };
+    client.report({ ...tcf('CPa.AA'), gpp });
+    calls[0].resolve(json([]));
+    await settle();
+    for (let i = 0; i < 3; i++) client.report({ ...tcf('bad;', ['p4']), gpp });
+    expect(calls, 'pending: one call').toHaveLength(2);
+    calls[1].resolve(json([]));
+    await settle();
+    for (let i = 0; i < 3; i++) client.report({ ...tcf('bad;', ['p4']), gpp });
+    expect(calls, 'answered: still one call').toHaveLength(2);
+    expect(client.mirrorSource(), 'and still suppressed').toEqual([]);
+  });
+
   it('keeps a TCF withdrawal sent without its TC string suppressed after its answer', async () => {
     const gpp = { gppString: 'DBA', applicableSections: [7] };
     client.report({ ...tcf('CPa.AA'), gpp });

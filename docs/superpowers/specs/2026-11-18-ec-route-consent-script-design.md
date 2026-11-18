@@ -76,9 +76,11 @@ would release IDs a navigation withholds. `applicableSections` appears only
 with `gppString`, and GPP values use #1535's cookie-safe validation.
 
 A snapshot with nothing to send makes no call. A TCF reading with
-`gdprApplies === true` and an invalid `tcString` is not sent. When that reading
-is a known withdrawal (below), the page still clears and suppresses its merged
-IDs until a later valid reading is answered.
+`gdprApplies === true` and an invalid `tcString` is not sent; any GPP reading
+in the same snapshot still is. When that TCF reading is a known withdrawal
+(below), the server cannot receive it, so the page fences suppression (see
+Merging) and keeps its merged IDs cleared until a later valid reading is
+answered.
 
 Responses: `200` with a JSON body `{"v":1,"eids":[...]}` in the mirror
 envelope's decoded shape, including any `exp` (WB-4's view for that request,
@@ -96,7 +98,9 @@ navigation, which already applied that signal from its cookies.
 
 At most one call is in flight. A snapshot whose request body equals the
 newest waiting snapshot's, or with none waiting the one in flight, or with none
-in flight the last one successfully sent, is ignored.
+in flight the last one successfully sent, is ignored. A fence (see Merging)
+forgets the last successfully sent snapshot, so after it an unchanged reading
+is sent again.
 
 Each snapshot is classified against the previous snapshot. A reading
 _changes_ when the previous snapshot had a reading from the same API with a
@@ -135,9 +139,9 @@ A barrier that fails stays at the head of the queue and is resent on the next
 trigger (a new reading, `visibilitychange`, `focus` or persisted `pageshow`),
 with no background retry timer, as #1535's consent sync does. A grant that
 fails is dropped: resending an older grant on focus could override a
-withdrawal made in another tab. Only a new reading produces another grant, and
-since a dropped grant was never successfully sent, an identical reading is not
-ignored.
+withdrawal made in another tab. Only a new reading produces another grant. A
+reading equal to the dropped grant is ignored only when it also equals the
+last snapshot successfully sent, which the server already holds.
 
 On `pagehide` a waiting snapshot is not sent ahead of the call in flight, so a
 withdrawal made while a call is in flight can be lost when the tab closes. This
@@ -170,9 +174,19 @@ capture.
 Queuing a barrier, or discarding a result, clears the applied route result.
 Queuing a barrier also suppresses merging until a result is applied, which
 happens only when nothing is waiting, so suppression lasts through every call
-after the barrier. A known withdrawal also expires `__Host-ts-eids-mirror` from
-script at once (`Path=/; Secure; Max-Age=0`), because a grant in flight may
-still deliver that cookie before the withdrawal is answered. Native Prebid IDs
+after the barrier.
+
+A known withdrawal whose TCF reading cannot be sent sets a fence: every call is
+stamped with the fence count when queued, the fence count rises after this
+withdrawal's own call (if any) is queued, and an answer lifts suppression only
+when its call carries the current count. The answer to a call queued before the
+fence, including the withdrawal's own GPP-only call that the server answers
+from the stale `euconsent-v2` cookie, therefore cannot lift it. A repeat of the
+same withdrawal that is already pending or answered sets no new fence.
+
+A known withdrawal also expires `__Host-ts-eids-mirror` from script at once
+(`Path=/; Secure; Max-Age=0`), because a grant in flight may still deliver that
+cookie before the withdrawal is answered. Native Prebid IDs
 remain under Prebid's own consent handling and are not touched.
 
 Suppression and clearing apply to the tab that observed the barrier. Another
@@ -289,10 +303,14 @@ them.
 - PR self-review (independent reviewer): a known withdrawal whose TC string
   cannot be sent queues nothing, so the grant already in flight lifted its
   suppression when answered. Such a withdrawal now fences suppression: only an
-  answer to a call queued after it lifts it, while a repeated withdrawal that
-  is already queued does not. Removed two test-only members and made the
-  no-route preservation test cover both modes.
+  answer to a call queued after it lifts it. Removed two test-only members and
+  made the no-route preservation test cover both modes.
 - Fix re-review: a withdrawal with an unsendable TC string now fences even when
   its GPP part is still sent, because the server answers that call from the
   stale `euconsent-v2` cookie; and after a fence, a reading equal to the last
   call is sent again so its answer can lift suppression.
+- Final review: a post-fence grant that failed left the older answered state
+  deduplicating the next identical reading, so suppression stayed on. Replaced
+  the repeat flag with forgetting the last answered state at a fence, and
+  stopped an identical fenced withdrawal from re-fencing and resending. Moved
+  the fence rules into the Request contract, Ordering and Merging sections.

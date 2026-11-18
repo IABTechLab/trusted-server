@@ -144,21 +144,26 @@ export class ConsentQueue {
     return this.waiting[this.waiting.length - 1] ?? this.inFlight ?? this.lastSent;
   }
 
-  /**
-   * Queues a snapshot; returns the new entry, or `undefined` when it is
-   * ignored. `allowRepeat` admits a snapshot equal to the tail, so a caller can
-   * resend a state whose earlier answer it no longer trusts.
-   */
-  offer(raw: ConsentSnapshot, cookies: CookieView, allowRepeat = false): QueueEntry | undefined {
+  /** Queues a snapshot; returns the new entry, or `undefined` when it is ignored. */
+  offer(raw: ConsentSnapshot, cookies: CookieView): QueueEntry | undefined {
     const snapshot = sendableSnapshot(raw);
     const body = requestBody(snapshot);
     const tail = this.tail();
-    if (body === undefined || (!allowRepeat && body === tail?.body)) return undefined;
+    if (body === undefined || body === tail?.body) return undefined;
     const entry: QueueEntry = { snapshot, body, kind: classify(snapshot, tail?.snapshot, cookies) };
     const last = this.waiting[this.waiting.length - 1];
     if (last?.kind === 'grant') this.waiting[this.waiting.length - 1] = entry;
     else this.waiting.push(entry);
     return entry;
+  }
+
+  /**
+   * Stops treating the last answered call as the server's current state, so a
+   * reading equal to it is sent again. Waiting and in-flight calls still
+   * deduplicate.
+   */
+  forgetSent(): void {
+    this.lastSent = undefined;
   }
 
   /** Moves the head into flight, unless a call is already in flight. */
