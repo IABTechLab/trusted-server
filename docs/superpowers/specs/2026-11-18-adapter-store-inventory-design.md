@@ -93,9 +93,11 @@ resolve design review findings within those decisions.
 - **D4: Remove the dead local stores.**
   - Remove `creative_store` from `fastly.toml`. Remove `creative_store`,
     `opid_store` and `ec_partner_store` from the integration Viceroy template.
-  - `counter_store` stays: it is the Fastly rate-counter name that
-    `FastlyRateLimiter` opens, and the integration config asserts it. Making it
-    a rate-counter declaration instead of a KV one is out of scope.
+  - Remove the local `counter_store` KV entry from both files too.
+    `FastlyRateLimiter` opens `counter_store` as an Edge Rate Limiting counter,
+    which is a separate Fastly service resource, not a KV store. Viceroy
+    0.21.0 stubs rate counters, so the KV entry backed nothing. The
+    integration config test now asserts the entry is absent.
 - **D5: The Cloudflare KV binding stays `TRUSTED_SERVER_KV`, the binding the
   manifests already declare.**
   - The local smoke uses that namespace to hand the app-config envelope from
@@ -104,9 +106,8 @@ resolve design review findings within those decisions.
     Worker never reads config from KV (startup reads the
     `TRUSTED_SERVER_CONFIG` variable), so this is a staging copy.
   - The Cloudflare guide tells deployments to push config to a separate
-    namespace. It also reserves the `trusted_server_config` key in
-    `TRUSTED_SERVER_KV` for the smoke's handoff, so KV consumers must not use
-    that key.
+    namespace. The smoke's handoff needs no reserved key, because it uses an
+    isolated local namespace that its exit trap removes.
 - **D6: Keep `cloudflare.toml` as a reference manifest.** A test pins its config
   ID to the runtime default. Add a header saying the Worker runtime does not
   read it, and correct the `platform.rs` comment that claims otherwise.
@@ -184,23 +185,23 @@ Viceroy template's fixtures are listed as test-only.
 
 ## Acceptance
 
-| Scenario                                                             | Before                                            | After                                               | Evidence                                                                                                                                   |
-| -------------------------------------------------------------------- | ------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Fastly with `trusted_server_kv` linked                               | `kv_store()` returns `Unavailable`                | Reads and writes reach the linked store             | Viceroy test: the registry is built from `TrustedServerApp::stores().kv`, and a write through the services is read back by a second handle |
-| Fastly service without the store linked                              | `Unavailable`; request served                     | `OpenFailed`; request served                        | Runtime verification under Viceroy with the local store removed                                                                            |
-| Cloudflare with and without `TRUSTED_SERVER_KV`                      | `Unavailable` both ways                           | Binding reached; absent binding gives `Unavailable` | Test pinning the binding constant to `wrangler.toml`; runtime probe on `wrangler dev --local`                                              |
-| Spin with and without the `trusted_server_kv` label                  | `Unavailable` both ways                           | Label reached; absent label gives `OpenFailed`      | Test that `stores()` declares only KV; runtime probe on `spin up`                                                                          |
-| Axum with `TRUSTED_SERVER_KV_PATH` set, unset or unopenable          | `Unavailable`                                     | Persistent round trip; otherwise `Unavailable`      | Native tests, covering a restart read-back, the env-var name, and a run outside a Tokio runtime                                            |
-| Spin discovery with signing metadata in `default`                    | `500`                                             | `200` with the JWKS                                 | CI `spin_runtime_` integration test                                                                                                        |
-| Spin signed auction with the private key in an encoded variable      | Fails (no `current-kid`)                          | Signed request reaches the bidder                   | Runtime verification with a stub bidder                                                                                                    |
-| Cloudflare discovery and `/verify-signature`                         | `500` and `200 verified:false`, documented `real` | Same results, now documented as unsupported         | Host route test, a documentation pin that cannot see the wasm path; runtime check on `wrangler dev`                                        |
-| Every adapter without the new bindings: startup and publisher routes | Served                                            | Served, unchanged                                   | Existing suites and parity test; runtime publisher request on each adapter                                                                 |
+| Scenario                                                             | Before                                            | After                                                  | Evidence                                                                                                                                   |
+| -------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fastly with `trusted_server_kv` linked                               | `kv_store()` returns `Unavailable`                | Reads and writes reach the linked store                | Viceroy test: the registry is built from `TrustedServerApp::stores().kv`, and a write through the services is read back by a second handle |
+| Fastly service without the store linked                              | `Unavailable`; request served                     | `OpenFailed`; request served                           | Runtime verification under Viceroy with the local store removed                                                                            |
+| Cloudflare with and without `TRUSTED_SERVER_KV`                      | `Unavailable` both ways                           | Binding reached; absent binding gives `Unavailable`    | Test pinning the binding constant to `wrangler.toml`; runtime probe on `wrangler dev --local`                                              |
+| Spin with and without the `trusted_server_kv` label                  | `Unavailable` both ways                           | Label reached; absent label gives `OpenFailed`         | Test that `stores()` declares only KV; runtime probe on `spin up`                                                                          |
+| Axum with `TRUSTED_SERVER_KV_PATH` set, unset or unopenable          | `Unavailable`                                     | Persistent round trip; otherwise `Unavailable`         | Native tests, covering a restart read-back, the env-var name, and a run outside a Tokio runtime                                            |
+| Spin discovery with signing metadata in `default`                    | `500`                                             | `200` with the JWKS                                    | CI `spin_runtime_` integration test                                                                                                        |
+| Spin signed auction with the private key in an encoded variable      | Fails (no `current-kid`)                          | Signed request reaches the bidder                      | Runtime verification with a stub bidder                                                                                                    |
+| Cloudflare discovery and `/verify-signature`                         | `500` and `200 verified:false`, documented `real` | Same results, explained in the API reference and guide | Host route test, a documentation pin that cannot see the wasm path; runtime check on `wrangler dev`                                        |
+| Every adapter without the new bindings: startup and publisher routes | Served                                            | Served, unchanged                                      | Existing suites and parity test; runtime publisher request on each adapter                                                                 |
 
 ## Out of scope
 
 - Cloudflare request signing, key management and startup config (D3).
-- EC record stores (EZI-2\*), and making `counter_store` a rate-counter
-  declaration (D4).
+- EC record stores (EZI-2\*), and declaring the `counter_store` rate counter
+  as a Fastly service resource.
 - Any new consumer of `kv_store()`.
 
 ## Review log
@@ -240,3 +241,19 @@ Viceroy template's fixtures are listed as test-only.
   - Document the `ts provision` label effect.
   - Add the key-rotation store IDs and the Worker secrets to the inventory.
   - Correct the Spin guide's CI note.
+- **Round 3, two independent agent reviews of the opened PR.** One covered
+  the runtime code, the other the tests, manifests and docs. Neither raised a
+  blocking finding. The optional findings that were adopted:
+  - Axum's store goes behind a `KvHandle`, so its key, value and TTL limits
+    match the other adapters.
+  - Axum opens the store during startup, not on the first request.
+  - The dead local `counter_store` KV entry is removed and D4 corrected:
+    `FastlyRateLimiter` uses a rate-counter resource, which Viceroy stubs.
+  - A CI test covers the Spin signed auction, with the private key in an
+    encoded variable.
+  - Inventory rows, the Cloudflare guide and a test comment are corrected, and
+    the request-signing guide links the inventory.
+
+  Declined: opening the Cloudflare binding lazily. The per-request cost is a
+  few JS property reads, and a lazy wrapper would be wasm-only code that host
+  tests cannot run.

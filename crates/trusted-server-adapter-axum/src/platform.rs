@@ -8,12 +8,12 @@ use bytes::Bytes;
 use edgezero_adapter_axum::context::AxumRequestContext;
 use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::error::EdgeError;
-use edgezero_core::key_value_store::KvPage;
+use edgezero_core::key_value_store::{KvHandle, KvPage};
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    ClientInfo, GeoInfo, KvError, KvHandleStore, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -257,6 +257,9 @@ impl PlatformKvStore for BlockingKvStore {
 
 /// Opens the runtime KV store backed by the database file at `path`.
 ///
+/// The store sits behind a `KvHandle`, so key, value, TTL and list-limit
+/// validation matches the other adapters before any database I/O.
+///
 /// Without a path, or when the file cannot be opened (a missing parent
 /// directory, a lock held by another process or a corrupt file), the store is
 /// unavailable: each KV operation answers `KvError::Unavailable`, a warning is
@@ -269,7 +272,9 @@ fn kv_store_from_path(path: Option<&Path>) -> Arc<dyn PlatformKvStore> {
     match PersistentKvStore::new(path) {
         Ok(store) => {
             log::info!("Axum: generic runtime KV store at {}", path.display());
-            Arc::new(BlockingKvStore(Arc::new(store)))
+            Arc::new(KvHandleStore::new(KvHandle::new(Arc::new(
+                BlockingKvStore(Arc::new(store)),
+            ))))
         }
         Err(error) => {
             log::warn!(
@@ -287,6 +292,15 @@ fn kv_store_from_env() -> Arc<dyn PlatformKvStore> {
     kv_store_from_path(path.as_deref())
 }
 
+/// Returns the process-wide runtime KV store, opening it on the first call.
+///
+/// Startup calls this while assembling the app, before the listener serves a
+/// request, so a slow database open or repair never stalls a request.
+pub(crate) fn runtime_kv_store() -> Arc<dyn PlatformKvStore> {
+    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
+    Arc::clone(KV_STORE.get_or_init(kv_store_from_env))
+}
+
 // ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
@@ -296,8 +310,9 @@ fn kv_store_from_env() -> Arc<dyn PlatformKvStore> {
 /// # Runtime KV
 ///
 /// The generic runtime KV store is the file [`KV_PATH_ENV_VAR`] names, opened
-/// on the first request and shared by every later one. Unset or unopenable, it
-/// is [`UnavailableKvStore`], with a `warn` log once per process.
+/// once per process during startup and shared by every request. Unset or
+/// unopenable, it is [`UnavailableKvStore`], with a `warn` log once per
+/// process.
 ///
 /// The outbound client is the one the request context carries, with the proxy
 /// marker turned off, and the clock is the context's monotonic clock.
@@ -321,7 +336,6 @@ pub fn build_runtime_services(
         std::sync::OnceLock::new();
     static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
         std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
     static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
@@ -337,7 +351,7 @@ pub fn build_runtime_services(
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(kv_store_from_env)))
+        .kv_store(runtime_kv_store())
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
         .geo(Arc::clone(GEO.get_or_init(|| {
@@ -492,6 +506,19 @@ mod tests {
                 .expect("should read the reopened store"),
             Some(Bytes::from_static(b"example-value")),
             "should keep values in the database file across a restart"
+        );
+    }
+
+    #[test]
+    fn runtime_kv_validates_keys_before_database_io() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let store = kv_store_from_path(Some(&directory.path().join("runtime-kv.redb")));
+
+        let result = futures::executor::block_on(store.get_bytes(""));
+
+        assert!(
+            matches!(result, Err(KvError::Validation(_))),
+            "should reject an empty key as the other adapters do, got {result:?}"
         );
     }
 

@@ -102,9 +102,10 @@ the [adapter matrix](./api-reference#adapter-and-startup-support).
 
 The generic runtime KV store is off by default. Set `TRUSTED_SERVER_KV_PATH`
 to a database file whose parent directory exists, for example
-`TRUSTED_SERVER_KV_PATH=.local/runtime-kv.redb`, and the server opens it on the
-first request. Store operations run on Tokio's blocking pool. Without the
-variable, or when the file cannot be opened, KV operations answer
+`TRUSTED_SERVER_KV_PATH=.local/runtime-kv.redb`, and the server opens it at
+startup, before it serves a request. Store operations run on Tokio's blocking
+pool and apply the same key, value and TTL limits as the other adapters.
+Without the variable, or when the file cannot be opened, KV operations answer
 `KvError::Unavailable`, a warning is logged, and every route is still served.
 One process holds the file's lock, so give each server its own path. See the
 [store inventory](./edgezero#store-inventory) for every store the adapter

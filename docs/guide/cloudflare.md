@@ -65,9 +65,9 @@ only after all four bindings are present.
 
 A successful `ts config push` alone does not configure this runtime: startup
 reads only the `TRUSTED_SERVER_CONFIG` variable, never a KV namespace. Push
-deployment config to a namespace other than `TRUSTED_SERVER_KV`. The local
-smoke reuses `TRUSTED_SERVER_KV` for its handoff, so its `trusted_server_config`
-key is reserved there.
+deployment config to a namespace other than `TRUSTED_SERVER_KV`, which holds
+runtime KV data. The local smoke's isolated namespace is removed when it
+exits.
 
 ## Runtime stores
 

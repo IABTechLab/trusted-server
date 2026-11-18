@@ -29,10 +29,6 @@ build = """
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.counter_store]]
-            key = "placeholder"
-            data = "placeholder"
-
         [[local_server.kv_stores.ec_identity_store]]
             key = "placeholder"
             data = "placeholder"

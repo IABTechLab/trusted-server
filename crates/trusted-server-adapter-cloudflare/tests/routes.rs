@@ -67,9 +67,9 @@ fn test_settings() -> Settings {
 }
 
 /// Cloudflare has no request-time config store, so request signing cannot read
-/// its metadata. This pins the documented results; on the host build every
-/// adapter gets the no-op config store, so the Worker's wasm path is checked
-/// at runtime instead.
+/// its metadata. This pins the documented results. The host and wasm builds
+/// both use the no-op config store, so this exercises the Worker's config
+/// path; it passes on the base revision too, because that path is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_signing_routes_report_unsupported_signing_metadata() {
     let discovery = route(

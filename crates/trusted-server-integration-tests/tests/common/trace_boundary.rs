@@ -211,13 +211,16 @@ pub(crate) fn with_trace_runtime(
             );
         }
         TraceRuntime::Fastly => with_fastly_runtime(envelope, |base_url, _stdout| check(base_url)),
-        TraceRuntime::Spin => with_spin_runtime(envelope, publisher_origin, &[], check),
+        TraceRuntime::Spin => with_spin_runtime(envelope, publisher_origin, &[], &[], check),
     }
 }
 
 /// Runs `check` against `spin up` serving the production Spin component with
 /// the app config `envelope` and `default_entries` in its `default`
 /// key-value label.
+///
+/// `extra_variables` declares additional component variables by their
+/// encoded Spin names, such as a request-signing private key.
 ///
 /// # Panics
 ///
@@ -227,6 +230,7 @@ pub(crate) fn with_spin_runtime(
     envelope: &str,
     publisher_origin: Option<&str>,
     default_entries: &[(&str, &str)],
+    extra_variables: &[(&str, &str)],
     check: impl FnOnce(&str),
 ) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -272,10 +276,16 @@ pub(crate) fn with_spin_runtime(
             spin_secret_variable(name)
         ));
     }
+    for (name, value) in extra_variables {
+        config.push_str(&format!("{name} = {{ default = {value:?} }}\n"));
+    }
     config.push_str("[component.trace.variables]\n");
     for (name, _) in secrets {
         let variable = spin_secret_variable(name);
         config.push_str(&format!("{variable} = \"{{{{ {variable} }}}}\"\n"));
+    }
+    for (name, _) in extra_variables {
+        config.push_str(&format!("{name} = \"{{{{ {name} }}}}\"\n"));
     }
     let manifest = fixture.0.join("spin.toml");
     fs::write(&manifest, config).expect("should write isolated Spin manifest");

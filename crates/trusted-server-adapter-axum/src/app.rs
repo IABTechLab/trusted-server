@@ -75,6 +75,8 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         &config_key,
         &trusted_server_core::settings_data::default_secret_store_name(),
     )?;
+    // Open the runtime KV store before the listener serves a request.
+    crate::platform::runtime_kv_store();
     build_state_with_settings(settings)
 }
 

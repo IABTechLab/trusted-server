@@ -15,7 +15,12 @@ Trusted Server provides Ed25519-based request signing capabilities to ensure aut
 
 ### Key Storage
 
-Keys are stored in two separate Fastly stores:
+Other adapters keep the same keys elsewhere. Spin reads the public metadata
+from its `default` key-value label and the private keys from encoded component
+variables. Axum reads environment variables. Cloudflare does not support
+request signing. See the [store inventory](./edgezero#store-inventory).
+
+On Fastly, keys are stored in two separate stores:
 
 **Secret Store** (`signing_keys`):
 
