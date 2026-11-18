@@ -32,8 +32,10 @@ import type { AuctionSlot, TsjsApi } from '../../core/types';
 import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace/runtime';
 import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
-import { mergeIdentityMirror } from './identity';
+import { installEcRouteClient, validEcRoute } from './ec_route';
+import { mergeIdentityMirror, readMirror, type MirrorEid } from './identity';
 import { installNativeIdCapture } from './native_capture';
+import { isPubcidOptedOut, syncPubcidOptOut } from './pubcid_optout';
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
   userIdConfigNameAliases,
@@ -202,6 +204,18 @@ interface InjectedPrebidConfig {
   excludedGamAdUnitPathSuffixes?: string[];
   /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
   managedUserIds?: InjectedManagedUserId[];
+  /** Same-origin EC route path; consent reporting stays off without it. */
+  ecRoute?: string;
+}
+
+/** SharedID's canonical EID source (SID-3). */
+const SHARED_ID_SOURCE = 'pubcid.org';
+
+/** Drops SharedID from mirrored IDs while the reader has opted out of it (SID-2). */
+function withoutOptedOutSharedId(eids: MirrorEid[]): MirrorEid[] {
+  return eids.length && isPubcidOptedOut()
+    ? eids.filter((eid) => eid.source !== SHARED_ID_SOURCE)
+    : eids;
 }
 
 /**
@@ -2330,13 +2344,26 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     }
   }
 
+  // Prebid also honors a localStorage SharedID opt-out the server cannot see;
+  // copy it into the cookie in both modes (SID-2).
+  syncPubcidOptOut();
+  document.addEventListener('visibilitychange', syncPubcidOptOut);
+  const ecRoutePath = validEcRoute(injected?.ecRoute, window.location);
+  const ecRoute =
+    ecRoutePath && typeof window.fetch === 'function'
+      ? installEcRouteClient(ecRoutePath, syncPubcidOptOut)
+      : undefined;
+
   if (merged.mode === 'identity') {
     const originalRequestBids = pbjs.requestBids;
     pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
       trySeedManagedUserIds?.();
       recordUserIdModuleDiagnostics();
       const opts = { ...(requestObj ?? {}) };
-      const ortb2 = mergeIdentityMirror(opts.ortb2, () => pbjs.getConfig('ortb2'));
+      const mirror = withoutOptedOutSharedId(
+        ecRoute ? ecRoute.client.mirrorSource() : readMirror()
+      );
+      const ortb2 = mergeIdentityMirror(opts.ortb2, () => pbjs.getConfig('ortb2'), mirror);
       if (ortb2 !== opts.ortb2) opts.ortb2 = ortb2 as typeof opts.ortb2;
       const originalBidsBack = opts.bidsBackHandler;
       opts.bidsBackHandler = function (...args: unknown[]) {
@@ -2348,7 +2375,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       return originalRequestBids.call(this, opts);
     };
     pbjs.processQueue();
-    installNativeIdCapture(() => syncPrebidEidsCookie(true));
+    installNativeIdCapture(() => {
+      syncPrebidEidsCookie(true);
+      syncPubcidOptOut();
+      ecRoute?.discover();
+    });
     recordUserIdModuleDiagnostics();
     return pbjs;
   }
@@ -2527,6 +2558,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
+    syncPubcidOptOut();
     trySeedManagedUserIds?.();
     recordUserIdModuleDiagnostics();
 

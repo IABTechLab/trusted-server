@@ -331,9 +331,10 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // Trace lifecycle and identity capture keep the shim below 55.5 KB.
-    // Importing the separate Prebid runtime (above 200 KB) must fail this guard.
-    expect(shimCode.length).toBeLessThan(55_500);
+    // Trace lifecycle, identity capture and EC route consent reporting keep the
+    // shim below 66.5 KB. Importing the separate Prebid runtime (above 200 KB)
+    // must fail this guard.
+    expect(shimCode.length).toBeLessThan(66_500);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 

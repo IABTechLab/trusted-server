@@ -4,7 +4,7 @@ const MIRROR_COOKIE_NAME = '__Host-ts-eids-mirror';
 const MAX_MIRROR_BYTES = 3584;
 type Fields = Record<string, unknown>;
 type MirrorUid = Fields & { id: string; atype?: number };
-type MirrorEid = Fields & { source: string; uids: MirrorUid[] };
+export type MirrorEid = Fields & { source: string; uids: MirrorUid[] };
 
 function fields(value: unknown): Fields {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -12,50 +12,83 @@ function fields(value: unknown): Fields {
     : {};
 }
 
-function readMirror(): MirrorEid[] {
+/** The mirror cookie's raw value, or `undefined` when absent or unreadable. */
+export function readMirrorCookieValue(): string | undefined {
   try {
-    const cookie = document.cookie
+    return document.cookie
       .split(';')
       .map((part) => part.trim())
       .find((part) => part.startsWith(`${MIRROR_COOKIE_NAME}=`))
       ?.slice(MIRROR_COOKIE_NAME.length + 1);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Validates a decoded `{v:1,eids:[...]}` mirror envelope, keeping each UID's
+ * `exp` for {@link liveMirrorEids}. Returns `undefined` for an envelope that is
+ * not version 1 with an `eids` array; invalid entries are omitted.
+ */
+export function parseMirrorEnvelope(value: unknown): MirrorEid[] | undefined {
+  const envelope = fields(value);
+  if (envelope.v !== 1 || !Array.isArray(envelope.eids)) return undefined;
+  return envelope.eids.flatMap((rawEid): MirrorEid[] => {
+    const eid = fields(rawEid);
+    if (typeof eid.source !== 'string' || !eid.source.trim() || !Array.isArray(eid.uids)) return [];
+    const uids = eid.uids.flatMap((rawUid): MirrorUid[] => {
+      const uid = fields(rawUid);
+      if (typeof uid.id !== 'string' || !uid.id.trim()) return [];
+      if (
+        uid.atype !== undefined &&
+        (typeof uid.atype !== 'number' ||
+          !Number.isInteger(uid.atype) ||
+          uid.atype < 0 ||
+          uid.atype > 2_147_483_647)
+      )
+        return [];
+      if ('exp' in uid && (typeof uid.exp !== 'number' || !Number.isInteger(uid.exp))) return [];
+      return [{ ...uid } as MirrorUid];
+    });
+    return uids.length ? [{ ...eid, source: eid.source, uids }] : [];
+  });
+}
+
+/** Drops UIDs whose `exp` has passed and strips the mirror-only `exp` field. */
+export function liveMirrorEids(eids: MirrorEid[], nowSeconds = Date.now() / 1000): MirrorEid[] {
+  return eids.flatMap((eid): MirrorEid[] => {
+    const uids = eid.uids.flatMap((uid): MirrorUid[] => {
+      if ('exp' in uid && !((uid.exp as number) > nowSeconds)) return [];
+      const copy = { ...uid };
+      delete copy.exp;
+      return [copy];
+    });
+    return uids.length ? [{ ...eid, uids }] : [];
+  });
+}
+
+/** Reads the live IDs in the current mirror cookie; any defect reads as none. */
+export function readMirror(): MirrorEid[] {
+  try {
+    const cookie = readMirrorCookieValue();
     if (!cookie || cookie.length > MAX_MIRROR_BYTES || !/^[\w-]+$/.test(cookie)) return [];
     const binary = atob(cookie.replace(/-/g, '+').replace(/_/g, '/'));
     const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    const envelope = fields(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
-    if (envelope.v !== 1 || !Array.isArray(envelope.eids)) return [];
-    const now = Date.now() / 1000;
-    return envelope.eids.flatMap((rawEid): MirrorEid[] => {
-      const eid = fields(rawEid);
-      if (typeof eid.source !== 'string' || !eid.source.trim() || !Array.isArray(eid.uids))
-        return [];
-      const uids = eid.uids.flatMap((rawUid): MirrorUid[] => {
-        const uid = fields(rawUid);
-        if (typeof uid.id !== 'string' || !uid.id.trim()) return [];
-        if (
-          uid.atype !== undefined &&
-          (typeof uid.atype !== 'number' ||
-            !Number.isInteger(uid.atype) ||
-            uid.atype < 0 ||
-            uid.atype > 2_147_483_647)
-        )
-          return [];
-        if (
-          'exp' in uid &&
-          (typeof uid.exp !== 'number' ||
-            !Number.isFinite(uid.exp) ||
-            !Number.isInteger(uid.exp) ||
-            uid.exp <= now)
-        )
-          return [];
-        const copy = { ...uid };
-        delete copy.exp;
-        return [copy as MirrorUid];
-      });
-      return uids.length ? [{ ...eid, source: eid.source, uids }] : [];
-    });
+    const eids = parseMirrorEnvelope(
+      JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
+    );
+    return eids ? liveMirrorEids(eids) : [];
   } catch {
     return [];
+  }
+}
+
+/** Expires the script-readable mirror cookie at once (a known withdrawal). */
+export function expireMirrorCookie(): void {
+  try {
+    document.cookie = `${MIRROR_COOKIE_NAME}=; Path=/; Secure; Max-Age=0`;
+  } catch {
+    // Blocked cookies leave nothing for this page to merge from anyway.
   }
 }
 
@@ -72,8 +105,11 @@ function uidKey(source: unknown, uid: Fields): string {
  * publisher data. Configured global EIDs are consulted only for deduplication;
  * Prebid itself merges those arrays into the request on its normal path.
  */
-export function mergeIdentityMirror(ortb2: unknown, getGlobalOrtb2: () => unknown): unknown {
-  const mirror = readMirror();
+export function mergeIdentityMirror(
+  ortb2: unknown,
+  getGlobalOrtb2: () => unknown,
+  mirror: MirrorEid[] = readMirror()
+): unknown {
   if (!mirror.length) return ortb2;
   const seen = new Set<string>();
   let globalOrtb2: unknown;
