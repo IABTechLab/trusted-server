@@ -4,6 +4,7 @@ import {
   ConsentQueue,
   isKnownWithdrawal,
   readConsentCookies,
+  requestBody,
   sendableSnapshot,
   type ConsentSnapshot,
   type CookieView,
@@ -94,7 +95,15 @@ export class EcRouteClient {
     }
     const entry = this.queue.offer(snapshot, consentCookies());
     if (entry?.kind === 'barrier') this.suppress();
-    if (entry) this.entryEpochs.set(entry, this.fenceEpoch);
+    if (entry) {
+      this.entryEpochs.set(entry, this.fenceEpoch);
+    } else {
+      // A reading equal to a call still pending is carried by that call, so
+      // its answer reflects the current state and may lift a later fence.
+      const body = requestBody(snapshot);
+      const pending = body === undefined ? undefined : this.queue.pendingWithBody(body);
+      if (pending) this.entryEpochs.set(pending, this.fenceEpoch);
+    }
     this.pump();
   }
 

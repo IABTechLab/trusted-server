@@ -157,6 +157,11 @@ export class ConsentQueue {
     return entry;
   }
 
+  /** The waiting or in-flight call carrying this request body, if any. */
+  pendingWithBody(body: string): QueueEntry | undefined {
+    return [this.inFlight, ...this.waiting].find((entry) => entry?.body === body);
+  }
+
   /**
    * Stops treating the last answered call as the server's current state, so a
    * reading equal to it is sent again. Waiting and in-flight calls still

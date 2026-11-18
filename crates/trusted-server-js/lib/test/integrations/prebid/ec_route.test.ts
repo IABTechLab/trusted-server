@@ -351,6 +351,16 @@ describe('EcRouteClient', () => {
     expect(client.mirrorSource()).toEqual([]);
   });
 
+  it('lifts a fence on the answer to a pending call that matches the later reading', async () => {
+    client.report(tcf('CPa.AA'));
+    client.report(tcf('', []));
+    client.report(tcf('CPa.AA'));
+    expect(calls, 'the pending call already carries the reading').toHaveLength(1);
+    calls[0].resolve(json([routeId]));
+    await settle();
+    expect(client.mirrorSource()).toEqual([routeId]);
+  });
+
   it('lifts suppression after a repeated withdrawal is answered', async () => {
     client.report(tcf('CPa.AA', ['p1']));
     client.report(tcf('CPa.AA', ['p1']));

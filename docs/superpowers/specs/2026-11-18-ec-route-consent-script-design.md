@@ -182,7 +182,9 @@ fence: every call is stamped with the fence count when queued, the fence count
 rises with each such withdrawal, and an answer lifts suppression only when its
 call carries the current count. The answer to any call queued before the
 withdrawal therefore cannot lift it, and only a later valid reading's answer
-can.
+can. A later reading equal to a call still waiting or in flight is not queued
+again; that call is re-stamped instead, since its answer reflects the current
+reading.
 
 A known withdrawal also expires `__Host-ts-eids-mirror` from script at once
 (`Path=/; Secure; Max-Age=0`), because a grant in flight may still deliver that
@@ -318,3 +320,6 @@ them.
   matched an earlier call let that earlier call's answer lift suppression.
   Such a withdrawal is now not sent at all, so it has no cookie-based answer
   and needs no repeat rule; each report re-fences without a call.
+- Last-delta review: a later reading equal to a call still pending was
+  deduplicated without a new stamp, so that call's answer could not lift the
+  fence. Such a call is now re-stamped.
