@@ -59,6 +59,7 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod registry;
+pub mod sharedid;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -1041,7 +1042,7 @@ mod tests {
             None,
             &registry::PartnerRegistry::empty(),
             None,
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         )
         .await;

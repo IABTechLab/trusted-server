@@ -26,6 +26,7 @@ use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::{PartnerConfig, PartnerRegistry};
+use super::sharedid::{SharedIdRequest, drop_opted_out_sharedid_updates};
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -60,7 +61,7 @@ pub async fn ec_finalize_response(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
-    sharedid_cookie: Option<&str>,
+    sharedid: &SharedIdRequest,
     response: &mut Response<EdgeBody>,
 ) {
     let navigation = finalize_response_inner(
@@ -69,7 +70,7 @@ pub async fn ec_finalize_response(
         kv,
         registry,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
         response,
     )
     .await;
@@ -206,7 +207,7 @@ async fn finalize_response_inner(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
-    sharedid_cookie: Option<&str>,
+    sharedid: &SharedIdRequest,
     response: &mut Response<EdgeBody>,
 ) -> bool {
     let (permit, after_response) = ec_context
@@ -232,11 +233,14 @@ async fn finalize_response_inner(
 
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
         let collected = if ec_context.eid_sync_source().is_some() || ec_context.ec_generated() {
-            collect_eid_updates(
-                eids_cookie,
-                sharedid_cookie,
-                ec_context.client_eids(),
-                registry,
+            drop_opted_out_sharedid_updates(
+                collect_eid_updates(
+                    eids_cookie,
+                    sharedid.readable_value(),
+                    ec_context.client_eids(),
+                    registry,
+                ),
+                sharedid,
             )
         } else {
             Vec::new()
@@ -859,7 +863,7 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -914,7 +918,7 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -972,7 +976,7 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1018,7 +1022,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1071,7 +1075,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1106,7 +1110,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1141,7 +1145,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1184,7 +1188,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1248,7 +1252,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1299,7 +1303,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1360,7 +1364,7 @@ mod tests {
                 Some(&graph),
                 &registry,
                 None,
-                Some(cookie_id),
+                &SharedIdRequest::with_value_for_test(cookie_id),
                 &mut response,
             )
             .await;
@@ -1403,7 +1407,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("generated-cookie-id"),
+            &SharedIdRequest::with_value_for_test("generated-cookie-id"),
             &mut response,
         )
         .await;
@@ -1455,7 +1459,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1534,7 +1538,7 @@ mod tests {
             Some(&graph),
             &registry,
             Some(&eids_cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1547,6 +1551,117 @@ mod tests {
         assert!(
             stored.ids.is_empty(),
             "should persist neither the auction body nor the cookie EIDs"
+        );
+    }
+
+    /// Runs a returning navigation's finalize against a live record and
+    /// returns the `SharedID` it stores under `pubcid.org`.
+    async fn stored_sharedid_after_navigation(
+        consent: ConsentContext,
+        sharedid: &SharedIdRequest,
+        client_eids: Vec<Eid>,
+    ) -> Option<String> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("shrdid");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &consent,
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the live row");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            consent,
+        );
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        ec_context.set_client_eids(client_eids);
+        let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
+            .expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            sharedid,
+            &mut response,
+        )
+        .await;
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .expect("should keep the row");
+        stored.ids.get("pubcid.org").map(|id| id.uid.clone())
+    }
+
+    fn sharedid_body_eid(id: &str) -> Eid {
+        Eid::new(
+            "pubcid.org",
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_the_sharedid_cookie_under_pubcid() {
+        let stored = stored_sharedid_after_navigation(
+            granting_consent(),
+            &SharedIdRequest::with_value_for_test("cookie-shared"),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(
+            stored.as_deref(),
+            Some("cookie-shared"),
+            "should store the SharedID cookie under pubcid.org"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_no_sharedid_for_an_opted_out_reader() {
+        let stored = stored_sharedid_after_navigation(
+            granting_consent(),
+            &SharedIdRequest::opted_out_for_test("cookie-shared"),
+            vec![sharedid_body_eid("body-shared")],
+        )
+        .await;
+
+        assert_eq!(
+            stored, None,
+            "should store no SharedID from the cookie or the request EIDs after an opt-out"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_no_sharedid_when_purpose_four_is_denied() {
+        let stored = stored_sharedid_after_navigation(
+            purpose_one_only_consent(),
+            &SharedIdRequest::with_value_for_test("cookie-shared"),
+            vec![sharedid_body_eid("body-shared")],
+        )
+        .await;
+
+        assert_eq!(
+            stored, None,
+            "should store no SharedID with Purpose 1 granted and Purpose 4 denied"
         );
     }
 
@@ -1599,7 +1714,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1666,7 +1781,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1714,7 +1829,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("fallback-cookie-id"),
+            &SharedIdRequest::with_value_for_test("fallback-cookie-id"),
             &mut response,
         )
         .await;
@@ -1756,7 +1871,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1806,7 +1921,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1855,7 +1970,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1916,7 +2031,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1966,7 +2081,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1998,7 +2113,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2022,7 +2137,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2059,7 +2174,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2219,7 +2334,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2362,7 +2477,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2560,7 +2675,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2590,7 +2705,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2669,7 +2784,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2697,7 +2812,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2724,7 +2839,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2753,7 +2868,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2799,7 +2914,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2861,7 +2976,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2897,7 +3012,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut repeated_response,
         )
         .await;
@@ -2947,7 +3062,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2993,7 +3108,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3023,7 +3138,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3078,7 +3193,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3116,7 +3231,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3159,7 +3274,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3194,7 +3309,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3232,7 +3347,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3274,7 +3389,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3342,7 +3457,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3382,7 +3497,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3446,7 +3561,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3479,7 +3594,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3510,7 +3625,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3552,7 +3667,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3585,7 +3700,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3616,7 +3731,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3648,7 +3763,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3714,7 +3829,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
