@@ -67,7 +67,11 @@ authority, scheme, and client-address headers in the innermost middleware.
 | startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | exits with status `1` | startup error (`500`) | startup error (`503`) |
 
 `real`, `unsupported`, `guarded`, `publisher fallback`, `startup error`, and
-`exits with status 1` are distinct observable dispositions. An em dash means
+`exits with status 1` are distinct observable dispositions. On Cloudflare,
+`/.well-known/trusted-server.json` and `/verify-signature` are routed, but the
+Worker has no request-time config store for signing metadata: discovery
+answers the shared `500` and `/verify-signature` answers `200` with
+`verified: false`. An em dash means
 that the adapter has no local route; the publisher fallback can therefore
 receive that path. The startup rows show what each path answers when app assembly fails,
 in place of every normal route. Fastly answers `/health` before it assembles

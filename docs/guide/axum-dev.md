@@ -95,10 +95,20 @@ sessions.
 ## Runtime boundaries
 
 Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
-[adapter matrix](./api-reference#adapter-and-startup-support).
+and key rotation are registered but return not-supported responses, because
+the adapter has no EC record store or key-management stores. It sanitizes
+forwarded client-IP headers but does not resolve `[trusted_client_ip]`; see
+the [adapter matrix](./api-reference#adapter-and-startup-support).
+
+The generic runtime KV store is off by default. Set `TRUSTED_SERVER_KV_PATH`
+to a database file whose parent directory exists, for example
+`TRUSTED_SERVER_KV_PATH=.local/runtime-kv.redb`, and the server opens it on the
+first request. Store operations run on Tokio's blocking pool. Without the
+variable, or when the file cannot be opened, KV operations answer
+`KvError::Unavailable`, a warning is logged, and every route is still served.
+One process holds the file's lock, so give each server its own path. See the
+[store inventory](./edgezero#store-inventory) for every store the adapter
+reads.
 
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.

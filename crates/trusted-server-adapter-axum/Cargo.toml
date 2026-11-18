@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
@@ -33,5 +34,6 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true }
+tempfile = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -6,8 +6,8 @@ deployment target.
 
 The crate owns Axum route registration, middleware, and environment-backed
 platform services. Outbound HTTP goes through EdgeZero's Axum client. Its
-route surface follows the shared core contract, but request-time KV operations
-are unavailable. A startup error, such as a missing config or secret, stops the
+route surface follows the shared core contract. Request-time KV is an opt-in
+file store at `TRUSTED_SERVER_KV_PATH` and is unavailable when that is unset. A startup error, such as a missing config or secret, stops the
 process with a non-zero exit before it listens. Application configuration
 reaches the process through the documented environment bridge; the local
 EdgeZero config-store file is not read directly.

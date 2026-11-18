@@ -55,7 +55,7 @@ Native Axum dev/test adapter (native binary):
 
 | Feature                                    | Axum dev server                                                                                                                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
+| KV store                                   | Opt-in file store at `TRUSTED_SERVER_KV_PATH`; unavailable when unset                                                                                                                            |
 | Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
 | Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
@@ -67,7 +67,7 @@ Native Axum dev/test adapter (native binary):
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
+- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_kv` label
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning

@@ -1,14 +1,19 @@
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::error::EdgeError;
+use edgezero_core::key_value_store::KvPage;
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
+    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,16 +163,141 @@ impl PlatformGeo for AxumPlatformGeo {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime KV
+// ---------------------------------------------------------------------------
+
+/// Environment variable naming the file that backs the generic runtime KV store.
+///
+/// Unset, the store is unavailable. The adapter does not declare the store to
+/// `EdgeZero`, whose Axum server would treat it as required and refuse to start
+/// without a writable local database.
+pub const KV_PATH_ENV_VAR: &str = "TRUSTED_SERVER_KV_PATH";
+
+/// Runs a [`PersistentKvStore`]'s synchronous database I/O off the async task.
+///
+/// Inside a Tokio runtime each operation runs on the blocking pool, so a slow
+/// write cannot stall other requests; outside one it runs inline. An operation
+/// whose blocking task panics or is cancelled answers `KvError::Unavailable`.
+struct BlockingKvStore(Arc<PersistentKvStore>);
+
+impl BlockingKvStore {
+    async fn run<T, F, Fut>(&self, operation: F) -> Result<T, KvError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<PersistentKvStore>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, KvError>>,
+    {
+        let store = Arc::clone(&self.0);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime
+                .spawn_blocking(move || futures::executor::block_on(operation(store)))
+                .await
+                .unwrap_or_else(|error| {
+                    log::error!("Axum: runtime KV operation did not complete: {error}");
+                    Err(KvError::Unavailable)
+                }),
+            Err(_) => operation(store).await,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl PlatformKvStore for BlockingKvStore {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.get_bytes(&key).await })
+            .await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.exists(&key).await })
+            .await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes(&key, value).await })
+            .await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes_with_ttl(&key, value, ttl).await })
+            .await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.delete(&key).await })
+            .await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let prefix = prefix.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.run(move |store| async move {
+            store
+                .list_keys_page(&prefix, cursor.as_deref(), limit)
+                .await
+        })
+        .await
+    }
+}
+
+/// Opens the runtime KV store backed by the database file at `path`.
+///
+/// Without a path, or when the file cannot be opened (a missing parent
+/// directory, a lock held by another process or a corrupt file), the store is
+/// unavailable: each KV operation answers `KvError::Unavailable`, a warning is
+/// logged, and requests are still served.
+fn kv_store_from_path(path: Option<&Path>) -> Arc<dyn PlatformKvStore> {
+    let Some(path) = path else {
+        log::warn!("Axum: generic runtime KV is unavailable; set {KV_PATH_ENV_VAR} to enable it");
+        return Arc::new(UnavailableKvStore);
+    };
+    match PersistentKvStore::new(path) {
+        Ok(store) => {
+            log::info!("Axum: generic runtime KV store at {}", path.display());
+            Arc::new(BlockingKvStore(Arc::new(store)))
+        }
+        Err(error) => {
+            log::warn!(
+                "Axum: generic runtime KV is unavailable; cannot open {}: {error}",
+                path.display()
+            );
+            Arc::new(UnavailableKvStore)
+        }
+    }
+}
+
+/// Opens the runtime KV store named by [`KV_PATH_ENV_VAR`].
+fn kv_store_from_env() -> Arc<dyn PlatformKvStore> {
+    let path = std::env::var_os(KV_PATH_ENV_VAR).map(PathBuf::from);
+    kv_store_from_path(path.as_deref())
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Axum request.
 ///
-/// # Degraded features in dev
+/// # Runtime KV
 ///
-/// The generic runtime KV slot uses
-/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
-/// emitted once per process.
+/// The generic runtime KV store is the file [`KV_PATH_ENV_VAR`] names, opened
+/// on the first request and shared by every later one. Unset or unopenable, it
+/// is [`UnavailableKvStore`], with a `warn` log once per process.
 ///
 /// The outbound client is the one the request context carries, with the proxy
 /// marker turned off, and the clock is the context's monotonic clock.
@@ -179,11 +309,6 @@ impl PlatformGeo for AxumPlatformGeo {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
 ) -> Result<RuntimeServices, EdgeError> {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
-    });
-
     let client_ip = ctx
         .extensions()
         .get::<AxumRequestContext>()
@@ -212,9 +337,7 @@ pub fn build_runtime_services(
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
+        .kv_store(Arc::clone(KV_STORE.get_or_init(kv_store_from_env)))
         .outbound_client(outbound_client)
         .clock(ctx.monotonic_clock())
         .geo(Arc::clone(GEO.get_or_init(|| {
@@ -313,6 +436,118 @@ mod tests {
                     .expect("should reuse the cooperative timer"),
             ),
             "should share the stateless timer without requiring an executor"
+        );
+    }
+
+    fn put_then_get(store: &dyn PlatformKvStore, key: &str) -> Option<Bytes> {
+        futures::executor::block_on(store.put_bytes(key, Bytes::from_static(b"example-value")))
+            .expect("should write the runtime KV store");
+        futures::executor::block_on(store.get_bytes(key)).expect("should read the runtime KV store")
+    }
+
+    #[test]
+    fn runtime_kv_round_trips_outside_a_tokio_runtime() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let store = kv_store_from_path(Some(&directory.path().join("runtime-kv.redb")));
+
+        assert_eq!(
+            put_then_get(store.as_ref(), "example-key"),
+            Some(Bytes::from_static(b"example-value")),
+            "should run store operations inline without a runtime"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_kv_round_trips_on_the_blocking_pool() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let store = kv_store_from_path(Some(&directory.path().join("runtime-kv.redb")));
+
+        store
+            .put_bytes("example-key", Bytes::from_static(b"example-value"))
+            .await
+            .expect("should write the runtime KV store");
+
+        assert_eq!(
+            store
+                .get_bytes("example-key")
+                .await
+                .expect("should read the runtime KV store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should read back the value written inside a runtime"
+        );
+    }
+
+    #[test]
+    fn runtime_kv_persists_across_reopen() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let path = directory.path().join("runtime-kv.redb");
+        let first = kv_store_from_path(Some(&path));
+        put_then_get(first.as_ref(), "example-key");
+        drop(first);
+
+        let reopened = kv_store_from_path(Some(&path));
+
+        assert_eq!(
+            futures::executor::block_on(reopened.get_bytes("example-key"))
+                .expect("should read the reopened store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should keep values in the database file across a restart"
+        );
+    }
+
+    #[test]
+    fn runtime_kv_without_a_path_is_unavailable() {
+        let store = kv_store_from_path(None);
+
+        assert!(
+            matches!(
+                futures::executor::block_on(store.get_bytes("example-key")),
+                Err(KvError::Unavailable)
+            ),
+            "should report KV as unavailable without a path"
+        );
+    }
+
+    #[test]
+    fn runtime_kv_with_an_unopenable_path_is_unavailable() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let file = directory.path().join("regular-file");
+        std::fs::write(&file, b"not a directory").expect("should create a regular file");
+
+        let store = kv_store_from_path(Some(&file.join("runtime-kv.redb")));
+
+        assert!(
+            matches!(
+                futures::executor::block_on(store.get_bytes("example-key")),
+                Err(KvError::Unavailable)
+            ),
+            "should report KV as unavailable when the file cannot be opened"
+        );
+    }
+
+    #[test]
+    fn runtime_kv_reads_its_path_from_the_environment() {
+        let directory = tempfile::tempdir().expect("should create a temp directory");
+        let path = directory.path().join("runtime-kv.redb");
+
+        let enabled = temp_env::with_var("TRUSTED_SERVER_KV_PATH", Some(&path), kv_store_from_env);
+        let disabled = temp_env::with_var_unset("TRUSTED_SERVER_KV_PATH", kv_store_from_env);
+
+        assert_eq!(
+            put_then_get(enabled.as_ref(), "example-key"),
+            Some(Bytes::from_static(b"example-value")),
+            "should open the store TRUSTED_SERVER_KV_PATH names"
+        );
+        assert!(
+            path.is_file(),
+            "should create the database file at the configured path"
+        );
+        assert!(
+            matches!(
+                futures::executor::block_on(disabled.get_bytes("example-key")),
+                Err(KvError::Unavailable)
+            ),
+            "should leave KV unavailable when TRUSTED_SERVER_KV_PATH is unset"
         );
     }
 

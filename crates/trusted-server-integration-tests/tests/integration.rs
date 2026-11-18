@@ -2055,6 +2055,56 @@ fn with_spin_ingress(status: u16, check: impl FnOnce(&str, &RecordingOrigin)) {
     OriginRuntime::Spin.serve(&envelope, |base_url| check(base_url, &origin));
 }
 
+/// Spin serves request-time config, including request-signing metadata, from
+/// the `default` label startup reads. Before that wiring, discovery answered
+/// 500 because every request-time config read failed.
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_discovery_reads_signing_metadata_from_default() {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "example-kid-a",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw",
+    })
+    .to_string();
+    let default_entries = [
+        ("current-kid", "example-kid-a"),
+        ("active-kids", "example-kid-a"),
+        ("example-kid-a", jwk.as_str()),
+    ];
+
+    common::trace_boundary::with_spin_runtime(
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        &default_entries,
+        |base_url| {
+            let response =
+                reqwest::blocking::get(format!("{base_url}/.well-known/trusted-server.json"))
+                    .expect("should request the discovery document");
+            let status = response.status().as_u16();
+            let body = response.text().expect("should read the discovery document");
+            assert_eq!(
+                status, 200,
+                "Spin discovery should read signing metadata from `default`: {body}"
+            );
+            let document: serde_json::Value =
+                serde_json::from_str(&body).expect("should return a JSON discovery document");
+            assert_eq!(
+                document["jwks"]["keys"][0]["kid"],
+                serde_json::json!("example-kid-a"),
+                "discovery should publish the active key seeded in `default`: {body}"
+            );
+        },
+    );
+}
+
 #[test]
 #[ignore = "requires Spin and the current production Spin WASM artifact"]
 fn spin_runtime_post_auction_with_json_body() {

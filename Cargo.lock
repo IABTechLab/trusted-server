@@ -6608,6 +6608,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
@@ -6615,6 +6616,7 @@ dependencies = [
  "log",
  "reqwest 0.12.28",
  "temp-env",
+ "tempfile",
  "tokio",
  "trusted-server-core",
 ]

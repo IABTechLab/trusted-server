@@ -66,6 +66,68 @@ fn test_settings() -> Settings {
     .expect("should parse route test settings")
 }
 
+/// Cloudflare has no request-time config store, so request signing cannot read
+/// its metadata. This pins the documented results; on the host build every
+/// adapter gets the no-op config store, so the Worker's wasm path is checked
+/// at runtime instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_signing_routes_report_unsupported_signing_metadata() {
+    let discovery = route(
+        test_router(),
+        request_builder()
+            .method("GET")
+            .uri("/.well-known/trusted-server.json")
+            .body(Body::empty())
+            .expect("should build discovery request"),
+    )
+    .await;
+    let verify = route(
+        test_router(),
+        request_builder()
+            .method("POST")
+            .uri("/verify-signature")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "payload": "example-payload",
+                    "signature": "ZXhhbXBsZS1zaWduYXR1cmU",
+                    "kid": "example-kid",
+                })
+                .to_string(),
+            ))
+            .expect("should build verify request"),
+    )
+    .await;
+
+    assert_eq!(
+        discovery.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "discovery should answer the shared 500 without signing metadata"
+    );
+    assert_eq!(
+        verify.status(),
+        StatusCode::OK,
+        "verification should answer 200 with an unverified result"
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &verify
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the verify response"),
+    )
+    .expect("should return a JSON verify response");
+    assert_eq!(
+        body["verified"],
+        serde_json::json!(false),
+        "verification should report an unverified signature: {body}"
+    );
+    assert_eq!(
+        body["error"],
+        serde_json::json!("internal verification error"),
+        "verification should report the metadata read failure: {body}"
+    );
+}
+
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
 fn registered_routes() -> Vec<(String, String)> {
     test_router()

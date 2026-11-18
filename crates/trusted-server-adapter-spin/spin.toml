@@ -4,9 +4,16 @@ spin_manifest_version = 2
 name = "trusted-server-adapter-spin"
 version = "0.1.0"
 
-# EdgeZero's Spin config stores are KV-backed and read keys verbatim. Request-signing
-# metadata such as `current-kid`, `active-kids`, and public JWK entries therefore
-# belongs directly in the component's `default` key-value store.
+# Startup and request-time config both read the component's `default` key-value
+# store, with keys verbatim and whatever store name the caller asks for. Request-
+# signing metadata such as `current-kid`, `active-kids`, and public JWK entries
+# therefore belongs directly in `default`.
+#
+# The generic runtime KV store is the `trusted_server_kv` label, which this
+# manifest does not grant: KV operations fail and every route is still served.
+# To enable it, add the label below and give it a backend in the runtime config:
+#   key_value_stores = ["default", "trusted_server_kv"]
+# Never map EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME to `default`.
 #
 # Secret stores read Spin component variables. The adapter encodes the store and
 # key into a collision-resistant variable name. Every generated name starts with

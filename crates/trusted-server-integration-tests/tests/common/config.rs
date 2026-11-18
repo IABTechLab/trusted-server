@@ -560,6 +560,10 @@ mod tests {
             stores["counter_store"].is_array(),
             "fastly.toml should define counter_store for batch-sync rate limiting"
         );
+        assert!(
+            stores["trusted_server_kv"].is_array(),
+            "fastly.toml should link the generic runtime KV store under its logical ID"
+        );
         let ec_entries = stores["ec_identity_store"]
             .as_array()
             .expect("fastly.toml should define ec_identity_store");

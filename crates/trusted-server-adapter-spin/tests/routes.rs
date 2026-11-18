@@ -206,7 +206,7 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
 
     assert!(
         manifest.stores.config.is_some(),
-        "Spin EdgeZero manifest must enable config store injection"
+        "edgezero.toml should declare the config store that `ts config push` targets"
     );
     assert_eq!(
         manifest
@@ -216,11 +216,34 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
             .expect("should declare a KV store")
             .default_id(),
         "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
+        "edgezero.toml should declare the generic runtime KV store"
     );
     assert!(
         manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),
-        "Spin EdgeZero manifest must enable secret handle injection"
+        "edgezero.toml should enable the secret store for Spin"
+    );
+}
+
+#[test]
+fn hooks_declare_only_the_runtime_kv_store() {
+    let stores = <TrustedServerApp as edgezero_core::app::Hooks>::stores();
+    let kv = stores.kv.expect("should declare the runtime KV store");
+
+    assert_eq!(
+        (kv.default, kv.ids),
+        (
+            trusted_server_adapter_spin::app::SPIN_KV_STORE_ID,
+            &["trusted_server_kv"][..]
+        ),
+        "should declare `trusted_server_kv` as the only KV store"
+    );
+    assert!(
+        !kv.ids.contains(&"default"),
+        "should never open the `default` label as runtime KV"
+    );
+    assert!(
+        stores.config.is_none() && stores.secrets.is_none(),
+        "should leave config on the `default` label and secrets on component variables"
     );
 }
 

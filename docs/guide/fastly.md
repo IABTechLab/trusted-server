@@ -351,11 +351,15 @@ When upgrading an existing service:
   `EDGEZERO__STORES__<KIND>__<ID>__NAME` variable. An unset selector falls
   back to the logical ID, so the deploy links whichever account-level store
   carries that name, which can belong to another service.
-- Select a KV store for logical ID `trusted_server_kv`. The managed deploy
-  links every declared store, and this one is usually absent on Fastly. Set
-  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` to an existing KV store or
-  run `ts provision --adapter fastly`; otherwise the deploy stops with
-  "selected Fastly KV store `trusted_server_kv` does not exist".
+- Select a KV store for logical ID `trusted_server_kv`, the generic runtime
+  KV store that features reach through `RuntimeServices::kv_store()`. The
+  managed deploy links every declared store, and this one is usually absent on
+  Fastly. Set `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` to a dedicated KV
+  store or run `ts provision --adapter fastly`; otherwise the deploy stops with
+  "selected Fastly KV store `trusted_server_kv` does not exist". Never select
+  `ec_identity_store` or another store a feature already owns: runtime KV
+  writes land in the selected store. A version without the link still serves
+  every route, and its KV operations answer `KvError::OpenFailed`.
 - Re-push staging app config under the logical key into the staging Config
   Store, with `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` set to
   that store. Entries previously pushed under `<logical-store-id>_staging` are
