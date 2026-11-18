@@ -859,17 +859,17 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                               | Type           | Required | Description                                                             |
-| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                          | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                  |
-| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                  |
-| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
+| Field                               | Type           | Required | Description                                                               |
+| ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                     |
+| `ec_store`                          | String or null | No       | EC identity graph and withdrawal store (Fastly KV or Axum process memory) |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response                |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                       |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps   |
+| `partners`                          | Array          | No       | Static partner registry entries                                           |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                    |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                    |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -937,14 +937,23 @@ validate`, `push` and `diff` build every enabled provider and reject one whose
 `spin`, because those adapters refuse to start with one. On Fastly and
 Axum, an enabled provider whose `kind` this build does not include, or whose
 `settings` its kind rejects, also fails startup. The Axum dev server keeps the
-identity graph named by `ec.ec_store` in process memory, so stored IDs are lost
+identity graph named by `ec.ec_store` in process memory, so stored IDs and remembered opt-outs are lost
 when it exits. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
 (`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
-provider cleared on an opt-out is not refilled from the browser.
+provider cleared on an opt-out is not refilled from the browser. Legacy single-UID
+records already stored for an owned source are treated as expired immediately;
+provider-written records keep their per-UID expiry. Unowned sources retain their
+existing behavior. Remembered provider opt-outs also withhold client copies from
+`ts-eids` and the `/auction` body on API, initial-page and page-bids auctions until
+the opt-out expires. Ordinary client EIDs do not clear that memory.
+Accepted auctions with an existing EC also read opt-out policy when Fastly
+browser TLS metadata is unavailable or Axum does not recognize the User-Agent. This read does not enable stored-ID enrichment, identity
+generation, provider lookups or KV writes. Missing rows or failed KV reads retain
+the existing degraded behavior because no active opt-out can be established.
 
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the
@@ -1037,9 +1046,8 @@ rewrites the row.
 `ts config validate`, `ts config push` and `ts config diff` also build every
 enabled provider of a registered kind, so a provider-specific setting error
 (for example a `liveramp` `endpoint` without `placement_id` and
-`custom_id_namespace`) fails the command before deploy. At runtime the same
-error would disable every identity provider for each request, with an error
-log.
+`custom_id_namespace`) fails the command before deploy. Fastly and Axum
+reject the same invalid provider settings during application initialization.
 
 #### Provider kinds
 
@@ -1161,24 +1169,23 @@ token is kept privately and the token is refreshed server side from
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. Set `consent_store` to a
-KV store name only when consent should persist with the EC identity graph.
+signals. It does not create a second consent database; minimal persisted consent
+metadata lives in `ec.ec_store`.
 
 ### `[consent]`
 
-| Field                                          | Type           | Default                     | Contract                                                    |
-| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
-| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
-| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
-| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
-| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
-| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
-| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
-| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
-| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
-| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
-| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+| Field                                          | Type          | Default                     | Contract                                                    |
+| ---------------------------------------------- | ------------- | --------------------------- | ----------------------------------------------------------- |
+| `mode`                                         | String        | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
+| `check_expiration`                             | Boolean       | `true`                      | Check TCF timestamps                                        |
+| `max_consent_age_days`                         | Integer       | `395`                       | Clamped to `1..=3650`                                       |
+| `gdpr.applies_in`                              | Array[String] | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
+| `us_states.privacy_states`                     | Array[String] | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
+| `us_privacy_defaults.notice_given`             | Boolean       | `true`                      | Publisher policy used for GPC-only requests                 |
+| `us_privacy_defaults.lspa_covered`             | Boolean       | `false`                     | Publisher LSPA posture                                      |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean       | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
+| `conflict_resolution.mode`                     | String        | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
+| `conflict_resolution.freshness_threshold_days` | Integer       | `30`                        | Age difference required by `newest`                         |
 
 In `proxy` mode Trusted Server does not decode the TC string, so it cannot
 confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:

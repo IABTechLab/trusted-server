@@ -62,10 +62,18 @@ sessions.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
+Axum implements the read-only `/_ts/admin/eids` diagnostic and EC record
+lookup. Configured identity providers use a process-local EC store: rows and
+remembered opt-outs disappear when the server exits. The default native
+geolocation service returns no country. Consent therefore has an unknown
+jurisdiction and fails closed for EC creation and identity use; supplying a TC
+string alone does not change that jurisdiction. The full identity flow requires
+a geolocation service through the application service injection interface.
+Auctions enforce remembered
+provider opt-outs for client IDs even when the User-Agent is not recognized;
+these policy reads do not enable identity collection, stored-ID enrichment or
+writes for those clients. Key rotation remains unsupported. Axum sanitizes
+forwarded client-IP headers but does not resolve `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

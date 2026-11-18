@@ -253,8 +253,9 @@ struct AuctionEidsView {
 struct SkippedPartnerId {
     /// Partner namespace key in the entry's `ids` map.
     source_domain: String,
-    /// Why the auction resolution skips it: `empty_uid`, `expired` (provider
-    /// record with no live UID), `not_in_registry`, or `bidstream_disabled`.
+    /// Why the auction resolution skips it: `empty_uid`, `expired` (no live
+    /// provider UID or a legacy record in an owned source), `provider_opted_out`,
+    /// `not_in_registry`, or `bidstream_disabled`.
     reason: &'static str,
 }
 
@@ -525,6 +526,10 @@ fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEid
             match registry.get(source_domain) {
                 None => "not_in_registry",
                 Some(partner) if !partner.bidstream_enabled => "bidstream_disabled",
+                Some(partner) if partner.owner_opted_out(entry, now) => "provider_opted_out",
+                Some(partner) if partner.provider_owned && !partner_uid.is_provider_written() => {
+                    "expired"
+                }
                 Some(_) => continue,
             }
         } else if partner_uid.is_provider_written() {
@@ -1620,6 +1625,60 @@ mod tests {
         assert_eq!(view.skipped.len(), 1, "should report the expired record");
         assert_eq!(view.skipped[0].source_domain, "expired.example");
         assert_eq!(view.skipped[0].reason, "expired", "should report expiry");
+    }
+
+    #[test]
+    fn auction_view_reports_owned_legacy_and_opted_out_sources() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.partners = vec![
+            make_test_partner("legacy.example.com", true),
+            make_test_partner("opted-out.example.com", true),
+        ];
+        settings.ec.identity_providers = vec![toml::from_str(
+            "id = \"example-provider\"\nkind = \"example\"\nsources = [\"opted-out.example.com\"]",
+        ).expect("should parse provider")];
+        let mut registry = PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+            .expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("legacy.example.com", None),
+            "should mark legacy source owned"
+        );
+        let mut entry = KvEntry::minimal("legacy.example.com", "legacy", 1);
+        let uid = KvUid::new(
+            UidValue::try_from("live").expect("should build UID"),
+            AgentType::try_from(1).expect("should build agent type"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        entry.ids.insert(
+            "opted-out.example.com".to_owned(),
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+                UnixSeconds::new(0),
+            )
+            .expect("should build provider record"),
+        );
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), u64::MAX);
+
+        let view = build_auction_view(&registry, &entry);
+
+        assert!(view.eids.is_empty(), "should withhold both owned sources");
+        let reasons: Vec<_> = view
+            .skipped
+            .iter()
+            .map(|item| (item.source_domain.as_str(), item.reason))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("legacy.example.com", "expired"),
+                ("opted-out.example.com", "provider_opted_out")
+            ],
+            "should explain each source's exclusion"
+        );
     }
 
     #[test]

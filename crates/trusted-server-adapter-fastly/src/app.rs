@@ -535,6 +535,7 @@ async fn dispatch_identity_lookups(
 struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
+    auction_policy_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
@@ -607,7 +608,7 @@ fn build_ec_request_state(
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
         log::info!(
-            "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
+            "Bot gate: blocking EC generation, enrichment and writes (ja4={:?}, platform={:?}, is_mobile={})",
             device_signals.ja4_class,
             device_signals.platform_class,
             device_signals.is_mobile,
@@ -625,7 +626,7 @@ fn build_ec_request_state(
             None
         });
 
-    let (ec_context, setup_error) =
+    let (mut ec_context, setup_error) =
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
@@ -652,11 +653,26 @@ fn build_ec_request_state(
     } else {
         None
     };
+    // Accepted auctions still enforce remembered opt-outs without authorizing
+    // identity enrichment, provider collection or finalization writes.
+    let auction_policy_graph = if !is_real_browser
+        && settings
+            .ec
+            .identity_providers
+            .iter()
+            .any(|provider| provider.enabled)
+    {
+        ec_context.restrict_to_auction_policy();
+        kv_graph.clone()
+    } else {
+        None
+    };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
         ec_context,
         kv_graph,
+        auction_policy_graph,
         finalize_kv_graph,
         eids_cookie,
         sharedid_cookie,
@@ -877,7 +893,7 @@ async fn run_named_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                ec.kv_graph.as_ref(),
+                ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
                 registry_ref,
                 &mut ec.ec_context,
                 services,
@@ -907,7 +923,7 @@ async fn run_named_route(
             handle_page_bids(
                 &state.settings,
                 services,
-                ec.kv_graph.as_ref(),
+                ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
                 auction,
                 &mut ec.ec_context,
                 req,
@@ -1096,7 +1112,7 @@ async fn dispatch_fallback(
         match handle_publisher_request(
             &state.settings,
             services,
-            ec.kv_graph.as_ref(),
+            ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
             &mut ec.ec_context,
             auction,
             req,
@@ -3515,6 +3531,230 @@ mod tests {
             finalize.is_real_browser,
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
         );
+    }
+
+    #[derive(Default)]
+    struct PolicyAuctionHttpClient {
+        bodies: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for PolicyAuctionHttpClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            let backend_name = request.backend_name;
+            let body = request
+                .request
+                .into_body()
+                .into_bytes_bounded(65536)
+                .await
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            self.bodies
+                .lock()
+                .expect("should lock bidder requests")
+                .push(body.to_vec());
+            Ok(PlatformPendingRequest::new(()).with_backend_name(backend_name))
+        }
+
+        async fn select(
+            &self,
+            pending: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            self.select_until(pending, web_time::Instant::now())
+                .await?
+                .ok_or_else(|| Report::new(PlatformError::HttpClient))
+        }
+
+        async fn select_until(
+            &self,
+            mut pending: Vec<PlatformPendingRequest>,
+            _deadline: web_time::Instant,
+        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+            let Some(ready) = pending.pop() else {
+                return Ok(None);
+            };
+            let backend = ready
+                .backend_name()
+                .expect("should carry backend name")
+                .to_owned();
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(Some(PlatformSelectResult {
+                ready: Ok(PlatformResponse::new(response).with_backend_name(backend)),
+                remaining: pending,
+                failed_backend_name: None,
+            }))
+        }
+    }
+
+    struct PolicyAuctionGeo;
+
+    impl trusted_server_core::platform::PlatformGeo for PolicyAuctionGeo {
+        fn lookup(
+            &self,
+            _ip: Option<IpAddr>,
+        ) -> Result<Option<trusted_server_core::geo::GeoInfo>, Report<PlatformError>> {
+            Ok(Some(trusted_server_core::geo::GeoInfo {
+                city: "Example City".to_owned(),
+                country: "NZ".to_owned(),
+                continent: "Oceania".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            }))
+        }
+    }
+
+    #[test]
+    fn accepted_auction_without_tls_metadata_enforces_opt_outs_without_enrichment() {
+        // Arrange: missing JA4 must keep the write gate closed, but not bypass
+        // a readable provider opt-out on an otherwise accepted auction.
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        let configured_bidder = settings
+            .auction
+            .providers
+            .get_mut(
+                &"prebid"
+                    .parse::<trusted_server_core::auction::plan::ProviderId>()
+                    .expect("should parse provider"),
+            )
+            .expect("should find bidder");
+        configured_bidder.endpoint = "https://bidder.example.com/openrtb2/auction".to_owned();
+        settings.auction.bidders = serde_json::from_value(serde_json::json!({
+            "example-bidder": {"provider": "prebid"}
+        }))
+        .expect("should configure bidder routing");
+        settings.ec.partners = ["ids.example.com", "other.example.com", "stored.example.com"]
+            .iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should parse partner")
+            })
+            .collect();
+        settings.ec.identity_providers = vec![toml::from_str(
+            "id = \"example-provider\"\nkind = \"sharedid\"\nsources = [\"ids.example.com\"]\n[settings]\ngenerate = false"
+        ).expect("should parse provider")];
+        let graph = crate::require_identity_graph(&settings).expect("should build graph");
+        let ec_id = format!("{}.pol001", "b".repeat(64));
+        let mut entry = trusted_server_core::ec::kv_types::KvEntry::minimal(
+            "stored.example.com",
+            "stored-only-uid",
+            1,
+        );
+        entry.opt_outs.insert(
+            trusted_server_core::ec::eid_types::ProviderId::new("example-provider"),
+            u64::MAX,
+        );
+        graph.create(&ec_id, &entry).expect("should seed row");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let bidder = Arc::new(PolicyAuctionHttpClient::default());
+        let request = request_builder().method(Method::POST).uri("https://publisher.example.com/auction")
+            .header(header::COOKIE, format!("ts-ec={ec_id}"))
+            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                "adUnits": [{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},
+                    "bids":[{"bidder":"example-bidder","params":{"placementId":"fixture"}}]}],
+                "eids": [
+                    {"source":"ids.example.com","uids":[{"id":"opted-out-client","atype":1}]},
+                    {"source":"other.example.com","uids":[{"id":"allowed-client","atype":1}]}
+                ]
+            })).expect("should serialize body"))).expect("should build request");
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::clone(&state.default_kv_store))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::clone(&bidder) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(PolicyAuctionGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let req = request;
+        let mut ec = super::build_ec_request_state(&state.settings, &services, &req);
+        assert!(!ec.is_real_browser, "should exercise the missing-TLS path");
+        assert!(
+            ec.ec_context.ec_allowed(),
+            "should allow identity consent for the fixture"
+        );
+        assert_eq!(
+            ec.ec_context.ec_value(),
+            Some(ec_id.as_str()),
+            "should use the seeded EC"
+        );
+        assert!(
+            ec.kv_graph.is_none(),
+            "should keep ordinary identity reads unavailable"
+        );
+        assert!(
+            ec.finalize_kv_graph.is_none(),
+            "should keep writes unavailable"
+        );
+
+        // Act
+        assert!(
+            state.orchestrator.is_enabled(),
+            "should enable the auction fixture"
+        );
+        let response = block_on(trusted_server_core::auction::endpoints::handle_auction(
+            &state.settings,
+            &state.orchestrator,
+            ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
+            Some(&state.partner_registry),
+            &mut ec.ec_context,
+            &services,
+            req,
+        ))
+        .expect("should handle the auction");
+
+        // Assert
+        let response_bytes = block_on(response.into_body().into_bytes_bounded(65536))
+            .expect("should read auction response");
+        let sent = bidder.bodies.lock().expect("should lock bidder requests");
+        assert_eq!(
+            sent.len(),
+            1,
+            "should dispatch an accepted auction, response={}",
+            String::from_utf8_lossy(&response_bytes)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0]).expect("should parse bid request");
+        let sources: Vec<&str> = body["user"]["ext"]["eids"]
+            .as_array()
+            .expect("should retain allowed EIDs")
+            .iter()
+            .filter_map(|eid| eid["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should enforce opt-outs without releasing stored IDs"
+        );
+        assert!(
+            matches!(
+                ec.ec_context.kv_snapshot(),
+                trusted_server_core::ec::EcKvSnapshot::NotRead
+            ),
+            "should keep the policy row out of finalization"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read row")
+            .expect("should retain row");
+        assert_eq!(stored, entry, "should not modify the stored row");
     }
 
     #[test]

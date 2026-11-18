@@ -41,8 +41,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    drop_vendor_denied_client_eids, merge_auction_eids, resolve_auction_eids,
-    resolve_client_auction_eids,
+    drop_denied_client_eids, merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -4917,6 +4916,9 @@ pub async fn handle_publisher_request(
     mut req: Request<EdgeBody>,
     edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    // A policy-only graph is never available to publisher identity operations.
+    let auction_policy_graph = kv.filter(|_| ec_context.auction_policy_only());
+    let kv = kv.filter(|_| !ec_context.auction_policy_only());
     auction
         .integration_registry
         .ensure_async_html_finish_allowed(settings)?;
@@ -5384,6 +5386,25 @@ pub async fn handle_publisher_request(
         ec_context.set_kv_snapshot(graph.load_snapshot(active_ec_id));
     }
 
+    // A request without browser TLS metadata may still run an auction. Its
+    // policy-only read enforces opt-outs without granting stored-ID enrichment
+    // or making this row available to pull sync and finalization.
+    let auction_policy_snapshot = if should_run_auction
+        && auction
+            .registry
+            .is_some_and(|registry| !registry.is_empty())
+        && ec_context.ec_allowed()
+        && !ec_context.ec_generated()
+        && kv.is_none()
+    {
+        match (auction_policy_graph, active_ec_id) {
+            (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id),
+            _ => crate::ec::EcKvSnapshot::NotRead,
+        }
+    } else {
+        crate::ec::EcKvSnapshot::NotRead
+    };
+
     // Dispatch SSP bid requests while req still has the original client headers
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
@@ -5469,7 +5490,11 @@ pub async fn handle_publisher_request(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
-                    kv_snapshot: ec_context.kv_snapshot(),
+                    kv_snapshot: if ec_context.auction_policy_only() {
+                        &auction_policy_snapshot
+                    } else {
+                        ec_context.kv_snapshot()
+                    },
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -6172,10 +6197,11 @@ fn apply_auction_eids_and_device(
         targeting.partner_registry,
         targeting.ec_context,
     );
-    let client_eids = drop_vendor_denied_client_eids(
+    let client_eids = drop_denied_client_eids(
         client_eids,
         targeting.partner_registry,
-        targeting.ec_context.consent(),
+        targeting.kv_snapshot,
+        targeting.ec_context,
     );
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
@@ -7648,9 +7674,9 @@ fn normalize_page_bids_path(raw: &str) -> String {
 /// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
-/// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
-/// on every adapter, so no adapter forwards unconsented EIDs.
+/// graph on Fastly and Axum. A policy-only graph checks remembered provider
+/// opt-outs without stored-ID enrichment. Cloudflare and Spin pass `None`;
+/// client cookie EIDs remain consent-gated on every adapter.
 ///
 /// # Errors
 ///
@@ -7864,18 +7890,18 @@ pub async fn handle_page_bids(
             };
             // Load the identity-graph snapshot only now that a live auction is
             // actually running (enabled, consent-granted, slots matched, not a
-            // bot/prefetch) and a partner registry exists to consume server-side
-            // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
+            // bot/prefetch) and a partner registry exists for EID enrichment or
+            // provider opt-out filtering. Kill-switch, no-slot, bot/prefetch, and no-registry requests
             // never reach here, so they incur no billable KV read.
             let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
                 (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
-            // Hand the loaded row to the request context so response
-            // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
-            // from this read instead of paying for a second lookup.
-            if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
+            // Ordinary reads may be reused by finalization. Policy-only reads
+            // stay local so they cannot affect writes or completeness markers.
+            if !ec_context.auction_policy_only()
+                && !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead)
+            {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
             let mut auction_request = trace_request.take().unwrap_or_else(|| {
@@ -10088,6 +10114,96 @@ mod tests {
                 special_feature_opt_ins: vec![false; 12],
             }),
             ..ConsentContext::default()
+        }
+    }
+
+    #[test]
+    fn navigation_and_page_bids_drop_opted_out_cookie_eids() {
+        // Arrange: both publisher dispatch paths use the same targeting helper.
+        for path_label in ["Server-side", "Page-bids"] {
+            let partners: Vec<crate::settings::EcPartner> =
+                ["ids.example.com", "other.example.com"]
+                    .iter()
+                    .map(|source| {
+                        serde_json::from_value(serde_json::json!({
+                            "name": source, "source_domain": source, "bidstream_enabled": true
+                        }))
+                        .expect("should build partner")
+                    })
+                    .collect();
+            let mut ec = create_test_settings().ec;
+            ec.partners = partners;
+            ec.identity_providers =
+                vec![toml::from_str(
+            "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]"
+        ).expect("should parse provider")];
+            let registry =
+                PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+            let cookie_eids = serde_json::json!([
+                {"source": "ids.example.com", "id": "owned-uid", "atype": 1},
+                {"source": "other.example.com", "id": "other-uid", "atype": 1}
+            ]);
+            let mut jar = CookieJar::new();
+            jar.add_original(
+                cookie::Cookie::build((
+                    COOKIE_TS_EIDS,
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&cookie_eids).expect("should serialize")),
+                ))
+                .secure(true)
+                .build(),
+            );
+            let ec_id = format!("{}.navvnd", "a".repeat(64));
+            let ec_context = EcContext::new_for_test(
+                Some(ec_id.clone()),
+                ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..ConsentContext::default()
+                },
+            );
+            let mut entry = crate::ec::kv_types::KvEntry::tombstone(1);
+            entry.consent.ok = true;
+            entry.opt_outs.insert(
+                crate::ec::eid_types::ProviderId::new("example-provider"),
+                u64::MAX,
+            );
+            let snapshot = crate::ec::EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(entry),
+                generation: None,
+            };
+            let services = noop_services();
+            let mut auction_request = test_auction_request();
+
+            // Act
+            apply_auction_eids_and_device(
+                &mut auction_request,
+                &AuctionEidTargeting {
+                    cookie_jar: Some(&jar),
+                    ec_id: Some(&ec_id),
+                    kv_snapshot: &snapshot,
+                    partner_registry: Some(&registry),
+                    ec_context: &ec_context,
+                    services: &services,
+                    geo: None,
+                    path_label,
+                },
+            );
+
+            // Assert
+            let sources: Vec<&str> = auction_request
+                .user
+                .eids
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|eid| eid.source.as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["other.example.com"],
+                "should drop remembered opt-out cookie EIDs on both publisher paths"
+            );
         }
     }
 
@@ -30606,6 +30722,272 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
         use std::sync::Mutex;
+
+        struct PolicyOnlyStore {
+            inner: InMemoryEcKv,
+            reads: Arc<AtomicUsize>,
+            other_operations: Arc<AtomicUsize>,
+        }
+
+        impl EcKvStore for PolicyOnlyStore {
+            fn store_name(&self) -> &str {
+                self.inner.store_name()
+            }
+
+            fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.inner.lookup(key)
+            }
+
+            fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+                self.other_operations.fetch_add(1, Ordering::SeqCst);
+                self.inner.key_exists(key)
+            }
+
+            fn insert(
+                &self,
+                key: &str,
+                write: EcKvWrite<'_>,
+            ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+                self.other_operations.fetch_add(1, Ordering::SeqCst);
+                self.inner.insert(key, write)
+            }
+
+            fn list_keys_with_prefix(
+                &self,
+                prefix: &str,
+                limit: u32,
+            ) -> Result<Vec<String>, Report<TrustedServerError>> {
+                self.other_operations.fetch_add(1, Ordering::SeqCst);
+                self.inner.list_keys_with_prefix(prefix, limit)
+            }
+
+            fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+                self.other_operations.fetch_add(1, Ordering::SeqCst);
+                self.inner.delete(key)
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_policy_reads_filter_cookie_ids_without_enrichment_or_finalizer_access()
+        {
+            for initial in [false, true] {
+                for mode in [
+                    "active",
+                    "disabled",
+                    "no-slots",
+                    "bot",
+                    "prefetch",
+                    "denied",
+                    "missing-ec",
+                ] {
+                    let mut settings = settings_with_capturing_provider();
+                    settings.ec.partners = ["ids.example.com", "other.example.com", "stored.example.com"]
+                        .map(|source| toml::from_str(&format!("name = \"Example partner\"\nsource_domain = \"{source}\"\nbidstream_enabled = true")).expect("should parse partner"))
+                        .to_vec();
+                    settings.ec.identity_providers = vec![toml::from_str(
+                        "id = \"example-provider\"\nkind = \"example\"\nsources = [\"ids.example.com\"]"
+                    ).expect("should parse provider")];
+                    if mode == "disabled" {
+                        settings.auction.enabled = false;
+                    }
+                    let registry = PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+                        .expect("should build registry");
+                    let captured = Arc::new(Mutex::new(None));
+                    let orchestrator = orchestrator_capturing_request(&settings, &captured);
+                    let reads = Arc::new(AtomicUsize::new(0));
+                    let other_operations = Arc::new(AtomicUsize::new(0));
+                    let graph = KvIdentityGraph::new(PolicyOnlyStore {
+                        inner: InMemoryEcKv::new("navigation-policy"),
+                        reads: Arc::clone(&reads),
+                        other_operations: Arc::clone(&other_operations),
+                    });
+                    let ec_id = format!("{}.ABC123", "a".repeat(64));
+                    let mut entry = crate::ec::kv_types::KvEntry::minimal(
+                        "stored.example.com",
+                        "stored-only-uid",
+                        1,
+                    );
+                    entry.opt_outs.insert(
+                        crate::ec::eid_types::ProviderId::new("example-provider"),
+                        u64::MAX,
+                    );
+                    graph
+                        .create(&ec_id, &entry)
+                        .expect("should seed policy row");
+                    reads.store(0, Ordering::SeqCst);
+                    other_operations.store(0, Ordering::SeqCst);
+                    let consent = ConsentContext {
+                        jurisdiction: if mode == "denied" {
+                            crate::consent::jurisdiction::Jurisdiction::Unknown
+                        } else {
+                            crate::consent::jurisdiction::Jurisdiction::NonRegulated
+                        },
+                        ..ConsentContext::default()
+                    };
+                    let mut context =
+                        EcContext::new_for_test((mode != "missing-ec").then_some(ec_id), consent);
+                    context.restrict_to_auction_policy();
+                    let stub = Arc::new(StubHttpClient::new());
+                    stub.push_response(
+                        200,
+                        b"<html><head></head><body>Example</body></html>".to_vec(),
+                    );
+                    let services = services_with(
+                        Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                        Arc::new(RecordingTelemetrySink::default()),
+                    );
+                    let client_eids = serde_json::json!([
+                        {"source": "IDS.EXAMPLE.COM.", "uids": [{"id": "owned", "atype": 1}]},
+                        {"source": "other.example.com", "uids": [{"id": "other", "atype": 1}]}
+                    ]);
+                    let encoded = base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&client_eids).expect("should encode cookie"));
+                    let path = if mode == "no-slots" {
+                        "/unmatched"
+                    } else {
+                        "/2024/article"
+                    };
+                    let uri = if initial {
+                        format!("https://{EDGE_HOST}{path}")
+                    } else {
+                        format!("https://{EDGE_HOST}/_ts/page-bids?path={path}")
+                    };
+                    let mut request = HttpRequest::builder()
+                        .uri(uri)
+                        .header(header::HOST, EDGE_HOST)
+                        .header(header::COOKIE, format!("ts-eids={encoded}"))
+                        .header("sec-fetch-site", "same-origin")
+                        .header("sec-fetch-dest", "document")
+                        .body(EdgeBody::empty())
+                        .expect("should build request");
+                    if mode == "bot" {
+                        request
+                            .headers_mut()
+                            .insert(header::USER_AGENT, HeaderValue::from_static("Googlebot"));
+                    }
+                    if mode == "prefetch" {
+                        request
+                            .headers_mut()
+                            .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+                    }
+                    let slots = article_slot();
+                    let dispatch = AuctionDispatch {
+                        integration_registry: &IntegrationRegistry::empty_for_tests(),
+                        orchestrator: &orchestrator,
+                        slots: &slots,
+                        registry: Some(&registry),
+                    };
+                    let mut response = if initial {
+                        let response = handle_publisher_request(
+                            &settings,
+                            &services,
+                            Some(&graph),
+                            &mut context,
+                            dispatch,
+                            request,
+                            EdgeCacheHeader::SMaxageFallback,
+                        )
+                        .await
+                        .expect("should handle initial navigation");
+                        buffer_publisher_response_async(
+                            response,
+                            &Method::GET,
+                            &settings,
+                            &IntegrationRegistry::empty_for_tests(),
+                            &orchestrator,
+                            &services,
+                        )
+                        .await
+                        .expect("should finish publisher response")
+                    } else {
+                        handle_page_bids(
+                            &settings,
+                            &services,
+                            Some(&graph),
+                            dispatch,
+                            &mut context,
+                            request,
+                        )
+                        .await
+                        .expect("should handle page-bids")
+                    };
+                    crate::ec::finalize::ec_finalize_response(
+                        &settings,
+                        &mut context,
+                        None,
+                        &registry,
+                        Some(&encoded),
+                        None,
+                        &mut response,
+                    );
+                    assert_eq!(
+                        reads.load(Ordering::SeqCst),
+                        usize::from(mode == "active"),
+                        "should read policy only for an eligible auction with EC: initial={initial}, mode={mode}"
+                    );
+                    assert_eq!(
+                        other_operations.load(Ordering::SeqCst),
+                        0,
+                        "should never write rows or access completion markers: initial={initial}, mode={mode}"
+                    );
+                    assert!(
+                        matches!(context.kv_snapshot(), crate::ec::EcKvSnapshot::NotRead),
+                        "should keep policy snapshot isolated from finalization"
+                    );
+                    assert!(
+                        context.lookup_results().is_empty(),
+                        "should never run identity providers"
+                    );
+                    assert!(
+                        !context.pull_sync_marker().was_present(),
+                        "should not create a pull-sync marker"
+                    );
+                    assert!(
+                        response
+                            .headers()
+                            .get_all(header::SET_COOKIE)
+                            .iter()
+                            .all(|value| {
+                                !value
+                                    .to_str()
+                                    .expect("should contain a cookie header")
+                                    .starts_with(crate::constants::COOKIE_TS_EC_PULL_COMPLETE)
+                            }),
+                        "should not issue or expire a pull-sync marker cookie"
+                    );
+                    let auction = captured
+                        .lock()
+                        .expect("should lock captured auction")
+                        .clone();
+                    if matches!(mode, "active" | "missing-ec") {
+                        let auction = auction.expect("should dispatch the eligible auction");
+                        if mode == "active" {
+                            let sources: Vec<_> = auction
+                                .user
+                                .eids
+                                .as_deref()
+                                .expect("should send retained EIDs")
+                                .iter()
+                                .map(|eid| eid.source.as_str())
+                                .collect();
+                            assert_eq!(
+                                sources,
+                                vec!["other.example.com"],
+                                "should suppress opted-out client IDs and stored-only enrichment"
+                            );
+                        } else {
+                            assert!(
+                                auction.user.eids.is_none(),
+                                "should not forward persistent IDs without an EC"
+                            );
+                        }
+                    } else {
+                        assert!(auction.is_none(), "should not dispatch a gated auction");
+                    }
+                }
+            }
+        }
 
         /// Trusted-server edge host the browser addresses on the SSAT proxy
         /// path — deliberately different from the configured publisher domain.

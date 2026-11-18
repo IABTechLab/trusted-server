@@ -303,6 +303,8 @@ pub struct EcContext {
     device_signals: Option<DeviceSignals>,
     /// Request-scoped persisted identity-graph state for the active EC ID.
     kv_snapshot: EcKvSnapshot,
+    /// Restricts an auction's graph to policy reads, without stored-ID enrichment.
+    auction_policy_only: bool,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
     /// EIDs the route resolved from the current request: the `/auction` JSON
@@ -402,6 +404,7 @@ impl EcContext {
             geo_info: geo_info.cloned(),
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
+            auction_policy_only: false,
             recovery_eligible: false,
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
@@ -559,6 +562,30 @@ impl EcContext {
     /// Replaces the request-scoped identity-graph snapshot.
     pub fn set_kv_snapshot(&mut self, snapshot: EcKvSnapshot) {
         self.kv_snapshot = snapshot;
+    }
+
+    /// Restricts an auction's supplied graph to remembered opt-out checks.
+    ///
+    /// Stored IDs must not enrich bids in this mode. Policy snapshots stay local
+    /// to auction targeting, so writes, pull sync and completeness markers retain
+    /// their ordinary graph and snapshot requirements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::ec::EcContext;
+    ///
+    /// let mut context = EcContext::default();
+    /// context.restrict_to_auction_policy();
+    /// ```
+    pub fn restrict_to_auction_policy(&mut self) {
+        self.auction_policy_only = true;
+    }
+
+    /// Whether the supplied auction graph is restricted to policy reads.
+    #[must_use]
+    pub(crate) fn auction_policy_only(&self) -> bool {
+        self.auction_policy_only
     }
 
     /// Marks a real-browser document navigation as eligible for orphan recovery.
@@ -734,6 +761,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
+            auction_policy_only: false,
             recovery_eligible: false,
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
@@ -763,6 +791,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
+            auction_policy_only: false,
             recovery_eligible: false,
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
@@ -795,6 +824,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
+            auction_policy_only: false,
             recovery_eligible: false,
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,

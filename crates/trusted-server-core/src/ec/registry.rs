@@ -15,6 +15,8 @@ use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 use crate::settings::{Ec, EcPartner};
 
+use super::eid_types::{ProviderId, UnixSeconds};
+use super::kv_types::KvEntry;
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
 /// Minimum length for inbound partner Bearer API tokens.
@@ -53,6 +55,8 @@ pub struct PartnerConfig {
     /// Whether an enabled identity provider claims this source. Browser
     /// ingest skips it and batch sync rejects it.
     pub provider_owned: bool,
+    /// Enabled providers claiming this source, used to enforce remembered opt-outs.
+    pub owner_provider_ids: Vec<ProviderId>,
     /// TCF vendor IDs of the configured providers, enabled or disabled, that
     /// claim this source. Its UIDs leave the server only while every one of
     /// these vendors has consent.
@@ -64,6 +68,14 @@ pub struct PartnerConfig {
 }
 
 impl PartnerConfig {
+    /// Whether any enabled owner has an active opt-out in this row.
+    #[must_use]
+    pub(crate) fn owner_opted_out(&self, entry: &KvEntry, now: UnixSeconds) -> bool {
+        self.owner_provider_ids
+            .iter()
+            .any(|owner| entry.opted_out(owner, now))
+    }
+
     /// Whether the effective TCF consent denies any vendor that gates this
     /// source.
     #[must_use]
@@ -278,6 +290,13 @@ impl PartnerRegistry {
             }
             for source in &provider.sources {
                 registry.mark_provider_owned(source, provider.tcf_vendor_id);
+                if let Ok(normalized) = normalize_partner_source_domain(source)
+                    && let Some(partner) = registry.by_source_domain.get_mut(&normalized)
+                {
+                    partner
+                        .owner_provider_ids
+                        .push(ProviderId::new(&provider.id));
+                }
             }
         }
         // A disabled provider's stored UIDs stay behind its vendor consent,
@@ -449,6 +468,7 @@ fn build_partner_config(
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
         provider_owned: false,
+        owner_provider_ids: Vec::new(),
         owner_tcf_vendor_ids: Vec::new(),
         excluded_where_gdpr_applies: false,
     }
@@ -675,6 +695,58 @@ mod tests {
             partner.owner_vendor_consent_denied(&consent),
             "should withhold the source while the disabled provider's vendor lacks consent"
         );
+        let mut entry = KvEntry::tombstone(1);
+        for owner in ["old", "unknown"] {
+            entry.remember_opt_out(&ProviderId::new(owner), UnixSeconds::new(100));
+        }
+        assert!(
+            !partner.owner_opted_out(&entry, UnixSeconds::new(100)),
+            "should ignore disabled and unknown providers' opt-outs"
+        );
+        entry.remember_opt_out(&ProviderId::new("new"), UnixSeconds::new(100));
+        assert!(
+            partner.owner_opted_out(&entry, UnixSeconds::new(100)),
+            "should honor the enabled owner's opt-out"
+        );
+    }
+
+    #[test]
+    fn owner_opt_out_honors_any_enabled_owner() {
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_partner(
+            "ids.example.com",
+            &valid_api_token("ids-partner"),
+        )];
+        ec.identity_providers = ["first", "second"]
+            .map(|id| {
+                toml::from_str(&format!(
+                    "id = \"{id}\"\nkind = \"k\"\nsources = [\"IDS.EXAMPLE.COM.\"]"
+                ))
+                .expect("should parse provider")
+            })
+            .to_vec();
+        let registry =
+            PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+        let partner = registry
+            .get("ids.example.com")
+            .expect("should find partner");
+        assert_eq!(
+            partner.owner_provider_ids.len(),
+            2,
+            "should retain both enabled owners"
+        );
+        for owner in ["first", "second"] {
+            let mut entry = KvEntry::tombstone(1);
+            entry.opt_outs.insert(ProviderId::new(owner), 101);
+            assert!(
+                partner.owner_opted_out(&entry, UnixSeconds::new(100)),
+                "should honor either owner's active opt-out"
+            );
+            assert!(
+                !partner.owner_opted_out(&entry, UnixSeconds::new(101)),
+                "should stop honoring an opt-out at its expiry"
+            );
+        }
     }
 
     #[test]

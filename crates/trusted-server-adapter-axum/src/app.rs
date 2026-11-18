@@ -430,7 +430,7 @@ async fn dispatch_fallback(
     let result = match handle_publisher_request(
         &state.settings,
         services,
-        ec.kv_graph.as_ref(),
+        ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
         &mut ec.ec_context,
         auction,
         req,
@@ -838,7 +838,7 @@ async fn run_named_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                ec.kv_graph.as_ref(),
+                ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
                 state.auction_partner_registry(),
                 &mut ec.ec_context,
                 services,
@@ -862,7 +862,7 @@ async fn run_named_route(
             handle_page_bids(
                 &state.settings,
                 services,
-                ec.kv_graph.as_ref(),
+                ec.kv_graph.as_ref().or(ec.auction_policy_graph.as_ref()),
                 auction,
                 &mut ec.ec_context,
                 req,

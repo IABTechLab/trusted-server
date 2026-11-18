@@ -6,8 +6,8 @@
 //! real [`AxumPlatformHttpClient`] with its deadline handling.
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -40,18 +40,36 @@ const PARTNER_TOKEN: &str = "example-partner-token-for-identify-tests";
 struct Stub {
     address: String,
     id5_requests: Arc<AtomicUsize>,
+    id5_opt_out: Arc<AtomicBool>,
     origin_requests: Arc<AtomicUsize>,
+    bidder_requests: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 async fn start_stub() -> Stub {
     let id5_requests = Arc::new(AtomicUsize::new(0));
     let origin_requests = Arc::new(AtomicUsize::new(0));
+    let id5_opt_out = Arc::new(AtomicBool::new(false));
+    let vendor_opt_out = Arc::clone(&id5_opt_out);
+    let bidder_requests = Arc::new(Mutex::new(Vec::new()));
+    let captured_bids = Arc::clone(&bidder_requests);
     let counter = Arc::clone(&id5_requests);
     let origin_counter = Arc::clone(&origin_requests);
-    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+        let captured_bids = Arc::clone(&captured_bids);
+        let vendor_opt_out = Arc::clone(&vendor_opt_out);
         let counter = Arc::clone(&counter);
         let origin_counter = Arc::clone(&origin_counter);
         async move {
+            if uri.path().starts_with("/bidder") {
+                captured_bids
+                    .lock()
+                    .expect("should lock bidder captures")
+                    .push(serde_json::from_slice(&body).expect("should decode bidder request"));
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({"id":"example-auction","seatbid":[]}).to_string(),
+                );
+            }
             if !uri.path().starts_with("/id5") {
                 origin_counter.fetch_add(1, Ordering::SeqCst);
             }
@@ -60,7 +78,7 @@ async fn start_stub() -> Stub {
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     serde_json::json!({
-                        "universal_uid": "id5-example-uid",
+                        "universal_uid": if vendor_opt_out.load(Ordering::SeqCst) { "0" } else { "id5-example-uid" },
                         "signature": "example-signature",
                     })
                     .to_string(),
@@ -88,7 +106,9 @@ async fn start_stub() -> Stub {
     Stub {
         address,
         id5_requests,
+        id5_opt_out,
         origin_requests,
+        bidder_requests,
     }
 }
 
@@ -104,6 +124,8 @@ impl StubRoutingClient {
         let uri = request.request.uri();
         let prefix = if uri.host() == Some("id5.example.com") {
             "/id5"
+        } else if uri.host() == Some("bidder.example.com") {
+            "/bidder"
         } else {
             ""
         };
@@ -702,4 +724,315 @@ async fn asset_route_skips_ec_finalization() {
         "should set no EC cookie on an asset response, got {:?}",
         set_cookies(&response)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_user_agent_auction_enforces_opt_outs_without_enrichment_or_writes() {
+    for providers_enabled in [true, false] {
+        for opted_out in [true, false] {
+            for from_cookie in [true, false] {
+                check_unknown_agent_auction(providers_enabled, opted_out, from_cookie).await;
+            }
+        }
+    }
+}
+
+async fn check_unknown_agent_auction(providers_enabled: bool, opted_out: bool, from_cookie: bool) {
+    // Arrange
+    let provider = if providers_enabled {
+        r#"
+        [[ec.identity_providers]]
+        id = "example-provider"
+        kind = "sharedid"
+        sources = ["id5.example.com"]
+        [ec.identity_providers.settings]
+        generate = false
+    "#
+    } else {
+        ""
+    };
+    let configuration = format!(
+        r#"
+        {provider}
+        [auction]
+        enabled = true
+        [auction.providers.bidder]
+        protocol = "openrtb-2.6"
+        profile = "standard"
+        endpoint = "https://bidder.example.com/auction"
+        routing = "all_eligible"
+    "#
+    );
+    let fixture = harness(&configuration, "NZ").await;
+    let ec_id = format!("{}.pol001", "b".repeat(64));
+    let mut entry = KvEntry::minimal("pubcid.org", "stored-only-uid", 1);
+    entry.opt_outs.insert(
+        trusted_server_core::ec::eid_types::ProviderId::new("example-provider"),
+        if opted_out { u64::MAX } else { 0 },
+    );
+    fixture
+        .state
+        .identity_graph()
+        .expect("should have graph")
+        .create(&ec_id, &entry)
+        .expect("should seed row");
+    let generation = fixture.generation(&ec_id);
+    let eids = serde_json::json!([
+        {"source":"id5.example.com","uids":[{"id":"opted-out-client","atype":1}]},
+        {"source":"other.example.com","uids":[{"id":"allowed-client","atype":1}]}
+    ]);
+    let mut body = serde_json::json!({
+        "adUnits": [{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},
+            "bids":[{"bidder":"example-bidder","params":{}}]}]
+    });
+    let mut cookie = format!("ts-ec={ec_id}");
+    if from_cookie {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&eids).expect("should serialize cookie EIDs"));
+        cookie.push_str(&format!("; ts-eids={encoded}"));
+    } else {
+        body["eids"] = eids;
+    }
+    let request = edgezero_core::http::request_builder()
+        .method("POST")
+        .uri("https://publisher.example.com/auction")
+        .header(header::HOST, "publisher.example.com")
+        .header(header::COOKIE, cookie)
+        .header(header::USER_AGENT, "example-unknown-agent")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(edgezero_core::body::Body::from(
+            serde_json::to_vec(&body).expect("should serialize auction"),
+        ))
+        .expect("should build request");
+
+    // Act
+    let response = fixture.send(request).await;
+
+    // Assert
+    assert_eq!(response.status(), 200, "should accept the auction");
+    let captured = fixture
+        .stub
+        .bidder_requests
+        .lock()
+        .expect("should lock captures");
+    assert_eq!(captured.len(), 1, "should dispatch a bidder request");
+    let sources: Vec<&str> = captured[0]["user"]["ext"]["eids"]
+        .as_array()
+        .expect("should retain allowed EIDs")
+        .iter()
+        .filter_map(|eid| eid["source"].as_str())
+        .collect();
+    assert_eq!(
+        sources,
+        if providers_enabled && opted_out {
+            vec!["other.example.com"]
+        } else {
+            vec!["id5.example.com", "other.example.com"]
+        },
+        "should enforce enabled-owner opt-outs without releasing stored IDs"
+    );
+    drop(captured);
+    assert_eq!(
+        fixture.entry(&ec_id),
+        Some(entry),
+        "should preserve the stored row"
+    );
+    assert_eq!(
+        fixture.generation(&ec_id),
+        generation,
+        "should perform no KV write"
+    );
+    assert!(
+        !set_cookies(&response)
+            .iter()
+            .any(|cookie| cookie
+                .starts_with(trusted_server_core::constants::COOKIE_TS_EC_PULL_COMPLETE)),
+        "should not create a completeness marker"
+    );
+    assert_eq!(
+        fixture.stub.id5_requests.load(Ordering::SeqCst),
+        0,
+        "should not collect provider IDs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_http_opt_out_is_remembered_and_filters_client_fallbacks() {
+    // Arrange: a real provider HTTP response creates the remembered opt-out.
+    let configuration = format!(
+        r#"
+        {}
+        [auction]
+        enabled = true
+        [auction.providers.bidder]
+        protocol = "openrtb-2.6"
+        profile = "standard"
+        endpoint = "https://bidder.example.com/auction"
+        routing = "all_eligible"
+    "#,
+        id5_provider("page")
+    );
+    let fixture = harness(&configuration, "AU").await;
+    fixture.stub.id5_opt_out.store(true, Ordering::SeqCst);
+    let ec_id = fixture.mint_ec("").await;
+    let entry = fixture
+        .entry(&ec_id)
+        .expect("should persist the provider result");
+    assert!(
+        entry
+            .opt_outs
+            .contains_key(&trusted_server_core::ec::eid_types::ProviderId::new("id5")),
+        "should remember the HTTP provider opt-out"
+    );
+    assert!(
+        entry.ids.is_empty(),
+        "should keep opted-out provider IDs absent"
+    );
+
+    // Act: repeat navigations and cookie/body auctions for the same visitor.
+    for from_cookie in [true, false] {
+        fixture.navigate(&format!("ts-ec={ec_id}")).await;
+        let eids = serde_json::json!([
+            {"source":"id5.example.com","uids":[{"id":"stale-client","atype":1}]},
+            {"source":"other.example.com","uids":[{"id":"allowed-client","atype":1}]}
+        ]);
+        let mut body = serde_json::json!({
+            "adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},
+                "bids":[{"bidder":"example-bidder","params":{}}]}]
+        });
+        let mut cookie = format!("ts-ec={ec_id}");
+        if from_cookie {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&eids).expect("should serialize EIDs"));
+            cookie.push_str(&format!("; ts-eids={encoded}"));
+        } else {
+            body["eids"] = eids;
+        }
+        let mut request = browser_request("POST", "/auction", &cookie);
+        *request.body_mut() = edgezero_core::body::Body::from(
+            serde_json::to_vec(&body).expect("should serialize auction"),
+        );
+        let response = fixture.send(request).await;
+        assert_eq!(response.status(), 200, "should accept the auction");
+    }
+
+    // Assert
+    let captured = fixture
+        .stub
+        .bidder_requests
+        .lock()
+        .expect("should lock captures");
+    assert_eq!(captured.len(), 2, "should dispatch both client transports");
+    for request in captured.iter() {
+        let sources: Vec<&str> = request["user"]["ext"]["eids"]
+            .as_array()
+            .expect("should preserve allowed EIDs")
+            .iter()
+            .filter_map(|eid| eid["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should suppress cookie and body copies after the provider opt-out"
+        );
+    }
+    drop(captured);
+    assert_eq!(
+        fixture.stub.id5_requests.load(Ordering::SeqCst),
+        1,
+        "should not retry a provider with remembered opt-out"
+    );
+    assert_eq!(
+        fixture.entry(&ec_id).expect("should retain row").opt_outs,
+        entry.opt_outs,
+        "should not extend remembered opt-out from browser copies"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_owned_legacy_single_is_withheld_by_auction_and_identify() {
+    for provider_enabled in [true, false] {
+        // Arrange: an old browser row predates enabled source ownership.
+        let provider = if provider_enabled {
+            SHAREDID_PROVIDER
+        } else {
+            ""
+        };
+        let configuration = format!(
+            r#"
+            {provider}
+            [auction]
+            enabled = true
+            [auction.providers.bidder]
+            protocol = "openrtb-2.6"
+            profile = "standard"
+            endpoint = "https://bidder.example.com/auction"
+            routing = "all_eligible"
+        "#
+        );
+        let fixture = harness(&configuration, "NZ").await;
+        let ec_id = format!("{}.old001", "b".repeat(64));
+        let entry = KvEntry::minimal("pubcid.org", "legacy-browser-uid", 1);
+        fixture
+            .state
+            .identity_graph()
+            .expect("should have graph")
+            .create(&ec_id, &entry)
+            .expect("should seed legacy row");
+        let cookie = format!("ts-ec={ec_id}");
+        let mut auction = browser_request("POST", "/auction", &cookie);
+        *auction.body_mut() = edgezero_core::body::Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},
+                    "bids":[{"bidder":"example-bidder","params":{}}]}],
+                "eids":[{"source":"other.example.com","uids":[{"id":"allowed-client","atype":1}]}]
+            }))
+            .expect("should serialize auction"),
+        );
+        let mut identify = browser_request("GET", "/_ts/api/v1/identify", &cookie);
+        identify.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {PARTNER_TOKEN}"))
+                .expect("should build bearer header"),
+        );
+
+        // Act
+        let auction_response = fixture.send(auction).await;
+        let identify_response = fixture.send(identify).await;
+
+        // Assert
+        assert_eq!(auction_response.status(), 200, "should accept auction");
+        assert_eq!(identify_response.status(), 200, "should serve identify");
+        let captured = fixture
+            .stub
+            .bidder_requests
+            .lock()
+            .expect("should lock captures");
+        assert_eq!(captured.len(), 1, "should dispatch auction");
+        let eids = captured[0]["user"]["ext"]["eids"]
+            .as_array()
+            .expect("should preserve client EIDs");
+        assert!(
+            eids.iter().any(|eid| eid["source"] == "other.example.com"),
+            "should retain unrelated client EIDs"
+        );
+        assert_eq!(
+            eids.iter().any(|eid| eid["source"] == "pubcid.org"),
+            !provider_enabled,
+            "should expire legacy singles only while an enabled provider owns their source"
+        );
+        drop(captured);
+        let identify: serde_json::Value = serde_json::from_slice(
+            &identify_response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer identify"),
+        )
+        .expect("should parse identify");
+        assert_eq!(
+            identify["uid"].as_str(),
+            (!provider_enabled).then_some("legacy-browser-uid"),
+            "should apply the same legacy expiry to identify"
+        );
+    }
 }

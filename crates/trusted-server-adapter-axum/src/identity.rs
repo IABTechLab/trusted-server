@@ -51,6 +51,8 @@ pub(crate) struct EcRequestState {
     pub(crate) ec_context: EcContext,
     /// Graph for reads and the auction; `None` for a non-browser.
     pub(crate) kv_graph: Option<KvIdentityGraph>,
+    /// Graph restricted to opt-out policy reads for accepted auctions.
+    pub(crate) auction_policy_graph: Option<KvIdentityGraph>,
     /// Graph for the finalize write; kept for a consent withdrawal even from
     /// a non-browser so tombstones stay authoritative.
     finalize_kv_graph: Option<KvIdentityGraph>,
@@ -115,7 +117,9 @@ pub(crate) fn build_ec_request_state(
     let device_signals = device_signals_for(req);
     let is_real_browser = looks_like_browser(&device_signals);
     if !is_real_browser {
-        log::info!("Bot gate: blocking EC operations for a request without a known UA platform");
+        log::info!(
+            "Bot gate: blocking EC generation, enrichment and writes for a request without a known UA platform"
+        );
     }
 
     let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
@@ -128,7 +132,7 @@ pub(crate) fn build_ec_request_state(
             log::warn!("geo lookup failed during EC setup: {e}");
             None
         });
-    let (ec_context, setup_error) = match EcContext::read_from_request_with_geo(
+    let (mut ec_context, setup_error) = match EcContext::read_from_request_with_geo(
         state.settings(),
         req,
         services,
@@ -149,11 +153,28 @@ pub(crate) fn build_ec_request_state(
     } else {
         None
     };
+    // Accepted auctions enforce remembered opt-outs even when the UA gate
+    // suppresses identity enrichment, provider collection and writes.
+    let auction_policy_graph = if !is_real_browser
+        && kv_graph.is_some()
+        && state
+            .settings()
+            .ec
+            .identity_providers
+            .iter()
+            .any(|provider| provider.enabled)
+    {
+        ec_context.restrict_to_auction_policy();
+        kv_graph.clone()
+    } else {
+        None
+    };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
         ec_context,
         kv_graph,
+        auction_policy_graph,
         finalize_kv_graph,
         eids_cookie,
         sharedid_cookie,

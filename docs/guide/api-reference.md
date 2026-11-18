@@ -37,13 +37,13 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | real                  | —                     | —                     |
+| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | real                  | —                     | —                     |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -324,8 +324,9 @@ with `degraded: true`. Every response is `no-store`, varies on `Origin` and
 below `[publisher].domain` receive reflected credentialed CORS for
 `GET, OPTIONS`; every other supplied origin receives `403`. `OPTIONS` returns
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
-The endpoint is Fastly-only and requires the EC store and a statically
-configured `[[ec.partners]]` token.
+Fastly and Axum implement this endpoint. It requires the EC store and a
+statically configured `[[ec.partners]]` token. Axum uses process-local storage;
+see [runtime boundaries](./axum-dev#runtime-boundaries).
 
 **Request:**
 
@@ -369,7 +370,8 @@ item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`,
 same result), or `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
-or CORS headers. It is Fastly-only and requires the EC KV store.
+or CORS headers. Fastly and Axum implement it and require a configured EC
+store. Axum mappings live only for the lifetime of the server process.
 
 **Batch processing behavior:**
 
@@ -877,7 +879,10 @@ The examples below use fictional IDs and values only.
 
 Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
 
-This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+Fastly reads its configured KV identity graph; Axum reads its configured
+process-local EC store. Axum rows disappear on process exit. If the identity
+graph is not configured, or on Cloudflare and Spin, the route returns
+`501 Not Implemented`.
 
 **Response fields:**
 
