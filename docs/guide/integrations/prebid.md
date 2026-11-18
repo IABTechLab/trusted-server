@@ -56,9 +56,53 @@ Visibility changes trigger a fresh read; background timers may be throttled by
 the browser. Sampling pauses on `pagehide` and resumes after a BFCache restore.
 No auction or forced ID refresh is started to obtain IDs.
 
-Mirrored IDs are not copied back into this cookie. This mode does not call an
-EC endpoint or independently grant consent. It does not disable server auctions
-configured elsewhere.
+Mirrored IDs are not copied back into this cookie. This mode does not
+independently grant consent. It does not disable server auctions configured
+elsewhere.
+
+### Consent reporting to the EC route
+
+When the server injects an EC route path into the page, tsjs reports the
+publisher CMP's TCF and GPP decisions to that same-origin route in both modes,
+so a reader who consents after the page loads gets an Edge Cookie on that page
+view and a withdrawal reaches the server without waiting for the next
+navigation. tsjs only observes the existing `__tcfapi` and `__gpp` APIs; it
+never installs a CMP. Without an injected route, or with no CMP on the page, no
+call is made. The server-side route ships separately; until it injects the
+path, this reporting stays off.
+
+Each report is a `POST` with the CMP's TC string (when GDPR applies) and GPP
+string. Reports are sent in order, one at a time. A newer grant replaces a
+grant still waiting to be sent, but a possible withdrawal is never replaced:
+it is sent after the call in flight and before any later change. A failed
+withdrawal is resent on the next consent change, focus or visibility change;
+a failed grant is dropped until the CMP reports again.
+
+In identity mode the route's answer is merged into publisher auctions in place
+of the mirror cookie while that cookie is unchanged. While a possible
+withdrawal is waiting or in flight, no mirrored or route IDs are merged; a
+TCF denial of Purpose 1 or 4 also deletes the mirror cookie at once. A merge
+happens when the publisher calls `requestBids`, so a withdrawal made while
+Prebid is still delaying that auction does not reach it. Auction mode reports
+consent but merges nothing in the browser.
+
+CMPs that keep their decision outside the standard `euconsent-v2` and `__gpp`
+cookies cause each page's first report to be treated as a possible withdrawal,
+so mirrored IDs wait for the route's answer on every page view.
+
+### SharedID opt-out
+
+Prebid's SharedID module honors `_pubcid_optout` in a cookie or in
+localStorage, but the server can read only the cookie. In both modes tsjs
+copies an active localStorage opt-out, using Prebid's own rule (a non-empty
+value whose optional `_pubcid_optout_exp` is in the future), into a host-only
+`_pubcid_optout` cookie with a `_ts_pubcid_optout_src` marker. The copy lasts
+until the localStorage expiry or one year, and is removed when the localStorage
+opt-out ends. A publisher-written `_pubcid_optout` cookie is left alone. While
+either opt-out is present, identity mode drops `pubcid.org` IDs from mirrored
+and route IDs. The copy runs at load, on visibility changes, before each route
+report and, in auction mode, before each `requestBids`; in identity mode it
+also runs once per second.
 
 ## Configuration
 
