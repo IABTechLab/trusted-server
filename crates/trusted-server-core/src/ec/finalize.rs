@@ -26,7 +26,10 @@ use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::{PartnerConfig, PartnerRegistry};
-use super::sharedid::{SharedIdRequest, drop_opted_out_sharedid_updates};
+use super::sharedid::{
+    SharedIdRequest, apply_sharedid_write_back, created_sharedid_update,
+    drop_opted_out_sharedid_updates, expire_sharedid_on_denied_consent,
+};
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -54,7 +57,9 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// is proven absent).
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
-/// from the request *before* routing consumes it.
+/// from the request *before* routing consumes it. `sharedid` carries the
+/// request's `SharedID` cookies; on a navigation the response writes them
+/// back from the EC record under the `SharedID` consent rules.
 pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -219,6 +224,7 @@ async fn finalize_response_inner(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
+        expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -246,6 +252,11 @@ async fn finalize_response_inner(
             Vec::new()
         };
         let had_eid_updates = !collected.is_empty();
+        let mut collected = collected;
+        // A reader with no SharedID anywhere gets one in this write.
+        if navigation && let Some(created) = created_sharedid_update(sharedid, registry) {
+            collected.push(created);
+        }
         let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
         let commit = PageLoadCommit {
             settings,
@@ -266,6 +277,11 @@ async fn finalize_response_inner(
         // the page-load write succeeded or had nothing to change.
         if page_write_ok && let Some(after_response) = after_response {
             ec_context.set_after_response_permit(after_response);
+        }
+        // Write-back reads the row as the page-load write left it.
+        if navigation {
+            apply_sharedid_write_back(settings, ec_context, graph, registry, sharedid, response)
+                .await;
         }
     } else if ec_context.ec_generated() {
         // Do not emit a generated EC when there is no KV graph: that would
@@ -709,8 +725,10 @@ mod tests {
         DropCounts, LookupResults, LookupStatus, OptOutMemory, ProviderLookup,
     };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
+    use crate::ec::kv_types::KvPartnerId;
     use crate::ec::kv_types::{KvEid, KvUid};
     use crate::ec::page_load::NavigationPermit;
+    use crate::ec::sharedid::SharedIdStorage;
     use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -1617,6 +1635,382 @@ mod tests {
                 ext: None,
             }],
         )
+    }
+
+    const STORED_SHAREDID: &str = "11111111-2222-4333-8444-555555555555";
+    const OTHER_SHAREDID: &str = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+
+    fn pubcid_request(cookies: &str) -> SharedIdRequest {
+        let req = http::Request::builder()
+            .uri("https://example.com/")
+            .header(http::header::COOKIE, cookies)
+            .body(())
+            .expect("should build request");
+        SharedIdRequest::for_write_back(&SharedIdStorage::Cookie("_pubcid".to_owned()), &req)
+    }
+
+    fn pubcid_set_cookies(response: &Response<EdgeBody>) -> Vec<String> {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("_pubcid"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One `SharedID` write-back case: what the record holds, the request and
+    /// whether it is a navigation.
+    struct WriteBackCase<'a> {
+        consent: ConsentContext,
+        stored: Option<&'a str>,
+        sharedid: SharedIdRequest,
+        navigation: bool,
+        lookups: LookupResults,
+    }
+
+    /// Runs a returning reader's finalize and returns the `_pubcid` cookies
+    /// the response sets and the `SharedID` the record holds afterwards.
+    async fn run_write_back(case: WriteBackCase<'_>) -> (Vec<String>, Option<String>) {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("wrback");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        if let Some(stored) = case.stored {
+            live.ids
+                .insert("pubcid.org".to_owned(), KvPartnerId::single(stored));
+        }
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the live row");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            case.consent,
+        );
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        if case.navigation {
+            ec_context.set_navigation_permit(NavigationPermit::for_test());
+        }
+        ec_context.set_lookup_results(case.lookups);
+        let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
+            .expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            &case.sharedid,
+            &mut response,
+        )
+        .await;
+
+        let stored = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .and_then(|(entry, _)| entry.ids.get("pubcid.org").map(|id| id.uid.clone()));
+        (pubcid_set_cookies(&response), stored)
+    }
+
+    fn navigation_case<'a>(stored: Option<&'a str>, cookies: &str) -> WriteBackCase<'a> {
+        WriteBackCase {
+            consent: granting_consent(),
+            stored,
+            sharedid: pubcid_request(cookies),
+            navigation: true,
+            lookups: LookupResults::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_generated_by_the_provider_is_written_back_in_the_same_navigation() {
+        let generated = KvUid::new(
+            UidValue::try_from(STORED_SHAREDID).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("sharedid")),
+            Expiry::Never,
+        );
+        let lookups = LookupResults::new(
+            &sample_ec_id("wrback"),
+            vec![ProviderLookup {
+                provider: ProviderId::new("sharedid"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from("pubcid.org").expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![generated])],
+                )],
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        );
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            lookups,
+            ..navigation_case(None, "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies
+                .first()
+                .is_some_and(|cookie| cookie.starts_with(&format!("_pubcid={STORED_SHAREDID};"))),
+            "should set the SharedID the provider generated in this navigation's write: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_record_present_and_cookie_absent_sets_both_cookies() {
+        let settings = create_test_settings();
+        let domain = settings.publisher.ec_cookie_domain();
+
+        let (cookies, _) = run_write_back(navigation_case(Some(STORED_SHAREDID), "other=1")).await;
+
+        assert_eq!(
+            cookies.len(),
+            2,
+            "should set the cookie and its companion: {cookies:?}"
+        );
+        assert_eq!(
+            cookies[0],
+            format!(
+                "_pubcid={STORED_SHAREDID}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age=31536000"
+            ),
+            "should set the stored SharedID, readable by Prebid, for a year"
+        );
+        assert!(
+            cookies[1].starts_with("_pubcid_cst=")
+                && cookies[1].ends_with("; Path=/; Secure; SameSite=Lax; Max-Age=31536000"),
+            "should set the consent-hash companion: {}",
+            cookies[1]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_unchanged_returning_reader_gets_no_set_cookie() {
+        let (first, _) = run_write_back(navigation_case(Some(STORED_SHAREDID), "other=1")).await;
+        let consent_hash = first[1]
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value.to_owned())
+            .expect("should set a consent hash");
+
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}; _pubcid_cst={consent_hash}"),
+        ))
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should set no cookie for unchanged cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_equal_cookie_without_a_companion_sets_only_the_companion() {
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}"),
+        ))
+        .await;
+
+        assert_eq!(cookies.len(), 1, "should set one cookie: {cookies:?}");
+        assert!(
+            cookies[0].starts_with("_pubcid_cst="),
+            "should re-set only the companion: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_stored_value_wins_over_a_different_cookie() {
+        let (cookies, stored) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={OTHER_SHAREDID}"),
+        ))
+        .await;
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(STORED_SHAREDID),
+            "should keep the stored SharedID"
+        );
+        assert!(
+            cookies[0].starts_with(&format!("_pubcid={STORED_SHAREDID};")),
+            "should restore the stored value in the cookie: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_opt_out_expires_both_cookies() {
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}; _pubcid_optout=1"),
+        ))
+        .await;
+
+        assert_eq!(cookies.len(), 2, "should expire both cookies: {cookies:?}");
+        assert!(
+            cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+            "should expire both cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_denied_ec_consent_expires_both_cookies() {
+        let denied = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            consent: denied,
+            ..navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={STORED_SHAREDID}"))
+        })
+        .await;
+
+        assert_eq!(cookies.len(), 2, "should expire both cookies: {cookies:?}");
+        assert!(
+            cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+            "should expire both cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_purpose_four_denied_leaves_the_cookie_alone() {
+        for cookies in ["other=1".to_owned(), format!("_pubcid={OTHER_SHAREDID}")] {
+            let (set, _) = run_write_back(WriteBackCase {
+                consent: purpose_one_only_consent(),
+                ..navigation_case(Some(STORED_SHAREDID), &cookies)
+            })
+            .await;
+
+            assert!(
+                set.is_empty(),
+                "Purpose 4 denied should set no SharedID cookie for `{cookies}`: {set:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_written_on_a_subresource_response() {
+        let (cookies, _) = run_write_back(WriteBackCase {
+            navigation: false,
+            ..navigation_case(Some(STORED_SHAREDID), "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should not write back without a navigation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_written_without_cookie_storage() {
+        let req = http::Request::builder()
+            .uri("https://example.com/")
+            .header(http::header::COOKIE, "other=1")
+            .body(())
+            .expect("should build request");
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            sharedid: SharedIdRequest::for_write_back(&SharedIdStorage::LocalStorageOnly, &req),
+            ..navigation_case(Some(STORED_SHAREDID), "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should not write a cookie Prebid keeps in local storage"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_created_stored_and_set_on_a_consented_first_visit() {
+        let (cookies, stored) = run_write_back(navigation_case(None, "other=1")).await;
+
+        let created = stored.expect("should store a created SharedID");
+        assert!(
+            uuid::Uuid::parse_str(&created).is_ok_and(|id| id.get_version_num() == 4),
+            "should create a UUID v4 as Prebid writes: {created}"
+        );
+        assert!(
+            cookies
+                .first()
+                .is_some_and(|cookie| cookie.starts_with(&format!("_pubcid={created};"))),
+            "should set the created SharedID: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_created_without_consent_storage_or_with_an_opt_out() {
+        let html5_request = || {
+            let req = http::Request::builder()
+                .uri("https://example.com/")
+                .header(http::header::COOKIE, "other=1")
+                .body(())
+                .expect("should build request");
+            SharedIdRequest::for_write_back(&SharedIdStorage::LocalStorageOnly, &req)
+        };
+        let cases = [
+            (
+                "opt-out",
+                WriteBackCase {
+                    sharedid: pubcid_request("_pubcid_optout=1"),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "Purpose 4 denied",
+                WriteBackCase {
+                    consent: purpose_one_only_consent(),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "local storage only",
+                WriteBackCase {
+                    sharedid: html5_request(),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "subresource",
+                WriteBackCase {
+                    navigation: false,
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+        ];
+
+        for (label, case) in cases {
+            let (cookies, stored) = run_write_back(case).await;
+
+            assert_eq!(stored, None, "should create no SharedID with {label}");
+            assert!(
+                cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+                "should set no SharedID with {label}: {cookies:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

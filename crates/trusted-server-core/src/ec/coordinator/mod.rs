@@ -667,6 +667,16 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         });
                         recount_found(&mut found);
                     }
+                    // A provider whose stored ID wins ignores a cookie for a
+                    // source the row already holds a live UID for.
+                    if registered.provider.keeps_stored_uids() {
+                        found.entries.retain(|(source, _)| {
+                            !entry
+                                .and_then(|entry| entry.ids.get(source.as_str()))
+                                .is_some_and(|record| record.has_live_uid(lookup.now))
+                        });
+                        recount_found(&mut found);
+                    }
                     if matches!(found.status, LookupStatus::Found { .. }) {
                         // An ID in the vendor's cookies means the visitor
                         // opted back in, so a remembered opt-out is
@@ -3433,6 +3443,65 @@ mod tests {
         assert!(
             matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
             "should take the cookie UID that outlives the stored one"
+        );
+    }
+
+    /// A cookie provider whose live stored UID wins over any cookie UID.
+    struct StoredWinsCookieProvider(EchoProvider);
+
+    impl IdentityProvider for StoredWinsCookieProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn keeps_stored_uids(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_different_cookie_does_not_replace_a_stored_uid_that_wins() {
+        // Arrange: the row holds a live UID that outlives the cookie's.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            StoredWinsCookieProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record_until("stored-id", 4000)),
+            &granting(),
+        );
+
+        // Assert
+        assert!(
+            !matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should keep the stored UID over a different cookie: {:?}",
+            only_status(&results)
         );
     }
 
