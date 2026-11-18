@@ -140,11 +140,6 @@ export class ConsentQueue {
   private inFlight?: QueueEntry;
   private lastSent?: QueueEntry;
 
-  /** True while a call is in flight or waiting. */
-  get pending(): boolean {
-    return this.inFlight !== undefined || this.waiting.length > 0;
-  }
-
   private tail(): QueueEntry | undefined {
     return this.waiting[this.waiting.length - 1] ?? this.inFlight ?? this.lastSent;
   }

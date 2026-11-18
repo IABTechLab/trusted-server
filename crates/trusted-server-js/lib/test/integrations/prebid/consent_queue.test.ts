@@ -203,14 +203,4 @@ describe('ConsentQueue', () => {
       'a new identical reading sends again'
     ).toBeDefined();
   });
-
-  it('reports whether a call is pending', () => {
-    const queue = new ConsentQueue();
-    expect(queue.pending).toBe(false);
-    queue.offer(tcf('CPa.AA'), cookies);
-    expect(queue.pending).toBe(true);
-    queue.next();
-    queue.succeeded();
-    expect(queue.pending).toBe(false);
-  });
 });

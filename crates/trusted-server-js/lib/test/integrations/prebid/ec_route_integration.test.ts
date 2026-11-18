@@ -121,15 +121,18 @@ afterEach(() => {
 });
 
 describe('EC route consent reporting through the Prebid integration', () => {
-  it('makes no route call without an injected route, in either mode', async () => {
-    const cmp = tcfCmp();
-    page.__tcfapi = cmp.api;
-    await install({ mode: 'identity' });
-    cmp.emit(granted);
-    vi.advanceTimersByTime(3000);
-    expect(cmp.api, 'should not even subscribe').not.toHaveBeenCalled();
-    expect(window.fetch).not.toHaveBeenCalled();
-  });
+  it.each(['identity', 'auction'])(
+    'makes no route call without an injected route in %s mode',
+    async (mode) => {
+      const cmp = tcfCmp();
+      page.__tcfapi = cmp.api;
+      await install({ mode });
+      cmp.emit(granted);
+      vi.advanceTimersByTime(3000);
+      expect(cmp.api, 'should not even subscribe').not.toHaveBeenCalled();
+      expect(window.fetch).not.toHaveBeenCalled();
+    }
+  );
 
   it('ignores a cross-origin route', async () => {
     const cmp = tcfCmp();

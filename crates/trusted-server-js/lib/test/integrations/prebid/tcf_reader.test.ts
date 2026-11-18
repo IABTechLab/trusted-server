@@ -145,17 +145,9 @@ describe('TcfReader', () => {
     expect(readings).toEqual([]);
   });
 
-  it('does nothing without a CMP and stops listening on stop', () => {
-    const { target, readings, reader } = setup();
+  it('does nothing without a CMP', () => {
+    const { readings, reader } = setup();
     expect(() => reader.refresh()).not.toThrow();
-    const { api, emit, listeners } = cmp();
-    target.__tcfapi = api;
-    reader.refresh();
-    emit(granted);
-    reader.stop();
-    expect(listeners.size).toBe(0);
-    reader.refresh();
-    expect(api).toHaveBeenCalledTimes(2);
-    expect(readings).toHaveLength(1);
+    expect(readings).toEqual([]);
   });
 });

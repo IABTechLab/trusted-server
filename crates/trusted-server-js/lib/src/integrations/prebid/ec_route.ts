@@ -4,8 +4,10 @@ import {
   ConsentQueue,
   isKnownWithdrawal,
   readConsentCookies,
+  requestBody,
   type ConsentSnapshot,
   type CookieView,
+  type QueueEntry,
 } from './consent_queue';
 import { GppConsentCapture, type GppWindow } from './gpp_capture';
 import {
@@ -61,6 +63,12 @@ export class EcRouteClient {
   private readonly queue = new ConsentQueue();
   private sending = false;
   private suppressed = false;
+  // A known withdrawal that cannot be sent queues nothing, so the grant
+  // already in flight would otherwise lift its suppression when answered. An
+  // answer lifts suppression only when its call was queued after the latest
+  // such fence.
+  private fenceEpoch = 0;
+  private readonly entryEpochs = new WeakMap<QueueEntry, number>();
   private applied?: { eids: MirrorEid[]; cookie: string | undefined };
 
   constructor(
@@ -73,16 +81,19 @@ export class EcRouteClient {
   report(snapshot: ConsentSnapshot): void {
     if (isKnownWithdrawal(snapshot)) {
       // A grant in flight may still deliver the mirror before this is answered.
-      this.applied = undefined;
-      this.suppressed = true;
+      this.suppress();
       expireMirrorCookie();
+      if (requestBody(snapshot) === undefined) this.fenceEpoch++;
     }
     const entry = this.queue.offer(snapshot, consentCookies());
-    if (entry?.kind === 'barrier') {
-      this.applied = undefined;
-      this.suppressed = true;
-    }
+    if (entry?.kind === 'barrier') this.suppress();
+    if (entry) this.entryEpochs.set(entry, this.fenceEpoch);
     this.pump();
+  }
+
+  private suppress(): void {
+    this.applied = undefined;
+    this.suppressed = true;
   }
 
   /** Sends the head of the queue unless a call is in flight. */
@@ -119,8 +130,10 @@ export class EcRouteClient {
           return;
         }
         if (this.queue.succeeded()) {
-          this.applied = { eids, cookie: readMirrorCookieValue() };
-          this.suppressed = false;
+          if (this.entryEpochs.get(entry) === this.fenceEpoch) {
+            this.applied = { eids, cookie: readMirrorCookieValue() };
+            this.suppressed = false;
+          }
         } else {
           // Overtaken by a waiting change: never fall back to an older result.
           this.applied = undefined;

@@ -65,7 +65,6 @@ export class TcfReader {
   private api?: TcfApi;
   private listenerId?: unknown;
   private generation = 0;
-  private stopped = false;
 
   constructor(
     private readonly target: TcfWindow,
@@ -74,7 +73,6 @@ export class TcfReader {
 
   /** Subscribes to a newly published or replaced CMP; an unchanged one is left alone. */
   refresh(): void {
-    if (this.stopped) return;
     const next = this.target.__tcfapi;
     if (typeof next !== 'function' || next === this.api) return;
     this.unsubscribe();
@@ -85,7 +83,7 @@ export class TcfReader {
     const onEvent: TcfCallback = (data, success) => {
       const listenerId = fields(data).listenerId;
       const hasId = listenerId !== undefined && listenerId !== null;
-      if (this.stopped || generation !== this.generation) {
+      if (generation !== this.generation) {
         // A stub hands queued listeners to the real CMP, so a superseded
         // subscription can fire with an id it never reported before. The
         // drained stub no longer reaches the CMP that now holds the listener,
@@ -115,12 +113,6 @@ export class TcfReader {
     } catch (error) {
       log.warn('[tsjs-prebid] TCF consent subscription failed', error);
     }
-  }
-
-  /** Removes the subscription from the API that accepted it. */
-  stop(): void {
-    this.unsubscribe();
-    this.stopped = true;
   }
 
   private unsubscribe(): void {

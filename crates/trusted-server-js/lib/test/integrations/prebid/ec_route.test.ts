@@ -284,6 +284,29 @@ describe('EcRouteClient', () => {
     expect(() => throwing.report(tcf('CPa.AA', ['p1']))).not.toThrow();
   });
 
+  it('keeps an unsendable withdrawal suppressed when an earlier grant answers', async () => {
+    client.report(tcf('CPa.AA'));
+    client.report(tcf('', []));
+    calls[0].resolve(json([routeId]));
+    await settle();
+    setMirror([routeId]);
+    expect(client.mirrorSource(), 'the late grant answer must not lift it').toEqual([]);
+
+    client.report(tcf('CPb.AA'));
+    calls[1].resolve(json([cookieId]));
+    await settle();
+    expect(client.mirrorSource(), 'a later valid reading lifts it').toEqual([cookieId]);
+  });
+
+  it('lifts suppression after a repeated withdrawal is answered', async () => {
+    client.report(tcf('CPa.AA', ['p1']));
+    client.report(tcf('CPa.AA', ['p1']));
+    expect(calls).toHaveLength(1);
+    calls[0].resolve(json([routeId]));
+    await settle();
+    expect(client.mirrorSource()).toEqual([routeId]);
+  });
+
   it('suppresses on a known withdrawal it cannot send', () => {
     setMirror([cookieId]);
     client.report(tcf('not valid;', ['p1']));

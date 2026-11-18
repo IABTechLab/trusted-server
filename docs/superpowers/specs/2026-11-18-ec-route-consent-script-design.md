@@ -286,3 +286,9 @@ them.
   against a declared length; a superseded TCF stub subscription is removed
   through the CMP that now holds it. Each fix has a regression that fails when
   the fix is reverted.
+- PR self-review (independent reviewer): a known withdrawal whose TC string
+  cannot be sent queues nothing, so the grant already in flight lifted its
+  suppression when answered. Such a withdrawal now fences suppression: only an
+  answer to a call queued after it lifts it, while a repeated withdrawal that
+  is already queued does not. Removed two test-only members and made the
+  no-route preservation test cover both modes.
