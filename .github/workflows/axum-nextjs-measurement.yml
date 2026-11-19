@@ -25,7 +25,8 @@ concurrency:
 
 jobs:
   measure:
-    runs-on: ubuntu-latest
+    # Keep the runner within the locked Playwright browser support matrix.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
