@@ -13,6 +13,9 @@ lints=(-A clippy::all -D clippy::disallowed_methods -D clippy::disallowed_types)
 
 cargo clippy --locked "${shared[@]}" -p trusted-server-adapter-axum \
     --lib --bins --all-features -- "${lints[@]}"
+# Production defaults and reusable sandbox have mutually exclusive branches.
+cargo clippy --locked "${shared[@]}" -p trusted-server-adapter-fastly \
+    --target wasm32-wasip1 --lib --bins -- "${lints[@]}"
 cargo clippy --locked "${shared[@]}" -p trusted-server-adapter-fastly \
     --target wasm32-wasip1 --lib --bins --all-features -- "${lints[@]}"
 cargo clippy --locked "${shared[@]}" -p trusted-server-adapter-cloudflare \

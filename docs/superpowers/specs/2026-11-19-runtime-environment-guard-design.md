@@ -62,7 +62,7 @@ its own `std::env::var` expression and returns the unchanged `Result`.
 Constant identifiers remain usable; runtime-built arguments cannot compile.
 
 The runner selects production library/binary targets across native Axum,
-Fastly WASI (including reusable sandbox), Cloudflare WASM and Spin WASI.
+Fastly WASI (both defaults and reusable sandbox), Cloudflare WASM and Spin WASI.
 Explicitly select shared serving packages so Clippy checks their source as
 well as adapter source in each applicable target configuration. Omit test,
 example and benchmark targets. Rust removes test-only items, including nested
@@ -109,3 +109,7 @@ A future environment-reading dependency/API needs an explicit scope decision.
 - Round 2: independently checked source claims, shared package coverage, build
   exemptions, local/external macros and function references. No blocking or
   optional findings.
+
+- Round 3: implementation review found that an all-features Fastly check
+  excludes existing default-only production branches. Added a separate default
+  pass and conditional fixtures; a disposable-copy mutation verifies the gap.

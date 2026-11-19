@@ -65,3 +65,7 @@ wasm clock guard. A compile-time checked core macro preserves approved reads.
 - Round 2: independently checked source claims, shared package coverage, build
   exemptions, local/external macros and function references. No blocking or
   optional findings.
+
+- Round 3: implementation review found that an all-features Fastly check
+  excludes existing default-only production branches. Added a separate default
+  pass and conditional fixtures; a disposable-copy mutation verifies the gap.

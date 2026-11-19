@@ -13,13 +13,18 @@ count=0
 check() {
     local name=$1 expected=$2 diagnostic=${3:-disallowed_methods}
     local source="$scratch/$name.rs" output="$scratch/$name.log" fixture_exit=0
+    if [ "$#" -gt 3 ]; then
+        set -- --cfg "$4"
+    else
+        set --
+    fi
     cat > "$source"
     TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID=fixture "$driver" --edition=2024 --crate-type=lib --emit=metadata \
         -A warnings -D clippy::disallowed_methods -D clippy::disallowed_types \
         --extern "helper=$scratch/libhelper.rlib" \
         --extern "config=$scratch/libconfig.rlib" \
         --extern "libc=$scratch/liblibc.rlib" \
-        "$source" -o "$scratch/$name.rmeta" > "$output" 2>&1 || fixture_exit=$?
+        "$@" "$source" -o "$scratch/$name.rmeta" > "$output" 2>&1 || fixture_exit=$?
     if [ "$expected" = pass ]; then
         if [ "$fixture_exit" -ne 0 ]; then
             cat "$output" >&2
@@ -114,6 +119,14 @@ RS
 check vars_os fail <<'RS'
 use std::env;
 pub fn read() { let _ = env::vars_os(); }
+RS
+check fastly_default_branch fail <<'RS'
+#[cfg(not(feature = "reusable-sandbox"))]
+pub fn read() { let _ = std::env::var("TS_DEFAULT_ONLY_POISON"); }
+RS
+check fastly_reusable_branch fail disallowed_methods 'feature="reusable-sandbox"' <<'RS'
+#[cfg(feature = "reusable-sandbox")]
+pub fn read() { let _ = std::env::var("TS_REUSABLE_ONLY_POISON"); }
 RS
 check computed_name fail <<'RS'
 pub fn read(name: &str) { let _ = std::env::var(name); }
