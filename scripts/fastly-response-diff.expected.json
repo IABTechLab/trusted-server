@@ -1,0 +1,30 @@
+{
+  "publisher-page": {
+    "header connection": { "item": 6, "head": [] },
+    "header keep-alive": { "item": 6, "head": [] }
+  },
+  "head-root": {
+    "header connection": { "item": 6, "head": [] },
+    "header keep-alive": { "item": 6, "head": [] }
+  },
+  "conditional-get-root": {
+    "header connection": { "item": 6, "head": [] },
+    "header keep-alive": { "item": 6, "head": [] }
+  },
+  "first-party-proxy": {
+    "header connection": { "item": 6, "head": [] },
+    "header keep-alive": { "item": 6, "head": [] }
+  },
+  "asset": {
+    "header connection": { "item": 6, "head": [] },
+    "header keep-alive": { "item": 6, "head": [] },
+    "header content-length": { "item": 25, "head": ["20"] },
+    "header transfer-encoding": { "item": 25, "head": [] }
+  },
+  "trace-method": {
+    "header allow": {
+      "item": 5,
+      "head": ["DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"]
+    }
+  }
+}

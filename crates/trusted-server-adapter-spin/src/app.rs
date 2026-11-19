@@ -4,14 +4,17 @@ use std::sync::Arc;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{
+    HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
+};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
-use edgezero_core::router::RouterService;
+use edgezero_core::outbound::ResponseDecoding;
+use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -25,11 +28,14 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::{ClientInfo, RuntimeServices};
+use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
@@ -37,9 +43,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -87,14 +93,9 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
     let config_key = default_config_key();
-    let config_store =
-        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
-            .map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: "failed to open Spin Trusted Server config store".to_string(),
-            })
-            .attach(error.to_string())
-        })?;
+    // `for_label` defers open failures to the first read, which the
+    // read error branch below reports.
+    let config_store = SpinConfigStore::for_label(config_store_name.as_ref().to_owned());
     let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
     let config_adapter = ConfigStoreHandleAdapter(config_handle);
     let raw_envelope = config_adapter
@@ -130,12 +131,15 @@ fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Spin")?;
+    // Spin cannot send a host other than the origin URI authority.
+    settings
+        .publisher
+        .drop_origin_host_header_override_for_spin();
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
@@ -148,41 +152,22 @@ fn build_state_with_services(
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .map_or_else(|| build_runtime_services(ctx), Ok)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Publisher response helper
+// Publisher origin input cap
 // ---------------------------------------------------------------------------
 
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
+/// Largest publisher origin body the Spin adapter collects before egress.
 ///
-/// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction and enforces
-/// `settings.publisher.max_buffered_body_bytes` so a large processable origin
-/// response fails safely instead of exhausting the Wasm heap.
-async fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response_async(
-        publisher_response,
-        method,
-        settings,
-        registry,
-        orchestrator,
-        services,
-    )
-    .await
-}
+/// It keeps the 8 MiB limit the adapter's own client applied before the
+/// publisher origin moved to `EdgeZero`'s client.
+const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Publisher fallback method table
@@ -206,14 +191,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-//
-// The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
-// intentionally absent here, matching the Axum and Cloudflare adapters: those
-// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
-// registry and rate limiter) that the portability adapters do not yet wire.
-// On Spin these paths fall through to the publisher/integration fallback,
-// identical to the other non-Fastly adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -224,7 +201,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -236,6 +213,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/identify", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/batch-sync", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -294,8 +273,8 @@ fn parse_client_addr(raw: &str) -> Option<IpAddr> {
 // which rejects a relative path. Rebuilding an absolute URI from the trusted
 // scheme+host lets those handlers validate the signed target instead of failing
 // with "Invalid URL".
-pub(crate) fn normalize_spin_request(req: &mut Request) {
-    sanitize_forwarded_headers(req);
+pub(crate) fn normalize_spin_request(req: &mut RequestParts) {
+    sanitize_forwarded_headers(&mut req.headers);
 
     // Strip any client-supplied `x-forwarded-for`. Spin exposes no trusted
     // upstream forwarded-for chain — the only trusted client IP comes from the
@@ -303,7 +282,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // inbound `x-forwarded-for` to origins and Prebid copies it into its outbound
     // headers, so leaving it would let a Spin client spoof the IP seen by
     // downstream services while `device.ip` uses the trusted runtime address.
-    req.headers_mut().remove("x-forwarded-for");
+    req.headers.remove("x-forwarded-for");
 
     // Re-derive the trusted client IP from the *last* `spin-client-addr` header
     // and overwrite `SpinRequestContext`, which `build_runtime_services` reads
@@ -314,26 +293,23 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // hashing, `/auction` `device.ip`, and integration `X-Forwarded-For` consume.
     // Selecting the last occurrence pins the value to the trusted runtime one.
     let trusted_client_addr = req
-        .headers()
+        .headers
         .get_all("spin-client-addr")
         .iter()
         .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(parse_client_addr);
     let trusted_full_url = req
-        .headers()
+        .headers
         .get_all("spin-full-url")
         .iter()
         .next_back()
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    SpinRequestContext::insert(
-        req,
-        SpinRequestContext {
-            client_addr: trusted_client_addr,
-            full_url: trusted_full_url.clone(),
-        },
-    );
+    req.extensions.insert(SpinRequestContext {
+        client_addr: trusted_client_addr,
+        full_url: trusted_full_url.clone(),
+    });
 
     // Spin's WASI HTTP bridge copies synthetic `spin-client-addr` and
     // `spin-full-url` headers onto the core request. They are runtime metadata,
@@ -341,7 +317,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // values are captured into `SpinRequestContext` above; remove every copy here
     // so the shared publisher/integration handlers neither forward them to
     // publisher origins nor mistake them for client-controlled input.
-    req.headers_mut().remove("spin-client-addr");
+    req.headers.remove("spin-client-addr");
 
     // Spin's WASI HTTP bridge appends its synthetic `spin-full-url` *after* the
     // original client headers, so when duplicate names are present the trusted
@@ -351,7 +327,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // by publisher HTML rewriting, integration URL rewriting, and request
     // signing. Select the last occurrence as the trusted authority, then strip
     // every copy so none reach publisher origins or the shared handlers.
-    req.headers_mut().remove("spin-full-url");
+    req.headers.remove("spin-full-url");
     let Some((scheme, host)) = trusted_full_url
         .as_deref()
         .and_then(scheme_host_from_spin_url)
@@ -361,8 +337,7 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     let Ok(origin) = InboundOrigin::parse(&scheme, &host, OriginSource::RuntimeUri) else {
         return;
     };
-    req.extensions_mut()
-        .insert(RuntimeRequestOrigin::new(origin));
+    req.extensions.insert(RuntimeRequestOrigin::new(origin));
 
     // Always set Host from the trusted spin-full-url rather than preserving any
     // incoming value. Spin's WASI HTTP bridge does not normally surface the
@@ -374,18 +349,18 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // signing context) read one host while handlers parsing req.uri() see another.
     // Overriding from the single trusted authority keeps both consistent.
     if let Ok(hval) = HeaderValue::from_str(&host) {
-        req.headers_mut().insert(header::HOST, hval);
+        req.headers.insert(header::HOST, hval);
     }
 
     // Promote the path-only URI to an absolute one so the shared first-party
     // proxy/click/sign handlers can parse `req.uri()` as a full URL.
     let path_and_query = req
-        .uri()
+        .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_string());
     if let Ok(uri) = format!("{scheme}://{host}{path_and_query}").parse() {
-        *req.uri_mut() = uri;
+        req.uri = uri;
     }
 }
 
@@ -396,10 +371,9 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
 /// Builds the `GET /health` liveness response (`200 ok`, `text/plain`).
 ///
 /// Mirrors the Fastly entry point and Axum adapter so deployments reusing
-/// Trusted Server health probes see identical behaviour on Spin. Served from
-/// both the healthy router and the startup-error fallback so the probe answers
-/// even before (or when) application state is usable, leaving Spin's
-/// platform-provided `/.well-known/spin/health` untouched.
+/// Trusted Server health probes see identical behaviour on Spin. Served only
+/// once application state is built, so a startup failure answers 503 here too.
+/// Spin's platform-provided `/.well-known/spin/health` is left untouched.
 fn health_response() -> Response {
     let mut resp = Response::new(edgezero_core::body::Body::from("ok"));
     *resp.status_mut() = StatusCode::OK;
@@ -464,25 +438,6 @@ fn admin_ec_lookup_not_supported() -> Response {
     core_admin_ec_lookup_not_supported()
 }
 
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Spin adapter.
 ///
@@ -501,46 +456,6 @@ fn legacy_admin_alias_denied() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
-// ---------------------------------------------------------------------------
-
-/// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
-/// response body so that deployment state is not leaked to anonymous callers.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
-
-    let handler = |_ctx: RequestContext| {
-        let body = edgezero_core::body::Body::from("Service Unavailable\n");
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        async move { Ok::<Response, EdgeError>(resp) }
-    };
-
-    // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
-    // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
-    // healthy router: every method on `/` and `/{*rest}` returns the generic
-    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
-    let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
-    // Keep the liveness probe answering 200 even while state construction is
-    // failing, matching the Fastly/Axum health behaviour.
-    builder = builder.get("/health", |_ctx: RequestContext| async {
-        Ok::<Response, EdgeError>(health_response())
-    });
-    for method in publisher_fallback_methods() {
-        builder = builder.route("/", method.clone(), handler);
-        builder = builder.route("/{*rest}", method, handler);
-    }
-    builder.build()
-}
-
-// ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
@@ -548,20 +463,24 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app, synthesized_response_headers())
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
+    fn routes() -> Result<RouterService, EdgeError> {
+        // Every startup failure answers 503 with a generic message, so the
+        // report never reaches an anonymous caller. It is logged at error,
+        // which `EdgeZero`'s managed backend writes to the component's stderr.
+        let state = build_state().map_err(|report| {
+            log::error!("{report:?}");
+            EdgeError::service_unavailable("Service Unavailable")
+        })?;
 
-        build_router(&state)
+        Ok(router_builder(&state).build())
     }
 }
 
@@ -580,7 +499,34 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).build())
+    }
+
+    /// Build the full application router from explicit settings, with `client`
+    /// in router state.
+    ///
+    /// Testing seam: `EdgeZero` hands a client in router state to every
+    /// request in place of the adapter's own, so an app served from this
+    /// router on `EdgeZero`'s Axum test server starts no real transport.
+    /// Production installs no client in router state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+    /// let router = TrustedServerApp::routes_with_settings_and_outbound_client(settings, client)?;
+    /// ```
+    pub fn routes_with_settings_and_outbound_client(
+        settings: Settings,
+        client: HttpClient,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(router_builder(&state).with_state(client).build())
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -588,6 +534,8 @@ impl TrustedServerApp {
     /// Each request receives a clone of the supplied services, allowing callers
     /// to exercise production routes with deterministic platform dependencies.
     /// The supplied client metadata applies to every request to this router.
+    /// The services' outbound client also goes into router state, so an app
+    /// served from this router starts no real `EdgeZero` transport.
     ///
     /// # Errors
     ///
@@ -603,12 +551,14 @@ impl TrustedServerApp {
         settings: Settings,
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
+        let client = services.outbound_client().clone();
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).with_state(client).build())
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
+/// Registers every route, middleware, and hook for `state` on a router builder.
+fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     {
         let state = Arc::clone(state);
 
@@ -617,10 +567,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_trusted_server_discovery(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    handle_trusted_server_discovery(&s.settings, &services, req)
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
 
@@ -629,10 +581,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_verify_signature(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    handle_verify_signature(&s.settings, &services, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
 
@@ -653,11 +608,30 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let admin_eids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let req = ctx.into_request();
+                let req = ctx.into_request()?;
                 let result = PartnerRegistry::from_ec(&s.settings.ec)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
+        };
+
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: this adapter has no EC record store, so identify and batch
+        // sync answer 501 and any other method answers 405.
+        let s = Arc::clone(&state);
+        let identify_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+        let batch_sync_handler = |ctx: RequestContext| async move {
+            let req = ctx.into_request()?;
+            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
         };
 
         // /auction
@@ -665,13 +639,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
+                let services = s.services_for_request(&ctx)?;
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let mut req = ctx.into_request();
+                let mut req = ctx.into_request()?;
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                         &s.settings,
@@ -684,17 +658,19 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
-                Ok(handle_auction(
-                    &s.settings,
-                    &s.orchestrator,
-                    None,
-                    None,
-                    &mut ec_context,
-                    &services,
-                    req,
+                Ok::<Response, EdgeError>(
+                    handle_auction(
+                        &s.settings,
+                        &s.orchestrator,
+                        None,
+                        None,
+                        &mut ec_context,
+                        &services,
+                        req,
+                    )
+                    .await
+                    .unwrap_or_else(|e| http_error(&e)),
                 )
-                .await
-                .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -703,8 +679,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let mut req = ctx.into_request();
+                let services = s.services_for_request(&ctx)?;
+                let mut req = ctx.into_request()?;
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                         &s.settings,
@@ -720,7 +696,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
                 };
-                Ok(
+                Ok::<Response, EdgeError>(
                     handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
@@ -739,11 +715,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    handle_first_party_proxy(&s.settings, &services, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
 
@@ -752,11 +730,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_click(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    handle_first_party_click(&s.settings, &services, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
 
@@ -765,11 +745,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    handle_first_party_proxy_sign(&s.settings, &services, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
             }
         };
         let fp_sign_post_handler = fp_sign_handler.clone();
@@ -782,9 +764,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = s.services_for_request(&ctx);
-                let req = ctx.into_request();
-                Ok(
+                let services = s.services_for_request(&ctx)?;
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
@@ -798,8 +780,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let services = state.services_for_request(&ctx)?;
+            let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -841,6 +823,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
+                let input_cap = publisher_input_cap(&state.settings, PUBLISHER_ORIGIN_INPUT_BYTES);
                 match handle_publisher_request(
                     &state.settings,
                     &services,
@@ -848,21 +831,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SMaxageFallback,
+                    PublisherOriginOptions {
+                        edge_header: EdgeCacheHeader::SMaxageFallback,
+                        input_cap: Some(input_cap),
+                        response_decoding: ResponseDecoding::Original,
+                    },
                 )
                 .await
                 {
-                    Ok(pr) => {
-                        resolve_publisher_response(
-                            pr,
-                            &method,
-                            &state.settings,
-                            &state.registry,
-                            &state.orchestrator,
-                            &services,
-                        )
-                        .await
-                    }
+                    Ok((pr, owner)) => buffer_publisher_response_async(
+                        pr,
+                        &method,
+                        &state.settings,
+                        &state.registry,
+                        &state.orchestrator,
+                        &services,
+                        Some(input_cap),
+                    )
+                    .await
+                    .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
                     Err(e) => Err(e),
                 }
             };
@@ -955,6 +942,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/api/v1/identify",
+                method.clone(),
+                identify_handler.clone(),
+            );
+            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
+        }
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
             builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
         }
@@ -975,11 +971,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             builder = builder.route("/{*rest}", method, fallback.clone());
         }
 
-        builder.build()
+        builder
     }
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -991,7 +987,7 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         return TraceMetadata { client_info, geo };
     }
     let client_ip = request
-        .headers()
+        .headers
         .get_all("spin-client-addr")
         .iter()
         .next_back()
@@ -1027,6 +1023,14 @@ mod tests {
         );
     }
 
+    // Runs the production normalizer on the head of a whole test request.
+    fn normalize_request(req: &mut Request) {
+        let request = std::mem::replace(req, Request::new(edgezero_core::body::Body::empty()));
+        let (mut parts, body) = request.into_parts();
+        normalize_spin_request(&mut parts);
+        *req = Request::from_parts(parts, body);
+    }
+
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
@@ -1053,6 +1057,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
@@ -1077,6 +1082,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -1101,23 +1107,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = multi_provider_settings();
-        settings.auction.enabled = false;
+    fn startup_loads_multi_provider_plan() {
+        let state = build_state_with_settings(multi_provider_settings())
+            .expect("should load a multi-provider auction plan on Spin");
 
-        build_state_with_settings(settings)
-            .expect("disabled Spin auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn startup_rejects_multi_provider_auction_plan() {
-        let error = match build_state_with_settings(multi_provider_settings()) {
-            Ok(_) => panic!("Spin startup should reject multi-provider fanout"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:?}").contains("concurrent provider fanout"),
-            "should identify unsupported fanout: {error:?}"
+        assert_eq!(
+            state.orchestrator.provider_count(),
+            2,
+            "should register both configured providers"
         );
     }
 
@@ -1184,7 +1181,7 @@ mod tests {
                 ("spin-full-url", value),
             ]);
 
-            normalize_spin_request(&mut req);
+            normalize_request(&mut req);
 
             assert!(
                 req.extensions().get::<RuntimeRequestOrigin>().is_none(),
@@ -1225,7 +1222,7 @@ mod tests {
         ]);
         *req.method_mut() = Method::POST;
         *req.uri_mut() = "/_ts/trace/enable".parse().expect("should set action path");
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         let response = RouterService::oneshot(&router, req)
             .await
@@ -1261,11 +1258,13 @@ mod tests {
                 edgezero_core::ingress::HeaderFidelity::default(),
             ));
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
+        let (mut parts, body) = req.into_parts();
         trusted_server_core::forwarder::prepare_trusted_forwarder(
-            &mut req,
+            &mut parts,
             &multi_provider_settings(),
         );
+        let req = Request::from_parts(parts, body);
 
         let info = trusted_server_core::http_util::RequestInfo::from_request(
             &req,
@@ -1306,7 +1305,7 @@ mod tests {
             ("forwarded", "host=evil.example;proto=http"),
         ]);
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         // Spoofable host overrides are stripped, leaving only the trusted Host.
         assert!(
@@ -1358,7 +1357,7 @@ mod tests {
             ("spin-full-url", "https://www.publisher.example/cars/"),
         ]);
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         assert_eq!(
             req.headers()
@@ -1407,7 +1406,7 @@ mod tests {
             },
         );
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         // All `spin-full-url` copies are stripped after normalization.
         assert!(
@@ -1464,7 +1463,7 @@ mod tests {
             },
         );
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         assert_eq!(
             SpinRequestContext::get(&req).and_then(|c| c.client_addr),
@@ -1489,7 +1488,7 @@ mod tests {
             ("x-forwarded-for", "198.51.100.99, 10.0.0.1"),
         ]);
 
-        normalize_spin_request(&mut req);
+        normalize_request(&mut req);
 
         assert!(
             req.headers().get("x-forwarded-for").is_none(),
@@ -1511,74 +1510,21 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_error_router_serves_503_for_all_fallback_methods() {
-        // The degraded router must answer every publisher-fallback method
-        // (including HEAD/OPTIONS/PATCH) on both "/" and nested paths with the
-        // generic 503, never a router-level 405, so startup-failure behaviour
-        // stays consistent with the healthy router.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
-        });
-        let router = startup_error_router(&report);
-
-        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
-            for path in ["/", "/some/nested/page"] {
-                let req = edgezero_core::http::request_builder()
-                    .method(method)
-                    .uri(path)
-                    .body(edgezero_core::body::Body::empty())
-                    .expect("should build request");
-                let status = router
-                    .oneshot(req)
-                    .await
-                    .expect("should route startup-error request")
-                    .status()
-                    .as_u16();
-                assert_eq!(
-                    status, 503,
-                    "{method} {path} must return 503 from the startup fallback, got {status}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_error_router_answers_health_with_200() {
-        // The liveness probe must keep returning 200 even while application state
-        // construction is failing, matching the Fastly/Axum health behaviour.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
-        });
-        let router = startup_error_router(&report);
-
-        let req = edgezero_core::http::request_builder()
-            .method("GET")
-            .uri("/health")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let resp = router
-            .oneshot(req)
-            .await
-            .expect("should route startup-error health request");
+    #[test]
+    fn routes_answer_startup_failure_with_generic_service_unavailable() {
+        let Err(error) = TrustedServerApp::routes() else {
+            panic!("should fail startup without the production config store");
+        };
 
         assert_eq!(
-            resp.status().as_u16(),
-            200,
-            "GET /health must return 200 from the startup fallback"
+            error.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should answer 503 for every startup failure"
         );
         assert_eq!(
-            resp.headers()
-                .get("x-ts-version")
-                .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
-            "startup-fallback /health should report the compiled-in git version"
-        );
-        let body = resp.into_body().into_bytes().unwrap_or_default();
-        assert_eq!(
-            &body[..],
-            b"ok",
-            "startup-fallback health body should be `ok`"
+            error.message(),
+            "Service Unavailable",
+            "should not echo the startup report to callers"
         );
     }
 }
