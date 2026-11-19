@@ -1967,7 +1967,11 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
-        body["user"]["ext"]["eids"].clone()
+        assert!(
+            body["user"]["ext"].get("eids").is_none(),
+            "should not write user.ext.eids"
+        );
+        body["user"]["eids"].clone()
     }
 
     const SHAREDID_UUID: &str = "11111111-2222-4333-8444-555555555555";
