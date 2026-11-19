@@ -3089,7 +3089,7 @@ fn is_false(value: &bool) -> bool {
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
 ///
 /// Fail-closed superset: any key not listed here — notably `debug`, which
-/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// carries the resolved `OpenRTB` request (EC ID, `user.eids`, the TC
 /// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
 /// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].

@@ -10124,16 +10124,7 @@ mod tests {
                         client_ip: Some(runtime_ip.parse().expect("should parse runtime IP")),
                         ..ClientInfo::default()
                     };
-                    let geo = GeoInfo {
-                        country: "EX".to_owned(),
-                        city: String::new(),
-                        continent: String::new(),
-                        latitude: 0.0,
-                        longitude: 0.0,
-                        metro_code: 0,
-                        region: None,
-                        asn: None,
-                    };
+                    let geo = GeoInfo::country_region("EX", None);
                     let context = context_from_script(&trace_document_bootstrap(
                         gate,
                         &client,
@@ -11128,6 +11119,7 @@ mod tests {
         //! link; this tests that they connect.
 
         use super::*;
+        use crate::auction::test_support::{assert_no_user_eids, user_eids};
         use crate::platform::ClientInfo;
         use crate::test_support::tests::crate_test_settings_str;
         use std::collections::HashMap;
@@ -14113,12 +14105,14 @@ mod tests {
                 _client_ip: Option<std::net::IpAddr>,
             ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
                 Ok(Some(GeoInfo {
-                    city: self.0.to_string(),
+                    city: Some(self.0.to_string()),
                     country: self.0.to_string(),
-                    continent: self.0.to_string(),
-                    latitude: 1.0,
-                    longitude: 2.0,
-                    metro_code: 3,
+                    continent: Some(self.0.to_string()),
+                    coordinates: Some(crate::platform::GeoCoordinates {
+                        latitude: 1.0,
+                        longitude: 2.0,
+                    }),
+                    metro_code: Some(3),
                     region: Some(self.0.to_string()),
                     asn: Some(4),
                 }))
@@ -15383,13 +15377,10 @@ mod tests {
                         },
                         "should use this reader's identity and suppress it after withdrawal"
                     );
-                    let eids = &auction["user"]["ext"]["eids"];
                     if withdrawn {
-                        assert!(eids.is_null(), "should suppress withdrawn EIDs");
+                        assert_no_user_eids(&auction, "should suppress withdrawn EIDs");
                     } else {
-                        let eids = eids
-                            .as_array()
-                            .expect("should include consenting reader EIDs");
+                        let eids = user_eids(&auction, "should include consenting reader EIDs");
                         assert_eq!(eids.len(), 1, "should expose only the configured partner");
                         assert_eq!(
                             eids[0]["source"], "example.com",

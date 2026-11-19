@@ -388,16 +388,7 @@ mod tests {
                     client_ip: Some(client_ip),
                     ..ClientInfo::default()
                 },
-                geo: Some(GeoInfo {
-                    city: String::new(),
-                    country: "EX".to_owned(),
-                    continent: String::new(),
-                    latitude: 0.0,
-                    longitude: 0.0,
-                    metro_code: 0,
-                    region: None,
-                    asn: None,
-                }),
+                geo: Some(GeoInfo::country_region("EX", None)),
             });
             let request = Request::builder()
                 .uri("/_ts/trace")

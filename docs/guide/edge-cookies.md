@@ -190,7 +190,7 @@ Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted 
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
-EIDs can reach the EC identity graph from either server-side pull sync or browser-side Prebid sync. During a Prebid-routed auction, Trusted Server combines those stored IDs with any same-request EIDs from Prebid.js, applies consent gating, and forwards the merged set to Prebid Server as OpenRTB `user.ext.eids`. Prebid Server then passes those EIDs downstream to demand partners in its OpenRTB requests.
+EIDs can reach the EC identity graph from either server-side pull sync or browser-side Prebid sync. During a Prebid-routed auction, Trusted Server combines those stored IDs with any same-request EIDs from Prebid.js, applies consent gating, and forwards the merged set to Prebid Server as OpenRTB `user.eids`. Prebid Server then passes those EIDs downstream to demand partners in its OpenRTB requests.
 
 ```mermaid
 sequenceDiagram
@@ -219,8 +219,8 @@ sequenceDiagram
     TS->>KV: Resolve EC-backed source-domain IDs
     KV-->>TS: Stored partner UIDs
     TS->>TS: Convert stored UIDs to EIDs<br/>Merge + dedupe with request eids[]<br/>Apply consent gating
-    TS->>PS: OpenRTB request<br/>user.ext.eids = merged EID set
-    PS->>DSP: OpenRTB bid request<br/>user.ext.eids preserved for bidders
+    TS->>PS: OpenRTB request<br/>user.eids = merged EID set
+    PS->>DSP: OpenRTB bid request<br/>EIDs preserved for bidders
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available

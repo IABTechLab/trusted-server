@@ -32,7 +32,7 @@ use crate::tinybird::TelemetryQueue;
 use fastly::Request as FastlyRequest;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::platform::ClientInfo;
+use trusted_server_core::platform::{ClientInfo, GeoCoordinates};
 use trusted_server_core::settings::Settings;
 
 const DOCUMENT: &str = "<html><head></head><body>Example article</body></html>";
@@ -158,11 +158,13 @@ impl Adapter for FastlyAdapter {
         );
         let geo = (navigation.geo == Geo::Gdpr).then(|| GeoInfo {
             country: "DE".to_owned(),
-            city: String::new(),
-            continent: "EU".to_owned(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            city: None,
+            continent: Some("EU".to_owned()),
+            coordinates: Some(GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         });

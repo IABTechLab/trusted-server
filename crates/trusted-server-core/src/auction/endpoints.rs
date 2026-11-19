@@ -747,6 +747,7 @@ mod tests {
     use crate::auction::config::AuctionConfig;
 
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
+    use crate::auction::test_support::{assert_no_user_eids, user_eids};
 
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
@@ -1886,9 +1887,7 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
-        let sources: Vec<&str> = body["user"]["ext"]["eids"]
-            .as_array()
-            .expect("should send the kept EIDs")
+        let sources: Vec<&str> = user_eids(&body, "should send the kept EIDs")
             .iter()
             .filter_map(|eid| eid["source"].as_str())
             .collect();
@@ -1988,9 +1987,11 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
-        assert!(
-            body["user"]["ext"]["eids"].is_null(),
-            "outgoing auction request must carry no EIDs when EC identity is denied: {body}"
+        assert_no_user_eids(
+            &body,
+            &format!(
+                "outgoing auction request must carry no EIDs when EC identity is denied: {body}"
+            ),
         );
     }
 
