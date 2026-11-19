@@ -384,7 +384,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let registered = &self.providers[provider.get()];
         let cleared = if matches!(
             status,
-            LookupStatus::Skipped(SkipReason::OptedOut | SkipReason::Region)
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::Region)
         ) {
             registered.policy.sources.to_vec()
         } else {
@@ -452,11 +452,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 // re-read on every navigation instead.
                 return ProviderLookup {
                     opt_out: OptOutMemory::Remember,
-                    ..self.lookup(
-                        provider,
-                        LookupStatus::Skipped(SkipReason::OptedOut),
-                        Vec::new(),
-                    )
+                    ..self.lookup(provider, LookupStatus::OptedOut, Vec::new())
                 };
             }
             Err(report) => {
@@ -583,7 +579,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         "Identity lookup: provider={} opted out in its cookies",
                         registered.id
                     );
-                    pending.early.push(skip(SkipReason::OptedOut));
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::OptedOut,
+                    });
                     continue;
                 }
                 CookieRead::Found(eids) => {
@@ -847,8 +846,10 @@ fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLook
 /// Merges the statuses and entries of [`merge_lookups`].
 fn merge_entries(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
     let LookupStatus::Found { dropped, .. } = later.status else {
-        return if later.status == LookupStatus::Skipped(SkipReason::OptedOut)
-            || !matches!(earlier.status, LookupStatus::Found { .. })
+        return if matches!(
+            later.status,
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::OptedOut)
+        ) || !matches!(earlier.status, LookupStatus::Found { .. })
         {
             later
         } else {
@@ -1973,7 +1974,7 @@ mod tests {
             let lookup = results.iter().next().expect("should report the provider");
             assert_eq!(
                 lookup.status,
-                LookupStatus::Skipped(SkipReason::OptedOut),
+                LookupStatus::OptedOut,
                 "should skip for the opt-out"
             );
             assert_eq!(
@@ -2245,12 +2246,12 @@ mod tests {
 
         let merged = merge_lookups(
             found_lookup("a.example.com", "c-1"),
-            status_lookup(LookupStatus::Skipped(SkipReason::OptedOut)),
+            status_lookup(LookupStatus::OptedOut),
         );
 
         assert_eq!(
             merged.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should let a lookup opt-out win over cookie IDs"
         );
     }
@@ -2485,7 +2486,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out"
         );
         assert_eq!(
@@ -2509,7 +2510,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out the provider reads from a 204"
         );
         assert_eq!(

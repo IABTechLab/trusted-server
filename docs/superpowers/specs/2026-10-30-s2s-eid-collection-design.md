@@ -1119,6 +1119,8 @@ pub enum LookupStatus {
     TransportFailed,
     InvalidResponse,
     RequestFailed,
+    /// The provider reported an opt-out in this navigation.
+    OptedOut,
     Skipped(SkipReason),
 }
 
@@ -1140,6 +1142,7 @@ pub enum SkipReason {
     Input,
     Destination,
     RateLimited,
+    /// An opt-out remembered in the row has not lapsed.
     OptedOut,
 }
 
@@ -1273,13 +1276,15 @@ For each provider with a `Found` outcome and each source in its response:
 - Sources the provider claims but did not return stay unchanged.
 - `NoMatch`, failures, timeouts and skipped providers leave the row unchanged.
 - `OptedOut` (a cookie or a vendor server's reply) clears every source the
-  provider claims. Only an opt-out a vendor server reports is recorded in the
-  row's `opt_outs` map for 30 days: a cookie opt-out is re-read on every
-  navigation, so it needs no memory. Until a recorded opt-out lapses the
-  provider is skipped as `skipped_opted_out` and not called, and a result from
-  a lookup dispatched before the opt-out was recorded is discarded rather than
-  written over it. The vendor's cookies are read before the recorded opt-out
-  is checked: an ID in them means the visitor opted back in, so the opt-out is
+  provider claims. Only an opt-out a vendor server reports (outcome
+  `opted_out`) is recorded in the row's `opt_outs` map for 30 days: a cookie
+  opt-out is re-read on every navigation, so it needs no memory. Until a
+  recorded opt-out lapses the provider is skipped as `skipped_opted_out` and
+  not called, and a result from a lookup dispatched before the opt-out was
+  recorded is discarded rather than written over it. A `skipped_opted_out`
+  skip never renews the 30 days, and one whose opt-out lapsed before the write
+  is discarded. The vendor's cookies are read before the recorded opt-out is
+  checked: an ID in them means the visitor opted back in, so the opt-out is
   forgotten and the ID stored. Generated and cookie IDs merge like `Found`.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
@@ -1524,7 +1529,7 @@ examples use placeholders.
 ### 12.2 Logs and metrics
 
 Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
-`http_error`, `transport_error`, `request_error`, `invalid_response`, `skipped_no_row`, `skipped_consent`,
+`http_error`, `transport_error`, `request_error`, `invalid_response`, `opted_out`, `skipped_no_row`, `skipped_consent`,
 `skipped_not_due`, `skipped_input`, `skipped_rate_limited`, `skipped_opted_out`,
 `destination_rejected`; plus the totals of UIDs kept and dropped. The page-load write emits no
 outcome label in PR A: a skipped write is logged with its error (a conflict,

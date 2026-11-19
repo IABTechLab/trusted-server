@@ -63,8 +63,8 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
-    /// The vendor or its cookies report an opt-out; the provider's stored
-    /// UIDs are removed.
+    /// An opt-out remembered in the row has not lapsed; the provider's
+    /// stored UIDs are removed.
     OptedOut,
     /// Every source of the provider is excluded where GDPR applies; the
     /// provider's stored UIDs are removed.
@@ -93,6 +93,9 @@ pub enum LookupStatus {
     TransportFailed,
     /// The body could not be parsed at all.
     InvalidResponse,
+    /// The provider reported an opt-out in this navigation; its stored UIDs
+    /// are removed and the opt-out is remembered.
+    OptedOut,
     /// The provider was not called.
     Skipped(SkipReason),
 }
@@ -109,6 +112,7 @@ impl LookupStatus {
             Self::RequestFailed => "request_error",
             Self::TransportFailed => "transport_error",
             Self::InvalidResponse => "invalid_response",
+            Self::OptedOut => "opted_out",
             Self::Skipped(SkipReason::NoRow) => "skipped_no_row",
             Self::Skipped(SkipReason::Consent) => "skipped_consent",
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
@@ -145,7 +149,7 @@ pub struct ProviderLookup {
     /// Validated entries per returned source; empty unless `Found`.
     pub entries: Vec<(SourceDomain, Vec<KvEid>)>,
     /// Sources whose stored records are removed, because the user opted
-    /// out of the provider; empty unless `Skipped(OptedOut)`.
+    /// out of the provider; empty unless `OptedOut` or `Skipped(OptedOut)`.
     pub cleared: Vec<SourceDomain>,
     /// What this lookup does to the provider's remembered opt-out.
     pub opt_out: OptOutMemory,
