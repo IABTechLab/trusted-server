@@ -1,8 +1,9 @@
-//! Smoke tests for the Cloudflare adapter route wiring.
+//! Route tests for the Cloudflare adapter.
 //!
-//! Runs on the host target (no Workers runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! the platform layer or outbound network calls.
+//! Runs on the host target (no Workers runtime). Covers route registration,
+//! middleware, auth, and the publisher origin's input cap and decoding. Every
+//! outbound call goes through a scripted client, so nothing reaches the
+//! network.
 
 // Test crates may buffer bodies with `Body::into_bytes`.
 #![allow(clippy::disallowed_methods)]
@@ -10,7 +11,9 @@
 use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
 use edgezero_core::app::{App, Hooks as _};
 use edgezero_core::body::Body;
-use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
+use edgezero_core::http::{
+    HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+};
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
 use edgezero_core::outbound::{ResponseDecoding, ResponseMode};
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
@@ -19,8 +22,9 @@ use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
-    ScriptedHttpClient, ScriptedReply, TestClock,
+    RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
 };
 use trusted_server_core::test_support::{gzip, insert_outbound_client};
 
@@ -36,7 +40,13 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// The settings [`test_router`] builds its router from.
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -53,10 +63,7 @@ fn test_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
@@ -197,6 +204,29 @@ async fn canonical_not_found_carries_x_ts_version() {
             .and_then(|value| value.to_str().ok()),
         Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 404"
+    );
+}
+
+/// A handler `Err` still passes through the finalize middleware.
+///
+/// `dispatch_ingress` installs no outbound client, so the auction handler
+/// fails before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_error_carries_x_ts_version() {
+    let response = dispatch_through_app(Method::POST, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should answer the failed Cloudflare handler with 500"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the handler error response"
     );
 }
 
@@ -398,6 +428,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/first-party/sign"),
         ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
+        ("GET", "/_ts/api/v1/identify"),
+        ("OPTIONS", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/batch-sync"),
     ];
 
     for (method, path) in expected {
@@ -909,96 +942,52 @@ fn html_document(len: usize) -> Vec<u8> {
     document
 }
 
-/// The coding the scripted origin serves a body in.
-#[derive(Clone, Copy, Debug)]
-enum OriginCoding {
-    Identity,
-    Gzip,
+/// A 200 gzip origin reply carrying `body` with `content_type`.
+fn gzip_origin_reply(content_type: &str, body: &[u8]) -> ScriptedReply {
+    ScriptedReply::status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-encoding", "gzip")
+        .body(gzip(body))
 }
 
-/// A 200 origin reply carrying `body` with `content_type`, coded as `coding`.
-fn origin_reply(content_type: &str, body: &[u8], coding: OriginCoding) -> ScriptedReply {
-    let reply = ScriptedReply::status(StatusCode::OK).header("content-type", content_type);
-    match coding {
-        OriginCoding::Identity => reply.body(body.to_vec()),
-        OriginCoding::Gzip => reply.header("content-encoding", "gzip").body(gzip(body)),
-    }
+/// Sends a publisher GET for `path` that accepts gzip through `router`, with
+/// `origin` as its outbound client.
+async fn fetch_publisher(router: RouterService, origin: &ScriptedHttpClient, path: &str) -> Served {
+    let mut request = publisher_get(path);
+    request
+        .headers_mut()
+        .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    Served::from_router_response(route_to_origin(router, request, origin).await)
 }
 
-/// Asserts that an origin body that decodes to [`CLOUDFLARE_INPUT_CAP`] bytes
-/// is served as identity and one byte more fails with 502 before egress.
-async fn assert_cloudflare_input_cap(
-    content_type: &str,
-    body: fn(usize) -> Vec<u8>,
-    coding: OriginCoding,
-) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_cloudflare() {
     let origin = ScriptedHttpClient::new(&TestClock::new());
-    for (path, len) in [
-        ("/at-cap", CLOUDFLARE_INPUT_CAP),
-        ("/over-cap", CLOUDFLARE_INPUT_CAP + 1),
-    ] {
-        origin.respond_to(
-            Method::GET,
-            &format!("{ORIGIN}{path}"),
-            origin_reply(content_type, &body(len), coding),
-        );
-    }
 
-    let at_cap = route_to_origin(test_router(), publisher_get("/at-cap"), &origin).await;
-    assert_eq!(
-        (
-            at_cap.status(),
-            at_cap.headers().get(header::CONTENT_ENCODING)
-        ),
-        (StatusCode::OK, None),
-        "should serve a {coding:?} {content_type} body at the cap as identity"
-    );
-    let served = at_cap
-        .into_body()
-        .into_bytes()
-        .expect("should buffer the at-cap body");
-    assert!(
-        served.len() >= CLOUDFLARE_INPUT_CAP,
-        "should serve the whole {coding:?} {content_type} body at the cap, got {} bytes",
-        served.len()
-    );
-
-    let over_cap = route_to_origin(test_router(), publisher_get("/over-cap"), &origin).await;
-    assert_eq!(
-        over_cap.status(),
-        StatusCode::BAD_GATEWAY,
-        "should fail a {coding:?} {content_type} body one byte over the cap with 502"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_body_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap(
-        "application/octet-stream",
-        |len| vec![b'x'; len],
-        OriginCoding::Identity,
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        CLOUDFLARE_INPUT_CAP,
+        ResponseDecoding::Decode,
+        |path| fetch_publisher(test_router(), &origin, path),
     )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identity_html_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap("text/html", html_document, OriginCoding::Identity).await;
-}
+async fn processed_output_keeps_its_own_bound_cloudflare() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gzip_raw_body_decoded_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap(
-        "application/octet-stream",
-        |len| vec![b'x'; len],
-        OriginCoding::Gzip,
-    )
+    publisher_input_cap::assert_output_bound(&origin, |path| {
+        fetch_publisher(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build router from output-bound settings"),
+            &origin,
+            path,
+        )
+    })
     .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gzip_html_decoded_at_cap_passes_and_one_over_fails_502_cloudflare() {
-    assert_cloudflare_input_cap("text/html", html_document, OriginCoding::Gzip).await;
 }
 
 /// Serves `path` from a gzip origin to a client that sends no `Accept-Encoding`.
@@ -1007,7 +996,7 @@ async fn fetch_gzip_origin(path: &str, content_type: &str, body: &[u8]) -> (Resp
     origin.respond_to(
         Method::GET,
         &format!("{ORIGIN}{path}"),
-        origin_reply(content_type, body, OriginCoding::Gzip),
+        gzip_origin_reply(content_type, body),
     );
     let request = publisher_get(path);
     assert!(
@@ -1067,7 +1056,7 @@ async fn publisher_origin_streams_its_decoded_response_under_the_input_cap_cloud
     origin.respond_to(
         Method::GET,
         &format!("{ORIGIN}/page"),
-        origin_reply("text/html", &html_document(64), OriginCoding::Gzip),
+        gzip_origin_reply("text/html", &html_document(64)),
     );
 
     let response = route_to_origin(test_router(), publisher_get("/page"), &origin).await;
@@ -1090,4 +1079,118 @@ async fn publisher_origin_streams_its_decoded_response_under_the_input_cap_cloud
         ),
         "should stream the decoded origin response and cap its encoded bytes"
     );
+}
+
+/// A partner API request carrying a Bearer token and a mapping body.
+fn partner_api_request(method: Method, path: &str) -> Request {
+    request_builder()
+        .method(method)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .header("authorization", "Bearer fictional-partner-token-0123456789")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mappings":[]}"#))
+        .expect("should build partner API request")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_origin_receives_publisher_fallback_requests() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/article"),
+        ScriptedReply::status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body("served by origin"),
+    );
+
+    let response = route_to_origin(test_router(), publisher_get("/article"), &origin).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should proxy the publisher page to the origin"
+    );
+    assert_eq!(
+        origin
+            .requests()
+            .iter()
+            .map(RecordedRequest::method_and_path)
+            .collect::<Vec<_>>(),
+        vec!["GET /article".to_owned()],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let origin = ScriptedHttpClient::forbidding();
+
+    let identify = route_to_origin(
+        test_router(),
+        partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let preflight = route_to_origin(
+        test_router(),
+        partner_api_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let batch_sync = route_to_origin(
+        test_router(),
+        partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        &origin,
+    )
+    .await;
+
+    assert_eq!(
+        identify.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "identify should answer 501 locally"
+    );
+    assert_eq!(
+        preflight.status(),
+        StatusCode::OK,
+        "identify preflight should answer locally"
+    );
+    assert_eq!(
+        batch_sync.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "batch sync should answer 501 locally"
+    );
+    origin.assert_no_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let origin = ScriptedHttpClient::forbidding();
+    let cases = [
+        (Method::HEAD, "/_ts/api/v1/identify"),
+        (Method::POST, "/_ts/api/v1/identify"),
+        (Method::PUT, "/_ts/api/v1/identify"),
+        (Method::PATCH, "/_ts/api/v1/identify"),
+        (Method::DELETE, "/_ts/api/v1/identify"),
+        (Method::GET, "/_ts/api/v1/batch-sync"),
+        (Method::HEAD, "/_ts/api/v1/batch-sync"),
+        (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+        (Method::PUT, "/_ts/api/v1/batch-sync"),
+        (Method::PATCH, "/_ts/api/v1/batch-sync"),
+        (Method::DELETE, "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases.clone() {
+        let response =
+            route_to_origin(test_router(), partner_api_request(method, path), &origin).await;
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
+    origin.assert_no_requests();
 }

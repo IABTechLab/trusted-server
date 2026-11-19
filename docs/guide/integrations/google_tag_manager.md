@@ -256,13 +256,16 @@ The endpoint bounds POST bodies to prevent memory pressure:
 - A declared `Content-Length` over `max_beacon_body_size` returns
   `413 Payload Too Large` before any body byte is read.
 - A malformed or duplicate `Content-Length`, or `Content-Length` together with
-  `Transfer-Encoding`, returns `400 Bad Request` from EdgeZero's ingress check
-  before the route runs.
+  `Transfer-Encoding`, returns `400 Bad Request` before the route runs, from
+  EdgeZero's ingress check or the runtime's HTTP parser. Local Wrangler can
+  answer `500` instead. The request never reaches Google.
 - A body with no `Content-Length`, or under it, is read through a bounded
   reader. The read stops as soon as the body would pass
   `max_beacon_body_size` and returns `413 Payload Too Large`.
 - A body still unread 30 s after the request arrived returns
   `408 Request Timeout`.
+- A body stream that fails with EdgeZero's framing error returns
+  `400 Bad Request`.
 - Any other failed body read returns `502 Bad Gateway`.
 
 **Memory Protection**:

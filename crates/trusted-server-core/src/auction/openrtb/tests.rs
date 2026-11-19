@@ -14,7 +14,9 @@ use crate::auction::plan::{
 use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
 use crate::auction::routing::RoutedAuction;
 use crate::auction::routing::route_auction;
-use crate::auction::test_support::canonical_parity_auction_request;
+use crate::auction::test_support::{
+    aps_user_eids, assert_no_user_eids, canonical_parity_auction_request, user_eids,
+};
 use crate::auction::types::AuctionResponse;
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
 use crate::consent::jurisdiction::Jurisdiction;
@@ -41,6 +43,7 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
         providers: BTreeMap::from([(
             provider_id.clone(),
             ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: profile.to_string(),
                 endpoint: endpoint.to_string(),
@@ -869,7 +872,7 @@ fn pbs_driver_exact_golden_preserves_profile_policy() {
     };
     assert_eq!(
         serde_json::to_string(&request).expect("should serialize PBS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
         "should preserve PBS parity differences"
     );
 }
@@ -928,7 +931,7 @@ fn aps_driver_exact_golden_preserves_profile_policy() {
     let request = build("aps", json!({"account_id": "example-account-id"}), None);
     assert_eq!(
         serde_json::to_string(&request).expect("should serialize APS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
         "should preserve APS parity differences"
     );
 }
@@ -987,17 +990,17 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
         (
             "standard",
             json!({"request_ext": {"fictional": true}}),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
             "prebid-server",
             json!({}),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
             "aps",
             json!({"account_id": "example-account-id"}),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
     ];
     for (profile, config, expected) in cases {
@@ -1016,9 +1019,53 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
             None,
         ))
         .expect("should serialize unsigned standard request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#,
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#,
         "unsigned standard wire fixture should stay exact"
     );
+}
+
+#[test]
+fn every_profile_writes_eids_to_openrtb_26_user_eids() {
+    let expected =
+        [json!({"source": "identity.example", "uids": [{"id": "fictional-uid", "atype": 1}]})];
+    for (profile, profile_config) in [("standard", json!({})), ("prebid-server", json!({}))] {
+        let request = build(profile, profile_config, None);
+
+        let value = serde_json::to_value(request).expect("should serialize request");
+
+        assert_eq!(
+            user_eids(&value, profile),
+            expected,
+            "{profile} should carry the routed EIDs only in user.eids"
+        );
+    }
+
+    let request = build("aps", json!({"account_id": "example-account-id"}), None);
+
+    let value = serde_json::to_value(request).expect("should serialize request");
+
+    assert_eq!(
+        aps_user_eids(&value, "aps"),
+        expected,
+        "aps should carry the routed EIDs in user.eids and user.ext.eids"
+    );
+}
+
+#[test]
+fn every_profile_omits_both_eid_fields_without_eids() {
+    for (profile, profile_config) in [
+        ("standard", json!({})),
+        ("prebid-server", json!({})),
+        ("aps", json!({"account_id": "example-account-id"})),
+    ] {
+        let mut common = canonical_parity_auction_request();
+        common.user.eids = None;
+        let request = build_with_request(profile, profile_config, common, None);
+
+        let value = serde_json::to_value(request).expect("should serialize request");
+
+        assert_no_user_eids(&value, profile);
+    }
 }
 
 #[test]

@@ -775,15 +775,16 @@ registered integration selected by `[auction].mediator`.
 
 Common provider fields and defaults:
 
-| Field            | Default         | Meaning                                                        |
-| ---------------- | --------------- | -------------------------------------------------------------- |
-| `protocol`       | Required        | `openrtb-2.6`                                                  |
-| `profile`        | `standard`      | Typed OpenRTB behavior                                         |
-| `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
-| `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
-| `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
-| `profile_config` | `{}`            | Profile-owned typed settings                                   |
-| `notifications`  | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats |
+| Field                 | Default         | Meaning                                                                            |
+| --------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `protocol`            | Required        | `openrtb-2.6`                                                                      |
+| `profile`             | `standard`      | Typed OpenRTB behavior                                                             |
+| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                      |
+| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
+| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                         |
+| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                 |
+| `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
+| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
 
 A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
 `[::1]`.
@@ -846,8 +847,10 @@ A provider's reported response time runs from the batch start to its bid's
 arrival, so a collection that waits after an on-time bid does not increase it.
 
 Personalized auction and mediator requests explicitly bypass intermediary
-caches. Each bidder response is capped at 1 MiB and the mediator response at
-2 MiB. No cap applies across all bidder responses together.
+caches. A `prebid-server` or `aps` bidder response is capped at 2 MiB, a
+`standard` bidder response at 1 MiB, and the mediator response at 2 MiB. A
+bidder response over its cap fails that provider with `error_type`
+`transport`. No cap applies across all bidder responses together.
 
 On Fastly, EdgeZero records a bid's arrival whenever one of its polls services
 the provider, including the origin body reads while a page streams. A bid that
@@ -857,8 +860,8 @@ dropped.
 Dropping the batch cancels its in-flight requests on every adapter. An abandoned
 auction, an origin error, a non-HTML response, or a client that disconnects
 mid-stream therefore cancels the bidder and mediator requests. Only guest-side
-cancellation is guaranteed: Fastly host cancellation is best effort, so a bidder
-may still receive and answer a cancelled request. Upstream side effects that
+cancellation is guaranteed: host cancellation is best effort on Cloudflare,
+Fastly, and Spin, so a bidder may still receive and answer a cancelled request. Upstream side effects that
 already happened cannot be undone.
 
 Timer granularity and runtime scheduling can add a small overshoot. Parsing,
@@ -916,7 +919,7 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built or Fastly cannot register its backend, and other providers continue. If every routed provider fails to launch, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
+- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built, Fastly cannot register its backend, or the Spin or Cloudflare adapter cannot prepare the request, and other providers continue. If every routed provider fails before the request batch starts, because Trusted Server cannot build its request or Fastly cannot register its backend, direct `/auction` execution returns `502 Bad Gateway`, and split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids. Spin and Cloudflare prepare each request inside the batch, so their preparation failures are recorded during collection: even when every provider fails that way, the auction completes without bids, and split execution records it as completed.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
 - **No providers configured** — Completes as a no-bid without provider I/O.
 - **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.

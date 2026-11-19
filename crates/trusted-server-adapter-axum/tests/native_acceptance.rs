@@ -125,7 +125,7 @@ impl Prepared {
         command
             .env_clear()
             .current_dir(&root)
-            .env("RUST_LOG", "info")
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", port.to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &root)

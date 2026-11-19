@@ -31,7 +31,7 @@ use axum::http::Request as AxumRequest;
 use base64::Engine as _;
 use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
-use edgezero_adapter_axum::outbound::AxumOutboundClient;
+use edgezero_adapter_axum::outbound_executor::AxumOutboundExecutor;
 use edgezero_adapter_axum::request::into_core_request;
 use edgezero_adapter_axum::test_utils::AxumTestServer;
 use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
@@ -57,7 +57,8 @@ use trusted_server_core::test_support::scripted_client::{
 /// `get_settings()` rejects by design, so every app and router here is built
 /// from this known-good config through an adapter testing seam:
 /// `routes_with_settings_and_outbound_client` for served apps,
-/// `routes_with_settings` for route-table checks, and
+/// `routes_with_settings` for route-table checks and the one served app that
+/// uses `EdgeZero`'s own Axum client, and
 /// `routes_with_settings_and_services` for fixed-service fixtures.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
@@ -778,25 +779,20 @@ async fn spin_auction_ignores_spoofed_forwarded_headers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publisher_proxy_fallback_parity() {
-    // Cookie (Set-Cookie) parity for the publisher proxy requires a live origin.
-    // Without an origin, both adapters return an error (4xx or 5xx). The parity
-    // assertion is that Set-Cookie presence matches across adapters regardless of
-    // whether the proxy succeeds.
+    // Every adapter's scripted client fails the publisher origin request, so
+    // all three answer the fallback with an error. The parity assertion is that
+    // the status and the Set-Cookie presence match exactly across adapters.
     let (axum_status, axum_headers) = axum_get("/").await;
     let (cf_status, cf_headers) = cf_get("/").await;
     let (spin_status, spin_headers) = spin_get("/").await;
 
-    // Axum and Cloudflare must agree on the exact fallback outcome. Spin uses
-    // a different HTTP client, so until a live origin is configured the parity
-    // guard only requires it to fail in the same broad class.
     assert_eq!(
         axum_status, cf_status,
         "publisher fallback status must match exactly: axum={axum_status} cf={cf_status}"
     );
     assert_eq!(
-        cf_status >= 500,
-        spin_status >= 500,
-        "publisher fallback 5xx behaviour must match: cf={cf_status} spin={spin_status}"
+        cf_status, spin_status,
+        "publisher fallback status must match exactly: cf={cf_status} spin={spin_status}"
     );
 
     let axum_has_cookie = axum_headers.contains_key("set-cookie");
@@ -1076,14 +1072,15 @@ async fn assert_bodiless_get_reaches_origin_without_body() {
     let origin = RecordingOrigin::start().await;
     let mut settings = test_settings();
     settings.publisher.origin_url = format!("http://{}", origin.address);
-    // EdgeZero's own Axum client goes in router state instead of a script, and
-    // the publisher forward runs through it.
-    // `bodiless_get_with_a_forbidding_router_client_never_reaches_the_origin`
-    // proves the router-state client is the one that carries the forward.
-    let client = HttpClient::with_client(
-        AxumOutboundClient::try_new().expect("should build EdgeZero's Axum outbound client"),
-    );
-    let server = serve(Adapter::Axum.app(settings, client)).await;
+    // No client goes in router state, so the publisher forward runs through
+    // the outbound client EdgeZero's Axum listener builds for the request.
+    let app = App::from_router::<AxumApp>(
+        AxumApp::routes_with_settings(settings)
+            .expect("should build the Axum router from parity test settings"),
+        AXUM_PLATFORM,
+    )
+    .expect("should assemble the app with its production policies");
+    let server = serve(app).await;
 
     // A chunked body that holds only its terminating chunk is bodiless, but
     // the listener learns that only by reading it, so the app receives the
@@ -2340,9 +2337,16 @@ mod trace_parity {
                     http::HeaderValue::from_static(FORWARDER_SECRET),
                 );
             }
-            let request = into_core_request(AxumRequest::from_parts(parts, AxumBody::empty()))
-                .await
-                .expect("should convert the native Axum request");
+            // The converted request carries a client bound to this executor,
+            // but the router-state script answers every outbound call, so the
+            // executor never runs.
+            let executor = AxumOutboundExecutor::new();
+            let request = into_core_request(
+                AxumRequest::from_parts(parts, AxumBody::empty()),
+                executor.handle(),
+            )
+            .await
+            .expect("should convert the native Axum request");
             let response = RouterService::oneshot(&router, request)
                 .await
                 .expect("should dispatch forwarded action");

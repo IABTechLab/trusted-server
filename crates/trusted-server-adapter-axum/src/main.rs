@@ -3,42 +3,32 @@ use edgezero_adapter_axum::dev_server::{
 };
 use edgezero_adapter_axum::geo::NativeGeoConfigError;
 use error_stack::Report;
-use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_adapter_axum::native_geo::{NativeGeoProfileError, load_selection};
 use trusted_server_adapter_axum::startup::initialize_native;
 
-/// Environment variable that sets the maximum log level.
-const LOG_LEVEL_ENV: &str = "RUST_LOG";
-
-/// Log level used when `RUST_LOG` is unset or unrecognized.
-const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
-
-#[allow(clippy::print_stderr)]
+/// Runs Trusted Server through `EdgeZero`'s strict Axum production startup.
+///
+/// `EdgeZero` owns startup: it installs the logger at
+/// `EDGEZERO__LOGGING__LEVEL`, reads the ingress limits from
+/// `EDGEZERO__ADAPTER__INGRESS__*` and the listener address from
+/// `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT`, and prepares the
+/// declared config and secret stores from the selected providers. The
+/// initializer then loads and validates the settings from those stores and
+/// installs the router. A hosting, Geo, settings, store, ingress or bind
+/// failure returns before any request is served, and the process exits
+/// non-zero.
 fn main() {
-    // `var_os` keeps a set but non-UTF-8 value visible, so it is rejected
-    // with a warning instead of silently falling back.
-    let configured_level =
-        std::env::var_os(LOG_LEVEL_ENV).map(|value| value.to_string_lossy().into_owned());
-    let level = parse_log_level(configured_level.as_deref()).unwrap_or_else(|value| {
-        eprintln!(
-            "warning: {LOG_LEVEL_ENV}={value:?} is not a single log level; using {}",
-            DEFAULT_LOG_LEVEL.as_str().to_ascii_lowercase()
-        );
-        DEFAULT_LOG_LEVEL
-    });
-    if let Err(e) = simple_logger::SimpleLogger::new().with_level(level).init() {
-        eprintln!("warning: logger init failed: {e}");
-    }
-
     let options = match native_options() {
         Ok(options) => options,
         Err(error) => {
-            log::error!("Trusted Server native hosting configuration failed: {error}");
+            report_startup_failure(format_args!(
+                "Trusted Server native hosting configuration failed: {error}"
+            ));
             std::process::exit(1);
         }
     };
-    if let Err(err) = run_production_app_with_options_and_initializer::<TrustedServerApp, _>(
+    if let Err(error) = run_production_app_with_options_and_initializer::<TrustedServerApp, _>(
         options,
         |app, stores| {
             Box::pin(async move {
@@ -50,8 +40,26 @@ fn main() {
             })
         },
     ) {
-        log::error!("trusted-server-adapter-axum failed: {err}");
+        report_startup_failure(format_args!(
+            "trusted-server-adapter-axum failed: {error:#}"
+        ));
         std::process::exit(1);
+    }
+}
+
+/// Reports a fatal startup failure.
+///
+/// `EdgeZero` validates the hosting settings, such as the listener address,
+/// the log level and the ingress limits, before it installs the logger, and
+/// the hosting options are captured before the runner starts. A failure there
+/// finds no logger, so the message goes to standard error instead of being
+/// dropped.
+#[allow(clippy::print_stderr)]
+fn report_startup_failure(message: core::fmt::Arguments<'_>) {
+    if log::log_enabled!(log::Level::Error) {
+        log::error!("{message}");
+    } else {
+        eprintln!("{message}");
     }
 }
 
@@ -90,33 +98,10 @@ fn native_options() -> Result<AxumRunOptions, Report<NativeHostingError>> {
     Ok(options)
 }
 
-/// Parses an optional `RUST_LOG` value into the logger's maximum level.
-///
-/// Absent and blank values resolve to [`DEFAULT_LOG_LEVEL`]. Any other value
-/// must be a single level name (`trace`, `debug`, `info`, `warn`, `error`, or
-/// `off`), matched case-insensitively after trimming whitespace. The quiet
-/// default keeps trace-level payload and consent-string logging out of
-/// standard output unless an operator explicitly asks for it.
-///
-/// # Errors
-///
-/// Returns the trimmed value when it is not a single level name, such as the
-/// per-module filter `trusted_server=trace`, so the caller can warn before
-/// falling back to [`DEFAULT_LOG_LEVEL`].
-fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
-    match configured.map(str::trim) {
-        None | Some("") => Ok(DEFAULT_LOG_LEVEL),
-        Some(trimmed) => trimmed.parse().map_err(|_| trimmed),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use trusted_server_adapter_axum::native_geo::PROFILE_FILE_ENV;
-
-    #[test]
-    fn crate_compiles() {}
 
     #[test]
     fn hosting_error_preserves_redacted_sdk_diagnostic() {
@@ -178,62 +163,5 @@ mod tests {
                 "should not attach parser input to the hosting report"
             );
         });
-    }
-
-    #[test]
-    fn parse_log_level_defaults_to_info_when_unset_or_blank() {
-        assert_eq!(
-            parse_log_level(None),
-            Ok(LevelFilter::Info),
-            "should default to info when RUST_LOG is unset"
-        );
-        assert_eq!(
-            parse_log_level(Some("")),
-            Ok(LevelFilter::Info),
-            "should treat an empty value as unset"
-        );
-        assert_eq!(
-            parse_log_level(Some("  ")),
-            Ok(LevelFilter::Info),
-            "should treat a whitespace-only value as unset"
-        );
-    }
-
-    #[test]
-    fn parse_log_level_honors_explicit_levels() {
-        assert_eq!(
-            parse_log_level(Some("info")),
-            Ok(LevelFilter::Info),
-            "should suppress trace when RUST_LOG is info"
-        );
-        assert_eq!(
-            parse_log_level(Some("trace")),
-            Ok(LevelFilter::Trace),
-            "should enable trace when RUST_LOG is trace"
-        );
-        assert_eq!(
-            parse_log_level(Some(" DEBUG ")),
-            Ok(LevelFilter::Debug),
-            "should accept case-insensitive levels with surrounding whitespace"
-        );
-        assert_eq!(
-            parse_log_level(Some("off")),
-            Ok(LevelFilter::Off),
-            "should allow disabling logging"
-        );
-    }
-
-    #[test]
-    fn parse_log_level_rejects_unrecognized_values() {
-        assert_eq!(
-            parse_log_level(Some("trace,hyper=info")),
-            Err("trace,hyper=info"),
-            "should reject module-filter syntax it does not support"
-        );
-        assert_eq!(
-            parse_log_level(Some(" verbose ")),
-            Err("verbose"),
-            "should reject an unknown level name and return it trimmed"
-        );
     }
 }
