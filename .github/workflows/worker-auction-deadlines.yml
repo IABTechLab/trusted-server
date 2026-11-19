@@ -30,6 +30,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.versions.outputs.node }}
+      - name: Check Cloudflare smoke tool selection
+        if: matrix.adapter == 'cloudflare'
+        run: node --test scripts/smoke-cloudflare.test.mjs
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
