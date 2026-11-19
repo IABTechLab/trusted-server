@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use toml_edit::{Array, DocumentMut, value};
+use toml_edit::{Array, DocumentMut, table, value};
 
 const CONFIG: &str = include_str!(
     "../../trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml"
@@ -30,6 +30,9 @@ fn project(endpoints: &str, restricted: bool) -> TempDir {
     )
     .expect("should write manifest");
     let mut document = CONFIG.parse::<DocumentMut>().expect("should parse fixture");
+    // The fixture has no `[proxy]` table, and the appended endpoint tables need
+    // a standard table rather than the inline one indexing would create.
+    document.entry("proxy").or_insert(table());
     document["proxy"]["allowed_domains"] = value(
         [if restricted {
             "other.example.com"

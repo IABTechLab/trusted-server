@@ -56,36 +56,38 @@ impl RuntimeEnvironment for AxumDevServer {
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let app_config = integration_app_config_envelope(origin_port())?;
-        self.spawn_with_app_config(&app_config)
+        self.spawn_with_app_config(&app_config, &[])
     }
 
     fn health_check_path(&self) -> &str {
-        "/health"
+        "/ready"
     }
 }
 
 impl AxumDevServer {
     /// Spawn the real native binary with an isolated app-config envelope.
     ///
-    /// Normal [`RuntimeEnvironment::spawn`] retains its disabled baseline config.
+    /// `env` adds environment variables, such as `EDGEZERO__ADAPTER__INGRESS__*`
+    /// limits. Normal [`RuntimeEnvironment::spawn`] retains its disabled
+    /// baseline config.
     ///
     /// # Errors
     ///
     /// Returns a spawn or readiness error if the native process is unavailable.
-    pub(crate) fn spawn_with_app_config(&self, app_config: &str) -> TestResult<RuntimeProcess> {
+    pub(crate) fn spawn_with_app_config(
+        &self,
+        app_config: &str,
+        env: &[(&str, &str)],
+    ) -> TestResult<RuntimeProcess> {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
         let base_url = format!("http://127.0.0.1:{port}");
         let app_config = envelope_with_public_origin(app_config, &base_url)?;
-        let store_name = default_config_store_name();
-        let config_key = default_config_key();
-        let config_variable = config_env_var(store_name.as_ref(), &config_key);
 
-        let mut child = Command::new(&binary)
-            .env("PORT", port.to_string())
-            .env(config_variable, app_config)
-            .envs(INTEGRATION_SECRET_ENV.iter().copied())
+        let mut child = self
+            .command(&app_config, port)
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -108,14 +110,29 @@ impl AxumDevServer {
 
         let handle = AxumHandle { child };
 
-        // The Axum dev server returns 403 at root (no publisher config in test env),
-        // so we poll until we get any HTTP response rather than a specific status.
-        wait_for_any_response(&base_url)?;
+        super::wait_for_ready(&base_url, self.health_check_path(), false)?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
             base_url,
         })
+    }
+
+    /// The command that runs the binary on `port` with `app_config` and the
+    /// integration secrets.
+    ///
+    /// The caller chooses where its output goes.
+    pub(crate) fn command(&self, app_config: &str, port: u16) -> Command {
+        let store_name = default_config_store_name();
+        let config_key = default_config_key();
+        let config_variable = config_env_var(store_name.as_ref(), &config_key);
+
+        let mut command = Command::new(self.binary_path());
+        command
+            .env("EDGEZERO__ADAPTER__PORT", port.to_string())
+            .env(config_variable, app_config)
+            .envs(INTEGRATION_SECRET_ENV.iter().copied());
+        command
     }
 
     /// Resolve the path to the compiled `trusted-server-axum` binary.
@@ -131,25 +148,6 @@ impl AxumDevServer {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/trusted-server-axum")
     }
-}
-
-/// Poll until the Axum dev server responds with any HTTP status code.
-///
-/// The Axum server returns 403 at root when no publisher config is present,
-/// which is neither success nor 404, so the standard [`super::wait_for_ready`]
-/// helper cannot be used. Any HTTP response means the server is up.
-fn wait_for_any_response(base_url: &str) -> TestResult<()> {
-    use error_stack::Report;
-
-    let url = format!("{base_url}/");
-    for _ in 0..30 {
-        if reqwest::blocking::get(&url).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    Err(Report::new(TestError::RuntimeNotReady)
-        .attach(format!("Axum dev server at {base_url} not ready after 15s")))
 }
 
 /// Process handle for a running Axum dev-server instance.

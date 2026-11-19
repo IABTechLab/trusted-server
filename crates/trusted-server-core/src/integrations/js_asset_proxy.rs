@@ -576,9 +576,14 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::outbound::STREAMED_TIMEOUT;
+    use crate::platform::test_support::build_services_with_outbound_client;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
     use crate::test_support::tests::create_test_settings;
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
     use http::header;
     use serde_json::json;
 
@@ -1356,180 +1361,185 @@ mod tests {
         );
     }
 
+    const VENDOR_ORIGIN: &str = "https://cdn.example.com/vendor.js";
+
+    fn vendor_integration() -> Arc<JsAssetProxyIntegration> {
+        JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+            "/assets/vendor.js",
+            VENDOR_ORIGIN,
+            JsAssetProxyMode::Enabled,
+        )]))
+    }
+
+    /// Proxies `/assets/vendor.js` against an upstream that answers with `reply`.
+    fn handle_vendor_request(
+        request: Request<EdgeBody>,
+        reply: Option<ScriptedReply>,
+    ) -> (ScriptedHttpClient, Response<EdgeBody>) {
+        let clock = TestClock::new();
+        let upstream = ScriptedHttpClient::new(&clock);
+        if let Some(reply) = reply {
+            upstream.respond_to(Method::GET, VENDOR_ORIGIN, reply);
+        }
+        let services = build_services_with_outbound_client(&upstream, &clock);
+
+        let response = futures::executor::block_on(vendor_integration().handle(
+            &create_test_settings(),
+            &services,
+            request,
+        ))
+        .expect("should answer the JS asset request");
+
+        (upstream, response)
+    }
+
+    fn vendor_request() -> Request<EdgeBody> {
+        build_http_request(
+            Method::GET,
+            "https://publisher.example.com/assets/vendor.js",
+        )
+    }
+
     #[test]
-    fn handle_forwards_conditional_headers_and_preserves_not_modified() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
-                "/assets/vendor.js",
-                "https://cdn.example.com/vendor.js",
-                JsAssetProxyMode::Enabled,
-            )]));
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response_with_headers(
-                StatusCode::NOT_MODIFIED.as_u16(),
-                b"must not reach the client".to_vec(),
-                vec![(header::ETAG.as_str(), "\"current\"")],
-            );
-            let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let mut request = build_http_request(
-                Method::GET,
-                "https://publisher.example.com/assets/vendor.js",
-            );
-            request.headers_mut().insert(
-                header::IF_NONE_MATCH,
-                http::HeaderValue::from_static("\"current\""),
-            );
-            request.headers_mut().insert(
-                header::IF_MODIFIED_SINCE,
-                http::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
-            );
+    fn js_asset_proxy_request_readback() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/assets/vendor.js")
+            .header(header::ACCEPT, "*/*")
+            .header(header::ACCEPT_LANGUAGE, "en-US")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .header(header::IF_NONE_MATCH, "\"current\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::COOKIE, "session=fictional")
+            .header(HEADER_REFERER, "https://publisher.example.com/article")
+            .header(HEADER_X_FORWARDED_FOR, "198.51.100.10")
+            .body(EdgeBody::empty())
+            .expect("should build the JS asset request");
 
-            let response = integration
-                .handle(&settings, &services, request)
-                .await
-                .expect("should proxy conditional asset response");
+        let (upstream, response) = handle_vendor_request(
+            request,
+            Some(ScriptedReply::status(StatusCode::OK).body("vendor();")),
+        );
 
-            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(header::ETAG)
-                    .and_then(|value| value.to_str().ok()),
-                Some("\"current\"")
-            );
-            let response_body = response
-                .into_body()
-                .into_bytes_bounded(1024)
-                .await
-                .expect("should collect not-modified JS asset body");
-            assert!(
-                response_body.is_empty(),
-                "not-modified responses should not contain a body"
-            );
-            let request_headers = stub.recorded_request_headers();
-            assert_eq!(request_headers.len(), 1);
-            assert!(request_headers[0].iter().any(|(name, value)| {
-                name == header::IF_NONE_MATCH.as_str() && value == "\"current\""
-            }));
-            assert!(request_headers[0].iter().any(|(name, value)| {
-                name == header::IF_MODIFIED_SINCE.as_str()
-                    && value == "Wed, 21 Oct 2015 07:28:00 GMT"
-            }));
+        assert_eq!(response.status(), StatusCode::OK, "should serve the asset");
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 1, "should send one asset request");
+        let sent = &requests[0];
+        assert_eq!(
+            (&sent.method, sent.uri.to_string()),
+            (&Method::GET, VENDOR_ORIGIN.to_owned()),
+            "should fetch the configured origin"
+        );
+        sent.assert_headers(&[
+            ("accept", "*/*"),
+            ("accept-language", "en-US"),
+            ("accept-encoding", "gzip, br"),
+            ("if-none-match", "\"current\""),
+            ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ("user-agent", "TrustedServer/1.0"),
+        ]);
+        sent.assert_transport(ExpectedTransport {
+            timeout: STREAMED_TIMEOUT,
+            response_mode: ResponseMode::Streamed,
+            response_decoding: ResponseDecoding::Original,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
         });
     }
 
     #[test]
-    fn handle_maps_upstream_outcomes_and_respects_streaming_capability() {
-        futures::executor::block_on(async {
-            let settings = create_test_settings();
-            let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
-                "/assets/vendor.js",
-                "https://cdn.example.com/vendor.js",
-                JsAssetProxyMode::Enabled,
-            )]));
+    fn handle_forwards_conditional_headers_and_preserves_not_modified() {
+        let mut request = vendor_request();
+        request.headers_mut().insert(
+            header::IF_NONE_MATCH,
+            http::HeaderValue::from_static("\"current\""),
+        );
+        request.headers_mut().insert(
+            header::IF_MODIFIED_SINCE,
+            http::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
 
-            let buffered_stub = Arc::new(StubHttpClient::new());
-            buffered_stub.set_streaming_responses_supported(false);
-            buffered_stub.push_response(200, b"ok".to_vec());
-            let buffered_services = build_services_with_http_client(
-                Arc::clone(&buffered_stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let success = integration
-                .handle(
-                    &settings,
-                    &buffered_services,
-                    build_http_request(
-                        Method::GET,
-                        "https://publisher.example.com/assets/vendor.js",
-                    ),
-                )
-                .await
-                .expect("should proxy buffered asset response");
-            assert_eq!(success.status(), StatusCode::OK);
-            assert_eq!(buffered_stub.recorded_stream_response_flags(), vec![false]);
+        let (upstream, response) = handle_vendor_request(
+            request,
+            Some(
+                ScriptedReply::status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG.as_str(), "\"current\"")
+                    .body("must not reach the client"),
+            ),
+        );
 
-            let streaming_stub = Arc::new(StubHttpClient::new());
-            streaming_stub.set_streaming_responses_supported(true);
-            streaming_stub.push_streaming_response(200, b"streamed".to_vec());
-            let streaming_services = build_services_with_http_client(
-                Arc::clone(&streaming_stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let success = integration
-                .handle(
-                    &settings,
-                    &streaming_services,
-                    build_http_request(
-                        Method::GET,
-                        "https://publisher.example.com/assets/vendor.js",
-                    ),
-                )
-                .await
-                .expect("should proxy streaming asset response");
-            assert_eq!(success.status(), StatusCode::OK);
-            assert_eq!(streaming_stub.recorded_stream_response_flags(), vec![true]);
-            assert!(
-                matches!(success.body(), EdgeBody::Stream(_)),
-                "streaming-capable clients should preserve the origin response stream"
-            );
-            let streamed_body = success
-                .into_body()
-                .into_bytes_bounded(1024)
-                .await
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"current\"")
+        );
+        let response_body =
+            futures::executor::block_on(response.into_body().into_bytes_bounded(1024))
+                .expect("should collect not-modified JS asset body");
+        assert!(
+            response_body.is_empty(),
+            "not-modified responses should not contain a body"
+        );
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 1, "should send one conditional request");
+        assert_eq!(
+            (
+                requests[0].headers.get(header::IF_NONE_MATCH),
+                requests[0].headers.get(header::IF_MODIFIED_SINCE)
+            ),
+            (
+                Some(&http::HeaderValue::from_static("\"current\"")),
+                Some(&http::HeaderValue::from_static(
+                    "Wed, 21 Oct 2015 07:28:00 GMT"
+                ))
+            ),
+            "should forward both validators"
+        );
+    }
+
+    #[test]
+    fn handle_maps_upstream_outcomes() {
+        let (_upstream, success) = handle_vendor_request(
+            vendor_request(),
+            Some(ScriptedReply::status(StatusCode::OK).chunks(vec![
+                bytes::Bytes::from_static(b"stream"),
+                bytes::Bytes::from_static(b"ed"),
+            ])),
+        );
+        assert_eq!(success.status(), StatusCode::OK);
+        assert!(
+            success.body().is_stream(),
+            "should preserve the origin response stream"
+        );
+        let streamed_body =
+            futures::executor::block_on(success.into_body().into_bytes_bounded(1024))
                 .expect("should collect streamed JS asset body");
-            assert_eq!(streamed_body.as_ref(), b"streamed");
+        assert_eq!(streamed_body.as_ref(), b"streamed");
 
-            let unavailable_stub = Arc::new(StubHttpClient::new());
-            let unavailable_services = build_services_with_http_client(
-                Arc::clone(&unavailable_stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            );
-            let unavailable = integration
-                .handle(
-                    &settings,
-                    &unavailable_services,
-                    build_http_request(
-                        Method::GET,
-                        "https://publisher.example.com/assets/vendor.js",
-                    ),
-                )
-                .await
-                .expect("should map unavailable origin response");
-            assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
-            assert_eq!(
-                unavailable
-                    .headers()
-                    .get(HEADER_X_TS_ERROR)
-                    .and_then(|value| value.to_str().ok()),
-                Some(ERROR_ORIGIN_UNREACHABLE)
-            );
+        let (_upstream, unavailable) = handle_vendor_request(vendor_request(), None);
+        assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            unavailable
+                .headers()
+                .get(HEADER_X_TS_ERROR)
+                .and_then(|value| value.to_str().ok()),
+            Some(ERROR_ORIGIN_UNREACHABLE)
+        );
 
-            let status_stub = Arc::new(StubHttpClient::new());
-            status_stub.push_response(404, Vec::new());
-            let status_services = build_services_with_http_client(
-                Arc::clone(&status_stub) as Arc<dyn crate::platform::PlatformHttpClient>
-            );
-            let status = integration
-                .handle(
-                    &settings,
-                    &status_services,
-                    build_http_request(
-                        Method::GET,
-                        "https://publisher.example.com/assets/vendor.js",
-                    ),
-                )
-                .await
-                .expect("should map non-success origin response");
-            assert_eq!(status.status(), StatusCode::BAD_GATEWAY);
-            assert_eq!(
-                status
-                    .headers()
-                    .get(HEADER_X_TS_ERROR)
-                    .and_then(|value| value.to_str().ok()),
-                Some(ERROR_ORIGIN_STATUS)
-            );
-        });
+        let (_upstream, status) = handle_vendor_request(
+            vendor_request(),
+            Some(ScriptedReply::status(StatusCode::NOT_FOUND)),
+        );
+        assert_eq!(status.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            status
+                .headers()
+                .get(HEADER_X_TS_ERROR)
+                .and_then(|value| value.to_str().ok()),
+            Some(ERROR_ORIGIN_STATUS)
+        );
     }
 
     #[test]

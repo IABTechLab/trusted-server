@@ -22,7 +22,7 @@ use crate::constants::COOKIE_TS_EC;
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
-const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
+pub(crate) const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 fn is_allowed_ec_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
@@ -170,6 +170,19 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
             // Unreachable in practice: format_set_cookie emits only
             // controlled bytes from operator-trusted configuration.
             log::warn!("Skipping EC cookie expiry Set-Cookie: invalid header value: {e}");
+        }
+    }
+}
+
+/// Appends a raw `Set-Cookie` value, skipping values that are not valid
+/// header values.
+pub(crate) fn append_cookie(response: &mut Response<EdgeBody>, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(value) => {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        Err(err) => {
+            log::warn!("Skipping Set-Cookie: invalid header value: {err}");
         }
     }
 }

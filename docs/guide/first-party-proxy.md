@@ -370,14 +370,30 @@ The proxy automatically follows HTTP redirects:
 
 **Behavior**:
 
-1. Follow up to **4 redirect hops**, checking fetch permission before each send.
-2. Independently re-evaluate each destination's identity grant; permission for
+1. Follow up to **4 redirect hops** through EdgeZero's redirect follower,
+   checking fetch permission before each send.
+2. Check each redirect target before it is followed. A non-HTTPS target on a
+   route that requires HTTPS fails with `403`, a target without a host fails
+   with `502`, and a host outside `proxy.allowed_domains` fails with `403`. A
+   target whose scheme is neither `http` nor `https` is not followed, and its
+   redirect response is returned.
+3. Independently re-evaluate each destination's identity grant; permission for
    one recipient does not authorize the next.
-3. Remove carried or echoed reserved EC parameters and append exactly one
+4. Remove carried or echoed reserved EC parameters and append exactly one
    authorized EC only when the next destination and current request qualify.
-4. Switch to `GET` after `303` and rebuild the approved headers for each send.
-5. Reject any terminal 3xx carrying `Location` with `502`, without exposing that
-   header to the browser. This includes exhausted limits and unfollowed redirects.
+5. Send `301`, `302`, and `303` hops as a bodiless `GET` (a `HEAD` stays
+   `HEAD`); `307` and `308` keep the method and body. A `301` or `302` that
+   answers a method other than `GET`, `HEAD`, or `POST` is returned, not
+   followed. Every hop sends the same approved headers.
+6. Give each hop the request's own timeout, 15 s for a buffered response or 60 s
+   for a streamed one, and the whole chain a 60 s deadline.
+7. Strip `Authorization` and `Cookie` on a hop to another origin.
+8. Fail a `Location` that carries userinfo with `502 Bad Gateway`.
+9. Log each hop at `debug` without its query, and log a warning when a redirect
+   response is returned instead of followed.
+10. On the creative route, reject any terminal 3xx carrying `Location` with
+    `502`, without exposing that header to the browser. This includes exhausted
+    limits and redirect responses returned instead of followed.
 
 Creative targets containing URL credentials are rejected. A 3xx without
 `Location` is returned without creating a browser navigation. Click redirects
@@ -666,8 +682,10 @@ Missing required parameter: tsurl
 ### Redirect Limit
 
 A terminal 3xx with `Location`, including one left after the four-hop limit,
-returns `502` with private/no-store and no browser redirect. Reduce the origin's
-redirect chain and check every destination's fetch permission.
+returns `502` with private/no-store and no browser redirect. The proxy logs
+`returning an unfollowed redirect response: LimitReached` when the limit stops
+the chain. Reduce the origin's redirect chain and check every destination's
+fetch permission.
 
 ## Inspect policy and migrate
 

@@ -1,0 +1,114 @@
+name: Health and startup contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  health-startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [fastly, axum, cloudflare, spin]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read tool versions
+        id: versions
+        shell: bash
+        run: |
+          {
+            for tool in nodejs fastly viceroy spin wrangler; do
+              echo "$tool=$(awk -v tool="$tool" '$1 == tool { print $2 }' .tool-versions)"
+            done
+            echo "bindgen=$(sed -n '/^name = "wasm-bindgen"$/ { n; s/version = "\(.*\)"/\1/p; }' Cargo.lock)"
+            echo "worker=$(sed -n '/^name = "worker"$/ { n; s/version = "\(.*\)"/\1/p; }' Cargo.lock)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.nodejs }}
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.adapter == 'cloudflare' && 'wasm32-unknown-unknown' || 'wasm32-wasip1' }}
+          cache-key: health-startup-${{ matrix.adapter }}
+      - name: Install fixture prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes curl jq python3 procps shellcheck
+      - name: Install JS dependencies
+        working-directory: crates/trusted-server-js/lib
+        run: npm ci
+      - name: Check smoke scripts
+        run: |
+          shellcheck scripts/smoke-{common,fastly,axum,cloudflare,spin}.sh
+          for script in scripts/smoke-{common,fastly,axum,cloudflare,spin}.sh; do bash -n "$script"; done
+      - name: Build current operator CLI
+        run: cargo build --locked -p trusted-server-cli --bin ts
+      - name: Install pinned Fastly tools
+        if: matrix.adapter == 'fastly'
+        shell: bash
+        run: |
+          cargo install viceroy --version "${{ steps.versions.outputs.viceroy }}" --locked --force
+          mkdir -p "$RUNNER_TEMP/fastly"
+          curl --fail --location --silent --show-error "https://github.com/fastly/cli/releases/download/v${{ steps.versions.outputs.fastly }}/fastly_v${{ steps.versions.outputs.fastly }}_linux-amd64.tar.gz" --output "$RUNNER_TEMP/fastly.tar.gz"
+          test "${{ steps.versions.outputs.fastly }}" = 16.0.0
+          echo "b1b89112f1f1291ff275393779ffdacba8724ac64091bda0fa6000ae06308459  $RUNNER_TEMP/fastly.tar.gz" | sha256sum --check
+          tar -xz -C "$RUNNER_TEMP/fastly" -f "$RUNNER_TEMP/fastly.tar.gz"
+          echo "$RUNNER_TEMP/fastly" >> "$GITHUB_PATH"
+      - name: Install local Cloudflare tools
+        if: matrix.adapter == 'cloudflare'
+        shell: bash
+        run: |
+          npm install --global wrangler@${{ steps.versions.outputs.wrangler }}
+          cargo install --locked --version "=${{ steps.versions.outputs.worker }}" worker-build
+          mkdir -p "$RUNNER_TEMP/bindgen"
+          # Reuse the locked tool and published digest from the deadline fixture.
+          test "${{ steps.versions.outputs.bindgen }}" = 0.2.126
+          archive="$RUNNER_TEMP/wasm-bindgen.tar.gz"
+          curl --fail --location --silent --show-error "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${{ steps.versions.outputs.bindgen }}/wasm-bindgen-${{ steps.versions.outputs.bindgen }}-x86_64-unknown-linux-musl.tar.gz" --output "$archive"
+          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  $archive" | sha256sum --check
+          tar -xz --strip-components=1 -C "$RUNNER_TEMP/bindgen" -f "$archive"
+          echo "$RUNNER_TEMP/bindgen" >> "$GITHUB_PATH"
+      - name: Install pinned Spin runtime
+        if: matrix.adapter == 'spin'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/spin"
+          test "${{ steps.versions.outputs.spin }}" = 4.1.0
+          archive="$RUNNER_TEMP/spin.tar.gz"
+          curl --fail --location --silent --show-error "https://github.com/spinframework/spin/releases/download/v${{ steps.versions.outputs.spin }}/spin-v${{ steps.versions.outputs.spin }}-linux-amd64.tar.gz" --output "$archive"
+          echo "aeeb892f94cf861f5302546faa0bdaa82cc4be30539621299746a6dc011f3b5a  $archive" | sha256sum --check
+          tar -xz -C "$RUNNER_TEMP/spin" -f "$archive"
+          echo "$RUNNER_TEMP/spin" >> "$GITHUB_PATH"
+      - name: Build current production adapter
+        shell: bash
+        run: |
+          case '${{ matrix.adapter }}' in
+            fastly) cargo build --locked -p trusted-server-adapter-fastly --release --target wasm32-wasip1 ;;
+            axum) cargo build --locked -p trusted-server-adapter-axum ;;
+            cloudflare) (cd crates/trusted-server-adapter-cloudflare && worker-build --release) ;;
+            spin) cargo build --locked -p trusted-server-adapter-spin --release --target wasm32-wasip1 --features spin ;;
+          esac
+      - name: Exercise production health and startup inputs
+        shell: bash
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+          SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/health-startup-${{ matrix.adapter }}
+        run: |
+          export TS_BIN="$PWD/target/debug/ts"
+          export AXUM_BINARY_PATH="$PWD/target/debug/trusted-server-axum"
+          export WASM_BINARY_PATH="$PWD/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
+          export SPIN_WASM_PATH="$PWD/target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
+          export CLOUDFLARE_BUILD_PATH="$PWD/crates/trusted-server-adapter-cloudflare/build"
+          scripts/smoke-${{ matrix.adapter }}.sh
+      - name: Retain synthetic diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-startup-${{ matrix.adapter }}
+          path: ${{ runner.temp }}/health-startup-${{ matrix.adapter }}/
+          if-no-files-found: ignore

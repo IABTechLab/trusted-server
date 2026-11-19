@@ -5,18 +5,18 @@
 
 use std::sync::Arc;
 
+use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Request, Response, request_builder};
+use edgezero_core::outbound::HttpClient;
+use edgezero_core::time::MonotonicClock;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, RuntimeServices, UnavailableKvStore};
 use trusted_server_core::proxy::{handle_first_party_proxy, handle_first_party_proxy_sign};
 use trusted_server_core::settings::Settings;
 
-use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore,
-};
+use crate::platform::{FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo};
 
 const READER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 const READER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.Cd5678";
@@ -49,13 +49,20 @@ fn fixture() -> (Settings, RuntimeServices, String) {
         "#,
     )
     .expect("should parse runtime fixture settings");
+    // `EdgeZero`'s Fastly client, with no request lifecycle, as the deadline
+    // fixtures use it.
+    let client = HttpClient::with_client(FastlyOutboundClient::new());
     let services = RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .config_store(Arc::new(FastlyPlatformConfigStore::with_outbound_client(
+            client.clone(),
+        )))
+        .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
+            client.clone(),
+        )))
         .kv_store(Arc::new(UnavailableKvStore))
-        .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .outbound_client(client)
+        .clock(MonotonicClock::default())
+        .geo(Arc::new(RequestGeo::default()))
         .client_info(ClientInfo::default())
         .build();
     (settings, services, origin)
