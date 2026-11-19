@@ -17,12 +17,10 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::identify::answer_identify_locally;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -58,6 +56,10 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built once. The dev server has no EC record store and
+    /// applies no rate limit: its deployer limits traffic at the load
+    /// balancer.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -101,10 +103,14 @@ fn build_state_with_services(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -291,8 +297,6 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -322,7 +326,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
+fn named_routes() -> [NamedRoute; 16] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -354,26 +358,6 @@ fn named_routes() -> [NamedRoute; 19] {
             path: "/_ts/admin/cache/purge",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::CachePurgeNotSupported,
-        },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -500,15 +484,6 @@ fn named_route_handler(
                             HeaderValue::from_static("text/plain; charset=utf-8"),
                         );
                         Ok(resp)
-                    }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Identify => answer_identify_locally(&state.settings, &req),
@@ -728,6 +703,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 .expect("should build health response"),
         )
     });
+
+    // The core identity app registers `GET` on the admin EC and EIDs lookups;
+    // without a record store, admin EC lookup answers 501. Their other methods
+    // reach the catch-all fallback, which denies admin diagnostics locally.
+    router = state.identity.mount(router);
 
     for route in named_routes() {
         for method in route.primary_methods {

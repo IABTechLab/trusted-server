@@ -10,7 +10,8 @@ use edgezero_core::http::StatusCode;
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use futures::executor::block_on;
 use std::cell::RefCell;
-use trusted_server_core::ec::kv::KvIdentityGraph;
+use std::sync::Arc;
+use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, Consent, Geo, Navigation, Observation, RecordingStore, Scenario,
 };
@@ -40,28 +41,37 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36";
 
 thread_local! {
-    static GRAPH: RefCell<Option<KvIdentityGraph>> = const { RefCell::new(None) };
+    static STORE: RefCell<Option<RecordingStore>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn fixture_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    if settings.ec.ec_store.as_deref() == Some("identity-conformance") {
-        GRAPH.with_borrow(Clone::clone)
+/// Returns the installed fixture store for the conformance store name.
+///
+/// The identity app takes its record store from here while a conformance
+/// runner assembles the application, so the store it holds for every request
+/// is the fixture.
+pub(crate) fn fixture_store(store_name: &str) -> Option<Arc<dyn EcKvStore + Send + Sync>> {
+    if store_name == "identity-conformance" {
+        STORE.with_borrow(|store| {
+            store
+                .clone()
+                .map(|store| Arc::new(store) as Arc<dyn EcKvStore + Send + Sync>)
+        })
     } else {
         None
     }
 }
 
-struct GraphGuard(Option<KvIdentityGraph>);
+struct StoreGuard(Option<RecordingStore>);
 
-impl GraphGuard {
+impl StoreGuard {
     fn install(store: &RecordingStore) -> Self {
-        Self(GRAPH.replace(Some(KvIdentityGraph::new(store.clone()))))
+        Self(STORE.replace(Some(store.clone())))
     }
 }
 
-impl Drop for GraphGuard {
+impl Drop for StoreGuard {
     fn drop(&mut self) {
-        GRAPH.replace(self.0.take());
+        STORE.replace(self.0.take());
     }
 }
 
@@ -122,8 +132,11 @@ impl FastlyAdapter {
         let settings = settings();
         let clock = TestClock::new();
         let origin = ScriptedHttpClient::new(&clock);
-        let mut retained = assemble_app(Ok(settings.clone()), &"")
-            .expect("should assemble the conformance application");
+        let mut retained = {
+            let _guard = StoreGuard::install(&store);
+            assemble_app(Ok(settings.clone()), &"")
+                .expect("should assemble the conformance application")
+        };
         retained.app.set_monotonic_clock(clock.monotonic_clock());
         Self {
             settings,
@@ -136,7 +149,6 @@ impl FastlyAdapter {
 
 impl Adapter for FastlyAdapter {
     fn navigate(&mut self, navigation: &Navigation) -> Observation {
-        let _guard = GraphGuard::install(&self.store);
         self.origin.respond_to(
             edgezero_core::http::Method::GET,
             ORIGIN,

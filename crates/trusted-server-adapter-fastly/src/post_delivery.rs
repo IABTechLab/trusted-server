@@ -22,22 +22,21 @@ use edgezero_core::outbound::HttpClient;
 use trusted_server_core::ec::after_response::{
     after_response_lookups_allowed, commit_after_response_lookups,
 };
+use trusted_server_core::ec::app::IdentityApp;
 use trusted_server_core::ec::coordinator::transport::OutboundLookupTransport;
 use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupContext};
 use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::settings::Settings;
 
 use crate::app::{AfterResponseLookups, EcFinalizeState};
-use crate::maybe_identity_graph;
-use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
 
 /// Inputs a routed response's finalize step hands to post-delivery work.
 pub(crate) struct FinalizeState {
-    pub(crate) partner_registry: Arc<PartnerRegistry>,
+    /// The identity app built once with the retained application state.
+    pub(crate) identity: Arc<IdentityApp>,
     pub(crate) ec_state: EcFinalizeState,
     /// The navigation's after-response identity lookups, if any.
     pub(crate) after_response: Option<AfterResponseLookups>,
@@ -83,18 +82,12 @@ async fn post_delivery_work(
     send_queued_batches(client, &settings.tinybird, queue, log_context).await;
     if let Some(state) = state {
         let FinalizeState {
-            partner_registry,
+            identity,
             mut ec_state,
             after_response,
         } = state;
-        run_after_response_lookups(
-            &mut ec_state,
-            after_response,
-            &partner_registry,
-            settings,
-            client,
-        )
-        .await;
+        run_after_response_lookups(&mut ec_state, after_response, &identity, settings, client)
+            .await;
     }
 }
 
@@ -107,7 +100,7 @@ async fn post_delivery_work(
 pub(crate) async fn run_after_response_lookups(
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
-    partner_registry: &PartnerRegistry,
+    identity: &IdentityApp,
     settings: &Settings,
     client: &HttpClient,
 ) {
@@ -135,7 +128,7 @@ pub(crate) async fn run_after_response_lookups(
         log::debug!("After-response lookups skipped: nothing due");
         return;
     }
-    let Some(graph) = maybe_identity_graph(settings) else {
+    let Some(graph) = identity.identity_graph() else {
         return;
     };
     let snapshot = graph.load_snapshot(&lookups.ec_id).await;
@@ -148,7 +141,6 @@ pub(crate) async fn run_after_response_lookups(
         return;
     }
     let transport = OutboundLookupTransport::new(client);
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     let pending = lookups
         .coordinator
         .dispatch(
@@ -164,7 +156,7 @@ pub(crate) async fn run_after_response_lookups(
                 },
                 publisher_domain: &settings.publisher.domain,
                 cookies: RequestCookies::new(&lookups.cookie_header),
-                rate_limiter: &limiter,
+                rate_limiter: identity.rate_limiter(),
                 now,
             },
         )
@@ -173,9 +165,14 @@ pub(crate) async fn run_after_response_lookups(
         return;
     }
     let results = lookups.coordinator.collect(&transport, pending).await;
-    let outcome =
-        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results)
-            .await;
+    let outcome = commit_after_response_lookups(
+        &graph,
+        permit,
+        identity.partners(),
+        &lookups.ec_id,
+        &results,
+    )
+    .await;
     log::info!("After-response lookups: write outcome={outcome}");
 }
 
@@ -400,15 +397,14 @@ mod tests {
             Some(&geo),
         )
         .expect("should read the reader's EC context");
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app");
+        let kv = require_identity_graph(&identity).expect("should open the local identity store");
         ec_context.set_kv_snapshot(futures::executor::block_on(
             kv.load_snapshot(&seeded_ec_id()),
         ));
         FinalizeState {
-            partner_registry: Arc::new(
-                PartnerRegistry::from_config(&settings.ec.partners)
-                    .expect("should build the partner registry"),
-            ),
+            identity,
             ec_state: EcFinalizeState {
                 ec_context,
                 use_finalize_kv: false,
@@ -435,7 +431,8 @@ mod tests {
         state.ec_state.ec_context.set_navigation_permit(
             NavigationPermit::classify(&navigation).expect("should permit a navigation"),
         );
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let kv =
+            require_identity_graph(&app.identity).expect("should open the local identity store");
         let mut response = edgezero_core::http::response_builder()
             .status(StatusCode::OK)
             .body(edgezero_core::body::Body::empty())
@@ -444,16 +441,16 @@ mod tests {
             settings,
             &mut state.ec_state.ec_context,
             Some(&kv),
-            &app.partner_registry,
+            app.identity.partners(),
             None,
             None,
             &mut response,
         ));
-        state.partner_registry = app.partner_registry();
+        state.identity = Arc::clone(&app.identity);
         state.after_response = Some(AfterResponseLookups {
             coordinator: Arc::clone(
-                app.after_response_identity
-                    .as_ref()
+                app.identity
+                    .after_response_identity()
                     .expect("should run pull sync after the response"),
             ),
             ec_id: seeded_ec_id(),
