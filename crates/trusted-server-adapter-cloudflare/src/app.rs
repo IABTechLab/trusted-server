@@ -25,6 +25,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -208,6 +210,7 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -502,15 +505,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -632,7 +632,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    let partner_registry = PartnerRegistry::from_ec(&s.settings.ec)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
@@ -736,6 +736,21 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             );
         }
 
+        // Partner APIs are answered locally on every method so a partner's
+        // Bearer token and mapping body never reach the publisher origin. This
+        // adapter has no EC record store, so identify and batch sync answer 501
+        // and any other method answers 405.
+        let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            answer_identify_locally(&s.settings, &req)
+        });
+        let batch_sync = make_handler(Arc::clone(&state), |_s, _services, req| async move {
+            Ok(answer_batch_sync_locally(&req))
+        });
+        for method in publisher_fallback_methods() {
+            router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());
+            router = router.route("/_ts/api/v1/batch-sync", method, batch_sync.clone());
+        }
+
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(legacy_admin_alias_denied())
@@ -802,6 +817,23 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 mod tests {
     use super::*;
 
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = aps_profile_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Cloudflare"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
+
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
@@ -824,6 +856,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -890,6 +923,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),

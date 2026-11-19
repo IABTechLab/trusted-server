@@ -28,6 +28,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
@@ -132,6 +134,7 @@ fn build_state_with_services(
     mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Spin")?;
     // Spin cannot send a host other than the origin URI authority.
     settings
         .publisher
@@ -188,14 +191,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-//
-// The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
-// intentionally absent here, matching the Axum and Cloudflare adapters: those
-// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
-// registry and rate limiter) that the portability adapters do not yet wire.
-// On Spin these paths fall through to the publisher/integration fallback,
-// identical to the other non-Fastly adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -206,7 +201,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -218,6 +213,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/identify", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/batch-sync", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -612,10 +609,29 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request()?;
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                let result = PartnerRegistry::from_ec(&s.settings.ec)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
+        };
+
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: this adapter has no EC record store, so identify and batch
+        // sync answer 501 and any other method answers 405.
+        let s = Arc::clone(&state);
+        let identify_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(
+                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+        let batch_sync_handler = |ctx: RequestContext| async move {
+            let req = ctx.into_request()?;
+            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
         };
 
         // /auction
@@ -784,15 +800,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -929,6 +942,15 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/api/v1/identify",
+                method.clone(),
+                identify_handler.clone(),
+            );
+            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
+        }
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
             builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
         }
@@ -984,6 +1006,23 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 mod tests {
     use super::*;
 
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = multi_provider_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Spin"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
+
     // Runs the production normalizer on the head of a whole test request.
     fn normalize_request(req: &mut Request) {
         let request = std::mem::replace(req, Request::new(edgezero_core::body::Body::empty()));
@@ -1018,6 +1057,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
@@ -1042,6 +1082,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

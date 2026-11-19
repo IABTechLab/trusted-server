@@ -41,6 +41,7 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
         providers: BTreeMap::from([(
             provider_id.clone(),
             ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: profile.to_string(),
                 endpoint: endpoint.to_string(),

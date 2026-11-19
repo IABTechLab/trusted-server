@@ -12,9 +12,8 @@ The row above summarizes the
 [adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
 response does not prove that configuration loaded: Fastly serves `/health`
 before it constructs the application. If EdgeZero's managed logger fails to
-install, Trusted Server answers nothing, `/health` included, so check for the
-`ok` body, not only the status (see
-[When the logger fails to install](#when-the-logger-fails-to-install)).
+install, EdgeZero answers every route with its JSON `500`, `/health` included
+(see [When the logger fails to install](#when-the-logger-fails-to-install)).
 
 ## Create a Fastly Account
 
@@ -473,21 +472,23 @@ level, or link a Config Store with that key to change it.
 
 ### When the logger fails to install
 
-If EdgeZero cannot install its logger, Trusted Server answers nothing on any
-route, `/health` included: EdgeZero's lifecycle returns before Trusted
-Server's callback runs and sends no response, and the guest prints only
-`managed logger installation failed: <reason>` on stderr. Under
-`fastly compute serve` or Viceroy the client then gets `200` with an empty
-body, so a health check that reads only the status passes. Earlier releases
-answered `/health` before installing the logger, and served every request
-after printing the failure.
+If EdgeZero cannot install its logger, no Trusted Server route answers,
+`/health` included: EdgeZero's lifecycle stops before Trusted Server's
+callback runs. EdgeZero answers the request itself with its redacted JSON
+`500`, whose body is
+`{"error":{"kind":"internal","message":"internal server error","status":500}}`,
+and sends no body to a `HEAD`. The response carries none of Trusted Server's
+headers, such as `x-ts-version`, because no Trusted Server code runs. The
+guest then prints `managed logger installation failed: <reason>` on stderr.
+Earlier releases answered `/health` before installing the logger, and served
+every request after printing the failure.
 
-The usual causes are an `edgezero_logging` Config Store that is linked but
-cannot be opened or read, and an `endpoint` in `[adapters.fastly.logging]`
-that the Fastly logger rejects, such as a name containing `:`. EdgeZero's
-manifest validation does not check the endpoint ([IABTechLab/edgezero#506](https://github.com/IABTechLab/edgezero/issues/506)). The failure lasts for the
-instance. This is an open EdgeZero gap ([IABTechLab/edgezero#505](https://github.com/IABTechLab/edgezero/issues/505)), and Trusted Server
-does not work around it.
+The usual cause is an `edgezero_logging` Config Store that is linked but
+cannot be opened or read. EdgeZero checks the `endpoint` name in
+`[adapters.fastly.logging]` when the build reads the manifest, so a name that
+is empty, contains `:` or a line feed, or is `stdout` or `stderr` fails the
+build instead. Whether the endpoint exists is checked only when the logger
+installs. The failure lasts for the instance.
 
 ## Verify the complete local handoff
 
