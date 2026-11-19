@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{ConsentContext, consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -20,6 +20,10 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{MAX_STORED_UID_LENGTH, MAX_UID_LENGTH};
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::sharedid::{
+    SHAREDID_OPTOUT_COOKIE, canonical_source, canonicalize_sharedid_eid,
+    strip_opted_out_sharedid_eids,
+};
 use crate::error::TrustedServerError;
 use crate::http_util::read_request_body;
 use crate::openrtb::{Eid, Uid};
@@ -380,8 +384,11 @@ pub async fn handle_auction(
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
-    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context.consent());
-    let merged_eids = merge_auction_eids(client_eids, eids);
+    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context);
+    let merged_eids = strip_opted_out_sharedid_eids(
+        merge_auction_eids(client_eids, eids),
+        extract_cookie_value(&http_req, SHAREDID_OPTOUT_COOKIE).is_some(),
+    );
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -540,10 +547,13 @@ pub(crate) fn resolve_auction_eids(
     }
 
     let now = UnixSeconds::new(current_timestamp());
+    // A source a provider's cookies on this request opted out of is withheld
+    // before the navigation's write clears it from the row.
     Some(
         entry
             .live_eids(registry, ec_context.consent(), now)
             .map(Eid::from)
+            .filter(|eid| !ec_context.source_opted_out_in_cookies(&eid.source))
             .collect(),
     )
 }
@@ -641,25 +651,35 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 }
 
 /// Drops client EIDs whose source is owned by a configured identity provider
-/// whose TCF vendor consent is withheld, and, for a visitor whose jurisdiction
-/// is GDPR, client EIDs whose source a provider excludes where GDPR applies.
+/// whose TCF vendor consent is withheld, client EIDs whose source a provider's
+/// cookies on this request record an opt-out for, and, for a visitor whose
+/// jurisdiction is GDPR, client EIDs whose source a provider excludes where
+/// GDPR applies.
 ///
-/// Only sources marked by a configured provider carry a vendor ID or a GDPR
-/// exclusion, so with no providers configured the input is returned unchanged.
+/// Only sources marked by a configured provider carry a vendor ID, a GDPR
+/// exclusion or a cookie opt-out, so with no providers configured the input is
+/// returned unchanged.
 pub(crate) fn drop_vendor_denied_client_eids(
     client_eids: Option<Vec<Eid>>,
     registry: Option<&PartnerRegistry>,
-    consent: &ConsentContext,
+    ec_context: &EcContext,
 ) -> Option<Vec<Eid>> {
     let Some(registry) = registry else {
         return client_eids;
     };
+    let consent = ec_context.consent();
     let mut eids = client_eids?;
-    eids.retain(|eid| {
-        !registry.get(&eid.source).is_some_and(|partner| {
-            partner.owner_vendor_consent_denied(consent) || partner.excluded_for(consent)
-        })
-    });
+    let denied = |source: &str| {
+        ec_context.source_opted_out_in_cookies(source)
+            || registry.get(source).is_some_and(|partner| {
+                partner.owner_vendor_consent_denied(consent)
+                    || partner.excluded_for(consent)
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain)
+            })
+    };
+    // A SharedID EID is sent as `pubcid.org`, so that source's gate applies
+    // to it under either SharedID source.
+    eids.retain(|eid| !denied(&eid.source) && !denied(canonical_source(&eid.source)));
     Some(eids)
 }
 
@@ -670,7 +690,7 @@ pub(crate) fn merge_auction_eids(
     let mut merged: Vec<Eid> = Vec::new();
 
     // Server-resolved entries come first so their fields win on duplicates.
-    for eid in resolved_eids
+    for mut eid in resolved_eids
         .into_iter()
         .flatten()
         .chain(client_eids.into_iter().flatten())
@@ -678,6 +698,9 @@ pub(crate) fn merge_auction_eids(
         if eid.source.is_empty() {
             continue;
         }
+        // Either SharedID source is sent as `pubcid.org` with atype 1, so the
+        // same ID from the record, cookie and body merges into one EID.
+        canonicalize_sharedid_eid(&mut eid);
         let Eid {
             source,
             inserter,
@@ -808,6 +831,10 @@ mod tests {
             .build()
     }
 
+    fn vendor_denied_context() -> EcContext {
+        EcContext::new_for_test(None, vendor_denied_consent())
+    }
+
     fn vendor_denied_consent() -> ConsentContext {
         let mut purposes = vec![false; 24];
         purposes[0] = true;
@@ -878,7 +905,7 @@ mod tests {
 
         // Act
         let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent())
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context())
                 .expect("should keep the list");
 
         // Assert
@@ -905,13 +932,13 @@ mod tests {
         let under_gdpr = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
-            &gdpr,
+            &EcContext::new_for_test(None, gdpr),
         )
         .expect("should keep the list");
         let elsewhere = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
-            &ConsentContext::default(),
+            &EcContext::new_for_test(None, ConsentContext::default()),
         )
         .expect("should keep the list");
 
@@ -931,6 +958,58 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sharedid_client_eid_follows_the_pubcid_vendor_gate() {
+        let mut registry = partner_registry(&["pubcid.org", "ids.example.com"]);
+        assert!(
+            registry.mark_provider_owned("pubcid.org", std::num::NonZeroU16::new(42)),
+            "should mark the SharedID source"
+        );
+
+        let kept = drop_vendor_denied_client_eids(
+            client_eids_for(&["sharedid.org", "ids.example.com"]),
+            Some(&registry),
+            &vendor_denied_context(),
+        )
+        .expect("should keep the list");
+
+        assert_eq!(
+            kept.iter()
+                .map(|eid| eid.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ids.example.com"],
+            "should drop a sharedid.org EID when the pubcid.org vendor is denied"
+        );
+    }
+
+    #[test]
+    fn client_eids_of_a_source_opted_out_in_provider_cookies_are_dropped() {
+        // Arrange
+        let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", None),
+            "should mark the provider source"
+        );
+        let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let kept = drop_vendor_denied_client_eids(
+            client_eids_for(&["IDS.example.com", "other.example.com"]),
+            Some(&registry),
+            &ec_context,
+        )
+        .expect("should keep the list");
+
+        // Assert
+        let sources: Vec<&str> = kept.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should drop the browser EID of the opted-out source"
+        );
+    }
+
+    #[test]
     fn client_eids_are_unchanged_without_providers() {
         // Arrange
         let registry = partner_registry(&["ids.example.com"]);
@@ -939,7 +1018,7 @@ mod tests {
 
         // Act
         let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent());
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context());
 
         // Assert
         assert_eq!(
@@ -1065,7 +1144,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &crate::ec::sharedid::SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1161,7 +1240,7 @@ mod tests {
             Some(&graph),
             &registry,
             None, // No `ts-eids` cookie on this request at all.
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1813,6 +1892,151 @@ mod tests {
         bidders.assert_no_requests();
     }
 
+    /// Runs one `/auction` request against a record holding `stored` under
+    /// `sharedid.org` and returns the EIDs the bidder received.
+    async fn sharedid_auction_eids(
+        consent: ConsentContext,
+        cookies: &str,
+        body_eids: serde_json::Value,
+    ) -> serde_json::Value {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
+        let registry = partner_registry(&["pubcid.org", "sharedid.org"]);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.shrdid", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        live.ids.insert(
+            "sharedid.org".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single(SHAREDID_UUID),
+        );
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the record");
+        let mut ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .header("cookie", cookies)
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ],
+                    "eids": body_eids
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The assertion is on the EIDs the bidder received, not the auction result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        let sent = bidders.requests();
+        assert_eq!(
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
+        body["user"]["ext"]["eids"].clone()
+    }
+
+    const SHAREDID_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn non_regulated_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_sends_no_stored_sharedid_when_purpose_four_is_denied() {
+        let eids = sharedid_auction_eids(
+            crate::test_support::tests::purpose_one_only_consent(),
+            "other=1",
+            json!([]),
+        )
+        .await;
+
+        assert!(
+            eids.as_array()
+                .is_none_or(|eids| !eids.iter().any(|eid| eid["source"] == "pubcid.org")),
+            "should send no stored SharedID with Purpose 1 granted and Purpose 4 denied: {eids}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_sends_one_canonical_sharedid_eid() {
+        let ts_eids = BASE64.encode(
+            serde_json::to_vec(&json!([
+                { "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 3 }] }
+            ]))
+            .expect("should serialize ts-eids"),
+        );
+
+        let eids = sharedid_auction_eids(
+            non_regulated_consent(),
+            &format!("ts-eids={ts_eids}; _pubcid={SHAREDID_UUID}"),
+            json!([
+                { "source": "sharedid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 3 }] },
+                { "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID }] }
+            ]),
+        )
+        .await;
+
+        assert_eq!(
+            eids,
+            json!([{ "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 1 }] }]),
+            "should send the SharedID from record, cookie and body as one pubcid.org EID with atype 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_sends_no_sharedid_eid_for_an_opted_out_reader() {
+        let eids = sharedid_auction_eids(
+            non_regulated_consent(),
+            "_pubcid_optout=1",
+            json!([{ "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 1 }] }]),
+        )
+        .await;
+
+        assert!(
+            eids.as_array()
+                .is_none_or(|eids| !eids.iter().any(|eid| eid["source"] == "pubcid.org")),
+            "should send no SharedID EID after an opt-out: {eids}"
+        );
+    }
+
     #[tokio::test]
     async fn auction_drops_vendor_denied_body_eids() {
         // Arrange: a provider with vendor 42 owns one source, consent denies it.
@@ -2045,6 +2269,38 @@ mod tests {
             sources,
             vec!["ids.example.com"],
             "should not send the GDPR-excluded source to bidders"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_withholds_a_source_opted_out_in_provider_cookies() {
+        // Arrange: the row still holds the provider's UID; this request's
+        // cookies record the opt-out the navigation's write has not applied.
+        let registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("ids.example.com", "held-id", 1);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("other-uid"),
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let eids = resolve_auction_eids(&snapshot, Some(&registry), &ec_context)
+            .expect("should resolve EIDs");
+
+        // Assert
+        let sources: Vec<&str> = eids.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should not send the opted-out source to bidders"
         );
     }
 
@@ -2461,6 +2717,31 @@ mod tests {
         assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
         assert_eq!(merged[1].source, "liveramp.com");
         assert_eq!(merged[1].uids[0].id, "LR_xyz");
+    }
+
+    #[test]
+    fn merge_auction_eids_keeps_one_sharedid_across_sources() {
+        let uid = |atype| Uid {
+            id: "11111111-2222-4333-8444-555555555555".to_owned(),
+            atype,
+            ext: None,
+        };
+        let resolved_eids = Some(vec![Eid::new("sharedid.org", vec![uid(Some(3))])]);
+        let client_eids = Some(vec![
+            Eid::new("pubcid.org", vec![uid(None)]),
+            Eid::new("sharedid.org", vec![uid(Some(3))]),
+        ]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(
+            serde_json::to_value(&merged).expect("should serialize merged EIDs"),
+            json!([{
+                "source": "pubcid.org",
+                "uids": [{ "id": "11111111-2222-4333-8444-555555555555", "atype": 1 }]
+            }]),
+            "should keep one pubcid.org EID with atype 1"
+        );
     }
 
     #[test]

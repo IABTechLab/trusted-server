@@ -61,6 +61,7 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod registry;
+pub mod sharedid;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -342,6 +343,9 @@ pub struct EcContext {
     lookup_results: LookupResults,
     /// New row built by [`Self::generate_if_needed`], written by finalize.
     pending_entry: Option<Box<KvEntry>>,
+    /// Sources of identity providers whose first-party cookies on this
+    /// request record an opt-out; their IDs never leave the server for it.
+    cookie_opted_out_sources: Vec<String>,
 }
 
 impl EcContext {
@@ -429,6 +433,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         })
     }
 
@@ -607,6 +612,24 @@ impl EcContext {
         self.client_eids = Some(eids);
     }
 
+    /// Records the sources of identity providers whose first-party cookies on
+    /// this request record an opt-out.
+    ///
+    /// Every identity egress of the request withholds them: stored UIDs and
+    /// EIDs the browser supplies alike.
+    pub fn set_cookie_opted_out_sources(&mut self, sources: Vec<String>) {
+        self.cookie_opted_out_sources = sources;
+    }
+
+    /// Whether a provider's cookies on this request record an opt-out for
+    /// `source`.
+    #[must_use]
+    pub fn source_opted_out_in_cookies(&self, source: &str) -> bool {
+        self.cookie_opted_out_sources
+            .iter()
+            .any(|opted_out| opted_out.eq_ignore_ascii_case(source))
+    }
+
     /// Returns the current request's own EIDs, if the route captured any.
     #[must_use]
     pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
@@ -759,6 +782,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -789,6 +813,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -822,6 +847,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 }
@@ -1043,7 +1069,7 @@ mod tests {
             None,
             &registry::PartnerRegistry::empty(),
             None,
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         )
         .await;

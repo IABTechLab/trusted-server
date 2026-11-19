@@ -72,6 +72,7 @@ use crate::creative_opportunities::{
 };
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::sharedid::{SHAREDID_OPTOUT_COOKIE, strip_opted_out_sharedid_eids};
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::{
@@ -5705,9 +5706,13 @@ fn apply_auction_eids_and_device(
     let client_eids = drop_vendor_denied_client_eids(
         client_eids,
         targeting.partner_registry,
-        targeting.ec_context.consent(),
+        targeting.ec_context,
     );
-    let merged_eids = merge_auction_eids(client_eids, kv_eids);
+    let sharedid_opted_out = targeting
+        .cookie_jar
+        .is_some_and(|jar| jar.get(SHAREDID_OPTOUT_COOKIE).is_some());
+    let merged_eids =
+        strip_opted_out_sharedid_eids(merge_auction_eids(client_eids, kv_eids), sharedid_opted_out);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -15332,7 +15337,7 @@ mod tests {
                         Some(&graph),
                         &partners,
                         None,
-                        None,
+                        &crate::ec::sharedid::SharedIdRequest::default(),
                         &mut response,
                     )
                     .await;
