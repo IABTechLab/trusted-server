@@ -92,11 +92,14 @@ pub async fn handle_identify(
             } else {
                 // Extract only this partner's first live entry. A
                 // provider-owned source is withheld while its owner lacks TCF
-                // vendor consent, and a source a provider excludes where GDPR
-                // applies is withheld for a GDPR visitor, as in the bidstream.
+                // vendor consent or while the provider's cookies on this
+                // request record an opt-out, and a source a provider excludes
+                // where GDPR applies is withheld for a GDPR visitor, as in the
+                // bidstream.
                 let now = UnixSeconds::new(current_timestamp());
                 let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent())
-                    || partner.excluded_for(ec_context.consent());
+                    || partner.excluded_for(ec_context.consent())
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain);
                 eid = entry
                     .ids
                     .get(&partner.source_domain)
@@ -1005,6 +1008,15 @@ mod tests {
         registry: &PartnerRegistry,
         consent: ConsentContext,
     ) -> serde_json::Value {
+        identify_body_with_cookie_opt_outs(record, registry, consent, &[]).await
+    }
+
+    async fn identify_body_with_cookie_opt_outs(
+        record: KvPartnerId,
+        registry: &PartnerRegistry,
+        consent: ConsentContext,
+        cookie_opted_out_sources: &[&str],
+    ) -> serde_json::Value {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::in_memory("identify_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1019,7 +1031,13 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        let mut ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        ec_context.set_cookie_opted_out_sources(
+            cookie_opted_out_sources
+                .iter()
+                .map(|source| (*source).to_owned())
+                .collect(),
+        );
 
         let response = handle_identify(&settings, &kv, registry, &req, &ec_context)
             .await
@@ -1084,6 +1102,46 @@ mod tests {
         assert_eq!(
             elsewhere["uid"], "live",
             "should return the source outside GDPR"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_withholds_a_source_its_provider_cookies_opted_out_of() {
+        // Arrange
+        let registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        let record = || provider_record("held-id", Expiry::Never);
+        let consent = || ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+
+        // Act
+        let opted_out = identify_body_with_cookie_opt_outs(
+            record(),
+            &registry,
+            consent(),
+            &["ssp.example.com"],
+        )
+        .await;
+        let other_opted_out = identify_body_with_cookie_opt_outs(
+            record(),
+            &registry,
+            consent(),
+            &["other.example.com"],
+        )
+        .await;
+
+        // Assert
+        assert!(
+            opted_out.get("uid").is_none() && opted_out.get("eid").is_none(),
+            "should withhold the stored UID while the provider's cookies opt out"
+        );
+        assert_eq!(
+            other_opted_out["uid"], "held-id",
+            "should return the source when another provider opted out"
         );
     }
 

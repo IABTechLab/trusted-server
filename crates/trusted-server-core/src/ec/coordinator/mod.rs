@@ -276,6 +276,26 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         self.providers.is_empty()
     }
 
+    /// Sources of every provider whose first-party cookies record an
+    /// opt-out.
+    ///
+    /// Read on every request before any identity egress, so an opt-out
+    /// applies to the request it arrives on, not only to the navigation write
+    /// that later clears the row. Only cookies are read: no lookup is made.
+    #[must_use]
+    pub fn cookie_opted_out_sources(&self, cookies: RequestCookies<'_>) -> Vec<SourceDomain> {
+        self.providers
+            .iter()
+            .filter(|registered| {
+                matches!(
+                    registered.provider.read_request_cookies(cookies),
+                    CookieRead::OptedOut
+                )
+            })
+            .flat_map(|registered| registered.policy.sources.iter().cloned())
+            .collect()
+    }
+
     /// Whether `source` holds a UID of this provider whose refresh is due.
     fn refresh_due(
         registered: &Registered<P>,
@@ -1954,6 +1974,29 @@ mod tests {
             .ids
             .insert("ids.example.com".to_owned(), provider_record(id));
         seeded_snapshot(&entry)
+    }
+
+    #[test]
+    fn cookie_opted_out_sources_lists_only_providers_whose_cookies_opt_out() {
+        // Arrange
+        let coordinator = cookie_coordinator();
+
+        // Act
+        let opted_out =
+            coordinator.cookie_opted_out_sources(RequestCookies::new("other=1; vendor_id=optout"));
+        let holding_id = coordinator.cookie_opted_out_sources(RequestCookies::new("vendor_id=c-1"));
+        let without_cookie = coordinator.cookie_opted_out_sources(RequestCookies::new(""));
+
+        // Assert
+        assert_eq!(
+            opted_out,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should list the sources of the provider whose cookies opt out"
+        );
+        assert!(
+            holding_id.is_empty() && without_cookie.is_empty(),
+            "should list nothing when the cookies hold an ID or are absent"
+        );
     }
 
     #[test]

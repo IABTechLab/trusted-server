@@ -969,7 +969,11 @@ vendor's server reports is also remembered in the row for 30 days, and the
 provider is not called for that EC again until the 30 days pass, unless the
 vendor's cookies hold an ID again: that means the visitor opted back in, so the
 opt-out is forgotten. An opt-out read from the vendor's cookies is not
-remembered, because the cookies are read again on every navigation.
+remembered, because the cookies are read again on every navigation. It also
+applies to the request it arrives on: on every route, the vendor's cookies are
+read before any ID leaves the server, and the provider's sources are withheld
+from the publisher auction, `/_ts/page-bids`, `/auction` and identify, whether
+the ID comes from the row or from the browser. No lookup is made to do so.
 
 Some kinds keep private refresh state with a UID, such as a vendor refresh
 token, and refresh it server side once it is due, also after the UID expires
