@@ -369,8 +369,8 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// Origin readthrough is unavailable. Validation rejects `true`, and a live config
     /// that still sets it serves as if it were `false`: ad-serving requests bypass the
-    /// platform cache and other publisher requests keep the platform default. Runtime
-    /// loading warns through [`crate::settings::Settings::warn_ignored_origin_readthrough`].
+    /// platform cache and other publisher requests keep the platform default.
+    /// [`crate::config::validate_settings_for_runtime`] warns that it is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_readthrough_enabled: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
@@ -2352,6 +2352,7 @@ mod tests {
             providers: BTreeMap::from([(
                 ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example.test/openrtb".to_string(),

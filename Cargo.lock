@@ -19,6 +19,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0fc36d7440d015b45468ba08a21e80e056ebbd014c611c6298bb7503e04bd1"
+dependencies = [
+ "cipher",
+ "cpubits",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f2b8006a0c83f52b62ba44a97b58bf76fe2f70a329e588f67f89691d93d498f"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ctutils",
+ "ghash",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1389,6 +1414,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1489,7 +1520,9 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.2",
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1536,6 +1569,15 @@ checksum = "01334b89b69ff726750c5ce5073fc8bd860e99aa9a8fc5ca11b04730e3aee97a"
 dependencies = [
  "link-section",
  "linktime-proc-macro",
+]
+
+[[package]]
+name = "ctr"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -1942,7 +1984,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "base16ct 1.0.0",
  "edgezero-core",
@@ -1956,7 +1998,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1996,7 +2038,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2006,6 +2048,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "fern",
  "flate2",
  "futures",
  "futures-util",
@@ -2022,7 +2065,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2054,7 +2097,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2063,6 +2106,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "fern",
  "futures",
  "futures-util",
  "log",
@@ -2080,7 +2124,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "chrono",
  "clap",
@@ -2105,7 +2149,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "adler2",
  "alloc-no-stdlib",
@@ -2149,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2164,7 +2208,7 @@ dependencies = [
 [[package]]
 name = "edgezero-store-aws"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2185,7 +2229,7 @@ dependencies = [
 [[package]]
 name = "edgezero-store-celld"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.12-rc-axum.202611.2#4407d94130a9b752a70528b6c6f9c8fe3c10b81d"
+source = "git+https://github.com/IABTechLab/edgezero?rev=9d02d7b3185b49e81d9ac972ca3feef932ed848a#9d02d7b3185b49e81d9ac972ca3feef932ed848a"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2695,6 +2739,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghash"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
+dependencies = [
+ "polyval",
+]
+
+[[package]]
 name = "gix"
 version = "0.83.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3074,7 +3127,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5132,6 +5185,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0fa31d631f2b2cb2a544d0aa321ce847a94764d701ca2becc411138b93d49cd"
+dependencies = [
+ "cpubits",
+ "cpufeatures 0.3.0",
+ "universal-hash",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5302,7 +5366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "once_cell",
@@ -5322,7 +5386,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -5335,7 +5399,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -6416,8 +6480,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spin-macro"
-version = "7.0.0"
-source = "git+https://github.com/stackpop/spin-rust-sdk.git?rev=6c59ed5b4fcb377072763aee0b27a3abdd8edb72#6c59ed5b4fcb377072763aee0b27a3abdd8edb72"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45fefea15ed93ab2b6830a0249ce7cae2300202f569e013e12d39f3fba519ecc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6426,8 +6491,9 @@ dependencies = [
 
 [[package]]
 name = "spin-sdk"
-version = "7.0.0"
-source = "git+https://github.com/stackpop/spin-rust-sdk.git?rev=6c59ed5b4fcb377072763aee0b27a3abdd8edb72#6c59ed5b4fcb377072763aee0b27a3abdd8edb72"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df1f876031b7906a9e802a8bbadf599a423f49adacde532535c6270dc4f11a1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7055,7 +7121,6 @@ dependencies = [
  "log",
  "reqwest 0.12.28",
  "serde_json",
- "simple_logger",
  "temp-env",
  "tempfile",
  "tokio",
@@ -7090,21 +7155,19 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "chrono",
  "derive_more",
  "edgezero-adapter-fastly",
  "edgezero-core",
  "error-stack",
  "esi",
  "fastly",
- "fern",
  "futures",
  "log",
- "log-fastly",
  "serde",
  "serde_json",
  "toml",
  "trusted-server-core",
+ "trusted-server-identity-providers",
  "urlencoding",
 ]
 
@@ -7174,8 +7237,10 @@ dependencies = [
  "tracing",
  "trusted-server-adapter-axum",
  "trusted-server-core",
+ "trusted-server-identity-providers",
  "url",
  "uuid",
+ "validator",
  "webpki-roots",
  "which",
  "x509-parser",
@@ -7231,6 +7296,27 @@ dependencies = [
  "uuid",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-identity-providers"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "bytes",
+ "chrono",
+ "error-stack",
+ "http",
+ "httpdate",
+ "log",
+ "serde",
+ "serde_json",
+ "toml",
+ "trusted-server-core",
+ "url",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

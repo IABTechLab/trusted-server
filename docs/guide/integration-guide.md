@@ -55,7 +55,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _store: &StoreName,
         _key: &str,
     ) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn put(
@@ -64,7 +64,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 
     async fn delete(
@@ -72,7 +72,7 @@ impl PlatformConfigStore for ReadOnlyStore {
         _store: &StoreId,
         _key: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 }
 
@@ -83,7 +83,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _store: &StoreName,
         _key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn create(
@@ -92,7 +92,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 
     async fn delete(
@@ -100,7 +100,7 @@ impl PlatformSecretStore for ReadOnlyStore {
         _store: &StoreId,
         _key: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 }
 
@@ -362,13 +362,10 @@ The latency contract depends on the adapter and the stage:
   add to TTFB there even without stage retention. This feature does not add streaming
   support to those adapters.
 
-Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
-`publisher_response_into_streaming_response` for opted-in HTML. The synchronous
-pipeline and `stream_publisher_body` reject async processing before input/output
-effects. The raw partial-HTML copy path performs no callback; the synchronous helper
-leaves pending auction ownership with its caller, so pending auctions still require
-an async entry point. Async cancellation retains the auction guard's warning; error
-paths that can await emit abandonment telemetry.
+The publisher entry points are all asynchronous: `stream_publisher_body_async`,
+`buffer_publisher_response_async`, and `publisher_response_into_streaming_response`.
+The raw partial-HTML copy path performs no callback. Async cancellation retains the
+auction guard's warning; error paths that can await emit abandonment telemetry.
 
 Opted-in HTML bypasses shared-template reads/reservations/stores and receives
 `Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed

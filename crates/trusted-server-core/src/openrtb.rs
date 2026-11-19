@@ -6,6 +6,8 @@ use crate::auction::types::{BidRenderer, OrchestratorExt};
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
+/// `OpenRTB` 2.6 `user.eids` entry.
+pub type OpenRtbEid = trusted_server_openrtb::Eid;
 
 pub use trusted_server_openrtb::{
     Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
@@ -40,14 +42,27 @@ pub struct UserExt {
         skip_serializing_if = "Option::is_none"
     )]
     pub consented_providers_settings: Option<ConsentedProvidersSettings>,
-    /// Extended User IDs from identity providers.
-    ///
-    /// Gated by TCF Purpose 1 (storage) and Purpose 4 (personalized ads).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eids: Option<Vec<Eid>>,
 }
 
 impl ToExt for UserExt {}
+
+/// `user.ext` for APS requests.
+///
+/// The Prebid.js APS adapter that these requests mirror sends EIDs in
+/// `user.ext.eids`, the field Prebid's User ID module fills. APS requests
+/// therefore repeat `user.eids` there. No other request writes
+/// `user.ext.eids`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ApsUserExt {
+    /// TCF v2 consent string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) consent: Option<String>,
+    /// Copy of `user.eids`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) eids: Vec<OpenRtbEid>,
+}
+
+impl ToExt for ApsUserExt {}
 
 /// Google Additional Consent (AC) string container.
 ///
@@ -70,8 +85,35 @@ pub struct ConsentedProvidersSettings {
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
+    /// `OpenRTB` `inserter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inserter: Option<String>,
+    /// `OpenRTB` `matcher`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// `OpenRTB` `mm` (match method).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm: Option<i32>,
+    /// EID-level extension data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
     /// One or more user IDs from this provider.
     pub uids: Vec<Uid>,
+}
+
+impl Eid {
+    /// Builds an entry with no EID-level fields.
+    #[must_use]
+    pub fn new(source: impl Into<String>, uids: Vec<Uid>) -> Self {
+        Self {
+            source: source.into(),
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+            uids,
+        }
+    }
 }
 
 /// A single user identifier within an [`Eid`] entry.
@@ -86,6 +128,53 @@ pub struct Uid {
     /// Provider-specific extension data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Value>,
+}
+
+/// Converts an [`Eid`] to its `OpenRTB` 2.6 wire form.
+///
+/// `OpenRTB` requires every `ext` to be an object, so a non-object EID or UID
+/// extension is dropped.
+impl From<&Eid> for OpenRtbEid {
+    fn from(eid: &Eid) -> Self {
+        Self {
+            inserter: eid.inserter.clone(),
+            source: Some(eid.source.clone()),
+            matcher: eid.matcher.clone(),
+            mm: eid.mm,
+            uids: eid
+                .uids
+                .iter()
+                .map(trusted_server_openrtb::Uid::from)
+                .collect(),
+            ext: object_ext(eid.ext.as_ref()),
+        }
+    }
+}
+
+impl From<&Uid> for trusted_server_openrtb::Uid {
+    fn from(uid: &Uid) -> Self {
+        Self {
+            id: Some(uid.id.clone()),
+            atype: uid.atype,
+            ext: object_ext(uid.ext.as_ref()),
+        }
+    }
+}
+
+fn object_ext(ext: Option<&Value>) -> Option<trusted_server_openrtb::Object> {
+    ext.and_then(Value::as_object).cloned()
+}
+
+/// Builds the `OpenRTB` 2.6 `user.eids` list from resolved EIDs.
+///
+/// EIDs go in `user.eids`. Only APS also gets the pre-2.6 `user.ext.eids`
+/// placement, through [`ApsUserExt`].
+#[must_use]
+pub(crate) fn to_openrtb_user_eids(eids: Option<&[Eid]>) -> Vec<OpenRtbEid> {
+    eids.unwrap_or_default()
+        .iter()
+        .map(OpenRtbEid::from)
+        .collect()
 }
 
 /// Prebid-compatible `regs.ext` consent fields.
@@ -367,7 +456,6 @@ mod tests {
                 consented_providers_settings: Some(ConsentedProvidersSettings {
                     consented_providers: Some("2~2628.2316~dv.".to_owned()),
                 }),
-                eids: None,
             }
             .to_ext(),
             ..Default::default()
@@ -406,15 +494,94 @@ mod tests {
     }
 
     #[test]
-    fn eid_serializes_correctly() {
+    fn eid_serializes_eid_level_fields_only_when_present() {
+        let plain = Eid::new("ids.example.com", vec![]);
+        assert_eq!(
+            serde_json::to_value(&plain).expect("should serialize"),
+            serde_json::json!({ "source": "ids.example.com", "uids": [] }),
+            "should omit absent EID-level fields"
+        );
+        let full = Eid {
+            inserter: Some("inserter.example.com".to_owned()),
+            matcher: Some("matcher.example.com".to_owned()),
+            mm: Some(3),
+            ext: Some(serde_json::json!({ "k": 1 })),
+            ..Eid::new("ids.example.com", vec![])
+        };
+        let value = serde_json::to_value(&full).expect("should serialize");
+        assert_eq!(
+            value["inserter"],
+            serde_json::json!("inserter.example.com"),
+            "should write inserter"
+        );
+        assert_eq!(value["mm"], serde_json::json!(3), "should write mm");
+        let back: Eid = serde_json::from_value(value).expect("should accept EID-level fields");
+        assert_eq!(
+            back.matcher.as_deref(),
+            Some("matcher.example.com"),
+            "should read matcher"
+        );
+    }
+
+    #[test]
+    fn eid_converts_to_openrtb_26_eid() {
         let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+            inserter: Some("inserter.example.com".to_owned()),
+            matcher: Some("matcher.example.com".to_owned()),
+            mm: Some(3),
+            ext: Some(serde_json::json!({ "k": 1 })),
+            ..Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "fictional-uid".to_owned(),
+                    atype: Some(571_187),
+                    ext: Some(serde_json::json!({ "stype": "ppuid" })),
+                }],
+            )
+        };
+
+        let converted = OpenRtbEid::from(&eid);
+
+        assert_eq!(
+            serde_json::to_value(&converted).expect("should serialize converted EID"),
+            serde_json::to_value(&eid).expect("should serialize EID"),
+            "should carry every EID and UID field unchanged"
+        );
+    }
+
+    #[test]
+    fn eid_conversion_drops_non_object_extensions() {
+        let eid = Eid {
+            ext: Some(serde_json::json!("not-an-object")),
+            ..Eid::new(
+                "ids.example.com",
+                vec![Uid {
+                    id: "fictional-uid".to_owned(),
+                    atype: None,
+                    ext: Some(serde_json::json!([1, 2])),
+                }],
+            )
+        };
+
+        let converted = OpenRtbEid::from(&eid);
+
+        assert_eq!(
+            serde_json::to_value(&converted).expect("should serialize converted EID"),
+            serde_json::json!({ "source": "ids.example.com", "uids": [{ "id": "fictional-uid" }] }),
+            "should drop extensions OpenRTB requires to be objects"
+        );
+    }
+
+    #[test]
+    fn eid_serializes_correctly() {
+        let eid = Eid::new(
+            "id5-sync.com".to_owned(),
+            vec![Uid {
                 id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
         assert_eq!(serialized["source"], "id5-sync.com", "source should match");
@@ -431,14 +598,14 @@ mod tests {
 
     #[test]
     fn eid_serializes_vendor_specific_atype() {
-        let eid = Eid {
-            source: "google.com".to_owned(),
-            uids: vec![Uid {
+        let eid = Eid::new(
+            "google.com".to_owned(),
+            vec![Uid {
                 id: "pair-id".to_owned(),
                 atype: Some(571187),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
 

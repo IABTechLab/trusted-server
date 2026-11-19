@@ -79,7 +79,7 @@ impl ServerFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
-            .env("RUST_LOG", "info")
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &self.root)
