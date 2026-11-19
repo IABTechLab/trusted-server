@@ -1,8 +1,9 @@
 import net from 'node:net';
 import fs from 'node:fs';
+import type { Socket } from 'node:net';
 
 let next = 0;
-const sockets = new Set();
+const sockets = new Set<Socket>();
 const out = fs.createWriteStream(new URL('./connections.jsonl', import.meta.url));
 const log = (event) => {
   if (!out.writableEnded) {

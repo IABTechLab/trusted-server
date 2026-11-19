@@ -9,8 +9,33 @@ const require = createRequire(
 );
 const { chromium } = require('playwright');
 const root = new URL('./', import.meta.url);
-const results = { at: new Date().toISOString(), requests: [], browser: [], errors: [] };
-const agents = new Map();
+interface HttpObservation {
+  port: number;
+  path: string;
+  method: string;
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+  ms: number;
+}
+interface BrowserObservation {
+  port: number;
+  index: number;
+  javascript: boolean;
+  actions: { status: number; url: string; action: string | null }[];
+  cycles: { step: number; ms: number }[];
+  ms: number;
+  errors: string[];
+}
+const results: {
+  at: string;
+  requests: HttpObservation[];
+  browser: BrowserObservation[];
+  errors: string[];
+  chromium?: string;
+  success?: boolean;
+} = { at: new Date().toISOString(), requests: [], browser: [], errors: [] };
+const agents = new Map<number, http.Agent>();
 function request(
   port,
   path,
@@ -22,7 +47,7 @@ function request(
     freshIncoming = false,
   } = {}
 ) {
-  return new Promise((resolve, reject) => {
+  return new Promise<HttpObservation>((resolve, reject) => {
     const started = performance.now();
     if (!agents.has(port)) agents.set(port, new http.Agent({ keepAlive: true, maxSockets: 16 }));
     const req = http.request(

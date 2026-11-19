@@ -45,7 +45,7 @@ jobs:
           cache-key: axum-nextjs-measurement
       - name: Check evidence parser and CI pins
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/measure-axum-nextjs -p 'test_*.py'
+          node --test scripts/measure-axum-nextjs/analyze.test.ts
           node scripts/check-ci-node-pin.mjs
       - name: Measure the actual managed runner
         shell: bash

@@ -5,14 +5,14 @@ set -euo pipefail
 SCRIPT_ROOT=$(cd "$(dirname "$0")" && pwd)
 MEASURE_REPO=$(cd "$SCRIPT_ROOT/../.." && pwd)
 export MEASURE_REPO
-# Check the actual integration, rather than ancestry: a squash merge of PR 1506
-# must remain eligible while old main must not measure its private client.
-python3 - "$MEASURE_REPO" <<'CHECK'
-import sys
-from pathlib import Path
-root = Path(sys.argv[1]) / "crates/trusted-server-adapter-axum/src"
-if "run_app::<TrustedServerApp>" not in (root / "main.rs").read_text() or "request_outbound_client(ctx)" not in (root / "platform.rs").read_text():
-    raise SystemExit("The managed runner/client integration from PR 1506 is required.")
+# Check the integration rather than ancestry, so squash merges remain eligible.
+node --input-type=module - "$MEASURE_REPO" <<'CHECK'
+import {readFileSync} from 'node:fs';
+import {resolve} from 'node:path';
+const root=resolve(process.argv[2],'crates/trusted-server-adapter-axum/src');
+if (!readFileSync(resolve(root,'main.rs'),'utf8').includes('run_app::<TrustedServerApp>') || !readFileSync(resolve(root,'platform.rs'),'utf8').includes('request_outbound_client(ctx)')) {
+  throw new Error('The managed runner/client integration from PR 1506 is required.');
+}
 CHECK
 MEASURE_NODE=$(awk '$1 == "nodejs" {print $2}' "$MEASURE_REPO/.tool-versions")
 MEASURE_RUST=$(awk '$1 == "rust" {print $2}' "$MEASURE_REPO/.tool-versions")
@@ -28,31 +28,47 @@ mkdir -p "$CARGO_TARGET_DIR"
 CARGO_TARGET_DIR=$(cd "$CARGO_TARGET_DIR" && pwd)
 export CARGO_TARGET_DIR
 
-cp "$SCRIPT_ROOT/launch.py" "$SCRIPT_ROOT/exercise.mjs" "$SCRIPT_ROOT/relay.mjs" "$SCRIPT_ROOT/analyze.py" "$MEASURE_OUTPUT/"
+cp "$SCRIPT_ROOT/"*.ts "$SCRIPT_ROOT/package.json" "$MEASURE_OUTPUT/"
 cp -R "$SCRIPT_ROOT/origin-app" "$MEASURE_OUTPUT/origin-app"
 cp "$MEASURE_REPO/crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/package.json" \
    "$MEASURE_REPO/crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/package-lock.json" \
    "$MEASURE_OUTPUT/origin-app/"
+# Next.js 14 consumes this configuration format; keep it disposable.
+cat > "$MEASURE_OUTPUT/origin-app/next.config.mjs" <<'NEXT'
+export default {experimental:{cpus:2,serverActions:{allowedOrigins:['127.0.0.1:18982']}}};
+NEXT
 
-# Keep dependencies and generated bundles out of the retained evidence.
+MEASURE_PHASE=build
 cleanup() {
+    local status=$?
+    if [ "$status" -ne 0 ] && [ -f "$MEASURE_OUTPUT/$MEASURE_PHASE.log" ]; then
+        tail -n 60 "$MEASURE_OUTPUT/$MEASURE_PHASE.log" >&2
+    fi
     rm -rf "$MEASURE_OUTPUT/origin-app/node_modules" "$MEASURE_OUTPUT/origin-app/.next"
 }
 trap cleanup EXIT
 
+echo "Building the current checkout's native Axum runner and CLI."
 (cd "$MEASURE_REPO" && cargo build --locked -p trusted-server-adapter-axum -p trusted-server-cli) > "$MEASURE_OUTPUT/build.log" 2>&1
+MEASURE_PHASE=next-build
+echo "Installing and building the locked Next.js fixture."
 (cd "$MEASURE_OUTPUT/origin-app" && npm ci && npm run build) > "$MEASURE_OUTPUT/next-build.log" 2>&1
+MEASURE_PHASE=typescript
+echo "Type-checking the measurement scripts with the fixture's locked compiler."
+node "$MEASURE_OUTPUT/origin-app/node_modules/typescript/bin/tsc" --noEmit --module nodenext --moduleResolution nodenext --target es2022 --allowImportingTsExtensions --skipLibCheck --types node --typeRoots "$MEASURE_OUTPUT/origin-app/node_modules/@types" "$MEASURE_OUTPUT/"*.ts > "$MEASURE_OUTPUT/typescript.log" 2>&1
+MEASURE_PHASE=browser-install
+echo "Installing the locked browser; launch will validate system libraries."
 if [ -z "${PLAYWRIGHT_PACKAGE:-}" ]; then
     PLAYWRIGHT_PACKAGE="$MEASURE_REPO/crates/trusted-server-integration-tests/browser/package.json"
     (cd "$(dirname "$PLAYWRIGHT_PACKAGE")" && npm ci) > "$MEASURE_OUTPUT/browser-install.log" 2>&1
 fi
 export PLAYWRIGHT_PACKAGE
-if [ "${CI:-}" = true ]; then
-    (cd "$(dirname "$PLAYWRIGHT_PACKAGE")" && npx --no-install playwright install --with-deps chromium) >> "$MEASURE_OUTPUT/browser-install.log" 2>&1
-else
-    (cd "$(dirname "$PLAYWRIGHT_PACKAGE")" && npx --no-install playwright install chromium) >> "$MEASURE_OUTPUT/browser-install.log" 2>&1
-fi
+# The supported runner image supplies system libraries. Chromium launch retains
+# Playwright's own dependency validation; do not upgrade runner packages here.
+(cd "$(dirname "$PLAYWRIGHT_PACKAGE")" && npx --no-install playwright install chromium) >> "$MEASURE_OUTPUT/browser-install.log" 2>&1
 
+MEASURE_PHASE=config
+echo "Validating a disposable local configuration."
 MEASURE_TS="$CARGO_TARGET_DIR/debug/ts"
 "$MEASURE_TS" config init --app-config "$MEASURE_OUTPUT/trusted-server.toml" > "$MEASURE_OUTPUT/config.log" 2>&1
 cat >> "$MEASURE_OUTPUT/trusted-server.toml" <<'CONFIG'
@@ -72,33 +88,16 @@ sed -e "s|= \"crates/|= \"$MEASURE_REPO/crates/|g" \
     "$MEASURE_TS" config push --adapter axum --local --manifest edgezero.toml --app-config trusted-server.toml --yes --no-diff) >> "$MEASURE_OUTPUT/config.log" 2>&1
 export MEASURE_ENVELOPE="$MEASURE_OUTPUT/.edgezero/local-config-trusted_server_config.json"
 export MEASURE_BIN="$CARGO_TARGET_DIR/debug/trusted-server-axum"
-python3 - "$MEASURE_OUTPUT" "$MEASURE_REPO" <<'PY'
-import hashlib
-import json
-import os
-import platform
-import subprocess
-import sys
-import tomllib
-from pathlib import Path
-out, repo = map(Path, sys.argv[1:])
-metadata = {
-    "edgezero_source": next(package["source"] for package in tomllib.loads((repo / "Cargo.lock").read_text())["package"] if package["name"] == "edgezero-adapter-axum"),
-    "fixture_inputs_sha256": {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in (repo / "scripts/measure-axum-nextjs").rglob("*") if path.is_file() and path.suffix in [".py", ".mjs", ".tsx", ".ts", ".sh"]},
-    "next_version": json.loads((out / "origin-app/node_modules/next/package.json").read_text())["version"],
-    "runtime_revision": subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
-    "runtime_source_diff": subprocess.check_output(["git", "-C", str(repo), "diff", "HEAD", "--", "crates", "Cargo.toml", "Cargo.lock"], text=True),
-    "rust": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-    "node": subprocess.check_output(["node", "--version"], text=True).strip(),
-    "platform": platform.platform(),
-    "axum_binary_sha256": hashlib.sha256(Path(os.environ["MEASURE_BIN"]).read_bytes()).hexdigest(),
-    "github_run_id": os.environ.get("GITHUB_RUN_ID"),
-    "limits": "Local HTTP/1; allowed proxy origin; sequential targets; timings are descriptive, not pooling's causal benefit",
-}
-(out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-PY
-python3 "$MEASURE_OUTPUT/launch.py" > "$MEASURE_OUTPUT/run.log" 2>&1
-python3 "$MEASURE_OUTPUT/analyze.py"
+node "$MEASURE_OUTPUT/metadata.ts" "$MEASURE_OUTPUT" "$MEASURE_REPO"
+MEASURE_PHASE=run
+echo "Exercising the real managed runner, Next.js and isolated browser."
+node "$MEASURE_OUTPUT/launch.ts" > "$MEASURE_OUTPUT/run.log" 2>&1
+MEASURE_PHASE=analysis
+echo "Validating raw receipts and publishing descriptive measurements."
+node "$MEASURE_OUTPUT/analyze.ts" > "$MEASURE_OUTPUT/analysis.log" 2>&1
+test -s "$MEASURE_OUTPUT/summary.json"
+test -s "$MEASURE_OUTPUT/summary.md"
+cat "$MEASURE_OUTPUT/analysis.log"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     cat "$MEASURE_OUTPUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
 fi
