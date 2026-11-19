@@ -210,6 +210,7 @@ mod tests {
         values: BTreeMap<String, Vec<u8>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for MemorySecretStore {
         fn get_bytes(
             &self,
@@ -222,7 +223,7 @@ mod tests {
             })
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -231,7 +232,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }

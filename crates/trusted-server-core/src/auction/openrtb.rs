@@ -996,6 +996,4 @@ mod routing_metadata_tests {
 }
 
 #[cfg(test)]
-mod test_executor;
-#[cfg(test)]
 mod tests;

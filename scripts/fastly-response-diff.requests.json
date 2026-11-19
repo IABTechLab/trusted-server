@@ -1,0 +1,96 @@
+[
+  {
+    "id": "publisher-page",
+    "method": "GET",
+    "path": "/",
+    "headers": {
+      "accept": "text/html",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate"
+    },
+    "base_status": 200
+  },
+  {
+    "id": "head-root",
+    "method": "HEAD",
+    "path": "/",
+    "headers": {
+      "accept": "text/html"
+    },
+    "base_status": 200
+  },
+  {
+    "id": "conditional-get-root",
+    "method": "GET",
+    "path": "/",
+    "headers": {
+      "accept": "text/html",
+      "if-none-match": "\"fastly-response-diff-page-1\"",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate"
+    },
+    "base_status": 304
+  },
+  {
+    "id": "post-auction",
+    "method": "POST",
+    "path": "/auction",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "json": {
+      "adUnits": [
+        {
+          "code": "diff-slot",
+          "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+        }
+      ]
+    },
+    "base_status": 200
+  },
+  {
+    "id": "first-party-proxy",
+    "method": "GET",
+    "sign": "{origin}/proxied/widget.js",
+    "base_status": 200
+  },
+  {
+    "id": "asset",
+    "method": "GET",
+    "path": "/assets/site.css",
+    "base_status": 200
+  },
+  {
+    "id": "tsjs-bundle",
+    "method": "GET",
+    "path": "/static/tsjs=tsjs-unified.min.js",
+    "base_status": 200
+  },
+  {
+    "id": "admin-eids",
+    "method": "GET",
+    "path": "/_ts/admin/eids",
+    "headers": {
+      "authorization": "Basic YWRtaW46aW50ZWdyYXRpb24tYWRtaW4tcGFzc3dvcmQtMzItYnl0ZXMtb2s="
+    },
+    "base_status": 200
+  },
+  {
+    "id": "trace-method",
+    "method": "TRACE",
+    "path": "/",
+    "base_status": 405
+  },
+  {
+    "id": "trace-enable-action",
+    "method": "POST",
+    "path": "/_ts/trace/enable",
+    "headers": {
+      "cookie": "__Host-ts-console=1",
+      "origin": "{self}",
+      "sec-fetch-site": "same-origin",
+      "x-ts-trace-action": "enable"
+    },
+    "base_status": 200
+  }
+]

@@ -8,8 +8,12 @@ on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
 
 - `settings` and `settings_data` define typed application configuration,
   validation, secret references, and runtime normalization.
-- `platform` defines the HTTP, backend, store, geo, client-info, and telemetry
-  service boundary adapters implement.
+- `platform` defines the store, geo, client-info, template, and telemetry
+  service boundary adapters implement, and carries each request's EdgeZero
+  `HttpClient` and `MonotonicClock`.
+- `outbound` sets the connect timeout, constant timeouts, and response caps
+  every outbound request carries, and maps client failures to Trusted Server
+  errors.
 - `publisher`, `router`, `handlers`, and `response` dispatch publisher and
   administrative requests through platform-neutral request/response types.
 - `auction` builds plans, invokes providers and mediators, selects bids, and
@@ -30,10 +34,11 @@ on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
 - `tsjs` selects embedded browser modules supplied by `trusted-server-js`.
 - `openrtb` connects auction logic to the checked OpenRTB data model.
 
-Adapter crates own runtime startup, SDK conversion, concrete storage, outbound
-transport, and target-specific limitations. Adding an integration should use
-the narrowest registration hook and the core-neutral `RuntimeServices`
-boundary; see the [Integration Guide](../../docs/guide/integration-guide.md).
+Adapter crates own runtime startup, SDK conversion, concrete storage, and
+target-specific limitations. Outbound HTTP goes through EdgeZero's client.
+Adding an integration should use the narrowest registration hook and the
+core-neutral `RuntimeServices` boundary; see the
+[Integration Guide](../../docs/guide/integration-guide.md).
 
 ## Build and test
 

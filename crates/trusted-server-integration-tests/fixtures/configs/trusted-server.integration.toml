@@ -93,9 +93,6 @@ rewrite_script = true
 [integrations.gpt_diagnostics]
 enabled = true
 
-[proxy]
-certificate_check = false
-
 [auction]
 enabled = false
 timeout_ms = 2000
