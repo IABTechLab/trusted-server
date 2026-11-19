@@ -22,14 +22,14 @@ This change is a follow-up PR stacked on #1531's branch
 
 ## Requirement status
 
-| Requirement                                                                            | State on #1531                                                                                                                                                            | This change                                                                                                                             |
-| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| AX-1 missing secret exits non-zero before the port opens                               | `missing_secret_fails_before_listen_without_legacy_fallback`; runs in CI                                                                                                  | The missing-secret diagnostic names the missing reference; the before-listen probe stops counting a Linux self-connection as a listener |
-| AX-1 stop during a request completes it within the configured grace                    | `production_sigterm_drains_the_admitted_publisher_response` checks completion and the grace; runs in CI                                                                   | None                                                                                                                                    |
-| AX-1 stop completes a pending record write                                             | Not possible in A1: Axum has no record store until A2 (#1574), and draining after-response tasks is A3 (#1575) with its CI test in A8 (#1579)                             | Out of scope; the PR records the narrowing                                                                                              |
-| AX-2 startup through the AWS providers of IABTechLab/edgezero#414                      | `scripts/test-native-providers.mjs` (moto and the AppConfig agent in Docker); local only                                                                                  | Repairs the script's entry point and diagnostics; CI runs its unit tests                                                                |
-| AX-2 no runtime read of `TS_*`, `TRUSTED_SERVER_CONFIG_*` or `TRUSTED_SERVER_SECRET_*` | Met. The remaining names in tests and scripts are poison inputs that must be ignored. `TS_GIT_VERSION` is a constant set at build time from `TRUSTED_SERVER__GIT_VERSION` | Removes the legacy names from the getting-started guide                                                                                 |
-| AX-7 lockfile resolves EdgeZero to `rc/identity`                                       | Met (`9d02d7b3`)                                                                                                                                                          | None                                                                                                                                    |
+| Requirement                                                                            | State on #1531                                                                                                                                                            | This change                                                                                                                                             |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AX-1 missing secret exits non-zero before the port opens                               | `missing_secret_fails_before_listen_without_legacy_fallback`; runs in CI                                                                                                  | The missing-secret diagnostic names the config path of the missing secret; the before-listen probe stops counting a Linux self-connection as a listener |
+| AX-1 stop during a request completes it within the configured grace                    | `production_sigterm_drains_the_admitted_publisher_response` checks completion and the grace; runs in CI                                                                   | None                                                                                                                                                    |
+| AX-1 stop completes a pending record write                                             | Not possible in A1: Axum has no record store until A2 (#1574), and draining after-response tasks is A3 (#1575) with its CI test in A8 (#1579)                             | Out of scope; the PR records the narrowing                                                                                                              |
+| AX-2 startup through the AWS providers of IABTechLab/edgezero#414                      | `scripts/test-native-providers.mjs` (moto and the AppConfig agent in Docker); local only                                                                                  | Repairs the script's entry point and diagnostics; CI runs its unit tests                                                                                |
+| AX-2 no runtime read of `TS_*`, `TRUSTED_SERVER_CONFIG_*` or `TRUSTED_SERVER_SECRET_*` | Met. The remaining names in tests and scripts are poison inputs that must be ignored. `TS_GIT_VERSION` is a constant set at build time from `TRUSTED_SERVER__GIT_VERSION` | Removes the legacy names from the getting-started guide                                                                                                 |
+| AX-7 lockfile resolves EdgeZero to `rc/identity`                                       | Met (`9d02d7b3`)                                                                                                                                                          | None                                                                                                                                                    |
 
 `TRUSTED_SERVER__` overrides are applied by `ts config push` when it builds
 the envelope. The running server never reads them, and the native tests keep
@@ -40,9 +40,11 @@ treating them as poison. The CI guard for this is A9 (#1580).
 ### Startup and serving
 
 1. **Name the missing secret.** When a required app-config secret is absent,
-   the startup error names its reference key (never its value). Each
+   the startup error names the config field paths that reference it, never
+   the key or the value. A key is an operator-supplied string, so a secret
+   pasted into a reference field would otherwise be logged. Each
    missing-secret case in the Rust tests and `scripts/smoke-axum.sh` asserts
-   its own key and that the other keys are not named.
+   its own path, that the other paths are not named and that no key appears.
 2. **Read-only snapshot errors.** Replace `read_only_secret` and
    `read_only_config` with one helper whose name does not contain "secret".
    On #1528 CodeQL flagged the rotation rollback log as cleartext logging,
@@ -172,3 +174,9 @@ already rejects `request_signing.enabled`.
 
 - **Round 2 (same reviewer, re-check).** No blocking items remain. A
   wording fix for the DataDome fallback description was applied.
+- **Round 3 (independent review of the implementation).** No blocking
+  findings. Three optional ones were taken: name config paths instead of
+  reference keys in the missing-secret diagnostic (a key is an
+  operator-supplied string and could hold a misplaced secret); update the
+  Axum section of the architecture guide; attach the output tail when the
+  integration environment's readiness deadline expires.

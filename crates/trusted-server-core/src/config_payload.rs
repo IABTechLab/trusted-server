@@ -5,7 +5,7 @@
 //! stored [`edgezero_core::blob_envelope::BlobEnvelope`] and reconstruct
 //! [`Settings`] from its data value.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
@@ -13,7 +13,9 @@ use error_stack::Report;
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformSecretStore, StoreName};
-use crate::secret_resolution::{resolve_secret_references, secret_reference_keys};
+use crate::secret_resolution::{
+    resolve_secret_references, secret_reference_keys, secret_reference_paths,
+};
 use crate::settings::Settings;
 
 /// Canonical logical secret store used by Trusted Server app-config secrets.
@@ -89,6 +91,19 @@ impl VerifiedConfigBlob {
     /// Returns a configuration error for malformed secret paths or references.
     pub fn required_secret_keys(&self) -> Result<BTreeSet<String>, Report<TrustedServerError>> {
         secret_reference_keys::<TrustedServerAppConfig>(&self.data)
+    }
+
+    /// Return each required secret key with the config field paths that use it.
+    ///
+    /// Name the paths, not the keys, in diagnostics: see
+    /// [`secret_reference_paths`].
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed secret paths or references.
+    pub fn required_secret_references(
+        &self,
+    ) -> Result<BTreeMap<String, BTreeSet<String>>, Report<TrustedServerError>> {
+        secret_reference_paths::<TrustedServerAppConfig>(&self.data)
     }
 
     /// Enforce finite JSON structure limits before traversing secret metadata.

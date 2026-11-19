@@ -120,7 +120,7 @@ impl ServerFixture {
         );
     }
 
-    fn assert_failed_before_listen(&mut self, expected: &str) {
+    fn assert_failed_before_listen(&mut self, expected: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             // Linux can connect a socket to itself when its ephemeral source
@@ -163,7 +163,7 @@ impl ServerFixture {
                     "should explain startup failure: {diagnostic}"
                 );
                 assert_no_secrets(&diagnostic);
-                return;
+                return diagnostic;
             }
             assert!(
                 Instant::now() < deadline,
@@ -279,7 +279,12 @@ fn missing_config_fails_before_listen_without_legacy_fallback() {
 fn missing_secret_fails_before_listen_without_legacy_fallback() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn(true, false);
-    server.assert_failed_before_listen("required app-config secret `ec_key` is missing");
+    let diagnostic = server
+        .assert_failed_before_listen("required app-config secret at `ec.passphrase` is missing");
+    assert!(
+        !diagnostic.contains("ec_key"),
+        "should name the config path, never the reference key: {diagnostic}"
+    );
 }
 
 #[test]

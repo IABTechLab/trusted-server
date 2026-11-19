@@ -214,9 +214,18 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
     verified
         .check_structure(limits.max_json_depth, limits.max_json_nodes)
         .map_err(settings_error)?;
-    let keys = verified.required_secret_keys().map_err(settings_error)?;
+    let references = verified
+        .required_secret_references()
+        .map_err(settings_error)?;
     let mut values = BTreeMap::new();
-    for key in keys {
+    for (key, paths) in references {
+        // Diagnostics name config paths only. A key is an operator-supplied
+        // string, so a secret pasted into a reference field must not be logged.
+        let paths = paths
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         if remaining == 0 {
             return Err(configuration_error(
                 "native secret extraction exhausts the total byte budget",
@@ -229,14 +238,13 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             limits.max_backend_bytes.min(remaining),
             limits.max_secret_bytes.min(remaining),
         ).await.map_err(|_| configuration_error(&format!(
-            "failed bounded read of required app-config secret `{key}`; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
+            "failed bounded read of the required app-config secret at {paths}; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
         )))?;
         remaining = remaining.checked_sub(read.backend_bytes).ok_or_else(|| {
             configuration_error("native secret extraction exceeds the total byte budget")
         })?;
-        // The reference key is a name from the envelope, never a secret value.
         let value = read.value.ok_or_else(|| configuration_error(&format!(
-            "required app-config secret `{key}` is missing in trusted_server_secrets; publish every active reference before starting",
+            "the required app-config secret at {paths} is missing in trusted_server_secrets; publish every active reference before starting",
         )))?;
         values.insert(key, value.to_vec());
     }

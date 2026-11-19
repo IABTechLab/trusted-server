@@ -9,7 +9,8 @@ Each task runs `cargo test-axum` (and the listed extra check) before the next.
 ## Task 1: Name the missing secret (spec 1)
 
 - `src/startup.rs`: the missing-value and failed-read messages name the
-  reference key (an envelope reference name, never a value).
+  config field paths that reference the secret (never the key or value),
+  using a core `secret_reference_paths` helper.
 - `tests/native_acceptance.rs` (missing-input loop), `tests/startup.rs` and
   `scripts/smoke-axum.sh`: each case asserts its own key and that the other
   keys are absent. Red first.

@@ -455,23 +455,35 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
     fs::write(fixture.config_path(), "{}").expect("should publish empty config map");
     fixture.spawn(false).rejected("config envelope is missing");
     fixture.publish();
-    let keys = [
-        "native_admin",
-        "native_proxy",
-        "native_ec",
-        "native_forwarder",
+    let references = [
+        ("native_admin", "`handlers[0].password`"),
+        ("native_proxy", "`publisher.proxy_secret`"),
+        ("native_ec", "`ec.passphrase`"),
+        ("native_forwarder", "`trusted_forwarder.shared_secret`"),
     ];
-    for key in keys {
+    for (key, path) in references {
         let mut incomplete = Prepared::new(&origin.base_url);
         incomplete.secrets.remove(key);
         let log = incomplete
             .spawn(false)
-            .rejected(&format!("required app-config secret `{key}` is missing"));
-        for other in keys.iter().filter(|other| **other != key) {
+            .rejected("required app-config secret at ");
+        assert!(
+            log.contains(path),
+            "should name the config path {path} of the missing secret: {log}"
+        );
+        // A key is an operator-supplied string that could hold a misplaced
+        // secret, so diagnostics name config paths and never keys.
+        for (other_key, other_path) in references {
             assert!(
-                !log.contains(&format!("`{other}`")),
-                "should name only the missing reference {key}, not {other}: {log}"
+                !log.contains(other_key),
+                "should not print the reference key {other_key}: {log}"
             );
+            if other_key != key {
+                assert!(
+                    !log.contains(other_path),
+                    "should name only the missing secret's path, not {other_path}: {log}"
+                );
+            }
         }
     }
     let mut invalid = Prepared::new(&origin.base_url);

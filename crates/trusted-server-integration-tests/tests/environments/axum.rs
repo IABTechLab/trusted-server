@@ -206,9 +206,11 @@ fn wait_for_health(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(Report::new(TestError::RuntimeNotReady).attach(format!(
-        "Axum at {base_url} did not return HTTP 200 /health body ok within 15s"
-    )))
+    Err(Report::new(TestError::RuntimeNotReady)
+        .attach(format!(
+            "Axum at {base_url} did not return HTTP 200 /health body ok within 15s"
+        ))
+        .attach(format!("last Axum output:\n{}", tail.render())))
 }
 
 struct AxumHandle {

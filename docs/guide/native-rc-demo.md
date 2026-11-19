@@ -25,7 +25,7 @@ EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
 ```
 
 Leave one secret variable out to see startup fail before listening; the error
-names the missing reference. [Getting started](./getting-started)
+names the config field of the missing secret. [Getting started](./getting-started)
 covers the development overlay and port settings.
 
 ## Startup sequence
