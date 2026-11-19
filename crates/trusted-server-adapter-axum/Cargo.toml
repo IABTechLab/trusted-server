@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-adapter-axum"
-description = "Axum entry point for Trusted Server — native dev server."
+description = "Axum entry point for Trusted Server — native production and development server."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -18,10 +18,14 @@ path = "src/lib.rs"
 name = "trusted-server-axum"
 path = "src/main.rs"
 
+[features]
+default = []
+aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
+aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
+
 [dependencies]
 async-trait = { workspace = true }
-bytes = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "native-bindings"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
@@ -30,10 +34,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
-reqwest = { workspace = true }
-tempfile = { workspace = true }
-temp-env = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

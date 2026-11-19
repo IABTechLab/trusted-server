@@ -2,7 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -16,13 +16,14 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
-use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
-use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -37,15 +38,13 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
 
 use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::build_runtime_services;
+use crate::startup::NativeStoreSnapshot;
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -56,28 +55,11 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built once. The dev server has no EC record store and
+    /// applies no rate limit: its deployer limits traffic at the load
+    /// balancer.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
-        &AxumPlatformConfigStore,
-        &AxumPlatformSecretStore,
-        &store_name,
-        &config_key,
-        &trusted_server_core::settings_data::default_secret_store_name(),
-    )?;
-    // Open the runtime KV store before the listener serves a request.
-    crate::platform::runtime_kv_store();
-    build_state_with_settings(settings)
 }
 
 /// Build the application state from explicit settings.
@@ -96,14 +78,19 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -209,15 +196,12 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
-        let mut ec_context = EcContext::default();
         return state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: None,
-                ec_context: &mut ec_context,
                 services,
                 req,
             })
@@ -293,11 +277,11 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    Identify,
+    BatchSync,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -322,7 +306,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 16] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -355,26 +339,6 @@ fn named_routes() -> [NamedRoute; 17] {
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::CachePurgeNotSupported,
         },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
-        },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
         // basic-auth handler regex `^/_ts/admin` does not match them, and letting
@@ -390,6 +354,20 @@ fn named_routes() -> [NamedRoute; 17] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: the dev server has no EC record store, so identify and
+        // batch sync answer 501 and any other method answers 405.
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::Identify,
+        },
+        NamedRoute {
+            path: "/_ts/api/v1/batch-sync",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::BatchSync,
         },
         NamedRoute {
             path: "/auction",
@@ -456,11 +434,11 @@ fn named_route_handler(
                         handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::CachePurgeNotSupported => {
-                        // The Axum dev server has no template cache to purge. 501 rather
+                        // The Axum adapter has no template cache to purge. 501 rather
                         // than a fallthrough 404, so a CMS webhook can tell "not supported
                         // here" from "endpoint does not exist".
                         let body = edgezero_core::body::Body::from(
-                            "Template cache purge is not supported on the Axum dev server.\n\
+                            "Template cache purge is not supported on the Axum adapter.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
                         );
                         let mut resp = Response::new(body);
@@ -472,11 +450,11 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
-                        // Config/secret-store writes are backed by read-only env vars on the
-                        // Axum dev server. Returning 501 is clearer than failing on the first
-                        // store write.
+                        // Axum serves config and secrets from read-only snapshots taken at
+                        // startup. Returning 501 is clearer than failing on the first store
+                        // write.
                         let body = edgezero_core::body::Body::from(
-                            "Admin key management is not supported on the Axum dev server.\n\
+                            "Admin key management is not supported on the Axum adapter.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
                         );
                         let mut resp = Response::new(body);
@@ -487,17 +465,9 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
-                    }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::Identify => answer_identify_locally(&state.settings, &req),
+                    NamedRouteHandler::BatchSync => Ok(answer_batch_sync_locally(&req)),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
@@ -590,12 +560,22 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let state = build_state().map_err(|report| {
-            log::error!("{report:?}");
-            startup_error(&report)
-        })?;
+        // The prepared-store initializer installs the complete router before listening.
+        Ok(RouterService::builder().build())
+    }
 
-        Ok(router_builder(&state).build())
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+            kv: None,
+        }
     }
 }
 
@@ -679,6 +659,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let forwarder_settings = Arc::clone(&state.settings);
 
     let mut router = RouterService::builder()
+        .with_state(Arc::new(NativeStoreSnapshot::empty()))
         .received_head_preparer(move |headers, extensions| {
             if extensions
                 .get::<trusted_server_core::forwarder::ForwarderPreparation>()
@@ -713,6 +694,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 .expect("should build health response"),
         )
     });
+
+    // The core identity app registers `GET` on the admin EC and EIDs lookups;
+    // without a record store, admin EC lookup answers 501. Their other methods
+    // reach the catch-all fallback, which denies admin diagnostics locally.
+    router = state.identity.mount(router);
 
     for route in named_routes() {
         for method in route.primary_methods {
@@ -760,9 +746,11 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
         geo: None,
     }
 }
+
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
@@ -775,6 +763,23 @@ mod trace_dispatch_tests {
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::{TrustedClientIpConfig, TrustedForwarderConfig};
     use trusted_server_core::trace::TraceTerminalResponse;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = trace_settings(false);
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Axum"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     fn trace_settings(enabled: bool) -> Settings {
         Settings::from_toml(&format!(

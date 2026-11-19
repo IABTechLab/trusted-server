@@ -1,5 +1,9 @@
 # Adapter store inventory and wiring (issue #1139)
 
+Current rework: [production Axum startup and unsupported KV](./2026-11-19-adapter-store-inventory-rework-design.md).
+The baseline investigation below describes the original cutover; decisions and
+acceptance now account for #1635. Historical review entries retain their context.
+
 ## Problem
 
 Every adapter manifest declares stores. Several declarations have no working
@@ -56,8 +60,10 @@ branch (`spec/edgezero-pr275-migration` at `47a539528`, EdgeZero pin
 These decisions were recorded with the maintainer on 2026-11-18. D5 to D8
 resolve design review findings within those decisions.
 
-- **D1: Wire `trusted_server_kv` as an optional store on all four adapters.**
-  - Keep the declaration. When the binding exists, core's `kv_store()` reaches
+- **D1: Wire `trusted_server_kv` on Fastly, Cloudflare and Spin; leave Axum unsupported.**
+  - Keep the declaration for identity storage. Axum deliberately remains
+    `Unavailable` until #1587 → #1574 provide the EdgeZero-declared path.
+    On the other adapters, when the binding exists, core's `kv_store()` reaches
     it. When it is absent, every request is still served and KV operations
     return a typed `KvError` (`Unavailable` or `OpenFailed`), as today. A
     missing store never fails startup or routing.
@@ -119,7 +125,8 @@ resolve design review findings within those decisions.
 - **D8: Real-binding evidence for KV is limited, because no consumer exists
   yet.**
   - Automated real-binding tests: the Fastly KV round trip under Viceroy, the
-    Axum file-backed round trip and restart, and Spin discovery under
+    Axum context-path unavailable contract and production prepared startup,
+    and Spin discovery under
     `spin up`, which proves the `default` config path.
   - The Cloudflare and Spin KV bindings, the Spin signing private key, and the
     missing-binding cases are covered by runtime verification with a
@@ -129,16 +136,17 @@ resolve design review findings within those decisions.
 
 ### KV per adapter
 
-| Adapter    | Binding source                                                                                                                                                                                                                                                                       | Absent binding                                                                                       |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| Fastly     | `ctx.kv_store_default()`. EdgeZero registers it from the existing `Hooks::stores()` declaration and opens the store linked under `trusted_server_kv` on first use.                                                                                                                   | `KvError::OpenFailed`; requests are served.                                                          |
-| Cloudflare | `CloudflareKvStore::from_env(env, CLOUDFLARE_KV_BINDING)`, opened per request. The constant equals `wrangler.toml`'s `[[kv_namespaces]].binding`, and a test pins that. No `Hooks::stores()` is added, so no new `EDGEZERO__*` variable is needed.                                   | `UnavailableKvStore`, with one warning per isolate.                                                  |
-| Spin       | `Hooks::stores()` declares only `kv: trusted_server_kv`. EdgeZero opens the label `trusted_server_kv` lazily and never opens `default`. `spin.toml` does not list the label; operators opt in through `key_value_stores` and runtime config. `ts provision` adds the label for them. | `KvError::OpenFailed`; requests are served.                                                          |
-| Axum       | Opt-in `TRUSTED_SERVER_KV_PATH`, matching the adapter's `TRUSTED_SERVER_CONFIG_*` and `TRUSTED_SERVER_SECRET_*` variables, opens EdgeZero's `PersistentKvStore` once per process. Operations run on Tokio's blocking pool when a runtime is present, otherwise inline.               | Unset or unopenable: `UnavailableKvStore`, with a warning. The store is never opened during startup. |
+| Adapter    | Binding source                                                                                                                                                                                                                                                                       | Absent binding                                      |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
+| Fastly     | `ctx.kv_store_default()`. EdgeZero registers it from the existing `Hooks::stores()` declaration and opens the store linked under `trusted_server_kv` on first use.                                                                                                                   | `KvError::OpenFailed`; requests are served.         |
+| Cloudflare | `CloudflareKvStore::from_env(env, CLOUDFLARE_KV_BINDING)`, opened per request. The constant equals `wrangler.toml`'s `[[kv_namespaces]].binding`, and a test pins that. No `Hooks::stores()` is added, so no new `EDGEZERO__*` variable is needed.                                   | `UnavailableKvStore`, with one warning per isolate. |
+| Spin       | `Hooks::stores()` declares only `kv: trusted_server_kv`. EdgeZero opens the label `trusted_server_kv` lazily and never opens `default`. `spin.toml` does not list the label; operators opt in through `key_value_stores` and runtime config. `ts provision` adds the label for them. | `KvError::OpenFailed`; requests are served.         |
+| Axum       | No generic KV provider; prepared config and secrets are independent startup snapshots                                                                                                                                                                                                | `KvError::Unavailable`; requests are served         |
 
-Axum deliberately does not declare `Hooks::stores()`. EdgeZero's Axum dev
-server treats a declared KV store as required and would refuse to start
-without a writable `.edgezero/*.redb` file.
+Axum declares config and secrets through `Hooks::stores()`, but no KV provider.
+It loads these prepared stores once before listening; requests use immutable
+snapshots. Adding an adapter-local file store would conflict with the shared
+record backend and declared-store architecture.
 
 One `KvHandle` to `PlatformKvStore` bridge (`KvHandleStore`) in core replaces
 the private copies in the Cloudflare and Spin adapters, so Fastly does not add
@@ -176,8 +184,8 @@ It has one row for each of the following:
   deprecated `secret_store` selectors.
 - **Cloudflare Worker secrets** read through `env.secret()`, which no manifest
   declares.
-- **Axum environment bridges:** `TRUSTED_SERVER_CONFIG_*`,
-  `TRUSTED_SERVER_SECRET_*` and `TRUSTED_SERVER_KV_PATH`.
+- **Axum prepared stores:** config and active secret references are captured
+  once at startup; legacy environment bridges are not fallback inputs.
 
 Each row states its purpose, its startup and request-time consumer on each
 adapter, and the unsupported contract where one applies. The integration
@@ -191,7 +199,7 @@ Viceroy template's fixtures are listed as test-only.
 | Fastly service without the store linked                              | `Unavailable`; request served                     | `OpenFailed`; request served                           | Runtime verification under Viceroy with the local store removed                                                                            |
 | Cloudflare with and without `TRUSTED_SERVER_KV`                      | `Unavailable` both ways                           | Binding reached; absent binding gives `Unavailable`    | Test pinning the binding constant to `wrangler.toml`; runtime probe on `wrangler dev --local`                                              |
 | Spin with and without the `trusted_server_kv` label                  | `Unavailable` both ways                           | Label reached; absent label gives `OpenFailed`         | Test that `stores()` declares only KV; runtime probe on `spin up`                                                                          |
-| Axum with `TRUSTED_SERVER_KV_PATH` set, unset or unopenable          | `Unavailable`                                     | Persistent round trip; otherwise `Unavailable`         | Native tests, covering a restart read-back, the env-var name, and a run outside a Tokio runtime                                            |
+| Axum production prepared startup                                     | Generic KV unavailable                            | Remains unavailable pending #1587 → #1574              | Context-path regression and production startup/page probes                                                                                 |
 | Spin discovery with signing metadata in `default`                    | `500`                                             | `200` with the JWKS                                    | CI `spin_runtime_` integration test                                                                                                        |
 | Spin signed auction with the private key in an encoded variable      | Fails (no `current-kid`)                          | Signed request reaches the bidder                      | Runtime verification with a stub bidder                                                                                                    |
 | Cloudflare discovery and `/verify-signature`                         | `500` and `200 verified:false`, documented `real` | Same results, explained in the API reference and guide | Host route test, a documentation pin that cannot see the wasm path; runtime check on `wrangler dev`                                        |
@@ -257,3 +265,10 @@ Viceroy template's fixtures are listed as test-only.
   Declined: opening the Cloudflare binding lazily. The per-request cost is a
   few JS property reads, and a lazy wrapper would be wasm-only code that host
   tests cannot run.
+
+## Rework decision (2026-11-19)
+
+The former Axum file-store decisions and tests in the historical review log
+above are superseded. Keep `trusted_server_kv` for identity storage, leave Axum
+unsupported until #1587 → #1574, and preserve #1635 prepared-store startup.
+See the rework design and its review log for the current acceptance criteria.

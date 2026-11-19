@@ -41,7 +41,7 @@ use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -54,7 +54,7 @@ use crate::integrations::{
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt, to_openrtb_i32,
+    TrustedServerExt, User, UserExt, to_openrtb_i32, to_openrtb_user_eids,
 };
 #[cfg(test)]
 use crate::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
@@ -2122,7 +2122,13 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            let selected = if *name == COOKIE_EUCONSENT_V2 {
+                // Use the canonical name on the wire, including in cookies-only mode.
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = selected else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -2879,11 +2885,11 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs resolved from the KV identity graph and consent-gated
-                // in `handle_auction` via `gate_eids_by_consent`.
-                eids: request.user.eids.clone(),
             }
             .to_ext(),
+            // EIDs resolved from the KV identity graph and consent-gated
+            // in `handle_auction` via `gate_eids_by_consent`.
+            eids: to_openrtb_user_eids(request.user.eids.as_deref()),
             ..Default::default()
         });
 
@@ -3713,8 +3719,8 @@ mod tests {
         ProviderId, RoutingMode,
     };
     use crate::auction::test_support::{
-        canonical_parity_auction_request,
-        create_test_auction_context as shared_test_auction_context,
+        assert_no_user_eids, canonical_parity_auction_request,
+        create_test_auction_context as shared_test_auction_context, user_eids,
     };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -5559,6 +5565,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://primary.example.test/openrtb".to_string(),
@@ -5571,6 +5578,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://secondary.example.test/openrtb".to_string(),
@@ -6952,30 +6960,30 @@ external_bundle_sri = "sha384-AAAA"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();
@@ -6990,23 +6998,16 @@ external_bundle_sri = "sha384-AAAA"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
-        let ext_eids = &serialized["user"]["ext"]["eids"];
-        assert!(ext_eids.is_array(), "should populate user.ext.eids");
-        assert_eq!(ext_eids.as_array().unwrap().len(), 3, "should have 3 EIDs");
+        let eids = user_eids(&serialized, "prebid");
+        assert_eq!(eids.len(), 3, "should have 3 EIDs");
         assert_eq!(
-            ext_eids[0]["source"], "liveramp.com",
+            eids[0]["source"], "liveramp.com",
             "should include liveramp EID"
         );
+        assert_eq!(eids[1]["source"], "id5-sync.com", "should include id5 EID");
+        assert_eq!(eids[2]["source"], "google.com", "should include PAIR EID");
         assert_eq!(
-            ext_eids[1]["source"], "id5-sync.com",
-            "should include id5 EID"
-        );
-        assert_eq!(
-            ext_eids[2]["source"], "google.com",
-            "should include PAIR EID"
-        );
-        assert_eq!(
-            ext_eids[2]["uids"][0]["atype"], 571187,
+            eids[2]["uids"][0]["atype"], 571187,
             "should preserve PAIR's vendor-specific atype"
         );
     }
@@ -7028,10 +7029,7 @@ external_bundle_sri = "sha384-AAAA"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
-        assert!(
-            serialized["user"]["ext"]["eids"].is_null(),
-            "should omit user.ext.eids when no EIDs available"
-        );
+        assert_no_user_eids(&serialized, "prebid without EIDs");
     }
 
     #[test]
@@ -9034,6 +9032,7 @@ set = { networkId = 42 }
             providers: BTreeMap::from([(
                 provider_id.clone(),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example/openrtb2/auction".to_string(),
@@ -9923,6 +9922,16 @@ set = { networkId = 42 }
         for (input, expected, requires_body) in [
             ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
             (
+                "__Host-ts-tcf=TC-example",
+                Some("euconsent-v2=TC-example"),
+                false,
+            ),
+            (
+                "__Host-ts-tcf=bridge; euconsent-v2=publisher",
+                Some("euconsent-v2=publisher"),
+                false,
+            ),
+            (
                 "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
                 Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),
                 false,
@@ -10205,7 +10214,7 @@ set = { networkId = 42 }
         );
         assert_eq!(
             disabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
             "should preserve the complete disabled PBS wire shape"
         );
 
@@ -10243,7 +10252,7 @@ set = { networkId = 42 }
             serde_json::to_string(&enabled).expect("should serialize enabled PBS request");
         assert_eq!(
             enabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
         );
     }

@@ -27,7 +27,7 @@ use trusted_server_core::test_support::insert_outbound_client;
 use trusted_server_core::test_support::logging::LogCapture;
 use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
-    ScriptedHttpClient, ScriptedReply, TestClock,
+    RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
 };
 
 /// Build the full application router from explicit test settings.
@@ -1321,4 +1321,118 @@ async fn spin_ignores_host_override_with_warning() {
         ("origin.test-publisher.example.com", false),
         "should send the URI authority with no override"
     );
+}
+
+/// A partner API request carrying a Bearer token and a mapping body.
+fn partner_api_request(method: Method, path: &str) -> Request {
+    request_builder()
+        .method(method)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .header("authorization", "Bearer fictional-partner-token-0123456789")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mappings":[]}"#))
+        .expect("should build partner API request")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_origin_receives_publisher_fallback_requests() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/article"),
+        ScriptedReply::status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body("served by origin"),
+    );
+
+    let response = route_to_origin(test_router(), publisher_get("/article"), &origin).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should proxy the publisher page to the origin"
+    );
+    assert_eq!(
+        origin
+            .requests()
+            .iter()
+            .map(RecordedRequest::method_and_path)
+            .collect::<Vec<_>>(),
+        vec!["GET /article".to_owned()],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let origin = ScriptedHttpClient::forbidding();
+
+    let identify = route_to_origin(
+        test_router(),
+        partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let preflight = route_to_origin(
+        test_router(),
+        partner_api_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let batch_sync = route_to_origin(
+        test_router(),
+        partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        &origin,
+    )
+    .await;
+
+    assert_eq!(
+        identify.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "identify should answer 501 locally"
+    );
+    assert_eq!(
+        preflight.status(),
+        StatusCode::OK,
+        "identify preflight should answer locally"
+    );
+    assert_eq!(
+        batch_sync.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "batch sync should answer 501 locally"
+    );
+    origin.assert_no_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let origin = ScriptedHttpClient::forbidding();
+    let cases = [
+        (Method::HEAD, "/_ts/api/v1/identify"),
+        (Method::POST, "/_ts/api/v1/identify"),
+        (Method::PUT, "/_ts/api/v1/identify"),
+        (Method::PATCH, "/_ts/api/v1/identify"),
+        (Method::DELETE, "/_ts/api/v1/identify"),
+        (Method::GET, "/_ts/api/v1/batch-sync"),
+        (Method::HEAD, "/_ts/api/v1/batch-sync"),
+        (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+        (Method::PUT, "/_ts/api/v1/batch-sync"),
+        (Method::PATCH, "/_ts/api/v1/batch-sync"),
+        (Method::DELETE, "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases.clone() {
+        let response =
+            route_to_origin(test_router(), partner_api_request(method, path), &origin).await;
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
+    origin.assert_no_requests();
 }

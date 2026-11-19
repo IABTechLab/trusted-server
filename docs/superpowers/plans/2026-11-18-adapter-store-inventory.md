@@ -2,8 +2,9 @@
 
 Spec: [2026-11-18-adapter-store-inventory-design.md](../specs/2026-11-18-adapter-store-inventory-design.md).
 
-Base: `spec/edgezero-pr275-migration` (#1506). This work stacks on the cutover
-because #1506 rewrites every adapter `platform.rs` and `edgezero.toml`.
+Current base: `feat/1573-axum-production-serving` (#1635), merged without
+rebasing. The [rework plan](./2026-11-19-adapter-store-inventory-rework.md)
+supersedes the original Axum file-store task and local full-gate instruction.
 
 Each task follows red, then green, then refactor. A task's verify command must
 pass before the next task starts.
@@ -102,26 +103,14 @@ pass before the next task starts.
     and `cargo check-spin`.
   - The Spin wasm build, then the new integration test with Spin 4.1.0.
 
-## Task 5: Axum opt-in persistent KV
+## Task 5: Axum deliberately unsupported KV
 
-- `platform.rs`:
-  - `fn kv_store_from_path(path: Option<&Path>) -> Arc<dyn PlatformKvStore>`
-    opens `PersistentKvStore` behind `BlockingKvStore`. Without a path, or
-    when the open fails, it logs a warning and returns `UnavailableKvStore`.
-  - `fn kv_store_from_env()` reads `TRUSTED_SERVER_KV_PATH` and calls it.
-  - `build_runtime_services` caches the result in a `OnceLock`.
-  - `BlockingKvStore` runs each call with `spawn_blocking` plus `block_on`
-    when `tokio::runtime::Handle::try_current()` succeeds, and inline
-    otherwise.
-- Tests:
-  - A temp-dir path round-trips a value.
-  - Reopening the path after a drop reads the value back.
-  - `None` gives `Unavailable`.
-  - A path under a regular file gives `Unavailable`, not a panic.
-  - `kv_store_from_env` under `temp_env` covers both the set and unset cases.
-  - A round trip under `futures::executor::block_on`, outside any runtime.
-  - Add `tempfile` (workspace) to the dev-dependencies.
-- Verify: `cargo test-axum` and `cargo clippy-axum`.
+- Preserve #1635's immutable prepared config/secret snapshots and unavailable KV.
+- Remove the adapter-local file implementation and production `bytes` dependency;
+  keep `tempfile` for the production startup tests and do not restore `temp-env`.
+- Test unavailable reads and writes through an actual request context.
+- Runtime: production binary starts from prepared stores and serves publisher
+  pages while reporting KV unavailable. Support is deferred to #1587 → #1574.
 
 ## Task 6: Inventory and documentation
 
@@ -141,8 +130,8 @@ pass before the next task starts.
   - Signing private keys use encoded variables.
   - The opt-in KV label and the override warning (D7).
   - Correct lines 84-86.
-- `docs/guide/axum-dev.md`: describe `TRUSTED_SERVER_KV_PATH`, and correct the
-  reason EC lookup and key rotation are unsupported.
+- `docs/guide/axum-dev.md`: document unsupported KV pending #1587 → #1574,
+  prepared-store startup, and unsupported EC lookup and key rotation.
 - `docs/guide/fastly.md`: the purpose of `trusted_server_kv`, plus the
   dedicated-store requirement (D7).
 - `docs/guide/api-reference.md`: add a footnote for the Cloudflare discovery
@@ -157,12 +146,8 @@ pass before the next task starts.
     docs' pinned prettier.
   - The domain lint on changed lines.
 
-## Task 7: Full gate and runtime verification
+## Task 7: Targeted and runtime verification
 
-1. Run the CI gate list from `CLAUDE.md` with Rust 1.98.1, Node 24.20.0 and
-   Viceroy 0.21.0.
-2. Runtime verification (D8): Viceroy, `wrangler dev --local`, `spin up` and
-   Axum, each with and without the KV binding.
-   - Use a temporary probe build, never committed, to read and write KV.
-   - Also run a Spin signed auction against a stub bidder.
-   - Also send a publisher request on each adapter.
+Follow the rework plan's targeted test and real-runtime matrix. Full CI gates
+run in GitHub Actions, not locally. Preserve fixture-driven infrastructure
+proof separately from production identity persistence.

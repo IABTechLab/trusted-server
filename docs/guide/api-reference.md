@@ -16,12 +16,12 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -42,8 +42,9 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `OPTIONS`                                                  | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -336,8 +337,14 @@ with `degraded: true`. Every response is `no-store`, varies on `Origin` and
 below `[publisher].domain` receive reflected credentialed CORS for
 `GET, OPTIONS`; every other supplied origin receives `403`. `OPTIONS` returns
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
-The endpoint is Fastly-only and requires the EC store and a statically
-configured `[[ec.partners]]` token.
+The endpoint requires the EC store and a statically configured
+`[[ec.partners]]` token. Without an EC store, `GET` returns
+`501 {"error":"ec_store_not_configured"}` locally, after the same origin
+policy (`403` for a denied origin, reflected CORS for an allowed one). Only
+Fastly has an EC store today, so Axum, Cloudflare and Spin always answer `501`
+to `GET`; their `OPTIONS` preflight is still answered locally. Every other
+method returns `405` with `Allow: GET, OPTIONS`. No request on this path is
+proxied to the publisher origin.
 
 **Request:**
 
@@ -375,11 +382,17 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 **Contract:** The JSON body is limited to 2 MiB and 1,000 mappings. The
 per-partner, per-minute limit is `ec.partners[].batch_rate_limit`. Responses are
 `200` when every mapping is accepted or `207` when at least one is rejected;
-item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
-`kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
+item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`,
+`provider_owned` (the source belongs to a server-side identity provider),
+`row_full` (the EC's row would exceed its 16 KiB limit; retrying gives the
+same result), or `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
-or CORS headers. It is Fastly-only and requires the EC KV store.
+or CORS headers. It requires the EC KV store; without one it returns
+`501 {"error":"ec_store_not_configured"}` locally. Only Fastly has an EC store
+today, so Axum, Cloudflare and Spin always answer `501`. Every method other
+than `POST` returns `405 {"error":"method_not_allowed"}` with `Allow: POST`. No
+request on this path is proxied to the publisher origin.
 
 **Batch processing behavior:**
 
@@ -894,6 +907,7 @@ This lookup is implemented only by the Fastly adapter because the identity graph
 - `ec_id`, `store`, and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
+- Provider refresh state is private: every `refresh.state` in `entry` is shown as `"[redacted]"`, while `refresh.from` stays visible.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
 - `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
 - `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.

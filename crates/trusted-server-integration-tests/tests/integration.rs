@@ -2172,6 +2172,51 @@ fn spin_runtime_signs_auction_requests_with_an_encoded_private_key() {
                     .is_some_and(|signature| !signature.is_empty()),
                 "Spin should sign with the private key variable: {body}"
             );
+            let params = trusted_server_core::request_signing::SigningParams {
+                request_id: body["id"]
+                    .as_str()
+                    .expect("should send request id")
+                    .to_owned(),
+                request_host: trusted_server["request_host"]
+                    .as_str()
+                    .expect("should bind request host")
+                    .to_owned(),
+                request_scheme: trusted_server["request_scheme"]
+                    .as_str()
+                    .expect("should bind request scheme")
+                    .to_owned(),
+                timestamp: trusted_server["ts"]
+                    .as_u64()
+                    .expect("should bind timestamp"),
+            };
+            let payload = params
+                .build_payload("ts-2025-10-A")
+                .expect("should reconstruct the signed payload");
+            let client = reqwest::blocking::Client::new();
+            for (payload, expected) in [(payload.as_str(), true), ("tampered-payload", false)] {
+                let response = client
+                    .post(format!("{base_url}/verify-signature"))
+                    .json(&serde_json::json!({
+                        "kid": "ts-2025-10-A",
+                        "payload": payload,
+                        "signature": trusted_server["signature"],
+                    }))
+                    .send()
+                    .expect("should verify the captured auction signature");
+                assert_eq!(
+                    response.status().as_u16(),
+                    200,
+                    "should answer verification"
+                );
+                let verified: serde_json::Value = response
+                    .json()
+                    .expect("should decode signature verification");
+                assert_eq!(
+                    verified["verified"],
+                    serde_json::json!(expected),
+                    "should verify only the authentic payload against the JWK in default"
+                );
+            }
         },
     );
 }
@@ -2479,8 +2524,10 @@ fn axum_invalid_ingress_variable_fails_startup() {
     let envelope = common::config::integration_app_config_envelope(origin_port())
         .expect("should build the integration app config");
     let port = environments::find_available_port().expect("should reserve a port");
-    let mut child = environments::axum::AxumDevServer
+    let (mut command, _workspace) = environments::axum::AxumDevServer
         .command(&envelope, port)
+        .expect("should prepare isolated native config");
+    let mut child = command
         .env("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT", "0")
         .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
