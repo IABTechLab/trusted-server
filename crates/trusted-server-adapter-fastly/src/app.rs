@@ -3737,12 +3737,30 @@ mod tests {
     }
 
     fn identity_fixture_with(after_response: bool, sends_ec_id: bool) -> AfterResponseFixture {
+        build_identity_fixture(after_response, sends_ec_id, false, Duration::ZERO)
+    }
+
+    /// An app state that runs the echo provider in the page phase for a
+    /// mirrored partner, answering each lookup after `reply_delay`.
+    fn mirrored_page_identity_fixture(reply_delay: Duration) -> AfterResponseFixture {
+        build_identity_fixture(false, true, true, reply_delay)
+    }
+
+    fn build_identity_fixture(
+        after_response: bool,
+        sends_ec_id: bool,
+        mirror_enabled: bool,
+        reply_delay: Duration,
+    ) -> AfterResponseFixture {
         let provider_config: IdentityProviderConfig = toml::from_str(
             "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
         )
         .expect("should parse provider config");
         let partner: EcPartner = serde_json::from_value(serde_json::json!({
-            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true
+            "name": "ids",
+            "source_domain": "ids.example.com",
+            "bidstream_enabled": true,
+            "mirror_enabled": mirror_enabled
         }))
         .expect("should build partner");
         let mut settings = test_settings();
@@ -3775,7 +3793,7 @@ mod tests {
         let coordinator = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config, provider)],
             Arc::clone(&partners),
-            Duration::from_millis(200),
+            PAGE_LOOKUP_BUDGET,
         )
         .expect("should build coordinator");
         let coordinator = Some(Arc::new(coordinator));
@@ -3804,10 +3822,15 @@ mod tests {
         let client = ScriptedHttpClient::new(&clock);
         // One answer for each phase that may look up.
         for _ in 0..2 {
+            let reply = ScriptedReply::status(StatusCode::OK).body("p-1");
             client.respond_to(
                 Method::GET,
                 LOOKUP_URL,
-                ScriptedReply::status(StatusCode::OK).body("p-1"),
+                if reply_delay.is_zero() {
+                    reply
+                } else {
+                    reply.after(reply_delay)
+                },
             );
         }
         AfterResponseFixture {
@@ -3959,6 +3982,331 @@ mod tests {
             owned_uid(&fixture, &ec_id).as_deref(),
             Some("p-1"),
             "should write the provider UID in the write that creates the row"
+        );
+    }
+
+    /// The page-phase lookup budget of [`build_identity_fixture`]'s coordinator.
+    const PAGE_LOOKUP_BUDGET: Duration = Duration::from_millis(200);
+
+    /// A consented request from loopback carrying `ec_id`, if any.
+    fn consented_request(mut request: Request, ec_id: Option<&str>) -> Request {
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..ClientInfo::default()
+        });
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out grants consent.
+        let cookie = ec_id.map_or_else(
+            || "us_privacy=1YNN".to_owned(),
+            |ec_id| format!("us_privacy=1YNN; ts-ec={ec_id}"),
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("should build cookie header"),
+        );
+        request
+    }
+
+    /// Routes a request whose response carries EC state and finalizes it as
+    /// the entry point does, returning the response, whether page-phase
+    /// lookups were dispatched and how long finalization held the response
+    /// on the fixture's clock.
+    fn finalized_response(
+        fixture: &AfterResponseFixture,
+        request: Request,
+    ) -> (Response, bool, Duration) {
+        let router = TrustedServerApp::routes_for_state(&fixture.state);
+        super::take_navigation_lookups();
+        let mut response = route_with_host_geo(&router, request, &fixture.client);
+        let page = super::take_navigation_lookups().page;
+        let dispatched = page.is_some();
+        let mut ec_state = take_finalize_state(&mut response);
+        let clock = fixture.clock.monotonic_clock();
+        let started = clock.now();
+        fixture.clock.drive(crate::apply_edgezero_ec_finalize(
+            &fixture.state,
+            &mut ec_state,
+            page,
+            &mut response,
+        ));
+        let held = clock.now().duration_since(started);
+        (response, dispatched, held)
+    }
+
+    /// Routes and finalizes one navigation for a returning `ec_id`, returning
+    /// the finalized response and how long collection held it.
+    fn finalized_returning_navigation(
+        fixture: &AfterResponseFixture,
+        ec_id: &str,
+    ) -> (Response, Duration) {
+        let (response, dispatched, held) = finalized_response(
+            fixture,
+            consented_request(navigation_request("/article"), Some(ec_id)),
+        );
+        assert!(dispatched, "should dispatch page-phase lookups");
+        (response, held)
+    }
+
+    fn set_cookies(response: &Response) -> Vec<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn mirror_set_cookie(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|cookie| {
+                cookie.starts_with(&format!(
+                    "{}=",
+                    trusted_server_core::constants::COOKIE_TS_EIDS_MIRROR
+                ))
+            })
+            .map(str::to_owned)
+    }
+
+    /// The JSON of the mirror cookie `response` sets, if any.
+    fn decoded_mirror(response: &Response) -> Option<String> {
+        let cookie = mirror_set_cookie(response)?;
+        let value = cookie
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value)
+            .expect("should carry a mirror value");
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value)
+                .expect("should encode the mirror as unpadded base64url");
+        Some(String::from_utf8(decoded).expect("should encode the mirror as UTF-8 JSON"))
+    }
+
+    #[test]
+    fn page_lookup_within_the_deadline_reaches_the_record_and_the_mirror_cookie() {
+        // Arrange
+        let fixture = mirrored_page_identity_fixture(PAGE_LOOKUP_BUDGET / 4);
+        let ec_id = format!("{}.pg0002", "d".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (response, held) = finalized_returning_navigation(&fixture, &ec_id);
+
+        // Assert
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the navigation's page-load write"
+        );
+        let decoded = decoded_mirror(&response)
+            .expect("should set the mirror cookie on the navigation's response");
+        assert!(
+            decoded.contains("\"p-1\"") && decoded.contains("ids.example.com"),
+            "should mirror the provider UID found on this navigation, got {decoded}"
+        );
+        assert!(
+            held <= PAGE_LOOKUP_BUDGET,
+            "should not hold the response past the lookup deadline, held {held:?}"
+        );
+    }
+
+    #[test]
+    fn page_lookup_past_the_deadline_is_skipped_without_delaying_the_response() {
+        // Arrange
+        let fixture = mirrored_page_identity_fixture(PAGE_LOOKUP_BUDGET * 5);
+        let ec_id = format!("{}.pg0003", "e".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (response, held) = finalized_returning_navigation(&fixture, &ec_id);
+
+        // Assert
+        assert_eq!(
+            owned_uid(&fixture, &ec_id),
+            None,
+            "should skip a provider that misses the deadline"
+        );
+        assert_eq!(
+            mirror_set_cookie(&response),
+            None,
+            "should set no mirror cookie from a skipped lookup"
+        );
+        assert!(
+            held <= PAGE_LOOKUP_BUDGET,
+            "should release the response at the deadline, held {held:?}"
+        );
+    }
+
+    #[test]
+    fn identity_cookies_are_set_on_navigations_and_never_on_other_responses() {
+        // Arrange
+        let fixture = mirrored_page_identity_fixture(Duration::ZERO);
+        let ec_id = format!("{}.wb0001", "f".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let identity_cookie = |cookie: &str| {
+            [
+                trusted_server_core::constants::COOKIE_TS_EC,
+                trusted_server_core::constants::COOKIE_TS_EIDS,
+                trusted_server_core::constants::COOKIE_TS_EIDS_MIRROR,
+            ]
+            .iter()
+            .any(|name| cookie.starts_with(&format!("{name}=")))
+        };
+
+        // Act
+        let (new_visit, _, _) = finalized_response(
+            &fixture,
+            consented_request(navigation_request("/article"), None),
+        );
+        let (returning_visit, _, _) = finalized_response(
+            &fixture,
+            consented_request(navigation_request("/article"), Some(&ec_id)),
+        );
+        let others: Vec<(&str, Response)> = [
+            (
+                "subresource",
+                browser_request(Method::GET, "/article", "image"),
+                None,
+            ),
+            (
+                "subresource of a returning reader",
+                browser_request(Method::GET, "/article", "image"),
+                Some(ec_id.as_str()),
+            ),
+            (
+                "auction API",
+                browser_request(Method::POST, "/auction", "empty"),
+                Some(ec_id.as_str()),
+            ),
+            (
+                "page-bids API",
+                browser_request(Method::GET, "/_ts/page-bids", "empty"),
+                Some(ec_id.as_str()),
+            ),
+        ]
+        .into_iter()
+        .map(|(label, request, ec)| {
+            let (response, _, _) = finalized_response(&fixture, consented_request(request, ec));
+            (label, response)
+        })
+        .collect();
+
+        // Assert
+        assert!(
+            set_cookies(&new_visit)
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.starts_with("ts-ec=;")),
+            "should set ts-ec on the navigation that mints it, got {:?}",
+            set_cookies(&new_visit)
+        );
+        assert!(
+            mirror_set_cookie(&returning_visit).is_some(),
+            "should set the mirror on a returning reader's navigation, got {:?}",
+            set_cookies(&returning_visit)
+        );
+        for (label, response) in &others {
+            let cookies = set_cookies(response);
+            assert!(
+                !cookies.iter().any(|cookie| identity_cookie(cookie)),
+                "should set no identity cookie on the {label} response, got {cookies:?}"
+            );
+        }
+    }
+
+    /// The ID5 fetch URL for partner 1234 at the example endpoint.
+    const ID5_LOOKUP_URL: &str = "https://id5.example.com/gs/v2/1234.json";
+
+    /// An app state built from settings that enable the registered ID5
+    /// provider in the page phase for a mirrored partner.
+    fn id5_fixture() -> AfterResponseFixture {
+        let provider_config: IdentityProviderConfig = serde_json::from_value(serde_json::json!({
+            "id": "id5",
+            "kind": "id5",
+            "endpoint": "https://id5.example.com/gs/v2",
+            "allowed_domains": ["id5.example.com"],
+            "sources": ["id5.example.com"],
+            "settings": { "partner_id": 1234 },
+        }))
+        .expect("should parse the ID5 provider config");
+        let partner: EcPartner = serde_json::from_value(serde_json::json!({
+            "name": "id5",
+            "source_domain": "id5.example.com",
+            "bidstream_enabled": true,
+            "mirror_enabled": true
+        }))
+        .expect("should build the ID5 partner");
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings.ec.partners = vec![partner];
+        settings.ec.identity_providers = vec![provider_config];
+        let state = app_state_for_settings(settings);
+        let graph =
+            crate::require_identity_graph(&state.identity).expect("should open identity graph");
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::POST,
+            ID5_LOOKUP_URL,
+            ScriptedReply::status(StatusCode::OK).body(
+                serde_json::json!({
+                    "universal_uid": "id5-example-uid",
+                    "signature": "",
+                    "cache_control": { "max_age_sec": 3600 },
+                })
+                .to_string(),
+            ),
+        );
+        AfterResponseFixture {
+            state,
+            clock,
+            client,
+            graph,
+        }
+    }
+
+    #[test]
+    fn id5_lookup_reaches_the_minted_record_and_the_mirror_of_the_same_navigation() {
+        // Arrange
+        let fixture = id5_fixture();
+
+        // Act
+        let (response, dispatched, _) = finalized_response(
+            &fixture,
+            consented_request(navigation_request("/article"), None),
+        );
+
+        // Assert
+        assert!(dispatched, "should dispatch the ID5 lookup at navigation");
+        let ec_id = set_cookies(&response)
+            .iter()
+            .find_map(|cookie| {
+                cookie
+                    .strip_prefix("ts-ec=")
+                    .and_then(|rest| rest.split(';').next())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+            .expect("should set ts-ec on the navigation that mints it");
+        let snapshot = block_on(fixture.graph.load_snapshot(&ec_id));
+        let stored = snapshot
+            .entry_for(&ec_id)
+            .and_then(|entry| entry.ids.get("id5.example.com"))
+            .map(|record| record.uid.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("id5-example-uid"),
+            "should write the ID5 UID in the write that creates the record"
+        );
+        let decoded = decoded_mirror(&response)
+            .expect("should set the mirror cookie on the same navigation response");
+        assert!(
+            decoded.contains("id5-example-uid"),
+            "should mirror the ID5 UID found on this navigation, got {decoded}"
         );
     }
 
