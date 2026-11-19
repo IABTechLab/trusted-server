@@ -535,10 +535,16 @@ impl Running {
     fn exited(&mut self, start: Instant, grace: Duration) -> bool {
         loop {
             if let Some(status) = self.child.try_wait().expect("should observe exit") {
+                let elapsed = start.elapsed();
+                let limit = if status.success() {
+                    grace
+                } else {
+                    // Forced expiry is observed after the host's deadline fires.
+                    grace + Duration::from_millis(300)
+                };
                 assert!(
-                    start.elapsed() < grace + Duration::from_millis(300),
-                    "should exit within grace plus process scheduling tolerance: {:?}",
-                    start.elapsed()
+                    elapsed < limit,
+                    "should exit within the applicable grace bound: {elapsed:?} < {limit:?}"
                 );
                 return status.success();
             }
