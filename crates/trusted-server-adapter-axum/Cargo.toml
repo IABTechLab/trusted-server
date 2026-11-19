@@ -24,6 +24,7 @@ aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 aws-dynamodb-ec = ["edgezero-adapter-axum/aws-dynamodb-records"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -35,7 +36,6 @@ futures = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
@@ -51,6 +51,6 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
-edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.12-rc-records.202611.2", default-features = false, features = ["dynamodb-records"] }
+edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", rev = "9d02d7b3185b49e81d9ac972ca3feef932ed848a", default-features = false, features = ["dynamodb-records"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

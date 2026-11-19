@@ -178,11 +178,11 @@ pub(crate) async fn send_queued_batches(
     }
 }
 
-/// Logs one failed Tinybird send at warn, through [`outbound_error`], followed by `log_context`.
+/// Logs one failed Tinybird send at warn, as one line followed by `log_context`.
 ///
-/// `outbound_error` logs the failure's status, kind, budget source, and provider
-/// detail, never the error's message, which can hold provider text or a URL.
-/// This then logs the report with the `failed` step.
+/// The line is the [`outbound_error`] report with the `failed` step. The
+/// report carries the failure's budget source and provider detail, never the
+/// error's message, which can hold provider text or a URL.
 fn log_send_failure(error: EdgeError, failed: String, log_context: &dyn fmt::Display) {
     let report = outbound_error(
         error,
@@ -206,7 +206,7 @@ pub(crate) mod tests {
     use trusted_server_core::auction::telemetry::AuctionEventRow;
     use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::redacted::Redacted;
-    use trusted_server_core::test_support::logging::WarningCapture;
+    use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
     };
@@ -277,12 +277,13 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn test_services() -> RuntimeServices {
+    /// Services whose outbound requests go through `client`.
+    pub(crate) fn test_services(client: &ScriptedHttpClient) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(FastlyPlatformConfigStore::read_only()))
             .secret_store(Arc::new(FastlyPlatformSecretStore::read_only()))
             .kv_store(Arc::new(UnavailableKvStore))
-            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .outbound_client(client.http_client())
             .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
@@ -345,13 +346,17 @@ pub(crate) mod tests {
 
     #[test]
     fn sink_queues_ndjson_with_the_full_user_agent_and_sends_nothing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
-        futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(vec![test_row()])),
-        )
+        futures::executor::block_on(sink.emit_auction_events(
+            &test_services(&client),
+            AuctionEventBatch::new(vec![test_row()]),
+        ))
         .expect("should queue the batch");
+
+        client.assert_no_requests();
 
         let bodies = queue.take();
         let [body] = bodies.as_slice() else {
@@ -366,26 +371,31 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_batch_queues_nothing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
 
         futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(Vec::new())),
+            sink.emit_auction_events(&test_services(&client), AuctionEventBatch::new(Vec::new())),
         )
         .expect("should ignore the empty batch");
 
+        client.assert_no_requests();
         assert!(queue.take().is_empty(), "should queue no empty batch");
     }
 
     #[test]
     fn sink_rejects_a_row_count_oversize_before_queueing() {
+        let client = ScriptedHttpClient::forbidding();
         let queue = TelemetryQueue::default();
         let sink = QueueingTelemetrySink::new(&enabled_config(), queue.clone());
         let rows = vec![test_row(); TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH + 1];
 
         let result = futures::executor::block_on(
-            sink.emit_auction_events(&test_services(), AuctionEventBatch::new(rows)),
+            sink.emit_auction_events(&test_services(&client), AuctionEventBatch::new(rows)),
         );
+
+        client.assert_no_requests();
 
         assert!(
             result.is_err(),
@@ -460,7 +470,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn send_and_build_failures_log_through_outbound_error() {
+    fn send_and_build_failures_log_one_line_each() {
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client.respond_to(
@@ -470,7 +480,7 @@ pub(crate) mod tests {
         );
         let mut unbuildable = enabled_config();
         unbuildable.api_host = "api tinybird.example.com".to_owned();
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         clock.drive(send_queued_batches(
             &client.http_client(),
@@ -485,14 +495,15 @@ pub(crate) mod tests {
             &" [request=example]",
         ));
 
-        let warnings = capture.take();
-        let typed = warnings
+        let warnings = capture.take_all();
+        let messages: Vec<&str> = warnings
             .iter()
-            .filter(|warning| warning.message.starts_with("Outbound request failed with"))
-            .count();
+            .map(|warning| warning.message.as_str())
+            .collect();
         assert_eq!(
-            typed, 2,
-            "should log the send failure and the build failure through outbound_error"
+            messages.len(),
+            2,
+            "should log one line each for the send failure and the build failure, got {messages:?}"
         );
         for step in [
             "the Events API request for dataset auction_events_raw failed",
@@ -500,9 +511,10 @@ pub(crate) mod tests {
         ] {
             assert!(
                 warnings.iter().any(|warning| {
-                    warning
-                        .message
-                        .starts_with("Tinybird telemetry send failed:")
+                    warning.level == log::Level::Warn
+                        && warning
+                            .message
+                            .starts_with("Tinybird telemetry send failed:")
                         && warning.message.contains(step)
                         && warning.message.ends_with(" [request=example]")
                 }),

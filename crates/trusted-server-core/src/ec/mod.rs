@@ -7,12 +7,14 @@
 //!    context. This is called pre-routing on every request.
 //!
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
-//!    when none exists and consent allows it. This is called only in organic
-//!    handlers (publisher proxy, integration proxy) — never in read-only
-//!    endpoints like `/_ts/api/v1/identify`.
+//!    when none exists and consent allows it. This is called only for
+//!    publisher navigations — never in integration proxies or read-only
+//!    endpoints like `/_ts/api/v1/identify`. The new row is written by the
+//!    navigation's single page-load write in finalize ([`page_load`]).
 //!
 //! # Module structure
 //!
+//! - [`app`] — Identity app built once and shared by every adapter
 //! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
@@ -26,17 +28,26 @@
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`eid_types`] — Value types for full-fidelity provider EIDs
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
-//! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
+//! - [`page_load`] — Single-use page-load write permit and row changes
+//! - [`write_plan`] — Plans a navigation's single row change
+//! - [`provider`] — Identity provider interface and configuration
+//! - [`coordinator`] — Server-side identity lookup coordination
+//! - [`mirror`] — JS-readable mirror of provider-owned bidstream UIDs
 
 mod auth;
 
 pub mod admin;
+pub mod after_response;
+pub mod app;
 pub mod batch_sync;
 pub mod consent;
 pub mod consent_update;
 pub mod cookies;
+pub mod coordinator;
 pub mod device;
+pub mod eid_types;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
@@ -44,13 +55,16 @@ pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
+pub mod mirror;
+pub mod page_load;
 pub mod partner;
 pub mod prebid_eids;
-pub mod pull_sync;
-pub(crate) mod pull_sync_marker;
+pub mod provider;
 pub mod rate_limiter;
 pub mod record_backend;
 pub mod registry;
+pub mod sharedid;
+pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
 const LOG_ID_PREFIX_CHARS: usize = 8;
@@ -75,7 +89,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -85,9 +99,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
-use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
+use self::coordinator::results::LookupResults;
+use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
-use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
+use self::page_load::{AfterResponseWrite, NavigationPermit};
 
 /// Bounded request classifications that may persist browser EID cookies.
 ///
@@ -106,9 +121,6 @@ pub enum EidSyncSource {
     /// Admitted `GET /_ts/page-bids` SPA navigation.
     #[display("page_bids")]
     PageBids,
-    /// Request that generated a new EC identity during finalization.
-    #[display("new_ec")]
-    NewEc,
 }
 
 /// Request-scoped view of one EC identity-graph lookup.
@@ -184,10 +196,25 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
-    /// Pull-sync completeness marker, if present.
-    pull_sync_marker: Option<String>,
+    /// Whether the retired pull-sync completeness marker is present.
+    pull_marker_present: bool,
+    /// The mirror cookie's value, when present.
+    mirror_cookie: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
+}
+
+/// Returns the value of the first cookie named `name` across every Cookie
+/// header field of `req`.
+fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<String> {
+    req.headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(cookie::Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
 }
 
 /// Parses EC identity from request cookies in a single pass.
@@ -202,15 +229,16 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
-    let pull_sync_marker = jar
-        .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
-        .map(cookie::Cookie::value)
-        .map(str::to_owned);
+    // Browsers may split cookies across several Cookie fields, and the jar
+    // holds only the first, so every field is searched: a mirror or retired
+    // marker missed here would not be expired.
+    let pull_marker_present = find_cookie_in_any_field(req, COOKIE_TS_EC_PULL_COMPLETE).is_some();
+    let mirror_cookie = find_cookie_in_any_field(req, COOKIE_TS_EIDS_MIRROR);
 
     Ok(RequestEc {
         cookie_ec,
-        pull_sync_marker,
+        pull_marker_present,
+        mirror_cookie,
         jar,
     })
 }
@@ -240,6 +268,28 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
         log::trace!("Existing EC ID found: {}", log_id(id));
     }
     Ok(ec_id)
+}
+
+/// Holds the request's navigation permit. Cloning an [`EcContext`] never
+/// copies the permit, so only the original context can spend it.
+#[derive(Debug, Default)]
+struct PermitSlot(Option<NavigationPermit>);
+
+impl Clone for PermitSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+/// Holds the navigation's after-response permit. Like [`PermitSlot`],
+/// cloning an [`EcContext`] never copies it.
+#[derive(Debug, Default)]
+struct AfterResponsePermitSlot(Option<AfterResponseWrite>);
+
+impl Clone for AfterResponsePermitSlot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
 }
 
 /// Captures the EC state for a single request lifecycle.
@@ -280,10 +330,24 @@ pub struct EcContext {
     /// sent instead of being limited to whatever fits in the size-capped
     /// `ts-eids` cookie.
     client_eids: Option<Vec<Eid>>,
-    /// Browser-carried proof of recent pull-partner completeness.
-    pull_sync_marker: PullSyncMarkerState,
+    /// Whether the request carried the retired pull-sync marker cookie.
+    pull_marker_present: bool,
+    /// The mirror cookie's value, when the request carried it.
+    mirror_cookie: Option<String>,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Navigation permit issued by the router for page-load navigations.
+    navigation_permit: PermitSlot,
+    /// Permit for the navigation's follow-up write after its response, set
+    /// by finalize when it confirms the navigation permit.
+    after_response_permit: AfterResponsePermitSlot,
+    /// Validated provider lookup results collected for this navigation.
+    lookup_results: LookupResults,
+    /// New row built by [`Self::generate_if_needed`], written by finalize.
+    pending_entry: Option<Box<KvEntry>>,
+    /// Sources of identity providers whose first-party cookies on this
+    /// request record an opt-out; their IDs never leave the server for it.
+    cookie_opted_out_sources: Vec<String>,
 }
 
 impl EcContext {
@@ -364,16 +428,25 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
+            pull_marker_present: parsed.pull_marker_present,
+            mirror_cookie: parsed.mirror_cookie,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         })
     }
 
     /// Generates a new EC ID if none exists and consent allows it.
     ///
-    /// This is the second phase of the EC lifecycle. Call this only in
-    /// organic handlers (publisher proxy, integration proxy, auction) —
-    /// never in read-only endpoints.
+    /// This is the second phase of the EC lifecycle. Call this only for
+    /// publisher navigations — never in read-only endpoints.
+    ///
+    /// Never writes KV. When `kv` is available, the new row is held as the
+    /// pending entry and created by the navigation's single page-load write
+    /// in finalize; the EC is issued only if that write succeeds.
     ///
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
@@ -405,62 +478,31 @@ impl EcContext {
             })
         })?;
 
-        const MAX_CREATE_ATTEMPTS: usize = 5;
-        for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let ec_id = generation::generate_ec_id(settings, client_ip)?;
-            log::info!("Generated new EC ID: {}", log_id(&ec_id));
-            let now = current_timestamp();
-            let mut entry = KvEntry::new(
-                &self.consent,
-                self.geo_info.as_ref(),
-                now,
-                &settings.publisher.domain,
-            );
-            entry.device = self
-                .device_signals
-                .as_ref()
-                .map(DeviceSignals::to_kv_device);
+        let ec_id = generation::generate_ec_id(settings, client_ip)?;
+        log::info!("Generated new EC ID: {}", log_id(&ec_id));
+        let now = current_timestamp();
+        let mut entry = KvEntry::new(
+            &self.consent,
+            self.geo_info.as_ref(),
+            now,
+            &settings.publisher.domain,
+        );
+        entry.device = self
+            .device_signals
+            .as_ref()
+            .map(DeviceSignals::to_kv_device);
 
-            if let Some(graph) = kv {
-                match graph.create_if_absent(&ec_id, &entry).await {
-                    Ok(CreateIfAbsentOutcome::Written) => {
-                        self.kv_snapshot = EcKvSnapshot::Present {
-                            ec_id: ec_id.clone(),
-                            entry: Box::new(entry),
-                            generation: None,
-                        };
-                    }
-                    Ok(CreateIfAbsentOutcome::AlreadyExists) => {
-                        log::warn!(
-                            "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
-                            attempt + 1
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        log::error!(
-                            "Failed to create EC entry for id '{}' after generation: {err:?}",
-                            log_id(&ec_id),
-                        );
-                        return Err(err.change_context(TrustedServerError::EdgeCookie {
-                            message: "Failed to persist generated EC ID to KV identity graph"
-                                .to_string(),
-                        }));
-                    }
-                }
-            }
-
-            self.ec_value = Some(ec_id);
-            self.ec_generated = true;
-            self.pull_sync_marker.invalidate_for_replaced_ec();
-            return Ok(());
+        if kv.is_some() {
+            // The row is created by the navigation's single page-load write in
+            // finalize; a collision there leaves this EC unissued.
+            self.pending_entry = Some(Box::new(entry));
+            self.kv_snapshot = EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            };
         }
-
-        Err(Report::new(TrustedServerError::EdgeCookie {
-            message: format!(
-                "Failed to allocate a unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
-            ),
-        }))
+        self.ec_value = Some(ec_id);
+        self.ec_generated = true;
+        Ok(())
     }
 
     /// Returns the EC ID value, if present (either from request or generated).
@@ -572,41 +614,112 @@ impl EcContext {
         self.client_eids = Some(eids);
     }
 
+    /// Records the sources of identity providers whose first-party cookies on
+    /// this request record an opt-out.
+    ///
+    /// Every identity egress of the request withholds them: stored UIDs and
+    /// EIDs the browser supplies alike.
+    pub fn set_cookie_opted_out_sources(&mut self, sources: Vec<String>) {
+        self.cookie_opted_out_sources = sources;
+    }
+
+    /// Whether a provider's cookies on this request record an opt-out for
+    /// `source`.
+    #[must_use]
+    pub fn source_opted_out_in_cookies(&self, source: &str) -> bool {
+        self.cookie_opted_out_sources
+            .iter()
+            .any(|opted_out| opted_out.eq_ignore_ascii_case(source))
+    }
+
     /// Returns the current request's own EIDs, if the route captured any.
     #[must_use]
     pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
         self.client_eids.as_deref()
     }
 
-    /// Validates a browser completeness marker against the active EC and partner set.
-    pub(crate) fn validate_pull_sync_marker(
-        &mut self,
-        settings: &Settings,
-        registry: &registry::PartnerRegistry,
-    ) {
-        validate_marker_state(
-            &mut self.pull_sync_marker,
-            settings,
-            registry,
-            self.ec_value.as_deref(),
-        );
-    }
-
-    /// Returns the current pull-sync marker state.
+    /// Whether the request carried the retired pull-sync marker cookie.
     #[must_use]
-    pub(crate) fn pull_sync_marker(&self) -> &PullSyncMarkerState {
-        &self.pull_sync_marker
+    pub(crate) fn pull_marker_present(&self) -> bool {
+        self.pull_marker_present
     }
 
-    /// Returns mutable pull-sync marker state for response reconciliation.
-    pub(crate) fn pull_sync_marker_mut(&mut self) -> &mut PullSyncMarkerState {
-        &mut self.pull_sync_marker
+    /// Whether the request carried the mirror cookie.
+    #[must_use]
+    pub(crate) fn mirror_cookie_present(&self) -> bool {
+        self.mirror_cookie.is_some()
     }
 
-    /// Sets pull-sync marker state in focused unit tests.
+    /// The mirror cookie's value, when the request carried it.
+    #[must_use]
+    pub(crate) fn mirror_cookie(&self) -> Option<&str> {
+        self.mirror_cookie.as_deref()
+    }
+
+    /// Sets the mirror cookie the request carried, for tests.
     #[cfg(test)]
-    pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
-        self.pull_sync_marker = state;
+    pub(crate) fn set_mirror_cookie_for_test(&mut self, value: Option<&str>) {
+        self.mirror_cookie = value.map(str::to_owned);
+    }
+
+    /// Marks the retired pull-sync marker cookie as present, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_pull_marker_present_for_test(&mut self, present: bool) {
+        self.pull_marker_present = present;
+    }
+
+    /// Stores the navigation permit issued by the router.
+    pub fn set_navigation_permit(&mut self, permit: NavigationPermit) {
+        self.navigation_permit = PermitSlot(Some(permit));
+    }
+
+    /// Whether this request still holds its page-load write permit.
+    pub(crate) fn has_navigation_permit(&self) -> bool {
+        self.navigation_permit.0.is_some()
+    }
+
+    /// Takes the navigation permit; returns `None` after the first call.
+    pub(crate) fn take_navigation_permit(&mut self) -> Option<NavigationPermit> {
+        self.navigation_permit.0.take()
+    }
+
+    /// Stores the after-response permit confirmed with the navigation permit.
+    pub(crate) fn set_after_response_permit(&mut self, permit: AfterResponseWrite) {
+        self.after_response_permit = AfterResponsePermitSlot(Some(permit));
+    }
+
+    /// Takes the after-response permit; returns `None` when finalize did not
+    /// confirm a navigation, or after the first call.
+    pub fn take_after_response_permit(&mut self) -> Option<AfterResponseWrite> {
+        self.after_response_permit.0.take()
+    }
+
+    /// Takes the navigation permit, for adapter tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn take_navigation_permit_for_test(&mut self) -> Option<NavigationPermit> {
+        self.take_navigation_permit()
+    }
+
+    /// Stores validated provider lookup results for finalize.
+    pub fn set_lookup_results(&mut self, results: LookupResults) {
+        self.lookup_results = results;
+    }
+
+    /// Provider lookup results collected for this navigation.
+    pub(crate) fn lookup_results(&self) -> &LookupResults {
+        &self.lookup_results
+    }
+
+    /// Takes the row built by [`Self::generate_if_needed`].
+    /// The row this navigation creates for the EC it minted, until finalize
+    /// takes it.
+    #[must_use]
+    pub fn pending_entry(&self) -> Option<&KvEntry> {
+        self.pending_entry.as_deref()
+    }
+
+    pub(crate) fn take_pending_entry(&mut self) -> Option<KvEntry> {
+        self.pending_entry.take().map(|entry| *entry)
     }
 
     /// Replaces an orphaned active ID after its new backing row is persisted.
@@ -614,7 +727,6 @@ impl EcContext {
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
         self.kv_snapshot = snapshot;
-        self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
     /// Returns whether EC creation is permitted by consent for this request.
@@ -665,8 +777,14 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -690,8 +808,14 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -718,8 +842,14 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             client_eids: None,
-            pull_sync_marker: PullSyncMarkerState::Absent,
+            pull_marker_present: false,
+            mirror_cookie: None,
             eid_sync_source: None,
+            navigation_permit: PermitSlot::default(),
+            after_response_permit: AfterResponsePermitSlot::default(),
+            lookup_results: LookupResults::default(),
+            pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 }
@@ -730,7 +860,8 @@ impl EcContext {
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
 /// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
 /// available.
-pub(crate) fn current_timestamp() -> u64 {
+#[must_use]
+pub fn current_timestamp() -> u64 {
     checked_current_timestamp().unwrap_or(0)
 }
 
@@ -768,72 +899,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
-    use crate::ec::kv_backend::{
-        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
-    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
-
-    /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
-    /// precondition failure, forcing generation to retry with a fresh suffix.
-    struct AddCollidingEcKv {
-        inner: InMemoryEcKv,
-        collisions_remaining: std::sync::Mutex<u32>,
-    }
-
-    impl AddCollidingEcKv {
-        fn new(collisions: u32) -> Self {
-            Self {
-                inner: InMemoryEcKv::new("add-colliding-store"),
-                collisions_remaining: std::sync::Mutex::new(collisions),
-            }
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl EcKvStore for AddCollidingEcKv {
-        fn store_name(&self) -> &str {
-            self.inner.store_name()
-        }
-        async fn lookup(
-            &self,
-            key: &str,
-        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key).await
-        }
-        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key).await
-        }
-
-        async fn insert(
-            &self,
-            key: &str,
-            write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            if matches!(write.mode, EcKvWriteMode::Add) {
-                let mut remaining = self
-                    .collisions_remaining
-                    .lock()
-                    .expect("should lock collision counter");
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Ok(EcKvWriteOutcome::PreconditionFailed);
-                }
-            }
-            self.inner.insert(key, write).await
-        }
-        async fn list_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit).await
-        }
-        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key).await
-        }
-    }
 
     fn granting_consent() -> ConsentContext {
         ConsentContext {
@@ -844,38 +911,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn generate_if_needed_retries_id_collision_then_persists() {
+    async fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
         let settings = create_test_settings();
-        let mut ec =
-            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
-        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            None,
+            granting_consent(),
+            Some("192.0.2.10".to_owned()),
+        );
+        let graph = KvIdentityGraph::in_memory("gen");
 
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec_context
+            .generate_if_needed(&settings, Some(&graph))
             .await
-            .expect("should generate after bounded collisions");
+            .expect("should mint EC");
 
-        assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
-        assert!(ec.ec_generated(), "should mark the EC as generated");
+        let ec_id = ec_context.ec_value().expect("should set EC").to_owned();
         assert!(
-            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
-            "generation should seed a present snapshot"
+            graph.get(&ec_id).await.expect("should read").is_none(),
+            "should not write during generation"
+        );
+        assert!(
+            ec_context.take_pending_entry().is_some(),
+            "should hold the new row for finalize"
+        );
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. }),
+            "should record missing row"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn generate_if_needed_errors_after_collision_exhaustion() {
-        let settings = create_test_settings();
-        let mut ec =
-            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()));
-        // Collide on every attempt so the bounded retry is exhausted.
-        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
+    #[test]
+    fn cloned_context_never_carries_the_navigation_permit() {
+        let mut ec_context = EcContext::default();
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
 
-        let result = ec.generate_if_needed(&settings, Some(&graph)).await;
+        let mut clone = ec_context.clone();
 
-        assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
-            ec.ec_value().is_none() && !ec.ec_generated(),
-            "must not activate an EC ID it could not persist"
+            clone.take_navigation_permit().is_none(),
+            "should drop permit on clone"
+        );
+        assert!(
+            ec_context.take_navigation_permit().is_some(),
+            "should keep permit on original"
         );
     }
 
@@ -979,6 +1057,37 @@ mod tests {
         assert_eq!(snapshot.generation_for("ec-1"), None);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn leftover_pull_marker_is_expired() {
+        let settings = create_test_settings();
+        let req = create_test_request(&[("cookie", "ts-ec-pull-complete=x")]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+        let mut response = http::Response::new(EdgeBody::empty());
+
+        finalize::ec_finalize_response(
+            &settings,
+            &mut ec,
+            None,
+            &registry::PartnerRegistry::empty(),
+            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
+            &mut response,
+        )
+        .await;
+
+        assert!(
+            response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=;")
+                    && cookie.contains("Max-Age=0")),
+            "should expire the leftover marker"
+        );
+    }
+
     #[test]
     fn read_from_request_ignores_header_ec() {
         let settings = create_test_settings();
@@ -992,6 +1101,37 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_finds_the_pull_marker_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let marker = format!("{COOKIE_TS_EC_PULL_COMPLETE}=1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &marker)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(
+            ec.pull_marker_present(),
+            "should detect the retired pull marker in a later Cookie field"
+        );
+    }
+
+    #[test]
+    fn read_from_request_finds_the_mirror_in_a_later_cookie_field() {
+        let settings = create_test_settings();
+        let mirror = format!("{COOKIE_TS_EIDS_MIRROR}=m-1");
+        let req = create_test_request(&[("cookie", "other=1"), ("cookie", &mirror)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.mirror_cookie(),
+            Some("m-1"),
+            "should capture the mirror from a later Cookie field"
+        );
     }
 
     #[test]

@@ -17,19 +17,22 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::constants::COOKIE_TS_EIDS;
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
-use trusted_server_core::edge_app::install_edge_policies;
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -66,6 +69,10 @@ pub struct AppState {
     pub(crate) settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built once. The dev server has no EC record store and
+    /// applies no rate limit: its deployer limits traffic at the load
+    /// balancer.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
     partners: PartnerRegistry,
     ec_graph: Option<Arc<dyn Fn() -> KvIdentityGraph + Send + Sync>>,
@@ -87,15 +94,20 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
     let partners = PartnerRegistry::from_config(&settings.ec.partners)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
         partners,
         ec_graph: None,
@@ -235,7 +247,7 @@ struct NativeEcRequest {
     graph: Option<KvIdentityGraph>,
     browser: bool,
     eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
+    sharedid: SharedIdRequest,
 }
 
 impl NativeEcRequest {
@@ -252,7 +264,10 @@ impl NativeEcRequest {
             graph: state.identity_graph(),
             browser,
             eids_cookie: cookie_value(req, COOKIE_TS_EIDS),
-            sharedid_cookie: cookie_value(req, COOKIE_SHAREDID),
+            sharedid: SharedIdRequest::from_request(
+                state.identity.sharedid_storage().cookie_name(),
+                req,
+            ),
         })
     }
 
@@ -268,7 +283,7 @@ impl NativeEcRequest {
             graph,
             &state.partners,
             self.eids_cookie.as_deref(),
-            self.sharedid_cookie.as_deref(),
+            &self.sharedid,
             &mut response,
         )
         .await;
@@ -377,9 +392,6 @@ async fn dispatch_ec_route(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: graph,
-                allow_generation: false,
-                ec_context: &mut ec.context,
                 services,
                 req,
             })
@@ -393,10 +405,20 @@ async fn dispatch_ec_route(
             let navigation = method == Method::GET
                 && is_navigation_request(&req)
                 && state.settings.asset_route_for_path(&path).is_none();
+            let mut has_permit = false;
             if navigation {
                 ec.context.set_eid_sync_source(EidSyncSource::Navigation);
+                // The page-load write permit uses the stricter Fetch Metadata
+                // test (spec §3.1); requests without it never write KV.
+                if let Some(permit) = NavigationPermit::classify(&req) {
+                    ec.context.set_navigation_permit(permit);
+                    has_permit = true;
+                }
             }
-            let eligible = navigation && ec.browser && graph.is_some();
+            // A new EC is minted only when this request may also write its
+            // row, so a client without Fetch Metadata never receives a
+            // throwaway EC.
+            let eligible = navigation && has_permit && ec.browser && graph.is_some();
             if eligible
                 && let Err(error) = ec.context.generate_if_needed(&state.settings, graph).await
             {
@@ -466,15 +488,14 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    Identify,
+    BatchSync,
     Auction,
     PageBids,
     ConsentUpdate,
-    Identify,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -497,7 +518,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
@@ -513,11 +534,6 @@ fn named_routes() -> [NamedRoute; 19] {
                 Method::CONNECT,
             ],
             handler: NamedRouteHandler::ConsentUpdate,
-        },
-        NamedRoute {
-            path: "/_ts/api/v1/identify",
-            primary_methods: &[Method::GET, Method::OPTIONS],
-            handler: NamedRouteHandler::Identify,
         },
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -550,26 +566,6 @@ fn named_routes() -> [NamedRoute; 19] {
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::CachePurgeNotSupported,
         },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
-        },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
         // basic-auth handler regex `^/_ts/admin` does not match them, and letting
@@ -585,6 +581,20 @@ fn named_routes() -> [NamedRoute; 19] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: the dev server has no EC record store, so identify and
+        // batch sync answer 501 and any other method answers 405.
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::Identify,
+        },
+        NamedRoute {
+            path: "/_ts/api/v1/batch-sync",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::BatchSync,
         },
         NamedRoute {
             path: "/auction",
@@ -682,31 +692,24 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // Enabling native operator EC diagnostics is separate
-                        // from the browser/server lifecycle.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        handle_admin_eids_lookup(&state.partners, &req)
-                    }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::ConsentUpdate => {
                         dispatch_ec_route(&state, &services, req, EcRoute::ConsentUpdate).await
                     }
+                    NamedRouteHandler::BatchSync => Ok(answer_batch_sync_locally(&req)),
                     NamedRouteHandler::Identify => {
                         // Read-only identity lookup never enters generation or
                         // response finalization, including cookie ingestion.
+                        // Every method is claimed so a partner's Bearer token never
+                        // reaches the publisher origin. `GET` reads the native EC
+                        // record store when one is selected; without one, and for
+                        // any other method, identify is answered locally.
                         if req.method() == Method::OPTIONS {
                             cors_preflight_identify(&state.settings, &req)
-                        } else {
+                        } else if let (true, Some(graph)) =
+                            (req.method() == Method::GET, state.identity_graph())
+                        {
                             let context = build_ec_context(&state, &services, &req)?;
-                            let graph = state.identity_graph().ok_or_else(|| {
-                                Report::new(TrustedServerError::KvStore {
-                                    store_name: "native EC".to_owned(),
-                                    message: "native EC provider is not selected".to_owned(),
-                                })
-                            })?;
                             handle_identify(
                                 &state.settings,
                                 &graph,
@@ -715,6 +718,8 @@ fn named_route_handler(
                                 &context,
                             )
                             .await
+                        } else {
+                            answer_identify_locally(&state.settings, &req)
                         }
                     }
                     NamedRouteHandler::Auction => {
@@ -773,7 +778,7 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)?;
+        install_edge_policies(app, synthesized_response_headers())?;
         crate::record_ec::configure(app)
     }
 
@@ -796,12 +801,27 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: crate::record_ec::metadata(),
+            kv: kv_store_metadata(),
         }
     }
+}
 
-    fn owns_logging() -> bool {
-        true
+/// Declares the native EC record store and the Geo KV store when selected.
+///
+/// The EC record store is the default when both are selected.
+fn kv_store_metadata() -> Option<StoreMetadata> {
+    let geo = crate::native_geo::kv_selected();
+    match (crate::record_ec::metadata(), geo) {
+        (Some(_), true) => Some(StoreMetadata {
+            default: crate::record_ec::STORE_ID,
+            ids: &[crate::record_ec::STORE_ID, crate::native_geo::GEO_STORE_ID],
+        }),
+        (Some(ec), false) => Some(ec),
+        (None, true) => Some(StoreMetadata {
+            default: crate::native_geo::GEO_STORE_ID,
+            ids: &[crate::native_geo::GEO_STORE_ID],
+        }),
+        (None, false) => None,
     }
 }
 
@@ -947,6 +967,11 @@ pub(crate) fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         )
     });
 
+    // The core identity app registers `GET` on the admin EC and EIDs lookups;
+    // without a record store, admin EC lookup answers 501. Their other methods
+    // reach the catch-all fallback, which denies admin diagnostics locally.
+    router = state.identity.mount(router);
+
     for route in named_routes() {
         for method in route.primary_methods {
             router = router.route(
@@ -993,9 +1018,11 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
         geo: None,
     }
 }
+
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
@@ -1008,6 +1035,23 @@ mod trace_dispatch_tests {
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::{TrustedClientIpConfig, TrustedForwarderConfig};
     use trusted_server_core::trace::TraceTerminalResponse;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = trace_settings(false);
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Axum"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     fn trace_settings(enabled: bool) -> Settings {
         Settings::from_toml(&format!(
