@@ -28,7 +28,8 @@
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
-//! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | OPTIONS | `/_ts/api/v1/identify` | [`answer_identify_locally`] (CORS preflight) |
+//! | other | `/_ts/api/v1/identify`, `/_ts/api/v1/batch-sync` | `405` with `Allow` |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -110,10 +111,10 @@ use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
@@ -672,19 +673,19 @@ async fn run_named_route(
             unreachable!("batch-sync should be handled by run_batch_sync")
         }
         NamedRouteHandler::Identify => {
-            if req.method() == Method::OPTIONS {
-                cors_preflight_identify(&state.settings, &req)
-            } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                handle_identify(
-                    &state.settings,
-                    &kv,
-                    &partner_registry,
-                    &req,
-                    &ec.ec_context,
-                )
-            }
+            let identity_graph = crate::maybe_identity_graph(&state.settings)
+                .filter(|_| req.method() == Method::GET);
+            let Some(kv) = identity_graph else {
+                return answer_identify_locally(&state.settings, &req);
+            };
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            handle_identify(
+                &state.settings,
+                &kv,
+                &partner_registry,
+                &req,
+                &ec.ec_context,
+            )
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
@@ -760,15 +761,20 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
-    let result = async {
-        let kv = crate::require_identity_graph(&state.settings)?;
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req).await
-    }
-    .await;
-
-    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    let identity_graph =
+        crate::maybe_identity_graph(&state.settings).filter(|_| req.method() == Method::POST);
+    let mut response = match identity_graph {
+        None => answer_batch_sync_locally(&req),
+        Some(kv) => {
+            let result = async {
+                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                handle_batch_sync(&kv, &partner_registry, &limiter, req).await
+            }
+            .await;
+            result.unwrap_or_else(|e| http_error(&e))
+        }
+    };
     // Legacy parity: batch-sync responses still pass through
     // ec_finalize_response with a default EC context and no finalize KV graph.
     response.extensions_mut().insert(EcFinalizeState {
@@ -1126,14 +1132,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
     },
+    // Partner APIs claim every method so no request on these paths, nor the
+    // partner's Bearer token, reaches the publisher. The handlers answer
+    // methods other than the primary ones with 405.
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
-        primary_methods: &[Method::POST],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::BatchSync,
     },
     NamedRoute {
         path: "/_ts/api/v1/identify",
-        primary_methods: &[Method::GET, Method::OPTIONS],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::Identify,
     },
     NamedRoute {
@@ -1424,7 +1433,7 @@ mod tests {
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
-        ScriptedHttpClient, ScriptedReply, TestClock,
+        RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
     use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
 
@@ -1518,16 +1527,22 @@ mod tests {
             .expect("should build request")
     }
 
-    fn route(router: &RouterService, mut request: edgezero_core::http::Request) -> Response {
+    fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
         // `oneshot` skips `EdgeZero`'s request conversion, which installs the
         // adapter's default client, so install one that fails every request.
-        // It also skips the entry point's `prepare`, so add the client info and
-        // the geo `prepare` would hold for the request's client IP, without host
-        // geo data.
-        insert_outbound_client(
-            &mut request,
-            HttpClient::with_client(ScriptedHttpClient::forbidding()),
-        );
+        route_through(router, request, &ScriptedHttpClient::forbidding())
+    }
+
+    /// Routes `request` with `origin` as its outbound client.
+    fn route_through(
+        router: &RouterService,
+        mut request: edgezero_core::http::Request,
+        origin: &ScriptedHttpClient,
+    ) -> Response {
+        // `oneshot` also skips the entry point's `prepare`, so add the client
+        // info and the geo `prepare` would hold for the request's client IP,
+        // without host geo data.
+        insert_outbound_client(&mut request, HttpClient::with_client(origin.clone()));
         let client_ip = request
             .extensions_mut()
             .get_or_insert_default::<ClientInfo>()
@@ -2765,40 +2780,136 @@ mod tests {
         );
     }
 
+    fn partner_api_request(method: Method, path: &str) -> edgezero_core::http::Request {
+        request_builder()
+            .method(method)
+            .uri(format!("https://publisher.example.com{path}"))
+            .header("host", "publisher.example.com")
+            .header("authorization", "Bearer fictional-partner-token-0123456789")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mappings":[]}"#))
+            .expect("should build partner API request")
+    }
+
+    fn partner_api_statuses(
+        router: &RouterService,
+        origin: &ScriptedHttpClient,
+    ) -> [StatusCode; 2] {
+        [
+            route_through(
+                router,
+                partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+                origin,
+            )
+            .status(),
+            route_through(
+                router,
+                partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+                origin,
+            )
+            .status(),
+        ]
+    }
+
     #[test]
-    fn dispatch_identify_get_routes_to_identity_handler() {
-        // Parity guard: GET /_ts/api/v1/identify must reach the identify
-        // handler chain. The test settings configure no ec.ec_store, so
-        // require_identity_graph fails with a KvStore error (503) — proving
-        // the request was NOT proxied to the publisher origin.
+    fn scripted_origin_receives_publisher_fallback_requests() {
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        origin.respond_to(
+            Method::GET,
+            &format!("{}/article", test_settings().publisher.origin_url),
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "text/plain")
+                .body("served by origin"),
+        );
         let router = test_router();
-        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
+
+        let response = route_through(&router, empty_request(Method::GET, "/article"), &origin);
 
         assert_eq!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "GET identify without ec_store should fail with the KvStore error, not a publisher proxy error"
+            StatusCode::OK,
+            "should proxy the publisher page to the origin"
+        );
+        assert_eq!(
+            origin
+                .requests()
+                .iter()
+                .map(RecordedRequest::method_and_path)
+                .collect::<Vec<_>>(),
+            vec!["GET /article".to_owned()],
+            "should record the proxied publisher request"
         );
     }
 
     #[test]
-    fn dispatch_batch_sync_routes_to_batch_sync_handler() {
-        // Parity guard: POST /_ts/api/v1/batch-sync must reach the batch-sync
-        // handler chain instead of forwarding the request (body and
-        // Authorization header included) to the publisher origin. With no
-        // ec.ec_store configured, require_identity_graph fails with a KvStore
-        // error (503).
+    fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+        let origin = ScriptedHttpClient::forbidding();
         let router = test_router();
-        let response = route(
-            &router,
-            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
-        );
+
+        let statuses = partner_api_statuses(&router, &origin);
 
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "POST batch-sync without ec_store should fail with the KvStore error, not reach the publisher"
+            statuses,
+            [StatusCode::NOT_IMPLEMENTED; 2],
+            "identify and batch sync should answer 501 without ec.ec_store"
         );
+        origin.assert_no_requests();
+    }
+
+    #[test]
+    fn identify_and_batch_sync_answer_other_methods_405_locally() {
+        let cases = [
+            (Method::HEAD, "/_ts/api/v1/identify"),
+            (Method::POST, "/_ts/api/v1/identify"),
+            (Method::PUT, "/_ts/api/v1/identify"),
+            (Method::PATCH, "/_ts/api/v1/identify"),
+            (Method::DELETE, "/_ts/api/v1/identify"),
+            (Method::GET, "/_ts/api/v1/batch-sync"),
+            (Method::HEAD, "/_ts/api/v1/batch-sync"),
+            (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+            (Method::PUT, "/_ts/api/v1/batch-sync"),
+            (Method::PATCH, "/_ts/api/v1/batch-sync"),
+            (Method::DELETE, "/_ts/api/v1/batch-sync"),
+        ];
+        for ec_store in [None, Some("ec_identity_store".to_owned())] {
+            let origin = ScriptedHttpClient::forbidding();
+            let mut settings = test_settings();
+            settings.ec.ec_store = ec_store.clone();
+            let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings));
+
+            let statuses: Vec<StatusCode> = cases
+                .iter()
+                .map(|(method, path)| {
+                    route_through(&router, partner_api_request(method.clone(), path), &origin)
+                        .status()
+                })
+                .collect();
+
+            assert_eq!(
+                statuses,
+                vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+                "should answer every other partner API method with 405 (ec_store {ec_store:?}): {cases:?}"
+            );
+            origin.assert_no_requests();
+        }
+    }
+
+    #[test]
+    fn identify_and_batch_sync_run_locally_with_record_store() {
+        let origin = ScriptedHttpClient::forbidding();
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings));
+
+        let statuses = partner_api_statuses(&router, &origin);
+
+        assert_eq!(
+            statuses,
+            [StatusCode::UNAUTHORIZED; 2],
+            "identify and batch sync should run and reject the unknown partner token"
+        );
+        origin.assert_no_requests();
     }
 
     #[test]

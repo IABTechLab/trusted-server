@@ -127,6 +127,53 @@ pub async fn handle_batch_sync(
     handle_batch_sync_with_writer(kv, registry, rate_limiter, req).await
 }
 
+/// Builds the local `501 Not Implemented` response for
+/// `POST /_ts/api/v1/batch-sync` on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request, with its Bearer token
+/// and mapping body, to the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn batch_sync_not_supported() -> Response<EdgeBody> {
+    error_response(StatusCode::NOT_IMPLEMENTED, "ec_store_not_configured")
+}
+
+/// Builds the local `405 Method Not Allowed` response for a method other than
+/// `POST` on `/_ts/api/v1/batch-sync`.
+///
+/// Adapters claim every method on the batch-sync path and answer the others
+/// with this response, so no request on the path reaches the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn batch_sync_method_not_allowed() -> Response<EdgeBody> {
+    let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    response
+        .headers_mut()
+        .insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
+    response
+}
+
+/// Answers a batch-sync request locally, without the EC record store.
+///
+/// `POST` returns [`batch_sync_not_supported`]; every other method returns
+/// [`batch_sync_method_not_allowed`].
+#[must_use]
+pub fn answer_batch_sync_locally(req: &Request<EdgeBody>) -> Response<EdgeBody> {
+    if req.method() == http::Method::POST {
+        batch_sync_not_supported()
+    } else {
+        batch_sync_method_not_allowed()
+    }
+}
+
 async fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
@@ -322,6 +369,58 @@ mod tests {
         let valid = format!("{}.ABC123", "a".repeat(64));
         assert!(is_valid_ec_id(&valid));
         assert!(!is_valid_ec_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn batch_sync_not_supported_returns_501() {
+        let response = batch_sync_not_supported();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
+        );
+    }
+
+    fn local_batch_sync_request(method: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method(method)
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer fictional-partner-token-0123456789")
+            .body(EdgeBody::from(r#"{"mappings":[]}"#))
+            .expect("should build local batch-sync request")
+    }
+
+    #[test]
+    fn answer_batch_sync_locally_dispatches_by_method() {
+        let post = answer_batch_sync_locally(&local_batch_sync_request("POST"));
+
+        assert_eq!(
+            post.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "POST should answer 501 without a record store"
+        );
+        for method in ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let response = answer_batch_sync_locally(&local_batch_sync_request(method));
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} batch sync should answer 405"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method} batch sync should advertise POST"
+            );
+        }
     }
 
     struct MockRateLimiter {
