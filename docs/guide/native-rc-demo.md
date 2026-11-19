@@ -1,12 +1,34 @@
-# Native prepared startup
+# Axum production startup
 
-The native adapter uses the workspace EdgeZero pin,
-`9d02d7b3185b49e81d9ac972ca3feef932ed848a` on EdgeZero's `rc/identity`
-branch; see [the pinned version](./edgezero#pinned-version). It retains PR
-#1506's direct outbound API and current-main application behavior. Historical
-demo results do not qualify this combination.
+The Axum binary loads its config and secrets once, before it listens, from
+stores that EdgeZero prepares: local files for development, or AWS AppConfig
+and Secrets Manager in production. A missing or invalid input stops the process
+with a non-zero exit before the port opens. On SIGTERM the server stops
+accepting connections and finishes in-flight requests within a configured
+grace.
 
-## Prepared startup
+The adapter uses the workspace EdgeZero pin; see
+[the pinned version](./edgezero#pinned-version).
+
+## Run locally
+
+From the repository root, with `ts` built from this checkout:
+
+```sh
+cp trusted-server.example.toml trusted-server.toml
+ts config push --adapter axum --local --no-diff --yes
+EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
+EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \
+EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)" \
+EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
+  cargo run -p trusted-server-adapter-axum
+```
+
+Leave one secret variable out to see startup fail before listening; the error
+names the missing reference. [Getting started](./getting-started)
+covers the development overlay and port settings.
+
+## Startup sequence
 
 The binary is `trusted-server-axum` in package
 `trusted-server-adapter-axum`. EdgeZero owns provider preparation, the production
@@ -39,11 +61,12 @@ validation and publication still reject those entries. The native loader uses
 TS's runtime validation policy, not operator publication validation.
 
 Request-time store management writes, persistent signing-key management and
-automatic key rotation are unavailable. Unsupported configured consumers fail
-at startup. This unit adds no native EC persistence or reader Geo. An AWS region
-is not a visitor's geography. Missing Geo retains existing consent behavior.
+automatic key rotation are unavailable. Unsupported configured consumers, such
+as enabled request signing, fail at startup. Axum has no Edge Cookie record
+store or visitor geo yet. An AWS region is not a visitor's geography, and
+missing geo keeps the existing consent behavior.
 
-## Prepare local inputs
+## Inputs
 
 Use a disposable project directory containing `edgezero.toml` and an ordinary
 `trusted-server.toml`. Keep secret references in config and private inputs
@@ -77,7 +100,8 @@ configuration overlays remain part of config publication.
 
 Native features `aws-appconfig-agent` and `aws-secrets-manager` independently
 enable EdgeZero providers and default off. CLI features do not enable server
-providers. This startup unit provisions nothing.
+providers. The server creates no AWS resources; provision the AppConfig
+profile and secrets before starting it.
 
 ## Request handling
 
@@ -100,7 +124,7 @@ HTTP bridge, pending/select compatibility layer or fallback transport.
 ```sh
 cargo test --locked -p trusted-server-adapter-axum --all-features
 cargo test --locked -p trusted-server-core --lib
-node --test scripts/tests/test-native-providers.test.mjs
+node --test 'scripts/tests/*.test.mjs'
 ```
 
 Process tests use synthetic envelopes, secrets and local origins. They cover
@@ -112,8 +136,9 @@ The ignored real Next.js test requires its local fixture and
 `NATIVE_NEXTJS_ORIGIN`. See the native test fixture README. An ignored result is
 not a pass.
 
-Provider acceptance requires an explicitly built binary and disposable local
-AppConfig Agent and Moto fixtures:
+Provider acceptance needs Docker, a binary built with both provider features,
+and disposable local AppConfig Agent and Moto (an AWS mock) containers. CI runs
+only the helper unit tests above; run the full check locally:
 
 ```sh
 cargo build --locked -p trusted-server-adapter-axum \
