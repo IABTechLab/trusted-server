@@ -1,16 +1,34 @@
-//! Smoke tests for the Spin adapter route wiring.
+//! Route tests for the Spin adapter.
 //!
-//! Runs on the host target (no Spin runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! Spin runtime bindings or outbound network calls. Tests with business logic
-//! that depends on external stores assert routing only; deterministic auth and
-//! method gates assert exact status codes.
+//! Runs on the host target (no Spin runtime), so Spin runtime bindings are not
+//! exercised. Every outbound call goes through a scripted client, so nothing
+//! reaches the network. Tests with business logic that depends on external
+//! stores assert routing only; deterministic auth and method gates assert exact
+//! status codes.
 
-use edgezero_core::app::Hooks as _;
-use edgezero_core::http::{Request, Response, request_builder};
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
+use edgezero_adapter_spin::SPIN_PLATFORM;
+use edgezero_core::app::App;
+use edgezero_core::body::Body;
+use edgezero_core::http::{
+    HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+};
+use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::outbound::ResponseDecoding;
+use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
+use trusted_server_core::constants::TS_GIT_VERSION;
+use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::insert_outbound_client;
+use trusted_server_core::test_support::logging::LogCapture;
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 /// Build the full application router from explicit test settings.
 ///
@@ -21,7 +39,13 @@ use trusted_server_core::settings::Settings;
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// The settings [`test_router`] builds its router from.
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -38,21 +62,139 @@ fn test_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
-async fn route(router: RouterService, req: Request) -> Response {
+async fn route(router: RouterService, mut req: Request) -> Response {
+    // `oneshot` skips `EdgeZero`'s request conversion, which installs the
+    // adapter's default client, so install one that fails every request.
+    insert_outbound_client(
+        &mut req,
+        HttpClient::with_client(ScriptedHttpClient::forbidding()),
+    );
     router.oneshot(req).await.expect("should route request")
 }
 
-#[test]
-fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
-    let _router = TrustedServerApp::routes();
+// ---------------------------------------------------------------------------
+// Synthesized headers on EdgeZero's canonical responses
+// ---------------------------------------------------------------------------
+
+/// Dispatches one request through the app `run_app` assembles, so the
+/// policies `TrustedServerApp::configure` installs apply, and returns the
+/// response head as egress would write it.
+async fn dispatch_through_app(method: Method, target: &str) -> Response {
+    let app = App::from_router::<TrustedServerApp>(test_router(), SPIN_PLATFORM)
+        .expect("should assemble the app with its edge policies");
+    let request = request_builder()
+        .method(method)
+        .uri(target)
+        .body(Body::empty())
+        .expect("should build request");
+    let outcome = app
+        .dispatch_ingress(
+            request,
+            app.monotonic_now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        )
+        .await
+        .expect("should admit the request");
+    let envelope = match outcome {
+        IngressDispatchOutcome::Response(envelope) => Some(envelope),
+        _ => None,
+    }
+    .expect("should answer with a response");
+    let (prepared, _policy, mut attempt, clock) = envelope
+        .begin(ResponseEgressFramingMode::ExplicitBufferedLength)
+        .map_err(|_failure| "response egress failed before conversion")
+        .expect("should begin response egress");
+    assert!(attempt.begin_writing(), "should start writing the response");
+    assert!(
+        attempt.complete(clock.now()),
+        "should complete the response"
+    );
+    prepared.into_response()
+}
+
+/// Returns the git version compiled into this build.
+///
+/// # Panics
+///
+/// Panics when the build has none, so a version assertion cannot pass on an
+/// absent header.
+fn compiled_git_version() -> &'static str {
+    TS_GIT_VERSION.expect("should compile a git version into the test build")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_not_found_carries_x_ts_version() {
+    // The publisher fallback claims every origin-form path, so only an
+    // asterisk-form target has no route and gets EdgeZero's canonical 404.
+    let response = dispatch_through_app(Method::OPTIONS, "*").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "should answer an unrouted target with the canonical 404"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the canonical 404"
+    );
+}
+
+/// A handler `Err` still passes through the finalize middleware.
+///
+/// `dispatch_ingress` installs no outbound client, so the auction handler
+/// fails before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_error_carries_x_ts_version() {
+    let response = dispatch_through_app(Method::POST, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should answer the failed Spin handler with 500"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the handler error response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
+    let response = dispatch_through_app(Method::TRACE, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "should answer an unrouted method on a known path with the canonical 405"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|value| value.to_str().ok()),
+        Some("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"),
+        "should list the path's methods in sorted order"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the canonical 405"
+    );
 }
 
 #[test]
@@ -988,14 +1130,12 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    use std::sync::Arc;
-
     use trusted_server_core::test_support::nextjs_auction;
 
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),
-        nextjs_auction::services(Arc::clone(&client)),
+        nextjs_auction::services(&client),
     )
     .expect("should build router with fixture services");
 
@@ -1046,5 +1186,116 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
     assert!(
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Publisher origin through EdgeZero's client
+// ---------------------------------------------------------------------------
+
+/// Origin of [`test_settings`].
+const ORIGIN: &str = "https://origin.test-publisher.example.com";
+
+/// Spin's origin input cap with the default 16 MiB `max_buffered_body_bytes`.
+const SPIN_INPUT_CAP: usize = 8 * 1024 * 1024;
+
+/// Sends `req` through `router` with `origin` as the request's outbound client.
+async fn route_to_origin(
+    router: RouterService,
+    mut req: Request,
+    origin: &ScriptedHttpClient,
+) -> Response {
+    insert_outbound_client(&mut req, HttpClient::with_client(origin.clone()));
+    router.oneshot(req).await.expect("should route request")
+}
+
+/// A publisher GET for `path` on the test publisher host.
+fn publisher_get(path: &str) -> Request {
+    request_builder()
+        .method(Method::GET)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header(header::HOST, "test-publisher.example.com")
+        .body(Body::empty())
+        .expect("should build publisher request")
+}
+
+/// Sends a publisher GET for `path` that accepts gzip through `router`, with
+/// `origin` as its outbound client.
+async fn fetch_publisher(router: RouterService, origin: &ScriptedHttpClient, path: &str) -> Served {
+    let mut request = publisher_get(path);
+    request
+        .headers_mut()
+        .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    Served::from_router_response(route_to_origin(router, request, origin).await)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_spin() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        SPIN_INPUT_CAP,
+        ResponseDecoding::Original,
+        |path| fetch_publisher(test_router(), &origin, path),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn processed_output_keeps_its_own_bound_spin() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+
+    publisher_input_cap::assert_output_bound(&origin, |path| {
+        fetch_publisher(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build router from output-bound settings"),
+            &origin,
+            path,
+        )
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spin_ignores_host_override_with_warning() {
+    let mut settings = test_settings();
+    settings.publisher.origin_host_header_override =
+        Some("www.test-publisher.example.com".to_owned());
+    let capture = LogCapture::start();
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should keep serving a config that sets the override");
+    assert!(
+        capture.take_warnings().iter().any(|warning| {
+            warning.message.contains("origin_host_header_override")
+                && warning.message.contains("ignored on Spin")
+        }),
+        "should warn at settings load that Spin ignores the override"
+    );
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/page"),
+        ScriptedReply::status(StatusCode::OK).header("content-type", "application/octet-stream"),
+    );
+
+    let response = route_to_origin(router, publisher_get("/page"), &origin).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should serve from the origin"
+    );
+    let requests = origin.requests();
+    assert_eq!(requests.len(), 1, "should send one origin request");
+    assert_eq!(
+        (
+            requests[0].host_authority.as_str(),
+            requests[0].has_host_authority_override
+        ),
+        ("origin.test-publisher.example.com", false),
+        "should send the URI authority with no override"
     );
 }
