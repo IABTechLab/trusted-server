@@ -21,6 +21,7 @@ const edgezero = readFileSync(resolve(repository, 'Cargo.lock'), 'utf8')
 const edgezeroSource = edgezero?.match(/^source = "([^"]+)"$/m)?.[1];
 if (!edgezeroSource) throw new Error('missing resolved EdgeZero source');
 const metadata = {
+  recorder_tcp_nodelay: true,
   edgezero_source: edgezeroSource,
   fixture_inputs_sha256: Object.fromEntries(
     inputs(resolve(repository, 'scripts/measure-axum-nextjs'))

@@ -11,9 +11,12 @@ const log = (event) => {
   }
 };
 const server = net.createServer((socket) => {
+  // Prevent the recorder from adding Nagle/delayed-ACK latency to small writes.
+  socket.setNoDelay(true);
   const id = ++next;
   log({ event: 'open', id });
   const upstream = net.connect(18980, '127.0.0.1');
+  upstream.setNoDelay(true);
   sockets.add(socket);
   sockets.add(upstream);
   socket.on('data', (data) => log({ event: 'request-bytes', id, data: data.toString('base64') }));
