@@ -1,10 +1,10 @@
 //! Identity app shared by every adapter.
 //!
 //! [`IdentityApp`] holds the identity state that every adapter needs: the
-//! settings, the partner registry, the EC record store and the rate limiter.
-//! An adapter builds it once per process or isolate from the platform
-//! services it supplies through [`IdentityPlatform`], so no identity route
-//! rebuilds that state per request.
+//! settings, the partner registry, the identity-provider coordinators, the EC
+//! record store and the rate limiter. An adapter builds it once per process
+//! or isolate from the platform services it supplies through
+//! [`IdentityPlatform`], so no identity route rebuilds that state per request.
 //!
 //! [`IdentityApp::mount`] registers the identity routes the core app owns on
 //! the adapter's router. Today these are the admin lookups; identify and
@@ -25,31 +25,57 @@ use crate::settings::Settings;
 use super::admin::{
     ADMIN_EC_PATH, ADMIN_EIDS_PATH, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
+use super::coordinator::ProviderCoordinator;
 use super::kv::KvIdentityGraph;
+use super::kv_backend::EcKvStore;
 use super::rate_limiter::{NoRateLimit, RateLimiter};
 use super::registry::PartnerRegistry;
 
 /// Platform services an adapter supplies to the [`IdentityApp`].
 ///
-/// An adapter without an EC record store leaves both fields `None`, and the
-/// app answers locally. An adapter that supplies a record store must also
-/// supply a rate limiter, so store-backed sync endpoints are never unlimited
-/// by omission.
+/// An adapter without an EC record store leaves `record_store` and
+/// `rate_limiter` `None`, and the app answers locally. An adapter that
+/// supplies a record store must also supply a rate limiter, so store-backed
+/// sync endpoints are never unlimited by omission.
+///
+/// The app holds the record store and the rate limiter across requests, in
+/// state every request handler shares, so both must be `Send` and `Sync`.
+/// [`EcKvStore`] and [`RateLimiter`] themselves carry no such bound: a store
+/// used within one request may be local.
 #[derive(Default)]
 pub struct IdentityPlatform {
     /// EC record store backing the identity graph, when the adapter has one.
-    pub identity_graph: Option<KvIdentityGraph>,
-    /// Rate limiter for sync endpoints. `None` applies no limit and is only
-    /// accepted when `identity_graph` is also `None`.
-    pub rate_limiter: Option<Arc<dyn RateLimiter>>,
+    pub record_store: Option<Arc<dyn EcKvStore + Send + Sync>>,
+    /// Rate limiter for sync endpoints and provider lookups. `None` applies
+    /// no limit and is only accepted when `record_store` is also `None`.
+    pub rate_limiter: Option<Arc<dyn RateLimiter + Send + Sync>>,
+    /// Identity providers, when the adapter has provider implementations.
+    ///
+    /// `None` builds the partner registry from `[ec]` without provider
+    /// ownership ([`PartnerRegistry::from_ec`]) and runs no provider.
+    pub providers: Option<IdentityProviders>,
+}
+
+/// Identity providers an adapter runs, with the partner registry their
+/// coordinators were built against.
+pub struct IdentityProviders {
+    /// Partner registry that marks the sources enabled providers own.
+    pub partners: Arc<PartnerRegistry>,
+    /// Coordinator for providers collected before the response, if any.
+    pub page: Option<Arc<ProviderCoordinator>>,
+    /// Coordinator for providers collected after the response, pull-sync
+    /// partners included, if any.
+    pub after_response: Option<Arc<ProviderCoordinator>>,
 }
 
 /// Identity state built once and shared by every identity route.
 pub struct IdentityApp {
     settings: Arc<Settings>,
     partners: Arc<PartnerRegistry>,
-    identity_graph: Option<KvIdentityGraph>,
-    rate_limiter: Arc<dyn RateLimiter>,
+    page_identity: Option<Arc<ProviderCoordinator>>,
+    after_response_identity: Option<Arc<ProviderCoordinator>>,
+    record_store: Option<Arc<dyn EcKvStore + Send + Sync>>,
+    rate_limiter: Arc<dyn RateLimiter + Send + Sync>,
 }
 
 impl IdentityApp {
@@ -71,7 +97,7 @@ impl IdentityApp {
         settings: Arc<Settings>,
         platform: IdentityPlatform,
     ) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        let rate_limiter = match (&platform.identity_graph, platform.rate_limiter) {
+        let rate_limiter = match (&platform.record_store, platform.rate_limiter) {
             (Some(_), None) => {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message:
@@ -80,13 +106,26 @@ impl IdentityApp {
                 }));
             }
             (_, Some(rate_limiter)) => rate_limiter,
-            (None, None) => Arc::new(NoRateLimit) as Arc<dyn RateLimiter>,
+            (None, None) => Arc::new(NoRateLimit) as Arc<dyn RateLimiter + Send + Sync>,
         };
-        let partners = Arc::new(PartnerRegistry::from_config(&settings.ec.partners)?);
+        let (partners, page_identity, after_response_identity) = match platform.providers {
+            Some(IdentityProviders {
+                partners,
+                page,
+                after_response,
+            }) => (partners, page, after_response),
+            None => (
+                Arc::new(PartnerRegistry::from_ec(&settings.ec)?),
+                None,
+                None,
+            ),
+        };
         Ok(Arc::new(Self {
             settings,
             partners,
-            identity_graph: platform.identity_graph,
+            page_identity,
+            after_response_identity,
+            record_store: platform.record_store,
             rate_limiter,
         }))
     }
@@ -103,13 +142,32 @@ impl IdentityApp {
         &self.partners
     }
 
-    /// Returns the EC identity graph, when the adapter supplied a record store.
+    /// Returns the coordinator for providers collected before the response,
+    /// when any is enabled.
     #[must_use]
-    pub fn identity_graph(&self) -> Option<&KvIdentityGraph> {
-        self.identity_graph.as_ref()
+    pub fn page_identity(&self) -> Option<&Arc<ProviderCoordinator>> {
+        self.page_identity.as_ref()
     }
 
-    /// Returns the rate limiter for sync endpoints.
+    /// Returns the coordinator for providers collected after the response,
+    /// pull-sync partners included, when any is enabled.
+    #[must_use]
+    pub fn after_response_identity(&self) -> Option<&Arc<ProviderCoordinator>> {
+        self.after_response_identity.as_ref()
+    }
+
+    /// Returns the EC identity graph over the app's record store, when the
+    /// adapter supplied one.
+    ///
+    /// Every graph this returns shares the one store built with the app.
+    #[must_use]
+    pub fn identity_graph(&self) -> Option<KvIdentityGraph> {
+        self.record_store
+            .as_ref()
+            .map(|store| KvIdentityGraph::from_shared(Arc::clone(store) as Arc<dyn EcKvStore>))
+    }
+
+    /// Returns the rate limiter for sync endpoints and provider lookups.
     #[must_use]
     pub fn rate_limiter(&self) -> &dyn RateLimiter {
         self.rate_limiter.as_ref()
@@ -139,14 +197,16 @@ impl IdentityApp {
         router
             .route(ADMIN_EC_PATH, Method::GET, move |ctx: RequestContext| {
                 let app = Arc::clone(&ec_lookup);
-                async move { Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?)) }
+                async move { Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?).await) }
             })
             .route(
                 ADMIN_EC_BY_ID_PATH,
                 Method::GET,
                 move |ctx: RequestContext| {
                     let app = Arc::clone(&ec_lookup_by_id);
-                    async move { Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?)) }
+                    async move {
+                        Ok::<_, EdgeError>(app.admin_ec_lookup(ctx.into_request()?).await)
+                    }
                 },
             )
             .route(ADMIN_EIDS_PATH, Method::GET, move |ctx: RequestContext| {
@@ -155,11 +215,14 @@ impl IdentityApp {
             })
     }
 
-    fn admin_ec_lookup(&self, request: Request) -> Response {
-        self.prepare(request)
-            .and_then(|request| {
-                handle_admin_ec_lookup(self.identity_graph.as_ref(), &self.partners, &request)
-            })
+    async fn admin_ec_lookup(&self, request: Request) -> Response {
+        let request = match self.prepare(request) {
+            Ok(request) => request,
+            Err(report) => return http_error(&report),
+        };
+        let graph = self.identity_graph();
+        handle_admin_ec_lookup(graph.as_ref(), &self.partners, &request)
+            .await
             .unwrap_or_else(|report| http_error(&report))
     }
 
@@ -182,6 +245,8 @@ const ADMIN_EC_BY_ID_PATH: &str = "/_ts/admin/ec/{id}";
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use edgezero_core::body::Body;
     use edgezero_core::http::{StatusCode, header};
     use edgezero_core::router::RouterService;
@@ -203,8 +268,9 @@ mod tests {
 
     fn store_platform() -> IdentityPlatform {
         IdentityPlatform {
-            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
+            record_store: Some(Arc::new(InMemoryEcKv::new("ec_store"))),
             rate_limiter: Some(Arc::new(NoRateLimit)),
+            providers: None,
         }
     }
 
@@ -360,8 +426,10 @@ mod tests {
         let app =
             IdentityApp::build(settings, store_platform()).expect("should build the identity app");
 
+        let graph = app.identity_graph();
+
         assert_eq!(
-            app.identity_graph().map(KvIdentityGraph::store_name),
+            graph.as_ref().map(KvIdentityGraph::store_name),
             Some("ec_store"),
             "should keep the supplied record store"
         );
@@ -371,8 +439,9 @@ mod tests {
     fn build_refuses_a_record_store_without_a_rate_limiter() {
         let settings = Arc::new(create_test_settings());
         let platform = IdentityPlatform {
-            identity_graph: Some(KvIdentityGraph::new(InMemoryEcKv::new("ec_store"))),
+            record_store: Some(Arc::new(InMemoryEcKv::new("ec_store"))),
             rate_limiter: None,
+            providers: None,
         };
 
         let result = IdentityApp::build(settings, platform);
@@ -391,17 +460,18 @@ mod tests {
 
     #[test]
     fn mounted_routes_share_the_supplied_store_across_requests() {
-        let graph = KvIdentityGraph::in_memory("ec_store");
+        let store: Arc<dyn EcKvStore + Send + Sync> = Arc::new(InMemoryEcKv::new("ec_store"));
+        let graph = KvIdentityGraph::from_shared(Arc::clone(&store) as Arc<dyn EcKvStore>);
         let router = router_for(IdentityPlatform {
-            identity_graph: Some(graph.clone()),
+            record_store: Some(store),
             rate_limiter: Some(Arc::new(NoRateLimit)),
+            providers: None,
         });
-        graph
-            .create(
-                SEEDED_EC_ID,
-                &KvEntry::minimal("partner.example", "uid-1", 1_741_824_000),
-            )
-            .expect("should seed the supplied record store");
+        block_on(graph.create(
+            SEEDED_EC_ID,
+            &KvEntry::minimal("partner.example", "uid-1", 1_741_824_000),
+        ))
+        .expect("should seed the supplied record store");
 
         let statuses: Vec<_> = (0..2)
             .map(|_| get(&router, &format!("/_ts/admin/ec/{SEEDED_EC_ID}")).status())
@@ -411,6 +481,69 @@ mod tests {
             statuses,
             vec![StatusCode::OK, StatusCode::OK],
             "should read the record written after mounting on every request, so no request builds its own store"
+        );
+    }
+
+    #[test]
+    fn build_keeps_the_supplied_partner_registry_and_coordinators() {
+        let partners = Arc::new(PartnerRegistry::empty());
+        let page: Arc<ProviderCoordinator> = Arc::new(
+            ProviderCoordinator::new(
+                Vec::new(),
+                Arc::clone(&partners),
+                Duration::from_millis(100),
+            )
+            .expect("should build the page coordinator"),
+        );
+        let after_response: Arc<ProviderCoordinator> = Arc::new(
+            ProviderCoordinator::new(
+                Vec::new(),
+                Arc::clone(&partners),
+                Duration::from_millis(100),
+            )
+            .expect("should build the after-response coordinator"),
+        );
+
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform {
+                providers: Some(IdentityProviders {
+                    partners: Arc::clone(&partners),
+                    page: Some(Arc::clone(&page)),
+                    after_response: Some(Arc::clone(&after_response)),
+                }),
+                ..IdentityPlatform::default()
+            },
+        )
+        .expect("should build the identity app");
+
+        assert!(
+            Arc::ptr_eq(app.partners(), &partners),
+            "should keep the registry the providers were built against"
+        );
+        assert!(
+            app.page_identity()
+                .is_some_and(|coordinator| Arc::ptr_eq(coordinator, &page)),
+            "should keep the page coordinator"
+        );
+        assert!(
+            app.after_response_identity()
+                .is_some_and(|coordinator| Arc::ptr_eq(coordinator, &after_response)),
+            "should keep the after-response coordinator"
+        );
+    }
+
+    #[test]
+    fn build_without_providers_runs_none() {
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build the identity app");
+
+        assert!(
+            app.page_identity().is_none() && app.after_response_identity().is_none(),
+            "should run no provider without provider implementations"
         );
     }
 }

@@ -40,7 +40,7 @@ path. Navigate by function name; line numbers change.
 | 8    | `handle_publisher_request`                          | Dispatch eligible bidder requests and send the publisher origin request, in the order described below                                                    |
 | 9    | Publisher response pipeline                         | Classify the origin response, then rewrite or inject into eligible HTML                                                                                  |
 | 10   | `main.rs`: `finalize_response`                      | Apply final EC and filter effects in EdgeZero's `finalize` hook; EdgeZero then delivers the response                                                     |
-| 11   | `adapter-fastly/src/delivery.rs`: `handle_delivery` | After a committed delivery, send queued auction telemetry and run EC pull sync                                                                           |
+| 11   | `adapter-fastly/src/delivery.rs`: `handle_delivery` | After a committed delivery, send queued auction telemetry and run after-response identity lookups, pull sync among them                                  |
 
 Two ordering details matter when debugging:
 

@@ -133,6 +133,7 @@ fn build_state_with_services(
     mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Spin")?;
     // Spin cannot send a host other than the origin URI authority.
     settings
         .publisher
@@ -781,15 +782,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -986,6 +984,23 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 mod tests {
     use super::*;
 
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = multi_provider_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Spin"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
+
     // Runs the production normalizer on the head of a whole test request.
     fn normalize_request(req: &mut Request) {
         let request = std::mem::replace(req, Request::new(edgezero_core::body::Body::empty()));
@@ -1020,6 +1035,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
@@ -1044,6 +1060,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

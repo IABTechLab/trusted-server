@@ -378,8 +378,10 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 **Contract:** The JSON body is limited to 2 MiB and 1,000 mappings. The
 per-partner, per-minute limit is `ec.partners[].batch_rate_limit`. Responses are
 `200` when every mapping is accepted or `207` when at least one is rejected;
-item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
-`kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
+item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`,
+`provider_owned` (the source belongs to a server-side identity provider),
+`row_full` (the EC's row would exceed its 16 KiB limit; retrying gives the
+same result), or `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
 or CORS headers. It requires the EC KV store; without one it returns
@@ -901,6 +903,7 @@ This lookup is implemented only by the Fastly adapter because the identity graph
 - `ec_id`, `store`, and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
+- Provider refresh state is private: every `refresh.state` in `entry` is shown as `"[redacted]"`, while `refresh.from` stays visible.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
 - `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
 - `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.

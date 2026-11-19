@@ -12,17 +12,15 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
-use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::app::IdentityApp;
+use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
-use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -50,8 +48,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
-    load_settings_from_config_store,
+    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
+    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
 };
 use crate::delivery::handle_delivery;
 use crate::middleware::{
@@ -338,7 +336,8 @@ fn serve(
     counters: &SandboxCounters,
     trace_path: bool,
 ) {
-    let settings = retained.state.settings.as_ref();
+    let state = retained.state.as_ref();
+    let settings = state.settings.as_ref();
     let values = ClientRequestValues::read(&mut req, settings, trace_path);
     // The request's one geo lookup serves `finalize` here and, from the
     // request extensions, every later step that uses geo.
@@ -349,10 +348,14 @@ fn serve(
         values.prepare(extensions, settings, &queue);
     };
     let inputs = FinalizeInputs {
-        identity: &retained.state.identity,
+        state,
         geo: request_geo.geo(),
         counters,
     };
+    // Identity lookups a navigation dispatches wait in a request-local slot
+    // until `finalize` collects them. Drop anything an earlier request on
+    // this sandbox left there, which cancels its requests.
+    drop(take_navigation_lookups());
     let delivery = send_request_with_registries_and_hooks(
         &retained.app,
         TrustedServerApp::stores(),
@@ -360,9 +363,11 @@ fn serve(
         prepare,
         |response: &mut HttpResponse| finalize_response(response, &inputs),
     );
-    handle_delivery(delivery, counters, |state| {
-        run_post_delivery(state, &queue, settings, &counters.log_context());
+    handle_delivery(delivery, counters, |finalized| {
+        run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
+    // A detached response never reaches `finalize`; release its lookups now.
+    drop(take_navigation_lookups());
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -461,9 +466,9 @@ impl ClientRequestValues {
 
 /// What the `finalize` step reads besides the routed response.
 struct FinalizeInputs<'a> {
-    /// The identity app built once with the retained application state; its
-    /// settings are the request's settings.
-    identity: &'a Arc<IdentityApp>,
+    /// The retained application state; its settings and the identity app
+    /// with its partner registry and identity coordinators.
+    state: &'a AppState,
     /// The geo lookup the entry point ran once for this request.
     geo: Option<&'a GeoInfo>,
     counters: &'a SandboxCounters,
@@ -476,14 +481,22 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters.
+/// sandbox counters. EC finalization first collects the identity lookups the
+/// navigation dispatched.
 ///
-/// Returns the pull-sync inputs post-delivery work needs, or `None` when the
-/// response carries no EC state.
+/// Returns the inputs post-delivery work needs, pull sync and after-response
+/// lookups, or `None` when the response carries no EC state.
 fn finalize_response(
     response: &mut HttpResponse,
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
+    let settings = inputs.state.settings.as_ref();
+    // Identity lookups this request dispatched, taken whatever the response
+    // so none outlives it.
+    let NavigationLookups {
+        page: identity,
+        after_response,
+    } = take_navigation_lookups();
     // Trace responses keep their exact hardened headers; no finalizer touches them.
     if response
         .extensions()
@@ -493,7 +506,6 @@ fn finalize_response(
         return None;
     }
 
-    let settings = inputs.identity.settings().as_ref();
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
@@ -508,10 +520,21 @@ fn finalize_response(
     }
 
     let state = ec_state.map(|mut ec_state| {
-        apply_edgezero_ec_finalize(inputs.identity, &mut ec_state, response);
+        // `EdgeZero` calls `finalize` synchronously after its dispatch executor
+        // has returned, and Fastly's KV SDK completes I/O through blocking
+        // hostcalls. Keep this bridge here, never in native or worker executors.
+        // Identity lookups are collected inside it, so their wait never nests
+        // in the router's executor.
+        futures::executor::block_on(apply_edgezero_ec_finalize(
+            inputs.state,
+            &mut ec_state,
+            identity,
+            response,
+        ));
         FinalizeState {
-            identity: Arc::clone(inputs.identity),
+            identity: Arc::clone(&inputs.state.identity),
             ec_state,
+            after_response,
         }
     });
 
@@ -631,25 +654,51 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-fn apply_edgezero_ec_finalize(
-    identity: &IdentityApp,
+/// Runs EC finalization for a routed response with the identity app's partner
+/// registry and record store.
+///
+/// Collects `identity` lookups first, unless the response is a redirect,
+/// whose navigation writes nothing. The caller drives this future with the
+/// one `block_on` outside the router's executor.
+async fn apply_edgezero_ec_finalize(
+    state: &AppState,
     ec_state: &mut EcFinalizeState,
+    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) {
+    // A redirect skips the write, so do not wait for lookups it would discard.
+    let identity = identity.filter(|_| {
+        let redirect = NavigationPermit::is_redirect(response.status());
+        if redirect {
+            log::debug!("Identity lookups dropped: redirect response skips the write");
+        }
+        !redirect
+    });
+    if let Some(IdentityLookups {
+        coordinator,
+        transport,
+        pending,
+    }) = identity
+    {
+        let results = coordinator.collect(&transport, pending).await;
+        ec_state.ec_context.set_lookup_results(results);
+    }
+    let identity_app = &state.identity;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity.identity_graph()
+        identity_app.identity_graph()
     } else {
         None
     };
     ec_finalize_response(
-        identity.settings(),
+        identity_app.settings(),
         &mut ec_state.ec_context,
-        finalize_kv_graph,
-        identity.partners(),
+        finalize_kv_graph.as_ref(),
+        identity_app.partners(),
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+    )
+    .await;
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -725,11 +774,18 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
 
 /// Returns the identity graph held by the identity app, or an error if the
 /// `ec_store` config is not set.
+///
+/// Only tests open the graph this way; request paths use
+/// [`IdentityApp::identity_graph`](trusted_server_core::ec::app::IdentityApp::identity_graph).
+#[cfg(test)]
 pub(crate) fn require_identity_graph(
-    identity: &IdentityApp,
-) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
-    identity.identity_graph().cloned().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
+    identity: &trusted_server_core::ec::app::IdentityApp,
+) -> Result<
+    trusted_server_core::ec::kv::KvIdentityGraph,
+    error_stack::Report<trusted_server_core::error::TrustedServerError>,
+> {
+    identity.identity_graph().ok_or_else(|| {
+        error_stack::Report::new(trusted_server_core::error::TrustedServerError::KvStore {
             store_name: "ec.ec_store".to_owned(),
             message: "ec.ec_store is not configured".to_owned(),
         })
@@ -767,11 +823,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-
-    fn identity_for(settings: &Settings) -> Arc<IdentityApp> {
-        crate::app::build_identity_app(Arc::new(settings.clone()))
-            .expect("should build identity app")
-    }
 
     use base64::Engine as _;
     use edgezero_adapter_fastly::request::FastlyService;
@@ -842,6 +893,11 @@ mod tests {
         settings
     }
 
+    /// The retained application state `finalize` reads, built from `settings`.
+    fn app_state(settings: &Settings) -> Arc<AppState> {
+        crate::app::build_state_from_settings(settings.clone()).expect("should build the app state")
+    }
+
     fn counters() -> SandboxCounters {
         SandboxCounters {
             ordinal: 2,
@@ -892,7 +948,7 @@ mod tests {
         let state = finalize_response(
             &mut response,
             &FinalizeInputs {
-                identity: &identity_for(&settings),
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1042,7 +1098,7 @@ mod tests {
             let state = finalize_response(
                 &mut response,
                 &FinalizeInputs {
-                    identity: &identity_for(&settings),
+                    state: &app_state(&settings),
                     geo: None,
                     counters: &counters,
                 },
@@ -1168,7 +1224,7 @@ mod tests {
             let retained = retained_app(&sandbox).expect("should retain the app");
             let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
             let inputs = FinalizeInputs {
-                identity: &identity_for(&settings),
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             };
@@ -1226,7 +1282,7 @@ mod tests {
         let retained = retained_app(&sandbox).expect("should retain the app");
         let counters = SandboxCounters::capture(&sandbox, 1, "request-example");
         let inputs = FinalizeInputs {
-            identity: &identity_for(&settings),
+            state: &app_state(&settings),
             geo: None,
             counters: &counters,
         };
@@ -1392,7 +1448,7 @@ mod tests {
         let geo = sample_geo();
         let counters = counters();
         let inputs = FinalizeInputs {
-            identity: &identity_for(&settings),
+            state: &app_state(&settings),
             geo: Some(&geo),
             counters: &counters,
         };
@@ -1421,7 +1477,6 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid_cookie: None,
-            is_real_browser: true,
         });
 
         let state = finalize_response(&mut page, &inputs);
@@ -1511,7 +1566,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                identity: &identity_for(&settings),
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1538,7 +1593,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                identity: &identity_for(&settings),
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },

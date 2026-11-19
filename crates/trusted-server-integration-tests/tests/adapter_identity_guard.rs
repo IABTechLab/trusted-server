@@ -19,9 +19,10 @@ const ADAPTER_CRATES: &[&str] = &[
 
 const IDENTITY_ENTRY_POINTS: &[&str] = &[
     "PartnerRegistry::from_config",
+    "PartnerRegistry::from_ec",
     "answer_batch_sync_locally",
     "answer_identify_locally",
-    "dispatch_pull_sync",
+    "commit_after_response_lookups",
     "ec_finalize_response",
     "generate_if_needed",
     "handle_batch_sync",
@@ -73,7 +74,7 @@ const PENDING_LIFECYCLE_MOVE: &[(&str, &str)] = &[
     ),
     (
         "trusted-server-adapter-fastly/src/post_delivery.rs",
-        "dispatch_pull_sync",
+        "commit_after_response_lookups",
     ),
     (
         "trusted-server-adapter-spin/src/app.rs",
