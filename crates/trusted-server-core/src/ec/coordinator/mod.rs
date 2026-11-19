@@ -338,7 +338,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         entries: ValidatedEntries,
     ) -> ProviderLookup {
         let registered = &self.providers[provider.get()];
-        let cleared = if status == LookupStatus::Skipped(SkipReason::OptedOut) {
+        let cleared = if status == LookupStatus::OptedOut {
             registered.policy.sources.to_vec()
         } else {
             Vec::new()
@@ -400,11 +400,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
             }
             Ok(LookupOutcome::OptedOut) => {
-                return self.lookup(
-                    provider,
-                    LookupStatus::Skipped(SkipReason::OptedOut),
-                    Vec::new(),
-                );
+                return self.lookup(provider, LookupStatus::OptedOut, Vec::new());
             }
             Err(report) => {
                 log::debug!(
@@ -1663,7 +1659,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out"
         );
         assert_eq!(

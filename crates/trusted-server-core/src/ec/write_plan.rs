@@ -129,11 +129,21 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
+        let opted_out = entry.opted_out(&lookup.provider, now);
+        let remembered_skip = lookup.status == LookupStatus::Skipped(SkipReason::OptedOut);
+        // A skip because of a remembered opt-out that lapsed since dispatch
+        // is stale: the provider was not asked, so it must not renew the
+        // opt-out or clear sources a newer lookup may have written.
+        if remembered_skip && !opted_out {
+            log::info!(
+                "EC write planner: discarding skip on lapsed opt-out of provider '{}'",
+                lookup.provider
+            );
+            continue;
+        }
         // A newer request may have recorded this provider's opt-out after
         // the lookup was dispatched; never restore its UIDs over it.
-        if entry.opted_out(&lookup.provider, now)
-            && lookup.status != LookupStatus::Skipped(SkipReason::OptedOut)
-        {
+        if opted_out && !remembered_skip && lookup.status != LookupStatus::OptedOut {
             log::info!(
                 "EC write planner: discarding results of opted-out provider '{}'",
                 lookup.provider
@@ -146,7 +156,9 @@ fn apply_lookups(
                 written.push(source.clone());
             }
         }
-        if lookup.status == LookupStatus::Skipped(SkipReason::OptedOut) {
+        // Only an opt-out the provider reported in this navigation starts
+        // the memory period; a remembered one keeps its end time.
+        if lookup.status == LookupStatus::OptedOut {
             entry.remember_opt_out(&lookup.provider, now);
         }
         for source in &lookup.cleared {
@@ -630,7 +642,7 @@ mod tests {
             EC_ID,
             vec![ProviderLookup {
                 provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                status: LookupStatus::OptedOut,
                 entries: Vec::new(),
                 cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
             }],
@@ -656,14 +668,15 @@ mod tests {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let provider = ProviderId::new("example-provider");
-        let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+        let reported = failed_lookup(LookupStatus::OptedOut);
+        let skipped = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
 
-        // Act: the first opt-out is remembered.
+        // Act: the reported opt-out is remembered.
         let first = plan_write(&input(
             &present(&provider_entry(&["p-1"])).await,
             None,
             &ingest,
-            &lookups,
+            &reported,
             &registry,
         ))
         .expect("should plan update");
@@ -679,8 +692,44 @@ mod tests {
             "should remember the opt-out for the memory period"
         );
 
-        // Act: a skip because of the remembered opt-out changes nothing.
-        let again = plan_write(&input(
+        // Act: a skip because of the remembered opt-out, or the provider
+        // reporting it again, changes nothing.
+        for lookups in [&skipped, &reported] {
+            let again = plan_write(&input(
+                &present(&entry).await,
+                None,
+                &ingest,
+                lookups,
+                &registry,
+            ));
+
+            // Assert
+            assert!(again.is_none(), "should not extend a remembered opt-out");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skip_on_an_opt_out_that_lapsed_since_dispatch_is_discarded() {
+        // Arrange: the lookup was dispatched while the opt-out was
+        // remembered; it lapsed at 1999, before this plan at 2000. A newer
+        // lookup has since stored the provider's UID again.
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = provider_entry(&["p-new"]);
+        entry.opt_outs.insert(provider.clone(), 1999);
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider,
+                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(
             &present(&entry).await,
             None,
             &ingest,
@@ -689,7 +738,41 @@ mod tests {
         ));
 
         // Assert
-        assert!(again.is_none(), "should not extend a remembered opt-out");
+        assert!(
+            change.is_none(),
+            "should neither renew the lapsed opt-out nor clear the provider's UID"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reported_opt_out_after_a_lapsed_one_is_remembered_again() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = provider_entry(&["p-1"]);
+        entry.opt_outs.insert(provider.clone(), 1999);
+        let lookups = failed_lookup(LookupStatus::OptedOut);
+
+        // Act
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.opt_outs[&provider],
+            2000 + OPT_OUT_MEMORY_SECONDS,
+            "should start a new memory period from the provider's report"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

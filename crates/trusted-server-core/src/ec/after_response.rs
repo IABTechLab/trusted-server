@@ -588,9 +588,10 @@ mod tests {
             AfterResponseOutcome::Written,
             "should store the provider UID first"
         );
-        let opted_out = opt_out(vec![
-            SourceDomain::try_from("ids.example.com").expect("should build source"),
-        ]);
+        let opted_out = opt_out(
+            LookupStatus::OptedOut,
+            vec![SourceDomain::try_from("ids.example.com").expect("should build source")],
+        );
 
         // Act
         let outcome = commit_after_response_lookups(
@@ -615,12 +616,12 @@ mod tests {
         );
     }
 
-    fn opt_out(cleared: Vec<SourceDomain>) -> LookupResults {
+    fn opt_out(status: LookupStatus, cleared: Vec<SourceDomain>) -> LookupResults {
         LookupResults::new(
             EC_ID,
             vec![ProviderLookup {
                 provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                status,
                 entries: Vec::new(),
                 cleared,
             }],
@@ -638,7 +639,7 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &opt_out(Vec::new()),
+            &opt_out(LookupStatus::Skipped(SkipReason::OptedOut), Vec::new()),
         )
         .await;
 
