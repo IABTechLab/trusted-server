@@ -494,13 +494,16 @@ through the retained `uid` field, unless that `uid` (the first live provider
 UID) is over 512 bytes: older code rejects such a row whole.
 
 The row also gains `opt_outs`, a map from provider ID to the Unix time until
-which that provider's opt-out is remembered (30 days, §8.3).
+which that provider's opt-out is remembered (30 days, §8.3), and
+`revocations`, a map from provider ID to the Unix time of the latest opt-out
+the provider reported that removed its sources from the row (kept for one day,
+§8.3).
 
 `uid` is rewritten on every write to the first live UID of `eids`, and new code
 ignores it when `eids` is non-empty. A known limitation of staying on `v: 1`
 (D12): during a rollout or rollback, older code reads only `uid`, so it can
 serve that UID after its `exp`, and an older writer that re-saves the row drops
-`eids` and `opt_outs`. A UID served past its `exp` and dropped `eids` end at the
+`eids`, `opt_outs` and `revocations`. A UID served past its `exp` and dropped `eids` end at the
 next write by new code; a dropped opt-out is lost, so that provider is called
 again. Stored values are built only by validation
 (§8.2) or by deserializing rows TS wrote, so their fields are private to the
@@ -1286,6 +1289,13 @@ For each provider with a `Found` outcome and each source in its response:
   is discarded. The vendor's cookies are read before the recorded opt-out is
   checked: an ID in them means the visitor opted back in, so the opt-out is
   forgotten and the ID stored. Generated and cookie IDs merge like `Found`.
+- An `OptedOut` outcome that removes a source also records the time in the
+  row's `revocations` map (a later value if one from the same second is held).
+  Dispatch captures the row's `revocations`; a result for a provider whose
+  revocation differs at the write was superseded by a newer opt-out, from a
+  cookie or a server, and is discarded. An opt-out that removes nothing
+  records none, so it adds no write. Revocations older than a day are pruned
+  with a real change.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
 results, so the write order never lets browser data overwrite provider data.

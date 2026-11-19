@@ -1,5 +1,7 @@
 //! Per-provider outcomes of one navigation's lookups.
 
+use std::collections::BTreeMap;
+
 use crate::ec::eid_types::{EidValidationError, ProviderId, SourceDomain};
 use crate::ec::kv_types::KvEid;
 
@@ -149,7 +151,8 @@ pub struct ProviderLookup {
     /// Validated entries per returned source; empty unless `Found`.
     pub entries: Vec<(SourceDomain, Vec<KvEid>)>,
     /// Sources whose stored records are removed, because the user opted
-    /// out of the provider; empty unless `OptedOut` or `Skipped(OptedOut)`.
+    /// out of the provider or GDPR excludes them; empty unless `OptedOut`,
+    /// `Skipped(OptedOut)` or `Skipped(Region)`, or a source is excluded.
     pub cleared: Vec<SourceDomain>,
     /// What this lookup does to the provider's remembered opt-out.
     pub opt_out: OptOutMemory,
@@ -161,6 +164,8 @@ pub struct LookupResults {
     /// EC ID the lookups were made for; `None` when nothing was looked up.
     ec_id: Option<String>,
     lookups: Vec<ProviderLookup>,
+    /// The row's revocations when the lookups were dispatched.
+    revocations: BTreeMap<ProviderId, u64>,
 }
 
 impl LookupResults {
@@ -171,7 +176,25 @@ impl LookupResults {
         Self {
             ec_id: Some(ec_id.to_owned()),
             lookups,
+            revocations: BTreeMap::new(),
         }
+    }
+
+    /// Records the row's revocations as the lookups' dispatch saw them.
+    #[must_use]
+    pub fn dispatched_with(mut self, revocations: BTreeMap<ProviderId, u64>) -> Self {
+        self.revocations = revocations;
+        self
+    }
+
+    /// The revocation of `provider` the row held when its lookup was
+    /// dispatched.
+    ///
+    /// A row holding a different one has seen a newer opt-out since, so the
+    /// lookup's result is stale.
+    #[must_use]
+    pub fn revocation_at_dispatch(&self, provider: &ProviderId) -> Option<u64> {
+        self.revocations.get(provider).copied()
     }
 
     /// Whether these results were looked up for `ec_id`.

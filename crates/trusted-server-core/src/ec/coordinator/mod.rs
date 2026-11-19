@@ -8,7 +8,7 @@ pub mod results;
 pub mod transport;
 mod validate;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +113,9 @@ pub struct PendingLookups<Pending> {
     contexts: Vec<Tagged<String>>,
     /// Providers whose IDs were read from first-party cookies, validated.
     from_cookies: Vec<Tagged<ProviderLookup>>,
+    /// The row's revocations at dispatch, so a result a newer opt-out
+    /// superseded is discarded at the write.
+    revocations: BTreeMap<ProviderId, u64>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
@@ -127,6 +130,7 @@ impl<Pending> Default for PendingLookups<Pending> {
             excluded: Vec::new(),
             contexts: Vec::new(),
             from_cookies: Vec::new(),
+            revocations: BTreeMap::new(),
         }
     }
 }
@@ -547,6 +551,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .minted_entry
             .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
         let entry = stored.or(minted);
+        pending.revocations = entry
+            .map(|entry| entry.revocations.clone())
+            .unwrap_or_default();
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
@@ -780,6 +787,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             excluded,
             contexts,
             from_cookies,
+            revocations,
         } = pending;
         let responses = match in_flight {
             Some(in_flight) => transport.gather(in_flight).await,
@@ -827,7 +835,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for lookup in &lookups {
             log_outcome(lookup);
         }
-        LookupResults::new(&ec_id, lookups)
+        LookupResults::new(&ec_id, lookups).dispatched_with(revocations)
     }
 }
 
@@ -2517,6 +2525,32 @@ mod tests {
 
     fn optout_reply() -> Result<TransportResponse, Report<TransportError>> {
         Ok(reply(http::StatusCode::OK, b"optout"))
+    }
+
+    #[test]
+    fn results_carry_the_revocations_the_dispatch_saw() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.revocations.insert(provider.clone(), 900);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results.revocation_at_dispatch(&provider),
+            Some(900),
+            "should hand the dispatch's revocations to the write"
+        );
     }
 
     #[test]

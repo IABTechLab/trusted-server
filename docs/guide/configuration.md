@@ -974,6 +974,8 @@ applies to the request it arrives on: on every route, the vendor's cookies are
 read before any ID leaves the server, and the provider's sources are withheld
 from the publisher auction, `/_ts/page-bids`, `/auction` and identify, whether
 the ID comes from the row or from the browser. No lookup is made to do so.
+An opt-out that clears a source also records its time in the row for a day, so
+a slower lookup dispatched before it cannot restore the source.
 
 Some kinds keep private refresh state with a UID, such as a vendor refresh
 token, and refresh it server side once it is due, also after the UID expires

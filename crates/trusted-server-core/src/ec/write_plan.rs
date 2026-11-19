@@ -155,6 +155,18 @@ fn apply_lookups(
             );
             continue;
         }
+        // An opt-out recorded after the lookup was dispatched, which a cookie
+        // opt-out leaves only as a revocation, supersedes its results. An
+        // opt-out of its own still applies.
+        let superseded = entry.revocations.get(&lookup.provider).copied()
+            != lookups.revocation_at_dispatch(&lookup.provider);
+        if superseded && !remembered_skip && lookup.status != LookupStatus::OptedOut {
+            log::info!(
+                "EC write planner: discarding results of provider '{}' superseded by a newer opt-out",
+                lookup.provider
+            );
+            continue;
+        }
         if lookup.opt_out == OptOutMemory::Forget {
             entry.forget_opt_out(&lookup.provider);
         }
@@ -170,13 +182,20 @@ fn apply_lookups(
         if lookup.opt_out == OptOutMemory::Remember {
             entry.remember_opt_out(&lookup.provider, now);
         }
+        let mut removed = false;
         for source in &lookup.cleared {
             if entry.ids.remove(source.as_str()).is_some() {
+                removed = true;
                 log::info!(
                     "EC write planner: removing '{source}' after provider '{}' opt-out",
                     lookup.provider
                 );
             }
+        }
+        // Only an opt-out that changes the row records a revocation, so it
+        // never adds a write of its own.
+        if removed && lookup.status == LookupStatus::OptedOut {
+            entry.record_revocation(&lookup.provider, now);
         }
     }
     written
@@ -1428,6 +1447,92 @@ mod tests {
         assert!(
             change.is_none(),
             "should not write the opted-out provider's older result"
+        );
+    }
+
+    fn cookie_opt_out() -> LookupResults {
+        LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::OptedOut,
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_opt_out_that_removes_a_source_records_a_revocation() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+
+        // Act
+        let removing = plan_write(&input(
+            &present(&provider_entry(&["p-1"])).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ))
+        .expect("should plan update");
+        let removing_nothing = plan_write(&input(
+            &present(&live_entry()).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ));
+
+        // Assert
+        let RowChange::Update { entry, .. } = removing else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.revocations.get(&provider).copied(),
+            Some(2000),
+            "should record when the opt-out removed the provider's sources"
+        );
+        assert!(
+            entry.opt_outs.is_empty(),
+            "should not remember a cookie opt-out"
+        );
+        assert!(
+            removing_nothing.is_none(),
+            "should not write only to record a revocation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn found_result_dispatched_before_a_newer_cookie_opt_out_is_discarded() {
+        // Arrange: a cookie opt-out removed the source at 1990, after this
+        // lookup was dispatched against a row without that revocation.
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = live_entry();
+        entry.revocations.insert(provider.clone(), 1990);
+        let stale = found("ids.example.com", &["late-result"]);
+        let fresh = found("ids.example.com", &["new-id"])
+            .dispatched_with(std::iter::once((provider, 1990)).collect());
+
+        // Act
+        let stale_change = plan_write(&input(&present(&entry).await, None, &[], &stale, &registry));
+        let fresh_change = plan_write(&input(&present(&entry).await, None, &[], &fresh, &registry))
+            .expect("should plan update");
+
+        // Assert
+        assert!(
+            stale_change.is_none(),
+            "should not restore the source with a result the opt-out superseded"
+        );
+        let RowChange::Update { entry, .. } = fresh_change else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "new-id",
+            "should write a result dispatched after the opt-out"
         );
     }
 }
