@@ -401,7 +401,7 @@ function isNormalizedHeader(name, staging) {
   )
 }
 
-function normalize(response, staging) {
+export function normalize(response, staging) {
   const headers = new Map()
   for (const [name, value] of response.headers) {
     const normalized = isNormalizedHeader(name, staging)
@@ -426,7 +426,7 @@ function normalize(response, staging) {
   }
 }
 
-function compare(base, head) {
+export function compare(base, head) {
   const differences = new Map()
   if (base.status !== head.status) {
     differences.set('status', { base: base.status, head: head.status })

@@ -17,7 +17,6 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
-use edgezero_core::response::IntoResponse;
 use edgezero_core::response_headers::{
     SynthesizedResponseHeaders, SynthesizedResponseHeadersError,
 };
@@ -27,9 +26,11 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
 };
 use trusted_server_core::edge_app::synthesized_response_headers;
-use trusted_server_core::error::http_error;
+use trusted_server_core::error::{handler_error_response, http_error};
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::response_privacy::warn_skipped_operator_response_headers;
+use trusted_server_core::response_privacy::{
+    apply_response_headers_with_cache_privacy, warn_skipped_operator_response_headers,
+};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::version_header::apply_git_version_header;
 
@@ -82,11 +83,8 @@ impl Middleware for FinalizeResponseMiddleware {
         let request_geo = ctx.extensions().get::<RequestGeo>().cloned();
 
         let mut response = match next.run(ctx).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("request handler failed: {e:?}");
-                e.into_response()?
-            }
+            Ok(response) => response,
+            Err(error) => handler_error_response(error)?,
         };
 
         let geo =
@@ -109,8 +107,8 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to an HTTP response via
-///   [`http_error`] using the error's documented status code.
+/// - `Err(report)` → internal error; [`http_error`] logs it once and converts it
+///   to an HTTP response with the error's documented status code.
 ///
 /// # Errors
 ///
@@ -135,10 +133,7 @@ impl Middleware for AuthMiddleware {
         match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(http_error(&report));
-            }
+            Err(report) => return Ok(http_error(&report)),
         }
 
         next.run(ctx).await
@@ -257,10 +252,15 @@ pub(crate) use trusted_server_core::response_privacy::{
 /// still installs.
 pub(crate) fn version_synthesized_headers(service_version: Option<&str>) -> HeaderMap {
     let mut fields = synthesized_response_headers();
-    if let Some(value) = fastly_version_header_value(service_version)
-        && is_synthesizable(&HEADER_X_TS_FASTLY_VERSION, &value)
-    {
-        fields.insert(HEADER_X_TS_FASTLY_VERSION, value);
+    if let Some(value) = fastly_version_header_value(service_version) {
+        match synthesized_field_error(&HEADER_X_TS_FASTLY_VERSION, &value) {
+            None => {
+                fields.insert(HEADER_X_TS_FASTLY_VERSION, value);
+            }
+            Some(error) => log::warn!(
+                "Leaving `{HEADER_X_TS_FASTLY_VERSION}` out of the synthesized response headers: {error}"
+            ),
+        }
     }
     fields
 }
@@ -273,9 +273,12 @@ pub(crate) fn version_synthesized_headers(service_version: Option<&str>) -> Head
 /// without headers: `x-ts-version`, `x-ts-fastly-version`, `x-ts-env` on
 /// staging, the geo headers or `x-geo-info-available: false`, and the
 /// operator's `response_headers`. A field `EdgeZero` forbids, or whose value is
-/// not portable, such as a geo city with accents, is left out with a warning.
-/// When the rest still exceeds the set's bounds, only
-/// [`version_synthesized_headers`] remain, and the bound is logged.
+/// not portable, such as a geo city with accents, is left out at debug: the
+/// routed response still carries it, and
+/// [`warn_unsynthesizable_operator_response_headers`] warns about an operator
+/// entry once, when the sandbox loads its settings. When the rest still exceeds
+/// the set's bounds, only [`version_synthesized_headers`] remain, and the bound
+/// is logged.
 ///
 /// The entry point builds this set once for every request, so it also warns
 /// about each operator entry the finalize headers skip. [`apply_finalize_headers`]
@@ -289,8 +292,13 @@ pub(crate) fn per_request_synthesized_headers(
     apply_finalize_headers(settings, geo, &mut finalized);
     let mut fields = HeaderMap::new();
     for (name, value) in finalized.headers() {
-        if is_synthesizable(name, value) {
-            fields.append(name.clone(), value.clone());
+        match synthesized_field_error(name, value) {
+            None => {
+                fields.append(name.clone(), value.clone());
+            }
+            Some(error) => log::debug!(
+                "Leaving `{name}` out of this request's synthesized response headers: {error}"
+            ),
         }
     }
 
@@ -305,20 +313,38 @@ pub(crate) fn per_request_synthesized_headers(
     })
 }
 
-/// Whether `name: value` may join a synthesized set, warning when it may not.
+/// Logs one warning for each operator response header the synthesized set leaves out.
+///
+/// The finalize headers still set such an entry on routed responses; only the
+/// responses `EdgeZero` generates for the request lack it.
+/// [`per_request_synthesized_headers`] leaves it out of every request's set at
+/// debug, so the sandbox calls this once, when it loads its settings.
+pub(crate) fn warn_unsynthesizable_operator_response_headers(settings: &Settings) {
+    let mut operator = Response::new(Body::empty());
+    apply_response_headers_with_cache_privacy(settings, &mut operator);
+    for (name, value) in operator.headers() {
+        if let Some(error) = synthesized_field_error(name, value) {
+            log::warn!(
+                "Leaving configured response header `{name}` out of the synthesized response headers: {error}"
+            );
+        }
+    }
+}
+
+/// Why `name: value` may not join a synthesized set, or `None` when it may.
 ///
 /// A single field never exceeds the set's field count, and its byte bound is
 /// checked with the whole set, so only a forbidden name or an unportable value
 /// leaves it out here.
-fn is_synthesizable(name: &HeaderName, value: &HeaderValue) -> bool {
+fn synthesized_field_error(
+    name: &HeaderName,
+    value: &HeaderValue,
+) -> Option<SynthesizedResponseHeadersError> {
     let mut field = HeaderMap::new();
     field.insert(name.clone(), value.clone());
     match SynthesizedResponseHeaders::new(field) {
-        Ok(_) | Err(SynthesizedResponseHeadersError::TooManyBytes) => true,
-        Err(error) => {
-            log::warn!("Leaving `{name}` out of the synthesized response headers: {error}");
-            false
-        }
+        Ok(_) | Err(SynthesizedResponseHeadersError::TooManyBytes) => None,
+        Err(error) => Some(error),
     }
 }
 
@@ -368,6 +394,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use futures::executor::block_on;
     use trusted_server_core::response_privacy::apply_inactive_ad_stack_browser_cache_policy;
+    use trusted_server_core::test_support::logging::LogCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -801,6 +828,83 @@ mod tests {
     }
 
     #[test]
+    fn auth_handle_logs_a_configuration_error_once() {
+        let mut settings = settings_with_response_headers(vec![]);
+        settings.handlers.clear();
+        let middleware = AuthMiddleware::new(Arc::new(settings));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/_ts/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build an admin request");
+        let ctx = RequestContext::new(request, PathParams::new(HashMap::new()));
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(ctx, Next::new(&[], &*handler)))
+            .expect("should answer the configuration error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer an admin path no handler covers with 500"
+        );
+        let levels: Vec<log::Level> = capture
+            .take_all()
+            .iter()
+            .map(|record| record.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error],
+            "should log the configuration error once, at error"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_adds_version_header_to_a_handler_error() {
+        let version = trusted_server_core::constants::TS_GIT_VERSION
+            .expect("should compile a git version into the test build");
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings_with_response_headers(vec![])));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Err::<Response, EdgeError>(EdgeError::internal(std::io::Error::other(
+                "example handler failure",
+            )))
+        });
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should render the handler error as a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer the handler error with its status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(version),
+            "should add x-ts-version to the handler error response"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && !record.message.contains("example handler failure")
+            ),
+            "should log the handler error once, without its message"
+        );
+    }
+
+    #[test]
     fn auth_handle_passes_through_when_auth_not_configured() {
         let settings = test_settings();
         let middleware = AuthMiddleware::new(Arc::new(settings));
@@ -833,7 +937,10 @@ mod tests {
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
         assert_eq!(
             header("x-ts-version"),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version as x-ts-version"
         );
         assert_eq!(
@@ -1005,6 +1112,78 @@ mod tests {
             fields.get("x-kept").and_then(|value| value.to_str().ok()),
             Some("kept"),
             "should keep the portable operator fields"
+        );
+    }
+
+    #[test]
+    fn per_request_synthesized_headers_leave_out_a_non_ascii_geo_city_without_warning() {
+        let settings = settings_with_response_headers(vec![]);
+        let geo = sample_geo("Zürich");
+
+        for request in 1..=2 {
+            let capture = LogCapture::start();
+            let fields =
+                synthesized_fields(&per_request_synthesized_headers(&settings, Some(&geo)));
+            let records = capture.take_all();
+            drop(capture);
+
+            assert!(
+                records.is_empty(),
+                "should not warn about the geo city on request {request}"
+            );
+            assert!(
+                fields.get("x-geo-city").is_none(),
+                "should leave the unportable city out of the set on request {request}"
+            );
+        }
+
+        let mut routed = empty_response();
+        apply_finalize_headers(&settings, Some(&geo), &mut routed);
+        assert_eq!(
+            routed
+                .headers()
+                .get("x-geo-city")
+                .map(HeaderValue::as_bytes),
+            Some("Zürich".as_bytes()),
+            "should keep the city on the routed response"
+        );
+    }
+
+    #[test]
+    fn unsynthesizable_operator_entries_warn_once_at_settings_load_not_per_request() {
+        let settings = settings_with_response_headers(vec![
+            ("content-type", "text/plain"),
+            ("x-operator", " padded"),
+            ("x-kept", "kept"),
+        ]);
+
+        let capture = LogCapture::start();
+        warn_unsynthesizable_operator_response_headers(&settings);
+        let at_load = capture.take_all();
+        for _ in 0..2 {
+            let _set = per_request_synthesized_headers(&settings, None);
+        }
+        let per_request = capture.take_all();
+        drop(capture);
+
+        let mut warned: Vec<&str> = at_load
+            .iter()
+            .filter(|record| record.level == log::Level::Warn)
+            .filter_map(|record| {
+                ["content-type", "x-operator", "x-kept"]
+                    .into_iter()
+                    .find(|name| record.message.contains(&format!("`{name}`")))
+            })
+            .collect();
+        warned.sort_unstable();
+        assert_eq!(
+            (at_load.len(), warned),
+            (2, vec!["content-type", "x-operator"]),
+            "should warn once for each operator entry the set leaves out"
+        );
+        assert!(
+            per_request.is_empty(),
+            "should not warn again for each request"
         );
     }
 

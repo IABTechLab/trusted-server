@@ -23,6 +23,7 @@ default = []
 aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -34,7 +35,6 @@ futures = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
 

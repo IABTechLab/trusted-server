@@ -17,13 +17,13 @@ use crate::version_header::git_version_header_value;
 /// whatever its origin timeout.
 pub const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Installs the response write deadline and the app-level synthesized headers.
+/// Installs the response write deadline and the adapter's app-level synthesized headers.
 ///
 /// The egress policy ends each response write [`RESPONSE_WRITE_DEADLINE`] after
-/// egress starts. The synthesized set is [`synthesized_response_headers`].
-/// `EdgeZero` adds it, where a field is absent, to the responses it generates
-/// itself, such as the canonical 404 and 405. Routed responses keep the headers
-/// the finalize middleware sets.
+/// egress starts. `synthesized` is [`synthesized_response_headers`], or an
+/// adapter's set built from it. `EdgeZero` adds it, where a field is absent, to
+/// the responses it generates itself, such as the canonical 404 and 405. Routed
+/// responses keep the headers the finalize middleware sets.
 ///
 /// # Errors
 ///
@@ -34,14 +34,15 @@ pub const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(60);
 /// ```
 /// use edgezero_core::app::App;
 /// use edgezero_core::router::RouterService;
-/// use trusted_server_core::edge_app::install_edge_policies;
+/// use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 ///
 /// let mut app = App::new(RouterService::builder().build());
-/// install_edge_policies(&mut app).expect("should install the edge policies");
+/// install_edge_policies(&mut app, synthesized_response_headers())
+///     .expect("should install the edge policies");
 /// ```
-pub fn install_edge_policies(app: &mut App) -> Result<(), EdgeError> {
+pub fn install_edge_policies(app: &mut App, synthesized: HeaderMap) -> Result<(), EdgeError> {
     app.set_response_egress_policy(response_write_policy);
-    app.set_synthesized_response_headers(synthesized_response_headers())
+    app.set_synthesized_response_headers(synthesized)
         .map_err(EdgeError::internal)
 }
 
@@ -49,8 +50,8 @@ pub fn install_edge_policies(app: &mut App) -> Result<(), EdgeError> {
 ///
 /// The set holds `x-ts-version` when a git version is compiled in, the value
 /// the finalize middleware sets on routed responses. An adapter that adds its
-/// own fields starts from this set and installs the result with
-/// [`App::set_synthesized_response_headers`].
+/// own fields starts from this set and passes the result to
+/// [`install_edge_policies`].
 ///
 /// # Examples
 ///
@@ -100,7 +101,8 @@ mod tests {
     #[test]
     fn installed_egress_policy_sets_write_deadline_sixty_seconds_after_egress_start() {
         let mut app = App::new(RouterService::builder().build());
-        install_edge_policies(&mut app).expect("should install the edge policies");
+        install_edge_policies(&mut app, synthesized_response_headers())
+            .expect("should install the edge policies");
         let headers = HeaderMap::new();
         let request_start = MonotonicInstant::now();
         let egress_started_at = request_start

@@ -1,10 +1,10 @@
 # Native prepared startup
 
-The native adapter uses the published EdgeZero
-`v0.0.12-rc-axum.202611.2` tag at
-`4407d94130a9b752a70528b6c6f9c8fe3c10b81d`. It retains PR #1506's direct
-outbound API and current-main application behavior. Historical demo results do
-not qualify this combination.
+The native adapter uses the workspace EdgeZero pin,
+`9d02d7b3185b49e81d9ac972ca3feef932ed848a` on EdgeZero's `rc/identity`
+branch; see [the pinned version](./edgezero#pinned-version). It retains PR
+#1506's direct outbound API and current-main application behavior. Historical
+demo results do not qualify this combination.
 
 ## Prepared startup
 
@@ -119,9 +119,11 @@ geography remains Unknown. Configured GDPR countries and US privacy states keep
 their existing consent rules. This extraction does not change TCF/GPC/identity
 policy.
 
-The admitted-error finalizer retains Geo/TS headers without replacing framework
-status, required headers or failure classification. Pre-admission failures have
-no managed outcome and remain outside that finalizer. The selected serving
+A handler error, such as an oversized request body, passes through the finalize
+middleware, which retains Geo/TS headers without replacing the framework status.
+The pinned EdgeZero has no admitted-error finalizer, so an error EdgeZero
+renders outside the router carries no Geo/TS headers. Pre-admission failures
+have no managed outcome. The selected serving
 provider is protected CloudFront, not the standalone EdgeZero KV Geo prototype. No
 Geo database, remote lookup or licensed data is imported.
 
@@ -176,7 +178,8 @@ node scripts/test-native-providers.mjs /absolute/path/to/trusted-server-axum
 These fixtures do not establish hosted, image, fleet or live-data acceptance.
 Deployment and infrastructure migration are separate operations.
 
-Keep `RUST_LOG` at `info` or quieter around operator inputs. Dependency
-DEBUG/TRACE events can expose credential-source metadata, ARNs or bodies.
+Keep `EDGEZERO__LOGGING__LEVEL` at `info` or quieter around operator inputs.
+Dependency DEBUG/TRACE events can expose credential-source metadata, ARNs or
+bodies.
 AppConfig Agent diagnostics can include its request URL. This adapter does not
 suppress dependency events.

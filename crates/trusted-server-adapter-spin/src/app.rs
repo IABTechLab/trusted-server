@@ -24,12 +24,11 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
-use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::edge_app::install_edge_policies;
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -42,7 +41,7 @@ use trusted_server_core::proxy::{
 };
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
-    PublisherResponse, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
@@ -73,6 +72,8 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built with the app. This adapter has no EC record store.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -132,6 +133,7 @@ fn build_state_with_services(
     mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Spin")?;
     // Spin cannot send a host other than the origin URI authority.
     settings
         .publisher
@@ -140,10 +142,14 @@ fn build_state_with_services(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -157,7 +163,7 @@ impl AppState {
 }
 
 // ---------------------------------------------------------------------------
-// Publisher response helper
+// Publisher origin input cap
 // ---------------------------------------------------------------------------
 
 /// Largest publisher origin body the Spin adapter collects before egress.
@@ -165,34 +171,6 @@ impl AppState {
 /// It keeps the 8 MiB limit the adapter's own client applied before the
 /// publisher origin moved to `EdgeZero`'s client.
 const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
-///
-/// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction, collects raw origin bodies under
-/// `input_cap`, and enforces `settings.publisher.max_buffered_body_bytes` on
-/// processed output, so a large origin response fails safely instead of
-/// exhausting the Wasm heap.
-async fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-    input_cap: u64,
-) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response_async(
-        publisher_response,
-        method,
-        settings,
-        registry,
-        orchestrator,
-        services,
-        Some(input_cap),
-    )
-    .await
-}
 
 // ---------------------------------------------------------------------------
 // Publisher fallback method table
@@ -216,14 +194,6 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-//
-// The EC API routes that the Fastly entry point registers — POST
-// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
-// intentionally absent here, matching the Axum and Cloudflare adapters: those
-// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
-// registry and rate limiter) that the portability adapters do not yet wire.
-// On Spin these paths fall through to the publisher/integration fallback,
-// identical to the other non-Fastly adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -234,7 +204,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 19] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -246,6 +216,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/identify", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/api/v1/batch-sync", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -465,10 +437,6 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Spin adapter.
 ///
@@ -495,7 +463,7 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)
+        install_edge_policies(app, synthesized_response_headers())
     }
 
     fn name() -> &'static str {
@@ -504,7 +472,8 @@ impl Hooks for TrustedServerApp {
 
     fn routes() -> Result<RouterService, EdgeError> {
         // Every startup failure answers 503 with a generic message, so the
-        // logged report never reaches an anonymous caller.
+        // report never reaches an anonymous caller. It is logged at error,
+        // which `EdgeZero`'s managed backend writes to the component's stderr.
         let state = build_state().map_err(|report| {
             log::error!("{report:?}");
             EdgeError::service_unavailable("Service Unavailable")
@@ -628,21 +597,23 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         let cache_purge_unsupported_handler =
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
 
-        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-        };
-
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: this adapter has no EC record store, so identify and batch
+        // sync answer 501 and any other method answers 405.
         let s = Arc::clone(&state);
-        let admin_eids_handler = move |ctx: RequestContext| {
+        let identify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request()?;
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+                Ok::<Response, EdgeError>(
+                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                )
             }
+        };
+        let batch_sync_handler = |ctx: RequestContext| async move {
+            let req = ctx.into_request()?;
+            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
         };
 
         // /auction
@@ -811,15 +782,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -853,14 +821,14 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 )
                 .await
                 {
-                    Ok((pr, owner)) => resolve_publisher_response(
+                    Ok((pr, owner)) => buffer_publisher_response_async(
                         pr,
                         &method,
                         &state.settings,
                         &state.registry,
                         &state.orchestrator,
                         &services,
-                        input_cap,
+                        Some(input_cap),
                     )
                     .await
                     .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
@@ -900,7 +868,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // from Spin's synthetic runtime headers) so no handler can opt out of
             // the de-spoofing invariant. Runs after auth so the basic-auth gate
             // continues to see the original request, matching prior behaviour.
-            .middleware(NormalizeMiddleware::new())
+            .middleware(NormalizeMiddleware::new());
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups; without a record store, admin EC lookup answers 501.
+        builder = state.identity.mount(builder);
+        builder = builder
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
             .get("/health", |_ctx: RequestContext| async {
@@ -919,14 +891,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
-            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
-            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -953,6 +917,15 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 method.clone(),
                 cache_purge_unsupported_handler,
             );
+        }
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/api/v1/identify",
+                method.clone(),
+                identify_handler.clone(),
+            );
+            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
@@ -1010,6 +983,23 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = multi_provider_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Spin"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     // Runs the production normalizer on the head of a whole test request.
     fn normalize_request(req: &mut Request) {
@@ -1095,23 +1085,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = multi_provider_settings();
-        settings.auction.enabled = false;
-
-        build_state_with_settings(settings)
-            .expect("disabled Spin auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn cloudflare_and_spin_load_multi_provider_plan() {
+    fn startup_loads_multi_provider_plan() {
         let state = build_state_with_settings(multi_provider_settings())
             .expect("should load a multi-provider auction plan on Spin");
 
         assert_eq!(
             state.orchestrator.provider_count(),
             2,
-            "should fan out to both configured providers"
+            "should register both configured providers"
         );
     }
 

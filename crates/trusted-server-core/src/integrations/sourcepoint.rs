@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::outbound::OutboundResponse;
+use edgezero_core::error::EdgeError;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
@@ -38,7 +38,7 @@ use crate::http_util::read_request_body;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_response_bounded,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
 };
 use crate::outbound::{
     OutboundRequestSource, STREAMED_TIMEOUT, outbound_error, outbound_request, streamed,
@@ -50,6 +50,7 @@ const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
 const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
 const SOURCEPOINT_SITE_DATA_PATH: &str = "/mms/v2/get_site_data";
+const UPSTREAM_REQUEST_FAILED: &str = "Sourcepoint upstream request failed";
 
 /// Maximum input body size (5 MiB) collected for JavaScript or HTML rewriting.
 /// Declared larger bodies pass through without collection. Bodies that exceed
@@ -323,6 +324,12 @@ impl SourcepointIntegration {
             integration: SOURCEPOINT_INTEGRATION_ID.to_string(),
             message: message.into(),
         }
+    }
+
+    /// Maps a failed upstream exchange to a Sourcepoint 502 that carries
+    /// `error` opaquely, through [`outbound_error`].
+    fn upstream_error(error: EdgeError, message: &str) -> Report<TrustedServerError> {
+        outbound_error(error, Self::error(message), OutboundRequestSource::Internal)
     }
 
     fn strip_cdn_prefix(path: &str) -> Option<&str> {
@@ -599,9 +606,8 @@ impl SourcepointIntegration {
     }
 
     /// Returns `true` when the response `Content-Type` is HTML.
-    fn is_html_response(response: &Response<EdgeBody>) -> bool {
-        response
-            .headers()
+    fn is_html_response(headers: &HeaderMap) -> bool {
+        headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("text/html"))
@@ -624,9 +630,8 @@ impl SourcepointIntegration {
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
-    fn is_javascript_response(response: &Response<EdgeBody>) -> bool {
-        response
-            .headers()
+    fn is_javascript_response(headers: &HeaderMap) -> bool {
+        headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("javascript") || ct.contains("ecmascript"))
@@ -895,57 +900,28 @@ impl IntegrationProxy for SourcepointIntegration {
             .get(header::ACCEPT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"));
-        // Stream the body, so the rewrite collector enforces its limit before
-        // anything buffers the entire response.
-        let mut response = services
+        // Stream the body, so the bounded rewrite read enforces its limit
+        // before anything buffers the entire response.
+        let upstream = services
             .outbound_client()
             .send(streamed(proxy_req, STREAMED_TIMEOUT))
             .await
-            .and_then(OutboundResponse::into_response)
-            .map_err(|error| {
-                outbound_error(
-                    error,
-                    Self::error("Sourcepoint upstream request failed"),
-                    OutboundRequestSource::Internal,
-                )
-            })?;
+            .map_err(|error| Self::upstream_error(error, UPSTREAM_REQUEST_FAILED))?;
 
         log::info!(
             "Sourcepoint: upstream responded with status {}",
-            response.status()
+            upstream.status()
         );
-
-        // Rewrite Location headers on redirect responses so the browser
-        // follows the redirect through the first-party proxy instead of
-        // leaking the CDN origin to the client.
-        if response.status().is_redirection() {
-            if let Some(location) = response
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|h| h.to_str().ok())
-                && let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url)
-            {
-                log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
-                if let Ok(val) = HeaderValue::from_str(&rewritten) {
-                    response.headers_mut().insert(header::LOCATION, val);
-                }
-            }
-            // Redirects without Set-Cookie intentionally keep upstream cache
-            // semantics; default public caching is only applied to successful
-            // responses.
-            self.apply_cache_headers(&mut response, forwarded_cookies);
-            return Ok(response);
-        }
 
         // Rewrite CDN URLs inside JavaScript responses (dynamically loaded
         // chunks, API calls) and root-absolute asset paths inside HTML iframe
         // documents (privacy-manager pages), so both route through the
         // first-party proxy.
-        let response_is_javascript = Self::is_javascript_response(&response);
-        let response_is_html = Self::is_html_response(&response);
+        let response_is_javascript = Self::is_javascript_response(upstream.headers());
+        let response_is_html = Self::is_html_response(upstream.headers());
         // Only rewrite plain text. Unsupported, malformed, or mixed encoding
         // headers must pass through without collecting or altering the bytes.
-        let response_is_identity_encoded = response
+        let response_is_identity_encoded = upstream
             .headers()
             .get_all(header::CONTENT_ENCODING)
             .iter()
@@ -955,7 +931,7 @@ impl IntegrationProxy for SourcepointIntegration {
                     .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
             });
         let rewrite_eligible = method == Method::GET
-            && response.status() == StatusCode::OK
+            && upstream.status() == StatusCode::OK
             && self.config.rewrite_sdk
             && (response_is_javascript || response_is_html);
         if rewrite_eligible && !response_is_identity_encoded {
@@ -970,81 +946,102 @@ impl IntegrationProxy for SourcepointIntegration {
                  skipping rewrite (reason: encoded_response)"
             );
         }
+        // Guard against unexpectedly large responses to avoid unbounded
+        // memory consumption during rewriting.
+        let declared_oversize = upstream
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|len| *len > MAX_REWRITE_BODY_SIZE);
         if rewrite_eligible && response_is_identity_encoded {
-            let kind = if response_is_javascript {
-                "JavaScript"
-            } else {
-                "HTML"
-            };
-            log::info!("Sourcepoint: rewriting {kind} response body for {path}");
-
-            // Guard against unexpectedly large responses to avoid unbounded
-            // memory consumption during rewriting.
-            let content_length = response
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-
-            if let Some(len) = content_length
-                && len > MAX_REWRITE_BODY_SIZE
-            {
+            if let Some(len) = declared_oversize {
                 log::warn!(
                     "Sourcepoint: response body for {path} exceeds {} bytes \
                      (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
                     MAX_REWRITE_BODY_SIZE
                 );
-                self.apply_cache_headers(&mut response, forwarded_cookies);
+            } else {
+                let kind = if response_is_javascript {
+                    "JavaScript"
+                } else {
+                    "HTML"
+                };
+                log::info!("Sourcepoint: rewriting {kind} response body for {path}");
+
+                // Content-Length is optional and advisory. Stop at the actual
+                // byte limit even when the header is absent or understates the
+                // size. Overflow discards the partial body and returns a 502.
+                let status = upstream.status();
+                let headers = upstream.headers().clone();
+                let body_bytes = upstream
+                    .into_bytes_bounded(MAX_REWRITE_BODY_SIZE)
+                    .await
+                    .map_err(|error| {
+                        Self::upstream_error(
+                            error,
+                            &format!(
+                                "Sourcepoint response body collection for {path} failed \
+                                 (limit: {MAX_REWRITE_BODY_SIZE} bytes, \
+                                 reason: response_collection_failed)"
+                            ),
+                        )
+                    })?;
+                let mut response = Response::new(EdgeBody::empty());
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+
+                let body = match String::from_utf8(Vec::from(body_bytes)) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        log::warn!(
+                            "Sourcepoint: upstream body for {path} is not valid UTF-8 \
+                             at byte offset {}, passing through unmodified",
+                            err.utf8_error().valid_up_to()
+                        );
+                        *response.body_mut() = EdgeBody::from(err.into_bytes());
+                        self.apply_cache_headers(&mut response, forwarded_cookies);
+                        return Ok(response);
+                    }
+                };
+                if response_is_javascript {
+                    let rewritten = Self::rewrite_script_content(&body);
+                    self.rewrite_javascript_response(
+                        &mut response,
+                        rewritten,
+                        target_path,
+                        forwarded_cookies,
+                    );
+                } else {
+                    let rewritten = Self::rewrite_html_content(&body);
+                    self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
+                }
                 return Ok(response);
             }
-
-            // Content-Length is optional and advisory. Stop at the actual
-            // byte limit even when the header is absent or understates the
-            // size. Overflow discards the partial body and returns a 502.
-            let (resp_parts, resp_body) = response.into_parts();
-            let body_bytes = collect_response_bounded(
-                resp_body,
-                MAX_REWRITE_BODY_SIZE as usize,
-                SOURCEPOINT_INTEGRATION_ID,
-            )
-            .await
-            .inspect_err(|error| {
-                log::warn!(
-                    "Sourcepoint: response body collection for {path} failed \
-                     (limit: {MAX_REWRITE_BODY_SIZE} bytes), returning 502 \
-                     (reason: response_collection_failed): {error}"
-                );
-            })?;
-            let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
-
-            let body = match String::from_utf8(body_bytes) {
-                Ok(text) => text,
-                Err(err) => {
-                    log::warn!(
-                        "Sourcepoint: upstream body for {path} is not valid UTF-8 \
-                         at byte offset {}, passing through unmodified",
-                        err.utf8_error().valid_up_to()
-                    );
-                    *response.body_mut() = EdgeBody::from(err.into_bytes());
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-            };
-            if response_is_javascript {
-                let rewritten = Self::rewrite_script_content(&body);
-                self.rewrite_javascript_response(
-                    &mut response,
-                    rewritten,
-                    target_path,
-                    forwarded_cookies,
-                );
-            } else {
-                let rewritten = Self::rewrite_html_content(&body);
-                self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
-            }
-            return Ok(response);
         }
 
+        let mut response = upstream
+            .into_response()
+            .map_err(|error| Self::upstream_error(error, UPSTREAM_REQUEST_FAILED))?;
+
+        // Rewrite Location headers on redirect responses so the browser
+        // follows the redirect through the first-party proxy instead of
+        // leaking the CDN origin to the client.
+        if response.status().is_redirection()
+            && let Some(location) = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+            && let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url)
+        {
+            log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
+            if let Ok(val) = HeaderValue::from_str(&rewritten) {
+                response.headers_mut().insert(header::LOCATION, val);
+            }
+        }
+        // Redirects without Set-Cookie intentionally keep upstream cache
+        // semantics; default public caching is only applied to successful
+        // responses.
         self.apply_cache_headers(&mut response, forwarded_cookies);
         Ok(response)
     }
@@ -1640,8 +1637,15 @@ mod tests {
                                 "should report upstream overflow as 502"
                             );
                             assert!(
-                                matches!(error.current_context(), TrustedServerError::Integration { integration, message } if integration == SOURCEPOINT_INTEGRATION_ID && message.contains("exceeds")),
+                                matches!(error.current_context(), TrustedServerError::Integration { integration, .. } if integration == SOURCEPOINT_INTEGRATION_ID),
                                 "should identify Sourcepoint response overflow"
+                            );
+                            assert!(
+                                matches!(
+                                    error.downcast_ref::<EdgeError>(),
+                                    Some(EdgeError::ResponseTooLarge { .. })
+                                ),
+                                "should carry EdgeZero's response-limit error"
                             );
                         }
                         assert_eq!(
