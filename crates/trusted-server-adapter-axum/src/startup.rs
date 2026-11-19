@@ -22,8 +22,6 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 
 use crate::app::{build_state_with_settings, router_builder};
-use crate::middleware::apply_finalize_headers;
-use crate::platform::geo_from_outcome;
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -281,7 +279,6 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             ));
         }
     }
-    let finalize_settings = Arc::clone(&state.settings);
     let router = router_builder(&state).build();
     if deadline.is_expired_at(clock.now()) {
         return Err(configuration_error(
@@ -296,10 +293,6 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         secret_store,
     });
     app.set_router(router);
-    app.set_admitted_error_response_finalizer(move |outcome, response| {
-        let geo = geo_from_outcome(outcome);
-        apply_finalize_headers(&finalize_settings, geo.as_ref(), response);
-    });
     app.insert_state(snapshot);
     Ok(())
 }

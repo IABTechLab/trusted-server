@@ -5,7 +5,7 @@ use edgezero_core::EdgeError;
 use edgezero_core::app::{App, StoreMetadata};
 use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 
-const STORE_ID: &str = "trusted_server_kv";
+pub(crate) const STORE_ID: &str = "trusted_server_kv";
 
 fn declared() -> Result<bool, EdgeError> {
     match std::env::var("TS_EC_DYNAMODB_ENABLED") {

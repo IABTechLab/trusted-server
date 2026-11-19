@@ -103,7 +103,7 @@ cargo run -p trusted-server-adapter-axum
 ```
 
 The server will be available at `http://localhost:8787`. To use a different port,
-set `PORT=<port>` before `cargo run` and set
+set `EDGEZERO__ADAPTER__PORT=<port>` before `cargo run` and set
 `TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:<port>` before
 `ts config push` so rewritten creative URLs use the same listener.
 

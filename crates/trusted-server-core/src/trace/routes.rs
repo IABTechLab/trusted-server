@@ -411,7 +411,7 @@ mod tests {
     use crate::auth::EdgeTerminatedAuthorization;
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
     use crate::settings::Handler;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::tests::{create_test_settings, with_request_parts};
     use crate::trace::TraceTerminalResponse;
 
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn trace_auth_failure_logs_a_fixed_category_without_the_path() {
-        let warnings = WarningCapture::start();
+        let warnings = LogCapture::start();
         let mut request = request(Method::GET, "/_ts/trace/fictional-secret-sentinel", false);
         request.headers_mut().insert(
             header::AUTHORIZATION,
@@ -789,18 +789,16 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "should authenticate before reporting the reserved path error"
         );
-        let logs: Vec<String> = warnings
-            .take()
-            .into_iter()
-            .map(|warning| warning.message)
-            .collect();
+        let logs = warnings.take_all();
         assert!(
-            logs.iter().any(|message| message == "trace_auth_failed"),
-            "should emit only a fixed diagnostic category"
+            logs.iter()
+                .any(|record| record.level == log::Level::Warn
+                    && record.message == "trace_auth_failed"),
+            "should warn with only a fixed diagnostic category"
         );
         assert!(
             logs.iter()
-                .all(|message| !message.contains("fictional-secret-sentinel")),
+                .all(|record| !record.message.contains("fictional-secret-sentinel")),
             "should not log the confidential trace path"
         );
         let mut ordinary = self::request(Method::GET, "/ordinary-example-sentinel", false);
@@ -817,8 +815,11 @@ mod tests {
             "should retain ordinary credential rejection"
         );
         assert!(
-            warnings.take().iter().any(|warning| warning.message
-                == "Basic auth failed for path: /ordinary-example-sentinel"),
+            warnings
+                .take_warnings()
+                .iter()
+                .any(|warning| warning.message
+                    == "Basic auth failed for path: /ordinary-example-sentinel"),
             "should retain ordinary path logging outside trace"
         );
         let body = response
