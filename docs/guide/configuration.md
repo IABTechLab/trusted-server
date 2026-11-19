@@ -1099,8 +1099,11 @@ they reach bid requests from the next page load.
 
 **Lockr.** The `id5`, `liveramp` and `uid2` kinds accept
 `[ec.identity_providers.settings.lockr]` (`enabled`, `cookie_names`), read
-after the vendor's own cookies and never where GDPR applies. The other kinds
-reject that table.
+after the vendor's own cookies and never where GDPR applies. Each kind's
+default Lockr key equals one of its own cookie names, which are already read,
+so enabling Lockr with the defaults reads no extra cookie: set `cookie_names`
+to the key configured in Lockr when it differs. The other kinds reject that
+table.
 
 **Opt-out.** An `id5` cookie or fetch reply whose ID is `0`, a `liveramp`
 lookup answered `204`, a `uid2` `optout` identity or refresh reply, and
