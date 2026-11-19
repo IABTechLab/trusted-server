@@ -88,17 +88,15 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::ec_record_store::LazyEcRecordStore;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
-use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::RecordLayout;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
-use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
@@ -126,7 +124,7 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
+use trusted_server_core::ec::record_backend::EcRecordLayout;
 use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
@@ -324,13 +322,15 @@ fn identity_app_with_providers(
     )
 }
 
-/// Opens the EC record store `ec.storage` (or the legacy `ec.ec_store`)
-/// selects, once per sandbox, as an `EdgeZero` record view.
+/// Selects the EC record store `ec.storage` (or the legacy `ec.ec_store`)
+/// names, held once per sandbox.
+///
+/// The Fastly binding is opened on the first EC operation, not here, so a
+/// missing or failing store fails only EC work rather than every route.
 ///
 /// # Errors
 ///
-/// Returns a configuration error for an invalid selection and a KV store
-/// error when the declared record store cannot be opened with the EC layout.
+/// Returns a configuration error for an invalid selection.
 pub(crate) fn open_identity_record_store(
     settings: &Settings,
 ) -> Result<Option<Arc<dyn EcKvStore + Send + Sync>>, Report<TrustedServerError>> {
@@ -338,19 +338,7 @@ pub(crate) fn open_identity_record_store(
         None => return Ok(None),
         Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
     };
-    let store_error = |message: String| {
-        Report::new(TrustedServerError::KvStore {
-            store_name: store_id.to_owned(),
-            message,
-        })
-    };
-    let layout = RecordLayout::new(EcRecordLayout)
-        .map_err(|error| store_error(format!("invalid EC record layout: {error}")))?;
-    let provider = FastlyKvStore::open_records(store_id, layout)
-        .map_err(|error| store_error(format!("failed to open EC record store: {error}")))?;
-    let handle = KvHandle::new(Arc::new(provider));
-    let store = RecordEcKvStore::new(store_id.to_owned(), &handle)?;
-    Ok(Some(Arc::new(store)))
+    Ok(Some(Arc::new(LazyEcRecordStore::new(store_id.to_owned()))))
 }
 
 // ---------------------------------------------------------------------------
