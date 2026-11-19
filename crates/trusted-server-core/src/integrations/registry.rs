@@ -10,11 +10,8 @@ use matchit::Router;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::EcContext;
-use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
@@ -787,18 +784,11 @@ impl IntegrationMetadata {
 
 /// Inputs to [`IntegrationRegistry::handle_proxy`].
 ///
-/// Bundled into a struct so the dispatch surface stays within the project's
-/// 7-argument cap; `ec_context` and `req` participate in the borrow so the
-/// whole thing shares one lifetime.
+/// Bundled into a struct so the dispatch surface shares one lifetime.
 pub struct ProxyDispatchInput<'a> {
     pub method: &'a Method,
     pub path: &'a str,
     pub settings: &'a Settings,
-    pub kv: Option<&'a KvIdentityGraph>,
-    /// Whether this adapter permits identity generation on integration routes.
-    /// Native keeps issuance on publisher navigations, not static JS proxies.
-    pub allow_generation: bool,
-    pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
 }
@@ -1022,7 +1012,8 @@ impl IntegrationRegistry {
     /// Dispatch a proxy request when an integration handles the path.
     ///
     /// This method removes any caller-supplied `x-ts-ec` before proxying.
-    /// Response-side cookie mutation is centralized in EC finalize.
+    /// Response-side cookie mutation is centralized in EC finalize. It never
+    /// mints an EC: only a publisher navigation may create the EC row.
     #[must_use]
     pub async fn handle_proxy(
         &self,
@@ -1032,23 +1023,12 @@ impl IntegrationRegistry {
             method,
             path,
             settings,
-            kv,
-            allow_generation,
-            ec_context,
             services,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Organic proxy handler: generate if needed (best effort).
-            // Only generate for document navigations — subresource requests
-            // may lack consent signals such as the Sec-GPC header.
-            if allow_generation && is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv).await {
-                    log::warn!("EC generation failed for integration proxy: {err:?}");
-                }
-            } else {
-                log::debug!("EC generation skipped for integration proxy (path={path})",);
-            }
+            // Integration proxies never mint an EC: only the publisher
+            // navigation may create the row (one write per page load).
 
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
@@ -1838,15 +1818,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &http::Method::GET,
             path: "/integrations/test/echo",
             settings: &settings,
-            kv: None,
-            allow_generation: true,
-            ec_context: &mut ec_context,
             services: &noop_services(),
             req,
         }))
@@ -2193,8 +2168,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let services = noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
@@ -2202,9 +2175,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            allow_generation: true,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));
@@ -2244,8 +2214,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("evil;injected"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2253,9 +2221,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            allow_generation: true,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2294,8 +2259,6 @@ mod tests {
             ))
             .expect("should build Cookie header"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2303,9 +2266,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            allow_generation: true,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2341,8 +2301,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2350,9 +2308,6 @@ mod tests {
             method: &Method::POST,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            allow_generation: true,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));

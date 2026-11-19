@@ -1,11 +1,8 @@
 //! Integration module registry and sample implementations.
 
-use edgezero_core::body::{Body as EdgeBody, BodyPayload};
 use error_stack::Report;
-use futures::StreamExt as _;
 
 use crate::error::TrustedServerError;
-use crate::http_util::into_body_payload;
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -43,70 +40,9 @@ pub use registry::{
 pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Maximum response body size from RTB providers (prebid, aps, mediator).
-pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Drains an upstream [`EdgeBody`] response into a byte vector, rejecting
-/// bodies larger than `max_bytes` with [`TrustedServerError::Integration`].
-///
-/// Use this for upstream (provider/integration) response bodies to bound
-/// memory usage when a third-party server misbehaves. An oversized body is
-/// classified as [`TrustedServerError::Integration`] (502 `BAD_GATEWAY`).
-/// Inbound request bodies use
-/// [`read_request_body`](crate::http_util::read_request_body) instead, which
-/// answers an overflow with [`TrustedServerError::RequestTooLarge`] (413).
-///
-/// Note: the effective bound for streaming bodies is ≤ `max_bytes` + `one_chunk`
-/// because the size check runs after each chunk is materialized. Fastly
-/// H2/H3 chunks are ≤ 16 KiB in practice, making the overshoot negligible.
-///
-/// # Errors
-///
-/// Returns an error when:
-/// - The body exceeds `max_bytes` (mapped to [`TrustedServerError::Integration`]).
-/// - A streaming body chunk cannot be read (same error type).
-pub(crate) async fn collect_response_bounded(
-    body: EdgeBody,
-    max_bytes: usize,
-    integration: &'static str,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match into_body_payload(body) {
-        BodyPayload::Once(bytes) => {
-            if bytes.len() > max_bytes {
-                return Err(Report::new(TrustedServerError::Integration {
-                    integration: integration.to_string(),
-                    message: format!(
-                        "response body ({} bytes) exceeds the {max_bytes} byte limit",
-                        bytes.len(),
-                    ),
-                }));
-            }
-            Ok(bytes.to_vec())
-        }
-        BodyPayload::Stream(mut stream) => {
-            let mut body_bytes = Vec::new();
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = chunk_result.map_err(|error| {
-                    Report::new(TrustedServerError::Integration {
-                        integration: integration.to_string(),
-                        message: format!("Failed to read response body: {error}"),
-                    })
-                })?;
-                // Size check runs after chunk is materialized — effective bound is
-                // ≤ max_bytes + one_chunk (Fastly H2/H3 chunks are ≤ 16 KiB in practice).
-                if body_bytes.len() + chunk.len() > max_bytes {
-                    return Err(Report::new(TrustedServerError::Integration {
-                        integration: integration.to_string(),
-                        message: format!("response body exceeds the {max_bytes} byte limit",),
-                    }));
-                }
-                body_bytes.extend_from_slice(&chunk);
-            }
-            Ok(body_bytes)
-        }
-    }
-}
 
 type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;

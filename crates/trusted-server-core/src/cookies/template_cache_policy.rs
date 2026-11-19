@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR};
 use crate::platform::TemplateCookieValue;
 
 /// Whether the request can share a template and its explicit cookie dimensions.
@@ -32,7 +32,7 @@ pub(crate) fn validate_cookie_names(
                 return Err(format!("{field} contains invalid cookie name `{name}`"));
             }
             if field == "template_cache_key_cookies"
-                && [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_SHAREDID].contains(&name.as_str())
+                && [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR].contains(&name.as_str())
             {
                 return Err(format!(
                     "{field} must not key on Trusted Server identity cookie `{name}`"
@@ -46,6 +46,29 @@ pub(crate) fn validate_cookie_names(
         }
     }
     Ok(())
+}
+
+/// Rejects a template-cache key cookie that names the `SharedID` cookie.
+///
+/// The `SharedID` cookie name comes from the publisher's Prebid
+/// configuration, so it is checked apart from the fixed Trusted Server
+/// identity cookies in [`validate_cookie_names`]. `sharedid_cookie` is `None`
+/// when Prebid keeps the `SharedID` in local storage only.
+///
+/// # Errors
+///
+/// Returns an error naming the cookie when the key list names the `SharedID`
+/// cookie.
+pub(crate) fn validate_sharedid_key_cookie(
+    key_names: &[String],
+    sharedid_cookie: Option<&str>,
+) -> Result<(), String> {
+    match sharedid_cookie {
+        Some(sharedid) if key_names.iter().any(|name| name == sharedid) => Err(format!(
+            "template_cache_key_cookies must not key on the SharedID cookie `{sharedid}`"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Classifies all request-cookie fields using validated configuration names.
@@ -232,7 +255,7 @@ mod tests {
 
     #[test]
     fn template_cookie_policy_rejects_identity_keys_but_allows_bypass() {
-        for name in [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_SHAREDID] {
+        for name in [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR] {
             let error = validate_cookie_names(&names(&[name]), &[])
                 .expect_err("should reject identity cookie keys");
             assert!(
@@ -244,6 +267,24 @@ mod tests {
                 "should allow identity cookie bypass policies"
             );
         }
+    }
+
+    #[test]
+    fn template_cookie_policy_rejects_the_configured_sharedid_key() {
+        let error = validate_sharedid_key_cookie(&names(&["_pubcid"]), Some("_pubcid"))
+            .expect_err("should reject the configured SharedID cookie as a key");
+        assert!(
+            error.contains("template_cache_key_cookies") && error.contains("_pubcid"),
+            "should identify the field and the SharedID cookie"
+        );
+        assert!(
+            validate_sharedid_key_cookie(&names(&["sharedId"]), Some("_pubcid")).is_ok(),
+            "should allow a cookie that is not the configured SharedID cookie"
+        );
+        assert!(
+            validate_sharedid_key_cookie(&names(&["_pubcid"]), None).is_ok(),
+            "should allow any key when Prebid keeps SharedID in local storage"
+        );
     }
 
     #[test]

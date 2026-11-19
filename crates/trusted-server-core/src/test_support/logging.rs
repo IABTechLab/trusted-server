@@ -1,19 +1,19 @@
-//! Thread-local warning and error capture behind the single process-wide test logger.
+//! Thread-local capture of warn and error records behind the single process-wide test logger.
 
 use std::cell::RefCell;
 use std::sync::Once;
 
 thread_local! {
-    static WARNINGS: RefCell<Option<Vec<CapturedWarning>>> = const { RefCell::new(None) };
+    static RECORDS: RefCell<Option<Vec<CapturedLog>>> = const { RefCell::new(None) };
 }
 
-/// One warning or error a [`WarningCapture`] recorded.
-pub struct CapturedWarning {
+/// One warn or error record a [`LogCapture`] recorded.
+pub struct CapturedLog {
     /// Level of the record, [`log::Level::Warn`] or [`log::Level::Error`].
     pub level: log::Level,
-    /// Log target of the warning.
+    /// Log target of the record.
     pub target: String,
-    /// Rendered warning message.
+    /// Rendered log message.
     pub message: String,
 }
 
@@ -26,9 +26,9 @@ impl log::Log for TestLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            WARNINGS.with(|warnings| {
-                if let Some(warnings) = warnings.borrow_mut().as_mut() {
-                    warnings.push(CapturedWarning {
+            RECORDS.with(|records| {
+                if let Some(records) = records.borrow_mut().as_mut() {
+                    records.push(CapturedLog {
                         level: record.level(),
                         target: record.target().to_owned(),
                         message: record.args().to_string(),
@@ -41,14 +41,20 @@ impl log::Log for TestLogger {
     fn flush(&self) {}
 }
 
-/// Records the warnings and errors logged on the current thread until it is dropped.
+/// Records the warn and error records logged on the current thread until it is dropped.
 ///
-/// The first capture installs one process-wide logger that keeps only warnings and errors,
-/// so a test binary that installs another logger cannot use it. Captures do not nest.
-pub struct WarningCapture;
+/// A test that claims a warning reads [`LogCapture::take_warnings`], so the same message
+/// logged at error does not satisfy it. A test that claims something about every record,
+/// such as that nothing was logged or that no record carries a secret, reads
+/// [`LogCapture::take_all`] and checks each record's level itself.
+///
+/// The first capture installs one process-wide logger that keeps only warn and error
+/// records, so a test binary that installs another logger cannot use it. Captures do not
+/// nest.
+pub struct LogCapture;
 
-impl WarningCapture {
-    /// Starts capturing the warnings and errors logged on this thread.
+impl LogCapture {
+    /// Starts capturing the warn and error records logged on this thread.
     ///
     /// # Panics
     ///
@@ -62,36 +68,90 @@ impl WarningCapture {
             // Leave the level enabled: restoring it races captures on other threads.
             log::set_max_level(log::LevelFilter::Warn);
         });
-        WARNINGS.with(|warnings| {
-            assert!(
-                warnings.borrow().is_none(),
-                "should not nest warning captures"
-            );
-            *warnings.borrow_mut() = Some(Vec::new());
+        RECORDS.with(|records| {
+            assert!(records.borrow().is_none(), "should not nest log captures");
+            *records.borrow_mut() = Some(Vec::new());
         });
         Self
     }
 
-    /// Returns the warnings and errors captured since the start or the last take.
+    /// Returns the warn-level records captured since the start or the last take.
+    ///
+    /// Error-level records captured in the same span are discarded.
     ///
     /// # Panics
     ///
     /// Panics if the capture is no longer active on this thread.
     #[must_use]
-    pub fn take(&self) -> Vec<CapturedWarning> {
-        WARNINGS.with(|warnings| {
+    pub fn take_warnings(&self) -> Vec<CapturedLog> {
+        let mut records = self.take_all();
+        records.retain(|record| record.level == log::Level::Warn);
+        records
+    }
+
+    /// Returns every warn and error record captured since the start or the last take.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capture is no longer active on this thread.
+    #[must_use]
+    pub fn take_all(&self) -> Vec<CapturedLog> {
+        RECORDS.with(|records| {
             std::mem::take(
-                warnings
+                records
                     .borrow_mut()
                     .as_mut()
-                    .expect("should have an active warning capture"),
+                    .expect("should have an active log capture"),
             )
         })
     }
 }
 
-impl Drop for WarningCapture {
+impl Drop for LogCapture {
     fn drop(&mut self) {
-        WARNINGS.with(|warnings| *warnings.borrow_mut() = None);
+        RECORDS.with(|records| *records.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_warnings_keeps_only_warn_records_and_take_all_keeps_both() {
+        let capture = LogCapture::start();
+
+        log::warn!("example warning");
+        log::error!("example error");
+        let warnings = capture.take_warnings();
+        log::warn!("example warning");
+        log::error!("example error");
+        let all = capture.take_all();
+
+        let warning_view: Vec<(log::Level, &str)> = warnings
+            .iter()
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert_eq!(
+            warning_view,
+            [(log::Level::Warn, "example warning")],
+            "should return only the warn-level record"
+        );
+        let all_view: Vec<(log::Level, &str)> = all
+            .iter()
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert_eq!(
+            all_view,
+            [
+                (log::Level::Warn, "example warning"),
+                (log::Level::Error, "example error")
+            ],
+            "should return the warn and the error record in order"
+        );
+        assert!(
+            capture.take_all().is_empty(),
+            "should drain the records on each take"
+        );
     }
 }

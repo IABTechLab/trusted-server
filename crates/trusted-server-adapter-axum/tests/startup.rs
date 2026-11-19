@@ -153,7 +153,7 @@ impl ServerFixture {
         command
             .env_clear()
             .env("TMPDIR", std::env::temp_dir())
-            .env("RUST_LOG", "info")
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &self.root)
