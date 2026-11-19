@@ -53,9 +53,11 @@ server-side collection, and both feed the same consent-gated KV row.
 - Concrete vendor implementations (each gets its own spec, see §13.2 F1).
 - Adapters other than Fastly. Identity providers remain Fastly-only;
   Cloudflare and Spin get this design when EC identity is ported to them.
-  Native (Axum) EC persistence, added separately, applies the same page-load
-  write gate (§12.3 "EC minting") and withdrawal rule (§12.3 "Withdrawal"),
-  and refuses to start with an enabled provider.
+  Native (Axum) EC persistence, added separately, refuses to start with an
+  enabled provider. From #1566 up, native and Fastly EC follow the shared
+  async EC rules instead of this design's minting, collision and withdrawal
+  rules (§12.3 "EC minting" and "Withdrawal"); the single page-load write and
+  "backing row before cookie" still hold.
 - Cross-browser linking.
 - Vendor segment products and ad-server targeting.
 - Batch sync and admin write paths, except how batch sync treats a
@@ -1580,7 +1582,12 @@ PR A changes behaviour that operators and integrators can observe:
   top-level publisher navigation: a `GET` with `Sec-Fetch-Dest: document`,
   `Sec-Fetch-Mode: navigate`, no `prefetch` in `Sec-Purpose`, and a response
   that is not a 301, 302, 303, 307 or 308 redirect. Clients without Fetch
-  Metadata get no EC, and integration proxies no longer mint one.
+  Metadata get no EC, and integration proxies no longer mint one. From #1566
+  up the shared async EC rules apply instead: an EC is minted on any browser
+  document navigation (`Sec-Fetch-Dest: document`, or an `Accept` header
+  naming `text/html` without Fetch Metadata; Axum also requires `GET`), and
+  an ID collision on create or orphan recovery retries with a fresh ID, up to
+  five attempts, inside the navigation's one write.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
   until a later navigation finds its row.
@@ -1590,6 +1597,9 @@ PR A changes behaviour that operators and integrators can observe:
 - **Withdrawal.** The EC cookie is expired only once every tombstone is
   written or the row is proven absent; while a tombstone fails, the cookie is
   kept so the next request retries. On main the cookie was expired first.
+  From #1566 up the shared async EC rule applies instead: an explicit
+  withdrawal expires the cookie even when a tombstone fails, and the failure
+  is logged and marks the consent-update response failed (503).
 - **Vendor consent.** On Fastly, a provider's `tcf_vendor_id` gates every ID
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
