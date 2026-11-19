@@ -408,20 +408,14 @@ async fn dispatch_ec_route(
             let navigation = method == Method::GET
                 && is_navigation_request(&req)
                 && state.settings.asset_route_for_path(&path).is_none();
-            let mut has_permit = false;
             if navigation {
                 ec.context.set_eid_sync_source(EidSyncSource::Navigation);
-                // The page-load write permit uses the stricter Fetch Metadata
-                // test (spec §3.1); requests without it never write KV.
+                // The navigation's page-load write creates or updates its row.
                 if let Some(permit) = NavigationPermit::classify(&req) {
                     ec.context.set_navigation_permit(permit);
-                    has_permit = true;
                 }
             }
-            // A new EC is minted only when this request may also write its
-            // row, so a client without Fetch Metadata never receives a
-            // throwaway EC.
-            let eligible = navigation && has_permit && ec.browser && graph.is_some();
+            let eligible = navigation && ec.browser && graph.is_some();
             if eligible
                 && let Err(error) = ec.context.generate_if_needed(&state.settings, graph).await
             {

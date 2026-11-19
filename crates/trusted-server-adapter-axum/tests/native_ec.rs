@@ -314,7 +314,6 @@ fn request(method: Method, path: &str, cookie: Option<&str>) -> Request {
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
         )
         .header("sec-fetch-dest", "document")
-        .header("sec-fetch-mode", "navigate")
         .header(header::ACCEPT, "text/html");
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
