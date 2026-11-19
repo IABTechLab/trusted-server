@@ -256,6 +256,9 @@ pub enum PrebidUserIdStorageType {
     Cookie,
     /// Store the module's value in browser local storage.
     Html5,
+    /// Store the module's value in both a browser cookie and local storage.
+    #[serde(rename = "cookie&html5")]
+    CookieAndHtml5,
 }
 
 /// Browser storage settings forwarded verbatim to a Prebid User ID module.
@@ -4284,6 +4287,39 @@ refresh_in_seconds = 3600
             storage.refresh_in_seconds,
             Some(3600),
             "should preserve refresh interval"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_accept_prebid_cookie_and_html5_storage() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie&html5"
+name = "example_env"
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        let storage = entry.storage.as_ref().expect("should parse storage");
+
+        assert_eq!(
+            storage.storage_type,
+            PrebidUserIdStorageType::CookieAndHtml5,
+            "should accept Prebid's combined storage mechanism"
+        );
+        assert_eq!(
+            serde_json::to_value(storage.storage_type).expect("should serialize storage type"),
+            json!("cookie&html5"),
+            "should forward the combined mechanism to Prebid unchanged"
         );
     }
 

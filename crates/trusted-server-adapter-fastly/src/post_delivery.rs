@@ -411,7 +411,7 @@ mod tests {
                 ec_context,
                 use_finalize_kv: false,
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             },
             after_response: None,
         }
@@ -445,7 +445,7 @@ mod tests {
             Some(&kv),
             app.identity.partners(),
             None,
-            None,
+            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         ));
         state.identity = Arc::clone(&app.identity);
