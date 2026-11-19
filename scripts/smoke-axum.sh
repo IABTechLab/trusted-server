@@ -140,6 +140,18 @@ run_case() {
         fi
         APP_PID=""
         smoke_wait_log "$log_path" "$expected_diagnostic"
+        # A diagnostic that lists every reference would hide which one is absent.
+        local reference
+        for reference in handler_password publisher_proxy_secret ec_passphrase; do
+            case "$expected_diagnostic" in
+                *"\`$reference\`"*) ;;
+                *)
+                    if grep -qF "\`$reference\`" "$log_path"; then
+                        smoke_die "$case_name named the present reference $reference"
+                    fi
+                    ;;
+            esac
+        done
     else
         while [ "$attempt" -lt 100 ]; do
             smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
@@ -168,13 +180,13 @@ run_case missing-config "$BASE_PORT" "" \
     "Trusted Server config envelope is missing"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
     "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "required app-config secret \`handler_password\` is missing"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "required app-config secret \`publisher_proxy_secret\` is missing"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" exit \
-    "a required app-config secret is missing"
+    "required app-config secret \`ec_passphrase\` is missing"
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

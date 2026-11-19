@@ -28,6 +28,15 @@ const PROXY_SECRET: &str = "native-proxy-secret-32-bytes-example";
 const EC_PASSPHRASE: &str = "native-ec-passphrase-32-bytes-example";
 const FORWARDER_AUTH_HEADER: &str = "x-ts-forwarder-auth";
 const FORWARDER_SECRET: &str = "native-forwarder-secret-32-bytes-example";
+// Too short for runtime validation, and distinctive enough to find in logs.
+const SHORT_EC_PASSPHRASE: &str = "short-ec-fixture";
+const SECRETS: [&str; 5] = [
+    ADMIN_PASSWORD,
+    PROXY_SECRET,
+    EC_PASSPHRASE,
+    FORWARDER_SECRET,
+    SHORT_EC_PASSPHRASE,
+];
 
 struct Prepared {
     workspace: TempDir,
@@ -221,7 +230,7 @@ impl Running {
         );
     }
 
-    fn rejected(&mut self, diagnostic: &str) {
+    fn rejected(&mut self, diagnostic: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let listener_reachable =
@@ -239,15 +248,8 @@ impl Running {
                     log.contains(diagnostic),
                     "should report {diagnostic}: {log}"
                 );
-                for secret in [
-                    ADMIN_PASSWORD,
-                    PROXY_SECRET,
-                    EC_PASSPHRASE,
-                    FORWARDER_SECRET,
-                ] {
-                    assert!(!log.contains(secret), "should not log secret values");
-                }
-                return;
+                assert_no_secrets(&log);
+                return log;
             }
             assert!(
                 Instant::now() < deadline,
@@ -256,6 +258,21 @@ impl Running {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+impl Running {
+    /// Stops the server, then checks everything it logged for secret values.
+    fn assert_logs_hold_no_secrets(&mut self) {
+        self.child.kill().expect("should stop the running server");
+        self.child.wait().expect("should reap the running server");
+        assert_no_secrets(&self.log());
+    }
+}
+
+fn assert_no_secrets(log: &str) {
+    for secret in SECRETS {
+        assert!(!log.contains(secret), "should not log secret values");
     }
 }
 
@@ -277,7 +294,9 @@ impl Drop for Running {
 }
 
 fn reserve_port() -> tokio::net::TcpSocket {
-    // A listening reservation can satisfy another test's negative startup probe.
+    // Bind without listening to let the OS pick a free port. Callers drop the
+    // socket before spawning, so the port is released, not held: another
+    // process could take it, but no probe ever sees a fixture listener.
     let socket = tokio::net::TcpSocket::new_v4().expect("should create port reservation");
     socket
         .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -417,12 +436,14 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
             .expect("should serve script content type")
             .to_str()
             .expect("should read content type")
-            .contains("javascript")
+            .contains("javascript"),
+        "should serve the injected bundle as JavaScript"
     );
     assert!(
         successful_body(response).len() > 100,
         "should serve embedded bundle, not an empty router"
     );
+    app.assert_logs_hold_no_secrets();
 }
 
 #[test]
@@ -434,17 +455,24 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
     fs::write(fixture.config_path(), "{}").expect("should publish empty config map");
     fixture.spawn(false).rejected("config envelope is missing");
     fixture.publish();
-    for key in [
+    let keys = [
         "native_admin",
         "native_proxy",
         "native_ec",
         "native_forwarder",
-    ] {
+    ];
+    for key in keys {
         let mut incomplete = Prepared::new(&origin.base_url);
         incomplete.secrets.remove(key);
-        incomplete
+        let log = incomplete
             .spawn(false)
-            .rejected("a required app-config secret is missing");
+            .rejected(&format!("required app-config secret `{key}` is missing"));
+        for other in keys.iter().filter(|other| **other != key) {
+            assert!(
+                !log.contains(&format!("`{other}`")),
+                "should name only the missing reference {key}, not {other}: {log}"
+            );
+        }
     }
     let mut invalid = Prepared::new(&origin.base_url);
     invalid.data["publisher"]["origin_url"] = json!("not-a-valid-url");
@@ -455,7 +483,7 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
     let mut invalid = Prepared::new(&origin.base_url);
     invalid
         .secrets
-        .insert("native_ec".to_owned(), "short".to_owned());
+        .insert("native_ec".to_owned(), SHORT_EC_PASSPHRASE.to_owned());
     invalid
         .spawn(false)
         .rejected("Trusted Server initialization failed");
@@ -509,14 +537,19 @@ fn managed_post_bodies_reach_buffered_api_handlers_and_keep_their_limits() {
         .json(&json!({"adUnits": []}))
         .send()
         .expect("should submit a lazy managed auction body");
-    assert_eq!(auction.status().as_u16(), 200);
+    assert_eq!(
+        auction.status().as_u16(),
+        200,
+        "should answer the managed auction body"
+    );
     let auction: Value = auction
         .json()
         .expect("should receive a real OpenRTB no-bid response");
     assert!(
         auction
             .get("seatbid")
-            .is_none_or(|bids| bids.as_array().is_some_and(Vec::is_empty))
+            .is_none_or(|bids| bids.as_array().is_some_and(Vec::is_empty)),
+        "should return a no-bid response without configured providers"
     );
     let signed = client
         .post(format!("{}/first-party/sign", app.base_url()))
@@ -543,7 +576,11 @@ fn managed_post_bodies_reach_buffered_api_handlers_and_keep_their_limits() {
         .json(&json!({"payload": "x".repeat(4096), "signature": "invalid", "kid": "fixture"}))
         .send()
         .expect("should reject the bounded API upload");
-    assert_eq!(oversized.status().as_u16(), 413);
+    assert_eq!(
+        oversized.status().as_u16(),
+        413,
+        "should reject an upload above the API body limit"
+    );
 }
 
 #[test]
@@ -858,7 +895,11 @@ fn truncated_post_then_action_and_api_keep_using_the_same_live_origin() {
             .body("[\"synthetic-action\"]")
             .send()
             .expect("should forward action after truncated POST");
-        assert_eq!(successful_body(response), "0:{\"accepted\":true}\n");
+        assert_eq!(
+            successful_body(response),
+            "0:{\"accepted\":true}\n",
+            "should relay the origin's action result"
+        );
         let body = successful_body(
             client
                 .get(format!("{}/api/data", app.base_url()))
@@ -867,7 +908,8 @@ fn truncated_post_then_action_and_api_keep_using_the_same_live_origin() {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&body).expect("should retain API JSON"),
-            json!({"native": "transport-sequence"})
+            json!({"native": "transport-sequence"}),
+            "should relay the origin's API body"
         );
     }
     let received = origin
@@ -884,6 +926,17 @@ fn truncated_post_then_action_and_api_keep_using_the_same_live_origin() {
         3,
         "should deliver three complete action bodies despite preceding truncated POST"
     );
+    // The truncated upload must not reach the origin as a complete body either.
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| request.path == "/action")
+            .count(),
+        3,
+        "should forward no /action request beyond the three complete ones"
+    );
+    drop(received);
+    app.assert_logs_hold_no_secrets();
 }
 
 /// The ordinary origin above checks wire contracts, not a real Next.js runtime.

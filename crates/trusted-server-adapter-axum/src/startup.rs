@@ -27,7 +27,7 @@ use crate::app::TrustedServerApp;
 /// Only declared stores and explicitly loaded keys exist in these snapshots.
 /// Missing keys and all management writes fail rather than consulting legacy
 /// environment variables or opening another provider.
-pub struct NativeStoreSnapshot {
+pub(crate) struct NativeStoreSnapshot {
     pub(crate) config_store: Arc<dyn PlatformConfigStore>,
     pub(crate) secret_store: Arc<dyn PlatformSecretStore>,
 }
@@ -68,11 +68,11 @@ impl PlatformConfigStore for ConfigSnapshot {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(read_only_config())
+        Err(read_only_snapshot(PlatformError::ConfigStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-        Err(read_only_config())
+        Err(read_only_snapshot(PlatformError::ConfigStore))
     }
 }
 
@@ -100,22 +100,16 @@ impl PlatformSecretStore for SecretSnapshot {
         _name: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(read_only_secret())
+        Err(read_only_snapshot(PlatformError::SecretStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-        Err(read_only_secret())
+        Err(read_only_snapshot(PlatformError::SecretStore))
     }
 }
 
-fn read_only_config() -> Report<PlatformError> {
-    Report::new(PlatformError::ConfigStore)
-        .attach("native startup snapshots are read-only; publish inputs and restart")
-}
-
-fn read_only_secret() -> Report<PlatformError> {
-    Report::new(PlatformError::SecretStore)
-        .attach("native startup snapshots are read-only; publish inputs and restart")
+fn read_only_snapshot(error: PlatformError) -> Report<PlatformError> {
+    Report::new(error).attach("native startup snapshots are read-only; publish inputs and restart")
 }
 
 fn configuration_error(message: &str) -> EdgeError {
@@ -234,15 +228,16 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             deadline,
             limits.max_backend_bytes.min(remaining),
             limits.max_secret_bytes.min(remaining),
-        ).await.map_err(|_| configuration_error(
-            "failed bounded read of a required app-config secret; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
-        ))?;
+        ).await.map_err(|_| configuration_error(&format!(
+            "failed bounded read of required app-config secret `{key}`; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
+        )))?;
         remaining = remaining.checked_sub(read.backend_bytes).ok_or_else(|| {
             configuration_error("native secret extraction exceeds the total byte budget")
         })?;
-        let value = read.value.ok_or_else(|| configuration_error(
-            "a required app-config secret is missing in trusted_server_secrets; publish every active reference before starting",
-        ))?;
+        // The reference key is a name from the envelope, never a secret value.
+        let value = read.value.ok_or_else(|| configuration_error(&format!(
+            "required app-config secret `{key}` is missing in trusted_server_secrets; publish every active reference before starting",
+        )))?;
         values.insert(key, value.to_vec());
     }
     let secret_store = Arc::new(SecretSnapshot(values));

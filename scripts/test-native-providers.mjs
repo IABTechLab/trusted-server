@@ -12,7 +12,6 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -25,6 +24,10 @@ const configId = 'trusted_server_config'
 const secretId = 'trusted_server_secrets'
 const token = 'synthetic-agent-token'
 const keys = ['ec_key', 'proxy_key', 'admin_key']
+// Startup diagnostics expected from each selected-provider failure below.
+const CONFIG_FAILURE_CAUSE = 'trusted_server_config: missing resource'
+const SECRET_FAILURE_CAUSE = 'trusted_server_secrets: missing resource'
+
 const secretValues = (phase) => ({
   ec_key: `synthetic-ec-passphrase-32-bytes-minimum-${phase}`,
   proxy_key: `synthetic-proxy-secret-32-bytes-minimum-${phase}`,
@@ -128,7 +131,8 @@ async function request(
   return new Promise((resolve, reject) => {
     const req = http.request(
       `${endpoint}${path}`,
-      { method, headers },
+      // No shared agent: loopback requests never reuse or proxy a connection.
+      { method, headers, agent: false },
       (res) => {
         const chunks = []
         let size = 0
@@ -195,7 +199,14 @@ async function listening(port) {
       resolve(value)
     }
     socket.setTimeout(100, () => finish(false))
-    socket.once('connect', () => finish(true))
+    // Linux can connect a socket to itself when its ephemeral source port
+    // equals the target port. That is not a listener.
+    socket.once('connect', () =>
+      finish(
+        socket.localPort !== socket.remotePort ||
+          socket.localAddress !== socket.remoteAddress
+      )
+    )
     socket.once('error', () => finish(false))
   })
 }
@@ -222,6 +233,26 @@ export async function stopChild(child) {
     child.exitCode !== null || child.signalCode !== null,
     'child teardown deadline'
   )
+}
+// Do not inherit AWS, proxies, Docker config credentials, or arbitrary
+// endpoints. HOME is isolated, so a Docker context cannot be selected; an
+// explicit DOCKER_HOST endpoint is the only daemon selection passed through.
+export function dockerEnvironment(work, env = process.env) {
+  const docker = { PATH: env.PATH, HOME: work }
+  if (env.DOCKER_HOST) docker.DOCKER_HOST = env.DOCKER_HOST
+  return docker
+}
+// Bounded output from a launch expected to fail. It is only searched, never
+// printed, because provider and SDK errors are not reviewed for secrets.
+const maxCapturedOutput = 64 * 1024
+export function outputHolds(output, cause, phases = ['A', 'B']) {
+  if (!output.includes(cause)) return 'startup cause'
+  for (const phase of phases) {
+    for (const value of Object.values(secretValues(phase))) {
+      if (output.includes(value.trim())) return 'secret value in output'
+    }
+  }
+  return null
 }
 function bindingsText(
   mode,
@@ -289,8 +320,7 @@ export async function main(binary) {
   process.on('SIGINT', interrupt)
   process.on('SIGTERM', interrupt)
   const check = () => requireCheck(!interrupted, 'interrupted')
-  // Do not inherit AWS, proxies, Docker config credentials, or arbitrary endpoints.
-  const dockerEnv = { PATH: process.env.PATH, HOME: work }
+  const dockerEnv = dockerEnvironment(work)
   const docker = async (args, timeout = 30_000) => {
     const controller = new AbortController()
     commands.add(controller)
@@ -309,14 +339,40 @@ export async function main(binary) {
       commands.delete(controller)
     }
   }
-  const launch = async (directory, endpoints, bindingPath, phase) => {
+  const launch = async (
+    directory,
+    endpoints,
+    bindingPath,
+    phase,
+    { capture = false } = {}
+  ) => {
     check()
     const port = await freePort()
+    const env = isolatedEnvironment(
+      directory,
+      port,
+      endpoints,
+      bindingPath,
+      phase
+    )
+    if (capture) env.EDGEZERO__LOGGING__LEVEL = 'info'
     const child = spawn(binary, [], {
       cwd: directory,
-      env: isolatedEnvironment(directory, port, endpoints, bindingPath, phase),
-      stdio: 'ignore',
+      env,
+      stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'ignore',
     })
+    const output = { text: '' }
+    const closed = []
+    if (capture) {
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.setEncoding('utf8')
+        stream.on('data', (chunk) => {
+          if (output.text.length < maxCapturedOutput)
+            output.text = (output.text + chunk).slice(0, maxCapturedOutput)
+        })
+        closed.push(new Promise((resolve) => stream.once('close', resolve)))
+      }
+    }
     let spawnFailed = false
     child.on('error', () => {
       spawnFailed = true
@@ -327,6 +383,10 @@ export async function main(binary) {
       port,
       endpoint: `http://127.0.0.1:${port}`,
       spawnFailed: () => spawnFailed,
+      output: async () => {
+        await Promise.all(closed)
+        return output.text
+      },
     }
   }
   const stop = async (app) => {
@@ -393,7 +453,7 @@ export async function main(binary) {
       'TSJS route observation'
     )
   }
-  const rejected = async (app) => {
+  const rejected = async (app, cause) => {
     const until = Date.now() + 20_000
     while (Date.now() < until) {
       check()
@@ -404,6 +464,8 @@ export async function main(binary) {
           app.child.exitCode !== 0 && app.child.signalCode === null,
           'invalid startup exit'
         )
+        const problem = outputHolds(await app.output(), cause)
+        requireCheck(problem === null, problem ?? 'startup output')
         return
       }
       await delay(25)
@@ -429,6 +491,9 @@ export async function main(binary) {
         names[service],
         '--publish',
         `127.0.0.1::${service === 'moto' ? 5000 : 2772}`,
+        // Containers cannot resolve external names. IP egress is not blocked.
+        '--dns',
+        '127.0.0.1',
       ]
       if (service === 'agent')
         args.push(
@@ -562,8 +627,10 @@ export async function main(binary) {
           bindingPath,
           bindingsText(mode, endpoints, 'missing', secretArns)
         )
-        const invalid = await launch(directory, endpoints, bindingPath, 'B')
-        await rejected(invalid)
+        const invalid = await launch(directory, endpoints, bindingPath, 'B', {
+          capture: true,
+        })
+        await rejected(invalid, CONFIG_FAILURE_CAUSE)
         await stop(invalid)
         console.log(
           `PASS ${mode}: selected config failure before listen, no local/legacy fallback`
@@ -575,8 +642,10 @@ export async function main(binary) {
           bindingPath,
           bindingsText(mode, endpoints, mode, secretArns, true)
         )
-        const invalid = await launch(directory, endpoints, bindingPath, 'B')
-        await rejected(invalid)
+        const invalid = await launch(directory, endpoints, bindingPath, 'B', {
+          capture: true,
+        })
+        await rejected(invalid, SECRET_FAILURE_CAUSE)
         await stop(invalid)
         console.log(
           `PASS ${mode}: selected secret failure before listen, no local/legacy fallback`
@@ -624,10 +693,8 @@ export async function main(binary) {
   )
 }
 
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+// import.meta.main also holds when the script runs through a symlink.
+if (import.meta.main) {
   main(process.argv[2]).catch(() => {
     console.error(
       'Native provider acceptance failed; check binary/features, Docker availability, and bounded stage output. Raw diagnostics suppressed.'
