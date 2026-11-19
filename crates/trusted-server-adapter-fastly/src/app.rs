@@ -87,6 +87,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
+pub(crate) use trusted_server_core::ec::after_response::AfterResponseLookups;
 
 use crate::ec_kv::FastlyEcKvStore;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
@@ -430,20 +431,6 @@ pub(crate) struct IdentityLookups {
     pub(crate) coordinator: Arc<ProviderCoordinator>,
     pub(crate) transport: OutboundLookupTransport,
     pub(crate) pending: PendingLookups<InFlightLookups>,
-}
-
-/// What a navigation's after-response identity lookups need once the response
-/// has been sent.
-///
-/// The router owns the request, so the request signals the providers read are
-/// copied here. The lookups are dispatched only after the response, so they
-/// never delay the page.
-pub(crate) struct AfterResponseLookups {
-    pub(crate) coordinator: Arc<ProviderCoordinator>,
-    pub(crate) ec_id: String,
-    pub(crate) client_ip: Option<IpAddr>,
-    pub(crate) user_agent: Option<String>,
-    pub(crate) cookie_header: String,
 }
 
 /// Identity work a navigation hands to the entry point.
@@ -3661,7 +3648,6 @@ mod tests {
                 ec_state,
                 lookups,
                 &fixture.state.identity,
-                &fixture.state.settings,
                 &fixture.client.http_client(),
             ));
     }

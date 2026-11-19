@@ -4,8 +4,24 @@ The Axum binary loads its config and secrets once, before it listens, from
 stores that EdgeZero prepares: local files for development, or AWS AppConfig
 and Secrets Manager in production. A missing or invalid input stops the process
 with a non-zero exit before the port opens. On SIGTERM the server stops
-accepting connections and finishes in-flight requests within a configured
-grace.
+accepting connections and finishes in-flight requests and registered
+after-response tasks within one configured grace. Requests and tasks share
+that deadline; a task does not get a second grace period.
+
+Identity tasks use `ec.identity_after_response_budget_ms` (default 2000 ms)
+as a whole-task limit on Axum, starting after response-body release and
+including reads and the guarded follow-up write. The remaining shutdown grace
+can cancel work sooner. Fastly retains its existing post-send gate and lookup
+budget.
+
+The current Axum adapter has no EC record store or page-write finalization, so
+normal requests cannot yet register identity follow-up work. A3 (#1575) supplies
+the shared runner and scheduling plumbing; production activation needs A2
+(#1574), and CI proof of pending record-write completion needs A8 (#1579).
+Controlled fixtures exercise eligible work without adding a production store.
+
+The temporary EdgeZero preview pin for A3 **must be replaced by R2
+(edgezero#490) before merge**, including all workspace pins and lockfile entries.
 
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
