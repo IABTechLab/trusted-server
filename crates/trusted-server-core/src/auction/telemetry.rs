@@ -123,9 +123,9 @@ pub struct AuctionObservationContext {
     pub slot_count: u16,
     /// Whether this request's origin response *would be* eligible to share.
     ///
-    /// Records a predicate, not a cache hit. Ad-serving requests still bypass the
-    /// platform cache unless `origin_readthrough_enabled` is set, so this measures
-    /// the gate's potential reach before enablement as well as its eligibility afterwards.
+    /// Records a predicate, not a cache hit. Origin readthrough is unavailable until
+    /// `EdgeZero` surrogate keys (EZ-11) restore it, so this measures the reach it
+    /// would have.
     ///
     /// `None` on sources that do not make the decision, which is not the same as
     /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for
@@ -202,10 +202,10 @@ impl AuctionObservationContext {
         }
     }
 
-    /// Record whether this request's origin response would be eligible for readthrough.
+    /// Record whether this request's origin response would be shareable between readers.
     ///
-    /// A predicate about the request, recorded whether or not `origin_readthrough_enabled`
-    /// is set — not an outcome of the gate.
+    /// A predicate about the request, not a cache outcome: origin readthrough is
+    /// unavailable.
     pub fn set_origin_cache_shareable(&mut self, shareable: bool) {
         self.origin_cache_shareable = Some(shareable);
     }
@@ -370,7 +370,7 @@ pub struct AuctionEventRow {
     pub ad_domain: Option<String>,
     /// Creative/ad ID.
     pub ad_id: Option<String>,
-    /// `0` or `1`; absent when this source does not make the readthrough decision.
+    /// `0` or `1`; absent when this source does not judge shareability.
     ///
     /// Absent is not the same as `0` — see
     /// [`AuctionObservationContext::origin_cache_shareable`].

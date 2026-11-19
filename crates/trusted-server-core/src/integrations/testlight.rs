@@ -198,10 +198,7 @@ impl IntegrationProxy for TestlightIntegration {
         let payload_bytes = Self::rewrite_request_body(&payload_bytes, &ec_id)?;
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint)
-            .with_max_response_bytes(
-                u64::try_from(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
-                    .expect("should widen the RTB response cap to u64"),
-            );
+            .with_max_response_bytes(UPSTREAM_RTB_MAX_RESPONSE_BYTES);
         proxy_config.forward_ec_id = false;
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;

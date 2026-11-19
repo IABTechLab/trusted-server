@@ -1,7 +1,7 @@
 //! Local runtime fixture exercising `EdgeZero`'s Cloudflare HTTP client.
 //!
 //! `scripts/test-worker-auction-deadlines.mjs` calls it with a delayed
-//! upstream. It starts one bidder-shaped request in a batch, sleeps for the
+//! upstream. It starts one buffered request in a batch, sleeps for the
 //! simulated publisher work, then collects the batch at the auction cutoff.
 
 #[cfg(target_arch = "wasm32")]
