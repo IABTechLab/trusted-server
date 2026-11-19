@@ -51,8 +51,11 @@ server-side collection, and both feed the same consent-gated KV row.
   from the page.
 - Proxying vendor identity JavaScript through TS.
 - Concrete vendor implementations (each gets its own spec, see §13.2 F1).
-- Adapters other than Fastly. KV identity remains Fastly-only; Axum,
+- Adapters other than Fastly. Identity providers remain Fastly-only;
   Cloudflare and Spin get this design when EC identity is ported to them.
+  Native (Axum) EC persistence, added separately, applies the same page-load
+  write gate (§12.3 "EC minting") and withdrawal rule (§12.3 "Withdrawal"),
+  and refuses to start with an enabled provider.
 - Cross-browser linking.
 - Vendor segment products and ad-server targeting.
 - Batch sync and admin write paths, except how batch sync treats a
