@@ -178,18 +178,23 @@ Planned provider 'pbs-main' request failed: ...
 ```
 
 **Cause:** The bidder request did not complete: the connection or TLS
-handshake failed, the provider answered with a protocol error, or Fastly could
-not register the provider's backend. EdgeZero derives Fastly backends from the
-provider endpoint; they are not static Fastly backends. A registration failure
-records `launch_failed` for the provider, and other failures record
-`transport_failed`. The preceding `Outbound request failed` warning carries the
-provider failure detail, which holds closed failure codes and no URL.
+handshake failed, the provider answered with a protocol error, Fastly could not
+register the provider's backend, or the Spin or Cloudflare adapter could not
+prepare the request. EdgeZero derives Fastly backends from the provider
+endpoint; they are not static Fastly backends. A registration or preparation
+failure records `launch_failed` for the provider, and other failures record
+`transport`. The report in this warning carries the outbound status and kind,
+such as `outbound failure: 502 Bad Gateway (response_too_large)`, never the
+error's message, and, when EdgeZero reports one, the provider
+failure detail (`outbound provider failure detail: ...`), which holds closed
+failure codes and no URL.
 
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
   valid certificate; origin TLS is always verified
-- Read the provider failure detail in the `Outbound request failed` warning
+- Read the outbound status and kind in the warning's report, and its
+  `outbound provider failure detail` line when it has one
 - On Fastly, check the service's dynamic backend use. Fastly allows 200
   dynamic backends per service; the auction may use up to 160, and the
   publisher origin, integrations, and other outbound sites share the rest
@@ -779,15 +784,18 @@ If you encounter an error not listed here:
 
 ## Common HTTP Status Codes
 
-| Code    | Meaning         | Common Causes                    | Quick Fix            |
-| ------- | --------------- | -------------------------------- | -------------------- |
-| **400** | Bad Request     | Missing parameters, invalid JSON | Check request format |
-| **401** | Unauthorized    | Missing/invalid auth             | Check credentials    |
-| **403** | Forbidden       | Invalid token, disabled feature  | Verify token/config  |
-| **404** | Not Found       | Unknown endpoint                 | Check URL path       |
-| **500** | Internal Error  | Configuration error, bug         | Check logs           |
-| **502** | Bad Gateway     | Backend unavailable              | Verify backend       |
-| **504** | Gateway Timeout | Backend slow                     | Increase timeout     |
+| Code    | Meaning                         | Common Causes                                                   | Quick Fix                          |
+| ------- | ------------------------------- | --------------------------------------------------------------- | ---------------------------------- |
+| **400** | Bad Request                     | Missing parameters, invalid JSON                                | Check request format               |
+| **401** | Unauthorized                    | Missing/invalid auth                                            | Check credentials                  |
+| **403** | Forbidden                       | Invalid token, disabled feature                                 | Verify token/config                |
+| **404** | Not Found                       | Unknown endpoint                                                | Check URL path                     |
+| **408** | Request Timeout                 | Request body still unread 30 s after the request arrived        | Check the client's upload          |
+| **413** | Payload Too Large               | Body over the endpoint's cap, or a publisher upload over 16 MiB | Reduce the body size               |
+| **414** | URI Too Long                    | Request target over 8192 bytes                                  | Shorten the URL or query           |
+| **431** | Request Header Fields Too Large | More than 100 header fields or 64 KiB of headers                | Trim headers and cookies           |
+| **500** | Internal Error                  | Configuration error, bug                                        | Check logs                         |
+| **502** | Bad Gateway                     | Backend unavailable or timed out; Trusted Server has no 504     | Verify the backend and its latency |
 
 ---
 

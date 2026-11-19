@@ -105,7 +105,6 @@ export function isolatedEnvironment(work, port, endpoints, bindings, phase) {
     EDGEZERO__ADAPTER__DATA_DIR: work,
     EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS: '1',
     EDGEZERO__LOGGING__LEVEL: 'off',
-    RUST_LOG: 'off',
     TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG:
       fixtureEnvelope(phase),
     TRUSTED_SERVER__EC__PASSPHRASE: 'poison',

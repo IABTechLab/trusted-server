@@ -12,6 +12,7 @@ use crate::ec::kv::{KvIdentityGraph, UpsertResult};
 use crate::ec::kv_backend::{EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::KvEntry;
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::sharedid::SharedIdRequest;
 use crate::platform::GeoInfo;
 
 /// Exercise concurrent identity updates, withdrawal and stale-token rejection.
@@ -75,6 +76,7 @@ pub async fn assert_record_ec_lifecycle<Store: EcKvStore + Clone + 'static>(p: &
             .expect("should decode synthetic GPC withdrawal");
     let registry = PartnerRegistry::from_config(&[]).expect("should create empty fixture registry");
     let mut response = Response::new(Body::empty());
+    let sharedid = SharedIdRequest::default();
     let (_, raced) = futures::join!(
         ec_finalize_response(
             &settings,
@@ -82,7 +84,7 @@ pub async fn assert_record_ec_lifecycle<Store: EcKvStore + Clone + 'static>(p: &
             Some(&graph),
             &registry,
             None,
-            None,
+            &sharedid,
             &mut response
         ),
         graph.upsert_partner_id_if_exists(ec, "late.example", "late-uid"),
