@@ -94,7 +94,8 @@ pub async fn ec_finalize_response(
 /// Where the mirror cannot be rebuilt (non-navigations, or a navigation
 /// without a readable row), a carried mirror is expired when the request
 /// denies TCF vendor consent to a vendor gating any mirrored partner it holds,
-/// or when a provider excludes such a partner's source on this GDPR visit;
+/// when a provider excludes such a partner's source on this GDPR visit, or
+/// when a provider's cookies on this request record an opt-out for it;
 /// otherwise it is left untouched.
 fn apply_mirror(
     ec_context: &EcContext,
@@ -107,14 +108,14 @@ fn apply_mirror(
     } else if navigation && let Some(row) = mirror_row(ec_context) {
         build_mirror(
             row,
-            ec_context.consent(),
+            ec_context,
             registry,
             UnixSeconds::new(current_timestamp()),
         )
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
-        // provider whose TCF vendor consent is now denied or whose source is
-        // excluded on this GDPR visit.
+        // provider whose TCF vendor consent is now denied, whose source is
+        // excluded on this GDPR visit or whose cookies now record an opt-out.
         MirrorCookie::Expire
     } else {
         if navigation {
@@ -143,8 +144,9 @@ fn apply_mirror(
 
 /// Whether the request carries a mirror that holds UIDs of a mirrored partner
 /// with a denied gating TCF vendor (that of any configured provider claiming
-/// its source, enabled or disabled) or a source excluded where GDPR applies
-/// for this visitor, so those UIDs must no longer reach the page.
+/// its source, enabled or disabled), a source excluded where GDPR applies
+/// for this visitor or a source a provider's cookies on this request opt out
+/// of, so those UIDs must no longer reach the page.
 ///
 /// A carried value that does not decode as a mirror may hold anything, so it
 /// counts as holding denied UIDs whenever any mirrored partner is denied.
@@ -156,7 +158,8 @@ fn mirror_vendor_denied(ec_context: &EcContext, registry: &PartnerRegistry) -> b
         partner.bidstream_enabled
             && partner.mirror_enabled
             && (partner.owner_vendor_consent_denied(ec_context.consent())
-                || partner.excluded_for(ec_context.consent()))
+                || partner.excluded_for(ec_context.consent())
+                || ec_context.source_opted_out_in_cookies(&partner.source_domain))
     };
     if !registry.in_config_order().any(denied) {
         return false;
@@ -2159,6 +2162,8 @@ mod tests {
         /// A provider excludes the source where GDPR applies, and the request
         /// is a GDPR visit granting Purposes 1 and 4.
         RegionExcluded,
+        /// The source's provider's cookies on this request record an opt-out.
+        CookieOptedOut,
     }
 
     /// Runs a mirror request with the source withheld as `gate` says.
@@ -2207,6 +2212,10 @@ mod tests {
                     registry.exclude_where_gdpr_applies("ids.example.com"),
                     "should exclude the source"
                 );
+                None
+            }
+            MirrorGate::CookieOptedOut => {
+                ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
                 None
             }
         };
@@ -2445,6 +2454,25 @@ mod tests {
         assert!(
             cookies[0].contains("Max-Age=0"),
             "should expire a mirror holding a source excluded where GDPR applies"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_opt_out_expires_the_mirror_on_a_non_navigation() {
+        let response = run_mirror_request_with_owner(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            false,
+            MirrorGate::CookieOptedOut,
+        )
+        .await;
+
+        let cookies = mirror_cookies(&response);
+        assert_eq!(cookies.len(), 1, "should emit one mirror cookie");
+        assert!(
+            cookies[0].contains("Max-Age=0"),
+            "should expire a mirror holding a source opted out in provider cookies"
         );
     }
 
