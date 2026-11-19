@@ -182,13 +182,12 @@ pub fn build_after_response_coordinator(
     )
 }
 
-/// Builds every enabled provider of both collection phases, as the adapters
-/// do on each navigation, so a provider-specific setting error is reported
+/// Builds every enabled provider of both collection phases, as the Fastly
+/// adapter does at startup, so a provider-specific setting error is reported
 /// before deploy.
 ///
-/// At runtime such an error disables every provider for the request, so
-/// deploy-time config validation (`ts config push`, `validate` and `diff`)
-/// calls this. Partner tokens may still be secret key names at that point;
+/// On Fastly such an error prevents application startup, so deploy-time
+/// config validation (`ts config push`, `validate` and `diff`) calls this. Partner tokens may still be secret key names at that point;
 /// they are replaced with placeholders for the check.
 ///
 /// # Errors

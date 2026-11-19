@@ -952,11 +952,13 @@ vendor ID.
 
 Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
 build every enabled provider and reject one whose `kind` or `settings` is
-invalid. They do not know the target adapter: the Axum, Cloudflare and Spin
-adapters refuse to start when an enabled provider is configured, so do not push
-an enabled provider to those services. On Fastly, an enabled
-provider whose `kind` this build does not include, or whose `settings` its kind
-rejects, also fails startup. Lookups always verify the provider's TLS
+invalid. `ts config validate` is adapter-agnostic. `ts config push` and
+`ts config diff` reject enabled providers for targets other than Fastly: the
+Axum, Cloudflare and Spin adapters refuse to start when an enabled provider is
+configured. On Fastly, invalid enabled provider configuration, such as a `kind`
+this build does not include or `settings` its kind rejects, prevents
+application startup; providers are not silently disabled for individual
+requests. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
@@ -1064,9 +1066,8 @@ rewrites the row.
 `ts config validate`, `ts config push` and `ts config diff` also build every
 enabled provider of a registered kind, so a provider-specific setting error
 (for example a `liveramp` `endpoint` without `placement_id` and
-`custom_id_namespace`) fails the command before deploy. At runtime the same
-error would disable every identity provider for each request, with an error
-log.
+`custom_id_namespace`) fails the command before deploy. On Fastly the same
+error would prevent application startup.
 
 #### Provider kinds
 
