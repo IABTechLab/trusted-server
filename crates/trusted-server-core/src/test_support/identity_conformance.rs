@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use cookie::Cookie;
 use error_stack::Report;
+use futures::executor::block_on;
 
 use crate::consent::now_deciseconds;
 use crate::ec::normalize_ec_id_for_kv;
@@ -86,20 +87,21 @@ impl RecordingStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl EcKvStore for RecordingStore {
     fn store_name(&self) -> &str {
         self.0.inner.store_name()
     }
 
-    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-        self.0.inner.lookup(key)
+    async fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.0.inner.lookup(key).await
     }
 
-    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-        self.0.inner.key_exists(key)
+    async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.0.inner.key_exists(key).await
     }
 
-    fn insert(
+    async fn insert(
         &self,
         key: &str,
         write: EcKvWrite<'_>,
@@ -115,7 +117,7 @@ impl EcKvStore for RecordingStore {
                 message: "fixture rejects record creation".to_owned(),
             }));
         }
-        let outcome = self.0.inner.insert(key, write)?;
+        let outcome = self.0.inner.insert(key, write).await?;
         if outcome == EcKvWriteOutcome::Written {
             self.0
                 .events
@@ -126,16 +128,16 @@ impl EcKvStore for RecordingStore {
         Ok(outcome)
     }
 
-    fn list_keys_with_prefix(
+    async fn list_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
     ) -> Result<Vec<String>, Report<TrustedServerError>> {
-        self.0.inner.list_keys_with_prefix(prefix, limit)
+        self.0.inner.list_keys_with_prefix(prefix, limit).await
     }
 
-    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-        self.0.inner.delete(key)
+    async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.0.inner.delete(key).await
     }
 }
 
@@ -242,6 +244,9 @@ impl Scenario {
 
     /// Executes the scenario and checks the response against authoritative storage.
     ///
+    /// The store reads block on their futures, so call this from a synchronous
+    /// test, never from code already running under an executor.
+    ///
     /// # Panics
     ///
     /// Panics on any missing document, cookie/record mismatch, failed fixture gate,
@@ -255,8 +260,7 @@ impl Scenario {
     pub fn verify(self, adapter: &mut impl Adapter, store: &RecordingStore) {
         let graph = KvIdentityGraph::new(store.clone());
         assert!(
-            store
-                .list_keys_with_prefix("", 100)
+            block_on(store.list_keys_with_prefix("", 100))
                 .expect("should inspect empty store")
                 .is_empty(),
             "should start every scenario without seeded identities"
@@ -282,8 +286,7 @@ impl Scenario {
                     "should not issue or delete an EC for a fresh denied request"
                 );
                 assert!(
-                    store
-                        .list_keys_with_prefix("", 100)
+                    block_on(store.list_keys_with_prefix("", 100))
                         .expect("should inspect fixture rows")
                         .is_empty(),
                     "should not persist an identity"
@@ -322,8 +325,7 @@ impl Scenario {
                 let identity = assert_created(&response, store);
                 if matches!(self, Self::UnknownGeo | Self::GeoFailure | Self::Returning) {
                     let key = normalize_ec_id_for_kv(&identity);
-                    let keys = store
-                        .list_keys_with_prefix("", 100)
+                    let keys = block_on(store.list_keys_with_prefix("", 100))
                         .expect("should inspect issued rows");
                     request.ec_cookie = Some(identity.clone());
                     request.geo = match self {
@@ -340,8 +342,7 @@ impl Scenario {
                         Some(identity.as_str()),
                         "should retain the reader's cookie"
                     );
-                    let (record, _) = graph
-                        .get(&key)
+                    let (record, _) = block_on(graph.get(&key))
                         .expect("should read returning record")
                         .expect("should retain the returning record");
                     assert!(
@@ -358,8 +359,7 @@ impl Scenario {
                         Some(identity.as_str()),
                         "should preserve identity on replay"
                     );
-                    let (record, _) = graph
-                        .get(&key)
+                    let (record, _) = block_on(graph.get(&key))
                         .expect("should inspect replayed identity")
                         .expect("should retain the existing record");
                     assert!(
@@ -367,8 +367,7 @@ impl Scenario {
                         "should retain a live record after replay"
                     );
                     assert_eq!(
-                        store
-                            .list_keys_with_prefix("", 100)
+                        block_on(store.list_keys_with_prefix("", 100))
                             .expect("should inspect returning rows"),
                         keys,
                         "should not create a second identity"
@@ -418,8 +417,7 @@ fn assert_created(response: &Observation, store: &RecordingStore) -> String {
     );
     let graph = KvIdentityGraph::new(store.clone());
     let key = normalize_ec_id_for_kv(identity);
-    let (record, _) = graph
-        .get(&key)
+    let (record, _) = block_on(graph.get(&key))
         .expect("should inspect issued identity")
         .expect("should persist the record matching the issued cookie");
     assert!(record.created > 0, "should persist creation metadata");
@@ -438,8 +436,7 @@ fn assert_created(response: &Observation, store: &RecordingStore) -> String {
         "should persist before releasing the cookie"
     );
     assert_eq!(
-        store
-            .list_keys_with_prefix("", 100)
+        block_on(store.list_keys_with_prefix("", 100))
             .expect("should inspect created records")
             .len(),
         1,
@@ -493,8 +490,7 @@ mod tests {
     fn create(store: &RecordingStore, identity: &str) {
         let mut record = KvEntry::new(&ConsentContext::default(), None, 100, "example.com");
         record.consent.ok = true;
-        KvIdentityGraph::new(store.clone())
-            .create(identity, &record)
+        block_on(KvIdentityGraph::new(store.clone()).create(identity, &record))
             .expect("should create the control record");
     }
 
@@ -502,8 +498,7 @@ mod tests {
     #[should_panic(expected = "should hold a live authoritative record")]
     fn identity_conformance_rejects_cookie_for_tombstone() {
         let store = RecordingStore::new(false);
-        KvIdentityGraph::new(store.clone())
-            .create(IDENTITY, &KvEntry::tombstone(100))
+        block_on(KvIdentityGraph::new(store.clone()).create(IDENTITY, &KvEntry::tombstone(100)))
             .expect("should persist a withdrawal control");
         store.response_released();
         assert_created(&response(&format!("ts-ec={IDENTITY}")), &store);
@@ -556,13 +551,12 @@ mod tests {
         fn navigate(&mut self, navigation: &Navigation) -> Observation {
             let response = self.0.navigate(navigation);
             if navigation.ec_cookie.is_some() {
-                self.0
-                    .store
-                    .delete(IDENTITY)
-                    .expect("should replace the fixture record");
-                KvIdentityGraph::new(self.0.store.clone())
-                    .create(IDENTITY, &KvEntry::tombstone(100))
-                    .expect("should model a returning identity becoming unusable");
+                block_on(self.0.store.delete(IDENTITY)).expect("should replace the fixture record");
+                block_on(
+                    KvIdentityGraph::new(self.0.store.clone())
+                        .create(IDENTITY, &KvEntry::tombstone(100)),
+                )
+                .expect("should model a returning identity becoming unusable");
             }
             response
         }
@@ -612,12 +606,11 @@ mod tests {
     impl Adapter for LateRejectionAdapter {
         fn navigate(&mut self, _navigation: &Navigation) -> Observation {
             self.0.response_released();
-            let _error = KvIdentityGraph::new(self.0.clone())
-                .create(
-                    IDENTITY,
-                    &KvEntry::new(&ConsentContext::default(), None, 100, "example.com"),
-                )
-                .expect_err("should trigger the rejected write after release");
+            let _error = block_on(KvIdentityGraph::new(self.0.clone()).create(
+                IDENTITY,
+                &KvEntry::new(&ConsentContext::default(), None, 100, "example.com"),
+            ))
+            .expect_err("should trigger the rejected write after release");
             Observation {
                 status: StatusCode::OK,
                 cookies: Vec::new(),
@@ -643,31 +636,39 @@ mod tests {
 
 #[cfg(test)]
 mod portable_tests {
+    use std::time::Duration;
+
     use super::*;
-    use crate::consent::types::ConsentContext;
-    use crate::ec::kv::CreateIfAbsentOutcome;
-    use crate::ec::kv_types::KvEntry;
+    use crate::ec::kv_backend::EcKvWriteMode;
 
     const IDENTITY: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 
-    #[test]
-    fn identity_conformance_preserves_conditional_write_preconditions() {
+    /// A create-only write, the precondition identity creation relies on.
+    const ADD: EcKvWrite<'static> = EcKvWrite {
+        body: "{}",
+        metadata: "{}",
+        ttl: Duration::from_secs(60),
+        mode: EcKvWriteMode::Add,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_conformance_preserves_conditional_write_preconditions() {
         let store = RecordingStore::new(false);
-        let graph = KvIdentityGraph::new(store.clone());
-        let record = KvEntry::new(&ConsentContext::default(), None, 100, "example.com");
         assert_eq!(
-            graph
-                .create_if_absent(IDENTITY, &record)
+            store
+                .insert(IDENTITY, ADD)
+                .await
                 .expect("should create absent identity"),
-            CreateIfAbsentOutcome::Written,
+            EcKvWriteOutcome::Written,
             "should persist an absent key"
         );
         assert_eq!(
-            graph
-                .create_if_absent(IDENTITY, &record)
+            store
+                .insert(IDENTITY, ADD)
+                .await
                 .expect("should inspect existing identity"),
-            CreateIfAbsentOutcome::AlreadyExists,
+            EcKvWriteOutcome::PreconditionFailed,
             "should refuse a duplicate create"
         );
     }

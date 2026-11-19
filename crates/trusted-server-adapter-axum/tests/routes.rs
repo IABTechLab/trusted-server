@@ -22,7 +22,9 @@ use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
 use trusted_server_core::test_support::publisher_input_cap::{self, Served};
-use trusted_server_core::test_support::scripted_client::{ScriptedHttpClient, TestClock};
+use trusted_server_core::test_support::scripted_client::{
+    RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -285,6 +287,7 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
     settings.auction.providers.insert(
         "aps-main".parse().expect("should parse APS provider ID"),
         trusted_server_core::auction::ProviderConfig {
+            allow_insecure_http: false,
             protocol: "openrtb-2.6".to_string(),
             profile: "aps".to_string(),
             endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -337,6 +340,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/first-party/sign"),
         ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
+        ("GET", "/_ts/api/v1/identify"),
+        ("OPTIONS", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/batch-sync"),
     ];
 
     for (method, path) in expected {
@@ -679,6 +685,98 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
             );
         }
     }
+    server.assert_no_outbound_requests();
+}
+
+/// Sends a partner API request carrying a Bearer token and a mapping body.
+async fn send_partner_api_request(server: &TestServer, method: &str, path: &str) -> u16 {
+    send(
+        server
+            .request(method, path)
+            .header("host", "test-publisher.example.com")
+            .header("authorization", "Bearer fictional-partner-token-0123456789")
+            .header("content-type", "application/json")
+            .body(r#"{"mappings":[]}"#),
+    )
+    .await
+    .status()
+    .as_u16()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_origin_receives_publisher_fallback_requests() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        edgezero_core::http::Method::GET,
+        "https://origin.test-publisher.example.com/article",
+        ScriptedReply::status(edgezero_core::http::StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body("served by origin"),
+    );
+    let server = TestServer::with_origin(test_settings(), origin.clone()).await;
+
+    let status = send(
+        server
+            .request("GET", "/article")
+            .header("host", "test-publisher.example.com"),
+    )
+    .await
+    .status()
+    .as_u16();
+
+    assert_eq!(status, 200, "should proxy the publisher page to the origin");
+    assert_eq!(
+        origin
+            .requests()
+            .iter()
+            .map(RecordedRequest::method_and_path)
+            .collect::<Vec<_>>(),
+        vec!["GET /article".to_owned()],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let server = TestServer::with_test_settings().await;
+
+    let identify = send_partner_api_request(&server, "GET", "/_ts/api/v1/identify").await;
+    let preflight = send_partner_api_request(&server, "OPTIONS", "/_ts/api/v1/identify").await;
+    let batch_sync = send_partner_api_request(&server, "POST", "/_ts/api/v1/batch-sync").await;
+
+    assert_eq!(identify, 501, "identify should answer 501 locally");
+    assert_eq!(preflight, 200, "identify preflight should answer locally");
+    assert_eq!(batch_sync, 501, "batch sync should answer 501 locally");
+    server.assert_no_outbound_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let server = TestServer::with_test_settings().await;
+    let cases = [
+        ("HEAD", "/_ts/api/v1/identify"),
+        ("POST", "/_ts/api/v1/identify"),
+        ("PUT", "/_ts/api/v1/identify"),
+        ("PATCH", "/_ts/api/v1/identify"),
+        ("DELETE", "/_ts/api/v1/identify"),
+        ("GET", "/_ts/api/v1/batch-sync"),
+        ("HEAD", "/_ts/api/v1/batch-sync"),
+        ("OPTIONS", "/_ts/api/v1/batch-sync"),
+        ("PUT", "/_ts/api/v1/batch-sync"),
+        ("PATCH", "/_ts/api/v1/batch-sync"),
+        ("DELETE", "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases {
+        statuses.push(send_partner_api_request(&server, method, path).await);
+    }
+
+    assert_eq!(
+        statuses,
+        vec![405; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
     server.assert_no_outbound_requests();
 }
 

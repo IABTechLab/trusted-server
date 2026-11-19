@@ -57,8 +57,10 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-identity-providers = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+validator = { workspace = true }
 which = { workspace = true }
 
 # `ts dev lint domains` and `ts dev install-hooks` drive all git access through

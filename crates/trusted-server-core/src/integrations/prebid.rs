@@ -41,7 +41,7 @@ use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -2122,7 +2122,13 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            let selected = if *name == COOKIE_EUCONSENT_V2 {
+                // Use the canonical name on the wire, including in cookies-only mode.
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = selected else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -5559,6 +5565,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://primary.example.test/openrtb".to_string(),
@@ -5571,6 +5578,7 @@ external_bundle_sri = "sha384-AAAA"
                 (
                     ProviderId::from_str("pbs-secondary").expect("should parse provider ID"),
                     ProviderConfig {
+                        allow_insecure_http: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "prebid-server".to_string(),
                         endpoint: "https://secondary.example.test/openrtb".to_string(),
@@ -6952,30 +6960,30 @@ external_bundle_sri = "sha384-AAAA"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();
@@ -9034,6 +9042,7 @@ set = { networkId = 42 }
             providers: BTreeMap::from([(
                 provider_id.clone(),
                 ProviderConfig {
+                    allow_insecure_http: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example/openrtb2/auction".to_string(),
@@ -9922,6 +9931,16 @@ set = { networkId = 42 }
     fn prebid_cookie_selection_matches_extraction_and_preserves_safe_framing() {
         for (input, expected, requires_body) in [
             ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
+            (
+                "__Host-ts-tcf=TC-example",
+                Some("euconsent-v2=TC-example"),
+                false,
+            ),
+            (
+                "__Host-ts-tcf=bridge; euconsent-v2=publisher",
+                Some("euconsent-v2=publisher"),
+                false,
+            ),
             (
                 "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
                 Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),

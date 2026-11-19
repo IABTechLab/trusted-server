@@ -22,7 +22,8 @@ use edgezero_core::outbound::HttpClient;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, with_finalization,
+    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, take_navigation_lookups,
+    with_finalization,
 };
 use crate::platform::RequestGeo;
 use crate::sandbox::SandboxCounters;
@@ -159,7 +160,7 @@ impl Adapter for FastlyAdapter {
             request_id: "example-conformance-request".to_owned(),
         };
         let inputs = FinalizeInputs {
-            settings: &self.settings,
+            state: self.retained.state.as_ref(),
             geo: geo.as_ref(),
             counters: &counters,
         };
@@ -172,16 +173,16 @@ impl Adapter for FastlyAdapter {
         if let Some(identity) = &navigation.ec_cookie {
             cookies.push(format!("ts-ec={identity}"));
         }
+        let document = navigation.destination == "document";
+        // A browser sends `navigate` only for a document navigation, and the
+        // page-load write permit requires both headers.
         let mut request = FastlyRequest::get("https://publisher.example.com/article")
             .with_header("sec-fetch-dest", navigation.destination)
             .with_header(
-                "accept",
-                if navigation.destination == "document" {
-                    "text/html"
-                } else {
-                    "*/*"
-                },
+                "sec-fetch-mode",
+                if document { "navigate" } else { "no-cors" },
             )
+            .with_header("accept", if document { "text/html" } else { "*/*" })
             .with_header("user-agent", USER_AGENT)
             .with_header("cookie", cookies.join("; "));
         // Production's native read and `prepare` run unchanged. The fixture
@@ -208,6 +209,9 @@ impl Adapter for FastlyAdapter {
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let origin = self.origin.clone();
+        // As in `serve`, drop identity lookups an earlier request on this
+        // thread left in the request-local slot.
+        drop(take_navigation_lookups());
         let delivery = with_finalization(&inputs, |finalize| {
             FastlyService::new(&self.retained.app).run_request_with_hooks_for_test(
                 request,
@@ -262,6 +266,7 @@ impl Adapter for FastlyAdapter {
             )
         });
         handle_delivery(delivery, &counters, |_| {});
+        drop(take_navigation_lookups());
         observation.expect("should deliver a finalized response")
     }
 }
