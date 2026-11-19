@@ -1,0 +1,63 @@
+name: Axum Next.js transport measurement
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/axum-nextjs-measurement.yml'
+      - 'scripts/measure-axum-nextjs/**'
+      - 'crates/trusted-server-adapter-axum/**'
+      - 'crates/trusted-server-core/src/outbound.rs'
+      - 'crates/trusted-server-core/src/publisher.rs'
+      - 'crates/trusted-server-core/src/integrations/nextjs/**'
+      - 'crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/**'
+      - 'crates/trusted-server-integration-tests/browser/package*.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.tool-versions'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: axum-nextjs-measurement-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read pinned Node
+        id: versions
+        shell: bash
+        run: echo "node=$(awk '$1 == "nodejs" {print $2}' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: axum-nextjs-measurement
+      - name: Check evidence parser and CI pins
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/measure-axum-nextjs -p 'test_*.py'
+          node scripts/check-ci-node-pin.mjs
+      - name: Measure the actual managed runner
+        shell: bash
+        run: bash scripts/measure-axum-nextjs/run.sh "$RUNNER_TEMP/axum-nextjs-measurement"
+      - name: Upload observations and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axum-nextjs-measurement-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/axum-nextjs-measurement/*.json
+            ${{ runner.temp }}/axum-nextjs-measurement/*.jsonl
+            ${{ runner.temp }}/axum-nextjs-measurement/*.md
+            ${{ runner.temp }}/axum-nextjs-measurement/*.log
