@@ -166,6 +166,9 @@ pub struct LookupResults {
     lookups: Vec<ProviderLookup>,
     /// The row's revocations when the lookups were dispatched.
     revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each looked-up provider at dispatch, kept
+    /// with an opt-out its server reports.
+    known_uids: BTreeMap<ProviderId, Vec<String>>,
 }
 
 impl LookupResults {
@@ -177,7 +180,23 @@ impl LookupResults {
             ec_id: Some(ec_id.to_owned()),
             lookups,
             revocations: BTreeMap::new(),
+            known_uids: BTreeMap::new(),
         }
+    }
+
+    /// Records the hashes of the UIDs known for each looked-up provider at
+    /// dispatch: its cookies' and the row's.
+    #[must_use]
+    pub fn with_known_uids(mut self, known_uids: BTreeMap<ProviderId, Vec<String>>) -> Self {
+        self.known_uids = known_uids;
+        self
+    }
+
+    /// Hashes of the UIDs known for `provider` when its lookup was
+    /// dispatched; an opt-out its server reports is remembered with them.
+    #[must_use]
+    pub fn known_uids(&self, provider: &ProviderId) -> &[String] {
+        self.known_uids.get(provider).map_or(&[], Vec::as_slice)
     }
 
     /// Records the row's revocations as the lookups' dispatch saw them.

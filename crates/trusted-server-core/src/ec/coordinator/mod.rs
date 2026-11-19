@@ -25,7 +25,7 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::generation::ec_hash;
-use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
+use crate::ec::kv_types::{KvEid, KvEntry, KvUid, opt_out_uid_hash};
 use crate::ec::provider::{
     ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
     ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
@@ -116,6 +116,8 @@ pub struct PendingLookups<Pending> {
     /// The row's revocations at dispatch, so a result a newer opt-out
     /// superseded is discarded at the write.
     revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each provider sent a request.
+    known_uids: Vec<Tagged<Vec<String>>>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
@@ -131,6 +133,7 @@ impl<Pending> Default for PendingLookups<Pending> {
             contexts: Vec::new(),
             from_cookies: Vec::new(),
             revocations: BTreeMap::new(),
+            known_uids: Vec::new(),
         }
     }
 }
@@ -590,6 +593,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let remembered_opt_out =
                 entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
             let mut opted_back_in = false;
+            let mut cookie_uids = Vec::new();
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             due.retain(|source| !excluded.contains(source));
             // The vendor's own first-party cookies are read on every
@@ -614,6 +618,20 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 }
                 CookieRead::Found(eids) => {
                     let mut found = self.validated(provider, eids, lookup.now);
+                    cookie_uids = uid_hashes(found.entries.iter().flat_map(|(_, eids)| eids));
+                    // Cookies that repeat only UIDs known when the vendor's
+                    // server reported the remembered opt-out show no renewed
+                    // identity: a server refresh never rewrites them.
+                    let repeats_opted_out = remembered_opt_out.is_some_and(|entry| {
+                        entry.repeats_opted_out_uids(&registered.id, &cookie_uids)
+                    });
+                    if repeats_opted_out {
+                        log::debug!(
+                            "Identity lookup: provider={} cookies repeat the opted-out IDs",
+                            registered.id
+                        );
+                        found.status = LookupStatus::NoMatch;
+                    }
                     // A cookie older than a server-side refresh does not
                     // roll the refreshed UID back.
                     if registered.provider.keeps_fresher_stored_uids() {
@@ -758,6 +776,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             if let Some(value) = request.context.take() {
                 pending.contexts.push(Tagged { provider, value });
             }
+            pending.known_uids.push(Tagged {
+                provider,
+                value: known_uid_hashes(entry, &registered.policy.sources, cookie_uids),
+            });
             requests.push(Tagged {
                 provider,
                 value: request,
@@ -788,6 +810,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             contexts,
             from_cookies,
             revocations,
+            known_uids,
         } = pending;
         let responses = match in_flight {
             Some(in_flight) => transport.gather(in_flight).await,
@@ -835,8 +858,53 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for lookup in &lookups {
             log_outcome(lookup);
         }
-        LookupResults::new(&ec_id, lookups).dispatched_with(revocations)
+        let known_uids = known_uids
+            .into_iter()
+            .map(|Tagged { provider, value }| (self.providers[provider.get()].id.clone(), value))
+            .collect();
+        LookupResults::new(&ec_id, lookups)
+            .dispatched_with(revocations)
+            .with_known_uids(known_uids)
     }
+}
+
+/// Hashes of the UIDs in `eids`, without duplicates.
+fn uid_hashes<'eid>(eids: impl Iterator<Item = &'eid KvEid>) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for uid in eids.flat_map(KvEid::uids) {
+        let hash = opt_out_uid_hash(uid.id().as_str());
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// Hashes of the UIDs known for a provider at dispatch: those its cookies
+/// held and those the row stores for its sources.
+fn known_uid_hashes(
+    entry: Option<&KvEntry>,
+    sources: &[SourceDomain],
+    mut hashes: Vec<String>,
+) -> Vec<String> {
+    let records = sources
+        .iter()
+        .filter_map(|source| entry.and_then(|entry| entry.ids.get(source.as_str())));
+    for record in records {
+        let stored = if record.is_provider_written() {
+            uid_hashes(record.eids().iter())
+        } else if record.uid.is_empty() {
+            Vec::new()
+        } else {
+            vec![opt_out_uid_hash(&record.uid)]
+        };
+        for hash in stored {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+    }
+    hashes
 }
 
 /// Drops `sources` from a provider's result and removes them from the row.
@@ -2376,6 +2444,97 @@ mod tests {
             "should forget the remembered opt-out"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_unchanged_cookie_keeps_a_server_opt_out_until_a_renewed_id_arrives() {
+        // Arrange: the held UID's refresh is due and the cookie repeats it;
+        // the vendor's server answers the refresh with an opt-out.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let provider = ProviderId::new("example-provider");
+        let first_snapshot = snapshot_holding(refreshable_record(900));
+        let first = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(optout_reply),
+            &first_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&first_snapshot, &first)
+        else {
+            panic!("should plan the opt-out write")
+        };
+        assert!(
+            entry.opted_out(&provider, UnixSeconds::new(1000))
+                && !entry.ids.contains_key("ids.example.com"),
+            "should remember the server opt-out and clear the source"
+        );
+        let second_snapshot = seeded_snapshot(&entry);
+
+        // Act: the next navigation sends the same cookie, then a later one a
+        // renewed ID.
+        let unchanged_transport = CannedTransport::new(ok_reply);
+        let unchanged = run_with_cookies(
+            &coordinator,
+            &unchanged_transport,
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let renewed = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(ok_reply),
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-renewed",
+        );
+
+        // Assert
+        let unchanged_lookup = unchanged.iter().next().expect("should report the provider");
+        assert_eq!(
+            unchanged_lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should keep skipping the provider for an unchanged cookie"
+        );
+        assert_eq!(
+            unchanged_lookup.opt_out,
+            OptOutMemory::Unchanged,
+            "should not forget the server opt-out for an unchanged cookie"
+        );
+        assert!(
+            planned_change(&second_snapshot, &unchanged).is_none(),
+            "should neither restore the opted-out UID nor write"
+        );
+        assert!(
+            unchanged_transport.sent.borrow().is_empty(),
+            "should not call the opted-out provider"
+        );
+        let renewed_lookup = renewed.iter().next().expect("should report the provider");
+        assert_eq!(
+            renewed_lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the opt-out for a renewed cookie ID"
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&second_snapshot, &renewed)
+        else {
+            panic!("should plan the opt-back-in write")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "c-renewed",
+            "should store the renewed cookie ID"
+        );
+        assert!(
+            !entry.opted_out(&provider, UnixSeconds::new(1000)) && entry.opt_out_uids.is_empty(),
+            "should forget the opt-out and its UID hashes"
+        );
     }
 
     #[test]

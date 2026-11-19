@@ -967,8 +967,12 @@ provider cleared on an opt-out is not refilled from the browser.
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the
 provider is not called for that EC again until the 30 days pass, unless the
-vendor's cookies hold an ID again: that means the visitor opted back in, so the
-opt-out is forgotten. An opt-out read from the vendor's cookies is not
+vendor's cookies hold a new ID: that means the visitor opted back in, so the
+opt-out is forgotten. A cookie that only repeats an ID the cookies or the row
+held when the opt-out was reported does not count, because a server refresh
+never rewrites the cookie; the row keeps short hashes of those IDs, not the
+IDs. A vendor that issues the same ID again after an opt-back-in is called
+again once the 30 days pass. An opt-out read from the vendor's cookies is not
 remembered, because the cookies are read again on every navigation. It also
 applies to the request it arrives on: on every route, the vendor's cookies are
 read before any ID leaves the server, and the provider's sources are withheld

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::value::RawValue;
+use sha2::{Digest as _, Sha256};
 
 use super::eid_types::{
     AgentType, EidFields, Expiry, MAX_EID_FIELD_BYTES, MatchMethod, ProviderId, RawJson, UidValue,
@@ -53,6 +54,19 @@ pub const MAX_STORED_UID_LENGTH: usize = 1024;
 /// in seconds (30 days).
 pub const OPT_OUT_MEMORY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
+/// Most UID hashes the row keeps with one remembered opt-out.
+pub const MAX_OPT_OUT_UID_HASHES: usize = 16;
+
+/// Short hash of a UID known when a provider's opt-out was remembered.
+///
+/// The row keeps hashes rather than the opted-out UIDs themselves: they only
+/// need to recognise a cookie that repeats one.
+#[must_use]
+pub fn opt_out_uid_hash(uid: &str) -> String {
+    let digest = Sha256::digest(uid.as_bytes());
+    hex::encode(&digest[..8])
+}
+
 /// How long the row keeps the time of a provider's latest reported opt-out, in
 /// seconds (one day): far longer than any lookup stays in flight.
 pub const REVOCATION_MEMORY_SECONDS: u64 = 24 * 60 * 60;
@@ -89,6 +103,11 @@ pub struct KvEntry {
     /// honoured without calling the provider again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub opt_outs: BTreeMap<ProviderId, u64>,
+    /// Provider ID → hashes ([`opt_out_uid_hash`]) of the UIDs known for the
+    /// provider when its server reported the remembered opt-out. Cookies
+    /// holding only these UIDs are not an opt-back-in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opt_out_uids: BTreeMap<ProviderId, Vec<String>>,
     /// Provider ID → Unix time of the latest opt-out the provider reported,
     /// from its cookies or its server, that removed its sources from the row.
     /// A lookup dispatched before that opt-out is discarded rather than
@@ -691,6 +710,7 @@ impl KvEntry {
             network: None,
             ids: BTreeMap::new(),
             opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
             revocations: BTreeMap::new(),
         }
     }
@@ -703,11 +723,18 @@ impl KvEntry {
             .is_some_and(|until| *until > now.get())
     }
 
-    /// Remembers an opt-out by `provider` for [`OPT_OUT_MEMORY_SECONDS`].
+    /// Remembers an opt-out by `provider` for [`OPT_OUT_MEMORY_SECONDS`],
+    /// with the hashes of the UIDs known for it then (at most
+    /// [`MAX_OPT_OUT_UID_HASHES`]).
     ///
-    /// An opt-out already remembered keeps its end time, so a provider skipped
-    /// because of it is asked again once the time passes.
-    pub fn remember_opt_out(&mut self, provider: &ProviderId, now: UnixSeconds) {
+    /// An opt-out already remembered keeps its end time and hashes, so a
+    /// provider skipped because of it is asked again once the time passes.
+    pub fn remember_opt_out(
+        &mut self,
+        provider: &ProviderId,
+        now: UnixSeconds,
+        uid_hashes: &[String],
+    ) {
         if self.opted_out(provider, now) {
             return;
         }
@@ -715,17 +742,42 @@ impl KvEntry {
             provider.clone(),
             now.saturating_add_secs(OPT_OUT_MEMORY_SECONDS).get(),
         );
+        if uid_hashes.is_empty() {
+            self.opt_out_uids.remove(provider);
+        } else {
+            let kept = uid_hashes.len().min(MAX_OPT_OUT_UID_HASHES);
+            self.opt_out_uids
+                .insert(provider.clone(), uid_hashes[..kept].to_vec());
+        }
+    }
+
+    /// Whether every one of `uid_hashes` was known when `provider`'s
+    /// remembered opt-out was recorded, so cookies holding them repeat the
+    /// opted-out identity rather than a renewed one.
+    ///
+    /// An opt-out remembered without hashes knew no UID, so any UID is new.
+    #[must_use]
+    pub fn repeats_opted_out_uids(&self, provider: &ProviderId, uid_hashes: &[String]) -> bool {
+        !uid_hashes.is_empty()
+            && self
+                .opt_out_uids
+                .get(provider)
+                .is_some_and(|known| uid_hashes.iter().all(|hash| known.contains(hash)))
     }
 
     /// Forgets the opt-out remembered for `provider`, if any.
     pub fn forget_opt_out(&mut self, provider: &ProviderId) {
         self.opt_outs.remove(provider);
+        self.opt_out_uids.remove(provider);
     }
 
     /// Forgets opt-outs whose time has passed, and revocations older than
     /// [`REVOCATION_MEMORY_SECONDS`].
     pub fn prune_opt_outs(&mut self, now: UnixSeconds) {
         self.opt_outs.retain(|_, until| *until > now.get());
+        let opt_outs = &self.opt_outs;
+        self.opt_out_uids
+            .retain(|provider, _| opt_outs.contains_key(provider));
         self.revocations
             .retain(|_, at| at.saturating_add(REVOCATION_MEMORY_SECONDS) > now.get());
     }
@@ -772,6 +824,7 @@ impl KvEntry {
             network: None,
             ids,
             opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
             revocations: BTreeMap::new(),
         }
     }
@@ -806,6 +859,7 @@ impl KvEntry {
             network: None,
             ids: BTreeMap::new(),
             opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
             revocations: BTreeMap::new(),
         }
     }
@@ -991,6 +1045,43 @@ mod tests {
                 && !json.contains("cluster_checked")
                 && !json.contains("visits"),
             "serialized entry should omit removed timestamp and visit fields: {json}"
+        );
+    }
+
+    #[test]
+    fn a_remembered_opt_out_recognises_only_the_uids_known_then() {
+        // Arrange
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1000);
+        let held = vec![opt_out_uid_hash("held-id")];
+
+        // Act
+        entry.remember_opt_out(&provider, UnixSeconds::new(1000), &held);
+
+        // Assert
+        assert!(
+            entry.repeats_opted_out_uids(&provider, &held),
+            "should recognise a cookie that repeats the opted-out UID"
+        );
+        assert!(
+            !entry.repeats_opted_out_uids(
+                &provider,
+                &[opt_out_uid_hash("held-id"), opt_out_uid_hash("new-id")]
+            ),
+            "should not recognise a cookie holding a renewed UID"
+        );
+        assert!(
+            !serde_json::to_string(&entry)
+                .expect("should serialize the row")
+                .contains("held-id"),
+            "should store hashes rather than the opted-out UID"
+        );
+        let mut lapsed = entry.clone();
+        lapsed.prune_opt_outs(UnixSeconds::new(1000 + OPT_OUT_MEMORY_SECONDS));
+        entry.forget_opt_out(&provider);
+        assert!(
+            entry.opt_out_uids.is_empty() && lapsed.opt_out_uids.is_empty(),
+            "should drop the hashes with a forgotten or lapsed opt-out"
         );
     }
 

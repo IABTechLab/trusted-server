@@ -180,7 +180,7 @@ fn apply_lookups(
         // starts the memory period; a remembered one keeps its end time, and
         // a cookie opt-out is re-read on every navigation instead.
         if lookup.opt_out == OptOutMemory::Remember {
-            entry.remember_opt_out(&lookup.provider, now);
+            entry.remember_opt_out(&lookup.provider, now, lookups.known_uids(&lookup.provider));
         }
         let mut removed = false;
         for source in &lookup.cleared {
