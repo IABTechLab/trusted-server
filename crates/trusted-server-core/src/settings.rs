@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -15,6 +16,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::asset_image_optimizer::image_optimizer_region;
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
@@ -24,7 +26,6 @@ use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
-use crate::platform::PlatformImageOptimizerRegion;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -178,6 +179,19 @@ impl Publisher {
         "replace-with-random-proxy-secret",
     ];
 
+    /// Drops `origin_host_header_override` on Spin, with a warning.
+    ///
+    /// Spin sends the origin URI authority as `Host` and cannot override it, so
+    /// the Spin adapter calls this when it loads settings. A config that sets
+    /// the override keeps serving there, with the URI authority.
+    pub fn drop_origin_host_header_override_for_spin(&mut self) {
+        if self.origin_host_header_override.take().is_some() {
+            log::warn!(
+                "publisher.origin_host_header_override is ignored on Spin; the origin receives its URI authority as Host"
+            );
+        }
+    }
+
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
     /// Per spec §5.2, EC cookies derive their domain from
@@ -297,14 +311,6 @@ impl Publisher {
         self.public_origin
             .clone()
             .unwrap_or_else(|| format!("https://{}", self.domain))
-    }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
     }
 }
 
@@ -502,6 +508,15 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Whether this partner's provider-written UIDs are mirrored to the
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
+    /// effect only with `bidstream_enabled`.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub mirror_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -523,11 +538,8 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
-    ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
+    /// Legacy pull-sync refresh interval; retained for config compatibility;
+    /// unused.
     #[serde(
         default = "EcPartner::default_pull_sync_ttl_sec",
         deserialize_with = "from_value_or_str"
@@ -545,6 +557,13 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    /// Whether this partner runs pull sync as an identity provider, which
+    /// makes its source provider-owned.
+    #[must_use]
+    pub fn runs_pull_sync(&self) -> bool {
+        self.pull_sync_enabled && self.pull_sync_url.is_some()
+    }
+
     /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
     /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
@@ -635,11 +654,149 @@ impl EcPartner {
     }
 }
 
+/// One `[[ec.identity_providers]]` entry.
+///
+/// A `sharedid` provider with no `sources` claims `pubcid.org`, the source
+/// Prebid sends `SharedID` under.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+pub struct IdentityProviderConfig {
+    /// Unique provider ID; recorded as the owner of the UIDs it writes.
+    pub id: String,
+    /// Implementation kind, matched by the provider crate's `build`.
+    kind: String,
+    /// Whether lookups run. A disabled provider owns no sources.
+    #[serde(
+        default = "IdentityProviderConfig::default_enabled",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub enabled: bool,
+    /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
+    ///
+    /// Optional for kinds that only read first-party cookies; kinds that
+    /// make lookups reject a missing endpoint when they are built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Exact hosts the coordinator may call for this provider.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub allowed_domains: Vec<String>,
+    /// Source domains this provider owns; each needs an `[[ec.partners]]` entry.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub sources: Vec<String>,
+    /// TCF vendor ID that must have vendor consent, when set.
+    #[serde(default)]
+    pub tcf_vendor_id: Option<NonZeroU16>,
+    /// When the provider's lookup runs on a navigation.
+    #[serde(default)]
+    pub collect: CollectTiming,
+    /// Most lookups per EC hash per hour, when set; unset means unlimited.
+    /// ECs behind one client IP share the budget.
+    ///
+    /// The Fastly limiter enforces this as a per-minute budget of at least
+    /// one, so values below 60 behave like 60 per hour.
+    #[serde(default)]
+    pub rate_limit_per_hour: Option<NonZeroU32>,
+    /// Secret Store key references, resolved at startup.
+    #[serde(default)]
+    pub secrets: ProviderSecrets,
+    /// Provider-specific settings, parsed by the provider kind.
+    ///
+    /// Held as a JSON object because settings travel through the JSON app
+    /// config pipeline.
+    #[serde(default)]
+    pub settings: serde_json::Map<String, JsonValue>,
+}
+
+impl<'de> Deserialize<'de> for IdentityProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut config = Self::deserialize(deserializer)?;
+        if config.kind == SHAREDID_PROVIDER_KIND && config.sources.is_empty() {
+            config.sources = vec![SHAREDID_DEFAULT_SOURCE.to_owned()];
+        }
+        Ok(config)
+    }
+}
+
+impl Serialize for IdentityProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// Provider kind of Prebid's `SharedID`.
+const SHAREDID_PROVIDER_KIND: &str = "sharedid";
+
+/// Source a `sharedid` provider claims when none is configured.
+pub const SHAREDID_DEFAULT_SOURCE: &str = "pubcid.org";
+
+impl IdentityProviderConfig {
+    const fn default_enabled() -> bool {
+        true
+    }
+
+    /// Builds an enabled page-phase config with no TCF vendor, no rate limit,
+    /// default secrets and empty provider settings.
+    #[must_use]
+    pub fn new(
+        id: String,
+        kind: String,
+        endpoint: String,
+        allowed_domains: Vec<String>,
+        sources: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            enabled: true,
+            endpoint: Some(endpoint),
+            allowed_domains,
+            sources,
+            tcf_vendor_id: None,
+            collect: CollectTiming::default(),
+            rate_limit_per_hour: None,
+            secrets: ProviderSecrets::default(),
+            settings: serde_json::Map::new(),
+        }
+    }
+
+    /// The configured implementation kind.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+/// When an identity provider's lookup runs on a navigation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectTiming {
+    /// Before the response, within `identity_budget_ms`; results reach the
+    /// navigation's own write and response.
+    #[default]
+    Page,
+    /// After the response has been sent, within
+    /// `identity_after_response_budget_ms`; results reach the row in one
+    /// follow-up write and are served from the next page load.
+    AfterResponse,
+}
+
+/// Secret values for one identity provider.
+///
+/// `EdgeZero` secret paths address fixed field names, so V1 supports one
+/// optional bearer token per provider.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecrets {
+    /// Secret Store key whose value is the provider's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Redacted<String>>,
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
@@ -650,7 +807,8 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
+    /// Maximum number of pull-sync lookups dispatched per navigation; 0
+    /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 
@@ -672,6 +830,65 @@ pub struct Ec {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub partners: Vec<EcPartner>,
+
+    /// Shared time budget, in milliseconds, for all provider lookups on one
+    /// navigation.
+    ///
+    /// `Ec` denies unknown fields, so this and the other identity fields are
+    /// skipped from serialization at their defaults: a config blob without
+    /// providers then still loads in a runtime built before them.
+    #[serde(
+        default = "Ec::default_identity_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub identity_budget_ms: u64,
+
+    /// Time budget, in milliseconds, for lookups of providers with
+    /// `collect = "after_response"`, measured from their dispatch after the
+    /// response has been sent.
+    #[serde(
+        default = "Ec::default_identity_after_response_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_after_response_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 5000,
+        message = "must be between 1 and 5000 milliseconds"
+    ))]
+    pub identity_after_response_budget_ms: u64,
+
+    /// Server-side identity providers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
+    pub identity_providers: Vec<IdentityProviderConfig>,
+}
+
+// Not derived: the identity budgets default to their serde defaults so a
+// default `Ec` passes the budget range checks and serializes no identity keys.
+impl Default for Ec {
+    fn default() -> Self {
+        Self {
+            passphrase: Redacted::default(),
+            ec_store: None,
+            pull_sync_concurrency: 0,
+            cluster_trust_threshold: 0,
+            cluster_recheck_secs: 0,
+            partners: Vec::new(),
+            identity_budget_ms: Self::default_identity_budget_ms(),
+            identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
+            identity_providers: Vec::new(),
+        }
+    }
 }
 
 impl Ec {
@@ -683,6 +900,19 @@ impl Ec {
         "trusted-server-placeholder-secret",
         "replace-with-random-ec-passphrase",
     ];
+
+    /// Normalizes every partner's `pull_sync_allowed_domains`: trimmed,
+    /// lowercased and without a trailing dot, matching how request hosts are
+    /// compared.
+    fn normalize_pull_sync_domains(&mut self) {
+        for domain in self
+            .partners
+            .iter_mut()
+            .flat_map(|partner| partner.pull_sync_allowed_domains.iter_mut())
+        {
+            *domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        }
+    }
 
     /// Default maximum concurrent pull-sync requests.
     #[must_use]
@@ -700,6 +930,28 @@ impl Ec {
     #[must_use]
     pub const fn default_cluster_recheck_secs() -> u64 {
         3600
+    }
+
+    /// Default shared identity lookup budget (200 ms).
+    #[must_use]
+    pub const fn default_identity_budget_ms() -> u64 {
+        200
+    }
+
+    /// Default after-response identity lookup budget (2 s).
+    #[must_use]
+    pub const fn default_identity_after_response_budget_ms() -> u64 {
+        2000
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_budget_ms()
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_after_response_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_after_response_budget_ms()
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
@@ -1191,7 +1443,7 @@ impl AssetImageOptimizerConfig {
                         .to_string(),
             }));
         }
-        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+        if image_optimizer_region(&self.region).is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "proxy.asset_routes image_optimizer region `{}` is not supported",
@@ -1967,9 +2219,7 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Enable TLS certificate verification when proxying to HTTPS origins.
-    /// Defaults to true for secure production use.
-    /// Set to false for local development with self-signed certificates.
+    /// Must be true. Origin TLS is always verified.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the
@@ -3425,6 +3675,7 @@ impl Settings {
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
+        self.ec.normalize_pull_sync_domains();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
@@ -3567,6 +3818,19 @@ impl Settings {
                 insecure_fields.push(format!(
                     "ec.partners[{}].ts_pull_token",
                     partner.source_domain
+                ));
+            }
+        }
+        for provider in &self.ec.identity_providers {
+            if provider
+                .secrets
+                .token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.identity_providers[{}].secrets.token",
+                    provider.id
                 ));
             }
         }
@@ -4321,6 +4585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::auction::build_orchestrator;
     use crate::integrations::{
         IntegrationRegistry, gpt::GptConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
@@ -4332,6 +4597,52 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    #[test]
+    fn default_ec_uses_the_identity_budget_defaults() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            (ec.identity_budget_ms, ec.identity_after_response_budget_ms),
+            (
+                Ec::default_identity_budget_ms(),
+                Ec::default_identity_after_response_budget_ms()
+            ),
+            "should match the serde defaults"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("identity_budget_ms").is_none()
+                && serialized
+                    .get("identity_after_response_budget_ms")
+                    .is_none(),
+            "should serialize no identity keys"
+        );
+    }
+
+    #[test]
+    fn pull_sync_allowed_domains_are_normalized_at_load() {
+        let toml = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Pull partner"
+            source_domain = "partner.example.com"
+            pull_sync_enabled = true
+            pull_sync_url = "https://sync.example.com/pull"
+            pull_sync_allowed_domains = [" Sync.Example.COM. "]
+            ts_pull_token = "example-pull-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse settings");
+
+        assert_eq!(
+            settings.ec.partners[0].pull_sync_allowed_domains,
+            vec!["sync.example.com".to_owned()],
+            "should trim, lowercase and drop the trailing dot"
+        );
+    }
 
     #[test]
     fn html_finalization_timeout_defaults_and_boundaries() {
@@ -4413,6 +4724,53 @@ mod tests {
         );
     }
 
+    /// `Ec` denies unknown fields, so a binary built before identity providers
+    /// existed must still accept a blob that configures none.
+    #[test]
+    fn default_identity_settings_are_omitted_for_rollback() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize ec settings");
+
+        for field in [
+            "identity_budget_ms",
+            "identity_after_response_budget_ms",
+            "identity_providers",
+        ] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_budgets_are_range_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        for (page, after_response, invalid) in [
+            (1, 1, false),
+            (1000, 5000, false),
+            (0, 2000, true),
+            (1001, 2000, true),
+            (200, 0, true),
+            (200, 5001, true),
+        ] {
+            let ec = Ec {
+                identity_budget_ms: page,
+                identity_after_response_budget_ms: after_response,
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should enforce identity budget bounds for {page} and {after_response}"
+            );
+        }
+    }
+
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
     /// That only holds while the flag is skipped during serialization.
@@ -4424,6 +4782,41 @@ mod tests {
         assert!(
             serialized.get("sandbox_metrics_enabled").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn default_partner_omits_mirror_enabled_for_rollback() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+
+        assert!(
+            serialized.get("mirror_enabled").is_none(),
+            "a default partner must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_mirror_serializes_and_round_trips() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+            "mirror_enabled": true,
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+        let restored: EcPartner =
+            serde_json::from_value(serialized).expect("should deserialize serialized partner");
+
+        assert!(
+            restored.mirror_enabled,
+            "an enabled mirror must survive a round trip"
         );
     }
 
@@ -4847,6 +5240,7 @@ mod tests {
             source_domain: "canary-partner.example".to_string(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -6534,8 +6928,8 @@ origin_host_header_override = "www.example.com:8443""#,
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
-            "www.example.com:8443",
+            settings.publisher.origin_host_header_override.as_deref(),
+            Some("www.example.com:8443"),
             "should use configured host header override"
         );
     }
@@ -6903,6 +7297,7 @@ source_domain = "partner.example.com"
             source_domain: "partner.example.com".to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: api_token.map(|token| Redacted::new(token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
@@ -6946,6 +7341,31 @@ source_domain = "partner.example.com"
         settings
             .reject_placeholder_secrets()
             .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_identity_provider_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        let mut provider: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/\"",
+        )
+        .expect("should parse provider config");
+        provider.secrets.token = Some(Redacted::new(
+            "partner-api-token-32-bytes-minimum".to_owned(),
+        ));
+        settings.ec.identity_providers = vec![provider];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder provider token");
+
+        assert!(
+            format!("{err:?}").contains("ec.identity_providers[example-provider].secrets.token"),
+            "should mention the provider token field"
+        );
     }
 
     #[test]
@@ -7394,7 +7814,6 @@ source_domain = "partner.example.com"
                 settings.publisher.origin_host_header_override.as_deref(),
                 Some("www.example.com")
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
@@ -7502,40 +7921,6 @@ source_domain = "partner.example.com"
             allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            public_origin: None,
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            public_origin: None,
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]

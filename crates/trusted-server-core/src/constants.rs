@@ -1,11 +1,13 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
-/// Short-lived signed proof that the current EC row has every pull-partner UID.
+/// Retired pull-sync completeness marker; leftover cookies are expired.
 pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// JS-readable mirror of provider-owned bidstream UIDs (spec §10).
+pub const COOKIE_TS_EIDS_MIRROR: &str = "__Host-ts-eids-mirror";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
@@ -93,6 +95,8 @@ pub const INTERNAL_HEADERS: &[&str] = &[
 
 // Consent-related cookie names
 pub const COOKIE_EUCONSENT_V2: &str = "euconsent-v2";
+/// Host-only copy of the Sourcepoint TCF decision for first-party requests.
+pub const COOKIE_SOURCEPOINT_TCF: &str = "__Host-ts-tcf";
 pub const COOKIE_GPP: &str = "__gpp";
 pub const COOKIE_GPP_SID: &str = "__gpp_sid";
 pub const COOKIE_US_PRIVACY: &str = "us_privacy";

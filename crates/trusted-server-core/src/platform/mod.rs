@@ -9,8 +9,6 @@
 //! - [`PlatformConfigStore`] — key-value config store access
 //! - [`PlatformSecretStore`] — encrypted secret store access
 //! - [`PlatformKvStore`] — (re-exported from `edgezero_core`)
-//! - [`PlatformBackend`] — dynamic backend registration
-//! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
@@ -32,14 +30,8 @@
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
 
-use std::time::Duration;
-
-mod backend_naming;
 mod error;
-mod http;
-mod image_optimizer;
 mod kv;
-mod pending_response;
 mod template_assembly;
 mod template_cache;
 #[cfg(test)]
@@ -48,22 +40,11 @@ mod timer;
 mod traits;
 mod types;
 
-pub use backend_naming::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
-    BackendNamingPolicy, PredictedBackend,
-};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
+pub use edgezero_core::outbound::HttpClient;
+pub use edgezero_core::time::MonotonicClock;
 pub use error::PlatformError;
-pub use http::{
-    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
-};
-pub use image_optimizer::{
-    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
-};
 pub use kv::UnavailableKvStore;
-pub use pending_response::PlatformPendingResponse;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,
@@ -76,14 +57,8 @@ pub use template_cache::{
     UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use timer::PlatformTimer;
-pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
-pub use types::{
-    ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
-    StoreName,
-};
-
-/// Default first-byte timeout for platform backends.
-pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+pub use traits::{PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use types::{ClientInfo, GeoInfo, RuntimeServices, RuntimeServicesBuilder, StoreId, StoreName};
 
 #[cfg(test)]
 mod tests {
@@ -149,8 +124,6 @@ mod tests {
     fn _assert_config_store_object_safe(_: &dyn PlatformConfigStore) {}
     fn _assert_secret_store_object_safe(_: &dyn PlatformSecretStore) {}
     fn _assert_kv_store_object_safe(_: &dyn PlatformKvStore) {}
-    fn _assert_backend_object_safe(_: &dyn PlatformBackend) {}
-    fn _assert_http_client_object_safe(_: &dyn PlatformHttpClient) {}
     fn _assert_geo_object_safe(_: &dyn PlatformGeo) {}
     // Arc<dyn Trait> requires the trait impl to be Send + Sync. The assertion
     // below documents that RuntimeServices itself satisfies those bounds — the
@@ -248,45 +221,6 @@ mod tests {
             replaced.client_info().client_ip,
             services.client_info().client_ip,
             "should preserve client_info through with_kv_store"
-        );
-    }
-
-    #[test]
-    fn platform_pending_request_downcasts_and_preserves_backend_name() {
-        let pending = PlatformPendingRequest::new(7_u8).with_backend_name("origin");
-        let pending = pending
-            .downcast::<String>()
-            .expect_err("should reject downcast to the wrong pending type");
-        assert_eq!(
-            pending.backend_name(),
-            Some("origin"),
-            "should preserve backend metadata when downcast fails"
-        );
-
-        let pending = PlatformPendingRequest::new(7_u8).with_backend_name("origin");
-        let value = pending
-            .downcast::<u8>()
-            .expect("should recover the stored pending request type");
-        assert_eq!(value, 7, "should preserve the stored pending request");
-    }
-
-    #[test]
-    fn platform_pending_request_preserves_response_handling_metadata() {
-        let pending = PlatformPendingRequest::new(7_u8)
-            .with_backend_name("origin")
-            .with_response_handling(true, edgezero_core::http::Method::HEAD);
-        let pending = pending
-            .downcast::<String>()
-            .expect_err("should reject downcast to the wrong pending type");
-
-        assert!(
-            pending.stream_response(),
-            "should preserve the streaming response flag"
-        );
-        assert_eq!(
-            pending.request_method(),
-            Some(&edgezero_core::http::Method::HEAD),
-            "should preserve the originating request method"
         );
     }
 

@@ -9,12 +9,20 @@ config that `ts config push` writes into KV to the nested
 
 | Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
 | ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | single           | outermost sanitize         | none                  |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
 
-Cloudflare supports one enabled auction provider. GET/HEAD `/health` and
-`/ready` are local probes after Worker and SDK application dispatch begins.
-Caught initialization failures preserve liveness and make readiness and ordinary
-routes unavailable. See the [operational response contract](./api-reference#operational-probe-contract).
+This row is the canonical status summary. Cloudflare supports multiple auction
+providers. GET/HEAD `/health` and `/ready` are local probes after Worker and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable. See the
+[operational response contract](./api-reference#operational-probe-contract).
+
+EdgeZero's Cloudflare `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the Workers console, which `wrangler
+dev` prints and `wrangler tail` streams from a deployed Worker. The level comes
+from the `EDGEZERO__LOGGING__LEVEL` Worker variable and defaults to `info`, so
+the startup report and every warning are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 

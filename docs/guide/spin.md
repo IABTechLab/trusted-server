@@ -8,18 +8,28 @@ through Spin variables.
 
 | Adapter | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization            |
 | ------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | -------------------------------- |
-| `spin`  | experimental   | `200`    | `503`           | `200` / `503`            | single           | outermost sanitize         | innermost Spin-header derivation |
+| `spin`  | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | innermost Spin-header derivation |
 
-Spin supports one enabled auction provider. GET/HEAD `/health` and `/ready`
-answer after component and SDK application dispatch begins. Caught initialization
-failures preserve liveness and make readiness and ordinary routes unavailable.
-See the [operational response contract](./api-reference#operational-probe-contract).
+This row is the canonical status summary. Spin supports multiple auction
+providers. GET/HEAD `/health` and `/ready` answer after component and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable, and the full report goes
+only to the log. See the
+[operational response contract](./api-reference#operational-probe-contract).
+
+EdgeZero's Spin `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the component's stderr, which `spin up`
+writes to `<component>_stderr.txt` under its `--log-dir`. The level comes from
+`EDGEZERO__LOGGING__LEVEL` in the component's environment and defaults to
+`info`, so the startup report and every warning, such as the ignored
+`publisher.origin_host_header_override`, are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Prerequisites
 
-Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
-`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide, so an older runtime
-cannot start the component. Install or upgrade from the
+Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 8 imports
+WASI HTTP 0.3, which Spin 4.0.x does not provide, so an older runtime cannot
+start the component. Install or upgrade from the
 [Spin install guide](https://spinframework.dev/install).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
@@ -62,7 +72,8 @@ variables:
 It first launches `spin up` before config is pushed, then relaunches it while
 omitting each variable independently. Every publisher request must return 503,
 and the controlled config or variable delta must identify the intended missing
-input. A generic degraded response cannot satisfy the check.
+input. A generic degraded response cannot satisfy the check. The smoke reads
+that diagnostic from the component's stderr.
 
 The final non-health publisher request must return 200, retain the stub-origin
 sentinel, rewrite its origin URL to the Spin listener, and omit the original

@@ -84,7 +84,7 @@ run_case() {
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 
     "${env_args[@]}" \
-        PORT="$port" \
+        EDGEZERO__ADAPTER__PORT="$port" \
         "$AXUM_BINARY" >"$log_path" 2>&1 &
     APP_PID=$!
     local startup_state=ready

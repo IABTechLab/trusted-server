@@ -13,7 +13,10 @@ The row above summarizes the
 response does not prove that configuration loaded: Fastly serves GET/HEAD
 `/health` before it constructs the application. GET/HEAD `/ready` follows the
 ordinary initialization path, including required configuration-store access.
-See the [operational response contract](./api-reference#operational-probe-contract).
+If EdgeZero's managed logger fails to install, EdgeZero answers every route
+with its JSON `500`, `/health` and `/ready` included (see
+[When the logger fails to install](#when-the-logger-fails-to-install)). See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 ## Create a Fastly Account
 
@@ -41,20 +44,14 @@ See the [operational response contract](./api-reference#operational-probe-contra
    - Add your domain of the website you'll be testing or using
    - Click **Update**
 
-## Configure Origins
+## Origins
 
-Origins are the backend servers that Trusted Server will communicate with (ad servers, SSPs, etc.).
-
-1. In your Compute service, click on the **Origins** section
-2. For each backend you need to add:
-   - Enter the FQDN or IP address
-   - Click **Add**
-   - Enter a **Name** in the first field - this name will be referenced in your code (e.g., `my_ad_integration_1`)
-   - Configure port numbers and TLS settings as needed
-
-::: tip
-After saving origin information, you can select port numbers and toggle TLS on/off.
-:::
+Trusted Server needs no static origins on the Compute service. For every
+upstream it calls, such as the publisher origin, an auction provider, or an
+integration, EdgeZero registers a dynamic backend at request time from the
+request URL. Each backend is named `ez_b31v1_` followed by a hash of its
+configuration, so dashboards that group by backend name see those names. TLS
+to an HTTPS upstream is always verified.
 
 ## Configure Fastly CLI Profile
 
@@ -432,6 +429,70 @@ fastly resource-link list --service-id <service-id> --version <active-version>
 If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version.
 
 Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
+
+## Logging
+
+EdgeZero's Fastly lifecycle installs its managed logger before Trusted
+Server's request callback runs, and Trusted Server installs no logger of its
+own. The settings come from
+`[adapters.fastly.logging]` in `edgezero.toml`:
+
+```toml
+[adapters.fastly.logging]
+endpoint = "tslog"
+level = "info"
+echo_stdout = true
+```
+
+Records go to the Fastly log endpoint named `tslog` and are echoed to stdout,
+which `fastly compute serve` prints. Each line reads
+`<timestamp> <level> <target> <message>`. EdgeZero keeps its `edgezero::boot`
+startup warnings at `warn` whatever the level.
+
+### Raising the level at runtime
+
+A Config Store linked as `edgezero_logging` with the key
+`EDGEZERO__LOGGING__LEVEL` overrides the manifest level without a rebuild. The
+value is one of `off`, `error`, `warn`, `info`, `debug`, or `trace`, in any
+case; an invalid value selects `info`. Without the store or the key, the
+manifest level applies. EdgeZero reads the override once per instance, so a
+change reaches new instances only. It changes neither the endpoint nor the
+stdout echo.
+
+To log at `debug` locally with the same production wasm, add this to the local
+Fastly configuration that `fastly compute serve` or Viceroy reads, then restart
+it:
+
+```toml
+[local_server.config_stores.edgezero_logging]
+format = "inline-toml"
+
+[local_server.config_stores.edgezero_logging.contents]
+EDGEZERO__LOGGING__LEVEL = "debug"
+```
+
+On a deployed service, leave `edgezero_logging` unlinked to keep the manifest
+level, or link a Config Store with that key to change it.
+
+### When the logger fails to install
+
+If EdgeZero cannot install its logger, no Trusted Server route answers,
+`/health` included: EdgeZero's lifecycle stops before Trusted Server's
+callback runs. EdgeZero answers the request itself with its redacted JSON
+`500`, whose body is
+`{"error":{"kind":"internal","message":"internal server error","status":500}}`,
+and sends no body to a `HEAD`. The response carries none of Trusted Server's
+headers, such as `x-ts-version`, because no Trusted Server code runs. The
+guest then prints `managed logger installation failed: <reason>` on stderr.
+Earlier releases answered `/health` before installing the logger, and served
+every request after printing the failure.
+
+The usual cause is an `edgezero_logging` Config Store that is linked but
+cannot be opened or read. EdgeZero checks the `endpoint` name in
+`[adapters.fastly.logging]` when the build reads the manifest, so a name that
+is empty, contains `:` or a line feed, or is `stdout` or `stderr` fails the
+build instead. Whether the endpoint exists is checked only when the logger
+installs. The failure lasts for the instance.
 
 ## Verify the complete local handoff
 

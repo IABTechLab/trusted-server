@@ -4,13 +4,24 @@ Native development adapter for Trusted Server. It runs the shared application
 through Axum on the host, without an edge simulator, and is not a production
 deployment target.
 
-The crate owns Axum route registration, middleware, outbound HTTP through
-`reqwest`, and environment-backed platform services. Its route surface follows
-the shared core contract, but request-time KV operations are unavailable.
-Its `/health`, `/ready`, and startup-failure responses follow the shared
+The crate owns Axum route registration, middleware, and environment-backed
+platform services. Outbound HTTP goes through EdgeZero's Axum client. Its
+route surface follows the shared core contract, but request-time KV operations
+are unavailable. Its `/health`, `/ready`, and startup-failure responses follow
+the shared
 [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
-Application configuration reaches the process through the documented environment
-bridge; the local EdgeZero config-store file is not read directly.
+Application configuration reaches the process through the documented
+environment bridge; the local EdgeZero config-store file is not read directly.
+
+The binary runs through EdgeZero's Axum `run_app`, which installs the logger
+and binds the listener; the adapter installs no logger of its own. The log
+level comes from `EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener
+address from `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default
+`127.0.0.1:8787`). The listener's ingress limits come from
+`EDGEZERO__ADAPTER__INGRESS__*` environment variables, and an invalid value
+stops the process with a non-zero exit before it listens. The
+[Axum development guide](../../docs/guide/axum-dev.md#ingress-limits) lists
+them.
 
 Build and test from the repository root:
 

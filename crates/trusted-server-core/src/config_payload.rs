@@ -98,6 +98,28 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
+    if let Some(providers) = data
+        .pointer_mut("/ec/identity_providers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for provider in providers {
+            let Some(provider) = provider.as_object_mut() else {
+                continue;
+            };
+            // `enabled` defaults to true, so only an explicit false disables.
+            let disabled = provider
+                .get("enabled")
+                .is_some_and(|enabled| !json_bool_or_string_is_true(Some(enabled)));
+            if disabled
+                && let Some(secrets) = provider
+                    .get_mut("secrets")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                secrets.remove("token");
+            }
+        }
+    }
+
     let Some(datadome) = data
         .pointer_mut("/integrations/datadome")
         .and_then(serde_json::Value::as_object_mut)
@@ -156,6 +178,7 @@ mod tests {
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
         fn get_bytes(
             &self,
@@ -170,7 +193,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -179,13 +202,18 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
 
     struct UnifiedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnifiedSecretStore {
         fn get_bytes(
             &self,
@@ -205,6 +233,7 @@ mod tests {
                 "s3-session-key" => "resolved-session-token",
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
+                "provider-token-key" => "resolved-provider-token",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
                 "trusted-forwarder-key" => "resolved-trusted-forwarder-secret-32-bytes",
                 _ => key,
@@ -212,7 +241,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -221,7 +250,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
@@ -350,6 +383,46 @@ mod tests {
         assert!(
             config.geo_query_parameters,
             "should preserve Didomi geo opt-in"
+        );
+    }
+
+    #[test]
+    fn resolves_identity_provider_token_from_the_mapped_default_store() {
+        let mut original = test_settings();
+        original.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+        );
+        original.ec.identity_providers.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "example-provider",
+                "kind": "example-kind",
+                "endpoint": "https://ids.example.com/v1/lookup",
+                "allowed_domains": ["ids.example.com"],
+                "sources": ["ids.example.com"],
+                "secrets": { "token": "provider-token-key" },
+            }))
+            .expect("should build provider config"),
+        );
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the provider token");
+
+        assert_eq!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-provider-token"),
+            "should resolve the provider token key"
         );
     }
 
@@ -722,6 +795,12 @@ mod tests {
             .ec
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+        original.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nenabled = false\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]\nsecrets = { token = \"unused-provider-token\" }",
+            )
+            .expect("should parse disabled provider"),
+        );
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -730,6 +809,13 @@ mod tests {
         )
         .expect("should skip inactive optional feature references");
 
+        assert!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .is_none(),
+            "should not resolve a disabled provider's token"
+        );
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
         let datadome = reconstructed
@@ -996,6 +1082,31 @@ mod tests {
 
         load_settings(&envelope_json(&original))
             .expect("runtime should accept disabled browser bidder ownership overlap");
+    }
+
+    #[test]
+    fn live_blob_with_operator_framing_headers_still_loads() {
+        // Push rejects these entries, but a blob pushed before the rejection
+        // still has to load. The response-header helper skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = test_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            let loaded = load_settings(&envelope_json(&settings))
+                .expect("should keep loading a live config that predates the rejection");
+
+            assert_eq!(
+                loaded.response_headers.get(name).map(String::as_str),
+                Some(value),
+                "should keep the {name} entry for the response-header helper to skip"
+            );
+        }
     }
 
     #[test]

@@ -11,13 +11,15 @@ loaded by a separate tag.
 | Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
 | ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
 | `axum`       | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | single           | outermost sanitize             | none                             |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
 | `fastly`     | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | `200`    | `503`           | `200` / `503`            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
-All adapters keep GET/HEAD `/health` live after caught initialization failure;
-GET/HEAD `/ready` returns 503 until initialization succeeds. Readiness does not
-poll request-time dependencies. See the canonical
+This table summarizes the adapter implementations. All adapters keep GET/HEAD
+`/health` live after caught initialization failure; GET/HEAD `/ready` returns
+503 until initialization succeeds, so a liveness answer does not mean
+configuration loaded. Readiness does not poll request-time dependencies. See
+the canonical
 [operational response contract](./api-reference#operational-probe-contract) for
 exact responses, authentication exemptions, and platform timing limits.
 “Provider fan-out” describes whether the adapter

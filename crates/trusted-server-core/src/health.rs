@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Response, StatusCode, header};
+use edgezero_core::pre_dispatch::PreDispatchRequest;
 use edgezero_core::router::{BoxPreDispatchHook, PreDispatchHook};
 
 use crate::version_header::apply_git_version_header;
@@ -145,7 +146,10 @@ impl ProbePreDispatchHook {
 
 #[async_trait(?Send)]
 impl PreDispatchHook for ProbePreDispatchHook {
-    async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+    async fn handle(
+        &self,
+        request: &mut PreDispatchRequest,
+    ) -> Result<Option<Response>, EdgeError> {
         if let Some(probe) = classify_probe(request.method(), request.uri().path()) {
             return Ok(Some(probe_response(request.method(), probe, self.state)));
         }
@@ -159,6 +163,7 @@ impl PreDispatchHook for ProbePreDispatchHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::tests::run_pre_dispatch_hook;
     use edgezero_core::http::request_builder;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,7 +172,10 @@ mod tests {
 
     #[async_trait(?Send)]
     impl PreDispatchHook for Delegate {
-        async fn handle(&self, _request: &mut Request) -> Result<Option<Response>, EdgeError> {
+        async fn handle(
+            &self,
+            _request: &mut PreDispatchRequest,
+        ) -> Result<Option<Response>, EdgeError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let mut response = Response::new(Body::from("delegate"));
             *response.status_mut() = StatusCode::ACCEPTED;
@@ -210,20 +218,20 @@ mod tests {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             for state in [StartupState::Ready, StartupState::Unavailable] {
-                let hook =
-                    ProbePreDispatchHook::new(state, Some(Arc::new(Delegate(Arc::clone(&calls)))));
                 for method in [Method::GET, Method::HEAD] {
                     for (path, live) in [("/health?probe=1", true), ("/ready?probe=1", false)] {
-                        let mut request = request_builder()
+                        let hook = ProbePreDispatchHook::new(
+                            state,
+                            Some(Arc::new(Delegate(Arc::clone(&calls)))),
+                        );
+                        let request = request_builder()
                             .method(method.clone())
                             .uri(path)
                             .body(Body::empty())
                             .expect("should build request");
-                        let response = hook
-                            .handle(&mut request)
-                            .await
-                            .expect("should handle probe")
-                            .expect("should intercept probe");
+                        let Err(response) = run_pre_dispatch_hook(hook, request).await else {
+                            panic!("should intercept probe");
+                        };
                         let ready = live || state == StartupState::Ready;
                         assert_eq!(
                             response.status().as_u16(),
@@ -266,15 +274,13 @@ mod tests {
                 StartupState::Ready,
                 Some(Arc::new(Delegate(Arc::clone(&calls)))),
             );
-            let mut request = request_builder()
+            let request = request_builder()
                 .uri("/ordinary?query=1")
                 .body(Body::empty())
                 .expect("should build ordinary request");
-            let response = hook
-                .handle(&mut request)
-                .await
-                .expect("should delegate")
-                .expect("should return delegate response");
+            let Err(response) = run_pre_dispatch_hook(hook, request).await else {
+                panic!("should return delegate response");
+            };
             assert_eq!(
                 response.status(),
                 StatusCode::ACCEPTED,
@@ -285,15 +291,15 @@ mod tests {
                 1,
                 "should delegate exactly once"
             );
-            assert_eq!(request.uri(), "/ordinary?query=1", "should preserve URI");
             let hook = ProbePreDispatchHook::new(StartupState::Unavailable, None);
-            assert!(
-                hook.handle(&mut request)
-                    .await
-                    .expect("should continue")
-                    .is_none(),
-                "should continue without a delegate"
-            );
+            let request = request_builder()
+                .uri("/ordinary?query=1")
+                .body(Body::empty())
+                .expect("should build ordinary request");
+            let continued = run_pre_dispatch_hook(hook, request)
+                .await
+                .expect("should continue without a delegate");
+            assert_eq!(continued.uri(), "/ordinary?query=1", "should preserve URI");
         });
     }
 }
