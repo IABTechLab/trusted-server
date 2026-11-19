@@ -56,7 +56,7 @@ Required behavior assumptions:
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
 - Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup
 - `source_domain` is the canonical key used for stored IDs and controls EID source matching during ingestion
-- Partner has `bidstream_enabled = true` if you want `user.ext.eids` in bidstream
+- Partner has `bidstream_enabled = true` if you want `user.eids` in bidstream
 
 ## 2) Configure Demo Variables
 
