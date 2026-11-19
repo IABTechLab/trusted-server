@@ -617,7 +617,15 @@ fn running_snapshot_is_immutable_and_restart_adopts_config_and_secret() {
     );
 }
 
+// The visitors connect from 127.0.0.2 and 127.0.0.3, so the gateway's
+// 127.0.0.1 stays the only trusted peer. Linux routes all of 127.0.0.0/8 to
+// loopback; macOS has only 127.0.0.1 unless `ifconfig lo0 alias` adds the
+// others, and binding them fails with `AddrNotAvailable`.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "binds loopback sources 127.0.0.2 and 127.0.0.3, which need a loopback alias outside Linux"
+)]
 fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
     let origin = origin::Origin::start("ingress-page");
     let fixture = Prepared::new(&origin.base_url);
