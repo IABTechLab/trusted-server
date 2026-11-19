@@ -1,8 +1,8 @@
 # EdgeZero PR 275 Hard Cutover
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
-2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14, 2026-11-16 and
-2026-11-17
+2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14, 2026-11-16,
+2026-11-17 and 2026-11-18
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -26,8 +26,21 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`), the
-`rc/identity` commit on 2026-11-17 (IABTechLab/edgezero#495). It merges the
+The cut now pins `9d02d7b3` (`9d02d7b3185b49e81d9ac972ca3feef932ed848a`), the
+`rc/identity` commit on 2026-11-18 (IABTechLab/edgezero#495). PR 275 stays at
+`ea2549fb`. On top of `f84ffbbb` the branch merges EdgeZero 502 (geo through
+`ctx.geo()` on every adapter, and Axum geo bound from the manifest), the line
+EdgeZero 510, 454, 514 and 517 (the `KvStore` record contract with DynamoDB and
+celld providers on Axum, KV-backed geo, Cloudflare and Spin geo, and the
+portable ClientInfo contract, which also refactors EdgeZero 469's JA4
+selection), and the line EdgeZero 509, 512 and 515 (bounded work after the
+response on Fastly and Axum, Cloudflare `waitUntil`, and Spin's capability
+error). These add APIs the server-side identity work uses; the Trusted Server
+build needs no code change, and only the ten EdgeZero package sources change
+in `Cargo.lock`.
+
+The previous pin, `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`), was
+the `rc/identity` commit on 2026-11-17. It merges the
 same stack refreshed to PR 275's head `ea2549fb`, 16 fix and docs commits after
 `b65e7144` inside EdgeZero (Fastly response handles and progress wakers,
 retained outbound failures, body checkpoints, harness supervision and CLI
@@ -111,10 +124,12 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452`, `5c32ae61`, `10166628` and `3d92ee38` are earlier pins of the
-cut, `f84ffbbb` is the cut's pin (of the files cited at `5c32ae61`, only
-`lifecycle.rs` differs there, and every file cited at `3d92ee38` is
-unchanged), and `v0.0.11` is the base's pin. Dates are US Pacific time
+`737f8452`, `5c32ae61`, `10166628`, `3d92ee38` and `f84ffbbb` are earlier
+pins of the cut, `9d02d7b3` is the cut's pin (of the files cited at
+`5c32ae61`, only `lifecycle.rs` differs there; of the files cited at
+`3d92ee38`, only `edgezero-core`'s `manifest.rs` differs, where EdgeZero 502's
+geo placement validator moves the cited Fastly logging check), and `v0.0.11`
+is the base's pin. Dates are US Pacific time
 (UTC-8). In UTC, `5c32ae61`, PR 275's head late on 2026-11-13, is dated
 2026-11-14.
 
@@ -243,7 +258,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `f84ffbbb` at the 2026-11-17 repin. The cut repins
+which carries PR 275's head: `9d02d7b3` at the 2026-11-18 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
