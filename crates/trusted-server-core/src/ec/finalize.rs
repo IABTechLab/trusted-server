@@ -651,14 +651,11 @@ async fn finalize_unusable_consent(
         return;
     }
     let Some(graph) = kv else {
-        // No identity graph holds a row to tombstone, so the cookie is the
-        // only identity state left to clear.
+        // Without an identity graph no row can exist, so the row is proven
+        // absent and the cookie is the only identity state left to clear.
+        // This is not a failed tombstone: the consent-update endpoint already
+        // answers 503 when it has no graph.
         expire_ec_cookie(settings, response);
-        // A consent-update acknowledgment must reflect that no tombstone
-        // could be written.
-        if !withdrawal_ec_ids(ec_context).is_empty() {
-            super::consent_update::mark_reconciliation_failed(response);
-        }
         return;
     };
 

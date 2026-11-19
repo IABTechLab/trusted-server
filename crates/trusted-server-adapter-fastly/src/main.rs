@@ -36,6 +36,7 @@ mod compat;
 #[cfg(test)]
 mod deadline_network;
 mod delivery;
+mod ec_record_store;
 mod esi_assembly;
 mod management_api;
 mod middleware;
@@ -1738,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn fastly_graph_selection_opens_the_selected_record_store() {
+    fn fastly_graph_selection_selects_the_configured_record_store() {
         fastly::init();
         for storage in [
             None,
@@ -1770,23 +1771,8 @@ mod tests {
                 .is_none(),
             "should open no store when none is selected"
         );
-        let provider = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open_records(
-            "record_ec_fixture",
-            edgezero_core::RecordLayout::new(
-                trusted_server_core::ec::record_backend::EcRecordLayout,
-            )
-            .expect("should declare EC layout"),
-        )
-        .expect("should open the real Viceroy KV fixture");
-        let handle = edgezero_core::key_value_store::KvHandle::new(std::sync::Arc::new(provider));
-        let store = trusted_server_core::ec::record_backend::RecordEcKvStore::new(
-            "record_ec_fixture".to_owned(),
-            &handle,
-        )
-        .expect("should acquire shared backend");
-        futures::executor::block_on(
-            trusted_server_core::test_support::record_ec::assert_record_ec_lifecycle(&store),
-        );
+        // `ec_record_store` tests exercise the record lifecycle through the
+        // lazily opened store.
     }
 
     fn diagnostics_settings() -> Settings {
