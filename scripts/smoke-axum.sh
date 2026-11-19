@@ -101,7 +101,7 @@ run_case() {
     local env_args=(
         env -i
         "PATH=$PATH"
-        "RUST_LOG=info"
+        "EDGEZERO__LOGGING__LEVEL=info"
         "EDGEZERO__ADAPTER__HOST=127.0.0.1"
         "EDGEZERO__ADAPTER__PORT=$port"
         "EDGEZERO__ADAPTER__CONFIG_DIR=$config_dir"

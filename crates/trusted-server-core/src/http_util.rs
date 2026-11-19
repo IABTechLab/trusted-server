@@ -85,23 +85,21 @@ pub(crate) fn into_body_payload(body: EdgeBody) -> BodyPayload {
     }
 }
 
-/// Wraps a buffered body for a synchronous rewrite pipeline.
+/// Wraps a buffered body for the proxy's synchronous rewrite pipeline.
 ///
-/// Callers buffer the responses they rewrite, so a streamed body here is a
-/// bug. It fails instead of reading as empty. `pipeline` names the caller's
-/// pipeline in the error, such as `"proxy"` or `"publisher"`.
+/// The proxy buffers the responses it rewrites, so a streamed body here is a
+/// bug. It fails instead of reading as empty.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Proxy`] for a streamed body.
 pub(crate) fn body_as_reader(
     body: EdgeBody,
-    pipeline: &str,
 ) -> Result<std::io::Cursor<Bytes>, Report<TrustedServerError>> {
     match into_body_payload(body) {
         BodyPayload::Once(bytes) => Ok(std::io::Cursor::new(bytes)),
         BodyPayload::Stream(_) => Err(Report::new(TrustedServerError::Proxy {
-            message: format!("streaming body cannot be processed by the sync {pipeline} pipeline"),
+            message: "streaming body cannot be processed by the sync proxy pipeline".to_owned(),
         })),
     }
 }
@@ -635,7 +633,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
     use crate::test_support::body_read::body_read_failure_cases;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use http::{HeaderName, HeaderValue, Method};
 
     #[test]
@@ -660,15 +658,14 @@ mod tests {
 
     #[test]
     fn body_as_reader_rejects_a_streamed_body() {
-        let buffered = body_as_reader(EdgeBody::from("example"), "proxy")
+        let buffered = body_as_reader(EdgeBody::from("example"))
             .expect("should read a buffered body")
             .into_inner();
         let streamed = EdgeBody::stream(futures::stream::iter([bytes::Bytes::from_static(
             b"example",
         )]));
 
-        let error =
-            body_as_reader(streamed, "publisher").expect_err("should reject a streamed body");
+        let error = body_as_reader(streamed).expect_err("should reject a streamed body");
 
         assert_eq!(
             buffered.as_ref(),
@@ -679,8 +676,8 @@ mod tests {
             panic!("should fail with the proxy context instead of reading as empty, got {error:?}");
         };
         assert_eq!(
-            message, "streaming body cannot be processed by the sync publisher pipeline",
-            "should name the caller's pipeline"
+            message, "streaming body cannot be processed by the sync proxy pipeline",
+            "should name the proxy pipeline"
         );
     }
 
@@ -1632,12 +1629,12 @@ mod tests {
             let (request, expectation) =
                 case.into_request(http::Request::builder().uri("https://example.com/"));
             let (parts, body) = request.into_parts();
-            let capture = WarningCapture::start();
+            let capture = LogCapture::start();
 
             let report = read_body(&parts.headers, body).expect_err("should reject the body");
             let response = http_error(&report);
 
-            let records = capture.take();
+            let records = capture.take_all();
             drop(capture);
             let name = expectation.name();
             let expected = expectation.expected();

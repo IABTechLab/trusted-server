@@ -16,12 +16,18 @@
 //! reply as soon as the test clock reaches its
 //! arrival, which is more eager than Fastly's, where a check reports only what an earlier
 //! `EdgeZero` poll recorded.
+//!
+//! The double accepts every request option. It does not model the options a real adapter
+//! rejects: `EdgeZero`'s Axum, Cloudflare, and Spin clients refuse Image Optimizer options,
+//! and Spin's also refuses a host authority override. A route test that sends one of those
+//! passes here while the adapter fails the request in production.
 
 // This module builds under the `test-utils` feature, which the crate-root
 // `cfg(test)` allow does not cover, and it buffers scripted bodies.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::mem;
@@ -370,7 +376,11 @@ impl ReplyRelease {
 ///
 /// The fields come from [`OutboundRequestParts`] after preparation, so the proxy marker is
 /// resolved to on or off and the headers are normalized.
-#[derive(Clone, Debug)]
+///
+/// Its `Debug` output holds the method, the URI path, and the header names only. Header values,
+/// the URI authority and query, and the body can carry a credential, so a failing test never
+/// prints them.
+#[derive(Clone)]
 pub struct RecordedRequest {
     /// Request method.
     pub method: Method,
@@ -429,13 +439,44 @@ pub struct ExpectedTransport {
     pub cache_policy: OutboundCachePolicy,
 }
 
+impl fmt::Debug for RecordedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordedRequest")
+            .field("method", &self.method)
+            .field("path", &self.uri.path())
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .keys()
+                    .map(HeaderName::as_str)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl RecordedRequest {
+    /// Names the request by its method and URI path, such as `GET /collect`.
+    ///
+    /// Test messages use it in place of the URI, whose authority and query can carry a
+    /// credential or an identifier.
+    #[must_use]
+    pub fn method_and_path(&self) -> String {
+        format!("{} {}", self.method, self.uri.path())
+    }
+
     /// Asserts the transport settings every Trusted Server request carries.
     ///
     /// Checks a one second connect timeout, no caller deadline, no Image Optimizer options, the
     /// proxy marker off, the URI authority sent upstream with no override, and the timeout,
     /// response mode, decoding, and cache policy in `expected`. A failure names the request by
     /// its method only, never its URI or the authority it sent.
+    ///
+    /// The proxy-marker check catches only a request that turns the marker on itself.
+    /// [`ScriptedHttpClient::http_client`] already turns the client's marker off, so the
+    /// adapters' tests that build per-request services from a marker-on client pin the default.
     ///
     /// # Panics
     ///
@@ -645,7 +686,7 @@ impl ScriptedHttpClient {
     /// Creates a client that fails every request it receives.
     ///
     /// Each failure is internal, with a message that starts with `should not send <METHOD>
-    /// <uri>`, and each request is still recorded. Call
+    /// <path>`, and each request is still recorded. Call
     /// [`ScriptedHttpClient::assert_no_requests`] to fail the test on any of them.
     #[must_use]
     pub fn forbidding() -> Self {
@@ -694,13 +735,13 @@ impl ScriptedHttpClient {
     ///
     /// # Panics
     ///
-    /// Panics with `should not send <METHOD> <uri>`, naming every received request, if there are
+    /// Panics with `should not send <METHOD> <path>`, naming every received request, if there are
     /// any.
     pub fn assert_no_requests(&self) {
         let sent: Vec<String> = lock(&self.state)
             .requests
             .iter()
-            .map(|request| format!("{} {}", request.method, request.uri))
+            .map(RecordedRequest::method_and_path)
             .collect();
         assert!(sent.is_empty(), "should not send {}", sent.join(", "));
     }
@@ -771,16 +812,17 @@ impl ScriptedHttpClient {
     }
 
     fn take_reply(&self, recorded: &RecordedRequest) -> ScriptedReply {
-        let RecordedRequest { method, uri, .. } = recorded;
+        // The failure names the request by method and path: its URI can carry a credential.
+        let request = recorded.method_and_path();
         if self.forbid {
-            return ScriptedReply::error(internal(format!("should not send {method} {uri}")));
+            return ScriptedReply::error(internal(format!("should not send {request}")));
         }
         lock(&self.state)
             .replies
-            .get_mut(&(method.clone(), uri.to_string()))
+            .get_mut(&(recorded.method.clone(), recorded.uri.to_string()))
             .and_then(VecDeque::pop_front)
             .unwrap_or_else(|| {
-                ScriptedReply::error(internal(format!("unscripted request {method} {uri}")))
+                ScriptedReply::error(internal(format!("unscripted request {request}")))
             })
     }
 }
@@ -1690,7 +1732,7 @@ mod tests {
         assert!(
             error.inner().is_some_and(|inner| inner
                 .to_string()
-                .starts_with("should not send GET https://example.com/forbidden")),
+                .starts_with("should not send GET /forbidden")),
             "should name the forbidden request, got {error}"
         );
         let recorded = client.requests();
@@ -1742,6 +1784,43 @@ mod tests {
                 "should leave `{fragment}` out of the failure output"
             );
         }
+    }
+
+    #[test]
+    fn recorded_request_debug_holds_no_header_value_query_or_body() {
+        let client = ScriptedHttpClient::forbidding();
+        let request = OutboundRequest::post(uri("/collect?token=query-secret"))
+            .expect("should build the POST request")
+            .header("authorization", "Bearer header-secret")
+            .expect("should add the authorization header")
+            .body(Bytes::from_static(b"body-secret"));
+        block_on(client.http_client().send(request)).expect_err("should fail every request");
+        let recorded = client.requests();
+
+        let rendered = format!("{recorded:?}");
+
+        for fragment in ["POST", "/collect", "authorization"] {
+            assert!(
+                rendered.contains(fragment),
+                "should name the request by `{fragment}`"
+            );
+        }
+        for fragment in [
+            "header-secret",
+            "query-secret",
+            "body-secret",
+            "example.com",
+        ] {
+            assert!(
+                !rendered.contains(fragment),
+                "should leave `{fragment}` out of the debug output"
+            );
+        }
+        assert_eq!(
+            recorded[0].method_and_path(),
+            "POST /collect",
+            "should name the request by method and path only"
+        );
     }
 
     #[test]

@@ -1045,32 +1045,35 @@ mod tests {
         let mut demo = provider("prebid-server");
         demo.endpoint = "http://pbs.example.com:8000".to_string();
         assert!(
-            AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())]))).is_err()
+            AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())]))).is_err(),
+            "should reject HTTP without the provider's explicit opt-in"
         );
         demo.allow_insecure_http = true;
         let plan = AuctionPlan::compile(config(BTreeMap::from([(id("demo"), demo.clone())])))
-            .expect("should compile an explicitly approved demo HTTP endpoint");
+            .expect("should compile an explicitly opted-in HTTP provider");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
-            "http://pbs.example.com:8000/openrtb2/auction"
+            "http://pbs.example.com:8000/openrtb2/auction",
+            "should normalize the opted-in Prebid Server endpoint"
         );
         let mut other = provider("standard");
-        other.endpoint = "http://other.example/bid".to_string();
+        other.endpoint = "http://other.example.com/bid".to_string();
         assert!(
             AuctionPlan::compile(config(BTreeMap::from([
                 (id("demo"), demo),
                 (id("other"), other)
             ])))
-            .is_err()
+            .is_err(),
+            "should not inherit another provider's HTTP opt-in"
         );
     }
 
     #[test]
     fn insecure_http_opt_in_does_not_allow_credentials_fragments_or_other_schemes() {
         for endpoint in [
-            "http://user:pass@pbs.example/bid",
-            "http://pbs.example/bid#fragment",
-            "ftp://pbs.example/bid",
+            "http://user:pass@pbs.example.com/bid",
+            "http://pbs.example.com/bid#fragment",
+            "ftp://pbs.example.com/bid",
             "/relative",
         ] {
             let mut raw = provider("prebid-server");
@@ -1086,22 +1089,30 @@ mod tests {
     #[test]
     fn insecure_http_default_preserves_existing_provider_wire_shape() {
         let legacy = serde_json::to_value(provider("prebid-server"))
-            .expect("should serialize the existing provider wire shape");
-        assert!(legacy.get("allow_insecure_http").is_none());
+            .expect("should serialize the default provider");
+        assert!(
+            legacy.get("allow_insecure_http").is_none(),
+            "should omit the default HTTP opt-in field"
+        );
         assert!(
             !serde_json::from_value::<ProviderConfig>(legacy)
-                .expect("should deserialize an existing provider without the opt-in")
-                .allow_insecure_http
+                .expect("should deserialize the default provider")
+                .allow_insecure_http,
+            "should keep HTTP disabled when the field is absent"
         );
         let mut opted_in = provider("prebid-server");
         opted_in.allow_insecure_http = true;
         let encoded =
-            serde_json::to_value(opted_in).expect("should serialize the explicit HTTP opt-in");
-        assert_eq!(encoded["allow_insecure_http"], true);
+            serde_json::to_value(opted_in).expect("should serialize the opted-in provider");
+        assert_eq!(
+            encoded["allow_insecure_http"], true,
+            "should publish the explicit HTTP opt-in"
+        );
         assert!(
             serde_json::from_value::<ProviderConfig>(encoded)
-                .expect("should deserialize the explicit HTTP opt-in")
-                .allow_insecure_http
+                .expect("should deserialize the opted-in provider")
+                .allow_insecure_http,
+            "should retain the explicit HTTP opt-in across serialization"
         );
     }
 

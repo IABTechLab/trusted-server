@@ -8,16 +8,11 @@ stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
 
 ## Pinned version
 
-The workspace `Cargo.toml` selects the existing EdgeZero release tag
-`v0.0.12-rc-axum.202611.2` for all six direct dependencies. `Cargo.lock` resolves
-all EdgeZero packages to commit `4407d94130a9b752a70528b6c6f9c8fe3c10b81d`.
-The dependency does not follow a moving PR or branch.
-
-On native Axum, the application captures authenticated publisher forwarding
-metadata before EdgeZero removes transport forwarding headers. That decision
-survives sanitation without retaining credentials or changing transport ingress
-provenance. Missing, invalid or duplicate credentials cannot establish a public
-origin, and an existing rejected decision cannot be upgraded.
+The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
+`IABTechLab/edgezero`: `9d02d7b3185b49e81d9ac972ca3feef932ed848a`, a commit of
+EdgeZero's `rc/identity` integration branch. That branch carries pull request
+275 and the identity work built on it. The pin moves with the branch until
+those pull requests merge, and then to an EdgeZero release tag.
 
 ## Lifecycle
 
@@ -96,10 +91,12 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
 
 **Outbound requests.**
 
-- Every request has a 1 s connect timeout and a constant total timeout: the
+- Every request sets a 1 s connect timeout and a constant total timeout: the
   configured timeout where a setting names one, such as an auction provider's
   `timeout_ms`, 2 s for Tinybird, and otherwise 15 s for a buffered response or
-  60 s for a streamed one. A redirect chain also has a 60 s deadline.
+  60 s for a streamed one. A redirect chain also has a 60 s deadline. EdgeZero
+  enforces the connect timeout natively on Fastly only. On Axum, Cloudflare,
+  and Spin it is best effort, and the total timeout still bounds the request.
 - Origin TLS is always verified.
 - A request that sets no `Accept-Encoding` carries `Accept-Encoding: identity`.
 - Hop-by-hop fields, and fields that `Connection` names, never reach an
