@@ -52,6 +52,9 @@ pub enum TestError {
     #[display("JSON field assertion failed: {field}")]
     JsonFieldMismatch { field: String },
 
+    #[display("Response header `{name}` is missing or empty")]
+    MissingHeader { name: String },
+
     // Resource/config errors
     #[display("Failed to generate runtime configuration")]
     ConfigGeneration,

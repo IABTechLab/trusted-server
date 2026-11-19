@@ -1,7 +1,7 @@
 //! Authenticated browser-facing origin metadata, separate from transport evidence.
 
-use edgezero_core::body::Body;
-use http::{HeaderMap, HeaderName, Request};
+use edgezero_core::http::{Extensions, RequestParts};
+use http::{HeaderMap, HeaderName};
 use url::Url;
 
 use crate::settings::Settings;
@@ -58,21 +58,21 @@ impl ForwarderPreparation {
 /// # Examples
 ///
 /// ```ignore
-/// prepare_trusted_forwarder(&mut request, &settings);
+/// prepare_trusted_forwarder(request.parts_mut(), &settings);
 /// ```
-pub fn prepare_trusted_forwarder(request: &mut Request<Body>, settings: &Settings) {
-    if request.extensions().get::<ForwarderPreparation>().is_none() {
-        let prepared = ForwarderPreparation::capture(request.headers(), settings);
-        request.extensions_mut().insert(prepared);
+pub fn prepare_trusted_forwarder(parts: &mut RequestParts, settings: &Settings) {
+    if parts.extensions.get::<ForwarderPreparation>().is_none() {
+        let prepared = ForwarderPreparation::capture(&parts.headers, settings);
+        parts.extensions.insert(prepared);
     }
-    request.headers_mut().remove(FORWARDER_AUTH_HEADER);
+    parts.headers.remove(FORWARDER_AUTH_HEADER);
     if let Some(config) = &settings.trusted_forwarder {
-        request.headers_mut().remove(config.auth_header.as_str());
+        parts.headers.remove(config.auth_header.as_str());
     }
     // The decision is now typed metadata. Raw forwarding fields must not
     // influence later consumers or escape to publishers and vendors.
     for name in ["forwarded", "x-forwarded-host", "x-forwarded-proto"] {
-        request.headers_mut().remove(name);
+        parts.headers.remove(name);
     }
 }
 
@@ -160,9 +160,8 @@ fn parse_public_origin(scheme: &str, authority: &str) -> Option<PublicOrigin> {
     })
 }
 
-pub(crate) fn public_origin<B>(request: &Request<B>) -> Option<&PublicOrigin> {
-    request
-        .extensions()
+pub(crate) fn public_origin(extensions: &Extensions) -> Option<&PublicOrigin> {
+    extensions
         .get::<ForwarderPreparation>()
         .and_then(|prepared| prepared.origin.as_ref())
 }
@@ -170,15 +169,16 @@ pub(crate) fn public_origin<B>(request: &Request<B>) -> Option<&PublicOrigin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body;
     use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
-    use http::{HeaderValue, header};
+    use http::{HeaderValue, Request, header};
 
     use crate::http_util::RequestInfo;
     use crate::platform::ClientInfo;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, with_request_parts};
     use crate::trace::inspect_cookies;
 
     const SECRET: &str = "fictional-forwarder-secret-0123456789";
@@ -210,7 +210,9 @@ mod tests {
     fn authenticated_origin_overrides_transport_without_mutating_it() {
         let mut request = request();
         let original_uri = request.uri().clone();
-        prepare_trusted_forwarder(&mut request, &settings());
+        with_request_parts(&mut request, |parts| {
+            prepare_trusted_forwarder(parts, &settings())
+        });
 
         let info = RequestInfo::from_request(&request, &ClientInfo::default())
             .expect("should accept request metadata");
@@ -333,9 +335,11 @@ mod tests {
                     .headers_mut()
                     .append(name, HeaderValue::from_static(value));
             }
-            prepare_trusted_forwarder(&mut request, &settings());
+            with_request_parts(&mut request, |parts| {
+                prepare_trusted_forwarder(parts, &settings())
+            });
             assert!(
-                public_origin(&request).is_none(),
+                public_origin(request.extensions()).is_none(),
                 "should reject invalid {name}"
             );
             assert!(
@@ -359,8 +363,10 @@ mod tests {
             if !valid {
                 request.headers_mut().remove(FORWARDER_AUTH_HEADER);
             }
-            prepare_trusted_forwarder(&mut request, &settings());
-            let first = public_origin(&request).cloned();
+            with_request_parts(&mut request, |parts| {
+                prepare_trusted_forwarder(parts, &settings())
+            });
+            let first = public_origin(request.extensions()).cloned();
             request
                 .headers_mut()
                 .insert(FORWARDER_AUTH_HEADER, HeaderValue::from_static(SECRET));
@@ -371,9 +377,11 @@ mod tests {
             request
                 .headers_mut()
                 .insert("x-forwarded-proto", HeaderValue::from_static("http"));
-            prepare_trusted_forwarder(&mut request, &settings());
+            with_request_parts(&mut request, |parts| {
+                prepare_trusted_forwarder(parts, &settings())
+            });
             assert_eq!(
-                public_origin(&request),
+                public_origin(request.extensions()),
                 first.as_ref(),
                 "should retain the first forwarding decision"
             );
@@ -387,9 +395,11 @@ mod tests {
     #[test]
     fn disabled_forwarding_ignores_and_strips_spoofed_metadata() {
         let mut request = request();
-        prepare_trusted_forwarder(&mut request, &create_test_settings());
+        with_request_parts(&mut request, |parts| {
+            prepare_trusted_forwarder(parts, &create_test_settings());
+        });
         assert!(
-            public_origin(&request).is_none(),
+            public_origin(request.extensions()).is_none(),
             "should require explicit configuration"
         );
         assert!(
@@ -417,10 +427,12 @@ mod tests {
             .headers_mut()
             .insert("x-example-forwarder-auth", HeaderValue::from_static(SECRET));
 
-        prepare_trusted_forwarder(&mut request, &settings);
+        with_request_parts(&mut request, |parts| {
+            prepare_trusted_forwarder(parts, &settings)
+        });
 
         assert!(
-            public_origin(&request).is_some(),
+            public_origin(request.extensions()).is_some(),
             "should authenticate the configured credential field"
         );
         for name in ["x-example-forwarder-auth", FORWARDER_AUTH_HEADER] {
@@ -460,7 +472,9 @@ mod tests {
                     .insert(header::HOST, HeaderValue::from_static("other.example.com"));
             }
 
-            prepare_trusted_forwarder(&mut request, &settings());
+            with_request_parts(&mut request, |parts| {
+                prepare_trusted_forwarder(parts, &settings())
+            });
 
             let retained = request
                 .extensions()

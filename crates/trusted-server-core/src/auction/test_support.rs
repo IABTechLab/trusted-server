@@ -27,7 +27,6 @@ pub(crate) fn create_test_auction_context<'a>(
         settings,
         request,
         timeout_ms,
-        transport_timeout_ms: timeout_ms,
         provider_responses: None,
         services,
     }

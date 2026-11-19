@@ -1,10 +1,13 @@
 //! Prebid `SharedID` identity provider: reads the publisher common ID from
 //! the first-party cookie Prebid's `sharedIdSystem` writes.
 //!
-//! Prebid stores the ID as a bare UUID in `_sharedid` (the publisher's
-//! configured name) or the legacy `_pubcid`. It is sent as a device-based
-//! (agent type 1) EID. The opt-out cookie `_pubcid_optout` reports an
-//! opt-out, which removes a stored `SharedID`.
+//! Prebid stores the ID as a bare UUID in the cookie named by the
+//! publisher's `storage.name`. The provider reads the cookie named in
+//! `integrations.prebid.managed_user_ids[].storage.name` for the `sharedId`
+//! (or `pubCommonId`) module; without one it reads `_sharedid`, then the
+//! legacy `_pubcid`. It is sent as a device-based (agent type 1) EID under
+//! `pubcid.org` unless another source is configured. The opt-out cookie
+//! `_pubcid_optout` reports an opt-out, which removes a stored `SharedID`.
 //! No server call is made.
 //!
 //! `SharedID` is a publisher first-party ID with no vendor server. With
@@ -34,6 +37,9 @@ use crate::common::{
     CookieReader, MAX_TTL, bounded_expiry, cookie_capabilities, device_eid, is_usable_id,
 };
 
+/// Settings key naming the cookies that hold the `SharedID`.
+pub const COOKIE_NAMES_SETTING: &str = "cookie_names";
+
 /// Cookie Prebid sets when the user opts out of `SharedID`.
 const OPT_OUT_COOKIE: &str = "_pubcid_optout";
 
@@ -44,7 +50,8 @@ pub struct SharedId;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedIdSettings {
-    /// Cookies holding the `SharedID`, read in order.
+    /// Cookies holding the `SharedID`, read in order. Defaults to Prebid's
+    /// configured `storage.name`, else `_sharedid` then `_pubcid`.
     #[serde(default = "SharedIdSettings::default_cookie_names")]
     pub cookie_names: Vec<String>,
     /// Whether to generate a `SharedID` when the cookies hold none. Off by
@@ -212,6 +219,25 @@ mod tests {
             Some("pubcid-example"),
             "should fall back to _pubcid"
         );
+    }
+
+    #[test]
+    fn defaults_the_source_to_pubcid_org() {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "sharedid",
+            "kind": "sharedid",
+        }))
+        .expect("should parse provider config");
+
+        let provider = build_kind::<SharedId>(&config, &ProviderSecrets::default())
+            .expect("should build provider");
+        let eids = provider
+            .read_request_cookies(RequestCookies::new("_sharedid=sharedid-example"))
+            .into_found()
+            .expect("should read the cookie");
+
+        assert_eq!(eids[0].source, "pubcid.org", "should default to pubcid.org");
+        assert_eq!(eids[0].uids[0].atype, Some(1), "should be device-based");
     }
 
     #[test]

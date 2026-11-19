@@ -1,15 +1,13 @@
-use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use edgezero_core::blob_envelope::BlobEnvelope;
 use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
-use trusted_server_core::platform::{BackendNamingPolicy, PlatformBackendSpec};
-use url::{Host, Url};
+use trusted_server_core::settings::Settings;
+use url::Url;
 
 const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const GENERATED_STORES_MARKER: &str = "        # GENERATED_TRUSTED_SERVER_CONFIG_STORES";
@@ -23,7 +21,7 @@ struct Args {
     output: PathBuf,
     origin_url: Option<String>,
     public_origin: Option<String>,
-    bidder_origin_url: Option<String>,
+    provider_endpoint_origin: Option<String>,
 }
 
 fn main() -> Result<(), DynError> {
@@ -48,13 +46,9 @@ fn run(args: &Args) -> Result<(), DynError> {
             &app_config,
             args.origin_url.as_deref(),
             args.public_origin.as_deref(),
+            args.provider_endpoint_origin.as_deref(),
         )?;
-        let generated_config = inject_generated_config_stores(&template, &envelope_json)?;
-        if let Some(origin) = &args.bidder_origin_url {
-            inject_controlled_bidder_backends(&generated_config, &app_config, origin)?
-        } else {
-            generated_config
-        }
+        inject_generated_config_stores(&template, &envelope_json)?
     } else {
         retarget_generated_config(
             &template,
@@ -87,7 +81,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
     let mut output = None;
     let mut origin_url = None;
     let mut public_origin = None;
-    let mut bidder_origin_url = None;
+    let mut provider_endpoint_origin = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -99,8 +93,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
             }
             "--output" => output = Some(next_path_arg(&mut iter, "--output")?),
             "--origin-url" => origin_url = Some(next_string_arg(&mut iter, "--origin-url")?),
-            "--bidder-origin-url" => {
-                bidder_origin_url = Some(next_string_arg(&mut iter, "--bidder-origin-url")?);
+            "--provider-endpoint-origin" => {
+                provider_endpoint_origin =
+                    Some(next_string_arg(&mut iter, "--provider-endpoint-origin")?);
             }
             "--help" | "-h" => return Err(error_box(usage())),
             other => {
@@ -112,8 +107,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
         }
     }
 
-    if bidder_origin_url.is_some() && app_config.is_none() {
-        return Err(error_box("--bidder-origin-url requires --app-config"));
+    if provider_endpoint_origin.is_some() && app_config.is_none() {
+        return Err(error_box(
+            "--provider-endpoint-origin requires --app-config",
+        ));
     }
 
     Ok(Args {
@@ -123,97 +120,37 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
         output: output.ok_or_else(|| error_box(format!("missing --output\n\n{}", usage())))?,
         origin_url,
         public_origin,
-        bidder_origin_url,
+        provider_endpoint_origin,
     })
 }
 
-fn inject_controlled_bidder_backends(
-    runtime_config: &str,
-    app_config: &str,
-    origin: &str,
-) -> Result<String, DynError> {
-    let origin = Url::parse(origin)?;
-    let local = match origin.host() {
-        Some(Host::Domain("localhost")) => true,
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        _ => false,
-    };
-    if !local
-        || origin.scheme() != "http"
-        || !origin.username().is_empty()
+/// Points every auction provider at `origin`, keeping each endpoint's path and query.
+///
+/// `origin` must be a bare origin: a scheme and authority with no credentials, path, query,
+/// or fragment. Settings validation then decides whether the rewritten endpoints are allowed,
+/// which admits plain HTTP only for the loopback literals.
+fn rewrite_provider_endpoints(settings: &mut Settings, origin: &str) -> Result<(), DynError> {
+    let origin = Url::parse(origin)
+        .map_err(|error| error_box(format!("invalid provider endpoint origin: {error}")))?;
+    if !origin.username().is_empty()
         || origin.password().is_some()
         || origin.path() != "/"
         || origin.query().is_some()
         || origin.fragment().is_some()
     {
         return Err(error_box(
-            "bidder fixture requires a plain loopback HTTP origin",
+            "provider endpoint origin must be a scheme and authority only",
         ));
     }
-    let settings = toml::from_str::<TrustedServerAppConfig>(app_config)?.into_settings();
-    let logical_budget = settings.auction.timeout_ms.max(
-        settings
-            .creative_opportunities
-            .as_ref()
-            .and_then(|config| config.auction_timeout_ms)
-            .unwrap_or(settings.auction.timeout_ms),
-    );
-    if logical_budget > 60_000 {
-        return Err(error_box(
-            "controlled bidder fixture budget exceeds 60 seconds",
-        ));
+    for provider in settings.auction.providers.values_mut() {
+        let endpoint = Url::parse(&provider.endpoint)
+            .map_err(|error| error_box(format!("invalid auction provider endpoint: {error}")))?;
+        let mut rewritten = origin.clone();
+        rewritten.set_path(endpoint.path());
+        rewritten.set_query(endpoint.query());
+        provider.endpoint = String::from(rewritten);
     }
-    let plan = trusted_server_core::auction::compile_auction_plan(&settings)
-        .map_err(|_| error_box("invalid controlled bidder auction plan"))?;
-    let mut runtime: toml::Value = toml::from_str(runtime_config)?;
-    let backends = runtime
-        .get_mut("local_server")
-        .and_then(|server| server.get_mut("backends"))
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| error_box("runtime template requires a backend table"))?;
-    for provider in plan.providers() {
-        let endpoint = Url::parse(provider.endpoint.as_str())?;
-        // Reuse production policies for every reachable timer/name, rather
-        // than duplicating Fastly's quantization or backend-name algorithm.
-        let timers = (1..=provider.timeout_ms.min(logical_budget))
-            .map(|remaining| {
-                BackendNamingPolicy::Fastly
-                    .canonicalize_transport_timeout_ms(remaining, provider.timeout_ms)
-            })
-            .filter(|timer| *timer != 0)
-            .collect::<BTreeSet<_>>();
-        for timer in timers {
-            let duration = Duration::from_millis(u64::from(timer));
-            let spec = PlatformBackendSpec {
-                scheme: endpoint.scheme().to_owned(),
-                host: endpoint
-                    .host_str()
-                    .ok_or_else(|| error_box("missing bidder host"))?
-                    .to_owned(),
-                port: endpoint.port(),
-                host_header_override: None,
-                certificate_check: true,
-                first_byte_timeout: duration,
-                between_bytes_timeout: duration,
-                discriminator: Some(provider.id.as_str().to_owned()),
-            };
-            let name = BackendNamingPolicy::Fastly
-                .predict(&spec)
-                .map_err(|_| error_box("invalid controlled bidder backend name"))?
-                .name;
-            let alias = toml::Value::Table(toml::Table::from_iter([(
-                "url".to_owned(),
-                toml::Value::String(origin.as_str().to_owned()),
-            )]));
-            if backends.insert(name, alias).is_some() {
-                return Err(error_box(
-                    "controlled bidder alias collides with template backend",
-                ));
-            }
-        }
-    }
-    Ok(toml::to_string(&runtime)?)
+    Ok(())
 }
 
 fn next_path_arg(
@@ -232,23 +169,30 @@ fn next_string_arg(
 }
 
 fn usage() -> String {
-    "usage: generate-viceroy-config --template <path> [--app-config <path>] --output <path> [--origin-url <url>] [--public-origin <url>] [--bidder-origin-url <local-url> (requires --app-config)]\nWithout --app-config, retarget the blob in an already generated Viceroy config.".to_string()
+    "usage: generate-viceroy-config --template <path> [--app-config <path>] --output <path> [--origin-url <url>] [--public-origin <url>] [--provider-endpoint-origin <url> (requires --app-config)]\nWithout --app-config, retarget the blob in an already generated Viceroy config.".to_string()
 }
 
 fn build_app_config_envelope(
     app_config_toml: &str,
     origin_url: Option<&str>,
     public_origin: Option<&str>,
+    provider_endpoint_origin: Option<&str>,
 ) -> Result<String, DynError> {
     let app_config: TrustedServerAppConfig = toml::from_str(app_config_toml)
         .map_err(|error| error_box(format!("invalid Trusted Server app config: {error}")))?;
-    serialize_app_config_envelope(app_config, origin_url, public_origin)
+    serialize_app_config_envelope(
+        app_config,
+        origin_url,
+        public_origin,
+        provider_endpoint_origin,
+    )
 }
 
 fn serialize_app_config_envelope(
     app_config: TrustedServerAppConfig,
     origin_url: Option<&str>,
     public_origin: Option<&str>,
+    provider_endpoint_origin: Option<&str>,
 ) -> Result<String, DynError> {
     let mut settings = app_config.into_settings();
     if let Some(origin_url) = origin_url {
@@ -256,6 +200,9 @@ fn serialize_app_config_envelope(
     }
     if let Some(public_origin) = public_origin {
         settings.publisher.public_origin = Some(public_origin.to_string());
+    }
+    if let Some(origin) = provider_endpoint_origin {
+        rewrite_provider_endpoints(&mut settings, origin)?;
     }
     let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
@@ -290,7 +237,7 @@ fn retarget_generated_config(
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json)?;
     envelope.verify()?;
     let app_config = serde_json::from_value(envelope.data)?;
-    let envelope_json = serialize_app_config_envelope(app_config, origin_url, public_origin)?;
+    let envelope_json = serialize_app_config_envelope(app_config, origin_url, public_origin, None)?;
     contents[CONFIG_BLOB_KEY] = toml::Value::String(envelope_json);
     Ok(toml::to_string(&config)?)
 }
@@ -326,7 +273,6 @@ mod tests {
     use super::*;
     use error_stack::Report;
     use std::collections::HashMap;
-    use tempfile::tempdir;
     use trusted_server_core::config_payload::settings_from_config_blob;
     use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
@@ -337,6 +283,7 @@ mod tests {
         values: HashMap<String, Vec<u8>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for IntegrationSecretStore {
         fn get_bytes(
             &self,
@@ -349,7 +296,7 @@ mod tests {
                 .ok_or_else(|| Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -358,7 +305,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
@@ -407,138 +358,116 @@ mod tests {
         );
     }
 
+    const TRACE_APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.trace.toml");
+
     #[test]
-    fn parse_args_accepts_explicit_controlled_bidder_origin() {
-        assert!(
-            parse_args([
-                "--template".to_string(),
-                "template.toml".to_string(),
-                "--app-config".to_string(),
-                "trusted-server.toml".to_string(),
-                "--output".to_string(),
-                "generated.toml".to_string(),
-                "--bidder-origin-url".to_string(),
-                "http://127.0.0.1:8888".to_string(),
-            ])
-            .is_ok(),
-            "should accept an explicit local bidder fixture without changing defaults"
+    fn parse_args_accepts_provider_endpoint_origin() {
+        let args = parse_args([
+            "--template".to_string(),
+            "template.toml".to_string(),
+            "--app-config".to_string(),
+            "trusted-server.toml".to_string(),
+            "--output".to_string(),
+            "generated.toml".to_string(),
+            "--provider-endpoint-origin".to_string(),
+            "http://127.0.0.1:8888".to_string(),
+        ])
+        .expect("should accept a provider endpoint origin");
+
+        assert_eq!(
+            args.provider_endpoint_origin.as_deref(),
+            Some("http://127.0.0.1:8888"),
+            "should keep the provider endpoint origin"
         );
     }
 
-    fn run_bidder_fixture(origin: &str) -> Result<toml::Value, DynError> {
-        let directory = tempdir().expect("should create isolated generator fixture");
-        let template = directory.path().join("template.toml");
-        let app_config = directory.path().join("app.toml");
-        let output = directory.path().join("output.toml");
-        fs::write(&template, TEMPLATE).expect("should write runtime template");
-        fs::write(
-            &app_config,
-            include_str!("../../fixtures/configs/trusted-server.trace.toml"),
-        )
-        .expect("should write controlled trace app config");
-        run(&Args {
-            template,
-            app_config: Some(app_config),
-            output: output.clone(),
-            origin_url: None,
-            public_origin: Some("http://127.0.0.1:43130".to_string()),
-            bidder_origin_url: Some(origin.to_string()),
-        })?;
-        Ok(toml::from_str(&fs::read_to_string(output)?)?)
+    fn provider_endpoint(envelope: &str, provider: &str) -> String {
+        let envelope: serde_json::Value =
+            serde_json::from_str(envelope).expect("should parse the generated envelope");
+        envelope["data"]["auction"]["providers"][provider]["endpoint"]
+            .as_str()
+            .expect("should keep the provider endpoint")
+            .to_owned()
     }
 
     #[test]
-    fn controlled_bidder_uses_backend_aliases_and_preserves_https_app_config() {
-        let generated = run_bidder_fixture("http://127.0.0.1:8888")
-            .expect("should generate explicit local bidder aliases");
-        let aliases = generated["local_server"]["backends"]
-            .as_table()
-            .expect("should retain backend table");
-        assert!(
-            !aliases.is_empty(),
-            "should route the real Rust bidder HTTP client to the controlled local origin"
+    fn provider_endpoint_origin_replaces_scheme_and_authority_and_keeps_path_and_query() {
+        let app_config = TRACE_APP_CONFIG.replace(
+            "endpoint = \"https://bidder.example.com/api/trace-bidder\"",
+            "endpoint = \"https://bidder.example.com/api/trace-bidder?route=example\"",
         );
-        for alias in aliases.values() {
-            assert_eq!(
-                alias["url"].as_str(),
-                Some("http://127.0.0.1:8888/"),
-                "should keep every runtime-only alias local"
-            );
-        }
-        let retargeted = retarget_generated_config(
-            &toml::to_string(&generated).expect("should serialize generated config"),
-            None,
-            Some("http://127.0.0.1:43131"),
-        )
-        .expect("should retarget controlled bidder config");
-        let retargeted: toml::Value =
-            toml::from_str(&retargeted).expect("should parse retargeted bidder config");
+
+        let envelope =
+            build_app_config_envelope(&app_config, None, None, Some("http://127.0.0.1:8888"))
+                .expect("should rewrite the provider endpoint onto the loopback origin");
+
         assert_eq!(
-            retargeted["local_server"]["backends"], generated["local_server"]["backends"],
-            "should preserve controlled bidder aliases when retargeting the runtime listener"
+            provider_endpoint(&envelope, "example"),
+            "http://127.0.0.1:8888/api/trace-bidder?route=example",
+            "should replace the scheme and authority and keep the path and query"
         );
-        let envelope: serde_json::Value = serde_json::from_str(
-            generated["local_server"]["config_stores"][DEFAULT_CONFIG_STORE_ID]["contents"]
-                [CONFIG_BLOB_KEY]
-                .as_str()
-                .expect("should retain validated app envelope"),
-        )
-        .expect("should read unchanged app config envelope");
+    }
+
+    #[test]
+    fn provider_endpoints_are_unchanged_without_provider_endpoint_origin() {
+        let envelope = build_app_config_envelope(TRACE_APP_CONFIG, None, None, None)
+            .expect("should build the trace envelope");
+
         assert_eq!(
-            envelope["data"]["publisher"]["public_origin"], "http://127.0.0.1:43130",
-            "should support a runtime public origin alongside controlled bidder aliases"
-        );
-        assert_eq!(
-            envelope["data"]["auction"]["providers"]["example"]["endpoint"],
+            provider_endpoint(&envelope, "example"),
             "https://bidder.example.com/api/trace-bidder",
-            "should preserve production HTTPS and certificate admission"
+            "should keep the configured endpoint"
         );
     }
 
     #[test]
-    fn controlled_bidder_rejects_non_loopback_or_ambiguous_origins() {
+    fn provider_endpoint_origin_rejects_non_origin_and_non_loopback_urls() {
         for origin in [
-            "http://bidder.example.com",
             "http://127.0.0.1:8888/path",
             "http://127.0.0.1:8888/?query=value",
             "http://user:password@127.0.0.1:8888",
+            "http://localhost:8888",
+            "http://bidder.example.com",
         ] {
             assert!(
-                run_bidder_fixture(origin).is_err(),
-                "should reject a non-local or non-origin bidder fixture URL"
+                build_app_config_envelope(TRACE_APP_CONFIG, None, None, Some(origin)).is_err(),
+                "should reject `{origin}` as a provider endpoint origin"
             );
         }
     }
 
     #[test]
-    fn controlled_bidder_omits_unreachable_large_provider_timer_aliases() {
-        let app_config = include_str!("../../fixtures/configs/trusted-server.trace.toml").replace(
-            "[auction.providers.example]",
-            "[auction.providers.example]\ntimeout_ms = 100000",
-        );
-        let generated =
-            inject_controlled_bidder_backends(TEMPLATE, &app_config, "http://127.0.0.1:8888")
-                .expect("should bound the configured provider by reachable logical budgets");
-        let generated: toml::Value =
-            toml::from_str(&generated).expect("should generate valid bounded runtime aliases");
+    fn retargeting_keeps_rewritten_provider_endpoints() {
+        let envelope = build_app_config_envelope(
+            TRACE_APP_CONFIG,
+            None,
+            Some("http://127.0.0.1:43130"),
+            Some("http://127.0.0.1:8888"),
+        )
+        .expect("should build a trace envelope with a public origin and a provider origin");
+        let generated = inject_generated_config_stores(TEMPLATE, &envelope)
+            .expect("should inject generated stores");
+        let generated_data: serde_json::Value =
+            serde_json::from_str(&envelope).expect("should parse the generated envelope");
         assert_eq!(
-            generated["local_server"]["backends"]
-                .as_table()
-                .expect("should retain aliases")
-                .len(),
-            8,
-            "should generate only eight reachable timers for the 1000 ms fixture budget"
+            generated_data["data"]["publisher"]["public_origin"], "http://127.0.0.1:43130",
+            "should support a runtime public origin alongside a provider endpoint origin"
         );
-    }
 
-    #[test]
-    fn controlled_bidder_rejects_excessive_fixture_logical_budget() {
-        let app_config = include_str!("../../fixtures/configs/trusted-server.trace.toml")
-            .replace("auction_timeout_ms = 1000", "auction_timeout_ms = 100000");
-        assert!(
-            inject_controlled_bidder_backends(TEMPLATE, &app_config, "http://127.0.0.1:8888")
-                .is_err(),
-            "should reject fixture budgets beyond the bounded 60 second timer enumeration"
+        let retargeted =
+            retarget_generated_config(&generated, None, Some("http://127.0.0.1:43131"))
+                .expect("should retarget the generated trace config");
+        let retargeted: toml::Value =
+            toml::from_str(&retargeted).expect("should parse the retargeted trace config");
+        let retargeted_envelope = retargeted["local_server"]["config_stores"]
+            [DEFAULT_CONFIG_STORE_ID]["contents"][CONFIG_BLOB_KEY]
+            .as_str()
+            .expect("should contain a blob");
+
+        assert_eq!(
+            provider_endpoint(retargeted_envelope, "example"),
+            "http://127.0.0.1:8888/api/trace-bidder",
+            "should keep the rewritten provider endpoint when retargeting the runtime listener"
         );
     }
 
@@ -564,25 +493,25 @@ mod tests {
                 output: PathBuf::from("generated.toml"),
                 origin_url: Some("http://127.0.0.1:9999".to_string()),
                 public_origin: None,
-                bidder_origin_url: None,
+                provider_endpoint_origin: None,
             },
             "should parse expected args"
         );
     }
 
     #[test]
-    fn parse_args_rejects_bidder_injection_without_app_config() {
+    fn parse_args_rejects_provider_endpoint_origin_without_app_config() {
         let result = parse_args([
             "--template".to_string(),
             "generated.toml".to_string(),
             "--output".to_string(),
             "runtime.toml".to_string(),
-            "--bidder-origin-url".to_string(),
+            "--provider-endpoint-origin".to_string(),
             "http://127.0.0.1:8888".to_string(),
         ]);
         assert!(
             result.is_err(),
-            "should not silently ignore bidder injection when retargeting an existing blob"
+            "should not silently ignore a provider endpoint origin when retargeting an existing blob"
         );
     }
 
@@ -615,6 +544,7 @@ mod tests {
             APP_CONFIG,
             Some("http://127.0.0.1:9999"),
             Some("http://127.0.0.1:43126"),
+            None,
         )
         .expect("should build runtime-specific config");
         let envelope: BlobEnvelope =
@@ -634,7 +564,7 @@ mod tests {
 
     #[test]
     fn retargeting_generated_config_preserves_resources_and_app_policy() {
-        let json = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None)
+        let json = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None, None)
             .expect("should build original envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &json)
             .expect("should generate original config");
@@ -673,7 +603,7 @@ mod tests {
     #[test]
     fn generated_config_contains_blob_without_removed_rollout_flags() {
         let envelope =
-            build_app_config_envelope(APP_CONFIG, None, None).expect("should build envelope");
+            build_app_config_envelope(APP_CONFIG, None, None, None).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
 
@@ -700,7 +630,7 @@ mod tests {
     #[test]
     fn generated_config_is_valid_toml() {
         let envelope =
-            build_app_config_envelope(APP_CONFIG, None, None).expect("should build envelope");
+            build_app_config_envelope(APP_CONFIG, None, None, None).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
         let parsed: toml::Value = toml::from_str(&generated).expect("should parse as TOML");
@@ -716,8 +646,9 @@ mod tests {
 
     #[test]
     fn generated_blob_verifies_and_applies_origin_override() {
-        let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None)
-            .expect("should build envelope");
+        let envelope =
+            build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), None, None)
+                .expect("should build envelope");
         let settings = settings_from_config_blob(
             &envelope,
             &integration_secret_store(),
@@ -733,7 +664,7 @@ mod tests {
 
     #[test]
     fn invalid_app_config_fails() {
-        let result = build_app_config_envelope("not valid toml", None, None);
+        let result = build_app_config_envelope("not valid toml", None, None, None);
 
         assert!(result.is_err(), "should reject invalid app config");
     }
@@ -742,7 +673,7 @@ mod tests {
     fn invalid_non_secret_app_config_fails_before_envelope_generation() {
         let invalid = APP_CONFIG.replace("domain = \"localhost\"", "domain = \"invalid/domain\"");
 
-        let err = build_app_config_envelope(&invalid, None, None)
+        let err = build_app_config_envelope(&invalid, None, None, None)
             .expect_err("should reject invalid non-secret config before creating an envelope");
 
         assert!(
