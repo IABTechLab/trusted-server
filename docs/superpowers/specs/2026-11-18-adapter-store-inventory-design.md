@@ -57,8 +57,9 @@ branch (`spec/edgezero-pr275-migration` at `47a539528`, EdgeZero pin
 
 ## Decisions
 
-These decisions were recorded with the maintainer on 2026-11-18. D5 to D8
-resolve design review findings within those decisions.
+The initial decisions were recorded with the maintainer on 2026-11-18. The
+Axum exception was revised on 2026-11-19 for the production startup stack.
+D5 to D8 resolve design review findings within those decisions.
 
 - **D1: Wire `trusted_server_kv` on Fastly, Cloudflare and Spin; leave Axum unsupported.**
   - Keep the declaration for identity storage. Axum deliberately remains

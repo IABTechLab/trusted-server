@@ -26,7 +26,11 @@ warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 
-Install the Wrangler version pinned in `.tool-versions`, then run:
+The smoke helper requires a Wrangler entry in `.tool-versions` and an
+executable matching it. This stack has no Wrangler pin, so the helper currently
+exits with `missing Wrangler pin in .tool-versions`; the command below becomes
+available once the toolchain is pinned. Local binding verification for this
+change used Wrangler 4.83.0 directly with an isolated manifest and state.
 
 ```bash
 ./scripts/smoke-cloudflare.sh

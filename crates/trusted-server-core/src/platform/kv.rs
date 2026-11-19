@@ -49,10 +49,11 @@ impl PlatformKvStore for UnavailableKvStore {
 /// A [`PlatformKvStore`] over an `EdgeZero` [`KvHandle`].
 ///
 /// Adapters receive store handles from `EdgeZero` (or open them directly) as
-/// [`KvHandle`]s. This bridge forwards every trait method through the handle,
-/// so the handle's key, value and TTL validation runs before the backend is
+/// [`KvHandle`]s. This bridge forwards ordinary key/value operations through
+/// the handle, so its key, value and TTL validation runs before the backend is
 /// reached. Adapter crates should use it rather than defining their own
-/// bridge.
+/// bridge. Native record operations are outside this bridge and remain
+/// unsupported until the shared identity backend supplies them.
 pub struct KvHandleStore(KvHandle);
 
 impl KvHandleStore {

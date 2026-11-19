@@ -12,8 +12,10 @@ pass before the next task starts.
 ## Task 1: Shared `KvHandle` bridge in core
 
 - Add `KvHandleStore(KvHandle)` to `crates/trusted-server-core/src/platform/kv.rs`
-  and export it from `platform`. Every trait method, including `exists`,
-  forwards through the handle, so the handle's validation runs first.
+  and export it from `platform`. Every ordinary KV method, including
+  `exists`, forwards through the handle, so the handle's validation runs
+  first. Native record operations remain outside this bridge until the shared
+  identity backend work.
 - Tests:
   - A round trip of put, get, exists, list and delete.
   - An empty key returns `KvError::Validation`, and the backend's call count

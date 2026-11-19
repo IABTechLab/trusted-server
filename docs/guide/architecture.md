@@ -142,16 +142,17 @@ Data collection operations are subject to available consent signals (TCF v2 form
 
 ### Fastly KV Store
 
-Used for:
-
-- Counter storage
-- Domain mappings
-- Configuration cache
-- EC ID state
+Edge Cookie records use the configured `ec.ec_store` KV Store
+(`ec_identity_store` by default). The separate `trusted_server_kv` store is
+wired for generic runtime KV, with no normal production consumer yet.
+Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
+and batch-sync counters use Edge Rate Limiting counters rather than KV.
 
 ### Data Persistence
 
-Page content and request bodies are processed in-flight and are not persisted. EC ID state and related metadata are stored in KV stores as configured.
+Request bodies are processed in-flight. EC state and related metadata use the
+configured identity KV Store. When shared-template caching is enabled, Fastly
+Core Cache can retain transformed HTML templates; this is separate from KV.
 
 ## Performance Characteristics
 
@@ -169,12 +170,12 @@ Page content and request bodies are processed in-flight and are not persisted. E
 
 ## Runtime Targets
 
-| Adapter                             | Target                    | Use case                                                          |
-| ----------------------------------- | ------------------------- | ----------------------------------------------------------------- |
-| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                      |
-| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                  |
-| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                        |
-| `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
+| Adapter                             | Target                    | Use case                                                         |
+| ----------------------------------- | ------------------------- | ---------------------------------------------------------------- |
+| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                     |
+| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Cloudflare Workers (development support; see adapter guide)      |
+| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                       |
+| `trusted-server-adapter-axum`       | native                    | Production startup and local development (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
 

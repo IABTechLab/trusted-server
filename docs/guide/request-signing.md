@@ -254,7 +254,8 @@ Link stores to your service in `fastly.toml`:
 
 ### 1. Protect Private Keys
 
-- Store private keys only in Fastly Secret Store
+- Store private keys in the selected adapter's secret storage: Fastly Secret
+  Store or Spin's encoded component variables
 - Never log or expose private keys
 - Rotate keys regularly (see [Key Rotation](/guide/key-rotation))
 
