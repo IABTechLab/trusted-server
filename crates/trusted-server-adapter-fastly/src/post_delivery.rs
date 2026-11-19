@@ -383,7 +383,9 @@ mod tests {
         )
         .expect("should read the reader's EC context");
         let kv = require_identity_graph(settings).expect("should open the local identity store");
-        ec_context.set_kv_snapshot(kv.load_snapshot(&seeded_ec_id()));
+        ec_context.set_kv_snapshot(futures::executor::block_on(
+            kv.load_snapshot(&seeded_ec_id()),
+        ));
         FinalizeState {
             partner_registry: PartnerRegistry::from_config(&settings.ec.partners)
                 .expect("should build the partner registry"),
