@@ -8,7 +8,7 @@ mod proxy;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -195,7 +195,7 @@ impl Running {
     }
 
     fn ready(&mut self) {
-        let client = client(None);
+        let client = client();
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             assert!(
@@ -344,10 +344,9 @@ fn startup_probe_excludes_a_reflexive_connection_without_a_listener() {
     );
 }
 
-fn client(source: Option<IpAddr>) -> Client {
+fn client() -> Client {
     Client::builder()
         .no_proxy()
-        .local_address(source)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(2))
         .build()
@@ -389,7 +388,7 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     let body = page(&client, &app.base_url());
     assert!(
         body.contains("native-page"),
@@ -504,7 +503,7 @@ fn managed_post_bodies_reach_buffered_api_handlers_and_keep_their_limits() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     let auction = client
         .post(format!("{}/auction", app.base_url()))
         .json(&json!({"adUnits": []}))
@@ -554,7 +553,7 @@ fn running_snapshot_is_immutable_and_restart_adopts_config_and_secret() {
     let mut fixture = Prepared::new(&first.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     assert!(page(&client, &app.base_url()).contains("snapshot-first"));
     fixture.data["publisher"]["origin_url"] = json!(second.base_url);
     fixture.secrets.insert(
@@ -617,21 +616,13 @@ fn running_snapshot_is_immutable_and_restart_adopts_config_and_secret() {
     );
 }
 
-// The visitors connect from 127.0.0.2 and 127.0.0.3, so the gateway's
-// 127.0.0.1 stays the only trusted peer. Linux routes all of 127.0.0.0/8 to
-// loopback; macOS has only 127.0.0.1 unless `ifconfig lo0 alias` adds the
-// others, and binding them fails with `AddrNotAvailable`.
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "binds loopback sources 127.0.0.2 and 127.0.0.3, which need a loopback alias outside Linux"
-)]
 fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
     let origin = origin::Origin::start("ingress-page");
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let visitor = client(None);
+    let visitor = client();
     let response = visitor
         .get(app.base_url())
         .header(
@@ -650,12 +641,13 @@ fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
 
     let mut app = fixture.spawn(true);
     app.ready();
-    // Only the gateways connect from the declared trusted 127.0.0.1 address.
-    // Visitors use distinct source addresses and independent client pools.
-    let alpha_client = client(Some(
-        "127.0.0.2".parse().expect("should parse alpha source"),
-    ));
-    let beta_client = client(Some("127.0.0.3".parse().expect("should parse beta source")));
+    // Managed ingress now trusts the loopback peer that every client here
+    // shares. A spoofed assertion sent directly from that trusted peer still
+    // sets no public origin, because only the forwarder credential does.
+    // Each visitor has its own client, so the two gateways never share a
+    // connection pool.
+    let alpha_client = client();
+    let beta_client = client();
     let direct = alpha_client
         .get(app.base_url())
         .header(
@@ -663,7 +655,7 @@ fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
             "for=192.0.2.99;host=spoof.example.com;proto=https",
         )
         .send()
-        .expect("should bypass gateway from an untrusted peer");
+        .expect("should send a spoofed assertion from the trusted peer");
     assert_rewrite(&successful_body(direct), &app.base_url(), &origin.base_url);
     // Trusted transport provenance alone does not authorize publisher forwarding.
     for (host, credential) in [
@@ -737,7 +729,7 @@ fn production_sigterm_drains_the_admitted_publisher_response() {
     let url = format!("{}/drain", app.base_url());
     let request = std::thread::spawn(move || {
         successful_body(
-            client(None)
+            client()
                 .get(url)
                 .send()
                 .expect("should finish the admitted publisher request"),
@@ -844,7 +836,7 @@ fn truncated_post_then_action_and_api_keep_using_the_same_live_origin() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     truncate_inbound_post(&app);
     let broken = client
         .post(format!("{}/truncate-response", app.base_url()))
@@ -915,7 +907,7 @@ fn real_nextjs_action_and_api_after_truncated_post() {
     let fixture = Prepared::new(&origin);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     // The fixture instructions prewarm Next's compiler before this test.
     let body = page(&client, &app.base_url());
     let marker = "$ACTION_ID_";
