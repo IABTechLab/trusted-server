@@ -1591,7 +1591,9 @@ PR A changes behaviour that operators and integrators can observe:
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
-  reports `row_full`. A row written before the cap is trimmed only when a
+  reports `row_full`, and pull sync does not call a partner whose empty source
+  has no room left for its longest UID, so a full row is not pulled for on
+  every navigation; either resumes once pruning frees room. A row written before the cap is trimmed only when a
   write also carries a real change: its largest stored records are dropped
   first, so the change that triggered the write still lands. A provider
   refresh that no longer fits keeps the record it would replace.
