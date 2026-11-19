@@ -98,7 +98,7 @@ impl KeyRotationManager {
                 .await
             {
                 log::warn!(
-                    "rotate_key: rollback of private key '{new_kid}' failed after JWK write error: {rollback_err}"
+                    "rotate_key: rollback of private key '{new_kid}' failed after JWK write error: {rollback_err:?}"
                 );
             }
             return Err(err);
@@ -119,7 +119,7 @@ impl KeyRotationManager {
                 .await
             {
                 log::warn!(
-                    "rotate_key: rollback of JWK '{new_kid}' failed after active-kids write error: {rollback_err}"
+                    "rotate_key: rollback of JWK '{new_kid}' failed after active-kids write error: {rollback_err:?}"
                 );
             }
             if let Err(rollback_err) = services
@@ -128,7 +128,7 @@ impl KeyRotationManager {
                 .await
             {
                 log::warn!(
-                    "rotate_key: rollback of private key '{new_kid}' failed after active-kids write error: {rollback_err}"
+                    "rotate_key: rollback of private key '{new_kid}' failed after active-kids write error: {rollback_err:?}"
                 );
             }
             return Err(err);

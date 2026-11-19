@@ -14,7 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::{Host, Url};
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use crate::ec::registry::PartnerRegistry;
+use crate::ec::provider::validate_enabled_configs;
+use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig,
@@ -33,8 +34,9 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
+use crate::redacted::Redacted;
 use crate::response_privacy::is_forbidden_operator_response_header;
-use crate::settings::{AssetOriginAuth, IntegrationConfig, IntegrationSettings, Settings};
+use crate::settings::{AssetOriginAuth, Ec, IntegrationConfig, IntegrationSettings, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
@@ -224,6 +226,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
+                    object("ec"),
+                    optional_object("identity_providers"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("secrets"),
+                    object("token"),
+                ],
+                true,
+            ),
+            field(
+                vec![
                     object("handlers"),
                     SecretPathSegment::ArrayEach,
                     object("password"),
@@ -337,6 +349,9 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    // Provider kinds are registered outside core, so `ts config` refuses an
+    // enabled provider whose kind is not registered by building it.
+    validate_identity_providers(&with_placeholder_partner_tokens(&settings.ec))?;
     Ok(())
 }
 
@@ -350,7 +365,8 @@ pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
     warn_ignored_certificate_check(settings);
-    settings.warn_ignored_origin_readthrough();
+    warn_ignored_origin_readthrough(settings);
+    warn_origin_url_userinfo(settings);
     for id in unknown_integration_ids(settings) {
         log::warn!(
             "Unknown integration ID '{id}' is ignored; check the integration name or remove its configuration"
@@ -362,7 +378,8 @@ pub fn validate_settings_for_runtime(
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
-    PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    PartnerRegistry::from_ec(&settings.ec).map(|_| ())?;
+    validate_identity_providers(&settings.ec)?;
     Ok(())
 }
 
@@ -412,9 +429,7 @@ fn reject_origin_readthrough(settings: &Settings) -> Result<(), Report<TrustedSe
 ///
 /// Returns [`TrustedServerError::Configuration`] when the URL has a username or password.
 fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    let has_userinfo = url::Url::parse(&settings.publisher.origin_url)
-        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
-    if !has_userinfo {
+    if !origin_url_has_userinfo(settings) {
         return Ok(());
     }
     Err(Report::new(TrustedServerError::Configuration {
@@ -422,6 +437,25 @@ fn reject_origin_url_userinfo(settings: &Settings) -> Result<(), Report<TrustedS
             "publisher.origin_url must not contain userinfo; put credentials in a header instead"
                 .to_owned(),
     }))
+}
+
+/// Whether `publisher.origin_url` carries a username or password.
+fn origin_url_has_userinfo(settings: &Settings) -> bool {
+    url::Url::parse(&settings.publisher.origin_url)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
+}
+
+/// Warns that a live `publisher.origin_url` with userinfo fails every publisher request.
+///
+/// A config that predates the rejection keeps loading, but the publisher
+/// forward refuses such a target, so each publisher request answers 400. The
+/// warning never echoes the URL, which holds the credentials.
+fn warn_origin_url_userinfo(settings: &Settings) {
+    if origin_url_has_userinfo(settings) {
+        log::warn!(
+            "publisher.origin_url contains userinfo, so every publisher request answers 400; put the credentials in a header and push the config again"
+        );
+    }
 }
 
 /// Rejects operator `response_headers` entries that Trusted Server never sends:
@@ -465,6 +499,23 @@ fn warn_ignored_certificate_check(settings: &Settings) {
     }
 }
 
+/// Warns that a live `creative_opportunities.origin_readthrough_enabled = true` is ignored.
+///
+/// Origin readthrough is unavailable: the publisher origin is always fetched
+/// with the ad-stack bypass or the platform default cache policy, as if the
+/// setting were `false`. A config that predates the rejection keeps serving.
+fn warn_ignored_origin_readthrough(settings: &Settings) {
+    if settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(|config| config.origin_readthrough_enabled == Some(true))
+    {
+        log::warn!(
+            "creative_opportunities.origin_readthrough_enabled = true is ignored; origin readthrough is unavailable. Remove the setting before the next config push"
+        );
+    }
+}
+
 fn unknown_integration_ids(settings: &Settings) -> Vec<&str> {
     let mut ids = settings
         .integrations
@@ -491,6 +542,78 @@ fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<Tru
             ),
         })
     })
+}
+
+/// Returns a copy of `ec` whose partner tokens are unique placeholders.
+///
+/// Deploy validation runs before secret references are resolved, so partner
+/// tokens still hold secret key names that would fail the runtime length
+/// check when the partner registry is built.
+#[must_use]
+pub fn with_placeholder_partner_tokens(ec: &Ec) -> Ec {
+    let mut ec = ec.clone();
+    for (index, partner) in ec.partners.iter_mut().enumerate() {
+        if partner.api_token.is_some() {
+            partner.api_token = Some(Redacted::new(format!("{index:0>64}")));
+        }
+        if partner.ts_pull_token.is_some() {
+            partner.ts_pull_token = Some(Redacted::new(format!("{index:1>64}")));
+        }
+    }
+    ec
+}
+
+/// Checks the identity-provider rules core owns.
+///
+/// Unknown kinds and capability checks need the provider crate; the adapter
+/// builds the coordinators at startup and fails to start on either.
+fn validate_identity_providers(ec: &Ec) -> Result<(), Report<TrustedServerError>> {
+    if ec.identity_providers.is_empty() {
+        return Ok(());
+    }
+    // Pull-sync providers come only from partner config, which carries the
+    // pull token and rate limit; configuring the kind directly bypasses both.
+    if let Some(config) = ec
+        .identity_providers
+        .iter()
+        .find(|config| config.kind() == PULL_SYNC_KIND)
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.identity_providers: provider `{}` uses kind `{PULL_SYNC_KIND}`; configure pull sync on its [[ec.partners]] entry instead",
+                config.id
+            ),
+        }));
+    }
+    let partners = PartnerRegistry::from_ec(ec)?;
+    validate_enabled_configs(&ec.identity_providers, &partners).map_err(|report| {
+        let detail = report
+            .frames()
+            .filter_map(|frame| frame.downcast_ref::<String>())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        report.change_context(TrustedServerError::Configuration {
+            message: format!("ec.identity_providers: {detail}"),
+        })
+    })?;
+    // Pull-sync partners run as providers too; a source claimed by both would
+    // fail the coordinator build at startup.
+    for config in ec.identity_providers.iter().filter(|config| config.enabled) {
+        if let Some(source) = config.sources.iter().find(|source| {
+            partners
+                .find_by_source_domain(source)
+                .is_some_and(|partner| partner.runs_pull_sync)
+        }) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "ec.identity_providers: source `{source}` of provider `{}` is also claimed by a pull-sync partner",
+                    config.id
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -631,6 +754,15 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         }
     }
 
+    for (index, provider) in settings.ec.identity_providers.iter().enumerate() {
+        if let Some(token) = &provider.secrets.token {
+            validate_secret_key_reference(
+                &format!("ec.identity_providers[{index}].secrets.token"),
+                token.expose(),
+            )?;
+        }
+    }
+
     for (index, handler) in settings.handlers.iter().enumerate() {
         validate_secret_key_reference(
             &format!("handlers[{index}].password"),
@@ -749,7 +881,7 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -884,7 +1016,7 @@ formats = [{ width = 300, height = 250 }]
 
     #[test]
     fn public_origin_diagnostics_emit_once_per_boundary_and_validation_is_silent() {
-        let capture = crate::test_support::logging::WarningCapture::start();
+        let capture = crate::test_support::logging::LogCapture::start();
         for (origin, expected_warnings) in [
             (None, 1),
             (Some("HTTP://FOREIGN.EXAMPLE:8080"), 2),
@@ -896,11 +1028,12 @@ formats = [{ width = 300, height = 250 }]
             settings.publisher.public_origin = origin.map(str::to_owned);
             let constructed = TrustedServerAppConfig::new(settings)
                 .expect("should construct config with advisory-only origin diagnostics");
-            let warnings = capture.take();
+            let warnings = capture.take_all();
             assert_eq!(warnings.len(), expected_warnings);
             assert!(
                 warnings.iter().all(|warning| {
-                    warning.target == module_path!().trim_end_matches("::tests")
+                    warning.level == log::Level::Warn
+                        && warning.target == module_path!().trim_end_matches("::tests")
                         && !warning.message.contains("FOREIGN")
                         && !warning.message.contains("foreign.example")
                 }),
@@ -912,7 +1045,7 @@ formats = [{ width = 300, height = 250 }]
             let deserialized: TrustedServerAppConfig = serde_json::from_value(data.clone())
                 .expect("should deserialize config with advisory-only origin diagnostics");
             assert_eq!(
-                capture.take().len(),
+                capture.take_warnings().len(),
                 warnings.len(),
                 "should emit once on deserialization too"
             );
@@ -931,7 +1064,7 @@ formats = [{ width = 300, height = 250 }]
                 );
             }
             assert!(
-                capture.take().is_empty(),
+                capture.take_all().is_empty(),
                 "should not log during repeated validation"
             );
         }
@@ -1289,6 +1422,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.passphrase".to_owned(), false),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
+                ("ec.identity_providers[*].secrets.token".to_owned(), true,),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("trusted_forwarder.shared_secret".to_owned(), false),
@@ -1620,6 +1754,218 @@ gam_network_id = "99999"
         );
     }
 
+    fn settings_with_identity_provider(provider: serde_json::Value) -> Settings {
+        let mut settings = valid_settings();
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+        ];
+        let mut config = serde_json::json!({
+            "id": "example-provider",
+            "kind": "example-kind",
+            "endpoint": "https://ids.example.com/v1/lookup",
+            "allowed_domains": ["ids.example.com"],
+            "sources": ["ids.example.com"],
+        });
+        if let (Some(base), serde_json::Value::Object(overrides)) =
+            (config.as_object_mut(), provider)
+        {
+            base.extend(overrides);
+        }
+        settings.ec.identity_providers =
+            vec![serde_json::from_value(config).expect("should build provider config")];
+        settings
+    }
+
+    #[test]
+    fn runtime_validation_accepts_valid_identity_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({}));
+
+        validate_settings_for_runtime(&settings).expect("should accept valid identity provider");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_an_enabled_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({}));
+
+        validate_settings_for_deploy(&settings)
+            .expect("should leave the registered-kind check to the provider crate");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_provider_with_unresolved_partner_token() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners[0].api_token =
+            Some(Redacted::new("example_partner_api_token".to_owned()));
+
+        validate_settings_for_deploy(&settings)
+            .expect("should not length-check a partner token secret key name");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_provider_endpoint_outside_allowlist() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "endpoint": "https://other.example.com/v1/lookup"
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject endpoint outside allowlist");
+
+        assert!(
+            err.to_string().contains("allowed_domains"),
+            "should explain the allowlist rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_provider_and_pull_sync() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a source claimed twice");
+
+        assert!(
+            err.to_string().contains("pull-sync partner"),
+            "should explain the double claim: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_accepts_disabled_provider_sharing_a_pull_sync_source() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        validate_settings_for_runtime(&settings)
+            .expect("should accept a disabled provider sharing a pull-sync source");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_pull_token_invalid_in_a_header() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({ "enabled": false }));
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "ids",
+                "source_domain": "ids.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token\n32-bytes-minimum",
+            }))
+            .expect("should build partner"),
+        ];
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a pull token that cannot form a header");
+
+        assert!(
+            format!("{err:?}").contains("Authorization header"),
+            "should name the Authorization header problem: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_directly_configured_pull_sync_provider() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "kind": PULL_SYNC_KIND,
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject the pull-sync kind in identity providers");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should point to partner config: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_provider_source_without_partner() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "sources": ["unknown.example.com"]
+        }));
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject source without partner");
+
+        assert!(
+            err.to_string().contains("[[ec.partners]]"),
+            "should explain the partner rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_source_claimed_by_two_providers() {
+        let mut settings = settings_with_identity_provider(serde_json::json!({}));
+        let mut second = settings.ec.identity_providers[0].clone();
+        second.id = "second-provider".to_owned();
+        settings.ec.identity_providers.push(second);
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject double-claimed source");
+
+        assert!(
+            err.to_string()
+                .contains("claimed by another enabled provider"),
+            "should explain the claim rule: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_provider_token_reference() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "secrets": { "token": " " }
+        }));
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty provider token reference");
+
+        assert!(
+            err.to_string()
+                .contains("ec.identity_providers[0].secrets.token"),
+            "should identify the provider token reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_keeps_provider_token_key_reference() {
+        let settings = settings_with_identity_provider(serde_json::json!({
+            "enabled": false,
+            "secrets": { "token": "example_provider_token" }
+        }));
+
+        let app_config =
+            TrustedServerAppConfig::new(settings).expect("should validate provider token key name");
+
+        let serialized = serde_json::to_string(&app_config).expect("should serialize app config");
+        assert!(
+            serialized.contains("example_provider_token"),
+            "should keep the provider token key reference"
+        );
+    }
+
     #[test]
     fn trace_config_requires_enabled_on_both_validation_paths() {
         for raw in [
@@ -1746,12 +2092,12 @@ password = "production-admin-password-32-bytes"
     #[test]
     fn runtime_ignores_certificate_check_false_with_warning() {
         let mut settings = valid_settings();
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
         validate_settings_for_runtime(&settings)
             .expect("should accept the default certificate check at runtime");
         assert!(
             !capture
-                .take()
+                .take_all()
                 .iter()
                 .any(|warning| warning.message.contains("proxy.certificate_check")),
             "should not warn when certificate_check keeps its default"
@@ -1761,13 +2107,49 @@ password = "production-admin-password-32-bytes"
         validate_settings_for_runtime(&settings)
             .expect("should keep serving a config that sets certificate_check = false");
 
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
         assert!(
             warnings.iter().any(|warning| {
                 warning.message.contains("proxy.certificate_check")
                     && warning.message.contains("ignored")
             }),
             "should warn that certificate_check = false is ignored"
+        );
+    }
+
+    #[test]
+    fn runtime_ignores_origin_readthrough_with_warning() {
+        let mut settings = valid_settings();
+        let capture = LogCapture::start();
+        validate_settings_for_runtime(&settings)
+            .expect("should accept a config without origin readthrough at runtime");
+        assert!(
+            !capture
+                .take_all()
+                .iter()
+                .any(|record| record.message.contains("origin_readthrough_enabled")),
+            "should not warn when origin readthrough is unset"
+        );
+
+        settings.creative_opportunities = Some(
+            serde_json::from_value(serde_json::json!({
+                "gam_network_id": "12345",
+                "origin_readthrough_enabled": true,
+            }))
+            .expect("should build a readthrough creative opportunities config"),
+        );
+        validate_settings_for_runtime(&settings)
+            .expect("should keep serving a config that enables origin readthrough");
+
+        let warnings = capture.take_warnings();
+        assert!(
+            warnings.iter().any(|warning| {
+                warning
+                    .message
+                    .contains("creative_opportunities.origin_readthrough_enabled")
+                    && warning.message.contains("ignored")
+            }),
+            "should warn that origin readthrough is ignored"
         );
     }
 
@@ -1817,6 +2199,37 @@ password = "production-admin-password-32-bytes"
                 "should name the rejected setting on validate and push: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_warns_once_about_origin_url_userinfo_without_echoing_it() {
+        let mut settings = valid_settings();
+        settings.publisher.origin_url =
+            "https://example-user:example-pass@origin.test-publisher.example.com".to_owned();
+        let capture = LogCapture::start();
+
+        validate_settings_for_runtime(&settings)
+            .expect("should keep loading a live config whose origin URL has userinfo");
+
+        let records = capture.take_all();
+        let userinfo: Vec<_> = records
+            .iter()
+            .filter(|record| record.message.contains("publisher.origin_url"))
+            .collect();
+        assert!(
+            matches!(
+                userinfo.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message.contains("answers 400")
+            ),
+            "should warn once that every publisher request answers 400"
+        );
+        assert!(
+            records.iter().all(|record| {
+                !record.message.contains("example-user") && !record.message.contains("example-pass")
+            }),
+            "should never echo the credentials"
+        );
     }
 
     #[test]
@@ -1873,6 +2286,7 @@ password = "production-admin-password-32-bytes"
             "Proxy-Connection",
             "Proxy-Authenticate",
             "Proxy-Authorization",
+            "HTTP2-Settings",
         ] {
             let mut settings = valid_settings();
             settings
@@ -2349,12 +2763,12 @@ password = "production-admin-password-32-bytes"
         settings
             .integrations
             .insert("prebdi".to_owned(), serde_json::json!({ "enabled": true }));
-        let capture = crate::test_support::logging::WarningCapture::start();
+        let capture = crate::test_support::logging::LogCapture::start();
 
         validate_settings_for_runtime(&settings)
             .expect("should keep starting with an unknown stored integration ID");
 
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
         assert!(
             warnings
                 .iter()

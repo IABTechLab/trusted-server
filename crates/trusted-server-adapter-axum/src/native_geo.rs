@@ -1,8 +1,7 @@
 //! Explicit application-owned composition of the native Geo provider.
 //!
-//! EdgeZero does not load a Geo environment or store binding. This optional TS
-//! boot profile selects its Rust options before store preparation and listening.
-//! It contains a credential removal name, never the expected origin credential.
+//! An explicit legacy TS boot profile overrides EdgeZero's native Geo settings.
+//! When absent, EdgeZero resolves the provider before listening.
 
 use std::fs;
 
@@ -12,6 +11,15 @@ use serde::Deserialize;
 
 /// Path to the separately delivered TS native Geo boot profile.
 pub const PROFILE_FILE_ENV: &str = "TS_NATIVE_GEO_PROFILE_FILE";
+
+pub(crate) const GEO_STORE_ID: &str = "geo_index";
+
+/// Declare the Geo store only for deployments selecting KV Geo through native settings.
+pub(crate) fn kv_selected() -> bool {
+    cfg!(feature = "geo-kv")
+        && std::env::var_os(PROFILE_FILE_ENV).is_none()
+        && std::env::var("EDGEZERO__ADAPTER__GEO__PROVIDER").as_deref() == Ok("kv")
+}
 
 /// Safe startup categories that never retain profile bytes or policy inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
@@ -50,19 +58,18 @@ enum GeoSelection {
 
 /// Capture the application-owned selection once before starting the runner.
 ///
-/// An absent profile keeps existing local hosting Off. A supplied unreadable or
-/// invalid file is an error, never a silent fallback. The selected built-in
-/// implementation is validated by final `AxumRunOptions::geo_capability()`.
+/// An absent profile defers provider selection to `EdgeZero`. A supplied
+/// unreadable or invalid file is an error, never a silent fallback.
 ///
 /// # Errors
 /// Returns a bounded category without the file path, input bytes, CIDRs or name.
-pub fn load_selection() -> Result<NativeGeoSelection, Report<NativeGeoProfileError>> {
+pub fn load_selection() -> Result<Option<NativeGeoSelection>, Report<NativeGeoProfileError>> {
     let Some(path) = std::env::var_os(PROFILE_FILE_ENV) else {
-        return Ok(NativeGeoSelection::Off);
+        return Ok(None);
     };
     let bytes =
         fs::read_to_string(path).map_err(|_| Report::new(NativeGeoProfileError::Unavailable))?;
-    parse_selection(&bytes)
+    parse_selection(&bytes).map(Some)
 }
 
 fn parse_selection(bytes: &str) -> Result<NativeGeoSelection, Report<NativeGeoProfileError>> {
@@ -97,14 +104,13 @@ origin_credential_header_name = "x-origin-fixture-private-name"
 "#;
 
     #[test]
-    fn absent_profile_retains_off() {
+    fn absent_profile_defers_to_sdk() {
         temp_env::with_var_unset(PROFILE_FILE_ENV, || {
             assert!(
-                matches!(
-                    load_selection().expect("should retain absent selection"),
-                    NativeGeoSelection::Off
-                ),
-                "should keep Geo off when no profile is selected"
+                load_selection()
+                    .expect("should retain absent selection")
+                    .is_none(),
+                "should let EdgeZero select Geo when no profile is selected"
             );
         });
     }

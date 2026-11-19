@@ -203,7 +203,10 @@ pub fn handle_consent_update(
 mod tests {
     use super::*;
     use crate::consent::{ConsentContext, jurisdiction::Jurisdiction};
-    use crate::ec::{EcContext, finalize::ec_finalize_response, registry::PartnerRegistry};
+    use crate::ec::{
+        EcContext, finalize::ec_finalize_response, registry::PartnerRegistry,
+        sharedid::SharedIdRequest,
+    };
     use crate::http_util::RuntimeRequestOrigin;
     use crate::platform::test_support::noop_services;
     use crate::test_support::body_read::body_read_failure_cases;
@@ -398,7 +401,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -426,6 +429,18 @@ mod tests {
             .generate_if_needed(&settings, Some(&graph))
             .await
             .expect("fixture identity");
+        // The row is written by the page-load commit, not by generation.
+        original.set_navigation_permit(crate::ec::page_load::NavigationPermit::for_test());
+        ec_finalize_response(
+            &settings,
+            &mut original,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            &SharedIdRequest::default(),
+            &mut Response::new(EdgeBody::empty()),
+        )
+        .await;
         let id = original.ec_value().expect("fixture ID").to_owned();
         let mut req = request(
             Method::POST,
@@ -459,7 +474,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -498,7 +513,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -558,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_revocation_returns_failure_while_expiring_the_browser_cookie() {
+    async fn failed_revocation_returns_failure_and_keeps_the_browser_cookie() {
         let settings = create_test_settings();
         let req = prepare_consent_update(
             &noop_services(),
@@ -582,19 +597,25 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should report the failed revocation"
+        );
+        // The cookie stays so the next request retries the tombstone.
         assert!(
-            response
+            !response
                 .headers()
                 .get_all(header::SET_COOKIE)
                 .iter()
                 .any(|value| value
                     .to_str()
-                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0")))
+                    .is_ok_and(|value| value.starts_with("ts-ec="))),
+            "should keep the EC cookie until the tombstone is written"
         );
     }
 }

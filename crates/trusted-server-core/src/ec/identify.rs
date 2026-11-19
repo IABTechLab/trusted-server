@@ -6,19 +6,21 @@
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderValue};
-use http::{Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use url::Url;
 
 use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::settings::Settings;
 
-use super::EcContext;
+use super::eid_types::UnixSeconds;
+use super::eids::source_views;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::registry::PartnerRegistry;
+use super::{EcContext, current_timestamp};
 
 /// Handles `GET /_ts/api/v1/identify`.
 ///
@@ -41,14 +43,7 @@ pub async fn handle_identify(
     ec_context: &EcContext,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let allowed_origin = match classify_origin(req, settings) {
-        CorsDecision::Denied => {
-            return Ok(apply_identify_cache_headers(
-                Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(EdgeBody::empty())
-                    .expect("should build forbidden response"),
-            ));
-        }
+        CorsDecision::Denied => return Ok(identify_origin_denied()),
         CorsDecision::NoOrigin => None,
         CorsDecision::Allowed(origin) => Some(origin),
     };
@@ -84,7 +79,7 @@ pub async fn handle_identify(
     };
 
     let mut degraded = false;
-    let mut uid: Option<String> = None;
+    let mut eid: Option<Eid> = None;
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id).await {
@@ -95,12 +90,25 @@ pub async fn handle_identify(
                 // write back with the live-entry TTL.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
-                {
-                    uid = Some(partner_uid.uid.clone());
-                }
+                // Extract only this partner's first live entry. A
+                // provider-owned source is withheld while its owner lacks TCF
+                // vendor consent or while the provider's cookies on this
+                // request record an opt-out, and a source a provider excludes
+                // where GDPR applies is withheld for a GDPR visitor, as in the
+                // bidstream.
+                let now = UnixSeconds::new(current_timestamp());
+                let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent())
+                    || partner.excluded_for(ec_context.consent())
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain);
+                eid = entry
+                    .ids
+                    .get(&partner.source_domain)
+                    .filter(|_| !vendor_denied)
+                    .and_then(|record| {
+                        source_views(&partner.source_domain, record, partner.openrtb_atype, now)
+                            .next()
+                    })
+                    .map(Eid::from);
 
                 // Evaluate cluster size lazily for identify responses. Existing
                 // stored cluster_size values are reused without a prefix-list call.
@@ -124,14 +132,10 @@ pub async fn handle_identify(
         }
     }
 
-    let eid = uid.as_ref().map(|u| Eid {
-        source: partner.source_domain.clone(),
-        uids: vec![Uid {
-            id: u.clone(),
-            atype: Some(partner.openrtb_atype),
-            ext: None,
-        }],
-    });
+    let uid = eid
+        .as_ref()
+        .and_then(|eid| eid.uids.first())
+        .map(|uid| uid.id.clone());
 
     let body = IdentifyResponse {
         ec: ec_id.to_owned(),
@@ -180,6 +184,89 @@ pub fn cors_preflight_identify(
     };
 
     Ok(apply_identify_cache_headers(response))
+}
+
+/// Builds the local `501 Not Implemented` response for `GET /_ts/api/v1/identify`
+/// on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request to the publisher
+/// origin, so a partner's Bearer token never leaves Trusted Server. The same
+/// origin policy as [`handle_identify`] applies first: a denied browser origin
+/// receives `403`, and an allowed one receives reflected CORS headers so it can
+/// read the `501`.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn identify_not_supported(settings: &Settings, req: &Request<EdgeBody>) -> Response<EdgeBody> {
+    let allowed_origin = match classify_origin(req, settings) {
+        CorsDecision::Denied => return identify_origin_denied(),
+        CorsDecision::NoOrigin => None,
+        CorsDecision::Allowed(origin) => Some(origin),
+    };
+    let body = serde_json::json!({ "error": "ec_store_not_configured" });
+    let response = apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build identify not-supported response"),
+    );
+    apply_cors_headers_if_allowed(response, allowed_origin.as_deref())
+}
+
+/// Builds the local `405 Method Not Allowed` response for a method other than
+/// `GET` or `OPTIONS` on `/_ts/api/v1/identify`.
+///
+/// Adapters claim every method on the identify path and answer the others
+/// with this response, so no request on the path reaches the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn identify_method_not_allowed() -> Response<EdgeBody> {
+    let body = serde_json::json!({ "error": "method_not_allowed" });
+    apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ALLOW, "GET, OPTIONS")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build identify method-not-allowed response"),
+    )
+}
+
+/// Answers an identify request locally, without the EC record store.
+///
+/// `OPTIONS` runs [`cors_preflight_identify`], `GET` returns
+/// [`identify_not_supported`], and every other method returns
+/// [`identify_method_not_allowed`].
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when preflight response construction fails.
+pub fn answer_identify_locally(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    match *req.method() {
+        Method::OPTIONS => cors_preflight_identify(settings, req),
+        Method::GET => Ok(identify_not_supported(settings, req)),
+        _ => Ok(identify_method_not_allowed()),
+    }
+}
+
+fn identify_origin_denied() -> Response<EdgeBody> {
+    apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(EdgeBody::empty())
+            .expect("should build forbidden response"),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -334,10 +421,13 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
+    use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{consent_granting_vendors, create_test_settings};
+    use std::num::NonZeroU16;
 
     const VALID_API_TOKEN: &str = "identify-test-token-32-bytes-min";
 
@@ -349,6 +439,127 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store"),
             "identify responses should not be cached"
+        );
+    }
+
+    fn local_identify_request(method: &str, origin: Option<&str>) -> Request<EdgeBody> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("https://edge.publisher.example.com/_ts/api/v1/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build local identify request")
+    }
+
+    fn local_identify_settings() -> Settings {
+        let mut settings = create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings
+    }
+
+    #[test]
+    fn identify_not_supported_reflects_allowed_origin_on_501() {
+        let settings = local_identify_settings();
+        let req = local_identify_request("GET", Some("https://www.publisher.example.com"));
+
+        let response = identify_not_supported(&settings, &req);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 to an allowed browser origin"
+        );
+        assert_no_store(&response);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://www.publisher.example.com"),
+            "should reflect the allowed origin so the browser can read the 501"
+        );
+    }
+
+    #[test]
+    fn identify_not_supported_denies_mismatched_origin() {
+        let settings = local_identify_settings();
+        let req = local_identify_request("GET", Some("https://evil.example"));
+
+        let response = identify_not_supported(&settings, &req);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should apply the identify origin policy before the 501"
+        );
+        assert_no_store(&response);
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "should not reflect a denied origin"
+        );
+    }
+
+    #[test]
+    fn answer_identify_locally_dispatches_by_method() {
+        let settings = local_identify_settings();
+
+        let get = answer_identify_locally(&settings, &local_identify_request("GET", None))
+            .expect("should answer GET locally");
+        let options = answer_identify_locally(&settings, &local_identify_request("OPTIONS", None))
+            .expect("should answer OPTIONS locally");
+
+        assert_eq!(get.status(), StatusCode::NOT_IMPLEMENTED, "GET should 501");
+        assert_eq!(options.status(), StatusCode::OK, "OPTIONS should preflight");
+        for method in ["HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+            let response =
+                answer_identify_locally(&settings, &local_identify_request(method, None))
+                    .expect("should answer unsupported method locally");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} identify should answer 405"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET, OPTIONS"),
+                "{method} identify should advertise the allowed methods"
+            );
+            assert_no_store(&response);
+        }
+    }
+
+    #[test]
+    fn identify_not_supported_returns_uncached_501() {
+        let settings = local_identify_settings();
+        let response = identify_not_supported(&settings, &local_identify_request("GET", None));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_no_store(&response);
+        let body: serde_json::Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer body"),
+        )
+        .expect("should return a JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
         );
     }
 
@@ -367,6 +578,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -761,6 +973,206 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Origin, Authorization"),
             "should vary on identity request inputs for preflight"
+        );
+    }
+
+    fn provider_record(id: &str, expiry: Expiry) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            expiry,
+        );
+        let fields = EidFields {
+            inserter: Some("inserter.example.com".into()),
+            ..EidFields::default()
+        };
+        KvPartnerId::from_eids(vec![KvEid::new(fields, vec![uid])], UnixSeconds::new(0))
+            .expect("should build record")
+    }
+
+    async fn identify_body_for_record(record: KvPartnerId) -> serde_json::Value {
+        let registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        identify_body_with(record, &registry, consent).await
+    }
+
+    async fn identify_body_with(
+        record: KvPartnerId,
+        registry: &PartnerRegistry,
+        consent: ConsentContext,
+    ) -> serde_json::Value {
+        identify_body_with_cookie_opt_outs(record, registry, consent, &[]).await
+    }
+
+    async fn identify_body_with_cookie_opt_outs(
+        record: KvPartnerId,
+        registry: &PartnerRegistry,
+        consent: ConsentContext,
+        cookie_opted_out_sources: &[&str],
+    ) -> serde_json::Value {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::in_memory("identify_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert("ssp.example.com".to_owned(), record);
+        kv.create(&ec_id, &entry)
+            .await
+            .expect("should seed KV entry");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.example.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let mut ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        ec_context.set_cookie_opted_out_sources(
+            cookie_opted_out_sources
+                .iter()
+                .map(|source| (*source).to_owned())
+                .collect(),
+        );
+
+        let response = handle_identify(&settings, &kv, registry, &req, &ec_context)
+            .await
+            .expect("should construct identify response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return 200");
+        serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_withholds_a_source_whose_owner_lacks_vendor_consent() {
+        let mut registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        assert!(
+            registry.mark_provider_owned("ssp.example.com", NonZeroU16::new(9999)),
+            "should mark the source provider-owned"
+        );
+        let record = || provider_record("live", Expiry::Never);
+
+        let denied =
+            identify_body_with(record(), &registry, consent_granting_vendors(vec![1])).await;
+        let granted =
+            identify_body_with(record(), &registry, consent_granting_vendors(vec![9999])).await;
+
+        assert!(
+            denied.get("uid").is_none(),
+            "should withhold the UID without the owner's vendor consent"
+        );
+        assert_eq!(
+            granted["uid"], "live",
+            "should return the UID with the owner's vendor consent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_withholds_a_source_excluded_where_gdpr_applies() {
+        let mut registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        assert!(
+            registry.exclude_where_gdpr_applies("ssp.example.com"),
+            "should mark the source excluded where GDPR applies"
+        );
+        let record = || provider_record("live", Expiry::Never);
+        let non_regulated = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+
+        let gdpr = identify_body_with(record(), &registry, consent_granting_vendors(vec![1])).await;
+        let elsewhere = identify_body_with(record(), &registry, non_regulated).await;
+
+        assert!(
+            gdpr.get("uid").is_none() && gdpr.get("eid").is_none(),
+            "should withhold the excluded source from a GDPR visitor"
+        );
+        assert_eq!(
+            elsewhere["uid"], "live",
+            "should return the source outside GDPR"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_withholds_a_source_its_provider_cookies_opted_out_of() {
+        // Arrange
+        let registry =
+            PartnerRegistry::from_config(&[make_test_partner("ssp.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        let record = || provider_record("held-id", Expiry::Never);
+        let consent = || ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+
+        // Act
+        let opted_out = identify_body_with_cookie_opt_outs(
+            record(),
+            &registry,
+            consent(),
+            &["ssp.example.com"],
+        )
+        .await;
+        let other_opted_out = identify_body_with_cookie_opt_outs(
+            record(),
+            &registry,
+            consent(),
+            &["other.example.com"],
+        )
+        .await;
+
+        // Assert
+        assert!(
+            opted_out.get("uid").is_none() && opted_out.get("eid").is_none(),
+            "should withhold the stored UID while the provider's cookies opt out"
+        );
+        assert_eq!(
+            other_opted_out["uid"], "held-id",
+            "should return the source when another provider opted out"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_omits_expired_provider_uid() {
+        let body =
+            identify_body_for_record(provider_record("old", Expiry::At(UnixSeconds::new(1)))).await;
+
+        assert!(
+            body.get("uid").is_none(),
+            "should omit expired provider uid"
+        );
+        assert!(
+            body.get("eid").is_none(),
+            "should omit eid without a live uid"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_returns_live_provider_eid_with_eid_fields() {
+        let body = identify_body_for_record(provider_record("live", Expiry::Never)).await;
+
+        assert_eq!(body["uid"], "live", "should return live provider uid");
+        assert_eq!(
+            body["eid"]["inserter"], "inserter.example.com",
+            "should keep provider EID-level fields"
+        );
+        assert_eq!(
+            body["eid"]["uids"][0]["atype"], 1,
+            "should use the provider atype"
         );
     }
 }

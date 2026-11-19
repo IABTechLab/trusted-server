@@ -32,7 +32,7 @@ const INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL: &str = "private, max-age=60";
 /// `Trailer`, frames the body itself, and strips the hop-by-hop fields. A
 /// `Connection` value also removes the fields it names, and a malformed one
 /// fails the response with a 500 before commit.
-const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 10] = [
+const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 11] = [
     "trailer",
     "content-length",
     "connection",
@@ -43,6 +43,7 @@ const FORBIDDEN_OPERATOR_RESPONSE_HEADERS: [&str; 10] = [
     "proxy-connection",
     "proxy-authenticate",
     "proxy-authorization",
+    "http2-settings",
 ];
 
 /// Whether `name` is an operator response header that Trusted Server never sends.
@@ -270,7 +271,7 @@ mod tests {
     use edgezero_core::http::response_builder;
 
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
-    use crate::test_support::logging::WarningCapture;
+    use crate::test_support::logging::LogCapture;
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
@@ -691,6 +692,7 @@ mod tests {
             "Proxy-Connection",
             "Proxy-Authenticate",
             "Proxy-Authorization",
+            "HTTP2-Settings",
         ];
         let mut entries: Vec<(&str, &str)> = forbidden
             .iter()
@@ -703,12 +705,12 @@ mod tests {
         let mut response = response_builder()
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
-        let capture = WarningCapture::start();
+        let capture = LogCapture::start();
 
         apply_response_headers_with_cache_privacy(&settings, &mut response);
-        let applying = capture.take();
+        let applying = capture.take_all();
         warn_skipped_operator_response_headers(&settings);
-        let warnings = capture.take();
+        let warnings = capture.take_warnings();
 
         assert!(
             applying.is_empty(),

@@ -18,8 +18,14 @@ non-zero exit. Local development uses an isolated EdgeZero config-store map and
 See the [native RC guide](../../docs/guide/native-rc-demo.md) for the
 production-style hosting and provider checks.
 
-The listener's ingress limits come from `EDGEZERO__ADAPTER__INGRESS__*`
-environment variables, and an invalid value also stops startup. The
+The binary runs through EdgeZero's Axum production startup,
+`run_production_app_with_initializer`, which installs the logger and binds the
+listener; the adapter installs no logger of its own. The log level comes from
+`EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener address from
+`EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default
+`127.0.0.1:8787`); an invalid value stops startup. The listener's ingress
+limits come from `EDGEZERO__ADAPTER__INGRESS__*` environment variables, and an
+invalid value also stops startup. The
 [Axum development guide](../../docs/guide/axum-dev.md#ingress-limits) lists
 them.
 

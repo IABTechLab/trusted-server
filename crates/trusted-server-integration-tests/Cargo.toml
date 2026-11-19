@@ -11,6 +11,11 @@ version = { workspace = true }
 html-eof-runtime = []
 
 [[test]]
+name = "adapter_identity_guard"
+path = "tests/adapter_identity_guard.rs"
+harness = true
+
+[[test]]
 name = "html_eof_runtime"
 path = "tests/html_eof_runtime.rs"
 required-features = ["html-eof-runtime"]
