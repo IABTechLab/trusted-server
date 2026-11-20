@@ -1582,7 +1582,11 @@ impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
         install_edge_policies(
             app,
-            version_synthesized_headers(std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref()),
+            version_synthesized_headers(
+                trusted_server_core::runtime_env!(ENV_FASTLY_SERVICE_VERSION)
+                    .ok()
+                    .as_deref(),
+            ),
         )
     }
 
