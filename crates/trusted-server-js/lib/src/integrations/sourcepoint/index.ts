@@ -1,6 +1,7 @@
 import { log } from '../../core/log';
 
 import { installSourcepointGuard } from './script_guard';
+import { installSourcepointTcfMirror } from './tcf_mirror';
 
 type SourcepointWindow = Window & {
   __tsjs_sourcepoint?: {
@@ -284,6 +285,7 @@ export function initializeSourcepointConsentMirror(): void {
 
   initialized = true;
 
+  installSourcepointTcfMirror(window);
   if (!mirrorSourcepointConsent()) {
     scheduleInitialRetry();
   }
