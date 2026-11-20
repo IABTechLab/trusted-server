@@ -3,8 +3,9 @@
 //! Centralizes post-routing EC behavior so all handlers get consistent cookie
 //! and KV semantics. Every browser-driven KV write goes through the
 //! navigation's single page-load write ([`KvIdentityGraph::commit_page_load`]),
-//! so a request without a navigation permit never writes. The one exception is
-//! a consent withdrawal, whose tombstone is written on any request.
+//! so a request without a navigation permit never writes. The exceptions are a
+//! consent withdrawal, whose tombstone is written on any request, and the
+//! navigation's after-response follow-up write.
 
 use std::collections::BTreeSet;
 

@@ -103,12 +103,13 @@ use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
 use self::page_load::{AfterResponseWrite, NavigationPermit};
 
-/// Bounded request classifications that may persist browser EID cookies.
+/// Bounded request classifications that may read browser EID cookies.
 ///
 /// Adapters classify publisher navigations and `POST /auction` only after
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
-/// admitted SPA navigation, while EC finalization classifies new identities.
-/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+/// admitted SPA navigation. Only a publisher navigation holding a
+/// [`NavigationPermit`] persists the cookies; `Auction` and `PageBids` read them
+/// for bidders only. Challenged or blocked requests remain unclassified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
