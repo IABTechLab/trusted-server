@@ -883,7 +883,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
 | `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
 | `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)      |
 | `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                          | Array          | No       | Static partner registry entries                                         |
@@ -911,6 +911,7 @@ ec_store = "ec_identity_store"
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
 bidstream_enabled = true
+# mirror_enabled = true  # mirror provider-written UIDs to a JS-readable cookie (default false)
 # api_token = "partner_api_token"  # only for inbound identify or batch sync
 # ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
 ```
@@ -962,7 +963,7 @@ requests. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
-them, and batch sync rejects them and pull sync skips them. Browser-resolved IDs
+them, and batch sync rejects them. Browser-resolved IDs
 (`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
 provider cleared on an opt-out is not refilled from the browser.
 
@@ -1096,7 +1097,9 @@ row, as long as it does not send the EC ID to the vendor. The one exception is
 `liveramp` with an `endpoint`: its envelope lookup sends the EC ID as its
 Custom ID, so it is not run until the next navigation, even for its cookie
 reads. Without an `endpoint`, `liveramp` only reads cookies and runs on the
-first page view like the others. Kinds without a server call read their
+first page view like the others. Partner pull sync (an `[[ec.partners]]` entry
+with `pull_sync_enabled`) sends the EC ID to the partner, so it also waits for
+the next navigation. Kinds without a server call read their
 first-party cookie, so on the first page view their IDs come only from that
 cookie. In practice the first page's own auction carries no provider IDs;
 they reach bid requests from the next page load.
@@ -3109,7 +3112,7 @@ Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
 within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+`__Host-ts-eids-mirror`, `sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,

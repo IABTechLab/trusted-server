@@ -694,11 +694,12 @@ pub(crate) fn parse_sources(
 }
 
 /// Whether `url` is `https` and its host is one of `allowed_domains`,
-/// compared ASCII case-insensitively.
+/// compared ASCII case-insensitively, ignoring a trailing dot on the host.
 #[must_use]
 pub(crate) fn destination_allowed<S: AsRef<str>>(url: &Url, allowed_domains: &[S]) -> bool {
     url.scheme() == "https"
         && url.host_str().is_some_and(|host| {
+            let host = host.strip_suffix('.').unwrap_or(host);
             allowed_domains
                 .iter()
                 .any(|allowed| allowed.as_ref().eq_ignore_ascii_case(host))
