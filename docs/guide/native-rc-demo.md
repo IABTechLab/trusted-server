@@ -26,6 +26,11 @@ store = "trusted_server_kv"
 EdgeZero environment overlays only replace existing TOML keys; an environment
 variable cannot add this missing `provider` key to the starter.
 
+The declared record store is prepared before TS reads `ec.storage`. Its local
+provider always needs a writable `EDGEZERO__ADAPTER__DATA_DIR`, including when
+the config omits identity storage. Keep the directory below for every local
+start. Remote-only record bindings do not require this local directory.
+
 ```sh
 set -a && source .env.dev && set +a
 export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787

@@ -22,7 +22,7 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. The portable manifest and Axum startup always declare `trusted_server_kv` with the shared EC record layout before provider preparation. Select its provider through `EDGEZERO__STORE_BINDINGS_FILE`; without a remote binding, EdgeZero prepares its local persistent record provider. Supply a writable `EDGEZERO__ADAPTER__DATA_DIR` even when application identity storage is disabled.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. The portable manifest and Axum startup always declare `trusted_server_kv` with the shared EC record layout before provider preparation. Select its provider through `EDGEZERO__STORE_BINDINGS_FILE`; without a remote binding, EdgeZero prepares its local persistent record provider. In that local-provider case, supply a writable `EDGEZERO__ADAPTER__DATA_DIR` even when application identity storage is disabled. Remote-only bindings do not require the directory.
 
 Published application config selects the logical prepared store, not an endpoint or credentials:
 

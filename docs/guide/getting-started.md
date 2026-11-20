@@ -76,6 +76,12 @@ The Axum server reads its config envelope from a local config-store file in
 variables. It does **not** auto-load `.env` files, so export the variables into
 your shell before starting the server.
 
+The local record store is declared at boot even when `ec.storage` is omitted.
+`EDGEZERO__ADAPTER__DATA_DIR` must therefore name a writable directory for local
+starts, including a deployment without identity storage. Store preparation runs
+before the application config is loaded. Remote-only store bindings do not
+require a local data directory.
+
 Copy `trusted-server.example.toml` to `trusted-server.toml`. In the copied
 file, add `provider` to the existing storage table:
 

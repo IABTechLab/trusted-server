@@ -421,6 +421,33 @@ fn selected_celld_captures_only_its_explicit_bootstrap_reference_before_network(
 }
 
 #[test]
+fn local_records_require_data_dir_even_without_identity_storage() {
+    // ENVELOPE deliberately omits ec.storage: declarations prepare before app config loads.
+    let mut server = ServerFixture::new(Some(ENVELOPE));
+    server.child = Some(
+        Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
+            .env_clear()
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
+            .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
+            .env("EDGEZERO__ADAPTER__PORT", server.addr.port().to_string())
+            .env("EDGEZERO__ADAPTER__CONFIG_DIR", &server.root)
+            .env("EDGEZERO__SECRETS__PROXY_KEY", PROXY_SECRET)
+            .env("EDGEZERO__SECRETS__ADMIN_KEY", ADMIN_PASSWORD)
+            .env("EDGEZERO__SECRETS__EC_KEY", EC_PASSPHRASE)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("should spawn native startup without a data directory"),
+    );
+    server.assert_failed_before_listen("DATA_DIR: required for declared stores");
+
+    // The same no-identity config starts once its local provider has a writable root.
+    server.spawn(false, false);
+    server.wait_ready();
+    server.assert_logs_hold_no_secrets();
+}
+
+#[test]
 fn missing_config_fails_before_listen_without_legacy_fallback() {
     let mut server = ServerFixture::new(None);
     server.spawn(false, false);

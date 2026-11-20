@@ -34,6 +34,12 @@ local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
 envelope and active secret references, and installs immutable snapshots and
 the actual router before listening.
 
+The smoke also supplies a writable `EDGEZERO__ADAPTER__DATA_DIR`. The record
+store is always declared and EdgeZero prepares its local provider before TS
+loads application config, even when `ec.storage` is absent. Every local-provider
+start needs that directory; remote-only bindings do not. See
+[Getting started](./getting-started), Option B, for the complete shell setup.
+
 Local secrets use these variables:
 
 - `EDGEZERO__SECRETS__HANDLER_PASSWORD`

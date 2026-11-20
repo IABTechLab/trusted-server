@@ -89,9 +89,13 @@ Delete obsolete `TS_EC_*` reads and document migration to the binding file.
 An ordinary-only or `KvError::Unsupported` binding rejects startup before listen.
 AWS SDK dependencies remain test-only table administration helpers.
 
-The unconditional declaration prepares a local record provider even when identity
-is disabled; tests and operators need a writable EdgeZero data directory. Config
-and secrets continue to use A1's prepared immutable startup snapshots.
+Without a remote binding, the unconditional declaration prepares a local record
+provider even when identity is disabled; tests and operators need a writable
+EdgeZero data directory. Remote-only bindings do not require a local directory.
+Store preparation precedes application config loading, so deciding declarations
+from `ec.storage` would require an EdgeZero config-first preparation API. Keep
+the declaration unconditional. Config and secrets continue to use A1's prepared
+immutable startup snapshots.
 The temporary `TS_NATIVE_GEO_PROFILE_FILE` exception is narrowly justified by
 #1529 / #1532; geo selection remains a separate AX-2 obligation.
 

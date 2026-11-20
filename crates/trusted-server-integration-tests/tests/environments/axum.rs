@@ -128,6 +128,7 @@ impl AxumDevServer {
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", port.to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &root)
+            // Store preparation precedes config loading, including configs without identity.
             .env("EDGEZERO__ADAPTER__DATA_DIR", &root)
             .env("EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS", "1")
             .envs(INTEGRATION_SECRETS.iter().copied());

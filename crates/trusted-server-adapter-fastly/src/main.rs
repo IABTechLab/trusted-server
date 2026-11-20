@@ -1456,19 +1456,25 @@ mod tests {
         // A returning reader withdraws consent with GPC in a US state.
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let request = edgezero_core::http::request_builder()
+            .method(Method::GET)
             .uri("https://www.example.com/article")
+            .header("sec-fetch-dest", "document")
             .header("cookie", format!("ts-ec={ec_id}"))
             .header("sec-gpc", "1")
             .body(EdgeBody::empty())
             .expect("should build the reader request");
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");
+        ec_context.set_navigation_permit(
+            NavigationPermit::classify(&request).expect("should classify the document navigation"),
+        );
         let mut page = response_builder()
+            .header("content-type", "text/html; charset=utf-8")
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build the page response");
