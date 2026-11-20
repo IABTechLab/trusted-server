@@ -1,6 +1,8 @@
 // Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+use std::sync::Arc;
+
 use edgezero_adapter_fastly::context::FastlyOutboundObservation;
 use edgezero_adapter_fastly::request::{
     send_assembly_error, send_request_with_registries_and_hooks,
@@ -16,9 +18,11 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::forwarder::ForwarderPreparation;
@@ -48,8 +52,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
-    load_settings_from_config_store,
+    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
+    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
 };
 use crate::delivery::handle_delivery;
 use crate::ec_kv::FastlyEcKvStore;
@@ -337,7 +341,8 @@ fn serve(
     counters: &SandboxCounters,
     trace_path: bool,
 ) {
-    let settings = retained.state.settings.as_ref();
+    let state = retained.state.as_ref();
+    let settings = state.settings.as_ref();
     let values = ClientRequestValues::read(&mut req, settings, trace_path);
     // The request's one geo lookup serves `finalize` here and, from the
     // request extensions, every later step that uses geo.
@@ -348,10 +353,14 @@ fn serve(
         values.prepare(extensions, settings, &queue);
     };
     let inputs = FinalizeInputs {
-        settings,
+        state,
         geo: request_geo.geo(),
         counters,
     };
+    // Identity lookups a navigation dispatches wait in a request-local slot
+    // until `finalize` collects them. Drop anything an earlier request on
+    // this sandbox left there, which cancels its requests.
+    drop(take_navigation_lookups());
     let delivery = send_request_with_registries_and_hooks(
         &retained.app,
         TrustedServerApp::stores(),
@@ -359,9 +368,11 @@ fn serve(
         prepare,
         |response: &mut HttpResponse| finalize_response(response, &inputs),
     );
-    handle_delivery(delivery, counters, |state| {
-        run_post_delivery(state, &queue, settings, &counters.log_context());
+    handle_delivery(delivery, counters, |finalized| {
+        run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
+    // A detached response never reaches `finalize`; release its lookups now.
+    drop(take_navigation_lookups());
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -460,7 +471,9 @@ impl ClientRequestValues {
 
 /// What the `finalize` step reads besides the routed response.
 struct FinalizeInputs<'a> {
-    settings: &'a Settings,
+    /// The retained application state; its settings, partner registry and
+    /// identity coordinators.
+    state: &'a AppState,
     /// The geo lookup the entry point ran once for this request.
     geo: Option<&'a GeoInfo>,
     counters: &'a SandboxCounters,
@@ -473,14 +486,22 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters.
+/// sandbox counters. EC finalization first collects the identity lookups the
+/// navigation dispatched.
 ///
-/// Returns the pull-sync inputs post-delivery work needs, or `None` when the
-/// response carries no EC state or its partner registry cannot be built.
+/// Returns the inputs post-delivery work needs, pull sync and after-response
+/// lookups, or `None` when the response carries no EC state.
 fn finalize_response(
     response: &mut HttpResponse,
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
+    let settings = inputs.state.settings.as_ref();
+    // Identity lookups this request dispatched, taken whatever the response
+    // so none outlives it.
+    let NavigationLookups {
+        page: identity,
+        after_response,
+    } = take_navigation_lookups();
     // Trace responses keep their exact hardened headers; no finalizer touches them.
     if response
         .extensions()
@@ -496,38 +517,34 @@ fn finalize_response(
 
     if !take_finalize_sentinel(response) {
         let geo = resolve_geo_for_response(response, inputs.geo);
-        apply_finalize_headers(inputs.settings, geo, response);
+        apply_finalize_headers(settings, geo, response);
     }
 
     if let Some(policy) = asset_cache_policy {
         policy.apply_after_route_finalization(response, EdgeCacheHeader::SurrogateControl);
     }
 
-    let state = ec_state.and_then(|mut ec_state| {
+    let state = ec_state.map(|mut ec_state| {
         // `EdgeZero` calls `finalize` synchronously after its dispatch executor
         // has returned, and Fastly's KV SDK completes I/O through blocking
         // hostcalls. Keep this bridge here, never in native or worker executors.
-        match futures::executor::block_on(apply_edgezero_ec_finalize(
-            inputs.settings,
+        // Identity lookups are collected inside it, so their wait never nests
+        // in the router's executor.
+        let partner_registry = futures::executor::block_on(apply_edgezero_ec_finalize(
+            inputs.state,
             &mut ec_state,
+            identity,
             response,
-        )) {
-            Ok(partner_registry) => Some(FinalizeState {
-                partner_registry,
-                ec_state,
-            }),
-            Err(e) => {
-                log::error!(
-                    "EC finalize skipped: failed to build partner registry: {e:?}{}",
-                    inputs.counters.log_context()
-                );
-                None
-            }
+        ));
+        FinalizeState {
+            partner_registry,
+            ec_state,
+            after_response,
         }
     });
 
     apply_terminal_response_effects(response, request_filter_effects.as_ref());
-    if metrics_enabled(inputs.settings) {
+    if metrics_enabled(settings) {
         attach_sandbox_counters(response, inputs.counters);
     }
     state
@@ -642,12 +659,36 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
+/// Runs EC finalization for a routed response and returns the partner registry.
+///
+/// Collects `identity` lookups first, unless the response is a redirect,
+/// whose navigation writes nothing. The caller drives this future with the
+/// one `block_on` outside the router's executor.
 async fn apply_edgezero_ec_finalize(
-    settings: &Settings,
+    state: &AppState,
     ec_state: &mut EcFinalizeState,
+    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+) -> Arc<PartnerRegistry> {
+    let settings = state.settings.as_ref();
+    // A redirect skips the write, so do not wait for lookups it would discard.
+    let identity = identity.filter(|_| {
+        let redirect = NavigationPermit::is_redirect(response.status());
+        if redirect {
+            log::debug!("Identity lookups dropped: redirect response skips the write");
+        }
+        !redirect
+    });
+    if let Some(IdentityLookups {
+        coordinator,
+        transport,
+        pending,
+    }) = identity
+    {
+        let results = coordinator.collect(&transport, pending).await;
+        ec_state.ec_context.set_lookup_results(results);
+    }
+    let partner_registry = state.partner_registry();
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {
@@ -663,7 +704,7 @@ async fn apply_edgezero_ec_finalize(
         response,
     )
     .await;
-    Ok(partner_registry)
+    partner_registry
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -860,6 +901,11 @@ mod tests {
         settings
     }
 
+    /// The retained application state `finalize` reads, built from `settings`.
+    fn app_state(settings: &Settings) -> Arc<AppState> {
+        crate::app::build_state_from_settings(settings.clone()).expect("should build the app state")
+    }
+
     fn counters() -> SandboxCounters {
         SandboxCounters {
             ordinal: 2,
@@ -910,7 +956,7 @@ mod tests {
         let state = finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1060,7 +1106,7 @@ mod tests {
             let state = finalize_response(
                 &mut response,
                 &FinalizeInputs {
-                    settings: &settings,
+                    state: &app_state(&settings),
                     geo: None,
                     counters: &counters,
                 },
@@ -1186,7 +1232,7 @@ mod tests {
             let retained = retained_app(&sandbox).expect("should retain the app");
             let counters = SandboxCounters::capture(&sandbox, request + 1, "request-example");
             let inputs = FinalizeInputs {
-                settings: &settings,
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             };
@@ -1244,7 +1290,7 @@ mod tests {
         let retained = retained_app(&sandbox).expect("should retain the app");
         let counters = SandboxCounters::capture(&sandbox, 1, "request-example");
         let inputs = FinalizeInputs {
-            settings: &settings,
+            state: &app_state(&settings),
             geo: None,
             counters: &counters,
         };
@@ -1410,7 +1456,7 @@ mod tests {
         let geo = sample_geo();
         let counters = counters();
         let inputs = FinalizeInputs {
-            settings: &settings,
+            state: &app_state(&settings),
             geo: Some(&geo),
             counters: &counters,
         };
@@ -1529,7 +1575,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },
@@ -1556,7 +1602,7 @@ mod tests {
         finalize_response(
             &mut response,
             &FinalizeInputs {
-                settings: &settings,
+                state: &app_state(&settings),
                 geo: None,
                 counters: &counters,
             },
