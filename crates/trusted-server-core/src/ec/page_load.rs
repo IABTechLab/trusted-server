@@ -39,8 +39,8 @@ impl NavigationPermit {
     /// [`is_navigation_request`]: `Sec-Fetch-Dest: document`, or, without
     /// Fetch Metadata, an `Accept` header naming `text/html`.
     ///
-    /// The method is left to the caller, so each adapter keeps its own
-    /// navigation rule (Axum requires `GET`; Fastly accepts any method).
+    /// This classifier checks navigation signals only. The shared identity
+    /// application requires `GET` before calling it for a publisher navigation.
     ///
     /// Call once per request, from the publisher-proxy route only.
     #[must_use]

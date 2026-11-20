@@ -928,7 +928,7 @@ The examples below use fictional IDs and values only.
 
 Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
 
-This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+Fastly and Axum implement this lookup through the shared record service when identity storage is configured. Without a record service, the route returns `501 Not Implemented`, as it does on Cloudflare and Spin.
 
 **Response fields:**
 

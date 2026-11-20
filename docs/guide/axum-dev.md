@@ -112,10 +112,11 @@ sessions.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
+Axum implements the read-only `/_ts/admin/eids` diagnostic and EC record lookup
+through the configured shared record service. Record lookup returns 501 without
+identity storage; key rotation and other administrative mutations remain
+unsupported. It sanitizes forwarded client-IP headers but does not resolve
+`[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

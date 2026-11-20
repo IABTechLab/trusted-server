@@ -206,8 +206,8 @@ impl FastlyAdapter {
             cookies.push(format!("ts-ec={identity}"));
         }
         let document = navigation.destination == "document";
-        // A browser sends `navigate` only for a document navigation, and the
-        // page-load write permit requires both headers.
+        // Model browser Fetch Metadata; the shared classifier uses the
+        // destination and does not require Sec-Fetch-Mode.
         let mut request = FastlyRequest::get("https://publisher.example.com/article")
             .with_header("sec-fetch-dest", navigation.destination)
             .with_header(
