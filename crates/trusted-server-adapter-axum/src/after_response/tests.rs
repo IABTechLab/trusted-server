@@ -34,6 +34,7 @@ use trusted_server_core::ec::kv_backend::{
 use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::rate_limiter::NoRateLimit;
+use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::test_support::nextjs_auction;
@@ -283,7 +284,7 @@ impl Hooks for FixtureApp {
                     Some(&graph),
                     identity.partners(),
                     None,
-                    None,
+                    &SharedIdRequest::default(),
                     &mut response,
                 )
                 .await;
@@ -806,7 +807,7 @@ async fn registration_case(permit: bool) -> RegistrationCase {
             Some(&graph),
             identity.partners(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut Response::new(Body::empty()),
         )
         .await;

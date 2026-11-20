@@ -22,10 +22,12 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::sharedid::SharedIdStorage;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
+use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -509,8 +511,8 @@ pub struct EcPartner {
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
     /// Whether this partner's provider-written UIDs are mirrored to the
-    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
-    /// effect only with `bidstream_enabled`.
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default;
+    /// requires `bidstream_enabled`, and setting it alone is rejected.
     #[serde(
         default,
         skip_serializing_if = "is_false",
@@ -557,8 +559,9 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Whether this partner runs pull sync as an identity provider, which
-    /// makes its source provider-owned.
+    /// Whether this partner runs pull sync as an identity provider. Its
+    /// source is not provider-owned, so browser ingest and batch sync still
+    /// fill it.
     #[must_use]
     pub fn runs_pull_sync(&self) -> bool {
         self.pull_sync_enabled && self.pull_sync_url.is_some()
@@ -916,7 +919,7 @@ impl Ec {
         }
     }
 
-    /// Default maximum concurrent pull-sync requests.
+    /// Default maximum pull-sync lookups per navigation.
     #[must_use]
     pub const fn default_pull_sync_concurrency() -> usize {
         3
@@ -3728,6 +3731,7 @@ impl Settings {
             handler.prepare_runtime()?;
         }
 
+        let sharedid_storage = self.sharedid_storage();
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3740,11 +3744,18 @@ impl Settings {
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
-            co.validate_runtime().map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("Invalid creative opportunity slot config: {err}"),
+            co.validate_runtime()
+                .and_then(|()| {
+                    crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
+                        co.template_cache_key_cookies(),
+                        sharedid_storage.cookie_name(),
+                    )
                 })
-            })?;
+                .map_err(|err| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("Invalid creative opportunity slot config: {err}"),
+                    })
+                })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -4094,6 +4105,27 @@ impl Settings {
         T: IntegrationConfig,
     {
         self.integrations.get_typed(integration_id)
+    }
+
+    /// Returns where Prebid keeps the `SharedID`, from the `sharedId` entry
+    /// of `integrations.prebid.managed_user_ids`.
+    ///
+    /// Parses the Prebid configuration on every call, so callers on a hot
+    /// path resolve it once at startup. An unreadable Prebid configuration
+    /// counts as [`SharedIdStorage::Unconfigured`].
+    #[must_use]
+    pub fn sharedid_storage(&self) -> SharedIdStorage {
+        match self.integration_config::<PrebidIntegrationConfig>("prebid") {
+            Ok(prebid) => SharedIdStorage::from_managed_user_ids(
+                prebid
+                    .as_ref()
+                    .map_or(&[][..], |prebid| prebid.managed_user_ids.as_slice()),
+            ),
+            Err(report) => {
+                log::warn!("SharedID: Prebid config unreadable: {report}");
+                SharedIdStorage::Unconfigured
+            }
+        }
     }
 }
 

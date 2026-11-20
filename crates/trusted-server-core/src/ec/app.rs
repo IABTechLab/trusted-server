@@ -2,7 +2,7 @@
 //!
 //! [`IdentityApp`] holds the identity state that every adapter needs: the
 //! settings, the partner registry, the identity-provider coordinators, the EC
-//! record store and the rate limiter. An adapter builds it once per process
+//! record store, the rate limiter and where Prebid keeps the `SharedID`. An adapter builds it once per process
 //! or isolate from the platform services it supplies through
 //! [`IdentityPlatform`], so no identity route rebuilds that state per request.
 //!
@@ -30,6 +30,7 @@ use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvStore;
 use super::rate_limiter::{NoRateLimit, RateLimiter};
 use super::registry::PartnerRegistry;
+use super::sharedid::SharedIdStorage;
 
 /// Platform services an adapter supplies to the [`IdentityApp`].
 ///
@@ -76,6 +77,7 @@ pub struct IdentityApp {
     after_response_identity: Option<Arc<ProviderCoordinator>>,
     record_store: Option<Arc<dyn EcKvStore + Send + Sync>>,
     rate_limiter: Arc<dyn RateLimiter + Send + Sync>,
+    sharedid_storage: SharedIdStorage,
 }
 
 impl IdentityApp {
@@ -120,6 +122,7 @@ impl IdentityApp {
                 None,
             ),
         };
+        let sharedid_storage = settings.sharedid_storage();
         Ok(Arc::new(Self {
             settings,
             partners,
@@ -127,6 +130,7 @@ impl IdentityApp {
             after_response_identity,
             record_store: platform.record_store,
             rate_limiter,
+            sharedid_storage,
         }))
     }
 
@@ -171,6 +175,12 @@ impl IdentityApp {
     #[must_use]
     pub fn rate_limiter(&self) -> &dyn RateLimiter {
         self.rate_limiter.as_ref()
+    }
+
+    /// Returns where Prebid keeps the `SharedID`, resolved once at startup.
+    #[must_use]
+    pub fn sharedid_storage(&self) -> &SharedIdStorage {
+        &self.sharedid_storage
     }
 
     /// Registers the identity routes the core app owns on `router`.
@@ -228,7 +238,13 @@ impl IdentityApp {
 
     fn admin_eids_lookup(&self, request: Request) -> Response {
         self.prepare(request)
-            .and_then(|request| handle_admin_eids_lookup(&self.partners, &request))
+            .and_then(|request| {
+                handle_admin_eids_lookup(
+                    &self.partners,
+                    self.sharedid_storage.cookie_name(),
+                    &request,
+                )
+            })
             .unwrap_or_else(|report| http_error(&report))
     }
 
@@ -398,6 +414,34 @@ mod tests {
             response.status(),
             StatusCode::OK,
             "should answer the EIDs echo without a record store"
+        );
+    }
+
+    #[test]
+    fn build_resolves_the_sharedid_storage_from_prebid() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } },
+                    "managed_user_ids": [
+                        { "name": "sharedId", "storage": { "type": "cookie", "name": "_pubcid" } }
+                    ],
+                }),
+            )
+            .expect("should configure Prebid");
+
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build the identity app");
+
+        assert_eq!(
+            app.sharedid_storage(),
+            &SharedIdStorage::Cookie("_pubcid".to_owned()),
+            "should resolve the SharedID cookie named by Prebid's storage.name"
         );
     }
 

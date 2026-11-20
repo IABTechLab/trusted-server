@@ -808,9 +808,10 @@ mod tests {
             AfterResponseOutcome::Written,
             "should store the provider UID first"
         );
-        let opted_out = opt_out(vec![
-            SourceDomain::try_from("ids.example.com").expect("should build source"),
-        ]);
+        let opted_out = opt_out(
+            LookupStatus::OptedOut,
+            vec![SourceDomain::try_from("ids.example.com").expect("should build source")],
+        );
 
         // Act
         let outcome = commit_after_response_lookups(
@@ -835,12 +836,82 @@ mod tests {
         );
     }
 
-    fn opt_out(cleared: Vec<SourceDomain>) -> LookupResults {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_lookup_does_not_restore_a_source_after_a_newer_cookie_opt_out() {
+        // Arrange: the provider's UID is stored; a lookup is dispatched
+        // against that row, then a newer request's cookie opt-out clears the
+        // source before the lookup's result is written.
+        let graph = KvIdentityGraph::in_memory("after-response");
+        graph
+            .create(EC_ID, &live_entry())
+            .await
+            .expect("should seed row");
+        let seeded = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &found(EC_ID, "p-before-optout"),
+        )
+        .await;
+        assert_eq!(
+            seeded,
+            AfterResponseOutcome::Written,
+            "should store the provider UID first"
+        );
+        let dispatched_revocations = graph
+            .load_snapshot(EC_ID)
+            .await
+            .entry_for(EC_ID)
+            .map(|entry| entry.revocations.clone())
+            .unwrap_or_default();
+        let delayed = found(EC_ID, "late-result").dispatched_with(dispatched_revocations);
+        let cleared = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &opt_out(
+                LookupStatus::OptedOut,
+                vec![SourceDomain::try_from("ids.example.com").expect("should build source")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            cleared,
+            AfterResponseOutcome::Written,
+            "should clear the source on the cookie opt-out"
+        );
+
+        // Act
+        let outcome = commit_after_response_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &delayed,
+        )
+        .await;
+
+        // Assert
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::Unchanged,
+            "should discard the delayed result"
+        );
+        assert_eq!(
+            stored_uid(&graph, "ids.example.com").await,
+            None,
+            "should keep the opted-out source cleared"
+        );
+    }
+
+    fn opt_out(status: LookupStatus, cleared: Vec<SourceDomain>) -> LookupResults {
         LookupResults::new(
             EC_ID,
             vec![ProviderLookup {
                 provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                status,
                 entries: Vec::new(),
                 cleared,
                 opt_out: OptOutMemory::Unchanged,
@@ -859,7 +930,7 @@ mod tests {
             AfterResponseWrite::for_test(),
             &registry(),
             EC_ID,
-            &opt_out(Vec::new()),
+            &opt_out(LookupStatus::Skipped(SkipReason::OptedOut), Vec::new()),
         )
         .await;
 
