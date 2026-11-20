@@ -1,0 +1,18 @@
+# Runtime process-environment reads must use the compile-time checked macro.
+# Compiler name resolution covers aliases, function values and macro expansions.
+# Build scripts are explicitly exempt; tests are not production lint targets.
+disallowed-methods = [
+    { path = "std::env::var", reason = "use trusted_server_core::runtime_env! with a statically approved name" },
+    { path = "std::env::var_os", reason = "use trusted_server_core::runtime_env! with a statically approved name" },
+    { path = "std::env::vars", reason = "runtime environment scans cannot establish approved names" },
+    { path = "std::env::vars_os", reason = "runtime environment scans cannot establish approved names" },
+    { path = "std::env::home_dir", reason = "implicitly reads an unapproved process-environment name" },
+    { path = "std::env::temp_dir", reason = "implicitly reads platform process-environment names" },
+    # libc APIs vary by target and may not be linked by a serving crate.
+    { path = "libc::getenv", allow-invalid = true, reason = "runtime process-environment reads must use the checked macro" },
+    { path = "libc::secure_getenv", allow-invalid = true, reason = "runtime process-environment reads must use the checked macro" },
+]
+# Settings' legacy loader is test-only. Production must use prepared stores.
+disallowed-types = [
+    { path = "config::Environment", reason = "runtime configuration must use prepared stores, not an environment scan" },
+]
