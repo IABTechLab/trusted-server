@@ -83,7 +83,6 @@
 //! `EdgeZero`'s assembly-error response, which carries no TS headers, and
 //! retains nothing, so the next request retries.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -462,13 +461,20 @@ pub(crate) struct EcFinalizeState {
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid: SharedIdRequest,
+    /// After-response identity work this navigation hands to post-delivery.
+    pub(crate) after_response: Option<AfterResponseLookups>,
 }
 
-/// Identity lookups dispatched for this navigation, collected before finalize.
-pub(crate) struct IdentityLookups {
-    pub(crate) coordinator: Arc<ProviderCoordinator>,
-    pub(crate) transport: OutboundLookupTransport,
-    pub(crate) pending: PendingLookups<InFlightLookups>,
+/// Identity lookups dispatched for this navigation.
+///
+/// The in-flight `EdgeZero` batch is not `Send`, so it never leaves the
+/// handler: [`collect_identity_lookups`] awaits it before the response
+/// carries [`EcFinalizeState`], and only the collected results, which are
+/// `Send`, reach EC finalization on the request's [`EcContext`].
+struct IdentityLookups {
+    coordinator: Arc<ProviderCoordinator>,
+    transport: OutboundLookupTransport,
+    pending: PendingLookups<InFlightLookups>,
 }
 
 /// What a navigation's after-response identity lookups need once the response
@@ -476,7 +482,8 @@ pub(crate) struct IdentityLookups {
 ///
 /// The router owns the request, so the request signals the providers read are
 /// copied here. The lookups are dispatched only after the response, so they
-/// never delay the page.
+/// never delay the page. They travel to post-delivery in [`EcFinalizeState`].
+#[derive(Clone)]
 pub(crate) struct AfterResponseLookups {
     pub(crate) coordinator: Arc<ProviderCoordinator>,
     pub(crate) ec_id: String,
@@ -485,32 +492,30 @@ pub(crate) struct AfterResponseLookups {
     pub(crate) cookie_header: String,
 }
 
-/// Identity work a navigation hands to the entry point.
+/// Collects a navigation's page-phase identity lookups into `ec_context`.
 ///
-/// An in-flight `EdgeZero` batch is not `Send`, so it cannot ride in response
-/// extensions with [`EcFinalizeState`], and `EdgeZero` offers no other
-/// request-scoped slot that both the handler and `finalize` reach. The work
-/// travels through one request-local slot instead: the entry point clears it
-/// before sending the request and `finalize` takes it. The batch stays bound to
-/// the serving callback's outbound scope, which outlives `finalize`.
-#[derive(Default)]
-pub(crate) struct NavigationLookups {
-    /// Page-phase lookups, collected before EC finalization.
-    pub(crate) page: Option<IdentityLookups>,
-    /// After-response lookups, dispatched once the response has been sent.
-    pub(crate) after_response: Option<AfterResponseLookups>,
-}
-
-thread_local! {
-    static NAVIGATION_LOOKUPS: RefCell<NavigationLookups> = RefCell::new(NavigationLookups::default());
-}
-
-/// Takes the identity work stored for the current request.
-///
-/// The entry point calls this before routing (discarding anything a prior
-/// request left behind) and after the router returns.
-pub(crate) fn take_navigation_lookups() -> NavigationLookups {
-    NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+/// Runs in the handler once the response status is known, so the batch,
+/// which is not `Send`, never enters response extensions. The lookups were
+/// dispatched before the origin fetch, so their wait overlaps it, and their
+/// results reach the page-load write in EC finalization. A redirect skips
+/// that write, so its lookups are dropped, which cancels them, without
+/// waiting.
+async fn collect_identity_lookups(
+    lookups: IdentityLookups,
+    ec_context: &mut EcContext,
+    status: StatusCode,
+) {
+    if NavigationPermit::is_redirect(status) {
+        log::debug!("Identity lookups dropped: redirect response skips the write");
+        return;
+    }
+    let IdentityLookups {
+        coordinator,
+        transport,
+        pending,
+    } = lookups;
+    let results = coordinator.collect(&transport, pending).await;
+    ec_context.set_lookup_results(results);
 }
 
 /// Request signals lent to identity providers.
@@ -597,7 +602,7 @@ async fn dispatch_identity_lookups(
         ec.ec_context.set_kv_snapshot(snapshot);
     }
     // The request's own client: the batch it starts is bound to the serving
-    // callback, so it stays in flight until `finalize` collects it.
+    // callback, so it stays in flight until the handler collects it.
     let transport = OutboundLookupTransport::for_services(services);
     let signals = ProviderRequestSignals::read(req, services);
     let now = trusted_server_core::ec::current_timestamp();
@@ -669,6 +674,8 @@ struct EcRequestState {
     use_finalize_kv: bool,
     eids_cookie: Option<String>,
     sharedid: SharedIdRequest,
+    /// After-response identity work captured on a publisher navigation.
+    after_response: Option<AfterResponseLookups>,
     is_real_browser: bool,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
@@ -688,6 +695,7 @@ impl EcRequestState {
             use_finalize_kv: self.use_finalize_kv,
             eids_cookie: self.eids_cookie,
             sharedid: self.sharedid,
+            after_response: self.after_response,
         }
     }
 }
@@ -789,6 +797,7 @@ fn build_ec_request_state(
         use_finalize_kv,
         eids_cookie,
         sharedid,
+        after_response: None,
         is_real_browser,
         geo_info,
         setup_error,
@@ -1081,6 +1090,7 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
         use_finalize_kv: false,
         eids_cookie,
         sharedid,
+        after_response: None,
     });
     response
 }
@@ -1138,6 +1148,9 @@ async fn dispatch_fallback(
         PreRoute::Continue { effects } => effects,
     };
 
+    // Page-phase identity lookups a publisher navigation dispatches, collected
+    // below once the response status is known.
+    let mut page_lookups = None;
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
         handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
@@ -1194,18 +1207,15 @@ async fn dispatch_fallback(
         }
 
         // Identity lookups start before the origin fetch so they overlap it;
-        // the entry point collects them before EC finalization.
-        if is_publisher_navigation
-            && let Some(lookups) = dispatch_identity_lookups(state, services, &req, &mut ec).await
-        {
-            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        // they are collected once the response status is known, before EC
+        // finalization.
+        if is_publisher_navigation {
+            page_lookups = dispatch_identity_lookups(state, services, &req, &mut ec).await;
         }
         // After-response providers only capture request signals here; they
         // are built and dispatched once the response has been sent.
-        if is_publisher_navigation
-            && let Some(lookups) = prepare_after_response_lookups(state, services, &req, &ec)
-        {
-            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
+        if is_publisher_navigation {
+            ec.after_response = prepare_after_response_lookups(state, services, &req, &ec);
         }
 
         // Run the server-side auction with the configured creative-
@@ -1262,6 +1272,9 @@ async fn dispatch_fallback(
     };
 
     let response = result.unwrap_or_else(|e| http_error(&e));
+    if let Some(lookups) = page_lookups {
+        collect_identity_lookups(lookups, &mut ec.ec_context, response.status()).await;
+    }
     attach_dispatch_extensions(response, ec, effects)
 }
 
@@ -3600,9 +3613,9 @@ mod tests {
 
         let mut response = route(&router, navigation_request("/article"));
 
-        let _state = take_finalize_state(&mut response);
+        let state = take_finalize_state(&mut response);
         assert!(
-            super::take_navigation_lookups().page.is_none(),
+            !state.ec_context.has_lookup_results_for_test(),
             "should dispatch no identity lookups without enabled providers"
         );
     }
@@ -3683,6 +3696,7 @@ mod tests {
                     use_finalize_kv: false,
                     eids_cookie: None,
                     sharedid: super::SharedIdRequest::default(),
+                    after_response: None,
                     is_real_browser: true,
                     geo_info: None,
                     setup_error: None,
@@ -3877,7 +3891,7 @@ mod tests {
     }
 
     /// Like [`finalized_navigation`], and also reports whether page-phase
-    /// lookups were dispatched.
+    /// lookups were dispatched and collected.
     fn finalized_navigation_with_page(
         fixture: &AfterResponseFixture,
         ec_id: Option<&str>,
@@ -3903,18 +3917,15 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_str(&cookie).expect("should build cookie header"),
         );
-        super::take_navigation_lookups();
-        // Page-phase lookups leave on the request's client while it routes.
-        let mut response = route_with_host_geo(&router, request, &fixture.client);
-        let navigation = super::take_navigation_lookups();
-        let lookups = navigation.after_response;
-        let page = navigation.page;
-        let page_dispatched = page.is_some();
+        // Page-phase lookups leave on the request's client while it routes,
+        // and the handler collects them on the fixture's clock.
+        let mut response = route_on_clock(&router, request, fixture);
         let mut ec_state = take_finalize_state(&mut response);
+        let page_dispatched = ec_state.ec_context.has_lookup_results_for_test();
+        let lookups = ec_state.after_response.take();
         fixture.clock.drive(crate::apply_edgezero_ec_finalize(
             &fixture.state,
             &mut ec_state,
-            page,
             &mut response,
         ));
         (ec_state, page_dispatched, lookups)
@@ -4007,26 +4018,48 @@ mod tests {
         request
     }
 
+    /// Routes `request` with the fixture's client, driving the handler on the
+    /// fixture's clock so its page-phase lookup collection can reach the
+    /// lookup deadline.
+    fn route_on_clock(
+        router: &RouterService,
+        mut request: Request,
+        fixture: &AfterResponseFixture,
+    ) -> Response {
+        insert_outbound_client(
+            &mut request,
+            HttpClient::with_client(fixture.client.clone()),
+        );
+        let client_ip = request
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>()
+            .client_ip;
+        request
+            .extensions_mut()
+            .insert(RequestGeo::lookup_once(client_ip));
+        fixture
+            .clock
+            .drive(router.oneshot(request))
+            .expect("should route request")
+    }
+
     /// Routes a request whose response carries EC state and finalizes it as
     /// the entry point does, returning the response, whether page-phase
-    /// lookups were dispatched and how long finalization held the response
-    /// on the fixture's clock.
+    /// lookups were dispatched and collected, and how long routing and
+    /// finalization held the response on the fixture's clock.
     fn finalized_response(
         fixture: &AfterResponseFixture,
         request: Request,
     ) -> (Response, bool, Duration) {
         let router = TrustedServerApp::routes_for_state(&fixture.state);
-        super::take_navigation_lookups();
-        let mut response = route_with_host_geo(&router, request, &fixture.client);
-        let page = super::take_navigation_lookups().page;
-        let dispatched = page.is_some();
-        let mut ec_state = take_finalize_state(&mut response);
         let clock = fixture.clock.monotonic_clock();
         let started = clock.now();
+        let mut response = route_on_clock(&router, request, fixture);
+        let mut ec_state = take_finalize_state(&mut response);
+        let dispatched = ec_state.ec_context.has_lookup_results_for_test();
         fixture.clock.drive(crate::apply_edgezero_ec_finalize(
             &fixture.state,
             &mut ec_state,
-            page,
             &mut response,
         ));
         let held = clock.now().duration_since(started);

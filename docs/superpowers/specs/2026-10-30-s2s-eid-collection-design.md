@@ -1034,7 +1034,9 @@ unresolved as `Timeout` (every unresolved slot of a failed batch as `Send`). It
 adds no timing logic of its own. Dropping the pending batch cancels every lookup
 still in flight. On a navigation the request's own client starts the batch
 during routing; the batch stays bound to the serving callback's outbound scope
-and is gathered in `finalize`. After-response lookups use the post-delivery
+and the handler gathers it once the response status is known, before the
+response reaches `finalize`. The batch is not `Send`, so only the gathered
+results travel on, on the EC context. After-response lookups use the post-delivery
 client and clock.
 
 #### 8.1.2 `IdentityCoordinator`

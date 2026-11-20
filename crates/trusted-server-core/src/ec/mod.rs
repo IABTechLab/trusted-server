@@ -714,6 +714,13 @@ impl EcContext {
         &self.lookup_results
     }
 
+    /// Whether provider lookup results were collected, for adapter tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn has_lookup_results_for_test(&self) -> bool {
+        !self.lookup_results.is_empty()
+    }
+
     /// Takes the row built by [`Self::generate_if_needed`].
     /// The row this navigation creates for the EC it minted, until finalize
     /// takes it.

@@ -17,10 +17,8 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
-use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -48,8 +46,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
-    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+    load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
 use crate::middleware::{
@@ -352,10 +350,6 @@ fn serve(
         geo: request_geo.geo(),
         counters,
     };
-    // Identity lookups a navigation dispatches wait in a request-local slot
-    // until `finalize` collects them. Drop anything an earlier request on
-    // this sandbox left there, which cancels its requests.
-    drop(take_navigation_lookups());
     let delivery = send_request_with_registries_and_hooks(
         &retained.app,
         TrustedServerApp::stores(),
@@ -366,8 +360,6 @@ fn serve(
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
-    // A detached response never reaches `finalize`; release its lookups now.
-    drop(take_navigation_lookups());
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -481,8 +473,8 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters. EC finalization first collects the identity lookups the
-/// navigation dispatched.
+/// sandbox counters. The handler has already collected the navigation's
+/// page-phase identity lookups into the EC context.
 ///
 /// Returns the inputs post-delivery work needs, pull sync and after-response
 /// lookups, or `None` when the response carries no EC state.
@@ -491,12 +483,6 @@ fn finalize_response(
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
     let settings = inputs.state.settings.as_ref();
-    // Identity lookups this request dispatched, taken whatever the response
-    // so none outlives it.
-    let NavigationLookups {
-        page: identity,
-        after_response,
-    } = take_navigation_lookups();
     // Trace responses keep their exact hardened headers; no finalizer touches them.
     if response
         .extensions()
@@ -523,14 +509,14 @@ fn finalize_response(
         // `EdgeZero` calls `finalize` synchronously after its dispatch executor
         // has returned, and Fastly's KV SDK completes I/O through blocking
         // hostcalls. Keep this bridge here, never in native or worker executors.
-        // Identity lookups are collected inside it, so their wait never nests
-        // in the router's executor.
+        // The navigation's page-phase identity lookups were already collected
+        // by the handler into the EC context.
         futures::executor::block_on(apply_edgezero_ec_finalize(
             inputs.state,
             &mut ec_state,
-            identity,
             response,
         ));
+        let after_response = ec_state.after_response.take();
         FinalizeState {
             identity: Arc::clone(&inputs.state.identity),
             ec_state,
@@ -657,32 +643,14 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// Runs EC finalization for a routed response with the identity app's partner
 /// registry and record store.
 ///
-/// Collects `identity` lookups first, unless the response is a redirect,
-/// whose navigation writes nothing. The caller drives this future with the
-/// one `block_on` outside the router's executor.
+/// The navigation's page-phase lookup results are already on the EC context.
+/// The caller drives this future with the one `block_on` outside the
+/// router's executor.
 async fn apply_edgezero_ec_finalize(
     state: &AppState,
     ec_state: &mut EcFinalizeState,
-    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) {
-    // A redirect skips the write, so do not wait for lookups it would discard.
-    let identity = identity.filter(|_| {
-        let redirect = NavigationPermit::is_redirect(response.status());
-        if redirect {
-            log::debug!("Identity lookups dropped: redirect response skips the write");
-        }
-        !redirect
-    });
-    if let Some(IdentityLookups {
-        coordinator,
-        transport,
-        pending,
-    }) = identity
-    {
-        let results = coordinator.collect(&transport, pending).await;
-        ec_state.ec_context.set_lookup_results(results);
-    }
     let identity_app = &state.identity;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         identity_app.identity_graph()
@@ -1489,6 +1457,7 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            after_response: None,
         });
 
         let state = finalize_response(&mut page, &inputs);
