@@ -9,7 +9,7 @@ stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
 ## Pinned version
 
 The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
-`IABTechLab/edgezero`: `f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`, a commit of
+`IABTechLab/edgezero`: `9d02d7b3185b49e81d9ac972ca3feef932ed848a`, a commit of
 EdgeZero's `rc/identity` integration branch. That branch carries pull request
 275 and the identity work built on it. The pin moves with the branch until
 those pull requests merge, and then to an EdgeZero release tag.
@@ -97,7 +97,7 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
   60 s for a streamed one. A redirect chain also has a 60 s deadline. EdgeZero
   enforces the connect timeout natively on Fastly only. On Axum, Cloudflare,
   and Spin it is best effort, and the total timeout still bounds the request.
-- Origin TLS is always verified.
+- TLS is always verified on every outbound HTTPS request.
 - A request that sets no `Accept-Encoding` carries `Accept-Encoding: identity`.
 - Hop-by-hop fields, and fields that `Connection` names, never reach an
   upstream or come back from one. A request or response header whose value is
@@ -113,8 +113,10 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
   error answers 500 before the response is committed.
 - A response body must finish within 60 s after egress starts.
 - Framework errors, such as a 404, 405, 414, or 431, render as EdgeZero JSON
-  and carry `x-ts-version`. A startup failure response carries no
-  `x-ts-version`.
+  and carry `x-ts-version`. A startup failure answers the fixed response of the
+  [operational response contract](./api-reference#operational-probe-contract),
+  which carries `x-ts-version`. Only EdgeZero's Fastly assembly-error
+  response, for a method outside the publisher fallback set, carries none.
 
 ## Safe operator sequence
 
