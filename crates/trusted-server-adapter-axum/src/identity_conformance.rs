@@ -136,11 +136,15 @@ impl AxumAdapter {
                 ..ClientInfo::default()
             })
             .build();
+        let mut configured = settings();
+        if let Some(api) = api {
+            configured.auction.enabled = api.auction_enabled;
+        }
         let router = if api.is_some_and(|request| !request.store_enabled) {
-            TrustedServerApp::routes_with_settings_and_services(settings(), services)
+            TrustedServerApp::routes_with_settings_and_services(configured, services)
         } else {
             TrustedServerApp::routes_with_settings_services_and_ec_store(
-                settings(),
+                configured,
                 services,
                 self.store.clone(),
             )

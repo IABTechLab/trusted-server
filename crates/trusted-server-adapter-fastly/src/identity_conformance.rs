@@ -148,6 +148,7 @@ impl FastlyAdapter {
         let before_requests = self.origin.requests().len();
         if let Some(api) = api {
             let mut configured = self.settings.clone();
+            configured.auction.enabled = api.auction_enabled;
             configured.ec.ec_store = api.store_enabled.then(|| "trusted_server_kv".to_owned());
             let _guard = StoreGuard::install(&self.store);
             self.retained =

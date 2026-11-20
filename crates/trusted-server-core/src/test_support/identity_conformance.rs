@@ -1,5 +1,6 @@
 //! Portable record-store fixtures for adapter identity conformance.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -34,7 +35,7 @@ pub enum Event {
 struct StoreState {
     inner: InMemoryEcKv,
     events: Mutex<Vec<Event>>,
-    fail_writes: bool,
+    fail_writes: AtomicBool,
 }
 
 /// An inspectable store sharing authoritative state across request-local graphs.
@@ -59,8 +60,13 @@ impl RecordingStore {
         Self(Arc::new(StoreState {
             inner: InMemoryEcKv::new("identity-conformance"),
             events: Mutex::new(Vec::new()),
-            fail_writes,
+            fail_writes: AtomicBool::new(fail_writes),
         }))
+    }
+
+    /// Changes write failure without replacing the authoritative fixture rows.
+    pub fn reject_writes(&self, rejected: bool) {
+        self.0.fail_writes.store(rejected, Ordering::SeqCst);
     }
 
     /// Returns the ordered observations recorded so far.
@@ -110,7 +116,7 @@ impl EcKvStore for RecordingStore {
         key: &str,
         write: EcKvWrite<'_>,
     ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-        if self.0.fail_writes {
+        if self.0.fail_writes.load(Ordering::SeqCst) {
             self.0
                 .events
                 .lock()
@@ -685,6 +691,8 @@ pub struct ApiRequest {
     pub body: String,
     /// Whether the application has configured its record service.
     pub store_enabled: bool,
+    /// Whether bidding is enabled independently of identity storage.
+    pub auction_enabled: bool,
     /// Publisher response type for fallback controls.
     pub origin_content_type: &'static str,
 }
@@ -699,6 +707,7 @@ impl ApiRequest {
             headers: Vec::new(),
             body: String::new(),
             store_enabled: true,
+            auction_enabled: true,
             origin_content_type: "application/json",
         }
     }
@@ -742,6 +751,7 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
          "api_token":"example-partner-token-at-least-32-bytes"},
         {"name":"SharedID fixture","source_domain":"pubcid.org","bidstream_enabled":true},
         {"name":"Body fixture","source_domain":"body.example.com","bidstream_enabled":true},
+        {"name":"Disabled body fixture","source_domain":"disabled-body.example.com","bidstream_enabled":true},
         {"name":"Mirror fixture","source_domain":"mirror.example.com","bidstream_enabled":true,"mirror_enabled":true},
         {"name":"Expired fixture","source_domain":"expired.example.com","bidstream_enabled":true,"mirror_enabled":true},
         {"name":"Denied fixture","source_domain":"denied.example.com","bidstream_enabled":true,"mirror_enabled":true}
@@ -934,6 +944,29 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should preserve the batch UID in the same row after body ingestion"
     );
 
+    let mut disabled = ApiRequest::new(http::Method::POST, "/auction");
+    disabled.auction_enabled = false;
+    disabled
+        .headers
+        .push(("cookie".to_owned(), cookies.clone()));
+    disabled.body = serde_json::json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}],"eids":[{"source":"disabled-body.example.com","uids":[{"id":"disabled-body-id","atype":1}]}]}).to_string();
+    let disabled = adapter.exchange(&disabled);
+    assert!(
+        disabled.response.status.is_success(),
+        "should retain disabled no-bid response"
+    );
+    assert_no_identity_cookies(&disabled.response);
+    assert_eq!(
+        block_on(graph.get(&key))
+            .expect("should read disabled body record")
+            .expect("should retain live record")
+            .0
+            .ids["disabled-body.example.com"]
+            .uid,
+        "disabled-body-id",
+        "should save body EIDs independently of bidding enablement"
+    );
+
     for path in ["/asset.js", "/publisher-api"] {
         let mut asset = ApiRequest::new(http::Method::GET, path);
         asset.headers.push((
@@ -1111,6 +1144,28 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should reject EC creation without a graph"
     );
     assert_no_identity_cookies(&unavailable.response);
+    let denied_tcf = tcf_consent_cookie(false);
+    let mut failed_withdrawal = ApiRequest::new(http::Method::POST, ec_path);
+    failed_withdrawal.headers = post.headers.clone();
+    failed_withdrawal.body = serde_json::json!({"tcfString":denied_tcf.strip_prefix("euconsent-v2=").expect("should encode denied consent"),"applicableSections":[]}).to_string();
+    store.reject_writes(true);
+    let failed_withdrawal = adapter.exchange(&failed_withdrawal);
+    store.reject_writes(false);
+    assert_eq!(
+        failed_withdrawal.response.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "should not acknowledge a failed authoritative withdrawal"
+    );
+    assert!(
+        block_on(graph.get(&key))
+            .expect("should read failed withdrawal")
+            .expect("should retain original live row")
+            .0
+            .consent
+            .ok,
+        "should prove the rejected write did not tombstone the record"
+    );
+
     let mut denied_api = ApiRequest::new(http::Method::GET, "/publisher-api");
     denied_api.headers.push((
         "cookie".to_owned(),

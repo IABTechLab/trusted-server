@@ -5,8 +5,8 @@ shortest path for inspecting requests without an edge runtime. The same binary
 is the production entry point: it loads config and secrets from prepared stores
 (local files, or AWS AppConfig and Secrets Manager), refuses to listen when
 any of them is missing, and drains in-flight requests on SIGTERM. See
-[Axum production startup](./native-rc-demo). Edge Cookie record storage on
-Axum is not available yet.
+[Axum production startup](./native-rc-demo). Edge Cookie records and partner APIs run through the shared identity app over
+EdgeZero's prepared record service; see [native EC persistence](./native-ec-persistence).
 
 ## Support status
 

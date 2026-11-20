@@ -46,25 +46,22 @@
 //!
 //! # EC identity lifecycle
 //!
-//! The `EdgeZero` path mirrors the EC identity lifecycle of the legacy
-//! `route_request` (tracked in issue #495):
+//! [`IdentityApp`] owns request preparation, record creation, partner dispatch,
+//! provider decisions and finalization. This adapter supplies platform services
+//! and retains only Fastly's response-delivery bridge:
 //!
-//! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth, and the read-only admin diagnostics)
-//!   and reproduces the legacy
-//!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
-//!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
-//! - `handle_auction` and integration proxy dispatch receive the same
-//!   [`EcContext`], [`KvIdentityGraph`], and [`PartnerRegistry`] inputs as
-//!   legacy; the publisher fallback generates EC IDs for browser navigations.
-//! - Handlers attach an [`EcFinalizeState`] to the response via extensions;
-//!   the entry point's `finalize` step pops it and runs `ec_finalize_response`,
-//!   and post-delivery work runs pull sync once the response is delivered.
+//! - [`build_ec_request_state`] delegates consent, device metadata and cookie
+//!   capture to the core app. Missing JA4 does not block identity creation.
+//! - Auction and publisher handlers share the request-local [`EcContext`] and
+//!   the app's one record service. Core classifies eligible GET navigations.
+//! - Routed responses carry [`EcFinalizeState`] to the entry point, which calls
+//!   [`IdentityApp::finalize`] before delivery. Post-delivery work delegates
+//!   provider and pull-sync decisions to the same app.
 //!
 //! ## Intentional deviations from legacy
 //!
 //! - **401 auth challenges**: [`AuthMiddleware`] short-circuits before the
-//!   handler runs, so no EC state is built and `ec_finalize_response` does not
+//!   handler runs, so no EC state is built and shared identity finalization does not
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
@@ -425,7 +422,7 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 /// response extensions.
 ///
 /// The entry point's `finalize` step pops this from the routed response and
-/// runs [`trusted_server_core::ec::finalize::ec_finalize_response`], and
+/// runs [`IdentityApp::finalize`], and
 /// post-delivery work runs pull sync from it, the same EC response lifecycle
 /// the legacy path drives through `RouteResult`.
 #[derive(Clone)]

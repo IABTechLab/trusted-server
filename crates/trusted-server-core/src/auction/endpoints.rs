@@ -205,6 +205,10 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
+    // Identity ingestion is independent of whether this deployment runs bidders.
+    let body_snapshot =
+        persist_auction_body(kv, registry, ec_context, &http_req, body.eids.as_ref()).await;
+
     if !orchestrator.is_enabled() {
         log::info!("/auction: auction is disabled; returning no-bid response");
         let auction_request = convert_tsjs_to_auction_request(
@@ -349,44 +353,13 @@ pub async fn handle_auction(
     // Read the EC's row whenever an EC store exists: it decides whether the
     // EC may go to bidders as `user.id` (see `bidder_ec_id`), and with a
     // partner registry it supplies the server-side EIDs.
-    let mut auction_kv_snapshot = match (kv, ec_id.as_deref()) {
-        (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
-        _ => EcKvSnapshot::NotRead,
+    let auction_kv_snapshot = match body_snapshot {
+        Some(snapshot) => snapshot,
+        None => match (kv, ec_id.as_deref()) {
+            (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
+            _ => EcKvSnapshot::NotRead,
+        },
     };
-    // Only explicit body data is persisted here; cookie fallback stays read-only.
-    // A single conditional update cannot create a row or overwrite withdrawal.
-    if ec_context.ec_allowed()
-        && allows_eid_persistence(ec_context.consent())
-        && let (Some(graph), Some(registry), Some(ec_id)) = (kv, registry, ec_id.as_deref())
-    {
-        let body_eids = strip_opted_out_sharedid_eids(
-            drop_vendor_denied_client_eids(
-                parse_client_auction_eids(body.eids.as_ref()),
-                Some(registry),
-                ec_context,
-            ),
-            extract_cookie_value(&http_req, SHAREDID_OPTOUT_COOKIE).is_some(),
-        );
-        let updates = collect_eid_updates(None, None, body_eids.as_deref(), registry);
-        match graph
-            .commit_auction_body(ec_id, &auction_kv_snapshot, &updates, registry)
-            .await
-        {
-            Ok(Some(entry)) => {
-                auction_kv_snapshot = EcKvSnapshot::Present {
-                    ec_id: ec_id.to_owned(),
-                    entry: Box::new(entry),
-                    // The successful CAS returns no new generation. Do not reuse
-                    // the old generation in any subsequent operation.
-                    generation: None,
-                };
-            }
-            Ok(None) => {}
-            Err(error) => log::warn!("Auction body EID persistence failed: {error:?}"),
-        }
-    }
-    // Reuse the authoritative snapshot for downstream identity consumers.
-    // A successful body update replaces its contents without reusing a stale generation.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
@@ -549,6 +522,52 @@ fn retain_private_trace(
         response.extensions_mut().insert(trace);
     }
     response
+}
+
+/// Persists explicit body EIDs independently of bidder enablement.
+///
+/// No body, denied identity consent or no usable updates costs no record read.
+async fn persist_auction_body(
+    kv: Option<&KvIdentityGraph>,
+    registry: Option<&PartnerRegistry>,
+    context: &mut EcContext,
+    request: &Request<EdgeBody>,
+    raw: Option<&JsonValue>,
+) -> Option<EcKvSnapshot> {
+    if !context.ec_allowed() || !allows_eid_persistence(context.consent()) {
+        return None;
+    }
+    let (Some(graph), Some(registry), Some(ec_id)) =
+        (kv, registry, context.ec_value().map(str::to_owned))
+    else {
+        return None;
+    };
+    let body_eids = strip_opted_out_sharedid_eids(
+        drop_vendor_denied_client_eids(parse_client_auction_eids(raw), Some(registry), context),
+        extract_cookie_value(request, SHAREDID_OPTOUT_COOKIE).is_some(),
+    );
+    let updates = collect_eid_updates(None, None, body_eids.as_deref(), registry);
+    if updates.is_empty() {
+        return None;
+    }
+    let mut snapshot = graph.load_snapshot(&ec_id).await;
+    match graph
+        .commit_auction_body(&ec_id, &snapshot, &updates, registry)
+        .await
+    {
+        Ok(Some(entry)) => {
+            snapshot = EcKvSnapshot::Present {
+                ec_id,
+                entry: Box::new(entry),
+                // The provider returns no fresh generation after the CAS.
+                generation: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("Auction body EID persistence failed: {error:?}"),
+    }
+    context.set_kv_snapshot(snapshot.clone());
+    Some(snapshot)
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -1325,6 +1344,59 @@ mod tests {
         assert!(
             !response.headers().contains_key(header::SET_COOKIE),
             "should ingest an auction body without identity cookies"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_disabled_still_persists_consented_body_eids() {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("ids.example.com")])
+            .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("disabled-auction-body");
+        let ec_id = format!("{}.body01", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        graph
+            .create(&ec_id, &entry)
+            .await
+            .expect("should seed live row");
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let request = body_ingest_request(Some(
+            json!([{"source":"ids.example.com","uids":[{"id":"disabled-body-uid","atype":1}]}]),
+        ));
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut context,
+            &noop_services(),
+            request,
+        )
+        .await
+        .expect("should return disabled auction response");
+        assert!(
+            response.status().is_success(),
+            "should preserve disabled no-bid behavior"
+        );
+        let row = graph
+            .get(&ec_id)
+            .await
+            .expect("should read record")
+            .expect("should retain existing record")
+            .0;
+        assert_eq!(
+            row.ids.get("ids.example.com").map(|id| id.uid.as_str()),
+            Some("disabled-body-uid"),
+            "should persist body EIDs even when bidding is disabled"
+        );
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should keep auction response free of identity cookies"
         );
     }
 

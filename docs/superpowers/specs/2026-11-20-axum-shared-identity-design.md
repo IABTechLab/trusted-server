@@ -10,7 +10,8 @@ A consented HTML navigation or explicit EC route creates an EC record before
 issuing `ts-ec`. A failed store never issues an unbacked cookie. Returning ECs
 survive unknown geography. Identify, batch sync and admin lookup use the one
 shared graph; identify and batch sync answer locally with 501 without it.
-Auction body EIDs are saved for an existing live record under EID consent.
+Auction body EIDs are saved for an existing live record under EID consent,
+including deployments with bidding disabled.
 Identity cookies are emitted only on HTML navigation or EC route responses.
 Adapters supply platform services and call the shared app, without implementing
 `EcKvStore` or invoking lifecycle/identity handlers directly.
@@ -53,7 +54,9 @@ and can restore an existing SharedID from a readable record. Other methods are
 answered locally. Malformed snapshots return 400, oversized bodies 413,
 and missing/cross-site Origin 403 before record or provider work. Browser CMP capture/ordering remains T19/T20; A2 tests the HTTP
 contract, not new injected client behavior. POST uses the same consent and
-record-first creation as navigation. Provider construction uses the existing provider crate on Axum as on Fastly;
+record-first creation as navigation. A failed authoritative withdrawal returns
+503 while still clearing the browser identity; it never acknowledges a live
+row as successfully withdrawn. Provider construction uses the existing provider crate on Axum as on Fastly;
 provider/pull-sync decisions use core. Validate the runner's available completion
 hooks before selecting after-response scheduling; any missing drained-task API
 is an EdgeZero obligation, never a detached adapter task. Broader provider
@@ -100,9 +103,10 @@ EdgeZero providers. The selected approach uses the existing record API and
 shared app, preserving Fastly's lazy record opening. No EdgeZero implementation
 or infrastructure provisioning belongs in this PR.
 
-A2 supplies identity behavior and evidence. #1579 owns integrating the
-SIGTERM-during-write scenario into CI; #1581 owns broader Axum identity feature
-qualification. Local runtime evidence here does not substitute for either gate.
+A2 supplies identity behavior and evidence. The merged stack already has the
+DynamoDB image/SIGTERM CI job; #1579 still needs current-revision qualification
+and reconciliation of its shutdown acceptance. #1581 owns broader Axum identity
+feature qualification. Local runtime evidence does not substitute for those gates.
 
 ## Verification
 
@@ -149,3 +153,8 @@ Implementation review also required a shared GET-only navigation policy and
 API withdrawal persistence without cookie output. Dedicated regressions cover
 both. The configured streaming asset path keeps its pre-existing no-identity
 lifecycle contract; this is an explicit preservation boundary.
+
+- Implementation self-review: added regressions and corrections for body EIDs
+  when bidding is disabled and failed EC-route withdrawal acknowledgment.
+  Updated native quickstarts to publish the explicit records provider and
+  supply the local record data directory; reconciled current support guidance.

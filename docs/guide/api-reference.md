@@ -337,6 +337,8 @@ With consent and no EC, the app creates the record before setting `ts-ec`.
 SharedID and mirror cookies follow their existing consent, configuration and
 opt-out rules. A storage failure never issues an unbacked identity. A withdrawal
 tombstones the existing record and expires identity cookies on this response.
+If authoritative withdrawal cannot be persisted, it returns `503` while still
+clearing the browser identity, so the caller can retry reconciliation.
 The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
 excluding expired, non-mirrored and vendor-denied IDs.
 

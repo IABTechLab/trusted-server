@@ -47,8 +47,8 @@ Fastly Compute adapter (WASM binary, `wasm32-wasip1` target):
 
 Native Axum adapter (native binary):
 
-- Production entry point and local development server. Edge Cookie record
-  storage is not available on Axum yet
+- Production entry point and local development server. The shared identity app
+  uses a prepared EdgeZero record service for identity and partner APIs
 - Config and secrets are read once at startup from EdgeZero-prepared stores
   (local files, or AWS AppConfig and Secrets Manager) into read-only snapshots
 - Listens on `http://localhost:8787` by default
@@ -57,8 +57,8 @@ Native Axum adapter (native binary):
 
 | Feature                                    | Axum                                                                                                                                                                                             |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
-| Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
+| KV store                                   | Generic platform KV unavailable; EC records use the prepared record capability                                                                                                                   |
+| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                      |
 | Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                    |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
 | Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                              |

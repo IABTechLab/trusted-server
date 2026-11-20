@@ -82,6 +82,8 @@ cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 # Axum listens on 8787, not the Viceroy port in .env.dev.
 export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
+# The starter's implicit storage provider is Fastly-only; publish native records.
+export TRUSTED_SERVER__EC__STORAGE__PROVIDER=records
 
 # Use the repository's default app-config store name and key for this quickstart.
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
@@ -90,6 +92,7 @@ unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
 # Write .edgezero/local-config-trusted_server_config.json.
 ts config push --adapter axum --local --yes
 export EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero"
+export EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero"
 
 # Populate the three secret references from the starter config for this shell.
 # Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
@@ -119,8 +122,10 @@ the envelope; the running server does not read them. The older
 Do not put secret values in the TOML config, the config-store file, or a
 source-controlled environment file.
 
-> **Axum limitations:** The Axum adapter does not support KV store,
-> geo lookup, config/secret-store writes, or admin key-management routes.
+> **Axum capabilities:** The shared identity app uses EdgeZero's prepared record
+> service; the local provider stores records in `EDGEZERO__ADAPTER__DATA_DIR`.
+> Protected geo is optional and off by default. Generic platform KV operations,
+> config/secret-store writes and admin key-management mutations remain unavailable.
 > See [Architecture](/guide/architecture) for the full list, and
 > [Axum production startup](/guide/native-rc-demo) for AWS-backed stores.
 

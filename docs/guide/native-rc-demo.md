@@ -16,7 +16,9 @@ From the repository root, with `ts` built from this checkout:
 
 ```sh
 cp trusted-server.example.toml trusted-server.toml
-ts config push --adapter axum --local --no-diff --yes
+# Apply the native logical-record reference when publishing the copied starter.
+TRUSTED_SERVER__EC__STORAGE__PROVIDER=records \
+  ts config push --adapter axum --local --no-diff --yes
 EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
 EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero" \
 EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \
@@ -49,8 +51,9 @@ flowchart TD
     F --> G[Stop admission and drain on shutdown]
 ```
 
-The declared identities are `trusted_server_config` and
-`trusted_server_secrets`. The configuration key is `trusted_server_config`.
+The declared stores are `trusted_server_config`, `trusted_server_secrets` and
+`trusted_server_kv`. The record layout is declared before provider preparation;
+provider binding selection belongs to EdgeZero. The configuration key is `trusted_server_config`.
 Required-provider and required-value failures prevent readiness. Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running

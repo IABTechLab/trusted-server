@@ -46,6 +46,11 @@ fn response(status: StatusCode) -> Response<EdgeBody> {
     response
 }
 
+/// Requires authoritative withdrawal failures to be reported to this caller.
+pub(crate) fn require_reconciliation(response: &mut Response<EdgeBody>) {
+    response.extensions_mut().insert(ConsentUpdateResponse);
+}
+
 /// Marks an accepted consent update whose finalization could not confirm revocation.
 /// Ordinary publisher/error responses retain their existing status semantics.
 pub(crate) fn mark_reconciliation_failed(response: &mut Response<EdgeBody>) {
@@ -195,7 +200,7 @@ pub fn handle_consent_update(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     });
-    response.extensions_mut().insert(ConsentUpdateResponse);
+    require_reconciliation(&mut response);
     response
 }
 

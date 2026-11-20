@@ -162,6 +162,7 @@ impl IdentityApp {
         }
         let mut result = response(StatusCode::OK);
         result.extensions_mut().insert(EcRouteResponse);
+        crate::ec::consent_update::require_reconciliation(&mut result);
         self.finalize(
             &mut identity.context,
             identity.eids_cookie.as_deref(),

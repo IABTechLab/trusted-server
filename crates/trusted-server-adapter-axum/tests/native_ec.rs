@@ -929,3 +929,48 @@ async fn identify_withdrawal_updates_storage_without_identity_cookies() {
         "should tombstone withdrawal on identify"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn ec_withdrawal_storage_failure_is_not_acknowledged_as_success() {
+    let store = Store::default();
+    let created = call(
+        &allowed_router(store.clone()),
+        request(Method::GET, "/article", None),
+    )
+    .await;
+    let ec = ec_cookie(&created).expect("should create live record");
+    let app = router(
+        store.clone(),
+        Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
+    );
+    store.fail_writes.store(true, Ordering::SeqCst);
+    let mut withdrawal = ec_post(Some(&format!("ts-ec={ec}")));
+    withdrawal.headers_mut().insert(
+        "sec-gpc",
+        "1".parse().expect("should request genuine withdrawal"),
+    );
+    let response = call(&app, withdrawal).await;
+    assert_eq!(
+        response.status(),
+        503,
+        "should report that authoritative withdrawal could not be persisted"
+    );
+    assert_eq!(
+        ec_cookie(&response).as_deref(),
+        Some(""),
+        "should still expire the browser identity on the EC response"
+    );
+    let row: serde_json::Value = serde_json::from_slice(
+        &store
+            .lookup(&ec)
+            .await
+            .expect("should read store")
+            .expect("should retain original record")
+            .body,
+    )
+    .expect("should decode record");
+    assert_eq!(
+        row["consent"]["ok"], true,
+        "should prove the failed store left a live authoritative row"
+    );
+}
