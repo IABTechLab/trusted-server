@@ -1,148 +1,13 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use edgezero_adapter_axum::context::AxumRequestContext;
 use edgezero_core::error::EdgeError;
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    ClientInfo, GeoInfo, PlatformError, PlatformGeo, PlatformKvStore, RuntimeServices,
 };
-
-// ---------------------------------------------------------------------------
-// Env-var naming helpers
-// ---------------------------------------------------------------------------
-
-/// Normalize a store name or key for use as an environment-variable segment.
-///
-/// Uppercases and replaces hyphens, dots, and spaces with underscores.
-fn normalize_env_segment(s: &str) -> String {
-    s.to_uppercase().replace(['-', '.', ' '], "_")
-}
-
-/// Returns the environment-variable name for a config store entry.
-#[must_use]
-pub fn config_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_CONFIG_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
-fn secret_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_SECRET_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// PlatformConfigStore
-// ---------------------------------------------------------------------------
-
-/// Environment-variable–backed config store for the Axum dev server.
-///
-/// Reads from `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` (uppercased, hyphens→underscores).
-/// Write operations are unsupported in local development.
-pub struct AxumPlatformConfigStore;
-
-#[async_trait(?Send)]
-impl PlatformConfigStore for AxumPlatformConfigStore {
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let var_name = config_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name).map_err(|_| {
-            Report::new(PlatformError::ConfigStore).attach(format!(
-                "env var '{var_name}' not set — export it to supply this config value"
-            ))
-        })
-    }
-
-    async fn put(
-        &self,
-        store_id: &StoreId,
-        key: &str,
-        _value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformConfigStore: write to store '{}' key '{}' ignored \
-             (config store writes are not supported on the Axum dev server)",
-            store_id.as_ref(),
-            key
-        );
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on the Axum dev server"))
-    }
-
-    async fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformConfigStore: delete from store '{}' key '{}' ignored \
-             (config store deletes are not supported on the Axum dev server)",
-            store_id.as_ref(),
-            key
-        );
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store deletes are not supported on the Axum dev server"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PlatformSecretStore
-// ---------------------------------------------------------------------------
-
-/// Environment-variable–backed secret store for the Axum dev server.
-///
-/// Reads from `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` as raw UTF-8 bytes.
-/// Write operations are unsupported in local development.
-pub struct AxumPlatformSecretStore;
-
-#[async_trait(?Send)]
-impl PlatformSecretStore for AxumPlatformSecretStore {
-    fn get_bytes(
-        &self,
-        store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        let var_name = secret_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name)
-            .map(String::into_bytes)
-            .map_err(|_| {
-                Report::new(PlatformError::SecretStore).attach(format!(
-                    "env var '{var_name}' not set — export it to supply this secret value"
-                ))
-            })
-    }
-
-    async fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        _value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformSecretStore: create '{}' in store '{}' ignored \
-             (secret store writes are not supported on the Axum dev server)",
-            name,
-            store_id.as_ref()
-        );
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on the Axum dev server"))
-    }
-
-    async fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        log::warn!(
-            "AxumPlatformSecretStore: delete '{}' from store '{}' ignored \
-             (secret store deletes are not supported on the Axum dev server)",
-            name,
-            store_id.as_ref()
-        );
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store deletes are not supported on the Axum dev server"))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // PlatformGeo
@@ -161,7 +26,7 @@ impl PlatformGeo for AxumPlatformGeo {
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
-/// Construct [`RuntimeServices`] for an incoming Axum request.
+/// Construct request-scoped services from the immutable prepared native snapshots.
 ///
 /// # Degraded features in dev
 ///
@@ -174,11 +39,19 @@ impl PlatformGeo for AxumPlatformGeo {
 ///
 /// # Errors
 ///
-/// Returns an internal [`EdgeError`] when the request carries no outbound
-/// client.
+/// Returns an internal [`EdgeError`] when prepared snapshots or the request's
+/// outbound client are absent. No legacy environment store is consulted.
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
 ) -> Result<RuntimeServices, EdgeError> {
+    let snapshot = ctx
+        .extensions()
+        .get::<Arc<crate::startup::NativeStoreSnapshot>>()
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other(
+                "request has no prepared native store snapshot",
+            ))
+        })?;
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
         log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
@@ -192,10 +65,6 @@ pub fn build_runtime_services(
 
     // Stateless shims are promoted to process-wide statics so callers clone
     // an existing Arc instead of allocating a new one per request.
-    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
-        std::sync::OnceLock::new();
-    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
-        std::sync::OnceLock::new();
     static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
@@ -206,12 +75,8 @@ pub fn build_runtime_services(
 
     Ok(RuntimeServices::builder()
         .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))
-        .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
-        })))
-        .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
-        })))
+        .config_store(Arc::clone(&snapshot.config_store))
+        .secret_store(Arc::clone(&snapshot.secret_store))
         .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
             Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
         })))
@@ -255,6 +120,9 @@ mod tests {
         let mut request = edgezero_core::http::request_builder()
             .body(edgezero_core::body::Body::empty())
             .expect("should build a request");
+        request
+            .extensions_mut()
+            .insert(Arc::new(crate::startup::NativeStoreSnapshot::empty()));
         if let Some(client) = client {
             request.extensions_mut().insert(client);
         }
@@ -317,51 +185,16 @@ mod tests {
     }
 
     #[test]
-    fn config_env_var_normalizes_store_and_key() {
+    fn runtime_services_reject_a_request_without_prepared_snapshots() {
+        let request = edgezero_core::http::request_builder()
+            .body(edgezero_core::Body::empty())
+            .expect("should build a request");
+        let context = edgezero_core::context::RequestContext::new(request, Default::default());
+        let error = build_runtime_services(&context)
+            .expect_err("should not fall back to legacy environment stores");
         assert_eq!(
-            config_env_var("my-store.name", "my key"),
-            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
-            "should normalize environment-variable segments"
-        );
-    }
-
-    #[test]
-    fn config_store_reads_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY",
-            Some("test-value"),
-            || {
-                let store = AxumPlatformConfigStore;
-                let result = store
-                    .get(&StoreName::from("my-store"), "my-key")
-                    .expect("should read env var");
-                assert_eq!(result, "test-value", "should return env var value");
-            },
-        );
-    }
-
-    #[test]
-    fn config_store_returns_error_for_missing_env_var() {
-        let store = AxumPlatformConfigStore;
-        let result = store.get(
-            &StoreName::from("nonexistent-store-zzz"),
-            "nonexistent-key-zzz",
-        );
-        assert!(result.is_err(), "should error for missing env var");
-    }
-
-    #[test]
-    fn secret_store_reads_bytes_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_SECRET_MY_SECRETS_MY_SECRET",
-            Some("hello"),
-            || {
-                let store = AxumPlatformSecretStore;
-                let result = store
-                    .get_bytes(&StoreName::from("my-secrets"), "my-secret")
-                    .expect("should read env var as bytes");
-                assert_eq!(result, b"hello", "should return raw bytes");
-            },
+            error.to_string(),
+            "internal error: request has no prepared native store snapshot"
         );
     }
 
