@@ -87,6 +87,7 @@ impl PlatformGeo for FixtureGeo {
     fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         match self.0 {
             Geo::Gdpr => Ok(Some(GeoInfo::country_region("DE", None))),
+            Geo::UsCalifornia => Ok(Some(GeoInfo::country_region("US", Some("CA".to_owned())))),
             Geo::Missing => Ok(None),
             Geo::Failed => Err(Report::new(PlatformError::Geo)),
         }
@@ -103,7 +104,13 @@ impl Adapter for AxumAdapter {
     }
 
     fn exchange(&mut self, request: &ApiRequest) -> ApiObservation {
-        self.execute(&Navigation::default(), Some(request))
+        self.execute(
+            &Navigation {
+                geo: request.geo,
+                ..Navigation::default()
+            },
+            Some(request),
+        )
     }
 }
 

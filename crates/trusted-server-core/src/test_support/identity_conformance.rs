@@ -193,6 +193,8 @@ pub fn tcf_consent_cookie(granted: bool) -> String {
 pub enum Geo {
     /// A GDPR location.
     Gdpr,
+    /// A US state with opt-out privacy rules.
+    UsCalifornia,
     /// No location was found.
     Missing,
     /// The location service failed.
@@ -685,6 +687,8 @@ pub struct ApiRequest {
     pub method: http::Method,
     /// First-party path.
     pub path: String,
+    /// Trusted location supplied by the adapter fixture.
+    pub geo: Geo,
     /// Browser and partner headers.
     pub headers: Vec<(String, String)>,
     /// Serialized request body.
@@ -706,6 +710,7 @@ impl ApiRequest {
         Self {
             method,
             path: path.to_owned(),
+            geo: Geo::Gdpr,
             headers: Vec::new(),
             body: String::new(),
             store_enabled: true,
@@ -776,6 +781,9 @@ fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
     {
         let mut post = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
         post.body = case["body"].to_string();
+        if case["geo"] == "us-california" {
+            post.geo = Geo::UsCalifornia;
+        }
         post.headers = vec![
             (
                 "origin".to_owned(),
@@ -1257,6 +1265,61 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should support fresh pixel GET"
     );
     assert_no_identity_cookies(&empty_get.response);
+
+    for (geo, privacy, gpc, should_restore) in [
+        (Geo::UsCalifornia, "1YNN", false, true),
+        (Geo::UsCalifornia, "1YNN", true, false),
+        (Geo::UsCalifornia, "1YYN", false, false),
+        (Geo::Missing, "1YNN", false, false),
+    ] {
+        let before = block_on(graph.get(&key))
+            .expect("should read the consented GET fixture")
+            .expect("should retain the GET fixture record");
+        let mut pixel = ApiRequest::new(http::Method::GET, ec_path);
+        pixel.geo = geo;
+        pixel.headers.push((
+            "cookie".to_owned(),
+            format!("ts-ec={identity}; us_privacy={privacy}"),
+        ));
+        if gpc {
+            pixel.headers.push(("sec-gpc".to_owned(), "1".to_owned()));
+        }
+        let observed = adapter.exchange(&pixel);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::NO_CONTENT,
+            "should answer EC GET under every current consent decision"
+        );
+        assert!(
+            observed.response.body.is_empty(),
+            "should keep the pixel response empty"
+        );
+        assert_eq!(observed.origin_requests, 0, "should answer EC GET locally");
+        if should_restore {
+            assert!(
+                observed
+                    .response
+                    .cookies
+                    .iter()
+                    .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0")),
+                "should positively restore SharedID with current EC permission"
+            );
+        } else {
+            assert_no_identity_cookies(&observed.response);
+        }
+        let after = block_on(graph.get(&key))
+            .expect("should read the record after EC GET")
+            .expect("should retain the live record after EC GET");
+        assert_eq!(
+            after.1, before.1,
+            "should never write or tombstone a record from EC GET"
+        );
+        assert_eq!(
+            serde_json::to_value(after.0).expect("should serialize the GET record"),
+            serde_json::to_value(before.0).expect("should serialize the original record"),
+            "should leave consent and IDs unchanged on EC GET"
+        );
+    }
 
     post.headers.push(("cookie".to_owned(), cookies.clone()));
     let mirrored = adapter.exchange(&post);

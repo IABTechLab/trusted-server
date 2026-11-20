@@ -118,7 +118,9 @@ impl IdentityApp {
             let mut response = response(StatusCode::NO_CONTENT);
             if let Ok(mut identity) = self.read_request(services, &request) {
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
-                if let Some(graph) = identity.graph.as_ref() {
+                if identity.context.ec_allowed()
+                    && let Some(graph) = identity.graph.as_ref()
+                {
                     apply_sharedid_write_back(
                         &self.settings,
                         &mut identity.context,
