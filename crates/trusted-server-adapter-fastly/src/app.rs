@@ -4175,20 +4175,27 @@ mod tests {
         );
     }
 
+    /// WB-1: identity cookies are set only on navigation and EC route
+    /// responses. Expiring one (a withdrawal, a mirror revocation) is allowed
+    /// on any response, so an expiry `Set-Cookie` does not count as setting.
     #[test]
-    fn identity_cookies_are_set_on_navigations_and_never_on_other_responses() {
+    fn identity_cookies_are_set_only_on_navigations_and_may_expire_anywhere() {
         // Arrange
         let fixture = mirrored_page_identity_fixture(Duration::ZERO);
         let ec_id = format!("{}.wb0001", "f".repeat(64));
         seed_live_row(&fixture.graph, &ec_id);
-        let identity_cookie = |cookie: &str| {
-            [
-                trusted_server_core::constants::COOKIE_TS_EC,
-                trusted_server_core::constants::COOKIE_TS_EIDS,
-                trusted_server_core::constants::COOKIE_TS_EIDS_MIRROR,
-            ]
-            .iter()
-            .any(|name| cookie.starts_with(&format!("{name}=")))
+        let sets_identity_cookie = |cookie: &str| {
+            let expiry = cookie
+                .split(';')
+                .any(|attribute| attribute.trim().eq_ignore_ascii_case("max-age=0"));
+            !expiry
+                && [
+                    trusted_server_core::constants::COOKIE_TS_EC,
+                    trusted_server_core::constants::COOKIE_TS_EIDS,
+                    trusted_server_core::constants::COOKIE_TS_EIDS_MIRROR,
+                ]
+                .iter()
+                .any(|name| cookie.starts_with(&format!("{name}=")))
         };
 
         // Act
@@ -4245,7 +4252,7 @@ mod tests {
         for (label, response) in &others {
             let cookies = set_cookies(response);
             assert!(
-                !cookies.iter().any(|cookie| identity_cookie(cookie)),
+                !cookies.iter().any(|cookie| sets_identity_cookie(cookie)),
                 "should set no identity cookie on the {label} response, got {cookies:?}"
             );
         }

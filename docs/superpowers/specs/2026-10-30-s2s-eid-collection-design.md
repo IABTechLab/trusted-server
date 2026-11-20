@@ -238,7 +238,8 @@ browser             TS (navigation)                          providers   KV
   after-response budget, which lowers per-instance throughput when sandboxes
   are reused. Keep the budget no larger than the slowest provider needs.
 - Only the Fastly adapter runs identity providers (§2.2). Other adapters
-  refuse to start with an enabled provider.
+  refuse to start with an enabled provider. Axum's after-response follow-up
+  writes (ID-5) are deferred to #1581.
 - Cookie reads and generated IDs of an after-response provider also land only
   in the follow-up write, so cookie-only providers should stay `page`.
 
@@ -1490,6 +1491,11 @@ still due.
   write landed. It is **set** only when its value differs from the one the
   request carried, so unchanged responses carry no `Set-Cookie`; a mirror the
   browser lost is restored on the next navigation.
+- **Set only on navigations (WB-1).** Identity cookies (`ts-ec`, `ts-eids`, the
+  mirror) are set only on navigation and EC route responses, never on
+  `/auction`, page-bids, asset or other API responses. Expiring one
+  (`Max-Age=0`, for a withdrawal or a mirror revocation) is allowed on any
+  response.
 - **Expired** (`Max-Age=0`) only when the request carried it: on any response
   where EID consent is absent or withdrawn, whatever happened to the KV write;
   on a navigation whose mirror would be empty; and, where the mirror cannot be
