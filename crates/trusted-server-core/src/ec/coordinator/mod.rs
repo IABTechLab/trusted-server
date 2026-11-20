@@ -23,9 +23,13 @@ use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
-use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::eid_types::{
+    AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue, UnixSeconds,
+};
 use crate::ec::generation::ec_hash;
-use crate::ec::kv_types::{KvEid, KvEntry, KvUid, opt_out_uid_hash};
+use crate::ec::kv_types::{
+    KvEid, KvEntry, KvPartnerId, KvUid, MAX_ENTRY_BYTES, MAX_UID_LENGTH, opt_out_uid_hash,
+};
 use crate::ec::provider::{
     ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
     ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
@@ -33,6 +37,7 @@ use crate::ec::provider::{
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
+use crate::ec::write_plan::{member_len, serialized_len};
 
 use crate::settings::IdentityProviderConfig;
 
@@ -194,6 +199,11 @@ struct ProviderPolicy {
     /// Whether this is a pull-sync partner, counted against
     /// [`ProviderCoordinator::with_pull_sync_concurrency`].
     pull_sync: bool,
+    /// For a pull-sync partner, the most bytes its UID can add to a row.
+    /// A row without that room is never sent to the partner: the write
+    /// planner would drop the UID for size, and the empty source would be
+    /// pulled again on every navigation.
+    pull_uid_reserve: Option<usize>,
 }
 
 /// The production coordinator, built once at startup.
@@ -294,8 +304,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 config.id
             )));
         }
+        let id = ProviderId::new(&config.id);
+        let pull_sync = config.kind() == PULL_SYNC_KIND;
+        let pull_uid_reserve = pull_sync.then(|| {
+            sources
+                .iter()
+                .map(|source| pull_uid_reserve(&id, source))
+                .max()
+                .unwrap_or(0)
+        });
         Ok(Registered {
-            id: ProviderId::new(&config.id),
+            id,
             policy: ProviderPolicy {
                 sources,
                 allowed_domains: config
@@ -305,7 +324,8 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                     .collect(),
                 tcf_vendor_id: config.tcf_vendor_id,
                 rate_limit_per_hour: config.rate_limit_per_hour,
-                pull_sync: config.kind() == PULL_SYNC_KIND,
+                pull_sync,
+                pull_uid_reserve,
             },
             provider,
         })
@@ -389,6 +409,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let capabilities = registered.provider.capabilities();
         let mut input_blocked = false;
         let mut due = Vec::new();
+        let mut row_len = None;
         for source in &registered.policy.sources {
             let record = entry.and_then(|entry| entry.ids.get(source.as_str()));
             // A UID whose provider asked for a refresh makes its source due;
@@ -411,6 +432,21 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             });
             if held {
                 continue;
+            }
+            // A row too full to take the partner's UID is not pulled for: the
+            // planner would drop the UID for size, leaving the source empty,
+            // so the partner would be called again on every navigation. Batch
+            // sync refuses the same row with `row_full`. Pruning that frees
+            // room makes the source due again.
+            if let (Some(reserve), Some(entry)) = (registered.policy.pull_uid_reserve, entry) {
+                let len = *row_len.get_or_insert_with(|| serialized_len(entry));
+                if len.saturating_add(reserve) > MAX_ENTRY_BYTES {
+                    log::debug!(
+                        "Identity lookup: provider={} skips '{source}' (row of {len} bytes has no room for its UID)",
+                        registered.id
+                    );
+                    continue;
+                }
             }
             let needs_input = capabilities
                 .sources
@@ -948,6 +984,23 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .dispatched_with(revocations)
             .with_known_uids(known_uids)
     }
+}
+
+/// The most bytes a pull-sync partner's record for `source` adds to a row.
+///
+/// Measures the record pull sync stores for the longest UID it accepts
+/// ([`MAX_UID_LENGTH`] bytes needing no JSON escaping), with the widest agent
+/// type and no expiry.
+fn pull_uid_reserve(owner: &ProviderId, source: &SourceDomain) -> usize {
+    let uid = UidValue::try_from("x".repeat(MAX_UID_LENGTH))
+        .expect("should accept a UID at the pull-sync length limit");
+    let atype = AgentType::try_from(i32::MAX).expect("should accept a non-negative agent type");
+    let stored = KvUid::new(uid, atype, None, Some(owner.clone()), Expiry::Never);
+    KvPartnerId::from_eids(
+        vec![KvEid::new(EidFields::default(), vec![stored])],
+        UnixSeconds::new(0),
+    )
+    .map_or(usize::MAX, |record| member_len(source.as_str(), &record))
 }
 
 /// Hashes of the UIDs in `eids`, without duplicates.
@@ -1907,6 +1960,97 @@ mod tests {
             "should treat a pull with only an oversized UID as no match"
         );
         assert!(lookup.entries.is_empty(), "should store no oversized UID");
+    }
+
+    fn single_pull_sync_coordinator() -> ProviderCoordinator<EchoProvider> {
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"pull-sync:ids.example.com\"\nkind = \"{PULL_SYNC_KIND}\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]"
+        ))
+        .expect("should parse config");
+        coordinator_with(RegisteredProvider::new(
+            config,
+            echo_provider(SourceInput::Anonymous),
+        ))
+    }
+
+    #[test]
+    fn pull_uid_reserve_covers_the_longest_pulled_uid() {
+        // Arrange
+        let coordinator = single_pull_sync_coordinator();
+        let reserve = coordinator.providers[0]
+            .policy
+            .pull_uid_reserve
+            .expect("should reserve room for a pull-sync partner");
+        let transport = CannedTransport::new(|| {
+            Ok(TransportResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::from("x".repeat(MAX_UID_LENGTH)),
+            })
+        });
+
+        // Act
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        let (source, eids) = lookup
+            .entries
+            .first()
+            .cloned()
+            .expect("should return the pulled UID");
+        let record =
+            KvPartnerId::from_eids(eids, UnixSeconds::new(1000)).expect("should hold a live UID");
+        assert!(
+            member_len(source.as_str(), &record) <= reserve,
+            "should reserve at least the bytes the longest pulled UID adds to the row"
+        );
+    }
+
+    #[test]
+    fn pull_sync_does_not_recall_a_partner_for_a_full_row() {
+        // Arrange
+        let coordinator = single_pull_sync_coordinator();
+        let reserve = coordinator.providers[0]
+            .policy
+            .pull_uid_reserve
+            .expect("should reserve room for a pull-sync partner");
+        let transport = CannedTransport::new(ok_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        let mut filler = 0;
+        while serialized_len(&entry) + reserve <= MAX_ENTRY_BYTES {
+            entry.ids.insert(
+                format!("filler-{filler}.example.com"),
+                KvPartnerId::single("f".repeat(256)),
+            );
+            filler += 1;
+        }
+        assert!(
+            serialized_len(&entry) <= MAX_ENTRY_BYTES,
+            "should build a row within the size cap"
+        );
+        let snapshot = seeded_snapshot(&entry);
+
+        // Act
+        let navigations: Vec<LookupStatus> = (0..2)
+            .map(|_| only_status(&run(&coordinator, &transport, &snapshot, &granting())))
+            .collect();
+
+        // Assert
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call the partner for a row with no room for its UID"
+        );
+        assert_eq!(
+            navigations,
+            vec![LookupStatus::Skipped(SkipReason::NotDue); 2],
+            "should report the source as not due on every navigation"
+        );
+        assert!(
+            !coordinator.any_due(Some(&entry), UnixSeconds::new(1000)),
+            "should let the caller skip the row read for a full row"
+        );
     }
 
     #[test]
