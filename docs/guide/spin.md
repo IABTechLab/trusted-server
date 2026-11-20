@@ -6,20 +6,30 @@ through Spin variables.
 
 ## Support status
 
-| Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization            |
-| ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | -------------------------------- |
-| `spin`  | experimental   | real   | `503`          | yes            | single           | outermost sanitize         | innermost Spin-header derivation |
+| Adapter | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization            |
+| ------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | -------------------------------- |
+| `spin`  | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | innermost Spin-header derivation |
 
-This row is the canonical status summary. Spin supports one enabled
-auction provider. When startup fails, its hardened router preserves `/health`
-but answers publisher routes with 503; neither response proves successful
-configuration.
+This row is the canonical status summary. Spin supports multiple auction
+providers. GET/HEAD `/health` and `/ready` answer after component and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable, and the full report goes
+only to the log. See the
+[operational response contract](./api-reference#operational-probe-contract).
+
+EdgeZero's Spin `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the component's stderr, which `spin up`
+writes to `<component>_stderr.txt` under its `--log-dir`. The level comes from
+`EDGEZERO__LOGGING__LEVEL` in the component's environment and defaults to
+`info`, so the startup report and every warning, such as the ignored
+`publisher.origin_host_header_override`, are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Prerequisites
 
-Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
-`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide, so an older runtime
-cannot start the component. Install or upgrade from the
+Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 8 imports
+WASI HTTP 0.3, which Spin 4.0.x does not provide, so an older runtime cannot
+start the component. Install or upgrade from the
 [Spin install guide](https://spinframework.dev/install).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
@@ -62,12 +72,21 @@ variables:
 It first launches `spin up` before config is pushed, then relaunches it while
 omitting each variable independently. Every publisher request must return 503,
 and the controlled config or variable delta must identify the intended missing
-input. A generic degraded response cannot satisfy the check.
+input. A generic degraded response cannot satisfy the check. The smoke reads
+that diagnostic from the component's stderr.
 
 The final non-health publisher request must return 200, retain the stub-origin
 sentinel, rewrite its origin URL to the Spin listener, and omit the original
 URL. The exit trap stops Spin and the stub origin and removes the isolated
 manifest, SQLite store, response captures, and logs.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Runtime boundaries
 
@@ -79,10 +98,9 @@ available. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 
-Spin is not installed in the integration CI environment. The recurring manual
-smoke therefore needs a named owner, tested commit, exact tool versions, and an
-expiry; those details are recorded with each run in the documentation-refresh
-evidence ledger.
+The health/startup CI matrix runs the production smoke with the pinned Spin
+runtime. Manual verification should also record the tested commit and exact
+tool versions.
 
 Compare the [Fastly](./fastly), [Cloudflare](./cloudflare), and
 [Axum](./axum-dev) adapter journeys.

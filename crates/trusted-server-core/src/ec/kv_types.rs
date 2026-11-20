@@ -6,10 +6,17 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::value::RawValue;
+use sha2::{Digest as _, Sha256};
 
+use super::eid_types::{
+    AgentType, EidFields, Expiry, MAX_EID_FIELD_BYTES, MatchMethod, ProviderId, RawJson, UidValue,
+    UnixSeconds, optional_exp,
+};
 use crate::consent::ConsentContext;
 use crate::geo::GeoInfo;
 
@@ -30,14 +37,44 @@ pub const MAX_SEEN_DOMAINS: usize = 50;
 pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 
 /// Maximum allowed length (in bytes) for a partner UID across all sync
-/// mechanisms (pixel, batch, pull). Defined centrally to ensure consistent
-/// validation.
+/// mechanisms (pixel, batch, pull) and browser ingest. Defined centrally to
+/// ensure consistent validation.
+///
+/// Builds before identity providers reject a row holding a longer UID, so
+/// these writers stay at this limit until rollback past them is no longer
+/// supported; only provider writes use [`MAX_STORED_UID_LENGTH`].
 pub const MAX_UID_LENGTH: usize = 512;
+
+/// Maximum length (in bytes) of a UID a row may hold: the limit for identity
+/// provider writes and for reading stored rows. Sized for `LiveRamp` envelopes
+/// (about 700 bytes).
+pub const MAX_STORED_UID_LENGTH: usize = 1024;
+
+/// How long a provider opt-out keeps that provider from being called again,
+/// in seconds (30 days).
+pub const OPT_OUT_MEMORY_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Most UID hashes the row keeps with one remembered opt-out.
+pub const MAX_OPT_OUT_UID_HASHES: usize = 16;
+
+/// Short hash of a UID known when a provider's opt-out was remembered.
+///
+/// The row keeps hashes rather than the opted-out UIDs themselves: they only
+/// need to recognise a cookie that repeats one.
+#[must_use]
+pub fn opt_out_uid_hash(uid: &str) -> String {
+    let digest = Sha256::digest(uid.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// How long the row keeps the time of a provider's latest reported opt-out, in
+/// seconds (one day): far longer than any lookup stays in flight.
+pub const REVOCATION_MEMORY_SECONDS: u64 = 24 * 60 * 60;
 
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
-/// **KV value:** JSON-serialized `KvEntry` (max ~5KB).
+/// **KV value:** JSON-serialized `KvEntry` (at most [`MAX_ENTRY_BYTES`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     /// Schema version — always [`SCHEMA_VERSION`].
@@ -62,6 +99,21 @@ pub struct KvEntry {
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ids: BTreeMap<String, KvPartnerId>,
+    /// Provider ID → Unix time until which that provider's opt-out is
+    /// honoured without calling the provider again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opt_outs: BTreeMap<ProviderId, u64>,
+    /// Provider ID → hashes ([`opt_out_uid_hash`]) of the UIDs known for the
+    /// provider when its server reported the remembered opt-out. Cookies
+    /// holding only these UIDs are not an opt-back-in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opt_out_uids: BTreeMap<ProviderId, Vec<String>>,
+    /// Provider ID → Unix time of the latest opt-out the provider reported,
+    /// from its cookies or its server, that removed its sources from the row.
+    /// A lookup dispatched before that opt-out is discarded rather than
+    /// written over it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub revocations: BTreeMap<ProviderId, u64>,
 }
 
 /// Consent state within a KV entry.
@@ -97,11 +149,364 @@ pub struct KvGeo {
     pub dma: Option<i64>,
 }
 
-/// A partner user ID within a KV entry.
+/// Maximum serialized size of a KV entry body. Every writer refuses a larger
+/// row; only the page-load planner trims entries to fit.
+pub const MAX_ENTRY_BYTES: usize = 16 * 1024;
+
+/// A partner ID record within a KV entry, keyed by source domain.
+///
+/// `uid` is always present so older readers keep working. Records written by
+/// an identity provider also carry full-fidelity `eids`; new code reads
+/// `eids` whenever it is non-empty and treats `uid` as derived.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvPartnerId {
-    /// The partner's user identifier.
+    /// First live UID of `eids`, or the single UID for records written by
+    /// browser ingest, batch sync or older versions.
     pub uid: String,
+    /// Full-fidelity entries written by a provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eids: Vec<KvEid>,
+}
+
+impl KvPartnerId {
+    /// Builds a single-UID record (browser ingest, batch sync, pull sync).
+    #[must_use]
+    pub fn single(uid: impl Into<String>) -> Self {
+        Self {
+            uid: uid.into(),
+            eids: Vec::new(),
+        }
+    }
+
+    /// Builds a provider record, keeping only entries with live UIDs.
+    ///
+    /// Returns `None` when no live UID remains.
+    #[must_use]
+    pub fn from_eids(eids: Vec<KvEid>, now: UnixSeconds) -> Option<Self> {
+        let mut record = Self {
+            uid: String::new(),
+            eids,
+        };
+        record.prune_expired(now);
+        (!record.eids.is_empty()).then_some(record)
+    }
+
+    /// Full-fidelity provider entries; empty for single-UID records.
+    #[must_use]
+    pub fn eids(&self) -> &[KvEid] {
+        &self.eids
+    }
+
+    /// Whether this record was written by an identity provider.
+    #[must_use]
+    pub fn is_provider_written(&self) -> bool {
+        !self.eids.is_empty()
+    }
+
+    /// Whether a UID `owner` wrote asks it for a refresh by `now`.
+    ///
+    /// UIDs another provider wrote never make the record refresh-due for
+    /// `owner`, so their refresh state is never handed to it.
+    #[must_use]
+    pub fn refresh_due_for(&self, owner: &ProviderId, now: UnixSeconds) -> bool {
+        self.eids
+            .iter()
+            .flat_map(KvEid::uids)
+            .any(|uid| uid.owner() == Some(owner) && uid.refresh_due(now))
+    }
+
+    /// Whether the record holds a UID that may be served at `now`.
+    #[must_use]
+    pub fn has_live_uid(&self, now: UnixSeconds) -> bool {
+        if self.eids.is_empty() {
+            return !self.uid.is_empty();
+        }
+        self.eids
+            .iter()
+            .flat_map(KvEid::uids)
+            .any(|uid| uid.is_live(now))
+    }
+
+    /// Drops expired UIDs and empty entries, then resyncs `uid`.
+    ///
+    /// Returns whether anything changed. Single-UID records never change.
+    pub fn prune_expired(&mut self, now: UnixSeconds) -> bool {
+        if self.eids.is_empty() && !self.uid.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for eid in &mut self.eids {
+            let held = eid.uids.len();
+            eid.uids.retain(|uid| uid.is_live(now));
+            changed |= eid.uids.len() != held;
+        }
+        self.eids.retain(|eid| !eid.uids.is_empty());
+        let first = self
+            .eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map_or("", |uid| uid.id().as_str());
+        if self.uid != first {
+            self.uid = first.to_owned();
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drops entries left without UIDs and resyncs `uid`.
+    ///
+    /// Returns whether the record still holds a UID within
+    /// [`MAX_STORED_UID_LENGTH`].
+    fn retain_readable(&mut self) -> bool {
+        if self.eids.is_empty() {
+            return self.uid.len() <= MAX_STORED_UID_LENGTH;
+        }
+        self.eids.retain(|eid| !eid.uids.is_empty());
+        self.uid = self
+            .eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map(|uid| uid.id().as_str().to_owned())
+            .unwrap_or_default();
+        !self.eids.is_empty()
+    }
+
+    /// Removes the last UID of the last entry and resyncs `uid`; used by the
+    /// write planner's size cap.
+    pub(crate) fn drop_last_uid(&mut self) {
+        if let Some(eid) = self.eids.last_mut() {
+            eid.uids.pop();
+        }
+        self.eids.retain(|eid| !eid.uids.is_empty());
+        self.uid = self
+            .eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map(|uid| uid.id().as_str().to_owned())
+            .unwrap_or_default();
+    }
+}
+
+/// One stored EID entry with its EID-level fields.
+///
+/// Stored flat (`{"inserter": .., "uids": [..]}`). Serialization flattens
+/// [`EidFields`]; deserialization goes through a flat private representation
+/// because serde's `flatten` cannot deserialize the `RawValue` behind `ext`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "KvEidRepr")]
+pub struct KvEid {
+    #[serde(flatten)]
+    fields: EidFields,
+    uids: Vec<KvUid>,
+}
+
+/// Flat stored shape of [`KvEid`], used only to deserialize it.
+#[derive(Deserialize)]
+struct KvEidRepr {
+    #[serde(default)]
+    inserter: Option<Box<str>>,
+    #[serde(default)]
+    matcher: Option<Box<str>>,
+    #[serde(default)]
+    mm: Option<MatchMethod>,
+    #[serde(default)]
+    ext: Option<RawJson>,
+    #[serde(deserialize_with = "deserialize_readable_uids")]
+    uids: Vec<KvUid>,
+}
+
+/// The `id` of a stored UID, read without validating the rest of it.
+#[derive(Deserialize)]
+struct StoredId<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+}
+
+/// Deserializes stored UIDs, skipping any whose `id` exceeds
+/// [`MAX_STORED_UID_LENGTH`].
+///
+/// A row written under a higher limit then still loads; an entry left
+/// without UIDs is removed by [`KvEntry::drop_unreadable_ids`]. Any other
+/// invalid UID still fails the row.
+fn deserialize_readable_uids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<KvUid>, D::Error> {
+    let raw = Vec::<Box<RawValue>>::deserialize(deserializer)?;
+    let mut uids = Vec::with_capacity(raw.len());
+    for value in &raw {
+        let oversized = serde_json::from_str::<StoredId<'_>>(value.get())
+            .is_ok_and(|stored| stored.id.len() > MAX_STORED_UID_LENGTH);
+        if oversized {
+            continue;
+        }
+        uids.push(serde_json::from_str(value.get()).map_err(de::Error::custom)?);
+    }
+    Ok(uids)
+}
+
+impl From<KvEidRepr> for KvEid {
+    fn from(repr: KvEidRepr) -> Self {
+        let KvEidRepr {
+            inserter,
+            matcher,
+            mm,
+            ext,
+            uids,
+        } = repr;
+        Self {
+            fields: EidFields {
+                inserter,
+                matcher,
+                mm,
+                ext,
+            },
+            uids,
+        }
+    }
+}
+
+impl KvEid {
+    /// Builds an entry from validated parts.
+    #[must_use]
+    pub fn new(fields: EidFields, uids: Vec<KvUid>) -> Self {
+        Self { fields, uids }
+    }
+
+    /// EID-level fields.
+    #[must_use]
+    pub fn fields(&self) -> &EidFields {
+        &self.fields
+    }
+
+    /// Stored UIDs, live or not.
+    #[must_use]
+    pub fn uids(&self) -> &[KvUid] {
+        &self.uids
+    }
+}
+
+/// One stored UID with its owner and expiry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvUid {
+    id: UidValue,
+    atype: AgentType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ext: Option<RawJson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<ProviderId>,
+    #[serde(
+        default,
+        rename = "exp",
+        with = "optional_exp",
+        skip_serializing_if = "Expiry::is_never"
+    )]
+    expiry: Expiry,
+    /// Private refresh state; never served, mirrored or forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh: Option<KvRefresh>,
+}
+
+/// Refresh state a provider keeps with one of its UIDs.
+///
+/// It stays in the row only: outbound EIDs are built from the UID's `id`,
+/// `atype` and `ext`, so this state never reaches bidders or cookies.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct KvRefresh {
+    /// Provider-defined state, opaque to the framework.
+    pub state: String,
+    /// When the owning provider should be asked to refresh the UID.
+    pub from: UnixSeconds,
+}
+
+impl core::fmt::Debug for KvRefresh {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KvRefresh")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KvUid {
+    /// Builds a UID from validated parts.
+    #[must_use]
+    pub fn new(
+        id: UidValue,
+        atype: AgentType,
+        ext: Option<RawJson>,
+        owner: Option<ProviderId>,
+        expiry: Expiry,
+    ) -> Self {
+        Self {
+            id,
+            atype,
+            ext,
+            owner,
+            expiry,
+            refresh: None,
+        }
+    }
+
+    /// Attaches the owning provider's private refresh state.
+    #[must_use]
+    pub fn with_refresh(mut self, refresh: KvRefresh) -> Self {
+        self.refresh = Some(refresh);
+        self
+    }
+
+    /// The owning provider's private refresh state.
+    #[must_use]
+    pub fn refresh(&self) -> Option<&KvRefresh> {
+        self.refresh.as_ref()
+    }
+
+    /// Whether the owning provider asked to refresh this live UID by `now`.
+    ///
+    /// An expired UID is never refresh-due: its source is due anyway, and a
+    /// refresh that keeps failing must not outlive the UID.
+    #[must_use]
+    pub fn refresh_due(&self, now: UnixSeconds) -> bool {
+        self.is_live(now)
+            && self
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.from <= now)
+    }
+
+    /// The UID value.
+    #[must_use]
+    pub fn id(&self) -> &UidValue {
+        &self.id
+    }
+
+    /// The agent type.
+    #[must_use]
+    pub fn atype(&self) -> AgentType {
+        self.atype
+    }
+
+    /// The UID-level `ext`.
+    #[must_use]
+    pub fn ext(&self) -> Option<&RawJson> {
+        self.ext.as_ref()
+    }
+
+    /// The provider that wrote this UID.
+    #[must_use]
+    pub fn owner(&self) -> Option<&ProviderId> {
+        self.owner.as_ref()
+    }
+
+    /// When the UID stops being served.
+    #[must_use]
+    pub fn expiry(&self) -> Expiry {
+        self.expiry
+    }
+
+    /// Whether the UID may be served at `now`.
+    #[must_use]
+    pub fn is_live(&self, now: UnixSeconds) -> bool {
+        self.expiry.is_live(now)
+    }
 }
 
 /// Publisher property metadata captured when an EC entry is created.
@@ -263,6 +668,17 @@ pub(crate) fn validated_stored_domain(domain: &str) -> Option<String> {
 }
 
 impl KvEntry {
+    /// Removes partner records holding no UID this build can serve.
+    ///
+    /// Lets this build load rows written by one with a higher
+    /// [`MAX_STORED_UID_LENGTH`] instead of rejecting the whole row. Returns the
+    /// number of records removed.
+    pub fn drop_unreadable_ids(&mut self) -> usize {
+        let before = self.ids.len();
+        self.ids.retain(|_, record| record.retain_readable());
+        before - self.ids.len()
+    }
+
     /// Creates a new live entry from the current request context.
     ///
     /// `domain` is the publisher's apex domain (e.g. `"example.com"`),
@@ -293,7 +709,91 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
+            revocations: BTreeMap::new(),
         }
+    }
+
+    /// Whether `provider` opted out and must not be called again by `now`.
+    #[must_use]
+    pub fn opted_out(&self, provider: &ProviderId, now: UnixSeconds) -> bool {
+        self.opt_outs
+            .get(provider)
+            .is_some_and(|until| *until > now.get())
+    }
+
+    /// Remembers an opt-out by `provider` for [`OPT_OUT_MEMORY_SECONDS`],
+    /// with the hashes of the UIDs known for it then (at most
+    /// [`MAX_OPT_OUT_UID_HASHES`]).
+    ///
+    /// An opt-out already remembered keeps its end time and hashes, so a
+    /// provider skipped because of it is asked again once the time passes.
+    pub fn remember_opt_out(
+        &mut self,
+        provider: &ProviderId,
+        now: UnixSeconds,
+        uid_hashes: &[String],
+    ) {
+        if self.opted_out(provider, now) {
+            return;
+        }
+        self.opt_outs.insert(
+            provider.clone(),
+            now.saturating_add_secs(OPT_OUT_MEMORY_SECONDS).get(),
+        );
+        if uid_hashes.is_empty() {
+            self.opt_out_uids.remove(provider);
+        } else {
+            let kept = uid_hashes.len().min(MAX_OPT_OUT_UID_HASHES);
+            self.opt_out_uids
+                .insert(provider.clone(), uid_hashes[..kept].to_vec());
+        }
+    }
+
+    /// Whether every one of `uid_hashes` was known when `provider`'s
+    /// remembered opt-out was recorded, so cookies holding them repeat the
+    /// opted-out identity rather than a renewed one.
+    ///
+    /// An opt-out remembered without hashes knew no UID, so any UID is new.
+    #[must_use]
+    pub fn repeats_opted_out_uids(&self, provider: &ProviderId, uid_hashes: &[String]) -> bool {
+        !uid_hashes.is_empty()
+            && self
+                .opt_out_uids
+                .get(provider)
+                .is_some_and(|known| uid_hashes.iter().all(|hash| known.contains(hash)))
+    }
+
+    /// Forgets the opt-out remembered for `provider`, if any.
+    pub fn forget_opt_out(&mut self, provider: &ProviderId) {
+        self.opt_outs.remove(provider);
+        self.opt_out_uids.remove(provider);
+    }
+
+    /// Forgets opt-outs whose time has passed, and revocations older than
+    /// [`REVOCATION_MEMORY_SECONDS`].
+    pub fn prune_opt_outs(&mut self, now: UnixSeconds) {
+        self.opt_outs.retain(|_, until| *until > now.get());
+        let opt_outs = &self.opt_outs;
+        self.opt_out_uids
+            .retain(|provider, _| opt_outs.contains_key(provider));
+        self.revocations
+            .retain(|_, at| at.saturating_add(REVOCATION_MEMORY_SECONDS) > now.get());
+    }
+
+    /// Records that an opt-out reported by `provider` removed its sources.
+    ///
+    /// The recorded value always changes, even for two opt-outs within one
+    /// second, so a lookup that saw the earlier value is still discarded.
+    pub fn record_revocation(&mut self, provider: &ProviderId, now: UnixSeconds) {
+        let at = self
+            .revocations
+            .get(provider)
+            .map_or(now.get(), |previous| {
+                now.get().max(previous.saturating_add(1))
+            });
+        self.revocations.insert(provider.clone(), at);
     }
 
     /// Creates a minimal live entry.
@@ -303,12 +803,7 @@ impl KvEntry {
     #[must_use]
     pub fn minimal(partner_id: &str, uid: &str, now: u64) -> Self {
         let mut ids = BTreeMap::new();
-        ids.insert(
-            partner_id.to_owned(),
-            KvPartnerId {
-                uid: uid.to_owned(),
-            },
-        );
+        ids.insert(partner_id.to_owned(), KvPartnerId::single(uid.to_owned()));
         Self {
             v: SCHEMA_VERSION,
             created: now,
@@ -328,6 +823,9 @@ impl KvEntry {
             device: None,
             network: None,
             ids,
+            opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
+            revocations: BTreeMap::new(),
         }
     }
 
@@ -360,6 +858,9 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            opt_outs: BTreeMap::new(),
+            opt_out_uids: BTreeMap::new(),
+            revocations: BTreeMap::new(),
         }
     }
 
@@ -381,10 +882,27 @@ impl KvEntry {
         }
 
         for (partner_id, partner_uid) in &self.ids {
-            if partner_uid.uid.len() > MAX_UID_LENGTH {
+            if partner_uid.uid.len() > MAX_STORED_UID_LENGTH {
                 return Err(format!(
-                    "partner ID '{partner_id}' exceeds MAX_UID_LENGTH ({})",
+                    "partner ID '{partner_id}' exceeds MAX_STORED_UID_LENGTH ({})",
                     partner_uid.uid.len()
+                ));
+            }
+            let oversized_field = partner_uid.eids().iter().any(|eid| {
+                let fields = eid.fields();
+                [fields.inserter.as_deref(), fields.matcher.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|field| field.len() > MAX_EID_FIELD_BYTES)
+            });
+            if oversized_field {
+                return Err(format!(
+                    "partner ID '{partner_id}' has an EID inserter or matcher over MAX_EID_FIELD_BYTES"
+                ));
+            }
+            if partner_uid.eids().iter().any(|eid| eid.uids().is_empty()) {
+                return Err(format!(
+                    "partner ID '{partner_id}' has an EID entry with no UIDs"
                 ));
             }
         }
@@ -463,6 +981,10 @@ impl KvGeo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::eid_types::{
+        AgentType, EidFields, Expiry, MatchMethod, ProviderId, RawJson, UidValue, UnixSeconds,
+    };
+    use serde_json::json;
 
     fn sample_consent_context() -> ConsentContext {
         ConsentContext {
@@ -492,9 +1014,7 @@ mod tests {
         let mut entry = KvEntry::new(&consent, Some(&geo), 1_741_824_000, "example.com");
         entry.ids.insert(
             "liveramp".to_owned(),
-            KvPartnerId {
-                uid: "LR_xyz".to_owned(),
-            },
+            KvPartnerId::single("LR_xyz".to_owned()),
         );
 
         let json = serde_json::to_string(&entry).expect("should serialize KvEntry");
@@ -525,6 +1045,89 @@ mod tests {
                 && !json.contains("cluster_checked")
                 && !json.contains("visits"),
             "serialized entry should omit removed timestamp and visit fields: {json}"
+        );
+    }
+
+    #[test]
+    fn a_remembered_opt_out_recognises_only_the_uids_known_then() {
+        // Arrange
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1000);
+        let held = vec![opt_out_uid_hash("held-id")];
+
+        // Act
+        entry.remember_opt_out(&provider, UnixSeconds::new(1000), &held);
+
+        // Assert
+        assert!(
+            entry.repeats_opted_out_uids(&provider, &held),
+            "should recognise a cookie that repeats the opted-out UID"
+        );
+        assert!(
+            !entry.repeats_opted_out_uids(
+                &provider,
+                &[opt_out_uid_hash("held-id"), opt_out_uid_hash("new-id")]
+            ),
+            "should not recognise a cookie holding a renewed UID"
+        );
+        assert!(
+            !serde_json::to_string(&entry)
+                .expect("should serialize the row")
+                .contains("held-id"),
+            "should store hashes rather than the opted-out UID"
+        );
+        let mut lapsed = entry.clone();
+        lapsed.prune_opt_outs(UnixSeconds::new(1000 + OPT_OUT_MEMORY_SECONDS));
+        entry.forget_opt_out(&provider);
+        assert!(
+            entry.opt_out_uids.is_empty() && lapsed.opt_out_uids.is_empty(),
+            "should drop the hashes with a forgotten or lapsed opt-out"
+        );
+    }
+
+    #[test]
+    fn revocations_are_optional_and_round_trip() {
+        // Arrange: a row written before revocations existed.
+        let old_row = json!({
+            "v": 1,
+            "created": 1000,
+            "consent": { "ok": true, "updated": 1000 },
+            "geo": { "country": "ZZ" },
+            "opt_outs": { "example-provider": 5000 }
+        });
+
+        // Act
+        let mut entry: KvEntry =
+            serde_json::from_value(old_row).expect("should read a row without revocations");
+        let provider = ProviderId::new("example-provider");
+        entry.record_revocation(&provider, UnixSeconds::new(2000));
+        entry.record_revocation(&provider, UnixSeconds::new(2000));
+        let reread: KvEntry =
+            serde_json::from_value(serde_json::to_value(&entry).expect("should serialize the row"))
+                .expect("should read the row back");
+
+        // Assert
+        assert_eq!(
+            reread.revocations.get(&provider).copied(),
+            Some(2001),
+            "should keep a changed revocation for a second opt-out in one second"
+        );
+        assert_eq!(
+            reread.opt_outs.get(&provider).copied(),
+            Some(5000),
+            "should keep the remembered opt-out"
+        );
+        let mut pruned = reread;
+        pruned.prune_opt_outs(UnixSeconds::new(2001 + REVOCATION_MEMORY_SECONDS));
+        assert!(
+            pruned.revocations.is_empty(),
+            "should forget a revocation after its memory period"
+        );
+        assert!(
+            !serde_json::to_string(&pruned)
+                .expect("should serialize the row")
+                .contains("revocations"),
+            "should omit empty revocations"
         );
     }
 
@@ -737,16 +1340,14 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            KvPartnerId {
-                uid: "x".repeat(MAX_UID_LENGTH + 1),
-            },
+            KvPartnerId::single("x".repeat(MAX_STORED_UID_LENGTH + 1)),
         );
 
         let err = entry
             .validate()
             .expect_err("should reject oversized partner UIDs");
         assert!(
-            err.contains("MAX_UID_LENGTH"),
+            err.contains("MAX_STORED_UID_LENGTH"),
             "should describe the UID length validation failure"
         );
     }
@@ -1204,6 +1805,246 @@ mod tests {
         assert!(
             meta.known_browser.is_none(),
             "known_browser should default to None"
+        );
+    }
+
+    fn provider_uid(id: &str, expiry: Expiry) -> KvUid {
+        KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            expiry,
+        )
+    }
+
+    #[test]
+    fn legacy_partner_id_round_trips_without_eids() {
+        let legacy: KvPartnerId = serde_json::from_value(serde_json::json!({ "uid": "abc" }))
+            .expect("should read legacy record");
+        assert_eq!(legacy, KvPartnerId::single("abc"), "should read legacy uid");
+        assert_eq!(
+            serde_json::to_value(&legacy).expect("should serialize"),
+            serde_json::json!({ "uid": "abc" }),
+            "should not add eids to legacy records"
+        );
+    }
+
+    #[test]
+    fn from_eids_sets_uid_to_first_live_uid() {
+        let now = UnixSeconds::new(100);
+        let eid = KvEid::new(
+            EidFields::default(),
+            vec![
+                provider_uid("expired", Expiry::At(UnixSeconds::new(50))),
+                provider_uid("live", Expiry::Never),
+            ],
+        );
+        let record = KvPartnerId::from_eids(vec![eid], now).expect("should keep live uid");
+        assert_eq!(record.uid, "live", "should mirror first live uid into uid");
+        assert!(record.is_provider_written(), "should mark provider record");
+    }
+
+    #[test]
+    fn prune_expired_drops_dead_uids_and_resyncs_uid() {
+        let eid = KvEid::new(
+            EidFields::default(),
+            vec![
+                provider_uid("first", Expiry::At(UnixSeconds::new(150))),
+                provider_uid("second", Expiry::Never),
+            ],
+        );
+        let mut record =
+            KvPartnerId::from_eids(vec![eid], UnixSeconds::new(100)).expect("should build");
+        assert_eq!(record.uid, "first", "should start on first uid");
+
+        let changed = record.prune_expired(UnixSeconds::new(200));
+
+        assert!(changed, "should report pruning");
+        assert_eq!(record.eids()[0].uids().len(), 1, "should drop expired uid");
+        assert_eq!(record.uid, "second", "should resync uid");
+    }
+
+    #[test]
+    fn provider_record_round_trips_with_owner_and_exp() {
+        let eid = KvEid::new(
+            EidFields::default(),
+            vec![provider_uid("v", Expiry::At(UnixSeconds::new(500)))],
+        );
+        let record = KvPartnerId::from_eids(vec![eid], UnixSeconds::new(1)).expect("should build");
+        let json = serde_json::to_value(&record).expect("should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1, "owner": "example-provider", "exp": 500 }] }] }),
+            "should store owner and exp"
+        );
+        let back: KvPartnerId = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(back, record, "should round-trip");
+    }
+
+    #[test]
+    fn validate_rejects_empty_provider_eid() {
+        let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
+        let record: KvPartnerId =
+            serde_json::from_value(serde_json::json!({ "uid": "v", "eids": [{ "uids": [] }] }))
+                .expect("should parse");
+        entry.ids.insert("ids.example.com".to_owned(), record);
+        assert!(entry.validate().is_err(), "should reject EID with no UIDs");
+    }
+
+    #[test]
+    fn validate_accepts_liveramp_sized_uid() {
+        let entry = KvEntry::minimal("liveramp.example.com", &"x".repeat(703), 1);
+        assert!(
+            entry.validate().is_ok(),
+            "should accept a 703-byte envelope-sized UID"
+        );
+    }
+
+    #[test]
+    fn drop_unreadable_ids_removes_oversized_single_uid() {
+        let mut entry = KvEntry::minimal("ids.example.com", "kept", 1);
+        entry.ids.insert(
+            "long.example.com".to_owned(),
+            KvPartnerId::single("x".repeat(MAX_STORED_UID_LENGTH + 1)),
+        );
+
+        let dropped = entry.drop_unreadable_ids();
+
+        assert_eq!(dropped, 1, "should drop the oversized record");
+        assert_eq!(
+            entry.ids.keys().collect::<Vec<_>>(),
+            vec!["ids.example.com"],
+            "should keep the readable record"
+        );
+        assert!(entry.validate().is_ok(), "should validate after dropping");
+    }
+
+    #[test]
+    fn deserialize_drops_oversized_provider_uids() {
+        let long = "x".repeat(MAX_STORED_UID_LENGTH + 1);
+        let json = serde_json::json!({
+            "v": SCHEMA_VERSION,
+            "created": 1,
+            "consent": { "ok": true, "updated": 1 },
+            "geo": { "country": "US" },
+            "ids": {
+                "partial.example.com": { "uid": long, "eids": [
+                    { "uids": [{ "id": long, "atype": 1 }] },
+                    { "uids": [{ "id": "short", "atype": 1 }] }
+                ] },
+                "gone.example.com": { "uid": long, "eids": [
+                    { "uids": [{ "id": long, "atype": 1 }] }
+                ] }
+            }
+        })
+        .to_string();
+        let mut entry: KvEntry =
+            serde_json::from_str(&json).expect("should parse a row with oversized UIDs");
+
+        let dropped = entry.drop_unreadable_ids();
+
+        assert_eq!(dropped, 1, "should drop the record left without UIDs");
+        let partial = entry
+            .ids
+            .get("partial.example.com")
+            .expect("should keep the record with a readable UID");
+        assert_eq!(partial.uid, "short", "should resync uid to the kept UID");
+        assert_eq!(partial.eids().len(), 1, "should drop the emptied entry");
+        assert!(entry.validate().is_ok(), "should validate after dropping");
+    }
+
+    #[test]
+    fn provider_record_round_trips_eid_level_fields() {
+        let ext = serde_json::value::to_raw_value(&serde_json::json!({ "k": 1 }))
+            .expect("should encode ext");
+        let fields = EidFields {
+            inserter: Some("inserter.example.com".into()),
+            matcher: Some("matcher.example.com".into()),
+            mm: Some(MatchMethod::Authenticated),
+            ext: Some(RawJson::try_from(ext.as_ref()).expect("should accept ext")),
+        };
+        let eid = KvEid::new(fields, vec![provider_uid("v", Expiry::Never)]);
+        let record =
+            KvPartnerId::from_eids(vec![eid], UnixSeconds::new(1)).expect("should build record");
+
+        let json = serde_json::to_string(&record).expect("should serialize");
+        let back: KvPartnerId = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("should parse"),
+            serde_json::json!({ "uid": "v", "eids": [{
+                "inserter": "inserter.example.com",
+                "matcher": "matcher.example.com",
+                "mm": 3,
+                "ext": { "k": 1 },
+                "uids": [{ "id": "v", "atype": 1, "owner": "example-provider" }]
+            }] }),
+            "should store EID-level fields flat beside uids"
+        );
+        assert_eq!(back, record, "should round-trip EID-level fields");
+    }
+
+    #[test]
+    fn provider_record_rejects_invalid_stored_ext() {
+        let big = "x".repeat(crate::ec::eid_types::MAX_EXT_BYTES);
+        let cases = [
+            serde_json::json!({ "uid": "v", "eids": [{ "ext": [1], "uids": [{ "id": "v", "atype": 1 }] }] }),
+            serde_json::json!({ "uid": "v", "eids": [{ "ext": { "k": big }, "uids": [{ "id": "v", "atype": 1 }] }] }),
+            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1, "ext": { "k": big } }] }] }),
+            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1, "ext": "text" }] }] }),
+        ];
+
+        for case in cases {
+            let text = serde_json::to_string(&case).expect("should encode case");
+            assert!(
+                serde_json::from_str::<KvPartnerId>(&text).is_err(),
+                "should reject invalid stored ext: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_oversized_inserter_and_matcher() {
+        let long = "a".repeat(crate::ec::eid_types::MAX_EID_FIELD_BYTES + 1);
+        for field in ["inserter", "matcher"] {
+            let mut eid = serde_json::json!({ "uids": [{ "id": "v", "atype": 1 }] });
+            eid[field] = serde_json::Value::String(long.clone());
+            let record: KvPartnerId =
+                serde_json::from_value(serde_json::json!({ "uid": "v", "eids": [eid] }))
+                    .expect("should parse record");
+            let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
+            entry.ids.insert("ids.example.com".to_owned(), record);
+
+            assert!(entry.validate().is_err(), "should reject oversized {field}");
+        }
+    }
+
+    #[test]
+    fn refresh_is_due_only_while_the_uid_is_live() {
+        let uid = KvUid::new(
+            UidValue::try_from("p-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            None,
+            Expiry::At(UnixSeconds::new(5000)),
+        )
+        .with_refresh(KvRefresh {
+            state: "refresh-state".to_owned(),
+            from: UnixSeconds::new(1000),
+        });
+
+        assert!(
+            !uid.refresh_due(UnixSeconds::new(999)),
+            "should wait for `from`"
+        );
+        assert!(
+            uid.refresh_due(UnixSeconds::new(1000)),
+            "should be due at `from`"
+        );
+        assert!(
+            !uid.refresh_due(UnixSeconds::new(5000)),
+            "should stop refreshing once the UID expires"
         );
     }
 }

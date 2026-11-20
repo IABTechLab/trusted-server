@@ -41,6 +41,7 @@ pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
 };
 
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -287,6 +288,23 @@ fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
     })
 }
 
+/// Whether the effective TCF string grants vendor consent to `vendor_id`.
+///
+/// Returns `false` when no TCF string applies.
+#[must_use]
+pub fn has_tcf_vendor_consent(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bool {
+    effective_tcf(ctx).is_some_and(|tcf| tcf.has_vendor_consent(vendor_id.get()))
+}
+
+/// Whether TCF rules apply and withhold vendor consent from `vendor_id`.
+///
+/// Returns `false` when no TCF string applies and GDPR does not, so a TCF
+/// vendor requirement only gates traffic that TCF governs.
+#[must_use]
+pub fn tcf_vendor_consent_denied(ctx: &ConsentContext, vendor_id: NonZeroU16) -> bool {
+    (ctx.gdpr_applies || effective_tcf(ctx).is_some()) && !has_tcf_vendor_consent(ctx, vendor_id)
+}
+
 /// Returns whether a server-side auction may be dispatched for this request.
 ///
 /// Fails closed for GDPR-relevant traffic: when an EU TCF signal is present
@@ -499,6 +517,12 @@ pub(crate) fn allows_eid_persistence(ctx: &ConsentContext) -> bool {
     }
 }
 
+/// Decide whether current-request consent permits creative proxy EC disclosure.
+#[must_use]
+pub(crate) fn allows_proxy_ec_disclosure(ctx: &ConsentContext) -> bool {
+    !ctx.expired && !ctx.gpc && allows_ec_creation(ctx) && allows_eid_persistence(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // EC consent gating
 // ---------------------------------------------------------------------------
@@ -678,20 +702,84 @@ fn log_consent_context(ctx: &ConsentContext) {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use edgezero_core::body::Body as EdgeBody;
     use http::Request;
 
     use super::{
-        ConsentPipelineInput, allows_ec_creation, allows_eid_persistence, apply_expiration_check,
-        apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
-        consent_allows_server_side_auction, gate_eids_by_consent, has_explicit_ec_withdrawal,
+        ConsentPipelineInput, allows_ec_creation, allows_eid_persistence,
+        allows_proxy_ec_disclosure, apply_expiration_check, apply_tcf_conflict_resolution,
+        build_consent_context, build_context_from_signals, consent_allows_server_side_auction,
+        gate_eids_by_consent, has_explicit_ec_withdrawal, has_tcf_vendor_consent,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
         ConsentContext, GppConsent, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
     };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
+    use crate::constants::COOKIE_SOURCEPOINT_TCF;
     use crate::cookies::parse_cookies_to_jar;
+    use crate::geo::GeoInfo;
+    use std::num::NonZeroU16;
+
+    #[test]
+    fn proxy_disclosure_requires_current_consent_beyond_creation() {
+        let allowed = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_proxy_ec_disclosure(&allowed),
+            "should allow known non-regulated traffic"
+        );
+        for denied in [
+            ConsentContext::default(),
+            ConsentContext {
+                gpc: true,
+                ..allowed.clone()
+            },
+            ConsentContext {
+                expired: true,
+                ..allowed.clone()
+            },
+            ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                ..ConsentContext::default()
+            },
+            ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                tcf: Some(
+                    TcfBuilder::new()
+                        .with_storage(true)
+                        .with_personalized_ads(false)
+                        .build(),
+                ),
+                ..ConsentContext::default()
+            },
+        ] {
+            assert!(
+                !allows_proxy_ec_disclosure(&denied),
+                "should withhold disclosure for denied or insufficient current consent"
+            );
+        }
+        let gdpr_allowed = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(
+                TcfBuilder::new()
+                    .with_storage(true)
+                    .with_personalized_ads(true)
+                    .build(),
+            ),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_proxy_ec_disclosure(&gdpr_allowed),
+            "should honor affirmative storage and personalization consent"
+        );
+    }
 
     fn build_request() -> Request<EdgeBody> {
         Request::builder()
@@ -753,6 +841,32 @@ mod tests {
                 special_feature_opt_ins: vec![false; 12],
             }
         }
+    }
+
+    #[test]
+    fn tcf_vendor_consent_reads_the_effective_tcf_string() {
+        let mut tcf = TcfBuilder::new().with_storage(true).build();
+        tcf.vendor_consents = vec![9999];
+        let context = ConsentContext {
+            gdpr_applies: true,
+            tcf: Some(tcf),
+            ..ConsentContext::default()
+        };
+        let granted = NonZeroU16::new(9999).expect("should be non-zero");
+        let other = NonZeroU16::new(1234).expect("should be non-zero");
+
+        assert!(
+            has_tcf_vendor_consent(&context, granted),
+            "should grant consented vendor"
+        );
+        assert!(
+            !has_tcf_vendor_consent(&context, other),
+            "should deny other vendor"
+        );
+        assert!(
+            !has_tcf_vendor_consent(&ConsentContext::default(), granted),
+            "should deny when no TCF string applies"
+        );
     }
 
     fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {
@@ -983,6 +1097,67 @@ mod tests {
             !allows_ec_creation(&ctx),
             "missing geo should keep EC creation fail-closed"
         );
+    }
+
+    #[test]
+    fn sourcepoint_tcf_mirror_uses_existing_gdpr_grant_and_withdrawal_rules() {
+        // Minimal synthetic TCF v2 core segments with Purpose 1 toggled.
+        let mut core = [0u8; 32];
+        core[0] = 2 << 2;
+        let denial = URL_SAFE_NO_PAD.encode(core);
+        core[19] = 0x80;
+        let grant = URL_SAFE_NO_PAD.encode(core);
+        let geo = GeoInfo {
+            city: String::new(),
+            country: "GB".to_owned(),
+            continent: "EU".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+        let config = ConsentConfig {
+            check_expiration: false,
+            ..ConsentConfig::default()
+        };
+        let req = build_request();
+
+        for (cookie, allowed, withdrawn) in [
+            (format!("{COOKIE_SOURCEPOINT_TCF}={grant}"), true, false),
+            (format!("{COOKIE_SOURCEPOINT_TCF}={denial}"), false, true),
+            (
+                format!("{COOKIE_SOURCEPOINT_TCF}={grant}; euconsent-v2={denial}"),
+                false,
+                true,
+            ),
+            (format!("{COOKIE_SOURCEPOINT_TCF}=invalid"), false, false),
+        ] {
+            let jar = parse_cookies_to_jar(&cookie);
+            let ctx = build_consent_context(&ConsentPipelineInput {
+                jar: Some(&jar),
+                req: &req,
+                config: &config,
+                geo: Some(&geo),
+            });
+
+            assert_eq!(
+                ctx.jurisdiction,
+                Jurisdiction::Gdpr,
+                "should classify UK geo"
+            );
+            assert_eq!(allows_ec_creation(&ctx), allowed, "should gate EC issuance");
+            assert_eq!(
+                consent_allows_server_side_auction(&ctx),
+                allowed,
+                "should gate auction dispatch"
+            );
+            assert_eq!(
+                has_explicit_ec_withdrawal(&ctx),
+                withdrawn,
+                "should distinguish withdrawal from unavailable consent"
+            );
+        }
     }
 
     #[test]

@@ -7,13 +7,22 @@ config that `ts config push` writes into KV to the nested
 
 ## Support status
 
-| Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | absent | `500`          | no             | single           | outermost sanitize         | none                  |
+| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
 
-This row is the canonical status summary. Cloudflare has no
-`/health` route, supports one enabled auction provider, and returns 500 on
-every route when startup fails.
+This row is the canonical status summary. Cloudflare supports multiple auction
+providers. GET/HEAD `/health` and `/ready` are local probes after Worker and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable. See the
+[operational response contract](./api-reference#operational-probe-contract).
+
+EdgeZero's Cloudflare `run_app` installs the log backend, and Trusted Server
+installs none of its own. Records go to the Workers console, which `wrangler
+dev` prints and `wrangler tail` streams from a deployed Worker. The level comes
+from the `EDGEZERO__LOGGING__LEVEL` Worker variable and defaults to `info`, so
+the startup report and every warning are logged. EdgeZero's own startup
+warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 
@@ -24,7 +33,9 @@ Install the Wrangler version pinned in `.tool-versions`, then run:
 ```
 
 The smoke refuses an absent pin or a different Wrangler executable. It creates
-an isolated Worker manifest, maps the EdgeZero config store to
+an isolated Worker manifest, copies the tool version declarations into its
+temporary workspace so Node and Wrangler shims retain their selected versions,
+maps the EdgeZero config store to
 `TRUSTED_SERVER_KV`, and runs `ts config push --adapter cloudflare --local`.
 It reads `trusted_server_config` back with `wrangler kv key get` using both the
 explicit binding and local mode. The returned envelope becomes the string
@@ -35,7 +46,7 @@ the current startup reader.
 The generated local Wrangler files define `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
-secret. Each case requires a 500 response and verifies the exact missing
+secret. Each case requires a 503 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher
 request must return 200, include the stub-origin sentinel, rewrite its origin
 URL to the Worker listener, and omit the original URL.
@@ -43,6 +54,14 @@ URL to the Worker listener, and omit the original URL.
 The exit trap stops Wrangler and the stub origin and removes the isolated KV,
 generated Wrangler manifests, response captures, and logs. It does not modify
 the checked-in manifests.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Configure a deployed Worker
 
