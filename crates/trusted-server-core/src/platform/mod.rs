@@ -44,7 +44,7 @@ pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformK
 pub use edgezero_core::outbound::HttpClient;
 pub use edgezero_core::time::MonotonicClock;
 pub use error::PlatformError;
-pub use kv::UnavailableKvStore;
+pub use kv::{KvHandleStore, UnavailableKvStore};
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,

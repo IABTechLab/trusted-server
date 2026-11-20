@@ -26,7 +26,11 @@ warnings, under the `edgezero::boot` target, stay at `warn` whatever the level.
 
 ## Verify the complete local handoff
 
-Install the Wrangler version pinned in `.tool-versions`, then run:
+The smoke helper requires a Wrangler entry in `.tool-versions` and an
+executable matching it. This stack has no Wrangler pin, so the helper currently
+exits with `missing Wrangler pin in .tool-versions`; the command below becomes
+available once the toolchain is pinned. Local binding verification for this
+change used Wrangler 4.83.0 directly with an isolated manifest and state.
 
 ```bash
 ./scripts/smoke-cloudflare.sh
@@ -63,10 +67,31 @@ handler_password`, `wrangler secret put publisher_proxy_secret`, and `wrangler
 secret put ec_passphrase`; do not commit them to a Wrangler manifest. Deploy
 only after all four bindings are present.
 
-A successful `ts config push` alone does not configure this runtime: the
-Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time
-store registries are also unwired, so EC KV lookup and key rotation are not
-available. The read-only `/_ts/admin/eids` diagnostic remains available.
+A successful `ts config push` alone does not configure this runtime: startup
+reads only the `TRUSTED_SERVER_CONFIG` variable, never a KV namespace. Push
+deployment config to a namespace other than `TRUSTED_SERVER_KV`, which holds
+runtime KV data. The local smoke's isolated namespace is removed when it
+exits.
+
+## Runtime stores
+
+- **Generic runtime KV.** The Worker opens the `TRUSTED_SERVER_KV` namespace
+  binding for each request and hands it to features through
+  `RuntimeServices::kv_store()`. Without the binding, KV operations answer
+  `KvError::Unavailable`, a warning is logged once per isolate, and every
+  route is still served.
+- **Request-time config is unsupported.** Request signing therefore cannot
+  read its metadata: `/.well-known/trusted-server.json` answers the shared
+  `500`, `/verify-signature` answers `200` with `verified: false`, and a Worker
+  started with `request_signing.enabled = true` cannot sign outbound auction
+  requests. DataDome IP CIDR bypass lists from a config store are unavailable
+  too.
+- **EC lookup and key rotation are unsupported.** They need the EC record
+  store and the key-management stores, which this adapter does not provide.
+  The read-only `/_ts/admin/eids` diagnostic remains available.
+
+See the [store inventory](./edgezero#store-inventory) for every store each
+adapter reads.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 

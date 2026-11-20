@@ -135,7 +135,7 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, KvHandleStore, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -376,7 +376,7 @@ fn build_per_request_services(
         .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
             outbound_client.clone(),
         )))
-        .kv_store(Arc::clone(&state.default_kv_store))
+        .kv_store(request_kv_store(state, ctx))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
@@ -387,6 +387,21 @@ fn build_per_request_services(
         .geo(Arc::new(request_geo))
         .client_info(client_info)
         .build())
+}
+
+/// Returns the generic runtime KV store for one request.
+///
+/// `EdgeZero` registers the store [`TrustedServerApp::stores`] declares
+/// (`trusted_server_kv`) in every production request and opens the linked
+/// Fastly KV store on first use. A service without that store linked answers
+/// each KV operation with `KvError::OpenFailed`, and routes that do not use KV
+/// are unaffected. A request without a registry, which only test contexts
+/// build, uses [`AppState::default_kv_store`].
+fn request_kv_store(state: &AppState, ctx: &RequestContext) -> Arc<dyn PlatformKvStore> {
+    ctx.kv_store_default().map_or_else(
+        || Arc::clone(&state.default_kv_store),
+        |handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>,
+    )
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1912,6 +1927,81 @@ mod tests {
         assert!(
             !services.outbound_client().proxy_marker_enabled(),
             "should turn the proxy marker off on the context client"
+        );
+    }
+
+    /// Builds a context whose `KvRegistry` holds the Fastly KV store linked
+    /// under the id [`TrustedServerApp::stores`] declares, as `EdgeZero`'s
+    /// dispatch registers it for a production request.
+    fn context_with_declared_kv_store(request: edgezero_core::http::Request) -> RequestContext {
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+        let store = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+            .expect("should open the KV store fastly.toml links under the declared id");
+        let registry = edgezero_core::store_registry::KvRegistry::new(
+            std::collections::BTreeMap::from([(
+                declared.default.to_owned(),
+                edgezero_core::key_value_store::KvHandle::new(Arc::new(store)),
+            )]),
+            declared.default.to_owned(),
+        );
+        let mut request = request;
+        request.extensions_mut().insert(registry);
+        context_with_client(
+            request,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        )
+    }
+
+    #[test]
+    fn per_request_services_write_through_to_the_declared_kv_store() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_declared_kv_store(empty_request(Method::GET, "/article"));
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.kv_store().put_bytes(
+            "per-request-services-write-through",
+            Bytes::from_static(b"example-value"),
+        ))
+        .expect("should write through the request's KV store");
+
+        let independent =
+            edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+                .expect("should reopen the linked KV store");
+        assert_eq!(
+            block_on(PlatformKvStore::get_bytes(
+                &independent,
+                "per-request-services-write-through"
+            ))
+            .expect("should read the linked KV store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should persist the write in the store linked under `trusted_server_kv`"
+        );
+    }
+
+    #[test]
+    fn per_request_services_without_a_kv_registry_report_kv_unavailable() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        let result = block_on(services.kv_store().get_bytes("example-key"));
+
+        assert!(
+            matches!(
+                result,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should fall back to the unavailable KV store, got {result:?}"
         );
     }
 

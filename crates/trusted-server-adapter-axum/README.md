@@ -8,7 +8,9 @@ yet.
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
-unavailable; config/secret snapshots are not live identity storage.
+unavailable (`KvError::Unavailable`) until #1587 then #1574 connect identity
+storage through EdgeZero's declared store. There is no adapter-local KV store;
+config/secret snapshots are not live identity storage.
 
 Before listening, the native initializer reads the declared prepared stores,
 validates one bounded config envelope and its active secret references, and

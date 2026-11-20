@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
@@ -57,15 +57,19 @@ use crate::middleware::{
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
+use crate::platform::{
+    ConfigStoreHandleAdapter, SPIN_DEFAULT_CONFIG_LABEL, SpinSecretStoreAdapter,
+};
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
-/// Spin auto-provides this key-value store label without runtime configuration.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
+/// Logical ID, and default Spin label, of the generic runtime KV store.
+///
+/// It matches the KV store `edgezero.toml` declares. Its label must never be
+/// `default`, which holds the app config and request-signing metadata.
+pub const SPIN_KV_STORE_ID: &str = "trusted_server_kv";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -90,7 +94,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_LABEL);
     let config_key = default_config_key();
     // `for_label` defers open failures to the first read, which the
     // read error branch below reports.
@@ -480,6 +484,23 @@ impl Hooks for TrustedServerApp {
         })?;
 
         Ok(router_builder(&state).build())
+    }
+
+    /// Declares only the generic runtime KV store.
+    ///
+    /// `EdgeZero` opens the `trusted_server_kv` label on first use, so a
+    /// component without that label still serves every route. Config and
+    /// secrets are not declared: startup and request-time config read the
+    /// `default` label directly, and secrets come from component variables.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: SPIN_KV_STORE_ID,
+                ids: &[SPIN_KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 

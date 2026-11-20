@@ -28,7 +28,7 @@ impl PlatformGeo for AxumPlatformGeo {
 
 /// Construct request-scoped services from the immutable prepared native snapshots.
 ///
-/// # Degraded features in dev
+/// # Unsupported runtime KV
 ///
 /// The generic runtime KV slot uses
 /// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
@@ -54,7 +54,7 @@ pub fn build_runtime_services(
         })?;
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
+        log::warn!("Axum adapter: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
     let client_ip = ctx
@@ -195,6 +195,30 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "internal error: request has no prepared native store snapshot"
+        );
+    }
+
+    #[test]
+    fn runtime_services_report_kv_unavailable() {
+        let context = context_with_client(Some(ScriptedHttpClient::forbidding().http_client()));
+        let services = build_runtime_services(&context).expect("should build runtime services");
+        let store = services.kv_store();
+
+        let read = futures::executor::block_on(store.get_bytes("example-key"));
+        assert!(
+            matches!(
+                read,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should leave Axum runtime KV unavailable, got {read:?}"
+        );
+        let write = futures::executor::block_on(store.put_bytes("example-key", Default::default()));
+        assert!(
+            matches!(
+                write,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should reject Axum runtime KV writes as unavailable, got {write:?}"
         );
     }
 
