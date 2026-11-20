@@ -15,7 +15,7 @@
 - No login: no hashed email. The first-party `LiveIntent` cookie (`_lc2_fpi` by default) is sent as `duid`, read from `LookupInput::cookies`.
 - The attribute-to-source table is fixed, as in the reference provider; `settings.resolve` picks attributes from it, and every picked attribute's source must be one of the provider's `sources`.
 - No page URL in `LookupInput`, so `pu` is the publisher origin.
-- EID-level fields are preserved. As in Prebid, every attribute other than `nonId` is a partner ID whose UID carries `ext` `{"provider":"liveintent.com"}`; the Trade Desk ID's UID also carries `rtiPartner: "TDID"` and its EID `matcher = "liveintent.com"`. The reply's `segments` become the `nonId` EID's `ext` (`{"segments": ...}`), which needs the PR A change letting a provider return an owned EID `ext`.
+- EID-level fields are preserved. As in Prebid, every attribute other than `nonId` is a partner ID whose UID carries `ext` `{"provider":"liveintent.com"}`; the Trade Desk ID's UID instead carries `{"rtiPartner":"TDID","provider":<publisher domain>}` (falling back to `liveintent.com`) and its EID `matcher = "liveintent.com"`. The reply's `segments` become the `nonId` EID's `ext` (`{"segments": ...}`), which needs the PR A change letting a provider return an owned EID `ext`.
 - The `Expires` header becomes `ProviderExpiry::After(Expires - Date)`; the provider never reads the clock.
 
 ## Settings
