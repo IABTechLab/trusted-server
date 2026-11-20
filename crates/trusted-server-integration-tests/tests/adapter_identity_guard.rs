@@ -73,10 +73,6 @@ const PENDING_LIFECYCLE_MOVE: &[(&str, &str)] = &[
         "ec_finalize_response",
     ),
     (
-        "trusted-server-adapter-fastly/src/post_delivery.rs",
-        "commit_after_response_lookups",
-    ),
-    (
         "trusted-server-adapter-spin/src/app.rs",
         "answer_batch_sync_locally",
     ),

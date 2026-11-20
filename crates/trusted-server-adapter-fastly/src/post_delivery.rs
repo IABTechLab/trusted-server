@@ -19,15 +19,7 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
-use trusted_server_core::ec::after_response::{
-    after_response_lookups_allowed, commit_after_response_lookups,
-};
 use trusted_server_core::ec::app::IdentityApp;
-use trusted_server_core::ec::coordinator::transport::OutboundLookupTransport;
-use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupContext};
-use trusted_server_core::ec::current_timestamp;
-use trusted_server_core::ec::eid_types::UnixSeconds;
-use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::settings::Settings;
 
 use crate::app::{AfterResponseLookups, EcFinalizeState};
@@ -86,8 +78,7 @@ async fn post_delivery_work(
             mut ec_state,
             after_response,
         } = state;
-        run_after_response_lookups(&mut ec_state, after_response, &identity, settings, client)
-            .await;
+        run_after_response_lookups(&mut ec_state, after_response, &identity, client).await;
     }
 }
 
@@ -101,7 +92,6 @@ pub(crate) async fn run_after_response_lookups(
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
     identity: &IdentityApp,
-    settings: &Settings,
     client: &HttpClient,
 ) {
     let Some(lookups) = lookups else {
@@ -113,67 +103,9 @@ pub(crate) async fn run_after_response_lookups(
         );
         return;
     };
-    if ec_state.ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
-        log::debug!("After-response lookups skipped: EC changed during the request");
-        return;
-    }
-    // The request snapshot holds the row as finalize left it. A source held
-    // there is still held in the live row unless consent was withdrawn, which
-    // blocks the lookup anyway, so the live read is skipped when nothing is due.
-    // Only pull sync can be skipped: configured providers always run, so their
-    // cookie opt-outs and regional exclusions are processed.
-    let now = UnixSeconds::new(current_timestamp());
-    let request_entry = ec_state.ec_context.kv_snapshot().entry_for(&lookups.ec_id);
-    if !lookups.coordinator.any_due(request_entry, now) {
-        log::debug!("After-response lookups skipped: nothing due");
-        return;
-    }
-    let Some(graph) = identity.identity_graph() else {
-        return;
-    };
-    let snapshot = graph.load_snapshot(&lookups.ec_id).await;
-    if !after_response_lookups_allowed(
-        &snapshot,
-        &lookups.ec_id,
-        ec_state.ec_context.ec_generated(),
-    ) {
-        log::debug!("After-response lookups skipped: new EC or no live row");
-        return;
-    }
-    let transport = OutboundLookupTransport::new(client);
-    let pending = lookups
-        .coordinator
-        .dispatch(
-            &transport,
-            &LookupContext {
-                ec_id: &lookups.ec_id,
-                snapshot: &snapshot,
-                minted_entry: None,
-                consent: ec_state.ec_context.consent(),
-                client: ClientSignals {
-                    ip: lookups.client_ip,
-                    user_agent: lookups.user_agent.as_deref(),
-                },
-                publisher_domain: &settings.publisher.domain,
-                cookies: RequestCookies::new(&lookups.cookie_header),
-                rate_limiter: identity.rate_limiter(),
-                now,
-            },
-        )
+    lookups
+        .run(&ec_state.ec_context, permit, identity, client)
         .await;
-    if pending.is_empty() {
-        return;
-    }
-    let results = lookups.coordinator.collect(&transport, pending).await;
-    let outcome = commit_after_response_lookups(
-        &graph,
-        permit,
-        identity.partners(),
-        &lookups.ec_id,
-        &results,
-    )
-    .await;
-    log::info!("After-response lookups: write outcome={outcome}");
 }
 
 #[cfg(test)]

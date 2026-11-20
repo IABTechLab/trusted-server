@@ -854,7 +854,9 @@ pub struct Ec {
 
     /// Time budget, in milliseconds, for lookups of providers with
     /// `collect = "after_response"`, measured from their dispatch after the
-    /// response has been sent.
+    /// response has been sent. On Axum this also bounds the complete registered
+    /// task, including row reads and the guarded follow-up write. Shutdown may
+    /// cancel it sooner when the shared grace expires.
     #[serde(
         default = "Ec::default_identity_after_response_budget_ms",
         skip_serializing_if = "Ec::is_default_identity_after_response_budget_ms",

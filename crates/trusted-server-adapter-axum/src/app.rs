@@ -2,6 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_core::after_response::AfterResponseHandle;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -19,9 +20,12 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::after_response::AfterResponseLookups;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::answer_identify_locally;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -216,6 +220,8 @@ async fn dispatch_fallback(
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
     let mut ec_context = build_ec_context(state, services, &req);
+    let after_response_handle = req.extensions().get::<AfterResponseHandle>().cloned();
+    let after_response = prepare_after_response_lookups(state, services, &req, &ec_context);
     let auction = AuctionDispatch {
         integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
@@ -251,7 +257,44 @@ async fn dispatch_fallback(
         Some(input_cap),
     )
     .await?;
-    owner.attach(response).map_err(publisher_owner_error)
+    let response = owner.attach(response).map_err(publisher_owner_error)?;
+    // A2 supplies store-backed EC finalization and its permit. Until then the
+    // no-store identity app prepares no work and registers no background task.
+    if let Err(error) = crate::after_response::schedule_lookups(
+        after_response_handle.as_ref(),
+        after_response,
+        ec_context,
+        Arc::clone(&state.identity),
+        services.outbound_client().clone(),
+    ) {
+        log::warn!("After-response lookup registration failed: {error}");
+    }
+    Ok(response)
+}
+
+fn prepare_after_response_lookups(
+    state: &AppState,
+    services: &RuntimeServices,
+    request: &Request,
+    ec_context: &EcContext,
+) -> Option<AfterResponseLookups> {
+    let coordinator = Arc::clone(state.identity.after_response_identity()?);
+    state.identity.identity_graph()?;
+    NavigationPermit::classify(request)?;
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !DeviceSignals::derive(user_agent, None, None).looks_like_browser() {
+        return None;
+    }
+    Some(AfterResponseLookups::capture(
+        coordinator,
+        ec_context.ec_value()?.to_owned(),
+        services.client_info().client_ip,
+        request,
+    ))
 }
 
 fn fallback_handler(
