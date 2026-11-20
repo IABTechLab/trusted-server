@@ -41,6 +41,19 @@ const PENDING_LIFECYCLE_MOVE: &[(&str, &str)] = &[
         "answer_identify_locally",
     ),
     (
+        "trusted-server-adapter-axum/src/app.rs",
+        "ec_finalize_response",
+    ),
+    (
+        "trusted-server-adapter-axum/src/app.rs",
+        "generate_if_needed",
+    ),
+    ("trusted-server-adapter-axum/src/app.rs", "handle_identify"),
+    (
+        "trusted-server-adapter-axum/src/app.rs",
+        "PartnerRegistry::from_config",
+    ),
+    (
         "trusted-server-adapter-cloudflare/src/app.rs",
         "answer_batch_sync_locally",
     ),
