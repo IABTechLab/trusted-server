@@ -1720,7 +1720,7 @@ Controls first-party proxy security settings and path-based asset routes.
 | Field               | Type          | Required             | Description                                                 |
 | ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
 | `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
-| `certificate_check` | Boolean       | No (default: `true`) | Must be `true`; origin TLS is always verified               |
+| `certificate_check` | Boolean       | No (default: `true`) | Must be `true`; outbound TLS is always verified             |
 | `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
 
 **Example**:
@@ -1778,13 +1778,16 @@ See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage deta
 
 #### `certificate_check`
 
-**Purpose**: None to configure. Every adapter always verifies origin TLS.
+**Purpose**: None to configure. Every adapter always verifies TLS on every
+outbound HTTPS request: the publisher origin, asset routes and redirects,
+integrations, auction providers, and identity providers, EC pull sync among
+them.
 
 **Default**: `true`
 
 `ts config validate` and `ts config push` reject `certificate_check = false`. A
 live config that still sets it keeps loading: settings load logs a warning,
-ignores the setting, and origin TLS stays verified. Remove the setting before
+ignores the setting, and TLS stays verified. Remove the setting before
 the next push. An origin whose certificate fails verification fails the
 request with the route's 502. For local development, serve the origin over
 plain HTTP instead of with a self-signed certificate.
