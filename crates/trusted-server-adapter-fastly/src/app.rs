@@ -338,6 +338,11 @@ pub(crate) fn open_identity_record_store(
         None => return Ok(None),
         Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
     };
+    // Conformance substitutes one inspectable store for every identity path.
+    #[cfg(test)]
+    if let Some(store) = crate::identity_conformance::fixture_store(store_id) {
+        return Ok(Some(store));
+    }
     let name = store_id.to_owned();
     Ok(Some(Arc::new(LazyRecordEcKvStore::new(
         store_id.to_owned(),
