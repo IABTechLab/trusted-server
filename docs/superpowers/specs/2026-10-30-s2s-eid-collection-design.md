@@ -1241,7 +1241,7 @@ where
         }
     }
     // `ec_finalize_response` then applies the mirror (§10) with
-    // `ec::mirror::build_mirror(row, consent, partners, now)`.
+    // `ec::mirror::build_mirror(row, ec_context, partners, now)`.
     ec.apply_cookies(&mut response, row.as_ref());
     response
 }
@@ -1452,11 +1452,13 @@ still due.
   EID-level and UID-level fields. A source's UIDs are left out while the
   request denies consent to any TCF vendor gating that source: the
   `tcf_vendor_id` of every configured provider claiming it, enabled or
-  disabled (§8.6).
+  disabled (§8.6). It also leaves out a source a provider excludes where GDPR
+  applies on a GDPR visit, or whose provider cookies on the request record an
+  opt-out.
 - **Fill order:** sources in `[[ec.partners]]` config order; entries and UIDs in
   stored order. Each UID is added if the encoded value still fits; otherwise it
   is skipped and filling continues. KV keeps the complete set.
-- **Built** by `ec::mirror::build_mirror(row, consent, partners, now)`, called
+- **Built** by `ec::mirror::build_mirror(row, ec_context, partners, now)`, called
   from `ec_finalize_response`, on consented navigations from the row as it
   stands after the navigation: the committed row, or the snapshot when no
   write landed. It is **set** only when its value differs from the one the
@@ -1467,7 +1469,8 @@ still due.
   on a navigation whose mirror would be empty; and, where the mirror cannot be
   rebuilt (non-navigations, or a navigation whose row cannot be read), when it
   holds UIDs of a mirrored partner with a gating TCF vendor the request
-  denies or a source excluded where GDPR applies on a GDPR visit. A carried
+  denies, a source excluded where GDPR applies on a GDPR visit, or one a
+  provider's cookies on the request opt out of. A carried
   value that does not decode is treated as holding them whenever any
   mirrored partner is so withheld.
 - **Left untouched** on a navigation whose row cannot be read authoritatively

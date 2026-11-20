@@ -268,7 +268,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
 
     /// Caps the pull-sync lookups dispatched per navigation
     /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
-    /// skipped as rate limited and retried on a later navigation.
+    /// skipped (`skipped_concurrency_cap`) and retried on a later navigation.
     #[must_use]
     pub fn with_pull_sync_concurrency(mut self, max: Option<NonZeroUsize>) -> Self {
         self.pull_sync_concurrency = max;
