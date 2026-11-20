@@ -10,7 +10,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command jq
-smoke_require_command python3
+smoke_require_python
 smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace axum)
@@ -23,14 +23,15 @@ APP_PID=""
 cleanup() {
     smoke_stop_process "$APP_PID"
     smoke_stop_process "$ORIGIN_PID"
+    smoke_preserve_artifacts "$WORKSPACE"
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 AXUM_BINARY=${AXUM_BINARY_PATH:-$REPO_ROOT/target/debug/trusted-server-axum}
-if [ ! -x "$AXUM_BINARY" ]; then
-    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p trusted-server-adapter-axum
+if [ -z "${AXUM_BINARY_PATH:-}" ]; then
+    cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" -p trusted-server-adapter-axum
 fi
 [ -x "$AXUM_BINARY" ] || smoke_die "Axum binary not executable: $AXUM_BINARY"
 
@@ -56,11 +57,6 @@ ENVELOPE=$(jq --exit-status --raw-output \
     '.trusted_server_config' \
     "$WORKSPACE/.edgezero/local-config-trusted_server_config.json")
 
-# Starts Axum with the given config and secret values, or fails at startup.
-#
-# Without `expected_diagnostic` the publisher page must answer 200 through
-# the stub origin. With it, startup must fail: Axum exits non-zero before it
-# listens and logs the diagnostic.
 run_case() {
     local case_name="$1"
     local port="$2"
@@ -68,7 +64,8 @@ run_case() {
     local handler_value="$4"
     local proxy_value="$5"
     local ec_value="$6"
-    local expected_diagnostic="${7:-}"
+    local expected_status="$7"
+    local expected_diagnostic="${8:-}"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
@@ -90,58 +87,63 @@ run_case() {
         EDGEZERO__ADAPTER__PORT="$port" \
         "$AXUM_BINARY" >"$log_path" 2>&1 &
     APP_PID=$!
-
-    if [ -n "$expected_diagnostic" ]; then
-        assert_startup_failure "$case_name" "$log_path" "$expected_diagnostic"
-        return
+    local startup_state=ready
+    [ "$expected_status" != 503 ] || startup_state=unavailable
+    smoke_wait_http "http://127.0.0.1:$port/health" 200 \
+        "$WORKSPACE/$case_name-live.body" "$WORKSPACE/$case_name-live.headers"
+    if [ "$startup_state" = ready ]; then
+        smoke_wait_http "http://127.0.0.1:$port/ready" 200 \
+            "$WORKSPACE/$case_name-ready-wait.body" "$WORKSPACE/$case_name-ready-wait.headers"
     fi
-
-    smoke_wait_http "http://127.0.0.1:$port/" 200 "$body_path" "$headers_path"
+    smoke_assert_operational "http://127.0.0.1:$port" "$startup_state" "$WORKSPACE/$case_name"
+    local origin_before
+    origin_before=$(smoke_origin_count "$WORKSPACE")
+    local SMOKE_AUTHENTICATE=false
+    if [ "$case_name" = hostile ]; then
+        smoke_wait_http "http://127.0.0.1:$port/private" 401 \
+            "$WORKSPACE/$case_name-auth.body" "$WORKSPACE/$case_name-auth.headers"
+        SMOKE_AUTHENTICATE=true
+    fi
+    smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
+        "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
     smoke_stop_process "$APP_PID"
     APP_PID=""
-    smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
-}
 
-# Waits up to 15 seconds for Axum to exit, then requires a non-zero status and
-# the diagnostic in its log.
-assert_startup_failure() {
-    local case_name="$1"
-    local log_path="$2"
-    local expected_diagnostic="$3"
-    local attempt=0
-    while kill -0 "$APP_PID" 2>/dev/null; do
-        if [ "$attempt" -ge 60 ]; then
-            sed -n '1,120p' "$log_path" >&2
-            smoke_die "$case_name: Axum kept running after a startup failure"
-        fi
-        attempt=$((attempt + 1))
-        sleep 0.25
-    done
-    local status=0
-    wait "$APP_PID" || status=$?
-    APP_PID=""
-    if [ "$status" -eq 0 ]; then
-        sed -n '1,120p' "$log_path" >&2
-        smoke_die "$case_name: Axum exited 0 after a startup failure"
+    if [ -n "$expected_diagnostic" ]; then
+        smoke_assert_unavailable_body "$body_path"
+        smoke_assert_failure "$expected_status" "$expected_diagnostic" "$log_path"
+    else
+        smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
+        [ "$(smoke_origin_count "$WORKSPACE")" -gt "$origin_before" ] || smoke_die "publisher control never reached origin"
     fi
-    smoke_wait_log "$log_path" "$expected_diagnostic"
+    echo "axum startup case passed: $case_name"
 }
 
 run_case missing-config "$BASE_PORT" "" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
     "env var '$SMOKE_CONFIG_ENV' not set"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
-    "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" \
+    "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
     "failed to resolve secret reference at \`handlers[0].password\`"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" \
+    "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 503 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 503 \
     "failed to resolve secret reference at \`ec.passphrase\`"
+INVALID_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" invalid)
+HOSTILE_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" hostile)
+run_case malformed-envelope "$((BASE_PORT + 5))" '{' \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
+    'failed to parse Trusted Server app-config blob envelope'
+run_case invalid-settings "$((BASE_PORT + 6))" "$INVALID_ENVELOPE" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
+    'invalid_publisher_domain'
+run_case hostile "$POSITIVE_PORT" "$HOSTILE_ENVELOPE" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 run_case positive "$POSITIVE_PORT" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE"
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 
 echo "Axum first-success smoke passed"

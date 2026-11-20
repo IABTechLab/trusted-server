@@ -81,9 +81,13 @@
 //!
 //! [`assemble_app`] and [`Hooks::routes`] return a settings or state failure
 //! as the [`EdgeError`] from [`startup_error`], and [`App::from_router`]
-//! returns a `configure` failure. The entry point answers either with
-//! `EdgeZero`'s assembly-error response, which carries no TS headers, and
-//! retains nothing, so the next request retries.
+//! returns a `configure` failure. The entry point retains nothing, so the next
+//! request retries. Whatever the error's status, it answers `GET` and `HEAD`
+//! `/ready` and every publisher fallback method with the fixed unavailable
+//! response from [`trusted_server_core::health`]; other methods get
+//! `EdgeZero`'s assembly-error response. Neither carries runtime or geo
+//! headers, and only the fixed response carries the compiled TS version.
+//! Liveness answers before assembly, so it stays `200`.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -129,6 +133,7 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::health::{ProbePreDispatchHook, StartupState};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
@@ -357,7 +362,8 @@ fn build_per_request_services(
         .build())
 }
 
-fn publisher_fallback_methods() -> [Method; 7] {
+/// Returns the methods supported by publisher fallback and startup responses.
+pub(super) fn publisher_fallback_methods() -> [Method; 7] {
     [
         Method::GET,
         Method::POST,
@@ -1531,10 +1537,13 @@ fn startup_state(
 impl TrustedServerApp {
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(trace_metadata),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(trace_metadata),
+                ))),
+            ))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -2462,27 +2471,55 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_blob_gets_500_then_recovers_in_same_sandbox() {
+    fn missing_config_blob_fails_startup_then_recovers_in_same_sandbox() {
         let mut sandbox = crate::sandbox::Sandbox::default();
+        let assemble = || {
+            assemble_app(
+                load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+                &"",
+            )
+        };
 
-        // Request 1: the linked store has no app config blob.
-        let error = sandbox
-            .initialize(|| {
-                assemble_app(
-                    load_settings_from_config_store(&RuntimeStoreConfig::logical()),
-                    &"",
-                )
-            })
-            .expect_err("should fail assembly without an app config blob");
+        // Request 1: the linked store has no app config blob, and a publisher
+        // fallback method gets the fixed unavailable response.
+        let crate::ApplicationDispatch::Operational(response) =
+            crate::initialize_dispatch(&mut sandbox, &Method::GET, "/", assemble)
+        else {
+            panic!("should answer the failed startup locally");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should answer the fixed startup-failure status"
+        );
+        let body = block_on(response.into_body().into_bytes_bounded(4096))
+            .expect("should read the startup failure body");
+        assert_eq!(
+            body.as_ref(),
+            b"Service Unavailable\n",
+            "should disclose nothing about the failure"
+        );
         assert!(
             sandbox.state().is_none(),
             "should retain nothing after a failed assembly"
         );
-        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 1, "request-1");
+
+        // Request 2: still no blob. A method outside the publisher fallback
+        // set keeps `EdgeZero`'s assembly-error response.
+        let crate::ApplicationDispatch::Ordinary(Err(error)) =
+            crate::initialize_dispatch(&mut sandbox, &Method::TRACE, "/", assemble)
+        else {
+            panic!("should fail assembly without an app config blob");
+        };
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after a failed assembly"
+        );
+        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
         let clock = edgezero_core::time::MonotonicClock::default();
         let response = delivered_response(App::assembly_error_egress(
             error,
-            Method::GET,
+            Method::TRACE,
             clock.now(),
             clock,
         ));
@@ -2507,11 +2544,11 @@ mod tests {
             "should render EdgeZero's error body: {json}"
         );
 
-        // Request 2: the blob is restored.
+        // Request 3: the blob is restored.
         sandbox
             .initialize(|| assemble_app(Ok(test_settings()), &""))
             .expect("should assemble once the blob is restored");
-        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
+        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 3, "request-3");
 
         assert!(
             sandbox.state().is_some(),

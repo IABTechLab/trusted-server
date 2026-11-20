@@ -6,13 +6,15 @@ production deployment target.
 
 ## Support status
 
-| Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `axum`  | development    | real   | exit 1         | no             | multiple         | outermost sanitize         | none                  |
+| Adapter | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
+| `axum`  | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
 
-This row is the canonical status summary. Axum supports multiple
-auction providers and exposes a real `/health` handler. A startup failure stops
-the process with exit status 1 before it listens, so no route answers.
+This row is the canonical status summary. Axum supports multiple auction
+providers. GET/HEAD `/health` remains live after caught initialization failure;
+`/ready` reports initialization readiness. Application or failure-router
+construction completes before the listener binds. See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 ## Verify the complete local handoff
 
@@ -36,15 +38,22 @@ are:
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
 
 Before the positive request, the smoke omits the config and each secret in
-separate process starts. Each start must fail before Axum listens: the process
-must exit non-zero and its log must identify the missing environment variable
-or exact setting path. This prevents a port, launcher, or origin error from
-satisfying a negative case.
+separate process starts. Each publisher request must return 503 and its log must identify
+the missing environment variable or exact setting path. This prevents a port,
+launcher, or origin error from satisfying a negative case.
 
 The final publisher request must return 200, include the stub-origin sentinel,
 rewrite its origin URL to the Axum listener, and remove the original URL. The
 exit trap stops the Axum process and stub origin, then removes the temporary
 config, local-push output, bodies, headers, and logs.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Listener address
 

@@ -7,8 +7,10 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 /// `EDGEZERO__LOGGING__LEVEL`, reads the ingress limits from
 /// `EDGEZERO__ADAPTER__INGRESS__*` and the listener address from
 /// `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT`, then builds the app
-/// and serves it. A settings, ingress or bind failure returns before any
-/// request is served, and the process exits non-zero.
+/// and serves it. An ingress or bind failure returns before any request is
+/// served, and the process exits non-zero. A settings or state failure serves
+/// the failure router instead, which keeps `/health` live and answers
+/// `/ready` and every supported route with `503`.
 fn main() {
     if let Err(error) = run_app::<TrustedServerApp>() {
         log::error!("trusted-server-adapter-axum failed: {error:#}");
