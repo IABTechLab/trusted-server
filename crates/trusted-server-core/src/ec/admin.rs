@@ -26,12 +26,14 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use crate::consent::ConsentContext;
+use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
-use super::eids::{resolve_partner_ids, to_eids};
+use super::current_timestamp;
+use super::eid_types::UnixSeconds;
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
@@ -39,14 +41,16 @@ use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
 use super::prebid_eids::{
     analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
+    partner_for_source,
 };
 use super::registry::PartnerRegistry;
+use super::sharedid::{SharedIdRequest, drop_opted_out_sharedid_updates};
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
-const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
+pub(super) const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
 
 /// Route used by the request-only EID cookie diagnostic.
-const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
+pub(super) const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
 
 /// Reserved Trusted Server admin prefix.
 ///
@@ -251,8 +255,8 @@ struct AuctionEidsView {
 struct SkippedPartnerId {
     /// Partner namespace key in the entry's `ids` map.
     source_domain: String,
-    /// Why the auction resolution skips it: `empty_uid`, `not_in_registry`,
-    /// or `bidstream_disabled`.
+    /// Why the auction resolution skips it: `empty_uid`, `expired` (provider
+    /// record with no live UID), `not_in_registry`, or `bidstream_disabled`.
     reason: &'static str,
 }
 
@@ -273,7 +277,7 @@ struct SkippedPartnerId {
 ///
 /// Returns [`TrustedServerError::KvStore`] when the store open or read
 /// fails.
-pub async fn handle_admin_ec_lookup(
+pub(super) async fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     req: &Request<EdgeBody>,
@@ -307,7 +311,7 @@ pub async fn handle_admin_ec_lookup(
 
 /// Returns the portable response used when an adapter has no EC KV backend.
 #[must_use]
-pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
+fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
     json_error(
         StatusCode::NOT_IMPLEMENTED,
         "EC identity graph is not configured on this deployment",
@@ -394,6 +398,7 @@ fn build_lookup_response(
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
             add_iso_timestamp_companions(&mut entry_json);
+            redact_refresh_state(&mut entry_json);
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
@@ -470,6 +475,30 @@ fn add_iso_timestamp_companions(entry_json: &mut JsonValue) {
     }
 }
 
+/// Placeholder served in place of a provider's private refresh state.
+const REDACTED: &str = "[redacted]";
+
+/// Replaces every provider refresh `state` in the entry with [`REDACTED`].
+///
+/// Refresh state can hold a provider credential (for example a refresh
+/// token), so the admin view shows only that it exists and when it is due.
+fn redact_refresh_state(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(state) = object
+                .get_mut("refresh")
+                .and_then(JsonValue::as_object_mut)
+                .and_then(|refresh| refresh.get_mut("state"))
+            {
+                *state = JsonValue::String(REDACTED.to_owned());
+            }
+            object.values_mut().for_each(redact_refresh_state);
+        }
+        JsonValue::Array(items) => items.iter_mut().for_each(redact_refresh_state),
+        _ => {}
+    }
+}
+
 /// Formats a unix-seconds timestamp as ISO 8601 (`yyyy-MM-ddTHH:mm:ss.SSSZ`).
 ///
 /// Returns `None` for values outside the representable date range.
@@ -479,22 +508,31 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
         .map(|datetime| datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
-/// Derives the auction EID view for a valid entry, mirroring the filters in
-/// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
+/// Derives the auction EID view for a valid entry through the same
+/// [`KvEntry::live_eids`] resolution the live auction uses, reporting why each
+/// stored ID was skipped.
+///
+/// Vendor consent belongs to the visitor's request, which this diagnostic
+/// does not have, so no source is withheld for it here.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
-    let eids = to_eids(&resolved);
+    let now = UnixSeconds::new(current_timestamp());
+    let eids = entry
+        .live_eids(registry, &ConsentContext::default(), now)
+        .map(Eid::from)
+        .collect();
 
     let mut skipped = Vec::new();
     for (source_domain, partner_uid) in &entry.ids {
-        let reason = if partner_uid.uid.is_empty() {
-            "empty_uid"
-        } else {
+        let reason = if partner_uid.has_live_uid(now) {
             match registry.get(source_domain) {
                 None => "not_in_registry",
                 Some(partner) if !partner.bidstream_enabled => "bidstream_disabled",
                 Some(_) => continue,
             }
+        } else if partner_uid.is_provider_written() {
+            "expired"
+        } else {
+            "empty_uid"
         };
         skipped.push(SkippedPartnerId {
             source_domain: source_domain.clone(),
@@ -517,8 +555,11 @@ struct AdminEidsResponse {
     /// Parse failure detail when the `ts-eids` cookie could not be decoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_error: Option<String>,
-    /// Whether a `sharedId` cookie was present on the request.
+    /// Whether the configured `SharedID` cookie was present on the request.
     sharedid_present: bool,
+    /// Whether the request carried `_pubcid_optout`, which keeps the
+    /// `SharedID` out of the ingestion preview.
+    sharedid_opted_out: bool,
     /// Number of partners configured in the registry.
     partners_configured: usize,
     /// Preview of what cookie ingestion would write into the EC entry's
@@ -562,10 +603,12 @@ enum DroppedEidReason {
 
 /// Handles `GET /_ts/admin/eids`.
 ///
-/// Echoes the request's `ts-eids` and `sharedId` cookies: the parsed EID
-/// list plus a preview of what cookie ingestion would write into the EC
-/// entry's `ids` map given the configured partner registry. Pure request
-/// inspection — no KV access — so it works on every adapter.
+/// Echoes the request's `ts-eids` cookie and the `SharedID` cookie named
+/// `sharedid_cookie`: the parsed EID list plus a preview of what cookie
+/// ingestion would write into the EC entry's `ids` map given the configured
+/// partner registry. A `_pubcid_optout` cookie keeps the `SharedID` out of
+/// the preview. Pure request inspection — no KV access — so it works on
+/// every adapter.
 ///
 /// Always responds `200 OK`; missing or malformed cookies are reported in
 /// the payload instead of as errors.
@@ -574,12 +617,13 @@ enum DroppedEidReason {
 ///
 /// Returns [`TrustedServerError::Configuration`] only when the response
 /// payload fails JSON serialization.
-pub fn handle_admin_eids_lookup(
+pub(super) fn handle_admin_eids_lookup(
     registry: &PartnerRegistry,
+    sharedid_cookie: Option<&str>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid_cookie = extract_cookie_value(req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(sharedid_cookie, req);
 
     let (eids, parse_error, diagnostic_sources, mut updates) = match &eids_cookie {
         None => (None, None, Vec::new(), Vec::new()),
@@ -604,12 +648,12 @@ pub fn handle_admin_eids_lookup(
     // `/auction` request-body EIDs, the consent gate on identity-graph writes,
     // and UIDs already stored in KV, so it lists candidate matches rather than
     // exactly what a request would store.
-    if let Some(value) = &sharedid_cookie
+    if let Some(value) = sharedid.readable_value()
         && let Some(update) = collect_sharedid_update(value, registry)
     {
         updates.push(update);
     }
-    let matched = dedupe_partner_updates(updates)
+    let matched = drop_opted_out_sharedid_updates(dedupe_partner_updates(updates), &sharedid)
         .into_iter()
         .map(|update| MatchedPartnerId {
             source_domain: update.partner_id,
@@ -631,7 +675,7 @@ pub fn handle_admin_eids_lookup(
     let unmatched = source_has_valid_uid
         .into_iter()
         .filter_map(|(source, has_valid_uid)| {
-            let reason = if registry.find_by_source_domain(&source).is_none() {
+            let reason = if partner_for_source(&source, registry).is_none() {
                 DroppedEidReason::NoPartner
             } else if !has_valid_uid {
                 DroppedEidReason::NoValidUid
@@ -646,7 +690,8 @@ pub fn handle_admin_eids_lookup(
         cookie_present: eids_cookie.is_some(),
         eids,
         parse_error,
-        sharedid_present: sharedid_cookie.is_some(),
+        sharedid_present: sharedid.has_value(),
+        sharedid_opted_out: sharedid.opted_out(),
         partners_configured: registry.len(),
         ingest: IngestPreview { matched, unmatched },
     };
@@ -680,11 +725,13 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     use crate::ec::kv::TombstoneOutcome;
+    use crate::ec::sharedid::LEGACY_SHAREDID_COOKIE;
 
     use super::*;
+    use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
-    use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -698,6 +745,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(format!("test-token-{source_domain:-<32}"))),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -783,15 +831,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::single("uid-disabled".to_owned()),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::single("uid-unknown".to_owned()),
         );
         entry
     }
@@ -1369,7 +1413,8 @@ mod tests {
         let req = get_request("/_ts/admin/eids");
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1404,7 +1449,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response);
@@ -1435,7 +1481,7 @@ mod tests {
 
     #[test]
     fn eids_lookup_reports_configured_source_without_valid_uid() {
-        let oversized_uid = "x".repeat(513);
+        let oversized_uid = "x".repeat(crate::ec::kv_types::MAX_STORED_UID_LENGTH + 1);
         let cookie = eids_cookie_for(&serde_json::json!([{
             "source": "bidstream.example",
             "uids": [
@@ -1447,7 +1493,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
         let json = response_json(response);
 
         assert!(
@@ -1480,7 +1527,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
         let json = response_json(response);
 
         let matched = json["ingest"]["matched"]
@@ -1502,7 +1550,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", "ts-eids=!!!not-base64!!!");
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(
             response.status(),
@@ -1537,8 +1586,8 @@ mod tests {
         .expect("should build sharedid test registry");
         let req = get_request_with_cookie("/_ts/admin/eids", "sharedId=shared-uid-123");
 
-        let response =
-            handle_admin_eids_lookup(&registry, &req).expect("should handle eids lookup");
+        let response = handle_admin_eids_lookup(&registry, Some(LEGACY_SHAREDID_COOKIE), &req)
+            .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response);
@@ -1551,5 +1600,133 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    #[test]
+    fn eids_lookup_reads_the_configured_sharedid_cookie_under_pubcid() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("pubcid.org", true)])
+            .expect("should build pubcid test registry");
+        let req = get_request_with_cookie(
+            "/_ts/admin/eids",
+            "sharedId=legacy-uid; _pubcid=configured-uid",
+        );
+
+        let response = handle_admin_eids_lookup(&registry, Some("_pubcid"), &req)
+            .expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(
+            json["sharedid_present"], true,
+            "should see the configured cookie"
+        );
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match only the configured cookie");
+        assert_eq!(matched[0]["source_domain"], "pubcid.org");
+        assert_eq!(matched[0]["uid"], "configured-uid");
+    }
+
+    #[test]
+    fn eids_lookup_previews_no_sharedid_after_an_opt_out() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("pubcid.org", true)])
+            .expect("should build pubcid test registry");
+        let req = get_request_with_cookie(
+            "/_ts/admin/eids",
+            "_pubcid=configured-uid; _pubcid_optout=1",
+        );
+
+        let response = handle_admin_eids_lookup(&registry, Some("_pubcid"), &req)
+            .expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(
+            json["sharedid_opted_out"], true,
+            "should report the opt-out"
+        );
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "should preview no SharedID after an opt-out"
+        );
+    }
+
+    #[test]
+    fn auction_view_matches_live_auction_for_provider_records() {
+        let registry = PartnerRegistry::from_config(&[
+            make_test_partner("expired.example", true),
+            make_test_partner("live.example", true),
+        ])
+        .expect("should build registry");
+        let provider_record = |id: &str, expiry: Expiry| {
+            let uid = KvUid::new(
+                UidValue::try_from(id).expect("should build uid"),
+                AgentType::try_from(1).expect("should build atype"),
+                None,
+                Some(ProviderId::new("example-provider")),
+                expiry,
+            );
+            KvPartnerId::from_eids(
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+                UnixSeconds::new(0),
+            )
+            .expect("should build record")
+        };
+        let mut entry = KvEntry::tombstone(1);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "expired.example".to_owned(),
+            provider_record("old", Expiry::At(UnixSeconds::new(1))),
+        );
+        entry.ids.insert(
+            "live.example".to_owned(),
+            provider_record("new", Expiry::Never),
+        );
+
+        let view = build_auction_view(&registry, &entry);
+
+        let view_json = serde_json::to_value(&view.eids).expect("should serialize view eids");
+        let live: Vec<Eid> = entry
+            .live_eids(
+                &registry,
+                &ConsentContext::default(),
+                UnixSeconds::new(current_timestamp()),
+            )
+            .map(Eid::from)
+            .collect();
+        assert_eq!(
+            view_json,
+            serde_json::to_value(&live).expect("should serialize live eids"),
+            "should show exactly what the live auction resolves"
+        );
+        assert_eq!(view.eids.len(), 1, "should omit the expired provider UID");
+        assert_eq!(view.eids[0].uids[0].id, "new", "should keep the live UID");
+        assert_eq!(view.skipped.len(), 1, "should report the expired record");
+        assert_eq!(view.skipped[0].source_domain, "expired.example");
+        assert_eq!(view.skipped[0].reason, "expired", "should report expiry");
+    }
+
+    #[test]
+    fn redacts_provider_refresh_state() {
+        let mut entry = serde_json::json!({
+            "ids": {"token.example": {"eids": [{"source": "token.example", "uids": [
+                {"id": "token", "refresh": {"state": "secret-refresh", "from": 1_000}}
+            ]}]}}
+        });
+
+        redact_refresh_state(&mut entry);
+
+        let refresh = &entry["ids"]["token.example"]["eids"][0]["uids"][0]["refresh"];
+        assert_eq!(refresh["state"], REDACTED, "should hide the refresh state");
+        assert_eq!(
+            refresh["from"], 1_000,
+            "should keep when the refresh is due"
+        );
+        assert_eq!(
+            entry["ids"]["token.example"]["eids"][0]["uids"][0]["id"], "token",
+            "should keep the UID"
+        );
     }
 }

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::AuctionContext;
 use crate::auction::types::{
@@ -91,14 +91,14 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
                 raw_ac_string: Some("fictional-ac".to_string()),
                 ..Default::default()
             }),
-            eids: Some(vec![Eid {
-                source: "identity.example".to_string(),
-                uids: vec![Uid {
+            eids: Some(vec![Eid::new(
+                "identity.example".to_string(),
+                vec![Uid {
                     id: "fictional-uid".to_string(),
                     atype: Some(1),
                     ext: None,
                 }],
-            }]),
+            )]),
         },
         device: Some(DeviceInfo {
             user_agent: Some("Fictional Browser".to_string()),
@@ -119,4 +119,48 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
         site: None,
         context: HashMap::new(),
     }
+}
+
+/// Asserts a serialized `OpenRTB` request carries no EIDs in `user.eids` or `user.ext.eids`.
+pub(crate) fn assert_no_user_eids(request: &Value, context: &str) {
+    assert!(
+        request["user"].get("eids").is_none(),
+        "{context}: should omit user.eids"
+    );
+    assert!(
+        request["user"]["ext"].get("eids").is_none(),
+        "{context}: should omit user.ext.eids"
+    );
+}
+
+/// Returns the `user.eids` array of a serialized `OpenRTB` request.
+///
+/// # Panics
+///
+/// Panics when `user.eids` is missing or `user.ext.eids` is present.
+pub(crate) fn user_eids<'a>(request: &'a Value, context: &str) -> &'a [Value] {
+    assert!(
+        request["user"]["ext"].get("eids").is_none(),
+        "{context}: should not write user.ext.eids"
+    );
+    request["user"]["eids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: should write user.eids"))
+}
+
+/// Returns the `user.eids` array of a serialized APS `OpenRTB` request.
+///
+/// # Panics
+///
+/// Panics when `user.eids` is missing or `user.ext.eids` does not mirror it.
+pub(crate) fn aps_user_eids<'a>(request: &'a Value, context: &str) -> &'a [Value] {
+    let eids = request["user"]["eids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: should write user.eids"));
+    assert_eq!(
+        request["user"]["ext"]["eids"].as_array(),
+        Some(eids),
+        "{context}: should mirror user.eids into user.ext.eids for APS"
+    );
+    eids
 }

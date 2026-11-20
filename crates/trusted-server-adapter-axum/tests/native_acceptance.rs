@@ -8,7 +8,7 @@ mod proxy;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -59,15 +59,15 @@ fn ec_response_cookie(response: &Response) -> Option<String> {
 
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
 #[test]
-#[ignore = "requires CELLD_EC_TEST_BINARY and celld-ec,geo-cloudfront features; real disposable servers only"]
+#[ignore = "requires official CELLD_EC_TEST_BINARY, matching EDGEZERO_CELLD_STORE_SERVICE and celld-ec,geo-cloudfront"]
 fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage() {
     let mut celld = celld_fixture::CelldFixture::new();
     let origin = origin::Origin::start("celld-ec-http");
     let mut prepared = Prepared::new(&origin.base_url);
-    let mut storage =
-        serde_json::to_value(celld.settings()).expect("should serialize pure selected binding");
-    storage["provider"] = json!("celld");
-    prepared.data["ec"]["storage"] = storage;
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.record_binding(
+        serde_json::to_value(celld.settings()).expect("should serialize native binding"),
+    );
     prepared.data["ec"]["partners"] = json!([{"name":"Fixture partner","source_domain":"partner.example.com","bidstream_enabled":true,"pull_sync_enabled":false}]);
     prepared.publish();
     let profile = prepared.workspace.path().join("native-geo.toml");
@@ -77,7 +77,7 @@ fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage
         .build()
         .expect("should drive typed record inspection");
     let store = runtime.block_on(celld.store());
-    let client = client(None);
+    let client = client();
     let document = |server: &Running, country: &str, cookie: Option<&str>, withdrawal: bool| {
         let mut request = client
             .get(format!("{}/article", server.base_url()))
@@ -161,7 +161,10 @@ fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage
     );
     drop(app);
     celld.restart();
-    prepared.data["ec"]["storage"]["endpoint"] = json!(celld.endpoint);
+    prepared.record_binding(
+        serde_json::to_value(celld.settings())
+            .expect("should update native endpoint after restart"),
+    );
     prepared.publish();
     app = prepared.spawn_with_geo(true, Some(&profile));
     app.ready();
@@ -270,6 +273,17 @@ impl Prepared {
         .expect("should publish local prepared config");
     }
 
+    #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+    fn record_binding(&self, mut binding: Value) {
+        binding["provider"] = json!("celld-records");
+        fs::write(
+            self.workspace.path().join("native-bindings.toml"),
+            toml::to_string(&json!({"version":1,"kv":{"trusted_server_kv":binding}}))
+                .expect("should encode native connector settings"),
+        )
+        .expect("should write native connector settings");
+    }
+
     fn spawn(&self, trusted_proxy: bool) -> Running {
         self.spawn_with_geo(trusted_proxy, None)
     }
@@ -295,7 +309,7 @@ impl Prepared {
         command
             .env_clear()
             .current_dir(&root)
-            .env("RUST_LOG", "info")
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", port.to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &root)
@@ -334,6 +348,12 @@ impl Prepared {
                 value,
             );
         }
+        let bindings = root.join("native-bindings.toml");
+        if bindings.is_file() {
+            command
+                .env("TS_EC_RECORDS_ENABLED", "true")
+                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
+        }
         if trusted_proxy {
             command
                 .env("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
@@ -368,7 +388,7 @@ impl Running {
     }
 
     fn ready(&mut self) {
-        let client = client(None);
+        let client = client();
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             assert!(
@@ -517,10 +537,9 @@ fn startup_probe_excludes_a_reflexive_connection_without_a_listener() {
     );
 }
 
-fn client(source: Option<IpAddr>) -> Client {
+fn client() -> Client {
     Client::builder()
         .no_proxy()
-        .local_address(source)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(2))
         .build()
@@ -562,7 +581,7 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     let body = page(&client, &app.base_url());
     assert!(
         body.contains("native-page"),
@@ -677,7 +696,7 @@ fn managed_post_bodies_reach_buffered_api_handlers_and_keep_their_limits() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     let auction = client
         .post(format!("{}/auction", app.base_url()))
         .json(&json!({"adUnits": []}))
@@ -727,7 +746,7 @@ fn running_snapshot_is_immutable_and_restart_adopts_config_and_secret() {
     let mut fixture = Prepared::new(&first.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     assert!(page(&client, &app.base_url()).contains("snapshot-first"));
     fixture.data["publisher"]["origin_url"] = json!(second.base_url);
     fixture.secrets.insert(
@@ -796,7 +815,7 @@ fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let visitor = client(None);
+    let visitor = client();
     let response = visitor
         .get(app.base_url())
         .header(
@@ -815,12 +834,13 @@ fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
 
     let mut app = fixture.spawn(true);
     app.ready();
-    // Only the gateways connect from the declared trusted 127.0.0.1 address.
-    // Visitors use distinct source addresses and independent client pools.
-    let alpha_client = client(Some(
-        "127.0.0.2".parse().expect("should parse alpha source"),
-    ));
-    let beta_client = client(Some("127.0.0.3".parse().expect("should parse beta source")));
+    // Managed ingress now trusts the loopback peer that every client here
+    // shares. A spoofed assertion sent directly from that trusted peer still
+    // sets no public origin, because only the forwarder credential does.
+    // Each visitor has its own client, so the two gateways never share a
+    // connection pool.
+    let alpha_client = client();
+    let beta_client = client();
     let direct = alpha_client
         .get(app.base_url())
         .header(
@@ -828,7 +848,7 @@ fn managed_ingress_ignores_direct_spoof_and_isolates_two_gateway_clients() {
             "for=192.0.2.99;host=spoof.example.com;proto=https",
         )
         .send()
-        .expect("should bypass gateway from an untrusted peer");
+        .expect("should send a spoofed assertion from the trusted peer");
     assert_rewrite(&successful_body(direct), &app.base_url(), &origin.base_url);
     // Trusted transport provenance alone does not authorize publisher forwarding.
     for (host, credential) in [
@@ -902,7 +922,7 @@ fn production_sigterm_drains_the_admitted_publisher_response() {
     let url = format!("{}/drain", app.base_url());
     let request = std::thread::spawn(move || {
         successful_body(
-            client(None)
+            client()
                 .get(url)
                 .send()
                 .expect("should finish the admitted publisher request"),
@@ -1009,7 +1029,7 @@ fn truncated_post_then_action_and_api_keep_using_the_same_live_origin() {
     let fixture = Prepared::new(&origin.base_url);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     truncate_inbound_post(&app);
     let broken = client
         .post(format!("{}/truncate-response", app.base_url()))
@@ -1080,7 +1100,7 @@ fn real_nextjs_action_and_api_after_truncated_post() {
     let fixture = Prepared::new(&origin);
     let mut app = fixture.spawn(false);
     app.ready();
-    let client = client(None);
+    let client = client();
     // The fixture instructions prewarm Next's compiler before this test.
     let body = page(&client, &app.base_url());
     let marker = "$ACTION_ID_";

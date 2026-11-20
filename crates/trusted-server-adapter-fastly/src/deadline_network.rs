@@ -26,10 +26,10 @@ mod tests {
         HttpClient::with_client(FastlyOutboundClient::new())
     }
 
-    /// Builds a bidder-shaped request to `path` on the harness origin.
+    /// Builds a buffered, decoded request to `path` on the harness origin.
     ///
-    /// The request is buffered (10 MiB cap) with cache bypass, like a bid
-    /// request.
+    /// It bypasses the cache and uses the default 10 MiB response cap. The
+    /// cases test the batch's waits, not a bidder's response cap.
     fn fixture_request(method: Method, path: &str) -> OutboundRequest {
         let port = fastly::ConfigStore::open("deadline_fixture")
             .get("port")

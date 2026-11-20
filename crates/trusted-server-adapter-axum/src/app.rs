@@ -17,20 +17,23 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::constants::COOKIE_TS_EIDS;
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
-use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterRegistryInput,
@@ -43,7 +46,7 @@ use trusted_server_core::proxy::{
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -66,6 +69,10 @@ pub struct AppState {
     pub(crate) settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built once. The dev server has no EC record store and
+    /// applies no rate limit: its deployer limits traffic at the load
+    /// balancer.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
     partners: PartnerRegistry,
     ec_graph: Option<Arc<dyn Fn() -> KvIdentityGraph + Send + Sync>>,
@@ -90,15 +97,20 @@ fn build_state_with_services(
     settings
         .ec
         .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Native)?;
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
     let partners = PartnerRegistry::from_config(&settings.ec.partners)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
         partners,
         ec_graph: None,
@@ -122,25 +134,6 @@ impl AppState {
             .clone()
             .map_or_else(|| build_runtime_services(ctx), Ok)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -257,7 +250,7 @@ struct NativeEcRequest {
     graph: Option<KvIdentityGraph>,
     browser: bool,
     eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
+    sharedid: SharedIdRequest,
 }
 
 impl NativeEcRequest {
@@ -274,7 +267,10 @@ impl NativeEcRequest {
             graph: state.identity_graph(),
             browser,
             eids_cookie: cookie_value(req, COOKIE_TS_EIDS),
-            sharedid_cookie: cookie_value(req, COOKIE_SHAREDID),
+            sharedid: SharedIdRequest::from_request(
+                state.identity.sharedid_storage().cookie_name(),
+                req,
+            ),
         })
     }
 
@@ -290,7 +286,7 @@ impl NativeEcRequest {
             graph,
             &state.partners,
             self.eids_cookie.as_deref(),
-            self.sharedid_cookie.as_deref(),
+            &self.sharedid,
             &mut response,
         )
         .await;
@@ -399,9 +395,6 @@ async fn dispatch_ec_route(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: graph,
-                allow_generation: false,
-                ec_context: &mut ec.context,
                 services,
                 req,
             })
@@ -415,10 +408,20 @@ async fn dispatch_ec_route(
             let navigation = method == Method::GET
                 && is_navigation_request(&req)
                 && state.settings.asset_route_for_path(&path).is_none();
+            let mut has_permit = false;
             if navigation {
                 ec.context.set_eid_sync_source(EidSyncSource::Navigation);
+                // The page-load write permit uses the stricter Fetch Metadata
+                // test (spec §3.1); requests without it never write KV.
+                if let Some(permit) = NavigationPermit::classify(&req) {
+                    ec.context.set_navigation_permit(permit);
+                    has_permit = true;
+                }
             }
-            let eligible = navigation && ec.browser && graph.is_some();
+            // A new EC is minted only when this request may also write its
+            // row, so a client without Fetch Metadata never receives a
+            // throwaway EC.
+            let eligible = navigation && has_permit && ec.browser && graph.is_some();
             if eligible
                 && let Err(error) = ec.context.generate_if_needed(&state.settings, graph).await
             {
@@ -426,8 +429,7 @@ async fn dispatch_ec_route(
             }
             // Keep errors inside this route result so withdrawal still finalizes.
             async {
-                let input_cap = u64::try_from(state.settings.publisher.max_buffered_body_bytes)
-                    .unwrap_or(u64::MAX);
+                let input_cap = publisher_input_cap(&state.settings, u64::MAX);
                 let (publisher_response, owner) = handle_publisher_request(
                     &state.settings,
                     services,
@@ -489,15 +491,14 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    Identify,
+    BatchSync,
     Auction,
     PageBids,
     ConsentUpdate,
-    Identify,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -520,7 +521,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
@@ -536,11 +537,6 @@ fn named_routes() -> [NamedRoute; 19] {
                 Method::CONNECT,
             ],
             handler: NamedRouteHandler::ConsentUpdate,
-        },
-        NamedRoute {
-            path: "/_ts/api/v1/identify",
-            primary_methods: &[Method::GET, Method::OPTIONS],
-            handler: NamedRouteHandler::Identify,
         },
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -573,26 +569,6 @@ fn named_routes() -> [NamedRoute; 19] {
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::CachePurgeNotSupported,
         },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
-        },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
         // basic-auth handler regex `^/_ts/admin` does not match them, and letting
@@ -608,6 +584,20 @@ fn named_routes() -> [NamedRoute; 19] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        // Partner APIs are answered locally so a partner's Bearer token and
+        // mapping body never reach the publisher origin. Every method is
+        // claimed: the dev server has no EC record store, so identify and
+        // batch sync answer 501 and any other method answers 405.
+        NamedRoute {
+            path: "/_ts/api/v1/identify",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::Identify,
+        },
+        NamedRoute {
+            path: "/_ts/api/v1/batch-sync",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::BatchSync,
         },
         NamedRoute {
             path: "/auction",
@@ -705,31 +695,24 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // Enabling native operator EC diagnostics is separate
-                        // from the browser/server lifecycle.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        handle_admin_eids_lookup(&state.partners, &req)
-                    }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::ConsentUpdate => {
                         dispatch_ec_route(&state, &services, req, EcRoute::ConsentUpdate).await
                     }
+                    NamedRouteHandler::BatchSync => Ok(answer_batch_sync_locally(&req)),
                     NamedRouteHandler::Identify => {
                         // Read-only identity lookup never enters generation or
                         // response finalization, including cookie ingestion.
+                        // Every method is claimed so a partner's Bearer token never
+                        // reaches the publisher origin. `GET` reads the native EC
+                        // record store when one is selected; without one, and for
+                        // any other method, identify is answered locally.
                         if req.method() == Method::OPTIONS {
                             cors_preflight_identify(&state.settings, &req)
-                        } else {
+                        } else if let (true, Some(graph)) =
+                            (req.method() == Method::GET, state.identity_graph())
+                        {
                             let context = build_ec_context(&state, &services, &req)?;
-                            let graph = state.identity_graph().ok_or_else(|| {
-                                Report::new(TrustedServerError::KvStore {
-                                    store_name: "native EC".to_owned(),
-                                    message: "native EC provider is not selected".to_owned(),
-                                })
-                            })?;
                             handle_identify(
                                 &state.settings,
                                 &graph,
@@ -738,6 +721,8 @@ fn named_route_handler(
                                 &context,
                             )
                             .await
+                        } else {
+                            answer_identify_locally(&state.settings, &req)
                         }
                     }
                     NamedRouteHandler::Auction => {
@@ -796,7 +781,8 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)
+        install_edge_policies(app, synthesized_response_headers())?;
+        crate::record_ec::configure(app)
     }
 
     fn name() -> &'static str {
@@ -818,12 +804,27 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: None,
+            kv: kv_store_metadata(),
         }
     }
+}
 
-    fn owns_logging() -> bool {
-        true
+/// Declares the native EC record store and the Geo KV store when selected.
+///
+/// The EC record store is the default when both are selected.
+fn kv_store_metadata() -> Option<StoreMetadata> {
+    let geo = crate::native_geo::kv_selected();
+    match (crate::record_ec::metadata(), geo) {
+        (Some(_), true) => Some(StoreMetadata {
+            default: crate::record_ec::STORE_ID,
+            ids: &[crate::record_ec::STORE_ID, crate::native_geo::GEO_STORE_ID],
+        }),
+        (Some(ec), false) => Some(ec),
+        (None, true) => Some(StoreMetadata {
+            default: crate::native_geo::GEO_STORE_ID,
+            ids: &[crate::native_geo::GEO_STORE_ID],
+        }),
+        (None, false) => None,
     }
 }
 
@@ -969,6 +970,11 @@ pub(crate) fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         )
     });
 
+    // The core identity app registers `GET` on the admin EC and EIDs lookups;
+    // without a record store, admin EC lookup answers 501. Their other methods
+    // reach the catch-all fallback, which denies admin diagnostics locally.
+    router = state.identity.mount(router);
+
     for route in named_routes() {
         for method in route.primary_methods {
             router = router.route(
@@ -1015,13 +1021,40 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
         geo: None,
     }
 }
+
 #[cfg(test)]
 mod trace_dispatch_tests {
     use super::*;
+
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
     use futures::executor::block_on;
+    use trusted_server_core::forwarder::{
+        FORWARDER_AUTH_HEADER, ForwarderPreparation, prepare_trusted_forwarder,
+    };
+    use trusted_server_core::http_util::RequestInfo;
     use trusted_server_core::redacted::Redacted;
-    use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::settings::{TrustedClientIpConfig, TrustedForwarderConfig};
     use trusted_server_core::trace::TraceTerminalResponse;
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = trace_settings(false);
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Axum"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     fn trace_settings(enabled: bool) -> Settings {
         Settings::from_toml(&format!(
@@ -1047,6 +1080,171 @@ mod trace_dispatch_tests {
         "#
         ))
         .expect("should parse trace settings")
+    }
+
+    fn forwarder_settings() -> Settings {
+        let mut settings = trace_settings(true);
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: Redacted::new("fictional-forwarder-secret-0123456789".to_owned()),
+        });
+        settings
+    }
+
+    #[test]
+    fn received_head_preparation_preserves_authenticated_origin_after_sanitation() {
+        let settings = forwarder_settings();
+        let app = App::new(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build the actual application router"),
+        );
+        for (credential, duplicate, authority, accepted) in [
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                None,
+                "publisher.example.com:8443",
+                true,
+            ),
+            (None, None, "publisher.example.com:8443", false),
+            (
+                Some("fictional-wrong-secret"),
+                None,
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some(FORWARDER_AUTH_HEADER),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some("x-forwarded-host"),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                Some("x-forwarded-proto"),
+                "publisher.example.com:8443",
+                false,
+            ),
+            (
+                Some("fictional-forwarder-secret-0123456789"),
+                None,
+                "other.example.com:8443",
+                false,
+            ),
+        ] {
+            let mut request = edgezero_core::http::request_builder()
+                .uri("http://upstream.example.com/path?example=1")
+                .header(header::HOST, "upstream.example.com")
+                .header(header::ORIGIN, "https://browser.example.com")
+                .header("x-forwarded-host", authority)
+                .header("x-forwarded-proto", "https")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build a fictional forwarded request");
+            if let Some(credential) = credential {
+                request
+                    .headers_mut()
+                    .insert(FORWARDER_AUTH_HEADER, HeaderValue::from_static(credential));
+            }
+            if let Some(name) = duplicate {
+                let value = request.headers()[name].clone();
+                request.headers_mut().append(name, value);
+            }
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                Some(
+                    InboundOrigin::parse("http", "upstream.example.com", OriginSource::RuntimeUri)
+                        .expect("should construct independent transport evidence"),
+                ),
+                HeaderFidelity::default(),
+            ));
+            let (mut parts, body) = request.into_parts();
+            let original_headers = parts.headers.clone();
+            app.prepare_received_head(&parts.headers, &mut parts.extensions);
+            assert!(
+                parts.extensions.get::<ForwarderPreparation>().is_some(),
+                "should freeze an accepted or rejected decision before native sanitation"
+            );
+            assert!(
+                parts.headers == original_headers,
+                "should not mutate received headers"
+            );
+            for name in [
+                FORWARDER_AUTH_HEADER,
+                "x-forwarded-host",
+                "x-forwarded-proto",
+            ] {
+                parts.headers.remove(name);
+            }
+            prepare_trusted_forwarder(&mut parts, &settings);
+            let request = Request::from_parts(parts, body);
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should resolve prepared public metadata");
+            assert_eq!(
+                info.host,
+                if accepted {
+                    "publisher.example.com:8443"
+                } else {
+                    "upstream.example.com"
+                }
+            );
+            assert_eq!(info.scheme, if accepted { "https" } else { "http" });
+            assert_eq!(request.uri(), "http://upstream.example.com/path?example=1");
+            assert_eq!(request.headers()[header::HOST], "upstream.example.com");
+            assert_eq!(
+                request.headers()[header::ORIGIN],
+                "https://browser.example.com"
+            );
+            let ingress = request
+                .extensions()
+                .get::<RequestIngress>()
+                .expect("should retain transport evidence");
+            assert_eq!(
+                ingress
+                    .origin()
+                    .expect("should retain transport origin")
+                    .authority(),
+                "upstream.example.com"
+            );
+            assert_eq!(
+                ingress.header_fidelity(&header::COOKIE),
+                HeaderFidelity::default()
+            );
+        }
+    }
+
+    #[test]
+    fn received_head_preparation_does_not_upgrade_an_existing_rejection() {
+        let settings = forwarder_settings();
+        let app = App::new(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build the actual application router"),
+        );
+        let request = edgezero_core::http::request_builder()
+            .uri("http://upstream.example.com/path")
+            .header(
+                FORWARDER_AUTH_HEADER,
+                "fictional-forwarder-secret-0123456789",
+            )
+            .header("x-forwarded-host", "publisher.example.com:8443")
+            .header("x-forwarded-proto", "https")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a fictional forwarded request");
+        let (mut parts, body) = request.into_parts();
+        parts.extensions.insert(ForwarderPreparation::default());
+        app.prepare_received_head(&parts.headers, &mut parts.extensions);
+        app.prepare_received_head(&parts.headers, &mut parts.extensions);
+        prepare_trusted_forwarder(&mut parts, &settings);
+        let request = Request::from_parts(parts, body);
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should retain the original rejected decision");
+        assert_eq!(info.host, "upstream.example.com");
+        assert_eq!(info.scheme, "http");
+        assert!(!request.headers().contains_key(FORWARDER_AUTH_HEADER));
     }
 
     fn router(enabled: bool) -> RouterService {

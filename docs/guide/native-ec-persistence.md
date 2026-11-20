@@ -1,6 +1,8 @@
 # Native EC persistence
 
-The native Axum adapter can use dedicated DynamoDB or celld EC persistence. Build with `aws-dynamodb-ec` or `celld-ec` and select the provider explicitly in published `[ec.storage]` configuration. This is separate from ordinary byte KV and from immutable AppConfig or secret snapshots. A local database file on an ephemeral ECS volume is not a substitute for retained identity state.
+Native EC persistence uses the shared core `RecordEcKvStore` over a prepared EdgeZero record binding. TS does not implement DynamoDB atomics, generation allocation or cursor decoding. The identity graph still owns consent, entry validation, collision handling and caller-specific conflict/recovery decisions.
+
+Ordinary and record operations on that binding share value rows. An ordinary replacement clears metadata and invalidates old generations. Configuration and secret snapshots remain immutable; identity rows stay live.
 
 Persistence does not grant consent. Keep the shared EC consent, bot, browser-navigation and withdrawal rules intact. A request can be eligible for an auction but ineligible for an EC. Missing qualifying consent in a jurisdiction that requires it must still prevent EC issuance. The operator owns genuine CMP signal transport; an empty integrations table is not necessarily a runtime defect.
 
@@ -8,53 +10,79 @@ The unified AWS example at `deploy/examples/native-aws-workload/README.md` combi
 
 ```mermaid
 flowchart TD
-    Start[Native startup] --> Validate[Validate selected regional table]
-    Validate --> Ready[Application ready]
-    Ready --> Request[Checked request and real consent signals]
-    Request --> Gate{Eligible publisher navigation and EC consent?}
-    Gate -->|No| NoMint[Do not mint an identity]
-    Gate -->|Yes| Allocate[Atomically allocate a fresh generation]
-    Allocate --> Persist[Conditionally persist identity row]
-    Persist -->|Confirmed| Finalize[Await shared EC response finalization]
-    Persist -->|Failed or uncertain| NoMint
-    Finalize --> Cookie[Commit response headers and ts-ec cookie]
+    Configure[Declare EC layout during App configuration] --> Prepare[EdgeZero prepares the selected record binding]
+    Prepare --> Acquire[Acquire shared EC view without changing routing]
+    Acquire --> Ready[Application ready]
+    Ready --> Eligible{Eligible request with required consent?}
+    Eligible -->|No| NoCookie[Do not issue an identity]
+    Eligible -->|Yes| Persist[Await native conditional persistence]
+    Persist -->|Acknowledged| Cookie[Finalize response and identity cookie]
+    Persist -->|Failed or uncertain| NoCookie
 ```
 
-## Native eligibility and route boundaries
+## Select the prepared binding
 
-Native eligibility uses checked effective client metadata from managed ingress and a user-agent platform/browser-engine heuristic. It does not invent Fastly TLS or JA4 headers. The browser heuristic is not spoof-resistant authentication. Only a GET publisher document navigation that passes integration request filters may issue a new identity. Health checks, static assets, preflights and rejected authentication do not mint ECs. Consent behavior is unchanged.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TS_EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
 
-Native supplies the live graph and partner registry to existing auction, page-bids and integration routes, and to read-only identify. EID cookies and IDs supplied in auction bodies are supported. Identify does not create identities. The adapter awaits shared EC response finalization exactly once, including handled errors, before committing response headers.
-
-Native admin EC management and lookup remain unsupported and require separate enablement. This work does not provide Fastly S2S batch or post-send pull-sync parity; those native routes and background tasks are not integrated here.
-
-## Build and select the backend
-
-The unified AWS example requires a final Axum image built with `aws-appconfig-agent,aws-secrets-manager,geo-cloudfront,aws-dynamodb-ec`, including the TS-owned runtime wrapper in `deploy/runtime/native-aws/README.md`. Image production is separate from provisioning. Record the final image's source, dependency and image digests. A historical AppConfig/Secrets Manager image qualification does not cover EC persistence merely because a provider was added to published configuration. Nonroot/read-only execution, writable volume ownership and bounded cold AppConfig Agent startup still need qualification.
-
-Publish the non-secret selection in the existing Trusted Server app-config BlobEnvelope, through the same `ts config push`/AppConfig publication path used for other settings:
+Published application config selects the logical prepared store, not an endpoint or credentials:
 
 ```toml
 [ec.storage]
-provider = "dynamodb"
-region = "eu-west-2"
+provider = "records"
+store = "trusted_server_kv"
+```
+
+A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TS_EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+
+Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
+
+```toml
+version = 1
+
+[kv.trusted_server_kv]
+provider = "aws-dynamodb-records"
+region = "us-east-1"
 table = "example-retained-ec"
 namespace = "example-staging"
 ```
 
-For the AWS example, copy the retained root's `ec_storage` output into this TOML and pass that same object to the workload root. Export with the matching source revision's TS CLI and `--no-env`. AppConfig receives the exact inner `BlobEnvelope` string, not the CLI's outer local map. Terraform checks shape, publisher and exact storage agreement but publishes the original text; it must not reserialize config or calculate the envelope checksum.
+Use the existing native binding-file selection mechanism. Keep its config/secret mappings in the same document. A raw `aws-dynamodb` binding does not satisfy the record requirement. Missing capability, a mismatched layout or failed selected-provider preparation is fatal before readiness, not permission to fall back to memory.
 
-Region, table and namespace are required. Preserve the exact existing table and namespace when migrating. Use the same region as the table; unrelated `AWS_REGION` values do not select the EC region. No provider or default binding is inferred on native. An ordinary KV declaration does not enable EC persistence. Selected-provider preparation must succeed before readiness. An error never permits fallback to memory, another provider or an unbacked cookie.
+For celld, use the same logical ID with `provider = "celld-records"`, its endpoint/store and access policy in that native binding document. Run the EdgeZero-owned `services/celld-store` application on official, unmodified celld 0.6.3. The matching EdgeZero revision must provide record API version 1, scoped pagination and no-expiry support. Ordinary KV and records share its rows and retained namespace allocator. Old or KV-only services fail read-only preparation; no fork listener, downgrade or migration is used.
 
-This is a hard cutover from native environment-only selection. `TS_EC_DYNAMODB_ENABLED=true` now fails before readiness with migration guidance, even if new config is also present. Malformed enablement also fails. Absent or `false` does not select a backend; orphaned old binding variables are ignored, not another source. Prepare and publish the new config, then remove the old enablement/region/table/namespace/endpoint launch inputs. There is no fallback reader.
+Region, table, namespace, credentials and endpoint behavior belong to EdgeZero's binding/provider configuration. The old `TS_EC_DYNAMODB_REGION`, `TS_EC_DYNAMODB_TABLE`, `TS_EC_DYNAMODB_NAMESPACE` and `TS_EC_DYNAMODB_LOCAL_ENDPOINT` do not configure another TS-owned provider. Tests use an explicitly isolated DynamoDB Local process with dummy credentials. No hosted IAM or deployment qualification is implied.
 
-Legacy `[ec] ec_store = "exact-binding"` remains supported on Fastly and inactive on other adapters. New Fastly config may use `[ec.storage] store = "exact-binding"`, with an omitted or explicit `fastly` provider. Both forms together are rejected. Cloudflare and Spin reject any explicit storage selection before routed application work. Shared parsing and publication do not resolve providers according to the CLI host. Missing storage stays absent when serialized, with no injected provider defaults.
+Fastly uses the same shared adapter and the logical `trusted_server_kv` declaration. Its compatibility `ec_store`/`provider="fastly"` references name logical IDs, not arbitrary physical store names. The application rejects undeclared IDs at startup. Request handling, response finalization and separately gated post-delivery pull sync retain the prepared handle; none reopens a store from settings. Link the desired physical Fastly store under that logical ID through the normal deployment workflow; these changes do not perform that operation.
 
-Older binaries reject the new section. Deploy a compatible binary before publishing it; rollback requires an old-compatible config and matching binary together. A provider or namespace switch does not migrate identity data or withdrawal obligations.
+## Key placement and generation lifetime
 
-The provider uses the standard AWS workload credential chain. In ECS, the application uses the task role. Keep credential values out of deployment inputs, logs, Terraform and container environment. The execution role still handles image pull, logs and task startup secrets, not application DynamoDB calls. Without a local-test selection, production preparation ignores configured endpoint overrides and uses the regional AWS endpoint. Local-only acceptance can set `local_endpoint = "http://127.0.0.1:8000"` inside `[ec.storage]`. This seam accepts only loopback HTTP with an explicit port and root path, bypasses the AWS config and credential chain, and uses dummy credentials. Never set it in a deployed task. In-process fixtures can also inject a client through the test preparation API.
+The application declares one stable `trusted-server-ec` layout:
 
-The table is a single-region base table. Do not add Global Tables or route writes to different regions and assume the same CAS guarantees. A single namespace partition and generation counter can become hot; `PAY_PER_REQUEST` is not a throughput qualification.
+- EC roots retain their full `<ip-hash>.<suffix>` keys and group by the complete `<ip-hash>.` prefix.
+- Completion markers retain `__ts_ec_withdrawal_complete__:<ec-id>:<expiry>` and group by the marker namespace plus EC ID, ending in `:`.
+- Layout resolution establishes placement. The graph still validates identity contents and marker expiry. A malformed marker is not silently accepted as proof of withdrawal.
+
+DynamoDB uses a namespace/layout-qualified partition key for each declared group. Value and retained per-key generation rows have different sort-key kinds. There is no namespace-wide counter updated by every mutation. Add/CAS use native conditions, and deletion or TTL of a value must not reset its retained generation history. Failed conditional attempts may consume unused generations.
+
+This is an explicit new record format, not a migration of the old `ec:{namespace}` and `ec-allocator:{namespace}` scheme. Reserve the table/namespace for the intended environment and retain allocator continuity through backup, restore and retirement. Do not restore an old allocator independently into an active dataset.
+
+TTL visibility is provider-native. DynamoDB records remain visible until native physical deletion; TS consent and tombstone policy is not replaced by the TTL collector. No portable exact expiry deadline or new expiry envelope is added.
+
+## Listing and errors
+
+EC cluster counting supplies a complete hash partition, including its dot delimiter. Marker listing supplies its complete marker partition. The shared adapter follows native continuation through short or empty pages until the requested cap or authoritative end. Existing graph callers continue to reject saturated cleanup conservatively.
+
+Strong partition Query and authoritative exact existence are separate from ordinary arbitrary-prefix/global Scan. An operator exposing ordinary global enumeration must account for its Scan cost and permission. Never scope a new policy to the obsolete single identity partition and global allocator.
+
+Provider preparation and runtime operations use EdgeZero's bounded, single-attempt policies. Definitive Add/CAS rejection is normal contention. Ambiguous completion is an error, not a false rejection or an automatic replay. TS retains its explicit reread/merge/retry/defer policy; no new cookie is issued merely because an uncertain mutation might have committed.
+
+## Eligibility and route boundaries
+
+Persistence does not grant consent. Native eligibility uses checked client metadata and existing browser/navigation rules, not invented Fastly TLS or JA4 signals. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
+
+Read-only identify does not create identities. Withdrawal remains writable for privacy-hardened clients, writes an authoritative tombstone, removes partner IDs and expires the browser cookie. Finalization is awaited before committing response headers.
+
+Native admin EC management, native S2S batch parity with Fastly, and native post-send pull sync remain separate work.
 
 ## Browser hostname and consent transport
 
@@ -68,88 +96,34 @@ Existing Sourcepoint GPP capture can mirror its supported signals and send scope
 
 Browser acceptance must inspect the visible URL, rejected-cookie diagnostics, stored `ts-ec` and its return on the next eligible request. Then verify genuine initial/no-consent behavior, a real CMP update reaching the server, and withdrawal producing durable tombstones and browser-cookie expiry. A `Set-Cookie` response header, a changed CMP UI or synthetic local consent alone is insufficient. See the browser hostname and consent qualification checklist in `deploy/examples/native-aws-workload/README.md`.
 
-## Celld conditional records
-
-Build the native adapter with `celld-ec` and publish an explicit binding:
-
-```toml
-[ec.storage]
-provider = "celld"
-endpoint = "https://stores.example.com:7780"
-store = "checkout-identity"
-
-[ec.storage.access]
-mode = "authenticated"
-token_env = "CHECKOUT_STORE_TOKEN"
-```
-
-The endpoint, service-owned alias and access policy use EdgeZero's pure celld settings. Do not publish a physical namespace or bearer token. The selected bootstrap variable is captured once during preparation; request paths do not reread it. Authenticated access requires HTTPS with normal certificate verification. Trusted-network access is an explicit alternative under the existing celld policy, never an authentication fallback.
-
-The provider requires the additive conditional-record protocol and checks both store and record version headers before readiness. Ordinary raw celld KV and the `celld-kv` feature do not supply the EC contract. Missing compiled provider, invalid credentials, unsupported protocol and unavailable service all fail closed.
-
-The typed client maps the unchanged EC trait onto body and opaque metadata, full-u64 server generations, atomic Add/Overwrite/IfGenerationMatch, exact physical existence, bounded strong prefix listing, TTL and hard deletion. A full list page is not proof of completeness. The server samples relative millisecond expiry inside the write transaction; finer positive client TTLs round upward. The core graph still owns every lifetime, tombstone and CAS retry. Transport does not replay uncertain mutations. Record cleanup must never reset the durable allocator. Raw KV keys and conditional record keys are separate datasets.
-
-Run the real disposable local-server proof explicitly with an existing tested celld binary:
-
-```sh
-CELLD_EC_TEST_BINARY=/absolute/path/to/celld \
-  cargo test --locked --target x86_64-unknown-linux-gnu \
-  -p trusted-server-adapter-axum --features celld-ec \
-  --test native_ec --test startup -- --include-ignored --test-threads=1
-
-CELLD_EC_TEST_BINARY=/absolute/path/to/celld \
-  cargo test --locked --target x86_64-unknown-linux-gnu \
-  -p trusted-server-adapter-axum --features celld-ec,geo-cloudfront \
-  --test native_acceptance \
-  real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage \
-  -- --ignored --test-threads=1
-```
-
-Missing prerequisites fail instead of silently skipping this selected check. Fixtures own temporary policy/data and loopback listeners, not operator configuration. They exercise the real typed client and graph through native issuance, EID update, withdrawal, restart, outage and published-envelope readiness. The second check drives actual native HTTP issuance from the published envelope using a real origin and celld, synthetic protected-ingress geography and isolated secret references. It covers application recreation, server restart and outage without replacing the graph with a memory double. Tests are serialized to keep subprocess listener ownership separate. Synthetic local geography and GPC inputs are not genuine live-browser consent acceptance. Same-disk fixture restart is not replicated disaster recovery or production storage qualification. The server's separate fresh-node-cache LTX proof does not certify a production object-store deployment either.
-
-## Table and namespace ownership
-
 The unified example's `deploy/examples/native-aws-workload/retained/` root creates the retained table and exports `ec_storage`. It neither depends on nor attaches policies to a task role. The parent workload root creates its own role and attaches the exact-table, partition-scoped policy. Removing the workload must not remove the table or leave a retained-state reference to the deleted task role.
 
-| Item                | Required layout or owner                                                                                                |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Table               | String hash key `pk`, string range key `sk`, `PAY_PER_REQUEST`, no indexes or replicas                                  |
-| Identity partition  | `pk=ec:{namespace}`, `sk` is the exact EC or withdrawal-marker key                                                      |
-| Allocator partition | `pk=ec-allocator:{namespace}`, `sk=generation`, numeric generation counter only, no TTL                                 |
-| Service TTL         | Enabled on numeric `ttl_epoch_s` for expiring identity/marker rows                                                      |
-| Logical expiry      | `expires_at_ms` filters lookup/list results and expiry-sensitive write conditions; held-row existence stays physical    |
-| Retained owner      | Named team/person owns state, table, namespace reservations, retention, allocator continuity, costs and decommissioning |
-| Workload owner      | Owns the application task role, provider-enabled image and task environment                                             |
+## Executed local acceptance and remaining deployment work
 
-The namespace must be nonempty, at most 512 UTF-8 bytes, and contain no Unicode control characters. The runtime does not trim or normalize it. Backend keys must be nonempty, at most 1024 bytes, and contain no control characters; withdrawal-marker keys are supported.
+The native lifecycle suite now runs through the shared adapter over real persistent records. It covers persistence-before-cookie, app recreation, consent/route exclusions, withdrawal, orphan recovery, cancellation, metadata/body coherence, stale tokens and native page traversal. The explicit `record_dynamodb` target exercises independent native Add/CAS, allocator-only Query pages, concurrent identity updates and withdrawal through DynamoDB Local.
 
-Reserve both partition values together for exactly one app/environment. Reuse the namespace across task replacements that should share identities. Use a distinct reservation for a separate environment. Do not share a namespace between unrelated applications or use an ephemeral task/run ID as its identity.
+The real celld fixture exercises route persistence, process restart, withdrawal, stale-token rejection, concurrent updates and outage through the same adapter. The production-binary tests prepare records from native bindings and the published logical selector, exercise actual HTTP issuance and withdrawal, restart against retained service state and refuse readiness on service outage. They require `CELLD_EC_TEST_BINARY` pointing to official celld and `EDGEZERO_CELLD_STORE_SERVICE` pointing to `services/celld-store` in the same SDK revision used by the Rust dependencies. Missing prerequisites fail rather than skip. The stock-celld workflow checks out that dependency tag, verifies the official runtime digest and executes all three ignored integration cases through a nonzero sentinel check. Historical modified-celld receipts do not prove this path.
 
-The internal allocator is not part of EC prefix listing. It has no `ttl_epoch_s` or logical expiration. Never delete, expire or reset it while the namespace can be used again. A delete/recreate cycle must not reuse a generation that an in-flight stale writer still holds. Failed conditional writes may consume unused generations; gaps are harmless.
+Fastly's WASM/Viceroy suite exercises the shared lifecycle and keeps response-finalization and post-delivery permissions separate. The separate SDK Viceroy independent-CAS race has a known emulator atomicity failure, deferred from this stock-celld integration. Do not describe that failed check as passing or as production Fastly qualification.
 
-Retain the allocator with the graph through backup, restore and migration. Rewinding it independently of rows can break stale-CAS protection. Do not restore old state into an active namespace without an explicit continuity plan. This example does not implement migration or disaster recovery.
-
-The graph owns live-row, tombstone and withdrawal-marker lifetimes. DynamoDB TTL only collects expired rows eventually. It does not define when a row stops authorizing EC use. `expires_at_ms` uses the application's UTC wall clock, so logical expiry and expiry-dependent Add/CAS conditions assume adequately synchronized task clocks. The deployment owner must qualify clock synchronization and skew across tasks. The backend adds no runtime skew guard or clock configuration. Current graph defaults are 31,536,000 seconds for live rows and 86,400 seconds for tombstones and completion markers. Do not apply a blanket TTL or cleanup job to the allocator partition.
-
-Lookup and prefix listing hide logically expired rows. Authoritative `key_exists` instead uses a strongly consistent exact-key read to confirm physical row presence, including logically expired rows. This means the identity is still held, not that it is logically readable. The read validates the expiry format; malformed rows are errors, not absence. Physical presence never authorizes identity use, EIDs or cookie issuance. It lets the graph write a fresh-generation withdrawal tombstone even when a CAS captured `:now` before expiry but arrives afterward. Treating the expired, still-held root as absent would skip that tombstone and let the delayed CAS match the old generation and revive the identity or partner IDs.
+These checks do not qualify a rebuilt application image, retained infrastructure, workload credentials, installed IAM/boundary policies, capacity, fleet failover, restore or real browser consent transport. `scripts/test-native-ec-image.mjs` uses the prepared binding and observes SDK-selected keys. Its binary and local-image modes test the same new-format lifecycle and fault cases. A binary-mode receipt alone does not qualify an image build; neither mode qualifies a deployed runtime wrapper.
 
 ## Task permissions and the existing boundary
 
 The runtime needs the following permissions on the exact table ARN:
 
-| Actions                                                                         | Scope                                                                      |
-| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `dynamodb:DescribeTable`                                                        | Exact table, no row condition; startup schema validation                   |
-| `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:Query` | Exact table and `dynamodb:LeadingKeys` equal to `ec:{namespace}`           |
-| `dynamodb:UpdateItem`                                                           | Exact table and `dynamodb:LeadingKeys` equal to `ec-allocator:{namespace}` |
+| Actions                                                                                                | Scope                                                              |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `dynamodb:DescribeTable`                                                                               | Exact table, no row condition; startup schema validation           |
+| `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:Query`, `dynamodb:UpdateItem` | Exact table and namespace/layout-qualified group partition pattern |
 
-No task permission is needed for `Scan`, `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, index creation or table deletion. Table creation and TTL configuration belong to the infrastructure operator. The allocator does not require `GetItem`. The example uses separate row and allocator statements, so ordinary identity deletion cannot delete the allocator through this policy. IAM partition scoping does not enforce a particular `sk` or stop a compromised task from modifying permitted rows.
+No task permission is needed for `Scan`, `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, index creation or table deletion. Table creation and TTL configuration belong to the infrastructure operator. The template trusts the task with both value and allocator rows inside the selected namespace/layout. IAM cannot distinguish their sort-key kinds. The SDK retains allocator rows, but these permissions do not independently prevent the task from deleting or replacing them. Do not use this template as production allocator protection.
 
 The workload's task inline policy and the externally owned permission boundary are separate layers. A boundary with an explicit `Deny`/`NotAction` read-action ceiling that excludes DynamoDB still denies the calls after an inline allow is attached.
 
 Before any deployment, the boundary and workload owners must review both layers:
 
-1. Review the boundary's action ceiling and constrained allows for only these six DynamoDB actions on the exact table and two partitions. Preserve unrelated restrictions. An action-ceiling edit alone does not grant permission.
+1. Review the boundary's action ceiling and constrained allows for only these six DynamoDB actions on the exact table and namespace/layout group pattern. Preserve unrelated restrictions. An action-ceiling edit alone does not grant permission.
 2. Review the workload root's exact-table, partition-scoped inline policy and all effective denies, including organization and endpoint policies, with the actual task credentials.
 
 The workload output `ec_task_policy_json` is a plan-known scoped allow document for that review, not a replacement boundary. Do not replace the boundary, add administrator access, remove explicit denies indiscriminately, or move application calls to the execution role. No DynamoDB execution-role change is needed. Existing Secrets Manager-only KMS statements do not authorize unrelated KMS use. DynamoDB uses default encryption at rest with an AWS-owned key here, with no new task KMS permissions. A customer-managed key is deferred and needs separate review.
@@ -182,14 +156,16 @@ Alternatively, supply `--image LOCAL_IMAGE` instead of `--binary`. Linux image m
 
 Before authorizing a deployment, retain evidence for the rebuilt image and these checks:
 
-- Real conditional expressions against DynamoDB Local, including concurrent Add, stale CAS, delete/recreate, metadata, logical expiry before TTL deletion, marker keys and short or empty Query pages with continuation. A bounded list that cannot prove exhaustion must fail rather than return an unsafe short result.
+- Real conditional expressions against DynamoDB Local, including concurrent Add, stale CAS, delete/recreate, metadata, physically present past-TTL rows, marker keys and short or empty Query pages with continuation. A bounded list that cannot prove exhaustion must fail rather than return an unsafe short result.
 - Native lifecycle tests proving persistence acknowledgement precedes new `Set-Cookie: ts-ec`, reuse survives application recreation, withdrawal writes a tombstone and expires the browser cookie, and an old EID update cannot undo withdrawal.
 - Failure cases for denied, unavailable and uncertain writes. No phantom identity may be issued. Test readiness failure and current-thread runtime scheduling while storage is delayed.
 - Existing route exclusions and consent rules. Health, static assets, preflight and rejected authentication must not mint identities. Missing qualifying consent must remain blocked. Synthetic local consent fixtures are not live-browser consent acceptance.
 - The actual final image's provider selection, non-root/read-only execution, startup, readiness, normal HTTPS trust and shutdown behavior, plus affected Fastly/WASM compatibility after shared EC changes.
 
-After separate AWS authorization, qualify the real task role with its retained boundary and inline policy. Prove allowed operations on the reviewed table/partitions and denial elsewhere, allocator retention, logical TTL and persistence across task replacement. Separately verify cookie acceptance and genuine initial/update/withdrawal CMP transport through the selected browser path. Do not relax privacy configuration or fabricate a live signal to make that acceptance pass.
+After separate AWS authorization, qualify the real task role with its retained boundary and inline policy. Prove allowed operations on the reviewed table/partitions and denial elsewhere, allocator retention, native TTL behavior and persistence across task replacement. Separately verify cookie acceptance and genuine initial/update/withdrawal CMP transport through the selected browser path. Do not relax privacy configuration or fabricate a live signal to make that acceptance pass.
 
 ## Deferred production considerations
 
 PITR/backups and restore qualification, alarms, HA, autoscaling, private networking/NAT/endpoints, WAF, customer-managed keys, IPv6, image automation, bidder/partner integrations, signing/admin/S2S additions and rollback automation remain deferred. Backup choices must preserve allocator continuity and account for erasure obligations. Capacity, clock behavior, recovery and regional access need operator evidence before a production design can rely on them. These are considerations for separately approved work, not infrastructure or runtime additions in this example.
+
+Review exact-table permissions, namespace/group scoping, retained state ownership and effective denies before any deployment. The application task role owns data access; do not move it to the execution role or remove unrelated boundaries. Do not add migration, apply infrastructure, publish images or deploy from these local test receipts.

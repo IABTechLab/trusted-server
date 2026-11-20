@@ -9,6 +9,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
@@ -213,12 +214,7 @@ pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
 ) -> Result<RuntimeServices, EdgeError> {
     let client_ip = extract_client_ip(ctx);
-    let outbound_client = ctx
-        .http_client()
-        .ok_or_else(|| {
-            EdgeError::internal(std::io::Error::other("request has no outbound client"))
-        })?
-        .with_proxy_marker(false);
+    let outbound_client = request_outbound_client(ctx)?;
 
     // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
@@ -396,6 +392,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
+    use trusted_server_core::consent::jurisdiction::{Jurisdiction, detect_jurisdiction};
+    use trusted_server_core::consent::{
+        ConsentContext, allows_ec_creation, consent_allows_server_side_auction,
+    };
+    use trusted_server_core::consent_config::ConsentConfig;
 
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
@@ -631,8 +632,67 @@ mod tests {
             "should populate continent"
         );
         let coordinates = info.coordinates.expect("should populate coordinate pair");
-        assert_eq!(coordinates.latitude, 40.71);
-        assert_eq!(coordinates.longitude, -74.01);
+        assert_eq!(
+            coordinates.latitude, 40.71,
+            "should retain the supplied cf-iplatitude value"
+        );
+        assert_eq!(
+            coordinates.longitude, -74.01,
+            "should retain the supplied cf-iplongitude value"
+        );
+    }
+
+    #[test]
+    fn build_geo_country_projection_preserves_core_consent_policy() {
+        let config = ConsentConfig::default();
+        let expected = vec![
+            (Some("US"), Jurisdiction::NonRegulated, true, true),
+            (Some("XK"), Jurisdiction::NonRegulated, true, true),
+            (Some("T1"), Jurisdiction::NonRegulated, true, true),
+            (Some("JP"), Jurisdiction::NonRegulated, true, true),
+            (Some("DE"), Jurisdiction::Gdpr, false, false),
+            (Some("GB"), Jurisdiction::Gdpr, false, false),
+            (Some("XX"), Jurisdiction::Unknown, false, false),
+            (None, Jurisdiction::Unknown, false, false),
+        ];
+        let actual: Vec<_> = expected
+            .iter()
+            .map(|(country, _, _, _)| {
+                let ctx = match country {
+                    Some(country) => make_ctx_with_header("cf-ipcountry", country),
+                    None => make_ctx_without_header(),
+                };
+                let geo = build_geo(&ctx)
+                    .lookup(None)
+                    .expect("should project Cloudflare country into Core GeoInfo");
+                if let Some(geo) = &geo {
+                    assert_eq!(
+                        geo,
+                        &GeoInfo::country_region(&geo.country, None),
+                        "should preserve country-only Cloudflare geography without inventing detail"
+                    );
+                }
+                let consent = ConsentContext {
+                    jurisdiction: detect_jurisdiction(geo.as_ref(), &config),
+                    ..ConsentContext::default()
+                };
+                assert!(
+                    consent.tcf.is_none() && !consent.gdpr_applies,
+                    "should not synthesize a TCF signal from Cloudflare geography"
+                );
+                (
+                    *country,
+                    consent.jurisdiction.clone(),
+                    consent_allows_server_side_auction(&consent),
+                    allows_ec_creation(&consent),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "should retain baseline jurisdiction, auction admission and EC creation policy for Cloudflare countries"
+        );
     }
 
     #[test]
@@ -642,7 +702,11 @@ mod tests {
             .lookup(None)
             .expect("should look up geo")
             .expect("should have country");
-        assert_eq!(info, GeoInfo::country_region("US", None));
+        assert_eq!(
+            info,
+            GeoInfo::country_region("US", None),
+            "should project a country-only US header without inventing optional Geo detail"
+        );
     }
 
     #[test]
@@ -672,9 +736,17 @@ mod tests {
                 .lookup(None)
                 .expect("should look up geo")
                 .expect("should have country");
-            assert_eq!(info.coordinates.is_some(), has_coordinates);
+            assert_eq!(
+                info.coordinates.is_some(),
+                has_coordinates,
+                "should require both parseable coordinates for latitude {latitude:?} and longitude {longitude:?}"
+            );
             if has_coordinates {
-                assert_eq!(info.coordinates_string().as_deref(), Some("0,0"));
+                assert_eq!(
+                    info.coordinates_string().as_deref(),
+                    Some("0,0"),
+                    "should preserve supplied zero coordinates for latitude {latitude:?} and longitude {longitude:?}"
+                );
             }
         }
     }

@@ -160,7 +160,7 @@ variable "config_envelope_file" {
 }
 
 variable "ec_storage" {
-  description = "Exact retained ec_storage output, also published as ec.storage in the CLI envelope. The workload owns only scoped task access, never the table."
+  description = "Exact retained ec_storage native record binding. Published ec.storage names only the logical prepared store. The workload owns scoped task access, never the table."
   type = object({
     provider  = string
     region    = string
@@ -169,8 +169,12 @@ variable "ec_storage" {
   })
   nullable = false
   validation {
-    condition     = var.ec_storage.provider == "dynamodb" && var.ec_storage.region == var.aws_region && can(regex("^[A-Za-z0-9_.-]{3,255}$", var.ec_storage.table))
-    error_message = "ec_storage must select DynamoDB in the workload region and a 3-255-character table name containing only ASCII letters, digits, underscores, periods or hyphens."
+    condition     = var.ec_storage.provider == "aws-dynamodb-records" && var.ec_storage.region == var.aws_region && can(regex("^[A-Za-z0-9_.-]{3,255}$", var.ec_storage.table))
+    error_message = "ec_storage must select aws-dynamodb-records in the workload region and a 3-255-character ASCII table name containing only letters, digits, underscores, periods or hyphens."
+  }
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]+$", var.ec_storage.namespace))
+    error_message = "Use an ASCII namespace containing only letters, digits, underscores, periods or hyphens so the IAM partition pattern stays literal."
   }
 }
 

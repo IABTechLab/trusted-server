@@ -7,6 +7,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
@@ -263,12 +264,7 @@ pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
 ) -> Result<RuntimeServices, EdgeError> {
     let client_ip = extract_client_ip(ctx);
-    let outbound_client = ctx
-        .http_client()
-        .ok_or_else(|| {
-            EdgeError::internal(std::io::Error::other("request has no outbound client"))
-        })?
-        .with_proxy_marker(false);
+    let outbound_client = request_outbound_client(ctx)?;
 
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()

@@ -9,12 +9,10 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 passphrase = "ec_passphrase"
 
-# Copy the retained root's ec_storage output into this table and workload inputs.
+# Logical reference only. The retained ec_storage output goes to native bindings.
 [ec.storage]
-provider = "dynamodb"
-region = "eu-west-2"
-table = "example-retained-ec"
-namespace = "example-staging"
+provider = "records"
+store = "trusted_server_kv"
 
 # Rust regex has no negative lookahead. These alternatives match every path
 # beginning '/' EXCEPT the exact '/health'. Review and test the actual policy;

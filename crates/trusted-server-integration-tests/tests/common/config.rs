@@ -362,6 +362,52 @@ fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
+
+    #[test]
+    fn fastly_ec_fixture_selects_the_declared_logical_store() {
+        for config in [
+            APP_CONFIG,
+            include_str!("../../fixtures/configs/trusted-server.trace.toml"),
+            include_str!("../../fixtures/configs/trusted-server.trace-auth.toml"),
+        ] {
+            let settings = toml::from_str::<TrustedServerAppConfig>(config)
+                .expect("should parse the integration configuration")
+                .into_settings();
+            let selected = settings
+                .ec
+                .resolve_storage(EcRuntime::Fastly)
+                .expect("should resolve Fastly storage without provider preparation");
+            assert!(
+                matches!(
+                    selected,
+                    Some(
+                        EcStorageSelection::Fastly("trusted_server_kv")
+                            | EcStorageSelection::Records("trusted_server_kv")
+                    )
+                ),
+                "should select the logical record store declared by the Fastly application"
+            );
+        }
+    }
+
+    #[test]
+    fn fastly_ec_fixture_exposes_seeded_rows_under_the_logical_store() {
+        let template: toml::Value = toml::from_str(VICEROY_TEMPLATE)
+            .expect("should parse the integration Viceroy template");
+        let entries = template["local_server"]["kv_stores"]["trusted_server_kv"]
+            .as_array()
+            .expect("should expose the declared logical record store");
+        for (index, prefix) in ['a', 'b', 'c', 'd', 'e'].into_iter().enumerate() {
+            let key = format!("{}.test0{}", prefix.to_string().repeat(64), index + 1);
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["key"].as_str() == Some(&key)),
+                "should preserve the seeded EC row {key}"
+            );
+        }
+    }
 
     #[test]
     fn sigv4_asset_fixture_validates_both_signed_routes() {
@@ -592,9 +638,9 @@ mod tests {
             stores["counter_store"].is_array(),
             "fastly.toml should define counter_store for batch-sync rate limiting"
         );
-        let ec_entries = stores["ec_identity_store"]
+        let ec_entries = stores["trusted_server_kv"]
             .as_array()
-            .expect("fastly.toml should define ec_identity_store");
+            .expect("fastly.toml should expose EC under its declared logical store ID");
         assert!(
             ec_entries.iter().any(|entry| {
                 entry["key"].as_str()

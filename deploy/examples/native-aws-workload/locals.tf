@@ -28,14 +28,14 @@ locals {
   envelope_text = file(var.config_envelope_file)
   envelope      = try(jsondecode(local.envelope_text), null)
   app_config    = try(local.envelope.data, {})
-  # Terraform checks publication shape, website and retained storage bindings.
+  # Terraform checks publication shape, website and the logical record reference.
   # The matching TS CLI/runtime owns authentication, signing, origin protocols,
   # secret-consumer semantics and the application checksum.
   envelope_valid = try(
     local.envelope.version == 1 &&
     can(regex("^[0-9a-f]{64}$", local.envelope.sha256)) &&
     local.app_config.publisher.domain == var.publisher_hostname &&
-    jsonencode(local.app_config.ec.storage) == jsonencode(var.ec_storage),
+    jsonencode(local.app_config.ec.storage) == jsonencode({ provider = "records", store = "trusted_server_kv" }),
     false
   )
 
@@ -58,6 +58,12 @@ locals {
     "application = ${jsonencode(aws_appconfig_application.review.id)}",
     "environment = ${jsonencode(aws_appconfig_environment.review.environment_id)}",
     "profile = ${jsonencode(aws_appconfig_configuration_profile.review.configuration_profile_id)}",
+    "",
+    "[kv.trusted_server_kv]",
+    "provider = ${jsonencode(var.ec_storage.provider)}",
+    "region = ${jsonencode(var.ec_storage.region)}",
+    "table = ${jsonencode(var.ec_storage.table)}",
+    "namespace = ${jsonencode(var.ec_storage.namespace)}",
     "",
     "[secrets.trusted_server_secrets]",
     "provider = \"aws-secrets-manager\"",

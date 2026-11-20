@@ -140,17 +140,18 @@ impl FastlyManagementApiClient {
         Self { api_key, base_url }
     }
 
-    /// Sends one management API request through `client` and returns its body.
+    /// Sends one management API request through `client`.
     ///
     /// A DELETE that the API answers 404 succeeds, because the entry is already
-    /// gone, so retries after a partial failure converge.
+    /// gone, so retries after a partial failure converge. The response body is
+    /// read only to describe a failure.
     async fn make_request(
         &self,
         client: &HttpClient,
         method: Method,
         path: &str,
         body: Option<ManagementBody>,
-    ) -> Result<Bytes, Report<TrustedServerError>> {
+    ) -> Result<(), Report<TrustedServerError>> {
         let failed = || TrustedServerError::Configuration {
             message: format!("Fastly management API {method} {path} failed"),
         };
@@ -176,14 +177,13 @@ impl FastlyManagementApiClient {
             .await
             .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
         let status = response.status();
+        if status.is_success() || (method == Method::DELETE && status == StatusCode::NOT_FOUND) {
+            return Ok(());
+        }
         let body = response
             .into_bytes_bounded(MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| outbound_error(error, failed(), OutboundRequestSource::Internal))?;
-
-        if status.is_success() || (method == Method::DELETE && status == StatusCode::NOT_FOUND) {
-            return Ok(body);
-        }
         Err(Report::new(failed()).attach(format!(
             "management API answered HTTP {status} - {}",
             truncate_error_body(&String::from_utf8_lossy(&body))
@@ -571,14 +571,14 @@ mod tests {
             request.assert_transport(management_transport());
         }
 
-        let secret = &requests[0];
-        secret.assert_headers(&[
+        let upsert_request = &requests[0];
+        upsert_request.assert_headers(&[
             ("fastly-key", API_KEY),
             ("accept", "application/json"),
             ("content-type", "application/json"),
         ]);
-        let upsert: serde_json::Value =
-            serde_json::from_slice(&secret.body).expect("should send the secret upsert as JSON");
+        let upsert: serde_json::Value = serde_json::from_slice(&upsert_request.body)
+            .expect("should send the secret upsert as JSON");
         assert_eq!(
             (&upsert["name"], &upsert["method"]),
             (
@@ -616,9 +616,8 @@ mod tests {
             assert_eq!(
                 request.body.as_ref(),
                 body.as_bytes(),
-                "should send {} {} its config item value as a URL-encoded form",
-                request.method,
-                request.uri
+                "should send {} its config item value as a URL-encoded form",
+                request.method_and_path()
             );
         }
     }

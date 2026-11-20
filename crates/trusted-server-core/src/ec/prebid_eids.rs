@@ -16,7 +16,8 @@ use crate::openrtb::{Eid, Uid};
 
 use super::kv::PartnerIdUpdate;
 use super::kv_types::MAX_UID_LENGTH;
-use super::registry::PartnerRegistry;
+use super::registry::{PartnerConfig, PartnerRegistry};
+use super::sharedid::{is_sharedid_source, sharedid_partner_source};
 
 /// Maximum raw `ts-eids` cookie size accepted before base64 decode.
 const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
@@ -157,6 +158,7 @@ pub(crate) fn collect_eid_updates(
     {
         updates.push(update);
     }
+    // Provider-owned sources stay in the list; the write planner skips them.
     dedupe_partner_updates(updates)
 }
 
@@ -194,7 +196,7 @@ fn collect_prebid_eid_updates_from_eids(
 ) -> Vec<PartnerIdUpdate> {
     let mut updates = Vec::new();
     for eid in eids {
-        let Some(partner) = registry.find_by_source_domain(&eid.source) else {
+        let Some(partner) = partner_for_source(&eid.source, registry) else {
             log::debug!("Prebid EIDs: no partner for source '{}'", eid.source);
             continue;
         };
@@ -217,6 +219,19 @@ fn collect_prebid_eid_updates_from_eids(
     updates
 }
 
+/// Returns the partner an EID source is filed under. Either `SharedID`
+/// source files under the registered `SharedID` partner, preferring
+/// `pubcid.org`, so one `SharedID` is stored whichever source carried it.
+pub(crate) fn partner_for_source<'registry>(
+    source: &str,
+    registry: &'registry PartnerRegistry,
+) -> Option<&'registry PartnerConfig> {
+    if is_sharedid_source(source) {
+        return sharedid_partner_source(registry).and_then(|source| registry.get(source));
+    }
+    registry.find_by_source_domain(source)
+}
+
 pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
@@ -237,9 +252,8 @@ pub(crate) fn is_valid_eid_uid(uid: &str) -> bool {
     !uid.trim().is_empty() && !eid_id_exceeds_size_limit(uid)
 }
 
-/// `SharedID` EID source domain used for partner registry lookup.
-const SHAREDID_SOURCE_DOMAIN: &str = "sharedid.org";
-
+/// Files the `SharedID` cookie value under the registered `SharedID`
+/// partner, preferring `pubcid.org` over the legacy `sharedid.org`.
 pub(crate) fn collect_sharedid_update(
     cookie_value: &str,
     registry: &PartnerRegistry,
@@ -257,12 +271,12 @@ pub(crate) fn collect_sharedid_update(
         return None;
     }
 
-    let Some(partner) = registry.find_by_source_domain(SHAREDID_SOURCE_DOMAIN) else {
-        log::debug!("SharedID: no partner configured for source '{SHAREDID_SOURCE_DOMAIN}'");
+    let Some(source) = sharedid_partner_source(registry) else {
+        log::debug!("SharedID: no partner configured for a SharedID source");
         return None;
     };
 
-    Some(PartnerIdUpdate::new(&partner.source_domain, cookie_value))
+    Some(PartnerIdUpdate::new(source, cookie_value))
 }
 
 fn eids_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
@@ -294,17 +308,15 @@ fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<E
             continue;
         }
 
-        eids.push(Eid {
-            source: entry.source,
-            uids,
-        });
+        eids.push(Eid::new(entry.source, uids));
     }
 
     eids
 }
 
 fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
-    if uid.id.is_empty() {
+    // Cookie UIDs keep the browser limit; only provider writes may be longer.
+    if uid.id.is_empty() || uid.id.len() > MAX_UID_LENGTH {
         return None;
     }
 
@@ -324,14 +336,18 @@ fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
 fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
     entries
         .into_iter()
-        .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
-        .map(|entry| Eid {
-            source: entry.source,
-            uids: vec![Uid {
-                id: entry.id,
-                atype: (entry.atype >= 0).then_some(entry.atype),
-                ext: None,
-            }],
+        .filter(|entry| {
+            !entry.source.is_empty() && !entry.id.is_empty() && entry.id.len() <= MAX_UID_LENGTH
+        })
+        .map(|entry| {
+            Eid::new(
+                entry.source,
+                vec![Uid {
+                    id: entry.id,
+                    atype: (entry.atype >= 0).then_some(entry.atype),
+                    ext: None,
+                }],
+            )
         })
         .collect()
 }
@@ -352,6 +368,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -448,6 +465,35 @@ mod tests {
             Some(571187),
             "should preserve PAIR's vendor-specific atype"
         );
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_drops_uids_over_the_browser_limit() {
+        // Arrange
+        let long = "x".repeat(MAX_UID_LENGTH + 1);
+        let at_limit = "y".repeat(MAX_UID_LENGTH);
+        let structured = BASE64.encode(
+            json!([{ "source": "ids.example.com", "uids": [
+                { "id": long, "atype": 1 },
+                { "id": at_limit, "atype": 1 }
+            ]}])
+            .to_string(),
+        );
+        let legacy = BASE64
+            .encode(json!([{ "source": "ids.example.com", "id": long, "atype": 1 }]).to_string());
+
+        // Act
+        let structured = parse_prebid_eids_cookie(&structured).expect("should decode");
+        let legacy = parse_prebid_eids_cookie(&legacy).expect("should decode");
+
+        // Assert
+        let ids: Vec<usize> = structured[0].uids.iter().map(|uid| uid.id.len()).collect();
+        assert_eq!(
+            ids,
+            vec![MAX_UID_LENGTH],
+            "should keep only the UID within the limit"
+        );
+        assert!(legacy.is_empty(), "should drop an over-limit legacy UID");
     }
 
     #[test]
@@ -636,22 +682,22 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_stale", "atype": 1}]}
         ]));
         let body_eids = vec![
-            Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![Uid {
                     id: "ID5_fresh".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_owned(),
+                vec![Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ];
 
         let updates = collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry);
@@ -761,6 +807,46 @@ mod tests {
             updates,
             vec![PartnerIdUpdate::new("sharedid.org", "cookie-shared")],
             "should apply the direct sharedId cookie after Prebid EIDs"
+        );
+    }
+
+    #[test]
+    fn collect_eid_updates_files_sharedid_under_pubcid() {
+        let registry = make_registry(vec![("pubcid", "pubcid.org"), ("sharedid", "sharedid.org")]);
+        let cookie = encode_json(&json!([
+            {"source": "sharedid.org", "uids": [{"id": "prebid-shared", "atype": 3}]}
+        ]));
+
+        let from_eids = collect_eid_updates(Some(&cookie), None, None, &registry);
+        let from_cookie = collect_eid_updates(None, Some("cookie-shared"), None, &registry);
+
+        assert_eq!(
+            from_eids,
+            vec![PartnerIdUpdate::new("pubcid.org", "prebid-shared")],
+            "should file a sharedid.org EID under pubcid.org"
+        );
+        assert_eq!(
+            from_cookie,
+            vec![PartnerIdUpdate::new("pubcid.org", "cookie-shared")],
+            "should file the SharedID cookie under pubcid.org"
+        );
+    }
+
+    #[test]
+    fn collect_eid_updates_keeps_one_sharedid_from_cookie_and_eids() {
+        let registry = make_registry(vec![("pubcid", "pubcid.org")]);
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let cookie = encode_json(&json!([
+            {"source": "pubcid.org", "uids": [{"id": uuid, "atype": 1}]},
+            {"source": "sharedid.org", "uids": [{"id": uuid, "atype": 3}]}
+        ]));
+
+        let updates = collect_eid_updates(Some(&cookie), Some(uuid), None, &registry);
+
+        assert_eq!(
+            updates,
+            vec![PartnerIdUpdate::new("pubcid.org", uuid)],
+            "should store one SharedID under pubcid.org"
         );
     }
 

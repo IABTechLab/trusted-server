@@ -1,5 +1,7 @@
 # EC storage provider configuration
 
+> Implementation update, 2026-11-14: the shared record contract supersedes this proposal's provider connection fields and late provider construction. Published `ec.storage` now references a logical prepared record binding; EdgeZero native bindings own endpoints, credentials and table/namespace selection. Fastly compatibility references also name declared logical IDs. See [Native EC persistence](../../guide/native-ec-persistence.md) for current configuration and qualification limits. The original design below is retained as history.
+
 Status: Design decisions confirmed. This document specifies configuration and
 adapter selection changes, not an implemented feature. Native environment
 configuration gets a hard cutover, and supplying both configuration forms is

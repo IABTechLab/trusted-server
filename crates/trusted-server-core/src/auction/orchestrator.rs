@@ -248,15 +248,19 @@ fn provider_skipped_response(provider_name: &str) -> AuctionResponse {
     )
 }
 
-/// Whether `error` is a failed backend registration, which no request byte
-/// follows.
+/// Whether `error` failed the request before any byte of it left: a failed
+/// backend registration, or a request the adapter could not prepare.
 ///
-/// A registration that runs out of budget stays a timeout.
-fn failed_backend_registration(error: &EdgeError) -> bool {
+/// A launch step that runs out of budget stays a timeout.
+fn failed_to_launch(error: &EdgeError) -> bool {
     !matches!(error, EdgeError::GatewayTimeout { .. })
-        && error
-            .provider_failure_detail()
-            .is_some_and(|detail| detail.phase() == ProviderFailurePhase::BackendRegistration)
+        && error.provider_failure_detail().is_some_and(|detail| {
+            matches!(
+                detail.phase(),
+                ProviderFailurePhase::BackendRegistration
+                    | ProviderFailurePhase::RequestPreparation
+            )
+        })
 }
 
 /// Whole milliseconds in `duration`, saturating.
@@ -318,7 +322,8 @@ fn materialize_planned_response(
 /// Logs one failed bidder or mediator request without its provider text.
 ///
 /// A timeout is an expected auction outcome, so it logs at debug. Every other
-/// failure goes through [`outbound_error`], which logs its typed detail.
+/// failure logs one warn line: the [`outbound_error`] report, which carries
+/// the typed detail, with the role and provider name.
 fn log_request_failure(role: &str, provider_name: &str, error: EdgeError) {
     if matches!(error, EdgeError::GatewayTimeout { .. }) {
         log::debug!("{role} '{provider_name}' exhausted its response budget");
@@ -729,7 +734,13 @@ impl AuctionOrchestrator {
                 .outbound_client()
                 .start_batch_until(bidder_requests, auction_deadline);
             // Fastly registers every bidder backend while it starts the batch,
-            // so a registration failure is already recorded here.
+            // so a registration failure is already recorded here. A launch
+            // failure an adapter reports later is settled during collection.
+            // Spin and Cloudflare prepare each request inside the batch task
+            // they spawn, so their preparation failure surfaces there as
+            // `launch_failed` and does not count toward the all-launch-failed
+            // boundary below: an auction whose bidders all fail preparation
+            // completes without bids.
             launch_failure_count += settle_recorded_slots(
                 &mut batch,
                 &mut slot_providers,
@@ -986,8 +997,11 @@ impl AuctionOrchestrator {
     /// Sends the mediator after the bidder batch, bounded by the auction deadline.
     ///
     /// Returns `None`, so the caller ranks bids locally, when the deadline has
-    /// passed, or the mediator fails, times out, or returns an unparsable
-    /// response.
+    /// passed, or the mediator fails, times out, returns a response it cannot
+    /// process (such as a non-success HTTP status), or reports an error status.
+    /// A result the mediator returns without a request is dropped too once its
+    /// logical budget, the earlier of its timeout and the auction deadline, has
+    /// run out.
     async fn run_mediator(
         &self,
         mediator: &dyn AuctionProvider,
@@ -1033,7 +1047,19 @@ impl AuctionOrchestrator {
             .trace
             .map(|trace| trace.launch_provider(TraceProviderRole::Mediator));
         let mediator_start = run.clock.now();
+        let mediator_deadline = run
+            .clock
+            .deadline_after(Duration::from_millis(u64::from(logical_budget_ms)));
         let mediated = match mediator.request_bids(run.request, &mediator_context).await {
+            Ok(ProviderRequestOutcome::Immediate(_))
+                if mediator_deadline.is_expired_at(run.clock.now()) =>
+            {
+                log::debug!(
+                    "Mediator '{}' exhausted its response budget during launch; using local ranking",
+                    mediator.provider_name()
+                );
+                None
+            }
             Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
             Ok(ProviderRequestOutcome::Ready {
                 request: mediator_request,
@@ -1075,6 +1101,8 @@ impl AuctionOrchestrator {
                 None => trace.observe_failure(observation),
             }
         }
+        // An error status is not a mediation decision, however the provider
+        // reports it, so it falls back to local ranking like other failures.
         if mediated
             .as_ref()
             .is_some_and(|response| response.status == BidStatus::Error)
@@ -1083,8 +1111,9 @@ impl AuctionOrchestrator {
                 "Mediator '{}' reported an error response; using local ranking",
                 mediator.provider_name()
             );
+            return None;
         }
-        mediated.filter(|response| response.status != BidStatus::Error)
+        mediated
     }
 
     /// Check if orchestrator is enabled.
@@ -1126,19 +1155,22 @@ async fn settle_bidder_slot(
             .await
         {
             Ok(parsed) => (parsed, true),
-            Err(error) => (
-                provider_error_response(
-                    provider_name,
-                    response_time_ms,
-                    ERROR_TYPE_PARSE_RESPONSE,
-                    &error,
-                ),
-                false,
-            ),
+            Err(error) => {
+                log::warn!("Planned provider '{provider_name}' response parse failed: {error:?}");
+                (
+                    provider_error_response(
+                        provider_name,
+                        response_time_ms,
+                        ERROR_TYPE_PARSE_RESPONSE,
+                        &error,
+                    ),
+                    false,
+                )
+            }
         },
         Err(error) => {
             let timed_out = matches!(error, EdgeError::GatewayTimeout { .. });
-            let launch_failed = failed_backend_registration(&error);
+            let launch_failed = failed_to_launch(&error);
             log_request_failure("Planned provider", provider_name, error);
             let response = if timed_out {
                 provider_timeout_response(provider_name, response_time_ms)
@@ -1162,15 +1194,15 @@ async fn settle_bidder_slot(
 
 /// Settles the bidder slots `batch` has already recorded, without waiting.
 ///
-/// Returns how many of them failed backend registration. A failed batch fails
-/// every later observation too, so collection marks the slots it leaves.
+/// Returns how many of them failed to launch. A failed batch fails every later
+/// observation too, so collection marks the slots it leaves.
 async fn settle_recorded_slots(
     batch: &mut OutboundBatch,
     slots: &mut [Option<BidderSlot>],
     responses: &mut Vec<AuctionResponse>,
     trace: Option<&TraceAuctionCarry>,
 ) -> usize {
-    let mut registration_failures = 0;
+    let mut launch_failures = 0;
     loop {
         match batch.check() {
             Ok(OutboundBatchCheck::Item(item)) => {
@@ -1179,17 +1211,13 @@ async fn settle_recorded_slots(
                     log::warn!("Auction batch reported unknown slot {index}, ignoring");
                     continue;
                 };
-                if result
-                    .outcome
-                    .as_ref()
-                    .is_err_and(failed_backend_registration)
-                {
-                    registration_failures += 1;
+                if result.outcome.as_ref().is_err_and(failed_to_launch) {
+                    launch_failures += 1;
                 }
                 responses.push(settle_bidder_slot(slot, result, trace).await);
             }
             Ok(OutboundBatchCheck::Pending | OutboundBatchCheck::Finished(_)) => {
-                return registration_failures;
+                return launch_failures;
             }
             Err(error) => {
                 let report = outbound_error(
@@ -1200,13 +1228,13 @@ async fn settle_recorded_slots(
                     OutboundRequestSource::Internal,
                 );
                 log::warn!("Auction bidder batch failed as it started: {report:?}");
-                return registration_failures;
+                return launch_failures;
             }
         }
     }
 }
 
-/// Parses a mediator response, logging and dropping a parse failure.
+/// Parses a mediator response, logging and dropping a processing failure.
 async fn parse_mediator_response(
     mediator: &dyn AuctionProvider,
     response: OutboundResponse,
@@ -1290,8 +1318,11 @@ mod tests {
 
     use base64::Engine as _;
     use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
-    use edgezero_core::outbound::OutboundResponse;
-    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
+    use edgezero_core::outbound::{OutboundResponse, ResponseMode};
+    use edgezero_core::{
+        CloudflareFailureCause, FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase,
+        SpinFailureCause,
+    };
     use http::{Method, StatusCode};
 
     use crate::auction::orchestrator::DispatchAuctionOutcome;
@@ -1302,7 +1333,6 @@ mod tests {
         AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
     };
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
-
     use crate::auction::telemetry::{
         AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     };
@@ -1320,7 +1350,7 @@ mod tests {
         StoreName,
     };
     use crate::test_support::scripted_client::{
-        ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
+        RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock, outbound_response,
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::Report;
@@ -1329,8 +1359,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_TIMEOUT,
-        ERROR_TYPE_TRANSPORT, OrchestrationResult,
+        AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_HTTP_STATUS, ERROR_TYPE_LAUNCH_FAILED,
+        ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT, OrchestrationResult,
     };
 
     /// Endpoint every [`planned_config`] provider shares.
@@ -1486,8 +1516,14 @@ mod tests {
     /// but `EdgeZero` builds no outbound request for a target with a backslash.
     const UNBUILDABLE_BIDDER: &str = r"https://failing.example.test/openrtb?x=\";
 
+    /// Endpoint of a second bidder that a launch-failure test makes fail.
+    const SECOND_FAILING_BIDDER: &str = "https://second-failing.example.test/openrtb";
+
     /// Endpoint of the bidder whose backend registration runs out of budget.
     const TIMED_OUT_BIDDER: &str = "https://timed-out.example.test/openrtb";
+
+    /// Endpoint of the bidder that bids beside a launch failure.
+    const WINNING_BIDDER: &str = "https://winning.example.test/openrtb";
 
     /// How a launch-failure test makes its bidder fail to launch.
     #[derive(Clone, Copy, Debug)]
@@ -1556,6 +1592,27 @@ mod tests {
         )
     }
 
+    /// The errors Spin and Cloudflare report when they cannot prepare a
+    /// bidder's request, before any byte of it leaves.
+    fn request_preparation_errors() -> [EdgeError; 2] {
+        [
+            EdgeError::bad_request_with_detail(
+                "Spin rejected an outbound request header",
+                ProviderFailureDetail::Spin {
+                    phase: ProviderFailurePhase::RequestPreparation,
+                    cause: SpinFailureCause::HeaderOther,
+                },
+            ),
+            EdgeError::internal_with_detail(
+                std::io::Error::other("example worker request build failure"),
+                ProviderFailureDetail::Cloudflare {
+                    phase: ProviderFailurePhase::RequestPreparation,
+                    cause: CloudflareFailureCause::Unknown,
+                },
+            ),
+        ]
+    }
+
     /// Compiles one standard provider per `(id, endpoint)`.
     fn launch_plan(providers: &[(&str, &str)]) -> Arc<AuctionPlan> {
         let mut config = planned_config(
@@ -1589,6 +1646,25 @@ mod tests {
         }
     }
 
+    /// A standard `OpenRTB` reply with one bid for the fixture slot.
+    fn bid_reply(price: f64) -> ScriptedReply {
+        ScriptedReply::status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "seatbid": [{"seat": "fictional-seat", "bid": [{
+                        "id": "fictional-bid",
+                        "impid": "fictional-slot",
+                        "price": price,
+                        "adm": "<div>fictional creative</div>",
+                        "w": 300,
+                        "h": 250
+                    }]}]
+                }))
+                .expect("should serialize the bid reply"),
+            )
+    }
+
     /// Each provider with the `error_type` its response carries, if any.
     fn error_types(result: &OrchestrationResult) -> Vec<(&str, Option<serde_json::Value>)> {
         result
@@ -1603,7 +1679,8 @@ mod tests {
             .collect()
     }
 
-    /// Bidders that fail to launch, through construction or backend registration.
+    /// Bidders that fail to launch: through construction, backend registration,
+    /// or a request the Spin or Cloudflare adapter could not prepare.
     mod launch_failure_tests {
         use super::*;
 
@@ -1662,6 +1739,154 @@ mod tests {
                     2 * failure.requests_per_auction(),
                     "{failure:?} should send no bid request beyond the failed registrations"
                 );
+            }
+        }
+
+        #[test]
+        fn launch_failure_leaves_a_later_bid_to_win() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            for failure in LaunchFailure::ALL {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                failure.script(&bidders, 1);
+                bidders.respond_to(
+                    Method::POST,
+                    WINNING_BIDDER,
+                    bid_reply(2.0).after(Duration::from_millis(100)),
+                );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[
+                        ("launch-fail", failure.endpoint()),
+                        ("winner", WINNING_BIDDER),
+                    ]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .unwrap_or_else(|error| {
+                        panic!("{failure:?} should complete the auction beside the launch failure: {error:?}")
+                    });
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        ("winner", None),
+                    ],
+                    "{failure:?} should keep the launch failure beside the bid"
+                );
+                assert_eq!(
+                    result
+                        .get_winning_bid("fictional-slot")
+                        .and_then(|bid| bid.price),
+                    Some(2.0),
+                    "{failure:?} should let the bid that arrives after the launch failure win"
+                );
+            }
+        }
+
+        #[test]
+        fn request_preparation_failure_is_a_launch_failure() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            for error in request_preparation_errors() {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                bidders
+                    .respond_to(
+                        Method::POST,
+                        FAILING_BIDDER,
+                        ScriptedReply::error(error).after(Duration::from_millis(10)),
+                    )
+                    .respond_to(
+                        Method::POST,
+                        WINNING_BIDDER,
+                        bid_reply(2.0).after(Duration::from_millis(100)),
+                    );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[("launch-fail", FAILING_BIDDER), ("winner", WINNING_BIDDER)]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction beside the preparation failure");
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        ("winner", None),
+                    ],
+                    "should class a request the adapter could not prepare as a launch failure"
+                );
+            }
+        }
+
+        #[test]
+        fn preparation_failures_of_every_bidder_complete_the_auction_without_bids() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            // Spin and Cloudflare report a preparation failure from the batch
+            // task they spawn, so it arrives after the batch has started.
+            for (first, second) in request_preparation_errors()
+                .into_iter()
+                .zip(request_preparation_errors())
+            {
+                let clock = TestClock::new();
+                let bidders = ScriptedHttpClient::new(&clock);
+                bidders
+                    .respond_to(
+                        Method::POST,
+                        FAILING_BIDDER,
+                        ScriptedReply::error(first).after(Duration::from_millis(10)),
+                    )
+                    .respond_to(
+                        Method::POST,
+                        SECOND_FAILING_BIDDER,
+                        ScriptedReply::error(second).after(Duration::from_millis(10)),
+                    );
+                let services = build_services_with_outbound_client(&bidders, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    launch_plan(&[
+                        ("launch-fail-a", FAILING_BIDDER),
+                        ("launch-fail-b", SECOND_FAILING_BIDDER),
+                    ]),
+                    None,
+                );
+                let context = launch_context(&settings, &inbound, &services);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction when every bidder fails preparation");
+
+                assert_eq!(
+                    error_types(&result),
+                    vec![
+                        (
+                            "launch-fail-a",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                        (
+                            "launch-fail-b",
+                            Some(serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+                        ),
+                    ],
+                    "should record each preparation failure as a launch failure"
+                );
+                assert_eq!(result.total_bids(), 0, "should complete without bids");
             }
         }
 
@@ -1930,25 +2155,6 @@ mod tests {
             u32::try_from(duration.as_millis()).expect("should fit the fixture duration in u32")
         }
 
-        /// A standard `OpenRTB` reply with one bid for the fixture slot.
-        fn bid_reply(price: f64) -> ScriptedReply {
-            ScriptedReply::status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(
-                    serde_json::to_vec(&serde_json::json!({
-                        "seatbid": [{"seat": "fictional-seat", "bid": [{
-                            "id": "fictional-bid",
-                            "impid": "fictional-slot",
-                            "price": price,
-                            "adm": "<div>fictional creative</div>",
-                            "w": 300,
-                            "h": 250
-                        }]}]
-                    }))
-                    .expect("should serialize the bid reply"),
-                )
-        }
-
         fn batch_context<'a>(
             settings: &'a crate::settings::Settings,
             inbound: &'a http::Request<edgezero_core::body::Body>,
@@ -2051,7 +2257,7 @@ mod tests {
                     ),
                     (OutboundSendMode::Batch, BudgetSource::BatchCutoff, cutoff),
                     "should send {} in the auction batch, capped by its cutoff",
-                    request.uri
+                    request.method_and_path()
                 );
             }
             assert_eq!(
@@ -2065,6 +2271,48 @@ mod tests {
                     .and_then(|bid| bid.price),
                 Some(2.5),
                 "should rank both bidders' bids"
+            );
+        }
+
+        #[test]
+        fn provider_responses_follow_plan_order_not_arrival_order() {
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::new(&clock);
+            client
+                .respond_to(
+                    Method::POST,
+                    SLOW_BIDDER,
+                    bid_reply(2.5).after(Duration::from_millis(200)),
+                )
+                .respond_to(
+                    Method::POST,
+                    FAST_BIDDER,
+                    bid_reply(1.5).after(Duration::from_millis(100)),
+                );
+            let services = build_services_with_outbound_client(&client, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                batch_plan(&[
+                    ("first-planned", SLOW_BIDDER, Duration::from_secs(1)),
+                    ("second-planned", FAST_BIDDER, Duration::from_secs(1)),
+                ]),
+                None,
+            );
+            let settings = create_test_settings();
+            let inbound = inbound_request();
+            let context = batch_context(&settings, &inbound, &services, AUCTION_TIMEOUT);
+
+            let result = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect("should complete the auction");
+
+            assert_eq!(
+                result
+                    .provider_responses
+                    .iter()
+                    .map(|response| response.provider.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first-planned", "second-planned"],
+                "should report providers in plan order although the later-planned one answered first"
             );
         }
 
@@ -2605,6 +2853,94 @@ mod tests {
                     ),
                     (cause, duration_ms(ends_at).into()),
                     "should end the mediator at the earlier of its timeout and the auction deadline"
+                );
+            }
+        }
+
+        /// A mediator that answers without a request once its launch has taken
+        /// `launch` on the test clock.
+        struct SlowImmediateMediator {
+            clock: TestClock,
+            launch: Duration,
+            timeout: Duration,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for SlowImmediateMediator {
+            fn provider_name(&self) -> &str {
+                "slow-immediate-mediator"
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                _context: &AuctionContext<'_>,
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+                self.clock.advance(self.launch);
+                Ok(ProviderRequestOutcome::Immediate(AuctionResponse::success(
+                    self.provider_name(),
+                    vec![mediated_bid(Some(
+                        "https://nurl.example/immediate".to_string(),
+                    ))],
+                    0,
+                )))
+            }
+
+            async fn parse_response(
+                &self,
+                _response: OutboundResponse,
+                _response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                panic!("immediate mediator response should not be parsed");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                duration_ms(self.timeout)
+            }
+        }
+
+        #[test]
+        fn immediate_mediator_result_counts_only_within_its_budget() {
+            // The auction deadline ends the first launch and the mediator's own
+            // timeout the second. The third answers in time.
+            for (launch, timeout, mediated) in [
+                (Duration::from_millis(600), Duration::from_secs(1), false),
+                (
+                    Duration::from_millis(200),
+                    Duration::from_millis(100),
+                    false,
+                ),
+                (Duration::from_millis(50), Duration::from_millis(100), true),
+            ] {
+                let clock = TestClock::new();
+                let client = ScriptedHttpClient::new(&clock);
+                client.respond_to(Method::POST, FAST_BIDDER, bid_reply(1.5));
+                let services = build_services_with_outbound_client(&client, &clock);
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    batch_plan(&[("fast", FAST_BIDDER, Duration::from_secs(1))]),
+                    Some(Arc::new(SlowImmediateMediator {
+                        clock: clock.clone(),
+                        launch,
+                        timeout,
+                    })),
+                );
+                let settings = create_test_settings();
+                let inbound = inbound_request();
+                let context = batch_context(&settings, &inbound, &services, AUCTION_TIMEOUT);
+
+                let result = clock
+                    .drive(orchestrator.run_auction(&planned_request(), &context))
+                    .expect("should complete the auction");
+
+                assert_eq!(
+                    (
+                        result.mediator_response.is_some(),
+                        result
+                            .get_winning_bid("fictional-slot")
+                            .and_then(|bid| bid.price),
+                    ),
+                    (mediated, (!mediated).then_some(1.5)),
+                    "should keep an immediate mediator result only within its budget, launch {launch:?} and timeout {timeout:?}"
                 );
             }
         }
@@ -3264,7 +3600,7 @@ mod tests {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -3272,7 +3608,7 @@ mod tests {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -3301,7 +3637,7 @@ mod tests {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -3309,7 +3645,7 @@ mod tests {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -3335,7 +3671,7 @@ mod tests {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -3343,7 +3679,7 @@ mod tests {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
@@ -3365,7 +3701,7 @@ mod tests {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -3373,18 +3709,13 @@ mod tests {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
     // ---------------------------------------------------------------------------
     // Minimal test double for AuctionProvider
     // ---------------------------------------------------------------------------
-
-    /// Mediator whose context-aware parse restores `nurl`/`ad_id` (mirroring
-    /// `adserver_mock`), while its context-free parse does not. Lets a test prove
-    /// the synchronous mediation path calls `parse_response_with_context`.
-    struct CacheRestoringMediator;
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
@@ -3446,59 +3777,6 @@ mod tests {
             cache_host: None,
             cache_path: None,
             metadata: HashMap::new(),
-        }
-    }
-
-    /// Endpoint the [`CacheRestoringMediator`] sends its mediation request to.
-    const CACHE_RESTORING_MEDIATOR: &str = "https://mediator.example.com/mediate";
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for CacheRestoringMediator {
-        fn provider_name(&self) -> &str {
-            "mediator"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            Ok(ProviderRequestOutcome::ready(
-                edgezero_core::outbound::OutboundRequest::post(CACHE_RESTORING_MEDIATOR)
-                    .expect("should build the mediator request"),
-            ))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: OutboundResponse,
-            response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            // Context-free path: cannot restore SSP-only render/accounting fields.
-            Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(None)],
-                response_time_ms,
-            ))
-        }
-
-        async fn parse_response_with_context(
-            &self,
-            _response: OutboundResponse,
-            response_time_ms: u64,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            // Context-aware path: restores nurl/ad_id from the collected SSP bids.
-            Ok(AuctionResponse::success(
-                "mediator",
-                vec![mediated_bid(Some("https://nurl.example/win".to_string()))],
-                response_time_ms,
-            ))
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            2000
         }
     }
 
@@ -3920,45 +4198,49 @@ mod tests {
         );
     }
 
+    /// Endpoint of the [`AdServerMockProvider`] mediator in the fallback tests.
+    const MOCK_MEDIATOR_ENDPOINT: &str = "https://mediator.example/mediate";
+
     async fn run_mock_mediator_response(
-        split: bool,
         status: u16,
         body: &serde_json::Value,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
         let body = serde_json::to_vec(body).expect("should serialize mediator response");
-        run_raw_mock_mediator_response(split, status, body, floor).await
+        run_raw_mock_mediator_response(status, body, floor).await
+    }
+
+    /// The [`AdServerMockProvider`] mediator at [`MOCK_MEDIATOR_ENDPOINT`].
+    fn mock_mediator() -> Arc<AdServerMockProvider> {
+        Arc::new(AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: MOCK_MEDIATOR_ENDPOINT.to_string(),
+            timeout_ms: 500,
+            ..AdServerMockConfig::default()
+        }))
     }
 
     async fn run_raw_mock_mediator_response(
-        split: bool,
         status: u16,
         body: Vec<u8>,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
-        let mediator = Arc::new(AdServerMockProvider::new(AdServerMockConfig {
-            enabled: true,
-            endpoint: "https://mediator.example/mediate".to_string(),
-            timeout_ms: 500,
-            ..AdServerMockConfig::default()
-        }));
-        run_mediated_provider_auction(split, mediator, Some((status, body)), floor).await
+        run_mediated_provider_auction(mock_mediator(), Some((status, body)), floor).await
     }
 
     /// Runs a planned auction whose single provider returns bids at 1.5 and 2.0.
     ///
-    /// `mediator_http` is the stubbed mediator HTTP reply, or `None` for a
+    /// `mediator_http` is the scripted mediator HTTP reply, or `None` for a
     /// mediator that answers without HTTP.
     async fn run_mediated_provider_auction(
-        split: bool,
         mediator: Arc<dyn AuctionProvider>,
         mediator_http: Option<(u16, Vec<u8>)>,
         floor: f64,
     ) -> (AuctionRequest, OrchestrationResult) {
         let clock = TestClock::new();
-        let http = ScriptedHttpClient::new(&clock);
+        let client = ScriptedHttpClient::new(&clock);
         respond_planned(
-            &http,
+            &client,
             200,
             serde_json::to_vec(&serde_json::json!({
                 "seatbid": [{"seat": "provider-seat", "bid": [
@@ -3971,9 +4253,9 @@ mod tests {
             .expect("should serialize provider bids"),
         );
         if let Some((status, body)) = mediator_http {
-            respond(&http, "https://mediator.example/mediate", status, body);
+            respond(&client, MOCK_MEDIATOR_ENDPOINT, status, body);
         }
-        let services = build_services_with_outbound_client(&http, &clock);
+        let services = build_services_with_outbound_client(&client, &clock);
         let plan = AuctionPlan::compile(planned_config(
             &[("provider-a", RoutingMode::AllEligible)],
             false,
@@ -3991,36 +4273,21 @@ mod tests {
             services: &services,
         };
 
-        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
-        let result = if split {
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("should dispatch the provider before mediation");
-            };
-            orchestrator
-                .collect_dispatched_auction(dispatched, &services, &context)
-                .await
-        } else {
-            orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("should complete auction with mock mediation")
-        };
+        let result = planned_orchestrator(plan, Some(mediator))
+            .run_auction(&request, &context)
+            .await
+            .expect("should complete auction with mock mediation");
 
         (request, result)
     }
 
-    async fn assert_mediator_non_success_falls_back(split: bool) {
+    #[tokio::test]
+    async fn mediator_non_success_status_falls_back_to_local_ranking() {
         for status in [302, 400, 503] {
             for floor in [1.0, 3.0] {
-                let (request, result) = run_mock_mediator_response(
-                    split,
-                    status,
-                    &serde_json::json!({"seatbid": []}),
-                    floor,
-                )
-                .await;
+                let (request, result) =
+                    run_mock_mediator_response(status, &serde_json::json!({"seatbid": []}), floor)
+                        .await;
                 let expected_winner = if floor < 2.0 { Some("higher") } else { None };
                 assert_eq!(
                     result
@@ -4028,7 +4295,7 @@ mod tests {
                         .get("fictional-slot")
                         .and_then(|bid| bid.bid_id.as_deref()),
                     expected_winner,
-                    "should rank provider bids locally with floors after HTTP {status} (split={split})"
+                    "should rank provider bids locally with floors after HTTP {status}"
                 );
                 assert_eq!(
                     result.provider_responses[0].bids.len(),
@@ -4082,68 +4349,79 @@ mod tests {
                         (Some(1.5), Some(0)),
                         (Some(2.0), Some(u8::from(expected_winner.is_some()))),
                     ],
-                    "should mark only the selected provider bid as winning after HTTP {status} (split={split})"
+                    "should mark only the selected provider bid as winning after HTTP {status}"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn mediator_non_success_status_falls_back_to_local_ranking() {
-        assert_mediator_non_success_falls_back(false).await;
-    }
-
-    #[tokio::test]
-    async fn planned_executor_mediator_non_success_status_falls_back_locally() {
-        assert_mediator_non_success_falls_back(true).await;
+    async fn mock_mediator_non_success_status_is_a_processing_failure() {
+        let warnings = crate::test_support::logging::LogCapture::start();
+        run_mock_mediator_response(503, &serde_json::json!({"seatbid": []}), 1.0).await;
+        let warnings = warnings.take_all();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.level == log::Level::Warn
+                    && warning.message.starts_with(
+                        "Mediator 'adserver_mock' response processing failed; using local ranking:"
+                    )
+                    && warning
+                        .message
+                        .contains("AdServer Mock returned non-success HTTP 503")),
+            "should fail mediator response processing on a non-success HTTP status"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.message.contains("reported an error response")),
+            "should not report a non-success HTTP status as an error-status mediation response"
+        );
     }
 
     #[tokio::test]
     async fn mock_mediator_success_and_no_bid_remain_authoritative() {
-        for split in [false, true] {
-            for has_winner in [false, true] {
-                let body = if has_winner {
-                    serde_json::json!({"seatbid": [{"seat": "provider-a", "bid": [{
-                        "id": "mediated", "impid": "fictional-slot", "price": 1.75,
-                        "adm": "<div>mediated</div>", "w": 300, "h": 250
-                    }]}]})
-                } else {
-                    serde_json::json!({"seatbid": []})
-                };
-                let (_, result) = run_mock_mediator_response(split, 200, &body, 1.0).await;
-                assert!(
-                    result.mediator_response.is_some(),
-                    "should preserve a valid mediation result, including no-bid"
-                );
-                assert_eq!(
-                    result
-                        .winning_bids
-                        .get("fictional-slot")
-                        .and_then(|bid| bid.bid_id.as_deref()),
-                    if has_winner { Some("mediated") } else { None },
-                    "should honor the mediator decision instead of the higher local bid"
-                );
-            }
+        for has_winner in [false, true] {
+            let body = if has_winner {
+                serde_json::json!({"seatbid": [{"seat": "provider-a", "bid": [{
+                    "id": "mediated", "impid": "fictional-slot", "price": 1.75,
+                    "adm": "<div>mediated</div>", "w": 300, "h": 250
+                }]}]})
+            } else {
+                serde_json::json!({"seatbid": []})
+            };
+            let (_, result) = run_mock_mediator_response(200, &body, 1.0).await;
+            assert!(
+                result.mediator_response.is_some(),
+                "should preserve a valid mediation result, including no-bid"
+            );
+            assert_eq!(
+                result
+                    .winning_bids
+                    .get("fictional-slot")
+                    .and_then(|bid| bid.bid_id.as_deref()),
+                if has_winner { Some("mediated") } else { None },
+                "should honor the mediator decision instead of the higher local bid"
+            );
         }
     }
 
     #[tokio::test]
     async fn mock_mediator_no_content_is_a_final_no_bid() {
-        for split in [false, true] {
-            let (_, result) = run_raw_mock_mediator_response(split, 204, Vec::new(), 1.0).await;
-            assert_eq!(
-                result
-                    .mediator_response
-                    .as_ref()
-                    .map(|response| response.status.clone()),
-                Some(BidStatus::NoBid),
-                "should record a bodiless HTTP 204 as a mediation no-bid (split={split})"
-            );
-            assert!(
-                result.winning_bids.is_empty(),
-                "should keep the mediator's no-bid instead of ranking provider bids (split={split})"
-            );
-        }
+        let (_, result) = run_raw_mock_mediator_response(204, Vec::new(), 1.0).await;
+        assert_eq!(
+            result
+                .mediator_response
+                .as_ref()
+                .map(|response| response.status.clone()),
+            Some(BidStatus::NoBid),
+            "should record a bodiless HTTP 204 as a mediation no-bid"
+        );
+        assert!(
+            result.winning_bids.is_empty(),
+            "should keep the mediator's no-bid instead of ranking provider bids"
+        );
     }
 
     struct ErrorStatusMediator;
@@ -4180,53 +4458,33 @@ mod tests {
 
     #[tokio::test]
     async fn mediator_error_status_response_falls_back_to_local_ranking() {
-        for split in [false, true] {
-            for floor in [1.0, 3.0] {
-                let (_, result) = run_mediated_provider_auction(
-                    split,
-                    Arc::new(ErrorStatusMediator),
-                    None,
-                    floor,
-                )
-                .await;
-                assert!(
-                    result.mediator_response.is_none(),
-                    "should treat an error-status mediator response as failed mediation (split={split})"
-                );
-                assert_eq!(
-                    result
-                        .winning_bids
-                        .get("fictional-slot")
-                        .and_then(|bid| bid.bid_id.as_deref()),
-                    if floor < 2.0 { Some("higher") } else { None },
-                    "should rank provider bids locally with floors (split={split}, floor={floor})"
-                );
-            }
+        for floor in [1.0, 3.0] {
+            let (_, result) =
+                run_mediated_provider_auction(Arc::new(ErrorStatusMediator), None, floor).await;
+            assert!(
+                result.mediator_response.is_none(),
+                "should treat an error-status mediator response as failed mediation"
+            );
+            assert_eq!(
+                result
+                    .winning_bids
+                    .get("fictional-slot")
+                    .and_then(|bid| bid.bid_id.as_deref()),
+                if floor < 2.0 { Some("higher") } else { None },
+                "should rank provider bids locally with floors (floor={floor})"
+            );
         }
     }
 
     #[tokio::test]
     async fn mediator_error_status_response_logs_local_ranking_fallback() {
-        for (split, expected) in [
-            (
-                false,
-                "Mediator 'error-status-mediator' reported an error response; using local ranking",
-            ),
-            (
-                true,
-                "Mediator 'error-status-mediator' reported an error response; using local ranking",
-            ),
-        ] {
-            let warnings = crate::test_support::logging::WarningCapture::start();
-            run_mediated_provider_auction(split, Arc::new(ErrorStatusMediator), None, 1.0).await;
-            assert!(
-                warnings
-                    .take()
-                    .iter()
-                    .any(|warning| warning.message == expected),
-                "should warn when an error-status mediator response falls back to local ranking (split={split})"
-            );
-        }
+        let warnings = crate::test_support::logging::LogCapture::start();
+        run_mediated_provider_auction(Arc::new(ErrorStatusMediator), None, 1.0).await;
+        assert!(
+            warnings.take_warnings().iter().any(|warning| warning.message
+                == "Mediator 'error-status-mediator' reported an error response; using local ranking"),
+            "should warn when an error-status mediator response falls back to local ranking"
+        );
     }
 
     #[tokio::test]
@@ -4246,7 +4504,7 @@ mod tests {
         );
         http.respond_to(
             Method::POST,
-            CACHE_RESTORING_MEDIATOR,
+            MOCK_MEDIATOR_ENDPOINT,
             ScriptedReply::error(edgezero_core::error::EdgeError::bad_gateway(
                 "fictional mediator transport failure",
             )),
@@ -4257,7 +4515,7 @@ mod tests {
             false,
         ))
         .expect("should compile planned auction");
-        let orchestrator = planned_orchestrator(plan, Some(Arc::new(CacheRestoringMediator)));
+        let orchestrator = planned_orchestrator(plan, Some(mock_mediator()));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -5905,7 +6163,10 @@ mod tests {
 
     #[tokio::test]
     async fn planned_routing_count_survives_standard_and_aps_bounded_body_failures() {
-        for (profile, provider_id) in [("standard", "standard"), ("aps", "aps-instance")] {
+        for (profile, provider_id, cap) in [
+            ("standard", "standard", STANDARD_CAP),
+            ("aps", "aps-instance", RTB_CAP),
+        ] {
             let clock = TestClock::new();
             let http = ScriptedHttpClient::new(&clock);
             let endpoint = if profile == "standard" {
@@ -5913,7 +6174,7 @@ mod tests {
             } else {
                 APS_ENDPOINT
             };
-            respond(&http, endpoint, 200, vec![b'x'; 1024 * 1024 + 1]);
+            respond(&http, endpoint, 200, vec![b'x'; cap + 1]);
             let services = build_services_with_outbound_client(&http, &clock);
             let mut config = if profile == "standard" {
                 planned_config(&[(provider_id, RoutingMode::AllEligible)], false)
@@ -5954,12 +6215,186 @@ mod tests {
             let response = &result.provider_responses[0];
             assert_eq!(response.status, BidStatus::Error, "{profile}");
             assert_eq!(
+                response.metadata["error_type"], ERROR_TYPE_TRANSPORT,
+                "{profile} should fail a body over its cap in the transport"
+            );
+            assert_eq!(
                 response.metadata["routing"]["unused_bidder_params_count"], 1,
                 "{profile} bounded-body failure should retain the input-derived count"
             );
             let routing = serde_json::to_string(&response.metadata["routing"])
                 .expect("should serialize routing metadata");
             assert!(!routing.contains("example-bidder") && !routing.contains("private"));
+        }
+    }
+
+    /// The Standard bidder response cap, as a body length.
+    const STANDARD_CAP: usize = 1024 * 1024;
+
+    /// The Prebid Server and APS bidder response cap, as a body length.
+    const RTB_CAP: usize = 2 * 1024 * 1024;
+
+    /// Endpoint of the [`planned_prebid_config`] provider `pbs`.
+    const PBS_ENDPOINT: &str = "https://pbs.example.test/openrtb";
+
+    /// Runs one planned auction over `config` with `reply` queued for `endpoint`.
+    ///
+    /// Returns the result and the requests the auction sent.
+    async fn run_one_planned_auction(
+        config: AuctionPlanConfig,
+        request: &AuctionRequest,
+        endpoint: &str,
+        reply: ScriptedReply,
+    ) -> (OrchestrationResult, Vec<RecordedRequest>) {
+        let clock = TestClock::new();
+        let http = ScriptedHttpClient::new(&clock);
+        http.respond_to(Method::POST, endpoint, reply);
+        let services = build_services_with_outbound_client(&http, &clock);
+        let plan = AuctionPlan::compile(config).expect("should compile the planned auction");
+        let orchestrator = planned_orchestrator(plan, None);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+        let result = orchestrator
+            .run_auction(request, &context)
+            .await
+            .expect("should complete the planned auction");
+        (result, http.requests())
+    }
+
+    /// One provider of each profile, with the request it routes and its endpoint.
+    fn one_provider_per_profile() -> [(
+        &'static str,
+        AuctionPlanConfig,
+        AuctionRequest,
+        &'static str,
+    ); 3] {
+        [
+            (
+                "standard",
+                planned_config(&[("standard", RoutingMode::AllEligible)], false),
+                planned_request(),
+                PLANNED_ENDPOINT,
+            ),
+            (
+                "prebid-server",
+                planned_prebid_config(&[(
+                    "pbs",
+                    serde_json::json!({}),
+                    NotificationConfig::default(),
+                )]),
+                planned_prebid_request(),
+                PBS_ENDPOINT,
+            ),
+            ("aps", planned_aps_config(), planned_request(), APS_ENDPOINT),
+        ]
+    }
+
+    #[tokio::test]
+    async fn planned_bidder_response_cap_follows_the_profile() {
+        for (profile, config, request, endpoint) in one_provider_per_profile() {
+            let (_, requests) =
+                run_one_planned_auction(config, &request, endpoint, reply(204, Vec::new())).await;
+
+            let [bidder] = requests.as_slice() else {
+                panic!(
+                    "should send one {profile} bidder request, sent {}",
+                    requests.len()
+                );
+            };
+            let expected = if profile == "standard" {
+                STANDARD_CAP
+            } else {
+                RTB_CAP
+            };
+            assert_eq!(
+                bidder.response_mode,
+                ResponseMode::Buffered {
+                    max_bytes: u64::try_from(expected).expect("should fit the cap in u64")
+                },
+                "should buffer the {profile} bidder response under its profile's cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_prebid_reply_between_one_and_two_mib_wins() {
+        let reply_body = serde_json::to_vec(&serde_json::json!({
+            "seatbid": [{"seat": "example-seat", "bid": [{
+                "id": "large-bid",
+                "impid": "fictional-slot",
+                "price": 2.5,
+                "adm": "<div>fictional creative</div>",
+                "w": 300,
+                "h": 250
+            }]}],
+            "ext": {"padding": "x".repeat(STANDARD_CAP / 2 * 3)}
+        }))
+        .expect("should serialize the large PBS reply");
+        assert!(
+            (STANDARD_CAP..RTB_CAP).contains(&reply_body.len()),
+            "should build a reply over the Standard cap and under the RTB cap"
+        );
+
+        let (result, _) = run_one_planned_auction(
+            planned_prebid_config(&[("pbs", serde_json::json!({}), NotificationConfig::default())]),
+            &planned_prebid_request(),
+            PBS_ENDPOINT,
+            reply(200, reply_body),
+        )
+        .await;
+
+        let response = &result.provider_responses[0];
+        assert_eq!(
+            (response.status.clone(), response.metadata.get("error_type")),
+            (BidStatus::Success, None),
+            "should parse a valid PBS reply under the 2 MiB cap"
+        );
+        assert_eq!(
+            result.winning_bids["fictional-slot"].bid_id.as_deref(),
+            Some("large-bid"),
+            "should let the large PBS reply's bid win"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_rtb_bodies_past_the_cap_fail_in_transport() {
+        for (profile, config, request, endpoint) in one_provider_per_profile() {
+            if profile == "standard" {
+                continue;
+            }
+            for (status, length, error_type) in [
+                (200, RTB_CAP + 1, ERROR_TYPE_TRANSPORT),
+                (502, RTB_CAP + 1, ERROR_TYPE_TRANSPORT),
+                (502, RTB_CAP, ERROR_TYPE_HTTP_STATUS),
+            ] {
+                let (result, _) = run_one_planned_auction(
+                    config.clone(),
+                    &request,
+                    endpoint,
+                    reply(status, vec![b'x'; length]),
+                )
+                .await;
+
+                let response = &result.provider_responses[0];
+                assert_eq!(
+                    (response.status.clone(), &response.metadata["error_type"]),
+                    (BidStatus::Error, &serde_json::json!(error_type)),
+                    "should classify a {profile} {status} with a {length}-byte body as {error_type}"
+                );
+                if error_type == ERROR_TYPE_HTTP_STATUS {
+                    assert_eq!(
+                        response.metadata["http_status"], status,
+                        "should keep the {profile} status for an error body at the cap"
+                    );
+                }
+            }
         }
     }
 

@@ -92,21 +92,30 @@ impl Drop for ChildHandle {
     fn drop(&mut self) {
         #[cfg(unix)]
         if self.process_group {
-            // Give Playwright's signal handlers time to close its browsers
-            // before escalating the owned Node and worker process group.
+            // Give the owned group's signal handlers time to exit, such as
+            // Playwright closing its browsers, before escalating the group.
+            let group = self.child.id() as libc::pid_t;
             unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGTERM);
+                libc::killpg(group, libc::SIGTERM);
             }
             let deadline = Instant::now() + Duration::from_secs(3);
+            let mut group_exited = false;
             while Instant::now() < deadline {
-                let group_exists = unsafe { libc::killpg(self.child.id() as libc::pid_t, 0) == 0 };
-                if !group_exists {
+                // An unreaped leader still counts as a group member on Linux,
+                // so reap it before probing. Only ESRCH means the group is gone.
+                let _ = self.child.try_wait();
+                let probe = unsafe { libc::killpg(group, 0) };
+                if probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    group_exited = true;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+            if !group_exited {
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
             }
         }
         let _ = self.child.kill();
@@ -182,8 +191,12 @@ pub(crate) fn with_trace_runtime(
                 .expect("should read baseline Wrangler template");
             let binding = serde_json::to_string(&serde_json::json!({CONFIG_BLOB_KEY:envelope}))
                 .expect("should serialize trace binding");
-            fs::write(fixture.0.join("wrangler.ci.toml"), template)
-                .expect("should write isolated Wrangler template");
+            let config = template.replace(
+                "TRUSTED_SERVER_CONFIG = \"{}\"",
+                &format!("TRUSTED_SERVER_CONFIG = '''{binding}'''"),
+            );
+            fs::write(fixture.0.join("wrangler.toml"), config)
+                .expect("should write isolated Wrangler config");
             temp_env::with_vars(
                 [
                     ("CLOUDFLARE_WRANGLER_DIR", Some(fixture.0.as_os_str())),
@@ -191,10 +204,7 @@ pub(crate) fn with_trace_runtime(
                 ],
                 || {
                     let process = CloudflareWorkers
-                        .spawn_with_config_json_and_readiness(
-                            &binding,
-                            wait_for_trace_fixture_ready,
-                        )
+                        .spawn_with_readiness(wait_for_trace_fixture_ready)
                         .expect("should spawn isolated Cloudflare trace runtime");
                     check(&process.base_url);
                 },
@@ -254,7 +264,8 @@ pub(crate) fn with_trace_runtime(
             fs::write(&manifest, config).expect("should write isolated Spin manifest");
             let port = crate::environments::find_available_port()
                 .expect("should reserve Spin runtime port");
-            let child = Command::new("spin")
+            let mut command = Command::new("spin");
+            command
                 .arg("up")
                 .arg("--from")
                 .arg(&manifest)
@@ -265,14 +276,17 @@ pub(crate) fn with_trace_runtime(
                 .arg("--key-value")
                 .arg(format!("{CONFIG_BLOB_KEY}={envelope}"))
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("should spawn isolated Spin runtime");
+                .stderr(Stdio::inherit());
+            // `spin up` serves through a `spin trigger http` child, so the
+            // runtime owns a process group that the handle stops as a whole.
+            #[cfg(unix)]
+            command.process_group(0);
+            let child = command.spawn().expect("should spawn isolated Spin runtime");
             let process = RuntimeProcess {
                 inner: Box::new(ChildHandle {
                     child,
                     #[cfg(unix)]
-                    process_group: false,
+                    process_group: true,
                 }),
                 base_url: format!("http://127.0.0.1:{port}"),
             };

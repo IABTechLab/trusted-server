@@ -7,6 +7,7 @@ use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+use trusted_server_core::error::{handler_error_response, http_error};
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
 
@@ -81,7 +82,10 @@ impl Middleware for FinalizeResponseMiddleware {
             .filter(|s| !s.is_empty() && *s != "XX")
             .is_some();
 
-        let mut response = next.run(ctx).await?;
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => handler_error_response(error)?,
+        };
         apply_finalize_headers(&self.settings, geo_available, &mut response);
         Ok(response)
     }
@@ -96,7 +100,7 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
+/// - `Err(report)` → internal error; [`http_error`] logs it once and answers 500.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
@@ -115,10 +119,7 @@ impl Middleware for AuthMiddleware {
         match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
-            }
+            Err(report) => return Ok(http_error(&report)),
         }
 
         next.run(ctx).await
@@ -147,6 +148,10 @@ pub(crate) fn apply_finalize_headers(
 
     trusted_server_core::version_header::apply_git_version_header(response);
 
+    // The finalize middleware runs once per request, so each skipped operator
+    // entry warns once.
+    trusted_server_core::response_privacy::warn_skipped_operator_response_headers(settings);
+
     // Cloudflare is a real shared cache: cookie-bearing responses must stay
     // private and operator headers must not re-enable caching for uncacheable
     // per-user payloads.
@@ -168,12 +173,13 @@ mod tests {
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{Method, request_builder, response_builder};
+    use edgezero_core::http::{Method, StatusCode, request_builder, response_builder};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::LogCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -219,6 +225,29 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         s
+    }
+
+    #[test]
+    fn warns_once_about_a_skipped_operator_entry() {
+        let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
+        let mut response = empty_response();
+        let capture = LogCapture::start();
+
+        apply_finalize_headers(&settings, false, &mut response);
+
+        let skipped = capture
+            .take_warnings()
+            .into_iter()
+            .filter(|warning| warning.message.contains("`connection`"))
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "should warn once about the skipped operator entry"
+        );
+        assert!(
+            !response.headers().contains_key("connection"),
+            "should skip the operator entry"
+        );
     }
 
     #[test]
@@ -323,6 +352,83 @@ mod tests {
     }
 
     #[test]
+    fn auth_handle_logs_a_configuration_error_once() {
+        let mut settings = settings_with_response_headers(vec![]);
+        settings.handlers.clear();
+        let middleware = AuthMiddleware::new(Arc::new(settings));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/_ts/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build an admin request");
+        let ctx = RequestContext::new(request, PathParams::new(HashMap::new()));
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(ctx, Next::new(&[], &*handler)))
+            .expect("should answer the configuration error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer an admin path no handler covers with 500"
+        );
+        let levels: Vec<log::Level> = capture
+            .take_all()
+            .iter()
+            .map(|record| record.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error],
+            "should log the configuration error once, at error"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_adds_version_header_to_a_handler_error() {
+        let version = trusted_server_core::constants::TS_GIT_VERSION
+            .expect("should compile a git version into the test build");
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings_with_response_headers(vec![])));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Err::<Response, EdgeError>(EdgeError::internal(std::io::Error::other(
+                "example handler failure",
+            )))
+        });
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should render the handler error as a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer the handler error with its status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(version),
+            "should add x-ts-version to the handler error response"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && !record.message.contains("example handler failure")
+            ),
+            "should log the handler error once, without its message"
+        );
+    }
+
+    #[test]
     fn emits_git_version_header() {
         let mut response = empty_response();
         apply_finalize_headers(
@@ -335,7 +441,10 @@ mod tests {
                 .headers()
                 .get("x-ts-version")
                 .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version as x-ts-version"
         );
     }

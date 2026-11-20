@@ -31,7 +31,7 @@ docker build \
   -t ts-native:aws .
 ```
 
-`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a provider does not select it. Validated runtime configuration selects EC storage, and a separate boot profile selects protected CloudFront Geo. Credentials and provider configuration belong in the runtime environment, not the image. The local-provider smoke test does not validate AWS access.
+`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a connector does not select it. For EC, set `TS_EC_RECORDS_ENABLED=true` at boot to declare the layout before preparation, select the connector in `EDGEZERO__STORE_BINDINGS_FILE`, and reference logical `trusted_server_kv` with `ec.storage.provider="records"` in published application configuration. A separate boot profile selects protected CloudFront Geo. Credentials and provider settings are runtime inputs, never image build arguments. See [Native EC persistence](./native-ec-persistence.md). The local-provider smoke below does not validate AWS access.
 
 ## Local smoke test
 
@@ -44,3 +44,17 @@ node scripts/test-native-container.mjs ts-native:local
 The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks startup rejection for invalid configuration and missing secrets, the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
 
 The `Native container` workflow builds the local-provider image and runs this test on relevant pull requests or manual dispatch. It does not publish an image or deploy a service.
+
+## Local record persistence proof
+
+Build with `NATIVE_FEATURES=aws-dynamodb-ec,geo-cloudfront`, then run against a disposable DynamoDB Local endpoint:
+
+```sh
+node scripts/test-native-ec-image.mjs \
+  --image ts-native:records \
+  --dynamodb http://127.0.0.1:8000
+```
+
+The same fixture accepts `--binary /absolute/path/trusted-server-axum` instead of an image. It supplies a prepared record binding, dummy AWS credentials, synthetic Geo/consent and an isolated table. It observes the SDK's native keys instead of reconstructing partition encoding. Checks cover acknowledgement-before-cookie, restart, withdrawal, a present past-TTL row racing a delayed CAS, denied and lost acknowledgements, and draining while storage waits. TTL eligibility is not a physical-deletion deadline.
+
+The fixture never builds/pulls or publishes an image, contacts hosted AWS, or runs a deployment wrapper. Binary-mode proof does not qualify the container build; image-mode proof does not qualify hosted IAM, release security, capacity or real browser consent transport.

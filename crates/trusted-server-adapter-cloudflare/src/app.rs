@@ -21,13 +21,12 @@ use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
-use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::edge_app::install_edge_policies;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError, startup_error};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
@@ -38,8 +37,8 @@ use trusted_server_core::proxy::{
 };
 use trusted_server_core::publisher::{
     AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
-    PublisherResponse, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_owner_error,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -79,6 +78,8 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built with the app. This adapter has no EC record store.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -211,14 +212,19 @@ fn build_state_with_services(
     settings
         .ec
         .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Cloudflare)?;
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -296,7 +302,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Publisher response helper
+// Publisher origin input cap
 // ---------------------------------------------------------------------------
 
 /// Largest publisher origin body the Cloudflare adapter collects before egress.
@@ -304,63 +310,6 @@ where
 /// It keeps the 10 MiB limit the adapter's own client applied before the
 /// publisher origin moved to `EdgeZero`'s client.
 const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 10 * 1024 * 1024;
-
-/// Returns the origin input cap: the smaller of the publisher buffer setting
-/// and [`PUBLISHER_ORIGIN_INPUT_BYTES`].
-fn publisher_input_cap(settings: &Settings) -> u64 {
-    u64::try_from(settings.publisher.max_buffered_body_bytes)
-        .unwrap_or(u64::MAX)
-        .min(PUBLISHER_ORIGIN_INPUT_BYTES)
-}
-
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
-///
-/// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction, collects raw origin bodies under
-/// `input_cap`, and enforces `settings.publisher.max_buffered_body_bytes` on
-/// processed output, then removes any `Transfer-Encoding` header since the
-/// buffered body is no longer chunked.
-async fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-    input_cap: u64,
-) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response_async(
-        publisher_response,
-        method,
-        settings,
-        registry,
-        orchestrator,
-        services,
-        Some(input_cap),
-    )
-    .await?;
-    response.headers_mut().remove(header::TRANSFER_ENCODING);
-    Ok(response)
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
 
 fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
@@ -388,10 +337,6 @@ fn cache_purge_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
-}
-
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -439,7 +384,7 @@ pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
-        install_edge_policies(app)
+        install_edge_policies(app, synthesized_response_headers())
     }
 
     fn name() -> &'static str {
@@ -578,16 +523,12 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        allow_generation: true,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -605,7 +546,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
-                let input_cap = publisher_input_cap(&state.settings);
+                let input_cap = publisher_input_cap(&state.settings, PUBLISHER_ORIGIN_INPUT_BYTES);
                 match handle_publisher_request(
                     &state.settings,
                     &services,
@@ -626,14 +567,14 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 )
                 .await
                 {
-                    Ok((pr, owner)) => resolve_publisher_response(
+                    Ok((pr, owner)) => buffer_publisher_response_async(
                         pr,
                         &method,
                         &state.settings,
                         &state.registry,
                         &state.orchestrator,
                         &services,
-                        input_cap,
+                        Some(input_cap),
                     )
                     .await
                     .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
@@ -664,7 +605,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups; without a record store, admin EC lookup answers 501.
+        router = state.identity.mount(router);
+        router = router
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -693,26 +638,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
-            .get(
-                "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
-                }),
-            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -813,6 +738,21 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             );
         }
 
+        // Partner APIs are answered locally on every method so a partner's
+        // Bearer token and mapping body never reach the publisher origin. This
+        // adapter has no EC record store, so identify and batch sync answer 501
+        // and any other method answers 405.
+        let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            answer_identify_locally(&s.settings, &req)
+        });
+        let batch_sync = make_handler(Arc::clone(&state), |_s, _services, req| async move {
+            Ok(answer_batch_sync_locally(&req))
+        });
+        for method in publisher_fallback_methods() {
+            router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());
+            router = router.route("/_ts/api/v1/batch-sync", method, batch_sync.clone());
+        }
+
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(legacy_admin_alias_denied())
@@ -874,8 +814,7 @@ mod tests {
     fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
         for storage in [
             serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
-            serde_json::json!({"provider":"dynamodb","region":"us-east-1","table":"example-identity","namespace":"fixture"}),
-            serde_json::json!({"provider":"celld","endpoint":"http://127.0.0.1:7780","store":"identity","access":{"mode":"trusted-network"}}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
         ] {
             let mut settings = Settings::default();
             settings.ec.storage =
@@ -886,13 +825,27 @@ mod tests {
             assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
         }
         let mut settings = Settings::default();
-        settings.ec.ec_store = Some("legacy-inactive-binding".to_owned());
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
         assert!(
-            settings
-                .ec
-                .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Cloudflare)
-                .expect("should accept inactive legacy field")
-                .is_none()
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
+    }
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = aps_profile_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Cloudflare"),
+            "should name the provider and the adapter: {message}"
         );
     }
 
@@ -959,52 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = Settings::from_toml(
-            r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
-                [publisher]
-                domain = "publisher.example"
-                cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
-                proxy_secret = "fictional-proxy-secret"
-
-                [ec]
-                passphrase = "fictional-secret-key-32-bytes-minimum"
-            "#,
-        )
-        .expect("should parse startup test settings");
-        settings.auction.enabled = false;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
-                    (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            allow_insecure_http: false,
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect();
-
-        build_state_with_settings(settings)
-            .expect("disabled Cloudflare auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn cloudflare_and_spin_load_multi_provider_plan() {
+    fn startup_loads_multi_provider_plan() {
         let mut settings = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -1050,7 +958,7 @@ mod tests {
         assert_eq!(
             state.orchestrator.provider_count(),
             2,
-            "should fan out to both configured providers"
+            "should register both configured providers"
         );
     }
 

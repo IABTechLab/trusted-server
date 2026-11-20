@@ -1,15 +1,17 @@
 //! Native lifecycle regressions with isolated conditional storage and origins.
 
-use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, Response, header};
+use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::record_store::RecordLayout;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use serde_json::json;
@@ -18,6 +20,7 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::ec::kv_backend::{
     EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
+use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
@@ -32,7 +35,7 @@ mod celld_fixture;
 
 #[cfg(feature = "celld-ec")]
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires CELLD_EC_TEST_BINARY pointing to the built real conditional-record server"]
+#[ignore = "requires official CELLD_EC_TEST_BINARY and matching EDGEZERO_CELLD_STORE_SERVICE"]
 async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallback() {
     let mut celld = celld_fixture::CelldFixture::new();
     let store = celld.store().await;
@@ -63,7 +66,7 @@ async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallba
         .await
         .expect("should read updated record")
         .expect("should retain updated identity");
-    assert!(updated.generation > original.generation);
+    assert_ne!(updated.generation, original.generation);
     let data: serde_json::Value =
         serde_json::from_slice(&updated.body).expect("should decode unchanged graph schema");
     assert_eq!(
@@ -130,6 +133,7 @@ async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallba
         ec_cookie(&call(&app, request(Method::GET, "/article", Some(&cookie))).await).is_none(),
         "should not resurrect withdrawal"
     );
+    trusted_server_core::test_support::record_ec::assert_record_ec_lifecycle(&store).await;
     celld.stop();
     let failed = call(&app, request(Method::GET, "/article", None)).await;
     assert!(
@@ -140,36 +144,68 @@ async fn real_celld_persists_routes_withdrawal_restart_and_outage_without_fallba
         store.key_exists(&ec).await.is_err(),
         "should not turn outage into false absence"
     );
-    trusted_server_adapter_axum::celld_ec::CelldEcKv::prepare(&celld.settings(), None)
+    celld
+        .record_handle()
         .await
         .expect_err("should fail selected-provider preparation without fallback");
 }
 
-#[derive(Clone, Default)]
+// Fault controls remain at the test request boundary. All stored rows and
+// conditional writes now use the shared adapter over real persistent records.
+#[derive(Clone)]
+
 struct Store {
-    rows: Arc<Mutex<BTreeMap<String, EcKvLookup>>>,
-    generation: Arc<AtomicU64>,
+    inner: RecordEcKvStore,
+    handle: KvHandle,
     fail_writes: Arc<AtomicBool>,
     pause_writes: Arc<AtomicBool>,
     started: Arc<Notify>,
     resume: Arc<Notify>,
+    _directory: Arc<tempfile::TempDir>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        let directory = Arc::new(tempfile::tempdir().expect("should create record fixture"));
+        let layout = RecordLayout::new(EcRecordLayout).expect("should declare EC layout");
+        let provider = PersistentKvStore::new_records(directory.path().join("ec.redb"), layout)
+            .expect("should open persistent EC records");
+        let handle = KvHandle::new(Arc::new(provider));
+        let inner = RecordEcKvStore::new("native-ec-fixture".to_owned(), &handle)
+            .expect("should acquire shared EC record adapter");
+        Self {
+            inner,
+            handle,
+            fail_writes: Arc::default(),
+            pause_writes: Arc::default(),
+            started: Arc::default(),
+            resume: Arc::default(),
+            _directory: directory,
+        }
+    }
+}
+
+impl Store {
+    async fn is_empty(&self) -> bool {
+        self.handle
+            .list_keys_page("", None, 1)
+            .await
+            .expect("should inspect persistent fixture rows")
+            .keys
+            .is_empty()
+    }
 }
 
 #[async_trait(?Send)]
 impl EcKvStore for Store {
     fn store_name(&self) -> &str {
-        "native-ec-fixture"
+        self.inner.store_name()
     }
     async fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-        Ok(self
-            .rows
-            .lock()
-            .expect("should lock fixture rows")
-            .get(key)
-            .cloned())
+        self.inner.lookup(key).await
     }
     async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-        Ok(self.lookup(key).await?.is_some())
+        self.inner.key_exists(key).await
     }
     async fn insert(
         &self,
@@ -186,49 +222,17 @@ impl EcKvStore for Store {
                 message: "isolated uncertain write".to_owned(),
             }));
         }
-        let mut rows = self.rows.lock().expect("should lock fixture rows");
-        match write.mode {
-            EcKvWriteMode::Add if rows.contains_key(key) => {
-                return Ok(EcKvWriteOutcome::PreconditionFailed);
-            }
-            EcKvWriteMode::IfGenerationMatch(expected)
-                if rows.get(key).map(|row| row.generation) != Some(expected) =>
-            {
-                return Ok(EcKvWriteOutcome::PreconditionFailed);
-            }
-            _ => {}
-        }
-        rows.insert(
-            key.to_owned(),
-            EcKvLookup {
-                body: write.body.as_bytes().to_vec(),
-                metadata: Some(write.metadata.as_bytes().to_vec()),
-                generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
-            },
-        );
-        Ok(EcKvWriteOutcome::Written)
+        self.inner.insert(key, write).await
     }
     async fn list_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
     ) -> Result<Vec<String>, Report<TrustedServerError>> {
-        Ok(self
-            .rows
-            .lock()
-            .expect("should lock fixture rows")
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .take(limit as usize)
-            .cloned()
-            .collect())
+        self.inner.list_keys_with_prefix(prefix, limit).await
     }
     async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-        self.rows
-            .lock()
-            .expect("should lock fixture rows")
-            .remove(key);
-        Ok(())
+        self.inner.delete(key).await
     }
 }
 
@@ -236,25 +240,25 @@ struct UnusedStores;
 #[async_trait(?Send)]
 impl PlatformConfigStore for UnusedStores {
     fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
     async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
     async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::ConfigStore))
     }
 }
 #[async_trait(?Send)]
 impl PlatformSecretStore for UnusedStores {
     fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
     async fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
     async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::Unsupported))
+        Err(Report::new(PlatformError::SecretStore))
     }
 }
 struct Geo(Option<GeoInfo>);
@@ -310,6 +314,7 @@ fn request(method: Method, path: &str, cookie: Option<&str>) -> Request {
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
         )
         .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate")
         .header(header::ACCEPT, "text/html");
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
@@ -525,11 +530,8 @@ async fn missing_consent_unknown_geo_storage_failure_and_non_navigation_do_not_m
     );
     assert!(ec_cookie(&identified).is_none());
     assert!(
-        store
-            .rows
-            .lock()
-            .expect("should read fixture rows")
-            .is_empty()
+        store.is_empty().await,
+        "should retain no persistent identity rows"
     );
     store.fail_writes.store(true, Ordering::SeqCst);
     assert!(
@@ -589,11 +591,8 @@ async fn delayed_storage_yields_to_health_and_cancels_without_cookie() {
     assert_eq!(health.status(), 200);
     assert!(ec_cookie(&health).is_none());
     assert!(
-        store
-            .rows
-            .lock()
-            .expect("should inspect paused rows")
-            .is_empty()
+        store.is_empty().await,
+        "should retain no persistent identity rows"
     );
     // Dropping the pending request models cancellation before acknowledgement.
     // No synchronous executor/worker must be joined before this runtime exits.
@@ -624,11 +623,8 @@ async fn orphan_recovery_rotates_only_after_an_eligible_publisher_start() {
         "read-only identify must not recover an orphan"
     );
     assert!(
-        store
-            .rows
-            .lock()
-            .expect("should read fixture rows")
-            .is_empty()
+        store.is_empty().await,
+        "should retain no persistent identity rows"
     );
     let recovered = call(&app, request(Method::GET, "/article", Some(&cookie))).await;
     let replacement =
@@ -645,5 +641,125 @@ async fn orphan_recovery_rotates_only_after_an_eligible_publisher_start() {
             .key_exists(&original)
             .await
             .expect("should leave orphan absent")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_record_backend_preserves_bytes_metadata_and_stale_tokens() {
+    let store = Store::default();
+    let key = "hash.ABC123";
+    let write = EcKvWrite {
+        body: "original",
+        metadata: "{\"kind\":\"ec\"}",
+        ttl: Duration::from_secs(60),
+        mode: EcKvWriteMode::Add,
+    };
+    assert_eq!(
+        store
+            .insert(key, write)
+            .await
+            .expect("should insert record"),
+        EcKvWriteOutcome::Written
+    );
+    let original = store
+        .lookup(key)
+        .await
+        .expect("should read record")
+        .expect("should retain record");
+    assert_eq!(
+        original.metadata.as_deref(),
+        Some(write.metadata.as_bytes())
+    );
+    store
+        .handle
+        .put_bytes(key, vec![0_u8, 255_u8].into())
+        .await
+        .expect("should replace same value through ordinary KV");
+    let ordinary = store
+        .lookup(key)
+        .await
+        .expect("should read ordinary replacement")
+        .expect("should retain ordinary replacement");
+    assert_eq!(ordinary.body, vec![0_u8, 255_u8]);
+    assert!(
+        ordinary.metadata.is_none(),
+        "should clear metadata on ordinary replacement"
+    );
+    assert_ne!(ordinary.generation, original.generation);
+    let stale = EcKvWrite {
+        mode: EcKvWriteMode::IfGenerationMatch(original.generation),
+        ..write
+    };
+    assert_eq!(
+        store
+            .insert(key, stale)
+            .await
+            .expect("should reject stale replacement"),
+        EcKvWriteOutcome::PreconditionFailed
+    );
+    store.delete(key).await.expect("should delete same value");
+    assert!(
+        !store
+            .key_exists(key)
+            .await
+            .expect("should prove exact absence")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_record_backend_collects_native_pages_without_changing_capped_semantics() {
+    let store = Store::default();
+    for index in 0_u32..1001_u32 {
+        store
+            .handle
+            .put_bytes(&format!("hash.{index:06}"), vec![1_u8].into())
+            .await
+            .expect("should seed paged records");
+    }
+    let complete = store
+        .list_keys_with_prefix("hash.", 2000)
+        .await
+        .expect("should traverse multiple native pages");
+    assert_eq!(
+        complete.len(),
+        1001,
+        "should not treat the first native page as complete"
+    );
+    let capped = store
+        .list_keys_with_prefix("hash.", 100)
+        .await
+        .expect("should retain graph's bounded count contract");
+    assert_eq!(capped.len(), 100);
+    assert!(
+        store.list_keys_with_prefix("hash", 100).await.is_err(),
+        "should reject partial partitions"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn graph_cluster_count_uses_a_complete_record_partition() {
+    let store = Store::default();
+    let hash = "a".repeat(64);
+    for suffix in ["Ab1234", "Cd5678"] {
+        store
+            .handle
+            .put_bytes(&format!("{hash}.{suffix}"), vec![1_u8].into())
+            .await
+            .expect("should seed root in one IP group");
+    }
+    let marker = format!("__ts_ec_withdrawal_complete__:{hash}.Ab1234:123");
+    store
+        .handle
+        .put_bytes(&marker, vec![1_u8].into())
+        .await
+        .expect("should seed separate marker group");
+    let graph = trusted_server_core::ec::kv::KvIdentityGraph::new(store);
+    assert_eq!(
+        graph
+            .count_hash_prefix_keys(&hash)
+            .await
+            .expect("should query the complete IP partition"),
+        2,
+        "should exclude completion markers"
     );
 }

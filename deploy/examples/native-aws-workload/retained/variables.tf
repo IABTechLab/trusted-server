@@ -18,8 +18,12 @@ variable "table_name" {
 }
 
 variable "namespace" {
-  description = "Exclusive app/environment identity namespace. Reserve its ec: and ec-allocator: partitions together."
+  description = "Exclusive fresh app/environment record namespace. Retain its per-key allocators with the values."
   type        = string
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]+$", var.namespace))
+    error_message = "Use an ASCII namespace containing only letters, digits, underscores, periods or hyphens so the IAM partition pattern stays literal."
+  }
 }
 
 variable "owner" {

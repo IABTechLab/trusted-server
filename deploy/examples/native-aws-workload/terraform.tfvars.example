@@ -20,7 +20,7 @@ agent_image                 = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbb
 config_envelope_file        = "example-envelope.json"
 # Copy the ec_storage output from the separately initialized retained/ root.
 ec_storage = {
-  provider  = "dynamodb"
+  provider  = "aws-dynamodb-records"
   region    = "eu-west-2"
   table     = "example-retained-ec"
   namespace = "example-staging"

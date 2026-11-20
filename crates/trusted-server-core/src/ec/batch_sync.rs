@@ -34,6 +34,8 @@ const REASON_INVALID_EC_ID: &str = "invalid_ec_id";
 const REASON_INVALID_PARTNER_UID: &str = "invalid_partner_uid";
 const REASON_INELIGIBLE: &str = "ineligible";
 const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
+const REASON_PROVIDER_OWNED: &str = "provider_owned";
+const REASON_ROW_FULL: &str = "row_full";
 
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
@@ -129,6 +131,53 @@ pub async fn handle_batch_sync(
     handle_batch_sync_with_writer(kv, registry, rate_limiter, req).await
 }
 
+/// Builds the local `501 Not Implemented` response for
+/// `POST /_ts/api/v1/batch-sync` on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request, with its Bearer token
+/// and mapping body, to the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn batch_sync_not_supported() -> Response<EdgeBody> {
+    error_response(StatusCode::NOT_IMPLEMENTED, "ec_store_not_configured")
+}
+
+/// Builds the local `405 Method Not Allowed` response for a method other than
+/// `POST` on `/_ts/api/v1/batch-sync`.
+///
+/// Adapters claim every method on the batch-sync path and answer the others
+/// with this response, so no request on the path reaches the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn batch_sync_method_not_allowed() -> Response<EdgeBody> {
+    let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    response
+        .headers_mut()
+        .insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
+    response
+}
+
+/// Answers a batch-sync request locally, without the EC record store.
+///
+/// `POST` returns [`batch_sync_not_supported`]; every other method returns
+/// [`batch_sync_method_not_allowed`].
+#[must_use]
+pub fn answer_batch_sync_locally(req: &Request<EdgeBody>) -> Response<EdgeBody> {
+    if req.method() == http::Method::POST {
+        batch_sync_not_supported()
+    } else {
+        batch_sync_method_not_allowed()
+    }
+}
+
 async fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
@@ -159,6 +208,7 @@ async fn handle_batch_sync_with_writer(
                 TrustedServerError::RequestTooLarge { .. }
             ) =>
         {
+            log::warn!("Rejecting batch sync request: {report:?}");
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body_too_large",
@@ -177,7 +227,13 @@ async fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings).await;
+    let (accepted, errors) = process_mappings_for_partner(
+        writer,
+        &partner.source_domain,
+        registry.is_provider_owned(&partner.source_domain),
+        &body.mappings,
+    )
+    .await;
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -193,6 +249,30 @@ async fn handle_batch_sync_with_writer(
     };
 
     json_response(status, &response_body)
+}
+
+/// Processes mappings for one partner, rejecting all of them when an enabled
+/// identity provider owns the partner's source (spec §8.5).
+async fn process_mappings_for_partner(
+    writer: &dyn BatchSyncWriter,
+    partner_id: &str,
+    provider_owned: bool,
+    mappings: &[SyncMapping],
+) -> (usize, Vec<MappingError>) {
+    if !provider_owned {
+        return process_mappings(writer, partner_id, mappings).await;
+    }
+    log::info!(
+        "Batch sync: rejecting {} mappings for provider-owned source '{partner_id}'",
+        mappings.len()
+    );
+    let errors = (0..mappings.len())
+        .map(|index| MappingError {
+            index,
+            reason: REASON_PROVIDER_OWNED,
+        })
+        .collect();
+    (0, errors)
 }
 
 /// Validates all mappings, then processes each normalized EC ID once.
@@ -252,6 +332,12 @@ async fn process_mappings(
         {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += group.indexes.len();
+            }
+            Ok(UpsertResult::RowFull) => {
+                errors.extend(group.indexes.iter().map(|&index| MappingError {
+                    index,
+                    reason: REASON_ROW_FULL,
+                }));
             }
             Ok(UpsertResult::NotFound | UpsertResult::ConsentWithdrawn) => {
                 errors.extend(group.indexes.iter().map(|&index| MappingError {
@@ -317,6 +403,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::body_read::{body_read_failure_cases, streamed_over};
+    use crate::test_support::logging::LogCapture;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -325,6 +412,58 @@ mod tests {
         let valid = format!("{}.ABC123", "a".repeat(64));
         assert!(is_valid_ec_id(&valid));
         assert!(!is_valid_ec_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn batch_sync_not_supported_returns_501() {
+        let response = batch_sync_not_supported();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
+        );
+    }
+
+    fn local_batch_sync_request(method: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method(method)
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer fictional-partner-token-0123456789")
+            .body(EdgeBody::from(r#"{"mappings":[]}"#))
+            .expect("should build local batch-sync request")
+    }
+
+    #[test]
+    fn answer_batch_sync_locally_dispatches_by_method() {
+        let post = answer_batch_sync_locally(&local_batch_sync_request("POST"));
+
+        assert_eq!(
+            post.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "POST should answer 501 without a record store"
+        );
+        for method in ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let response = answer_batch_sync_locally(&local_batch_sync_request(method));
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} batch sync should answer 405"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method} batch sync should advertise POST"
+            );
+        }
     }
 
     struct MockRateLimiter {
@@ -408,6 +547,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -444,8 +584,8 @@ mod tests {
         PartnerRegistry::from_config(&partners).expect("should build registry")
     }
 
-    #[test]
-    fn handle_batch_sync_rejects_oversized_content_length_before_body_parse() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_oversized_content_length_before_body_parse() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -459,10 +599,9 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
-            &writer, &registry, &limiter, req,
-        ))
-        .expect("should return oversized response");
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+            .await
+            .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -487,10 +626,9 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
-            &writer, &registry, &limiter, req,
-        ))
-        .expect("should return oversized response");
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+            .await
+            .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -518,6 +656,7 @@ mod tests {
             let writer = MockWriter::new(vec![]);
             let (req, expectation) = case.into_request(authorized_batch_builder());
 
+            let capture = LogCapture::start();
             let outcome = futures::executor::block_on(handle_batch_sync_with_writer(
                 &writer, &registry, &limiter, req,
             ));
@@ -529,6 +668,17 @@ mod tests {
                 expectation.name()
             );
             if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                let levels: Vec<log::Level> = capture
+                    .take_all()
+                    .iter()
+                    .map(|record| record.level)
+                    .collect();
+                assert_eq!(
+                    levels,
+                    [log::Level::Warn],
+                    "should log the {} case once, at warn",
+                    expectation.name()
+                );
                 let response = outcome.expect("should answer an overflow with a response");
                 assert_eq!(
                     response_json(response),
@@ -592,6 +742,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn provider_owned_source_rejects_every_mapping() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written), Ok(UpsertResult::Written)]);
+        let mappings = vec![
+            mapping(&format!("{}.ABC123", "a".repeat(64)), "u1", 1),
+            mapping(&format!("{}.ABC123", "b".repeat(64)), "u2", 1),
+        ];
+
+        let (accepted, errors) =
+            process_mappings_for_partner(&writer, "ids.example.com", true, &mappings).await;
+
+        assert_eq!(accepted, 0, "should accept nothing");
+        assert_eq!(errors.len(), 2, "should reject each mapping");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.reason == REASON_PROVIDER_OWNED),
+            "should report provider_owned"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_mappings_reports_a_full_row_and_continues() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::RowFull), Ok(UpsertResult::Written)]);
+
+        let mappings = vec![
+            mapping(&format!("{}.ABC123", "a".repeat(64)), "u1", 1),
+            mapping(&format!("{}.ABC123", "b".repeat(64)), "u2", 1),
+        ];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings).await;
+
+        assert_eq!(accepted, 1, "should accept the mapping after the full row");
+        assert_eq!(errors.len(), 1, "should report only the full row");
+        assert_eq!(errors[0].index, 0, "should report the full row's index");
+        assert_eq!(
+            errors[0].reason, REASON_ROW_FULL,
+            "should give a full row its own reason"
+        );
+        assert_eq!(writer.calls().len(), 2, "should continue past a full row");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn process_mappings_aborts_on_kv_unavailable() {
         let writer = MockWriter::new(vec![
             Ok(UpsertResult::Written),
@@ -639,9 +831,9 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
 
-        let response =
-            futures::executor::block_on(handle_batch_sync(&kv, &registry, &limiter, req))
-                .expect("should return response");
+        let response = handle_batch_sync(&kv, &registry, &limiter, req)
+            .await
+            .expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -962,6 +1154,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_accepts_mappings_for_a_pull_sync_owned_source() {
+        // Arrange: pull sync runs for the source, but no configured provider owns it.
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let body =
+            format!(r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}}]}}"#);
+
+        // Act
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .await
+        .expect("should return success response");
+
+        // Assert
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should accept batch mappings for a pull-sync partner"
+        );
+        assert_eq!(
+            response_json(response)["accepted"],
+            1,
+            "should accept the mapping"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_batch_sync_rejects_mappings_for_a_configured_provider_source() {
+        let mut registry = test_registry();
+        assert!(
+            registry.mark_provider_owned("ssp.example.com", None),
+            "should mark the configured provider source"
+        );
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let body =
+            format!(r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}}]}}"#);
+
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request(&body),
+        )
+        .await
+        .expect("should return response");
+
+        let json = response_json(response);
+        assert_eq!(json["accepted"], 0, "should accept nothing");
+        assert_eq!(
+            json["errors"][0]["reason"], REASON_PROVIDER_OWNED,
+            "should report provider_owned"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn handle_batch_sync_accepts_every_member_of_a_written_group() {
         let registry = test_registry();
         let limiter = MockRateLimiter {
@@ -973,12 +1232,13 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+        let response = handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        ))
+        )
+        .await
         .expect("should return success response");
 
         assert_eq!(
@@ -1003,12 +1263,13 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+        let response = handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        ))
+        )
+        .await
         .expect("should return multi-status response");
 
         assert_eq!(
@@ -1041,12 +1302,13 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"invalid","partner_uid":"one","timestamp":1}},{{"ec_id":"{valid_ec_id}","partner_uid":"","timestamp":2}}]}}"#
         );
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+        let response = handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        ))
+        )
+        .await
         .expect("should return validation response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);
@@ -1086,12 +1348,13 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"a-first","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"b","timestamp":2}},{{"ec_id":"{ec_id_a}","partner_uid":"a-last","timestamp":3}},{{"ec_id":"{ec_id_c}","partner_uid":"c","timestamp":4}}]}}"#
         );
 
-        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+        let response = handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        ))
+        )
+        .await
         .expect("should return infrastructure failure response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);

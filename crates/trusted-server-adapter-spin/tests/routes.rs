@@ -1,19 +1,22 @@
-//! Smoke tests for the Spin adapter route wiring.
+//! Route tests for the Spin adapter.
 //!
-//! Runs on the host target (no Spin runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! Spin runtime bindings or outbound network calls. Tests with business logic
-//! that depends on external stores assert routing only; deterministic auth and
-//! method gates assert exact status codes.
+//! Runs on the host target (no Spin runtime), so Spin runtime bindings are not
+//! exercised. Every outbound call goes through a scripted client, so nothing
+//! reaches the network. Tests with business logic that depends on external
+//! stores assert routing only; deterministic auth and method gates assert exact
+//! status codes.
 
 // Test crates may buffer bodies with `Body::into_bytes`.
 #![allow(clippy::disallowed_methods)]
 
 use edgezero_adapter_spin::SPIN_PLATFORM;
-use edgezero_core::app::{App, Hooks as _};
+use edgezero_core::app::App;
 use edgezero_core::body::Body;
-use edgezero_core::http::{Method, Request, Response, StatusCode, header, request_builder};
+use edgezero_core::http::{
+    HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+};
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
@@ -21,9 +24,10 @@ use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::insert_outbound_client;
-use trusted_server_core::test_support::logging::WarningCapture;
+use trusted_server_core::test_support::logging::LogCapture;
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
-    ScriptedHttpClient, ScriptedReply, TestClock,
+    RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
 };
 
 /// Build the full application router from explicit test settings.
@@ -71,13 +75,6 @@ async fn route(router: RouterService, mut req: Request) -> Response {
     router.oneshot(req).await.expect("should route request")
 }
 
-#[test]
-fn routes_build_without_panic() {
-    // Host targets have no production config store, so `routes()` returns
-    // the startup error instead of panicking.
-    let _router = TrustedServerApp::routes();
-}
-
 // ---------------------------------------------------------------------------
 // Synthesized headers on EdgeZero's canonical responses
 // ---------------------------------------------------------------------------
@@ -119,6 +116,16 @@ async fn dispatch_through_app(method: Method, target: &str) -> Response {
     prepared.into_response()
 }
 
+/// Returns the git version compiled into this build.
+///
+/// # Panics
+///
+/// Panics when the build has none, so a version assertion cannot pass on an
+/// absent header.
+fn compiled_git_version() -> &'static str {
+    TS_GIT_VERSION.expect("should compile a git version into the test build")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_not_found_carries_x_ts_version() {
     // The publisher fallback claims every origin-form path, so only an
@@ -135,8 +142,31 @@ async fn canonical_not_found_carries_x_ts_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|value| value.to_str().ok()),
-        TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 404"
+    );
+}
+
+/// A handler `Err` still passes through the finalize middleware.
+///
+/// `dispatch_ingress` installs no outbound client, so the auction handler
+/// fails before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_error_carries_x_ts_version() {
+    let response = dispatch_through_app(Method::POST, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should answer the failed Spin handler with 500"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the handler error response"
     );
 }
 
@@ -162,7 +192,7 @@ async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
             .headers()
             .get("x-ts-version")
             .and_then(|value| value.to_str().ok()),
-        TS_GIT_VERSION,
+        Some(compiled_git_version()),
         "should add the compiled-in git version to the canonical 405"
     );
 }
@@ -1189,63 +1219,44 @@ fn publisher_get(path: &str) -> Request {
         .expect("should build publisher request")
 }
 
-/// An identity HTML document exactly `len` bytes long.
-fn html_document(len: usize) -> Vec<u8> {
-    let mut document = b"<html><body>".to_vec();
-    document.resize(len - b"</body></html>".len(), b'a');
-    document.extend_from_slice(b"</body></html>");
-    document
+/// Sends a publisher GET for `path` that accepts gzip through `router`, with
+/// `origin` as its outbound client.
+async fn fetch_publisher(router: RouterService, origin: &ScriptedHttpClient, path: &str) -> Served {
+    let mut request = publisher_get(path);
+    request
+        .headers_mut()
+        .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    Served::from_router_response(route_to_origin(router, request, origin).await)
 }
 
-/// Asserts that an origin body of [`SPIN_INPUT_CAP`] bytes is served and one
-/// byte more fails with 502 before egress.
-async fn assert_spin_input_cap(content_type: &str, body: fn(usize) -> Vec<u8>) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_spin() {
     let origin = ScriptedHttpClient::new(&TestClock::new());
-    for (path, len) in [
-        ("/at-cap", SPIN_INPUT_CAP),
-        ("/over-cap", SPIN_INPUT_CAP + 1),
-    ] {
-        origin.respond_to(
-            Method::GET,
-            &format!("{ORIGIN}{path}"),
-            ScriptedReply::status(StatusCode::OK)
-                .header("content-type", content_type)
-                .body(body(len)),
-        );
-    }
 
-    let at_cap = route_to_origin(test_router(), publisher_get("/at-cap"), &origin).await;
-    assert_eq!(
-        at_cap.status(),
-        StatusCode::OK,
-        "should serve a {content_type} body at the cap"
-    );
-    let served = at_cap
-        .into_body()
-        .into_bytes()
-        .expect("should buffer the at-cap body");
-    assert!(
-        served.len() >= SPIN_INPUT_CAP,
-        "should serve the whole {content_type} body at the cap, got {} bytes",
-        served.len()
-    );
-
-    let over_cap = route_to_origin(test_router(), publisher_get("/over-cap"), &origin).await;
-    assert_eq!(
-        over_cap.status(),
-        StatusCode::BAD_GATEWAY,
-        "should fail a {content_type} body one byte over the cap with 502"
-    );
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        SPIN_INPUT_CAP,
+        ResponseDecoding::Original,
+        |path| fetch_publisher(test_router(), &origin, path),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_body_at_cap_passes_and_one_over_fails_502_spin() {
-    assert_spin_input_cap("application/octet-stream", |len| vec![b'x'; len]).await;
-}
+async fn processed_output_keeps_its_own_bound_spin() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identity_html_at_cap_passes_and_one_over_fails_502_spin() {
-    assert_spin_input_cap("text/html", html_document).await;
+    publisher_input_cap::assert_output_bound(&origin, |path| {
+        fetch_publisher(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build router from output-bound settings"),
+            &origin,
+            path,
+        )
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1253,11 +1264,11 @@ async fn spin_ignores_host_override_with_warning() {
     let mut settings = test_settings();
     settings.publisher.origin_host_header_override =
         Some("www.test-publisher.example.com".to_owned());
-    let capture = WarningCapture::start();
+    let capture = LogCapture::start();
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should keep serving a config that sets the override");
     assert!(
-        capture.take().iter().any(|warning| {
+        capture.take_warnings().iter().any(|warning| {
             warning.message.contains("origin_host_header_override")
                 && warning.message.contains("ignored on Spin")
         }),
@@ -1287,4 +1298,118 @@ async fn spin_ignores_host_override_with_warning() {
         ("origin.test-publisher.example.com", false),
         "should send the URI authority with no override"
     );
+}
+
+/// A partner API request carrying a Bearer token and a mapping body.
+fn partner_api_request(method: Method, path: &str) -> Request {
+    request_builder()
+        .method(method)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .header("authorization", "Bearer fictional-partner-token-0123456789")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mappings":[]}"#))
+        .expect("should build partner API request")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_origin_receives_publisher_fallback_requests() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/article"),
+        ScriptedReply::status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body("served by origin"),
+    );
+
+    let response = route_to_origin(test_router(), publisher_get("/article"), &origin).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should proxy the publisher page to the origin"
+    );
+    assert_eq!(
+        origin
+            .requests()
+            .iter()
+            .map(RecordedRequest::method_and_path)
+            .collect::<Vec<_>>(),
+        vec!["GET /article".to_owned()],
+        "should record the proxied publisher request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+    let origin = ScriptedHttpClient::forbidding();
+
+    let identify = route_to_origin(
+        test_router(),
+        partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let preflight = route_to_origin(
+        test_router(),
+        partner_api_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        &origin,
+    )
+    .await;
+    let batch_sync = route_to_origin(
+        test_router(),
+        partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        &origin,
+    )
+    .await;
+
+    assert_eq!(
+        identify.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "identify should answer 501 locally"
+    );
+    assert_eq!(
+        preflight.status(),
+        StatusCode::OK,
+        "identify preflight should answer locally"
+    );
+    assert_eq!(
+        batch_sync.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "batch sync should answer 501 locally"
+    );
+    origin.assert_no_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identify_and_batch_sync_answer_other_methods_405_locally() {
+    let origin = ScriptedHttpClient::forbidding();
+    let cases = [
+        (Method::HEAD, "/_ts/api/v1/identify"),
+        (Method::POST, "/_ts/api/v1/identify"),
+        (Method::PUT, "/_ts/api/v1/identify"),
+        (Method::PATCH, "/_ts/api/v1/identify"),
+        (Method::DELETE, "/_ts/api/v1/identify"),
+        (Method::GET, "/_ts/api/v1/batch-sync"),
+        (Method::HEAD, "/_ts/api/v1/batch-sync"),
+        (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+        (Method::PUT, "/_ts/api/v1/batch-sync"),
+        (Method::PATCH, "/_ts/api/v1/batch-sync"),
+        (Method::DELETE, "/_ts/api/v1/batch-sync"),
+    ];
+
+    let mut statuses = Vec::new();
+    for (method, path) in cases.clone() {
+        let response =
+            route_to_origin(test_router(), partner_api_request(method, path), &origin).await;
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+        "should answer every other method on the partner API paths with 405: {cases:?}"
+    );
+    origin.assert_no_requests();
 }

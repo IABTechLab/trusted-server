@@ -41,26 +41,24 @@ use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 #[cfg(test)]
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt, to_openrtb_i32,
+    TrustedServerExt, User, UserExt, to_openrtb_i32, to_openrtb_user_eids,
 };
 #[cfg(test)]
-use crate::outbound::{
-    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
-    outbound_request,
-};
+use crate::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
+use crate::outbound::{OutboundRequestSource, outbound_error};
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 #[cfg(test)]
@@ -258,6 +256,9 @@ pub enum PrebidUserIdStorageType {
     Cookie,
     /// Store the module's value in browser local storage.
     Html5,
+    /// Store the module's value in both a browser cookie and local storage.
+    #[serde(rename = "cookie&html5")]
+    CookieAndHtml5,
 }
 
 /// Browser storage settings forwarded verbatim to a Prebid User ID module.
@@ -2124,7 +2125,13 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            let selected = if *name == COOKIE_EUCONSENT_V2 {
+                // Use the canonical name on the wire, including in cookies-only mode.
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = selected else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -2292,15 +2299,19 @@ pub(crate) async fn parse_planned_prebid_response(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body_bytes = collect_response_bounded(
-        response.into_body(),
-        UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-        "prebid",
-    )
-    .await
-    .change_context(TrustedServerError::Prebid {
-        message: "Failed to read Prebid response body".to_string(),
-    });
+    // The request buffered the response under the same cap.
+    let body_bytes = response
+        .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            outbound_error(
+                error,
+                TrustedServerError::Prebid {
+                    message: "Failed to read Prebid response body".to_string(),
+                },
+                OutboundRequestSource::Internal,
+            )
+        });
 
     if !status.is_success() {
         log::warn!("Prebid auction {auction_id:?} returned non-success status: {status}");
@@ -2308,7 +2319,7 @@ pub(crate) async fn parse_planned_prebid_response(
             Ok(body_bytes) => Some(body_bytes),
             Err(error) => {
                 log::warn!(
-                    "Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
+                    "Provider '{provider_id}' Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
                 );
                 None
             }
@@ -2877,11 +2888,11 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs resolved from the KV identity graph and consent-gated
-                // in `handle_auction` via `gate_eids_by_consent`.
-                eids: request.user.eids.clone(),
             }
             .to_ext(),
+            // EIDs resolved from the KV identity graph and consent-gated
+            // in `handle_auction` via `gate_eids_by_consent`.
+            eids: to_openrtb_user_eids(request.user.eids.as_deref()),
             ..Default::default()
         });
 
@@ -3226,16 +3237,18 @@ impl PrebidAuctionProvider {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
-        // Parse response — collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            "prebid",
-        )
-        .await
-        .change_context(TrustedServerError::Prebid {
-            message: "Failed to read Prebid response body".to_string(),
-        });
+        let body_bytes = response
+            .into_bytes_bounded(UPSTREAM_RTB_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                outbound_error(
+                    error,
+                    TrustedServerError::Prebid {
+                        message: "Failed to read Prebid response body".to_string(),
+                    },
+                    OutboundRequestSource::Internal,
+                )
+            });
 
         if !status.is_success() {
             let auction_id = auction_id.unwrap_or("<unavailable>");
@@ -3705,8 +3718,8 @@ mod tests {
         ProviderId, RoutingMode,
     };
     use crate::auction::test_support::{
-        canonical_parity_auction_request,
-        create_test_auction_context as shared_test_auction_context,
+        assert_no_user_eids, canonical_parity_auction_request,
+        create_test_auction_context as shared_test_auction_context, user_eids,
     };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -3870,6 +3883,11 @@ mod tests {
                 .to_vec(),
         )
         .expect("should parse response body as utf-8")
+    }
+
+    /// The RTB response cap as a body length.
+    fn rtb_cap_len() -> usize {
+        usize::try_from(UPSTREAM_RTB_MAX_RESPONSE_BYTES).expect("should fit the RTB cap in usize")
     }
 
     fn prebid_platform_response(
@@ -4269,6 +4287,39 @@ refresh_in_seconds = 3600
             storage.refresh_in_seconds,
             Some(3600),
             "should preserve refresh interval"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_accept_prebid_cookie_and_html5_storage() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie&html5"
+name = "example_env"
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        let storage = entry.storage.as_ref().expect("should parse storage");
+
+        assert_eq!(
+            storage.storage_type,
+            PrebidUserIdStorageType::CookieAndHtml5,
+            "should accept Prebid's combined storage mechanism"
+        );
+        assert_eq!(
+            serde_json::to_value(storage.storage_type).expect("should serialize storage type"),
+            json!("cookie&html5"),
+            "should forward the combined mechanism to Prebid unchanged"
         );
     }
 
@@ -6707,9 +6758,21 @@ external_bundle_sri = "sha384-AAAA"
             Some("501"),
             "should set metro (DMA code)"
         );
-        assert_eq!(geo.country.as_deref(), Some("US"));
-        assert_eq!(geo.city.as_deref(), Some("New York"));
-        assert_eq!(geo.region.as_deref(), Some("NY"));
+        assert_eq!(
+            geo.country.as_deref(),
+            Some("US"),
+            "should export the supplied US country to Prebid"
+        );
+        assert_eq!(
+            geo.city.as_deref(),
+            Some("New York"),
+            "should export the supplied New York city to Prebid"
+        );
+        assert_eq!(
+            geo.region.as_deref(),
+            Some("NY"),
+            "should export the supplied NY region to Prebid"
+        );
     }
 
     #[test]
@@ -6746,7 +6809,10 @@ external_bundle_sri = "sha384-AAAA"
                 expected["lat"] = serde_json::json!(0.0);
                 expected["lon"] = serde_json::json!(0.0);
             }
-            assert_eq!(*geo, expected);
+            assert_eq!(
+                *geo, expected,
+                "should export only supplied US/CA Geo detail to Prebid with coordinates {coordinates:?}"
+            );
         }
     }
 
@@ -6987,30 +7053,30 @@ external_bundle_sri = "sha384-AAAA"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();
@@ -7025,23 +7091,16 @@ external_bundle_sri = "sha384-AAAA"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
-        let ext_eids = &serialized["user"]["ext"]["eids"];
-        assert!(ext_eids.is_array(), "should populate user.ext.eids");
-        assert_eq!(ext_eids.as_array().unwrap().len(), 3, "should have 3 EIDs");
+        let eids = user_eids(&serialized, "prebid");
+        assert_eq!(eids.len(), 3, "should have 3 EIDs");
         assert_eq!(
-            ext_eids[0]["source"], "liveramp.com",
+            eids[0]["source"], "liveramp.com",
             "should include liveramp EID"
         );
+        assert_eq!(eids[1]["source"], "id5-sync.com", "should include id5 EID");
+        assert_eq!(eids[2]["source"], "google.com", "should include PAIR EID");
         assert_eq!(
-            ext_eids[1]["source"], "id5-sync.com",
-            "should include id5 EID"
-        );
-        assert_eq!(
-            ext_eids[2]["source"], "google.com",
-            "should include PAIR EID"
-        );
-        assert_eq!(
-            ext_eids[2]["uids"][0]["atype"], 571187,
+            eids[2]["uids"][0]["atype"], 571187,
             "should preserve PAIR's vendor-specific atype"
         );
     }
@@ -7063,10 +7122,7 @@ external_bundle_sri = "sha384-AAAA"
         );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
-        assert!(
-            serialized["user"]["ext"]["eids"].is_null(),
-            "should omit user.ext.eids when no EIDs available"
-        );
+        assert_no_user_eids(&serialized, "prebid without EIDs");
     }
 
     #[test]
@@ -7390,7 +7446,7 @@ external_bundle_sri = "sha384-AAAA"
         let response = prebid_platform_response(
             StatusCode::BAD_GATEWAY,
             Some("text/plain"),
-            vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+            vec![b'x'; rtb_cap_len() + 1],
         );
 
         let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
@@ -7408,7 +7464,7 @@ external_bundle_sri = "sha384-AAAA"
         config.debug = true;
         let provider = PrebidAuctionProvider::new(config);
         let stream = futures::stream::iter([
-            Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+            Bytes::from(vec![b'x'; rtb_cap_len()]),
             Bytes::from_static(b"x"),
         ]);
         let response = prebid_platform_response_with_body(
@@ -9507,67 +9563,6 @@ set = { networkId = 42 }
     }
 
     #[test]
-    fn planned_parser_bounds_oversized_success_and_error_bodies() {
-        let profile = planned_prebid_profile(true);
-        for response in [
-            prebid_platform_response(
-                StatusCode::OK,
-                Some("application/json"),
-                vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
-            ),
-            prebid_platform_response_with_body(
-                StatusCode::OK,
-                Some("application/json"),
-                EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
-                    Bytes::from_static(b"x"),
-                ])),
-            ),
-        ] {
-            assert!(
-                futures::executor::block_on(parse_planned_prebid_response(
-                    "pbs-instance",
-                    &profile,
-                    &planned_prebid_input(&["fictional-slot"]),
-                    response,
-                    42,
-                    "auction-oversized-success",
-                ))
-                .is_err(),
-                "oversized successful planned PBS responses must fail bounded collection"
-            );
-        }
-
-        for response in [
-            prebid_platform_response(
-                StatusCode::BAD_GATEWAY,
-                Some("text/plain"),
-                vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
-            ),
-            prebid_platform_response_with_body(
-                StatusCode::SERVICE_UNAVAILABLE,
-                Some("text/plain"),
-                EdgeBody::stream(futures::stream::iter([
-                    Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
-                    Bytes::from_static(b"x"),
-                ])),
-            ),
-        ] {
-            let expected_status = response.status().as_u16();
-            let parsed = futures::executor::block_on(parse_planned_prebid_response(
-                "pbs-instance",
-                &profile,
-                &planned_prebid_input(&["fictional-slot"]),
-                response,
-                42,
-                "auction-oversized-error",
-            ))
-            .expect("should preserve HTTP classification for oversized planned error body");
-            assert_oversized_http_error_is_classified(&parsed, expected_status);
-        }
-    }
-
-    #[test]
     fn parse_bid_extracts_cache_id_from_ext_prebid_cache_bids() {
         let bid_json = serde_json::json!({
             "id": "bid-id-123",
@@ -10020,6 +10015,16 @@ set = { networkId = 42 }
         for (input, expected, requires_body) in [
             ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
             (
+                "__Host-ts-tcf=TC-example",
+                Some("euconsent-v2=TC-example"),
+                false,
+            ),
+            (
+                "__Host-ts-tcf=bridge; euconsent-v2=publisher",
+                Some("euconsent-v2=publisher"),
+                false,
+            ),
+            (
                 "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
                 Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),
                 false,
@@ -10302,7 +10307,7 @@ set = { networkId = 42 }
         );
         assert_eq!(
             disabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
             "should preserve the complete disabled PBS wire shape"
         );
 
@@ -10340,7 +10345,7 @@ set = { networkId = 42 }
             serde_json::to_string(&enabled).expect("should serialize enabled PBS request");
         assert_eq!(
             enabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1}]}],"ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf"}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
         );
     }

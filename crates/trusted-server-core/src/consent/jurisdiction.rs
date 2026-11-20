@@ -1,12 +1,9 @@
 //! Jurisdiction recognition for consent policy and observability.
 //!
-//! Geography selects the applicable policy, never synthesizes consent. Partial
-//! or unrecognized assertions remain unknown when policy requires subdivision
-//! recognition.
+//! Geography selects the applicable policy, never synthesizes consent.
+//! Publisher configuration determines the regulated countries and US states.
 
 use core::fmt;
-
-use edgezero_core::geo::CountryCode;
 
 use crate::consent_config::ConsentConfig;
 use crate::geo::GeoInfo;
@@ -44,14 +41,10 @@ impl fmt::Display for Jurisdiction {
 /// Checks the user's country against `config.gdpr.applies_in`, and for US
 /// users checks the region against `config.us_states.privacy_states`.
 ///
-/// Returns [`Jurisdiction::Unknown`] for missing/unrecognized country data or
-/// US geography without a recognized subdivision.
+/// Returns [`Jurisdiction::Unknown`] when no geo data is available.
 #[must_use]
 pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jurisdiction {
     let Some(geo) = geo else {
-        return Jurisdiction::Unknown;
-    };
-    let Ok(country) = CountryCode::new(&geo.country) else {
         return Jurisdiction::Unknown;
     };
 
@@ -63,42 +56,25 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jur
         .gdpr
         .applies_in
         .iter()
-        .any(|code| code.eq_ignore_ascii_case(country.as_str()))
+        .any(|code| code.eq_ignore_ascii_case(&geo.country))
     {
         return Jurisdiction::Gdpr;
     }
 
-    if country.as_str() == "US" {
-        let Some(region) = geo.region.as_deref() else {
-            return Jurisdiction::Unknown;
-        };
-        let region = region.to_ascii_uppercase();
-        // Recognition is not the configurable list of states with privacy laws.
-        // CloudFront supplies syntax-checked assertions, not a state catalogue.
-        if !US_SUBDIVISIONS.contains(&region.as_str()) {
-            return Jurisdiction::Unknown;
-        }
-        if config
+    // For US users, check if the region is a state with a privacy law.
+    if geo.country.eq_ignore_ascii_case("US")
+        && let Some(region) = &geo.region
+        && config
             .us_states
             .privacy_states
             .iter()
-            .any(|state| state.eq_ignore_ascii_case(&region))
-        {
-            return Jurisdiction::UsState(region);
-        }
+            .any(|state| state.eq_ignore_ascii_case(region))
+    {
+        return Jurisdiction::UsState(region.to_uppercase());
     }
 
     Jurisdiction::NonRegulated
 }
-
-// Assigned US state, district and outlying-area subdivision components. This
-// recognition list is separate from the publisher's privacy-policy settings.
-const US_SUBDIVISIONS: &[&str] = &[
-    "AK", "AL", "AR", "AS", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "GU", "HI", "IA", "ID",
-    "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MP", "MS", "MT", "NC", "ND",
-    "NE", "NH", "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "PR", "RI", "SC", "SD", "TN", "TX",
-    "UM", "UT", "VA", "VI", "VT", "WA", "WI", "WV", "WY",
-];
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -107,6 +83,7 @@ const US_SUBDIVISIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{Jurisdiction, detect_jurisdiction};
+    use crate::consent::{ConsentContext, allows_ec_creation, consent_allows_server_side_auction};
     use crate::consent_config::ConsentConfig;
     use crate::geo::GeoInfo;
 
@@ -170,13 +147,13 @@ mod tests {
     }
 
     #[test]
-    fn us_no_region_remains_unknown() {
+    fn us_no_region_is_non_regulated() {
         let config = ConsentConfig::default();
         let geo = make_geo("US", None);
         assert_eq!(
             detect_jurisdiction(Some(&geo), &config),
-            Jurisdiction::Unknown,
-            "country-only US geography must not imply a non-regulated state"
+            Jurisdiction::NonRegulated,
+            "should retain the country-only US fallback without inferring a state"
         );
     }
 
@@ -213,52 +190,76 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_subdivisions_remain_unknown_even_if_configured() {
+    fn publisher_country_list_is_authoritative() {
         let mut config = ConsentConfig::default();
-        config.us_states.privacy_states.push("ZZ".to_owned());
-        for region in ["ZZ", "01", "US-CA", "", " CA"] {
-            let geo = make_geo("US", Some(region));
-            assert_eq!(
-                detect_jurisdiction(Some(&geo), &config),
-                Jurisdiction::Unknown
-            );
-        }
-        for country in ["", "XX", "ZZ", "UK", "USA"] {
+        config.gdpr.applies_in = vec!["xk".to_owned(), "T1".to_owned()];
+        for country in ["XK", "t1"] {
             assert_eq!(
                 detect_jurisdiction(Some(&make_geo(country, None)), &config),
-                Jurisdiction::Unknown
+                Jurisdiction::Gdpr,
+                "should apply the publisher's GDPR list without an SDK country catalogue"
+            );
+        }
+        for country in ["DE", "", "XX", "ZZ", "UK", "USA"] {
+            assert_eq!(
+                detect_jurisdiction(Some(&make_geo(country, None)), &config),
+                Jurisdiction::NonRegulated,
+                "should retain the baseline fallback for countries outside the publisher's list"
             );
         }
     }
 
     #[test]
-    fn partial_geo_never_synthesizes_tcf_or_auction_permission() {
-        use crate::consent::{ConsentContext, consent_allows_server_side_auction};
+    fn publisher_state_list_is_authoritative() {
+        let mut config = ConsentConfig::default();
+        config.us_states.privacy_states = vec!["zz".to_owned()];
+        assert_eq!(
+            detect_jurisdiction(Some(&make_geo("us", Some("ZZ"))), &config),
+            Jurisdiction::UsState("ZZ".to_owned()),
+            "should use the publisher's state list without an additional subdivision catalogue"
+        );
+        for region in ["CA", "01", "US-CA", "", " CA"] {
+            assert_eq!(
+                detect_jurisdiction(Some(&make_geo("US", Some(region))), &config),
+                Jurisdiction::NonRegulated,
+                "should retain the baseline fallback for regions outside the publisher's list"
+            );
+        }
+    }
+
+    #[test]
+    fn geography_never_synthesizes_tcf_consent() {
         let config = ConsentConfig::default();
-        for geo in [
-            make_geo("US", None),
-            make_geo("US", Some("ZZ")),
-            make_geo("GB", None),
+        for (geo, auction_allowed, ec_allowed) in [
+            (make_geo("US", None), true, true),
+            (make_geo("US", Some("ZZ")), true, true),
+            (make_geo("GB", None), false, false),
+            (make_geo("US", Some("CA")), true, false),
         ] {
-            let context = ConsentContext {
+            let mut context = ConsentContext {
                 jurisdiction: detect_jurisdiction(Some(&geo), &config),
                 ..ConsentContext::default()
             };
-            assert!(!consent_allows_server_side_auction(&context));
-            assert!(context.tcf.is_none());
+            assert_eq!(
+                consent_allows_server_side_auction(&context),
+                auction_allowed,
+                "should retain baseline auction admission for {geo:?}"
+            );
+            assert_eq!(
+                allows_ec_creation(&context),
+                ec_allowed,
+                "should retain baseline EC creation policy for {geo:?}"
+            );
+            assert!(
+                context.tcf.is_none() && !context.gdpr_applies,
+                "should not manufacture TCF consent or a TCF signal from geography"
+            );
+            context.gdpr_applies = true;
+            assert!(
+                !consent_allows_server_side_auction(&context),
+                "should still require TCF storage consent when an EU TCF signal is present"
+            );
         }
-        let context = ConsentContext {
-            jurisdiction: detect_jurisdiction(Some(&make_geo("US", Some("CA"))), &config),
-            ..ConsentContext::default()
-        };
-        assert!(
-            consent_allows_server_side_auction(&context),
-            "should retain existing non-GDPR auction admission policy"
-        );
-        assert!(
-            context.tcf.is_none(),
-            "should not manufacture identity consent"
-        );
     }
 
     #[test]

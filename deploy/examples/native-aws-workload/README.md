@@ -11,7 +11,7 @@ flowchart TD
     Prerequisites --> Workload
     Retained --> Table[Regional DynamoDB EC table]
     Retained --> Binding[Non-secret ec_storage handoff]
-    Binding --> TOML[Operator-owned app-config TOML]
+    Operator[Application operator] --> TOML[Logical record reference in app-config TOML]
     TOML --> CLI[Matching TS CLI produces exact BlobEnvelope]
     CLI --> Workload[Workload Terraform root]
     Binding --> Workload
@@ -42,7 +42,7 @@ The retained and workload roots use S3 lockfile locking, but neither supplies a 
 | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | AWS account, region, state bucket/access and operator authority                            | Account and state owners, outside these roots                                                                                             |
 | Retained `owner`, table name and namespace reservation                                     | Retained owner, including allocator continuity, data lifetime, costs and eventual retirement                                              |
-| `ec_storage`                                                                               | Retained owner hands off the exact provider, region, table and namespace; application and workload owners use the same object             |
+| `ec_storage`                                                                               | Retained owner hands off the native provider, region, table and namespace to the workload; published config names only the logical store  |
 | Publisher origin, hostname/cookie arrangement, authentication and consent signal transport | Application/publisher operator, reviewed before browser acceptance                                                                        |
 | Digest-pinned application/runtime and Agent images                                         | Image owner, with final-image evidence rather than placeholder digest syntax                                                              |
 | Secret ARN/version references and Agent token version                                      | Secret owner seeds values separately; no values enter app config or application tfvars                                                    |
@@ -51,7 +51,7 @@ The retained and workload roots use S3 lockfile locking, but neither supplies a 
 
 Bootstrap creates the state bucket, ECR repository, certificates, DNS validation records, empty secret containers and, unless an existing zone is supplied, a dedicated evaluation hosted zone. It does not build/publish an image, grant consent, seed secret values or change external parent DNS. Permission boundaries are optional organisation-owned inputs, not mandatory fictional resources. Fictional tfvars, reserved documentation client CIDRs and placeholder image digests are not deployable inputs. The Agent image placeholder is not a verified official image. Never publish credentials, actual tfvars, state, saved plans, licensed data or private qualification records.
 
-There is no unconditional draft or approval gate. The AppConfig hosted-configuration resource checks envelope shape, publisher binding and exact agreement with `ec_storage` before publication. The CLI/runtime still owns application semantics and checksum validation. Account authorization, final-image/nonroot-volume behavior and live ingress acceptance are operator checks, not hardcoded Terraform blockers. Successful planning does not prove those runtime checks passed.
+There is no unconditional draft or approval gate. The AppConfig hosted-configuration resource checks envelope shape, publisher binding and the exact logical record reference before publication. The retained `ec_storage` handoff configures only the native binding. The CLI/runtime still owns application semantics and checksum validation. Account authorization, final-image/nonroot-volume behavior and live ingress acceptance are operator checks, not hardcoded Terraform blockers. Successful planning does not prove those runtime checks passed.
 
 ## Deployment permissions
 
@@ -83,7 +83,7 @@ These steps explain configuration ownership. Follow the [deployment walkthrough]
 
 The retained owner reviews `retained/terraform.tfvars.example`, account/region, retained state identity and the app/environment reservation. The retained root creates a single-region `PAY_PER_REQUEST` table with string keys `pk` and `sk`, TTL on `ttl_epoch_s`, deletion protection and Terraform `prevent_destroy`. It uses DynamoDB's default encryption at rest with an AWS-owned key. It adds no task KMS permission, indexes or replicas.
 
-Reserve both `ec:{namespace}` for identities/withdrawal markers and `ec-allocator:{namespace}` for the durable generation allocator. The allocator row has `sk=generation` and no TTL. Never reset it while the namespace may be reused. TTL collects expired rows eventually; runtime `expires_at_ms` controls logical expiry. See [the persistence guide](../../../docs/guide/native-ec-persistence.md) for continuity and retirement requirements.
+Reserve a fresh namespace for EdgeZero's record format, not the old `ec:{namespace}` / `ec-allocator:{namespace}` format. Values and retained per-key allocators share namespace/layout-qualified group partitions. Allocator rows have no TTL and must not be reset while the namespace may be reused. DynamoDB TTL collects value rows eventually; graph consent and tombstone checks still govern identity use. This template uses ASCII namespaces so its IAM pattern has literal, byte-length-delimited scope. See [the persistence guide](../../../docs/guide/native-ec-persistence.md) for continuity and retirement requirements.
 
 ### 2. Receive the retained handoff
 
@@ -91,25 +91,23 @@ After separately approved retained provisioning, the owner supplies its non-secr
 
 ```hcl
 ec_storage = {
-  provider  = "dynamodb"
+  provider  = "aws-dynamodb-records"
   region    = "eu-west-2"
   table     = "example-retained-ec"
   namespace = "example-staging"
 }
 ```
 
-The handoff is explicit, not a Terraform remote-state dependency or a task environment binding. Preserve exact values in the workload input and published config. A provider/table/namespace change does not migrate existing identities or withdrawal obligations.
+The handoff is explicit, not a Terraform remote-state dependency. Keep the historical `ec_storage` output/input name, but pass this object only to the workload, which renders it into `[kv.trusted_server_kv]` in native bindings. Do not paste connector fields into published `ec.storage`. A provider/table/namespace change does not migrate existing identities or withdrawal obligations.
 
 ### 3. Prepare operator-owned TOML
 
-Start with `example-config.toml` and review the entire application policy. Keep secret references, not resolved values. Include the retained selection:
+Start with `example-config.toml` and review the entire application policy. Keep secret references, not resolved values. Select the logical prepared store:
 
 ```toml
 [ec.storage]
-provider = "dynamodb"
-region = "eu-west-2"
-table = "example-retained-ec"
-namespace = "example-staging"
+provider = "records"
+store = "trusted_server_kv"
 ```
 
 The matching CLI validates application semantics. Terraform does not duplicate TS authentication, indexing, signing, origin-protocol or secret-consumer policy. The fixture's hostname and empty integration settings are not browser acceptance evidence; resolve the operator-owned requirements below without weakening runtime consent checks.
@@ -137,7 +135,7 @@ AppConfig consumes that inner `BlobEnvelope` document, not the outer local map o
 
 ### 5. Prepare the workload inputs
 
-The workload owner supplies the same `ec_storage` object and sets `config_envelope_file` to the exact CLI export. The workload checks envelope shape, publisher binding and exact `ec.storage` agreement, then publishes the original envelope text unchanged to AppConfig. It attaches exact-table/partition-scoped DynamoDB permissions to its own application task role. The retained root never attaches a policy to that role.
+The workload owner supplies the same `ec_storage` object and sets `config_envelope_file` to the exact CLI export. The workload checks envelope shape, publisher binding and the exact logical record reference above, then publishes the original envelope text unchanged to AppConfig. Connector settings remain in native bindings, separate from the envelope. It attaches exact-table/namespace-layout-scoped DynamoDB permissions to its own application task role. Values and allocators share that permission scope. EdgeZero retains allocator rows, but this example does not independently prevent the task from deleting or replacing them. The retained root never attaches a policy to that role.
 
 By default, `runtime_boundaries = null` creates no permission boundaries. If your organisation requires them, supply its existing execution/task policy ARNs and review `ec_task_policy_json` with the boundary owner. The two roles may use the same boundary ARN; their role policies still scope execution and task permissions independently. An existing task boundary with an explicit deny excluding DynamoDB still denies the calls despite an inline allow. Review its action ceiling and constrained allows, plus organization and endpoint policy denies. Do not remove a boundary, grant administrator access or move application calls to the execution role. The execution role retains image-pull, logs and startup-secret responsibilities.
 
@@ -150,11 +148,11 @@ Use the TS-owned runtime packaging in [`../../runtime/native-aws/`](../../runtim
 The task expects:
 
 - A Linux x86_64 application running as UID/GID `10001:10001`, listening on `0.0.0.0:8787`, with a read-only root filesystem and all Linux capabilities dropped.
-- A writable, correctly owned `/run/trusted-server` task volume. The runtime entrypoint publishes literal `TS_NATIVE_BINDINGS_TOML` privately and passes `/run/trusted-server/native-bindings.toml` through `EDGEZERO__STORE_BINDINGS_FILE`. The ephemeral volume does not store the identity graph.
+- A writable, correctly owned `/run/trusted-server` task volume. `TS_EC_RECORDS_ENABLED=true` declares the EC layout before preparation. The runtime entrypoint publishes literal `TS_NATIVE_BINDINGS_TOML`, including the retained KV record binding, privately and passes `/run/trusted-server/native-bindings.toml` through `EDGEZERO__STORE_BINDINGS_FILE`. The ephemeral volume does not store the identity graph.
 - Optional `TS_NATIVE_GEO_PROFILE_TOML` containing the CloudFront provider, ALB peer CIDRs and credential-removal header name, never the expected credential value. The runtime exports `TS_NATIVE_GEO_PROFILE_FILE`. An absent profile means Geo Off; an invalid explicit profile must fail before readiness. No KV Geo database/provider is configured here.
 - `EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS` and `EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY=x-forwarded` for checked forwarding. Geo admission and ordinary forwarded-header trust are separate checks.
 - An authenticated official AppConfig Agent on loopback `127.0.0.1:2772`, sharing the selected token version with the app. ECS `START` dependency orders startup but does not prove readiness. Qualify bounded cold Agent startup with the selected image/provider. No Agent disk-backup fallback is configured.
-- Successful preparation of the selected regional EC table using task-role credentials before readiness. No local-memory fallback or deployed `local_endpoint` is allowed. Regional HTTPS connectivity and actual effective IAM still need qualification.
+- Successful preparation of the selected regional EC table using task-role credentials before readiness. No local-memory fallback or deployed emulator endpoint is configured. Regional HTTPS connectivity and actual effective IAM still need qualification.
 - Exact HTTP `200` on `/health` after startup validation, plus direct SIGTERM/request draining. Defaults are a 10-second application grace and 30-second container stop timeout. One stop-first task permits update downtime; this is not high availability.
 
 ## Browser hostname and consent qualification
@@ -211,4 +209,4 @@ The offline workflow has read-only repository permissions and no Environment, OI
 
 The named operator owns ongoing charges, image updates, deliberate shutdown and manual reconciliation. Deletion is explicit, not expiry. Workload teardown removes its role/policy attachment, not the retained table. The retained owner separately approves namespace retirement, identity erasure, allocator continuity and eventual table removal. `prevent_destroy` and deletion protection are not backups and do not prevent authorized task-row deletion. Bootstrap-owned state infrastructure, ECR images, certificates, DNS and secret containers have a separate lifetime from the workload and table. Existing zones and organisation boundaries remain externally owned. Migrate bootstrap state back to private local storage before retiring its bucket. Secret containers use Secrets Manager's recovery window; retained data and secret values require deliberate retirement. Logs follow their selected retention/deletion setting; external audit records survive workload teardown.
 
-HA, autoscaling, private networking/NAT/endpoints, WAF, customer-managed encryption keys, IPv6, image automation, bidder/partner integrations, signing/admin/S2S additions and rollback automation are deferred. Review capacity and failure behavior before adding replicas or tasks; routing and endpoint policies before changing egress; and trust/consent boundaries before adding integrations. None of those production measures is implemented or qualified by this example.
+PITR/backups and restore qualification, HA, autoscaling, private networking/NAT/endpoints, WAF, customer-managed encryption keys, IPv6, image automation, bidder/partner integrations, signing/admin/S2S additions and rollback automation are deferred. Review capacity and failure behavior before adding replicas or tasks; routing and endpoint policies before changing egress; and trust/consent boundaries before adding integrations. None of those production measures is implemented or qualified by this example.

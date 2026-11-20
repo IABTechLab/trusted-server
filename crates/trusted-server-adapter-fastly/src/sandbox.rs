@@ -484,42 +484,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn setup_runs_once_on_success_and_retries_after_failure() {
-        let mut sandbox = Sandbox::default();
-        let attempts = Cell::new(0_u32);
-
-        // A failed install must leave setup eligible for retry.
-        let failed = sandbox.setup_once(|| {
-            attempts.set(attempts.get() + 1);
-            Err::<(), &str>("install failed")
-        });
-        assert_eq!(
-            failed.err(),
-            Some("install failed"),
-            "the error should surface"
-        );
-
-        // The retry runs, because setup was never marked complete.
-        sandbox
-            .setup_once(|| {
-                attempts.set(attempts.get() + 1);
-                Ok::<(), &str>(())
-            })
-            .expect("the retry should succeed");
-        assert_eq!(attempts.get(), 2, "a failed install should be retried");
-
-        // Once successful, it never runs again. Reinstalling the global logger
-        // panics inside `fern`, which is the failure this guards.
-        sandbox
-            .setup_once(|| -> Result<(), &str> {
-                attempts.set(attempts.get() + 1);
-                panic!("setup must not run again after success")
-            })
-            .expect("a completed setup should be skipped");
-        assert_eq!(attempts.get(), 2, "setup should stay complete");
-    }
-
     /// Minimal settings sufficient to build real application state.
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -537,6 +501,7 @@ mod tests {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "trusted_server_kv"
             "#,
         )
         .expect("should parse sandbox test settings")
@@ -805,6 +770,39 @@ mod tests {
             sandbox.initialization_attempts(),
             1,
             "the framework counter should agree"
+        );
+    }
+
+    #[test]
+    fn a_retained_application_shares_its_identity_state_across_requests() {
+        let mut sandbox = Sandbox::default();
+        sandbox
+            .initialize(|| Ok::<_, &str>(test_retained()))
+            .expect("should build the first request");
+        let first = Arc::clone(
+            &sandbox
+                .state()
+                .expect("should retain the first build")
+                .state
+                .identity,
+        );
+
+        sandbox
+            .initialize(|| -> Result<RetainedApp, &str> {
+                panic!("the second request must not rebuild a retained application")
+            })
+            .expect("should reuse the retained application");
+        let second = Arc::clone(
+            &sandbox
+                .state()
+                .expect("should keep the retained build")
+                .state
+                .identity,
+        );
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "should share one identity app, and so one partner registry and record store, across requests"
         );
     }
 

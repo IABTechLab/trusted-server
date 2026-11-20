@@ -6,7 +6,10 @@
 
 use core::error::Error;
 use derive_more::Display;
+use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
+use edgezero_core::http::{HeaderValue, Response, header};
+use edgezero_core::response::IntoResponse as _;
 use error_stack::Report;
 use http::StatusCode;
 
@@ -152,8 +155,10 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
             // The client sent the body too slowly; the detail stays in the logs.
             Self::RequestTimeout { .. } => "Request timeout".to_string(),
+            // The client sent too large a body; the limit stays in the logs.
+            Self::RequestTooLarge { .. } => "Request payload too large".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
-            // Full details are already logged via log::error! in to_error_response.
+            // Full details are already logged by http_error.
             _ => "An internal error occurred".to_string(),
         }
     }
@@ -199,9 +204,106 @@ pub fn startup_error(report: &Report<TrustedServerError>) -> EdgeError {
     }
 }
 
+/// Renders a handler's [`EdgeError`] as `EdgeZero`'s error response.
+///
+/// Each adapter's finalize middleware calls this when a handler returns `Err`,
+/// so the error response still gets the finalize headers, such as
+/// `x-ts-version`. The error is logged once, with its status and kind only: at
+/// warn for a client error and at error otherwise. Its message can hold
+/// provider text or a URL, so it is never logged.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] `EdgeZero` reports when the error cannot be
+/// rendered as a response.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::error::EdgeError;
+/// use edgezero_core::http::StatusCode;
+/// use trusted_server_core::error::handler_error_response;
+///
+/// let response = handler_error_response(EdgeError::bad_gateway("example upstream failure"))
+///     .expect("should render the error");
+/// assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+/// ```
+pub fn handler_error_response(error: EdgeError) -> Result<Response, EdgeError> {
+    let status = error.status();
+    if status.is_client_error() {
+        log::warn!("Request handler failed with {status} ({})", error.kind());
+    } else {
+        log::error!("Request handler failed with {status} ({})", error.kind());
+    }
+    error.into_response()
+}
+
+/// Renders a failed request's [`Report`] as the plain-text error response.
+///
+/// The response answers with the [`IntoHttpResponse::status_code`] of the
+/// report's current context and its client-safe
+/// [`IntoHttpResponse::user_message`]. The whole report is logged once: at
+/// warn when the status is a client error, because the client caused it, and
+/// at error otherwise.
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::http::StatusCode;
+/// use error_stack::Report;
+/// use trusted_server_core::error::{TrustedServerError, http_error};
+///
+/// let report = Report::new(TrustedServerError::RequestTooLarge {
+///     message: "example body over the limit".to_owned(),
+/// });
+/// assert_eq!(http_error(&report).status(), StatusCode::PAYLOAD_TOO_LARGE);
+/// ```
+#[must_use]
+pub fn http_error(report: &Report<TrustedServerError>) -> Response {
+    let error = report.current_context();
+    let status = error.status_code();
+    if status.is_client_error() {
+        log::warn!("Error occurred: {report:?}");
+    } else {
+        log::error!("Error occurred: {report:?}");
+    }
+
+    let mut response = Response::new(Body::from(format!("{}\n", error.user_message())));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::logging::LogCapture;
+
+    #[test]
+    fn handler_error_response_logs_a_client_error_once_at_warn_without_its_message() {
+        let capture = LogCapture::start();
+
+        let response = handler_error_response(EdgeError::bad_request("example secret detail"))
+            .expect("should render the handler error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "should answer with the error status"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Warn
+                    && record.message == "Request handler failed with 400 Bad Request (bad_request)"
+            ),
+            "should log the client error once, at warn, with only its status and kind"
+        );
+    }
 
     #[test]
     fn status_code_returns_expected_http_status_for_each_variant() {
@@ -463,6 +565,15 @@ mod tests {
             error.user_message(),
             "Request timeout",
             "should keep the timeout detail out of the client message"
+        );
+
+        let error = TrustedServerError::RequestTooLarge {
+            message: "body exceeds the 65536-byte limit".into(),
+        };
+        assert_eq!(
+            error.user_message(),
+            "Request payload too large",
+            "should name the 413 cause and keep the limit out of the client message"
         );
     }
 

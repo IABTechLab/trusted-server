@@ -3,6 +3,10 @@ pub(crate) mod body_read;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod logging;
 #[cfg(any(test, feature = "test-utils"))]
+pub mod publisher_input_cap;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod record_ec;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod scripted_client;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -135,6 +139,35 @@ pub mod tests {
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
     use crate::settings::Settings;
 
+    /// GDPR consent with TCF Purposes 1 and 4 and the given vendor consents.
+    #[must_use]
+    pub fn consent_granting_vendors(vendor_consents: Vec<u16>) -> ConsentContext {
+        let mut purposes = vec![false; 24];
+        purposes[0] = true;
+        purposes[3] = true;
+        ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: purposes,
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents,
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            ..ConsentContext::default()
+        }
+    }
+
     /// Run `edit` against the head of `request` and return its result.
     ///
     /// The body is left in place. This lets tests apply a head-only helper,
@@ -165,7 +198,7 @@ pub mod tests {
     pub async fn run_pre_dispatch_hook<H: PreDispatchHook>(
         hook: H,
         request: Request<Body>,
-    ) -> Result<Request<Body>, Box<Response<Body>>> {
+    ) -> Result<Request<Body>, Response<Body>> {
         let received: Arc<Mutex<Option<(RequestParts, Bytes)>>> = Arc::default();
         let sink = Arc::clone(&received);
         let record = move |context: RequestContext| {
@@ -193,7 +226,7 @@ pub mod tests {
             .take();
         match recorded {
             Some((parts, body)) => Ok(Request::from_parts(parts, Body::from(body))),
-            None => Err(Box::new(response)),
+            None => Err(response),
         }
     }
 
@@ -683,7 +716,7 @@ pub mod nextjs_auction {
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn put(
@@ -692,7 +725,7 @@ pub mod nextjs_auction {
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
         async fn delete(
@@ -700,7 +733,7 @@ pub mod nextjs_auction {
             _store_id: &StoreId,
             _key: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
@@ -711,7 +744,7 @@ pub mod nextjs_auction {
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<Vec<u8>, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn create(
@@ -720,7 +753,7 @@ pub mod nextjs_auction {
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
         async fn delete(
@@ -728,7 +761,7 @@ pub mod nextjs_auction {
             _store_id: &StoreId,
             _name: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
@@ -759,3 +792,20 @@ pub mod nextjs_auction {
 
 #[cfg(feature = "test-utils")]
 pub(crate) mod async_html_finalization;
+
+/// Fixtures shared with adapter crates through the `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures {
+    /// Returns an enabled identity provider configuration for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML is invalid.
+    #[must_use]
+    pub fn enabled_identity_provider() -> crate::settings::IdentityProviderConfig {
+        toml::from_str(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+        )
+        .expect("should parse identity provider")
+    }
+}

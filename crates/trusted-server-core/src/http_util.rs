@@ -85,23 +85,21 @@ pub(crate) fn into_body_payload(body: EdgeBody) -> BodyPayload {
     }
 }
 
-/// Wraps a buffered body for a synchronous rewrite pipeline.
+/// Wraps a buffered body for the proxy's synchronous rewrite pipeline.
 ///
-/// Callers buffer the responses they rewrite, so a streamed body here is a
-/// bug. It fails instead of reading as empty. `pipeline` names the caller's
-/// pipeline in the error, such as `"proxy"` or `"publisher"`.
+/// The proxy buffers the responses it rewrites, so a streamed body here is a
+/// bug. It fails instead of reading as empty.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Proxy`] for a streamed body.
 pub(crate) fn body_as_reader(
     body: EdgeBody,
-    pipeline: &str,
 ) -> Result<std::io::Cursor<Bytes>, Report<TrustedServerError>> {
     match into_body_payload(body) {
         BodyPayload::Once(bytes) => Ok(std::io::Cursor::new(bytes)),
         BodyPayload::Stream(_) => Err(Report::new(TrustedServerError::Proxy {
-            message: format!("streaming body cannot be processed by the sync {pipeline} pipeline"),
+            message: "streaming body cannot be processed by the sync proxy pipeline".to_owned(),
         })),
     }
 }
@@ -115,8 +113,9 @@ pub(crate) fn body_as_reader(
 /// malformed `Content-Length` never decides the outcome on its own. The
 /// read also ends with an error once the inbound read deadline passes.
 ///
-/// Rejections the client caused are logged at warn and host read failures at
-/// error. Body bytes are never logged.
+/// This function does not log. The report names the limit or carries the
+/// read error, and [`http_error`](crate::error::http_error) logs it at the
+/// level its status calls for. Body bytes never reach the report.
 ///
 /// # Errors
 ///
@@ -162,9 +161,6 @@ pub async fn read_request_body(
     if let Some(declared) = single_declared_content_length(headers)
         && declared > u64::try_from(max).unwrap_or(u64::MAX)
     {
-        log::warn!(
-            "Rejecting request body: declared Content-Length {declared} exceeds the {max} byte limit"
-        );
         return Err(Report::new(TrustedServerError::RequestTooLarge {
             message: format!("declared Content-Length {declared} exceeds the {max} byte limit"),
         }));
@@ -195,30 +191,18 @@ fn single_declared_content_length(headers: &HeaderMap) -> Option<u64> {
 fn request_body_read_error(error: &EdgeError, max: usize) -> Report<TrustedServerError> {
     let status = error.status();
     let context = match status {
-        StatusCode::PAYLOAD_TOO_LARGE => {
-            log::warn!("Rejecting request body: body exceeds the {max} byte limit");
-            TrustedServerError::RequestTooLarge {
-                message: format!("request body exceeds the {max} byte limit"),
-            }
-        }
-        StatusCode::REQUEST_TIMEOUT => {
-            log::warn!("Rejecting request body: read deadline passed: {error}");
-            TrustedServerError::RequestTimeout {
-                message: "request body was not read before the read deadline".to_string(),
-            }
-        }
-        status if status.is_client_error() => {
-            log::warn!("Rejecting request body: client read error ({status}): {error}");
-            TrustedServerError::BadRequest {
-                message: "request body could not be read".to_string(),
-            }
-        }
-        status => {
-            log::error!("Failed to read request body ({status}): {error}");
-            TrustedServerError::Proxy {
-                message: "failed to read request body".to_string(),
-            }
-        }
+        StatusCode::PAYLOAD_TOO_LARGE => TrustedServerError::RequestTooLarge {
+            message: format!("request body exceeds the {max} byte limit"),
+        },
+        StatusCode::REQUEST_TIMEOUT => TrustedServerError::RequestTimeout {
+            message: "request body was not read before the read deadline".to_string(),
+        },
+        status if status.is_client_error() => TrustedServerError::BadRequest {
+            message: "request body could not be read".to_string(),
+        },
+        _ => TrustedServerError::Proxy {
+            message: "failed to read request body".to_string(),
+        },
     };
     Report::new(context).attach(format!("body read failed with {status}: {error}"))
 }
@@ -644,10 +628,12 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::IntoHttpResponse as _;
+    use crate::error::{IntoHttpResponse as _, http_error};
     use crate::platform::ClientInfo;
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
     use http::{HeaderName, HeaderValue, Method};
 
     #[test]
@@ -672,15 +658,14 @@ mod tests {
 
     #[test]
     fn body_as_reader_rejects_a_streamed_body() {
-        let buffered = body_as_reader(EdgeBody::from("example"), "proxy")
+        let buffered = body_as_reader(EdgeBody::from("example"))
             .expect("should read a buffered body")
             .into_inner();
         let streamed = EdgeBody::stream(futures::stream::iter([bytes::Bytes::from_static(
             b"example",
         )]));
 
-        let error =
-            body_as_reader(streamed, "publisher").expect_err("should reject a streamed body");
+        let error = body_as_reader(streamed).expect_err("should reject a streamed body");
 
         assert_eq!(
             buffered.as_ref(),
@@ -691,8 +676,8 @@ mod tests {
             panic!("should fail with the proxy context instead of reading as empty, got {error:?}");
         };
         assert_eq!(
-            message, "streaming body cannot be processed by the sync publisher pipeline",
-            "should name the caller's pipeline"
+            message, "streaming body cannot be processed by the sync proxy pipeline",
+            "should name the proxy pipeline"
         );
     }
 
@@ -1636,6 +1621,40 @@ mod tests {
             |error| matches!(error, TrustedServerError::Proxy { .. }),
             StatusCode::BAD_GATEWAY,
         );
+    }
+
+    #[test]
+    fn body_read_failure_logs_once_at_its_status_level() {
+        for case in body_read_failure_cases(READ_TEST_MAX) {
+            let (request, expectation) =
+                case.into_request(http::Request::builder().uri("https://example.com/"));
+            let (parts, body) = request.into_parts();
+            let capture = LogCapture::start();
+
+            let report = read_body(&parts.headers, body).expect_err("should reject the body");
+            let response = http_error(&report);
+
+            let records = capture.take_all();
+            drop(capture);
+            let name = expectation.name();
+            let expected = expectation.expected();
+            assert_eq!(
+                response.status(),
+                expected,
+                "should answer the {name} case with {expected}"
+            );
+            let levels: Vec<log::Level> = records.iter().map(|record| record.level).collect();
+            let level = if expected.is_client_error() {
+                log::Level::Warn
+            } else {
+                log::Level::Error
+            };
+            assert_eq!(
+                levels,
+                [level],
+                "should log the {name} case once, at {level}"
+            );
+        }
     }
 
     #[test]

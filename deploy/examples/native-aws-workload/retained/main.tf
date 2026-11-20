@@ -1,6 +1,5 @@
 locals {
-  identity_partition  = "ec:${var.namespace}"
-  allocator_partition = "ec-allocator:${var.namespace}"
+  record_partition_pattern = "edgezero-dynamodb-records-v1#${length(var.namespace)}:${var.namespace}17:trusted-server-ec1:*"
 }
 
 resource "aws_dynamodb_table" "ec" {

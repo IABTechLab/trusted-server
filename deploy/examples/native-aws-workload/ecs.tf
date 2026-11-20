@@ -19,6 +19,7 @@ locals {
     EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY = "x-forwarded"
     EDGEZERO__STORE_BINDINGS_FILE               = "/run/trusted-server/native-bindings.toml"
     TS_NATIVE_BINDINGS_TOML                     = local.native_bindings
+    TS_EC_RECORDS_ENABLED                       = "true"
     # Release metadata forces a task-definition revision when config changes.
     # These fields do not make the Agent read a historical configuration.
     TS_REVIEW_CONFIG_TRANSPORT_SHA256 = sha256(local.envelope_text)

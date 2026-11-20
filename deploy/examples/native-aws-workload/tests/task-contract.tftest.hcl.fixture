@@ -59,7 +59,7 @@ variables {
   config_envelope_file = "example-envelope.json"
   geo_front_door       = null
   ec_storage = {
-    provider  = "dynamodb"
+    provider  = "aws-dynamodb-records"
     region    = "eu-west-2"
     table     = "example-retained-ec"
     namespace = "example-staging"
@@ -164,6 +164,36 @@ run "without_optional_permission_boundaries" {
   }
 }
 
+run "prepared_record_binding" {
+  command = plan
+
+  assert {
+    condition = (
+      local.application_environment.TS_EC_RECORDS_ENABLED == "true" &&
+      !contains(keys(local.application_environment), "TS_EC_DYNAMODB_ENABLED") &&
+      strcontains(local.native_bindings, "[kv.trusted_server_kv]\nprovider = \"aws-dynamodb-records\"\nregion = \"eu-west-2\"\ntable = \"example-retained-ec\"\nnamespace = \"example-staging\"") &&
+      local.envelope_valid
+    )
+    error_message = "Declare the EC layout before preparation, with connector settings only in the native record binding."
+  }
+}
+
+run "alternate_record_namespace" {
+  command = plan
+  variables {
+    ec_storage = {
+      provider = "aws-dynamodb-records"
+      region = "eu-west-2"
+      table = "example-retained-ec"
+      namespace = "another"
+    }
+  }
+  assert {
+    condition = local.envelope_valid && local.ec_partition_pattern == "edgezero-dynamodb-records-v1#7:another17:trusted-server-ec1:*"
+    error_message = "Native namespace changes must update the IAM prefix without changing the published logical reference."
+  }
+}
+
 run "scoped_dynamodb_task_policy" {
   command = plan
 
@@ -179,22 +209,12 @@ run "scoped_dynamodb_task_policy" {
             "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec"
           },
           {
-            "Sid": "IdentityRowsOnly",
+            "Sid": "EcRecordGroups",
             "Effect": "Allow",
-            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"],
+            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:UpdateItem"],
             "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
             "Condition": {
-              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec:example-staging"]},
-              "Null": {"dynamodb:LeadingKeys": "false"}
-            }
-          },
-          {
-            "Sid": "AllocateGenerationsOnly",
-            "Effect": "Allow",
-            "Action": ["dynamodb:UpdateItem"],
-            "Resource": "arn:aws:dynamodb:eu-west-2:000000000000:table/example-retained-ec",
-            "Condition": {
-              "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["ec-allocator:example-staging"]},
+              "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["edgezero-dynamodb-records-v1#15:example-staging17:trusted-server-ec1:*"]},
               "Null": {"dynamodb:LeadingKeys": "false"}
             }
           }
