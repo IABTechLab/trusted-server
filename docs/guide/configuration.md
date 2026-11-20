@@ -971,7 +971,13 @@ certificate, whatever `proxy.certificate_check` says.
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them. Browser-resolved IDs
 (`ts-eids` and the SharedID cookie) are never stored for an owned source, so a source a
-provider cleared on an opt-out is not refilled from the browser.
+provider cleared on an opt-out is not refilled from the browser. Legacy single-UID
+records in provider-owned sources expire immediately on reads. Provider-written
+IDs retain their per-UID expiry, and unowned records retain their existing
+behavior. Active remembered provider opt-outs also suppress client copies from
+`ts-eids` and the `/auction` body in direct, initial-page and page-bids auctions.
+Client EIDs cannot clear that memory. A missing, failed or mismatched row snapshot
+retains existing degraded behavior because it establishes no active opt-out.
 
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the

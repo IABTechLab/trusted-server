@@ -388,7 +388,8 @@ pub async fn handle_auction(
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
-    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context);
+    let client_eids =
+        drop_vendor_denied_client_eids(client_eids, registry, &auction_kv_snapshot, ec_context);
     let merged_eids = strip_opted_out_sharedid_eids(
         merge_auction_eids(client_eids, eids),
         extract_cookie_value(&http_req, SHAREDID_OPTOUT_COOKIE).is_some(),
@@ -543,7 +544,12 @@ async fn persist_auction_body(
         return None;
     };
     let body_eids = strip_opted_out_sharedid_eids(
-        drop_vendor_denied_client_eids(parse_client_auction_eids(raw), Some(registry), context),
+        drop_vendor_denied_client_eids(
+            parse_client_auction_eids(raw),
+            Some(registry),
+            context.kv_snapshot(),
+            context,
+        ),
         extract_cookie_value(request, SHAREDID_OPTOUT_COOKIE).is_some(),
     );
     let updates = collect_eid_updates(None, None, body_eids.as_deref(), registry);
@@ -733,6 +739,7 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 pub(crate) fn drop_vendor_denied_client_eids(
     client_eids: Option<Vec<Eid>>,
     registry: Option<&PartnerRegistry>,
+    snapshot: &EcKvSnapshot,
     ec_context: &EcContext,
 ) -> Option<Vec<Eid>> {
     let Some(registry) = registry else {
@@ -740,8 +747,11 @@ pub(crate) fn drop_vendor_denied_client_eids(
     };
     let consent = ec_context.consent();
     let mut eids = client_eids?;
+    let entry = ec_context.ec_value().and_then(|id| snapshot.entry_for(id));
+    let now = UnixSeconds::new(current_timestamp());
     let denied = |source: &str| {
-        ec_context.source_opted_out_in_cookies(source)
+        entry.is_some_and(|entry| registry.source_owner_opted_out(source, entry, now))
+            || ec_context.source_opted_out_in_cookies(source)
             || registry.get(source).is_some_and(|partner| {
                 partner.owner_vendor_consent_denied(consent)
                     || partner.excluded_for(consent)
@@ -975,9 +985,13 @@ mod tests {
         let client = client_eids_for(&["ids.example.com", "other.example.com"]);
 
         // Act
-        let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context())
-                .expect("should keep the list");
+        let kept = drop_vendor_denied_client_eids(
+            client,
+            Some(&registry),
+            &EcKvSnapshot::NotRead,
+            &vendor_denied_context(),
+        )
+        .expect("should keep the list");
 
         // Assert
         let sources: Vec<&str> = kept.iter().map(|eid| eid.source.as_str()).collect();
@@ -1003,12 +1017,14 @@ mod tests {
         let under_gdpr = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
+            &EcKvSnapshot::NotRead,
             &EcContext::new_for_test(None, gdpr),
         )
         .expect("should keep the list");
         let elsewhere = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
+            &EcKvSnapshot::NotRead,
             &EcContext::new_for_test(None, ConsentContext::default()),
         )
         .expect("should keep the list");
@@ -1039,6 +1055,7 @@ mod tests {
         let kept = drop_vendor_denied_client_eids(
             client_eids_for(&["sharedid.org", "ids.example.com"]),
             Some(&registry),
+            &EcKvSnapshot::NotRead,
             &vendor_denied_context(),
         )
         .expect("should keep the list");
@@ -1067,6 +1084,7 @@ mod tests {
         let kept = drop_vendor_denied_client_eids(
             client_eids_for(&["IDS.example.com", "other.example.com"]),
             Some(&registry),
+            &EcKvSnapshot::NotRead,
             &ec_context,
         )
         .expect("should keep the list");
@@ -1081,6 +1099,104 @@ mod tests {
     }
 
     #[test]
+    fn client_opt_out_filter_uses_only_the_matching_snapshot() {
+        // Arrange
+        let mut ec = create_test_settings().ec;
+        ec.partners = vec![counting_test_partner("ids.example.com")];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse provider"),
+        ];
+        let registry =
+            PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(
+            crate::ec::eid_types::ProviderId::new("example-provider"),
+            u64::MAX,
+        );
+        let context = make_ec_context(Jurisdiction::NonRegulated, Some("example-ec"));
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: "another-ec".to_owned(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+
+        // Act and assert
+        for snapshot in [
+            snapshot,
+            EcKvSnapshot::NotRead,
+            EcKvSnapshot::Missing {
+                ec_id: "example-ec".to_owned(),
+            },
+            EcKvSnapshot::Failed {
+                ec_id: "example-ec".to_owned(),
+            },
+        ] {
+            let result = drop_vendor_denied_client_eids(
+                client_eids_for(&["ids.example.com"]),
+                Some(&registry),
+                &snapshot,
+                &context,
+            )
+            .expect("should preserve list");
+            assert_eq!(
+                result.len(),
+                1,
+                "should not borrow an absent or another visitor's opt-out"
+            );
+        }
+    }
+
+    #[test]
+    fn remembered_opt_out_covers_both_sharedid_aliases_and_normalized_inputs() {
+        for owner_source in ["pubcid.org", "sharedid.org"] {
+            for client_source in ["pubcid.org", "sharedid.org", "PUBCID.ORG.", "SHAREDID.ORG."] {
+                let mut ec = create_test_settings().ec;
+                ec.partners = vec![
+                    counting_test_partner("pubcid.org"),
+                    counting_test_partner("sharedid.org"),
+                ];
+                ec.identity_providers =
+                    vec![toml::from_str(&format!(
+                    "id = \"example-provider\"\nkind = \"test\"\nsources = [\"{owner_source}\"]"
+                )).expect("should parse provider")];
+                let registry = PartnerRegistry::from_ec_with_kinds(&ec, |_| true)
+                    .expect("should build registry");
+                let mut entry = crate::ec::kv_types::KvEntry::tombstone(1);
+                entry.consent.ok = true;
+                entry.opt_outs.insert(
+                    crate::ec::eid_types::ProviderId::new("example-provider"),
+                    u64::MAX,
+                );
+                let context = make_ec_context(Jurisdiction::NonRegulated, Some("example-ec"));
+                let snapshot = EcKvSnapshot::Present {
+                    ec_id: "example-ec".to_owned(),
+                    entry: Box::new(entry),
+                    generation: None,
+                };
+                let result = drop_vendor_denied_client_eids(
+                    client_eids_for(&[client_source, "other.example.com"]),
+                    Some(&registry),
+                    &snapshot,
+                    &context,
+                )
+                .expect("should retain unrelated EID");
+                assert_eq!(
+                    result
+                        .iter()
+                        .map(|eid| eid.source.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["other.example.com"],
+                    "should suppress either SharedID alias: owner={owner_source}, client={client_source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn client_eids_are_unchanged_without_providers() {
         // Arrange
         let registry = partner_registry(&["ids.example.com"]);
@@ -1088,8 +1204,12 @@ mod tests {
         let before = serde_json::to_string(&client).expect("should serialize");
 
         // Act
-        let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context());
+        let kept = drop_vendor_denied_client_eids(
+            client,
+            Some(&registry),
+            &EcKvSnapshot::NotRead,
+            &vendor_denied_context(),
+        );
 
         // Assert
         assert_eq!(
@@ -2403,6 +2523,126 @@ mod tests {
                 .is_none_or(|eids| !eids.iter().any(|eid| eid["source"] == "pubcid.org")),
             "should send no SharedID EID after an opt-out: {eids}"
         );
+    }
+
+    #[tokio::test]
+    async fn auction_remembered_opt_out_filters_cookie_and_body_on_repeated_visits() {
+        for enabled in [false, true] {
+            for from_cookie in [false, true] {
+                for opted_out in [false, true] {
+                    // Arrange
+                    let mut settings = create_test_settings();
+                    settings.ec.partners = vec![
+                        counting_test_partner("ids.example.com"),
+                        counting_test_partner("other.example.com"),
+                    ];
+                    if enabled {
+                        settings.ec.identity_providers = vec![toml::from_str(
+                            "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]"
+                        ).expect("should parse provider")];
+                    }
+                    let registry = PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+                        .expect("should build registry");
+                    let orchestrator = orchestrator_with(AuctionConfig {
+                        enabled: true,
+                        providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+                        timeout_ms: 2000,
+                        ..Default::default()
+                    });
+                    let clock = TestClock::new();
+                    let bidder = ScriptedHttpClient::new(&clock);
+                    let services = build_services_with_outbound_client(&bidder, &clock);
+                    let graph = KvIdentityGraph::in_memory("opt-out-store");
+                    let ec_id = format!("{}.opt001", "a".repeat(64));
+                    let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+                    entry.consent.ok = true;
+                    entry.opt_outs.insert(
+                        crate::ec::eid_types::ProviderId::new("example-provider"),
+                        if opted_out { u64::MAX } else { 1 },
+                    );
+                    graph.create(&ec_id, &entry).await.expect("should seed row");
+                    let client = json!([
+                        {"source": if enabled && opted_out { "IDS.EXAMPLE.COM." } else { "ids.example.com" },"uids":[{"id":"owned-client","atype":1}]},
+                        {"source":"other.example.com","uids":[{"id":"unrelated-client","atype":1}]}
+                    ]);
+                    for visit in 0..2 {
+                        bidder.respond_to(
+                            http::Method::POST,
+                            EID_CAPTURE_ENDPOINT,
+                            ScriptedReply::status(StatusCode::NO_CONTENT),
+                        );
+                        let mut body = json!({"adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]});
+                        let mut request = Request::builder()
+                            .method("POST")
+                            .uri("https://publisher.example.com/auction");
+                        if from_cookie {
+                            request = request.header(
+                                "cookie",
+                                format!(
+                                    "ts-eids={}",
+                                    BASE64.encode(
+                                        serde_json::to_vec(&client).expect("should encode EIDs")
+                                    )
+                                ),
+                            );
+                        } else {
+                            body["eids"] = client.clone();
+                        }
+                        let request = request
+                            .body(EdgeBody::from(
+                                serde_json::to_vec(&body).expect("should encode request"),
+                            ))
+                            .expect("should build request");
+                        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+                        // Act
+                        handle_auction(
+                            &settings,
+                            &orchestrator,
+                            Some(&graph),
+                            Some(&registry),
+                            &mut context,
+                            &services,
+                            request,
+                        )
+                        .await
+                        .expect("should handle auction");
+                        // Assert on delivery, including the positive and no-provider controls.
+                        let sent = bidder.requests();
+                        assert_eq!(sent.len(), visit + 1, "should dispatch every visit");
+                        let payload: serde_json::Value = serde_json::from_slice(&sent[visit].body)
+                            .expect("should decode bidder request");
+                        let mut sources: Vec<&str> = payload["user"]["eids"]
+                            .as_array()
+                            .expect("should deliver unrelated EID")
+                            .iter()
+                            .filter_map(|eid| eid["source"].as_str())
+                            .collect();
+                        sources.sort_unstable();
+                        let expected = if enabled && opted_out {
+                            vec!["other.example.com"]
+                        } else {
+                            vec!["ids.example.com", "other.example.com"]
+                        };
+                        assert_eq!(
+                            sources, expected,
+                            "should honor remembered policy: enabled={enabled}, cookie={from_cookie}, opted_out={opted_out}, visit={visit}"
+                        );
+                        let stored = graph
+                            .get(&ec_id)
+                            .await
+                            .expect("should read row")
+                            .expect("should retain row")
+                            .0;
+                        if opted_out {
+                            assert_eq!(
+                                stored.opt_outs, entry.opt_outs,
+                                "should never clear active memory from client IDs"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
