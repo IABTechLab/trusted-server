@@ -1,57 +1,50 @@
 //! The one-KV-write-per-page-load rule, enforced by types.
 //!
-//! A request classified as a top-level document navigation receives a
+//! A request classified as a browser document navigation receives a
 //! [`NavigationPermit`]. Once the final response status is known it becomes a
 //! [`PageLoadWrite`], which [`KvIdentityGraph::commit_page_load`] consumes.
 //! Neither type is `Clone`, so one navigation makes at most one write before
 //! its response.
 //!
-//! Two writes fall outside this rule. [`AfterResponseWrite`], confirmed
+//! Three writes fall outside this rule. [`AfterResponseWrite`], confirmed
 //! alongside the page load's permit, allows one follow-up update after the
 //! response has been sent, carrying only the results of after-response
 //! identity lookups. A consent withdrawal's tombstone is a privacy write on
-//! any request that carries the EC cookie, and takes no permit.
+//! any request that carries the EC cookie, and takes no permit. Auction body EIDs
+//! use a separate conditional update of an existing live row; that operation
+//! cannot create or recover identity and never receives a navigation permit.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{Method, Request, StatusCode};
+use http::{Request, StatusCode};
 
 use super::EcKvSnapshot;
 use super::kv_types::KvEntry;
+use crate::http_util::is_navigation_request;
 
 /// Issued to a request classified as a page-load navigation.
 #[derive(Debug)]
 pub struct NavigationPermit(());
 
 impl NavigationPermit {
-    /// Returns a permit when `request` is a top-level document navigation:
-    /// `GET`, `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate`, and no
-    /// `prefetch` token in `Sec-Purpose`.
+    /// Authorizes the single write of an admitted same-origin EC POST.
+    ///
+    /// Called only by the shared EC route after bounded consent validation.
+    pub(crate) fn for_ec_route() -> Self {
+        Self(())
+    }
+
+    /// Returns a permit when `request` is a browser document navigation per
+    /// [`is_navigation_request`]: `Sec-Fetch-Dest: document`, or, without
+    /// Fetch Metadata, an `Accept` header naming `text/html`.
+    ///
+    /// This classifier checks navigation signals independently of method.
     ///
     /// Call once per request, from the publisher-proxy route only.
     #[must_use]
     pub fn classify(request: &Request<EdgeBody>) -> Option<Self> {
-        let headers = request.headers();
-        let header_is = |name: &str, expected: &str| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
-        };
-        let prefetch = headers
-            .get("sec-purpose")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split([';', ','])
-                    .any(|token| token.trim().eq_ignore_ascii_case("prefetch"))
-            });
-        let navigation = request.method() == Method::GET
-            && header_is("sec-fetch-dest", "document")
-            && header_is("sec-fetch-mode", "navigate")
-            && !prefetch;
-        navigation.then_some(Self(()))
+        is_navigation_request(request).then_some(Self(()))
     }
 
     /// Confirms the permit once the final response status is known.
@@ -217,10 +210,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_missing_fetch_metadata_iframes_and_prefetch() {
+    fn classify_follows_the_shared_navigation_rule() {
+        assert!(
+            NavigationPermit::classify(&request(&[("sec-fetch-dest", "document")])).is_some(),
+            "should permit a document navigation without Sec-Fetch-Mode"
+        );
+        assert!(
+            NavigationPermit::classify(&request(&[("accept", "text/html")])).is_some(),
+            "should fall back to an Accept header naming text/html without Fetch Metadata"
+        );
         assert!(
             NavigationPermit::classify(&request(&[])).is_none(),
-            "should reject without fetch metadata"
+            "should reject without fetch metadata or an HTML Accept header"
         );
         assert!(
             NavigationPermit::classify(&request(&[
@@ -230,11 +231,13 @@ mod tests {
             .is_none(),
             "should reject iframe"
         );
-        let mut prefetch = DOCUMENT.to_vec();
-        prefetch.push(("sec-purpose", "prefetch;prerender"));
         assert!(
-            NavigationPermit::classify(&request(&prefetch)).is_none(),
-            "should reject prefetch"
+            NavigationPermit::classify(&request(&[
+                ("sec-fetch-dest", "image"),
+                ("accept", "text/html")
+            ]))
+            .is_none(),
+            "should prefer Sec-Fetch-Dest over the Accept fallback"
         );
     }
 
@@ -307,16 +310,18 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn commit_create_reports_existing_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_create_reports_existing_row() {
         let graph = KvIdentityGraph::in_memory("page_load");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         graph
             .commit_page_load(permit(), &ec_id, RowChange::Create(live_entry()))
+            .await
             .expect("should create row");
 
         let error = graph
             .commit_page_load(permit(), &ec_id, RowChange::Create(live_entry()))
+            .await
             .expect_err("should refuse second create");
 
         assert!(
@@ -325,17 +330,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn commit_update_with_stale_generation_conflicts_without_retry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_update_with_stale_generation_conflicts_without_retry() {
         let graph = KvIdentityGraph::in_memory("page_load");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
-        let snapshot = graph.load_snapshot(&ec_id);
+        let snapshot = graph.load_snapshot(&ec_id).await;
         let expected = Generation::of(&snapshot, &ec_id).expect("should read generation");
         graph
             .create_or_revive(&ec_id, &live_entry())
+            .await
             .expect("should no-op on live row");
         graph
             .commit_page_load(
@@ -346,6 +353,7 @@ mod tests {
                     expected,
                 },
             )
+            .await
             .expect("should write at current generation");
 
         let error = graph
@@ -357,6 +365,7 @@ mod tests {
                     expected,
                 },
             )
+            .await
             .expect_err("should reject stale generation");
 
         assert!(

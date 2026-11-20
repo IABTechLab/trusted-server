@@ -14,6 +14,7 @@ use crate::openrtb::{Eid, Uid};
 use super::eid_types::{RawJson, UnixSeconds};
 use super::kv_types::{KvEid, KvEntry, KvPartnerId};
 use super::registry::PartnerRegistry;
+use super::sharedid::{SHAREDID_ATYPE, canonical_source, is_sharedid_source};
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
@@ -109,6 +110,7 @@ impl KvEntry {
     /// excludes where GDPR applies is skipped for a GDPR visitor. Active owner
     /// opt-outs also withhold the source. Legacy single-UID records expire as
     /// soon as an enabled provider owns their source.
+    /// A stored `SharedID` is viewed under `pubcid.org` with agent type 1.
     pub fn live_eids<'row>(
         &'row self,
         registry: &'row PartnerRegistry,
@@ -120,12 +122,20 @@ impl KvEntry {
                 partner.bidstream_enabled
                     && !partner.owner_vendor_consent_denied(consent)
                     && !partner.excluded_for(consent)
-                    && !partner.owner_opted_out(self, now)
-                    && (!partner.provider_owned || record.is_provider_written())
+                    && !registry.source_owner_opted_out(source, self, now)
+                    && (!registry.source_has_enabled_provider_owner(source)
+                        || record.is_provider_written())
             });
-            partner
-                .into_iter()
-                .flat_map(move |partner| source_views(source, record, partner.openrtb_atype, now))
+            partner.into_iter().flat_map(move |partner| {
+                // A stored SharedID is sent as `pubcid.org` with atype 1,
+                // whichever SharedID source holds it.
+                let atype = if is_sharedid_source(source) {
+                    SHAREDID_ATYPE
+                } else {
+                    partner.openrtb_atype
+                };
+                source_views(canonical_source(source), record, atype, now)
+            })
         })
     }
 }
@@ -196,6 +206,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -435,6 +446,58 @@ mod tests {
             1,
             "should allow live provider IDs at the opt-out expiry boundary"
         );
+    }
+
+    #[test]
+    fn live_eids_apply_owned_expiry_and_opt_outs_across_sharedid_aliases() {
+        for (owner, stored) in [
+            ("pubcid.org", "sharedid.org"),
+            ("sharedid.org", "pubcid.org"),
+        ] {
+            let mut ec = crate::test_support::tests::create_test_settings().ec;
+            ec.partners = vec![
+                make_test_partner("pubcid.org"),
+                make_test_partner("sharedid.org"),
+            ];
+            ec.identity_providers = vec![
+                toml::from_str(&format!(
+                    "id = \"example-provider\"\nkind = \"test\"\nsources = [\"{owner}\"]"
+                ))
+                .expect("should parse provider"),
+            ];
+            let registry =
+                PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+            let consent = ConsentContext::default();
+            let mut entry = KvEntry::minimal(stored, "legacy-browser-uid", 1);
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(19))
+                    .count(),
+                0,
+                "should expire legacy alias records when either emitted-source owner is enabled"
+            );
+            entry.ids.insert(
+                stored.to_owned(),
+                provider_record(&[("provider-uid", Expiry::Never)]),
+            );
+            entry
+                .opt_outs
+                .insert(ProviderId::new("example-provider"), 20);
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(19))
+                    .count(),
+                0,
+                "should withhold an alias during remembered opt-out"
+            );
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(20))
+                    .count(),
+                1,
+                "should restore live provider alias at expiry"
+            );
+        }
     }
 
     #[test]

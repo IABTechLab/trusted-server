@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU16;
 
 use error_stack::{Report, ResultExt as _};
+use http::HeaderValue;
 
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
@@ -18,6 +19,10 @@ use crate::settings::{Ec, EcPartner};
 use super::eid_types::{ProviderId, UnixSeconds};
 use super::kv_types::KvEntry;
 use super::partner::{hash_api_key, normalize_partner_source_domain};
+use super::sharedid::{LEGACY_SHAREDID_SOURCE, SHAREDID_SOURCE, is_sharedid_source};
+
+/// Provider kind under which pull-sync partners run as identity providers.
+pub const PULL_SYNC_KIND: &str = "pull-sync";
 
 /// Minimum length for inbound partner Bearer API tokens.
 pub const MIN_API_TOKEN_LENGTH: usize = 32;
@@ -33,6 +38,9 @@ pub struct PartnerConfig {
     pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     pub bidstream_enabled: bool,
+    /// Whether this partner's provider-written UIDs are mirrored to the
+    /// JS-readable `__Host-ts-eids-mirror` cookie.
+    pub mirror_enabled: bool,
     /// SHA-256 hex of the partner's API token, when inbound API access is enabled.
     pub api_key_hash: Option<String>,
     /// Max batch sync API requests per partner per minute.
@@ -52,8 +60,12 @@ pub struct PartnerConfig {
     pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
-    /// Whether an enabled identity provider claims this source. Browser
-    /// ingest skips it and batch sync rejects it.
+    /// Whether the partner runs pull sync as an identity provider
+    /// ([`EcPartner::runs_pull_sync`]). Browser ingest and batch sync still
+    /// fill its source.
+    pub runs_pull_sync: bool,
+    /// Whether an enabled configured identity provider claims this source.
+    /// Browser ingest skips it and batch sync rejects it.
     pub provider_owned: bool,
     /// Enabled providers claiming this source, used to enforce remembered opt-outs.
     pub owner_provider_ids: Vec<ProviderId>,
@@ -102,9 +114,42 @@ impl PartnerConfig {
 pub struct PartnerRegistry {
     by_source_domain: HashMap<String, PartnerConfig>,
     by_api_key_hash: HashMap<String, String>,
+    /// Normalized source domains in `[[ec.partners]]` order.
+    order: Vec<String>,
 }
 
 impl PartnerRegistry {
+    /// Checks all enabled owners of the emitted source, including `SharedID` aliases.
+    pub(crate) fn source_owner_opted_out(
+        &self,
+        source: &str,
+        entry: &KvEntry,
+        now: UnixSeconds,
+    ) -> bool {
+        self.source_owners(source)
+            .into_iter()
+            .flatten()
+            .any(|partner| partner.owner_opted_out(entry, now))
+    }
+
+    /// Whether an enabled provider owns the emitted source or its `SharedID` alias.
+    pub(crate) fn source_has_enabled_provider_owner(&self, source: &str) -> bool {
+        self.source_owners(source)
+            .into_iter()
+            .flatten()
+            .any(|partner| partner.provider_owned)
+    }
+
+    fn source_owners(&self, source: &str) -> [Option<&PartnerConfig>; 2] {
+        // Both stored SharedID spellings emit one canonical bidder namespace.
+        // Keep unrelated domains on their existing exact normalized lookup.
+        if is_sharedid_source(source.trim().trim_end_matches('.')) {
+            [self.get(SHAREDID_SOURCE), self.get(LEGACY_SHAREDID_SOURCE)]
+        } else {
+            [self.get(source), None]
+        }
+    }
+
     /// Validates partner structure without inspecting secret values.
     ///
     /// This is the push-time half of partner validation. API-token length,
@@ -156,6 +201,8 @@ impl PartnerRegistry {
                     })
                 })?;
 
+            validate_mirror_requires_bidstream(partner, &normalized_source)?;
+
             if partner.pull_sync_enabled {
                 validate_pull_sync_fields(
                     partner.pull_sync_url.as_deref(),
@@ -187,6 +234,7 @@ impl PartnerRegistry {
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
         let mut by_source_domain = HashMap::with_capacity(partners.len());
         let mut by_api_key_hash = HashMap::with_capacity(partners.len());
+        let mut order = Vec::with_capacity(partners.len());
 
         for partner in partners {
             let normalized_source = normalize_partner_source_domain(&partner.source_domain)
@@ -219,6 +267,8 @@ impl PartnerRegistry {
                 None
             };
 
+            validate_mirror_requires_bidstream(partner, &normalized_source)?;
+
             let config = build_partner_config(partner, &normalized_source, api_key_hash.as_deref());
 
             validate_rate_limits(&config).change_context(TrustedServerError::Configuration {
@@ -240,12 +290,14 @@ impl PartnerRegistry {
             if let Some(api_key_hash) = api_key_hash {
                 by_api_key_hash.insert(api_key_hash, normalized_source.clone());
             }
+            order.push(normalized_source.clone());
             by_source_domain.insert(normalized_source, config);
         }
 
         Ok(Self {
             by_source_domain,
             by_api_key_hash,
+            order,
         })
     }
 
@@ -315,6 +367,7 @@ impl PartnerRegistry {
         Self {
             by_source_domain: HashMap::new(),
             by_api_key_hash: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -392,17 +445,11 @@ impl PartnerRegistry {
             .is_some_and(|partner| partner.provider_owned)
     }
 
-    /// Returns all partners with `pull_sync_enabled = true` whose source no
-    /// identity provider owns.
-    ///
-    /// A provider writes full-fidelity records for the sources it owns, so a
-    /// pull-sync write there would overwrite them with a single UID.
-    #[must_use]
-    pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
-        self.by_source_domain
-            .values()
-            .filter(|p| p.pull_sync_enabled && !p.provider_owned)
-            .collect()
+    /// Partners in `[[ec.partners]]` order.
+    pub fn in_config_order(&self) -> impl Iterator<Item = &PartnerConfig> {
+        self.order
+            .iter()
+            .filter_map(|source| self.by_source_domain.get(source))
     }
 
     /// Returns an iterator over all configured partners.
@@ -459,6 +506,7 @@ fn build_partner_config(
         source_domain: normalized_source.to_owned(),
         openrtb_atype: partner.openrtb_atype,
         bidstream_enabled: partner.bidstream_enabled,
+        mirror_enabled: partner.mirror_enabled,
         api_key_hash: api_key_hash.map(ToOwned::to_owned),
         batch_rate_limit: partner.batch_rate_limit,
         pull_sync_enabled: partner.pull_sync_enabled,
@@ -467,11 +515,28 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        runs_pull_sync: partner.runs_pull_sync(),
         provider_owned: false,
         owner_provider_ids: Vec::new(),
         owner_tcf_vendor_ids: Vec::new(),
         excluded_where_gdpr_applies: false,
     }
+}
+
+/// Rejects `mirror_enabled` without `bidstream_enabled`: the mirror only
+/// carries bidstream UIDs, so the flag alone would silently do nothing.
+fn validate_mirror_requires_bidstream(
+    partner: &EcPartner,
+    normalized_source: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if partner.mirror_enabled && !partner.bidstream_enabled {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.partners: '{normalized_source}' sets mirror_enabled without bidstream_enabled"
+            ),
+        }));
+    }
+    Ok(())
 }
 
 fn validate_rate_limits(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
@@ -572,6 +637,17 @@ fn validate_pull_sync_fields(
         }));
     }
 
+    // The resolved token is sent as `Authorization: Bearer <token>`; one that
+    // is not a valid header value would fail every provider build at startup.
+    if require_nonempty_token
+        && token_value
+            .is_some_and(|value| HeaderValue::try_from(format!("Bearer {value}")).is_err())
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "ts_pull_token must be valid in an HTTP Authorization header".to_owned(),
+        }));
+    }
+
     Ok(())
 }
 
@@ -590,6 +666,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -604,9 +681,15 @@ mod tests {
     #[test]
     fn from_ec_marks_enabled_provider_sources_only() {
         let mut ec = crate::test_support::tests::create_test_settings().ec;
+        let mut pull = make_partner("pull.example.com", &valid_api_token("pull-partner"));
+        pull.pull_sync_enabled = true;
+        pull.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        pull.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        pull.ts_pull_token = Some(Redacted::new("example-pull-token".to_owned()));
         ec.partners = vec![
             make_partner("ids.example.com", &valid_api_token("ids-partner")),
             make_partner("other.example.com", &valid_api_token("other-partner")),
+            pull,
         ];
         ec.identity_providers = vec![
             toml::from_str(
@@ -619,8 +702,9 @@ mod tests {
             .expect("should parse disabled provider"),
         ];
 
-        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
-            .expect("should build registry");
+        let registry =
+            PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k" || kind == PULL_SYNC_KIND)
+                .expect("should build registry");
 
         assert!(
             registry.is_provider_owned("ids.example.com"),
@@ -636,6 +720,22 @@ mod tests {
                 .map(|partner| partner.owner_tcf_vendor_ids.clone()),
             Some(vec![NonZeroU16::new(42).expect("should be non-zero")]),
             "should keep the disabled provider's vendor consent gate"
+        );
+        assert!(
+            !registry.is_provider_owned("pull.example.com"),
+            "should keep browser and batch ingest for a source owned only by pull sync"
+        );
+        assert!(
+            registry
+                .get("pull.example.com")
+                .is_some_and(|partner| partner.runs_pull_sync),
+            "should record that the partner runs pull sync"
+        );
+        assert!(
+            !registry
+                .get("ids.example.com")
+                .is_some_and(|partner| partner.runs_pull_sync),
+            "should not record pull sync for a partner without it"
         );
     }
 
@@ -697,13 +797,13 @@ mod tests {
         );
         let mut entry = KvEntry::tombstone(1);
         for owner in ["old", "unknown"] {
-            entry.remember_opt_out(&ProviderId::new(owner), UnixSeconds::new(100));
+            entry.remember_opt_out(&ProviderId::new(owner), UnixSeconds::new(100), &[]);
         }
         assert!(
             !partner.owner_opted_out(&entry, UnixSeconds::new(100)),
             "should ignore disabled and unknown providers' opt-outs"
         );
-        entry.remember_opt_out(&ProviderId::new("new"), UnixSeconds::new(100));
+        entry.remember_opt_out(&ProviderId::new("new"), UnixSeconds::new(100), &[]);
         assert!(
             partner.owner_opted_out(&entry, UnixSeconds::new(100)),
             "should honor the enabled owner's opt-out"
@@ -777,6 +877,27 @@ mod tests {
         assert!(
             !plain.is_provider_owned("ids.example.com"),
             "should not claim sources without provider implementations"
+        );
+    }
+
+    #[test]
+    fn in_config_order_preserves_partner_order() {
+        let partners = vec![
+            make_partner("c.example.com", &valid_api_token("token-c")),
+            make_partner("a.example.com", &valid_api_token("token-a")),
+            make_partner("b.example.com", &valid_api_token("token-b")),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+
+        let order: Vec<&str> = registry
+            .in_config_order()
+            .map(|partner| partner.source_domain.as_str())
+            .collect();
+
+        assert_eq!(
+            order,
+            ["c.example.com", "a.example.com", "b.example.com"],
+            "should keep config order"
         );
     }
 
@@ -915,26 +1036,27 @@ mod tests {
     }
 
     #[test]
-    fn pull_enabled_partners_excludes_provider_owned_sources() {
+    fn from_config_rejects_a_pull_token_invalid_in_a_header() {
         let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
-        pull_partner.api_token = None;
         pull_partner.pull_sync_enabled = true;
         pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
-        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
-        let mut registry =
-            PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
+        pull_partner.ts_pull_token = Some(Redacted::new("example\ntoken".to_owned()));
 
-        registry.mark_provider_owned("pull.example.com", None);
-
+        let error = PartnerRegistry::from_config(std::slice::from_ref(&pull_partner))
+            .expect_err("should reject a pull token that is not a valid header value");
         assert!(
-            registry.pull_enabled_partners().is_empty(),
-            "should not pull sources an identity provider owns"
+            format!("{error:?}").contains("Authorization header"),
+            "should name the header problem"
         );
+
+        pull_partner.pull_sync_enabled = false;
+        PartnerRegistry::from_config(&[pull_partner])
+            .expect("should not validate the pull token of a partner without pull sync");
     }
 
     #[test]
-    fn pull_enabled_partners_filters_correctly() {
+    fn pull_sync_partner_keeps_its_token_without_an_api_token() {
         let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
         pull_partner.api_token = None;
         pull_partner.pull_sync_enabled = true;
@@ -948,22 +1070,19 @@ mod tests {
         ];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
-        let pull_enabled = registry.pull_enabled_partners();
-        assert_eq!(
-            pull_enabled.len(),
-            1,
-            "should have exactly one pull-enabled partner"
-        );
-        assert_eq!(
-            pull_enabled[0].source_domain, "pull.example.com",
-            "should be the correct partner"
+        let pull_partner = registry
+            .get("pull.example.com")
+            .expect("should register the pull-sync partner");
+        assert!(
+            pull_partner.pull_sync_enabled,
+            "should keep pull sync enabled"
         );
         assert!(
-            pull_enabled[0].api_key_hash.is_none(),
+            pull_partner.api_key_hash.is_none(),
             "should allow pull sync without an inbound API token"
         );
         assert_eq!(
-            pull_enabled[0]
+            pull_partner
                 .ts_pull_token
                 .as_ref()
                 .expect("should keep pull token")
@@ -1023,6 +1142,36 @@ mod tests {
             registry.get("ssp.example.com").is_some(),
             "should accept minimum-length token"
         );
+    }
+
+    #[test]
+    fn mirror_without_bidstream_is_rejected() {
+        let mut partner = make_partner("ids.example.com", &valid_api_token("token-m"));
+        partner.mirror_enabled = true;
+
+        let runtime = PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect_err("should reject mirror_enabled without bidstream_enabled at startup");
+        let deploy = PartnerRegistry::validate_config_for_deploy(std::slice::from_ref(&partner))
+            .expect_err("should reject mirror_enabled without bidstream_enabled at push");
+
+        for error in [runtime, deploy] {
+            assert!(
+                format!("{error:?}").contains("mirror_enabled without bidstream_enabled"),
+                "should name the misconfiguration: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_with_bidstream_is_accepted() {
+        let mut partner = make_partner("ids.example.com", &valid_api_token("token-m"));
+        partner.mirror_enabled = true;
+        partner.bidstream_enabled = true;
+
+        PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect("should accept mirror_enabled with bidstream_enabled");
+        PartnerRegistry::validate_config_for_deploy(std::slice::from_ref(&partner))
+            .expect("should accept mirror_enabled with bidstream_enabled at push");
     }
 
     #[test]

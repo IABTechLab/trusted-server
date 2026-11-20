@@ -1,9 +1,9 @@
 //! The app-config type that `ts config push`, `validate` and `diff` check.
 //!
 //! [`TrustedServerAppConfig`] validation lives in core, which cannot build
-//! identity providers because the provider crate depends on core. At runtime
-//! a provider that fails to build disables every provider for the request, so
-//! this wrapper adds [`validate_providers`] to the config checks: a
+//! identity providers because the provider crate depends on core. On Fastly
+//! and Axum, a provider that fails to build prevents application startup, so this
+//! wrapper adds [`validate_providers`] to the config checks: a
 //! provider-specific setting error then fails the command before deploy.
 //!
 //! `push` and `diff` name a target adapter, so for one that does not run
@@ -54,8 +54,8 @@ impl AppConfigMeta for CheckedAppConfig {
 
 /// Whether the named target adapter runs identity providers.
 ///
-/// The Fastly and Axum adapters run them; the Cloudflare and Spin adapters
-/// refuse to start with an enabled provider.
+/// Fastly and Axum run the shared coordinators. Cloudflare and Spin refuse
+/// to start with an enabled provider.
 pub(crate) fn adapter_runs_identity_providers(adapter: &str) -> bool {
     matches!(adapter, "fastly" | "axum")
 }
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn fastly_and_axum_run_identity_providers_and_other_adapters_do_not() {
+    fn supported_adapters_run_identity_providers() {
         for adapter in ["fastly", "axum"] {
             assert!(
                 adapter_runs_identity_providers(adapter),

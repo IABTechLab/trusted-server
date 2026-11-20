@@ -117,6 +117,17 @@ pub trait IdentityProvider: Send + Sync {
         false
     }
 
+    /// Whether a live stored UID is kept over any UID a cookie carries.
+    ///
+    /// For a publisher first-party ID such as `SharedID`, the stored value
+    /// wins over a different browser value and the response writes it back.
+    /// When this returns `true`, a cookie UID for a source the row holds a
+    /// live UID for is ignored; a cookie opt-out still wins. The default
+    /// always takes the cookie.
+    fn keeps_stored_uids(&self) -> bool {
+        false
+    }
+
     /// Whether this provider's request carries the EC ID.
     ///
     /// A provider that does not send it may run on the navigation that mints
@@ -168,6 +179,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn keeps_fresher_stored_uids(&self) -> bool {
         (**self).keeps_fresher_stored_uids()
+    }
+
+    fn keeps_stored_uids(&self) -> bool {
+        (**self).keeps_stored_uids()
     }
 }
 
@@ -694,11 +709,12 @@ pub(crate) fn parse_sources(
 }
 
 /// Whether `url` is `https` and its host is one of `allowed_domains`,
-/// compared ASCII case-insensitively.
+/// compared ASCII case-insensitively, ignoring a trailing dot on the host.
 #[must_use]
 pub(crate) fn destination_allowed<S: AsRef<str>>(url: &Url, allowed_domains: &[S]) -> bool {
     url.scheme() == "https"
         && url.host_str().is_some_and(|host| {
+            let host = host.strip_suffix('.').unwrap_or(host);
             allowed_domains
                 .iter()
                 .any(|allowed| allowed.as_ref().eq_ignore_ascii_case(host))

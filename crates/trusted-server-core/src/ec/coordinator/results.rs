@@ -1,5 +1,7 @@
 //! Per-provider outcomes of one navigation's lookups.
 
+use std::collections::BTreeMap;
+
 use crate::ec::eid_types::{EidValidationError, ProviderId, SourceDomain};
 use crate::ec::kv_types::KvEid;
 
@@ -63,12 +65,18 @@ pub enum SkipReason {
     Destination,
     /// The provider's hourly rate limit is reached.
     RateLimited,
-    /// The vendor or its cookies report an opt-out; the provider's stored
-    /// UIDs are removed.
+    /// Pull sync already dispatched `pull_sync_concurrency` partners on this
+    /// navigation.
+    ConcurrencyCap,
+    /// An opt-out remembered in the row has not lapsed; the provider's
+    /// stored UIDs are removed.
     OptedOut,
     /// Every source of the provider is excluded where GDPR applies; the
     /// provider's stored UIDs are removed.
     Region,
+    /// The row snapshot read failed, so consent state (such as a withdrawal
+    /// tombstone) is unknown.
+    SnapshotUnavailable,
 }
 
 /// One outcome per provider per navigation.
@@ -93,6 +101,9 @@ pub enum LookupStatus {
     TransportFailed,
     /// The body could not be parsed at all.
     InvalidResponse,
+    /// The provider reported an opt-out in this navigation; its stored UIDs
+    /// are removed and the opt-out is remembered.
+    OptedOut,
     /// The provider was not called.
     Skipped(SkipReason),
 }
@@ -109,12 +120,15 @@ impl LookupStatus {
             Self::RequestFailed => "request_error",
             Self::TransportFailed => "transport_error",
             Self::InvalidResponse => "invalid_response",
+            Self::OptedOut => "opted_out",
             Self::Skipped(SkipReason::NoRow) => "skipped_no_row",
             Self::Skipped(SkipReason::Consent) => "skipped_consent",
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
             Self::Skipped(SkipReason::Region) => "skipped_region",
+            Self::Skipped(SkipReason::ConcurrencyCap) => "skipped_concurrency_cap",
+            Self::Skipped(SkipReason::SnapshotUnavailable) => "skipped_snapshot_unavailable",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }
@@ -145,7 +159,8 @@ pub struct ProviderLookup {
     /// Validated entries per returned source; empty unless `Found`.
     pub entries: Vec<(SourceDomain, Vec<KvEid>)>,
     /// Sources whose stored records are removed, because the user opted
-    /// out of the provider; empty unless `Skipped(OptedOut)`.
+    /// out of the provider or GDPR excludes them; empty unless `OptedOut`,
+    /// `Skipped(OptedOut)` or `Skipped(Region)`, or a source is excluded.
     pub cleared: Vec<SourceDomain>,
     /// What this lookup does to the provider's remembered opt-out.
     pub opt_out: OptOutMemory,
@@ -157,6 +172,11 @@ pub struct LookupResults {
     /// EC ID the lookups were made for; `None` when nothing was looked up.
     ec_id: Option<String>,
     lookups: Vec<ProviderLookup>,
+    /// The row's revocations when the lookups were dispatched.
+    revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each looked-up provider at dispatch, kept
+    /// with an opt-out its server reports.
+    known_uids: BTreeMap<ProviderId, Vec<String>>,
 }
 
 impl LookupResults {
@@ -167,7 +187,41 @@ impl LookupResults {
         Self {
             ec_id: Some(ec_id.to_owned()),
             lookups,
+            revocations: BTreeMap::new(),
+            known_uids: BTreeMap::new(),
         }
+    }
+
+    /// Records the hashes of the UIDs known for each looked-up provider at
+    /// dispatch: its cookies' and the row's.
+    #[must_use]
+    pub fn with_known_uids(mut self, known_uids: BTreeMap<ProviderId, Vec<String>>) -> Self {
+        self.known_uids = known_uids;
+        self
+    }
+
+    /// Hashes of the UIDs known for `provider` when its lookup was
+    /// dispatched; an opt-out its server reports is remembered with them.
+    #[must_use]
+    pub fn known_uids(&self, provider: &ProviderId) -> &[String] {
+        self.known_uids.get(provider).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the row's revocations as the lookups' dispatch saw them.
+    #[must_use]
+    pub fn dispatched_with(mut self, revocations: BTreeMap<ProviderId, u64>) -> Self {
+        self.revocations = revocations;
+        self
+    }
+
+    /// The revocation of `provider` the row held when its lookup was
+    /// dispatched.
+    ///
+    /// A row holding a different one has seen a newer opt-out since, so the
+    /// lookup's result is stale.
+    #[must_use]
+    pub fn revocation_at_dispatch(&self, provider: &ProviderId) -> Option<u64> {
+        self.revocations.get(provider).copied()
     }
 
     /// Whether these results were looked up for `ec_id`.

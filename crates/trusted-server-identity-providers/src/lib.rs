@@ -17,11 +17,13 @@ pub mod criteo;
 pub mod id5;
 pub mod liveintent;
 pub mod liveramp;
+pub mod pull_sync;
 pub mod sharedid;
 pub mod uid2;
 pub mod unifiedid;
 
 use std::borrow::Cow;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,11 +34,13 @@ use trusted_server_core::ec::provider::{
     IdentityProvider, ProviderConfigError, ProviderKind as _, build_kind,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sharedid::SharedIdStorage;
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::prebid::{PrebidIntegrationConfig, PrebidUserIdStorageType};
 use trusted_server_core::settings::{
     CollectTiming, Ec, IdentityProviderConfig, ProviderSecrets, Settings,
 };
+
+use crate::pull_sync::PullSync;
 
 /// Whether `kind` has a registered implementation.
 ///
@@ -52,6 +56,7 @@ pub fn is_registered_kind(kind: &str) -> bool {
             | sharedid::SharedId::KIND
             | criteo::Criteo::KIND
             | unifiedid::UnifiedId::KIND
+            | PullSync::KIND
     )
 }
 
@@ -78,7 +83,8 @@ fn excludes_where_gdpr_applies(kind: &str, source: &str) -> bool {
 }
 
 /// Builds the partner registry, marking the sources claimed by enabled
-/// providers as provider-owned.
+/// configured providers as provider-owned. A pull-sync partner's source is
+/// not marked, so browser ingest and batch sync still fill it.
 ///
 /// The sources any configured provider, enabled or disabled, excludes where
 /// GDPR applies are marked too, so the UIDs already stored for them are
@@ -119,9 +125,37 @@ pub fn build(
         sharedid::SharedId::KIND => build_kind::<sharedid::SharedId>(config, secrets),
         criteo::Criteo::KIND => build_kind::<criteo::Criteo>(config, secrets),
         unifiedid::UnifiedId::KIND => build_kind::<unifiedid::UnifiedId>(config, secrets),
+        PullSync::KIND => build_kind::<PullSync>(config, secrets),
         kind => Err(Report::new(ProviderConfigError::UnknownKind)
             .attach(format!("kind `{kind}` is not registered"))),
     }
+}
+
+/// One `pull-sync` provider per partner with pull sync enabled, built from the
+/// partner's existing fields with no config change.
+///
+/// Pull sync runs after the response has been sent, so a slow partner never
+/// delays the page and a new EC whose row does not exist yet is never pulled.
+/// Its hourly rate limit is the partner's `pull_sync_rate_limit`, which
+/// partner validation keeps nonzero.
+pub fn pull_sync_providers(ec: &Ec) -> impl Iterator<Item = IdentityProviderConfig> + '_ {
+    ec.partners
+        .iter()
+        .filter(|partner| partner.runs_pull_sync())
+        .filter_map(|partner| {
+            let endpoint = partner.pull_sync_url.clone()?;
+            let mut config = IdentityProviderConfig::new(
+                format!("pull-sync:{}", partner.source_domain),
+                PullSync::KIND.to_owned(),
+                endpoint,
+                partner.pull_sync_allowed_domains.clone(),
+                vec![partner.source_domain.clone()],
+            );
+            config.secrets.token = partner.ts_pull_token.clone();
+            config.collect = CollectTiming::AfterResponse;
+            config.rate_limit_per_hour = NonZeroU32::new(partner.pull_sync_rate_limit);
+            Some(config)
+        })
 }
 
 /// Builds the coordinator for enabled providers collected before the
@@ -182,13 +216,12 @@ pub fn build_after_response_coordinator(
     )
 }
 
-/// Builds every enabled provider of both collection phases, as the adapters
-/// do on each navigation, so a provider-specific setting error is reported
+/// Builds every enabled provider of both collection phases, as the Fastly
+/// adapter does at startup, so a provider-specific setting error is reported
 /// before deploy.
 ///
-/// At runtime such an error disables every provider for the request, so
-/// deploy-time config validation (`ts config push`, `validate` and `diff`)
-/// calls this. Partner tokens may still be secret key names at that point;
+/// On Fastly such an error prevents application startup, so deploy-time
+/// config validation (`ts config push`, `validate` and `diff`) calls this. Partner tokens may still be secret key names at that point;
 /// they are replaced with placeholders for the check.
 ///
 /// # Errors
@@ -216,55 +249,54 @@ pub fn validate_providers(settings: &Settings) -> Result<(), Report<ProviderConf
     Ok(())
 }
 
-/// Prebid `userSync.userIds` names of the `SharedID` module.
-const PREBID_SHAREDID_NAMES: [&str; 2] = ["sharedId", "pubCommonId"];
-
-/// The cookie Prebid's `SharedID` module stores its ID in, as configured in
-/// `integrations.prebid.managed_user_ids[].storage.name`.
+/// Applies Prebid's `SharedID` storage to a `sharedid` provider.
 ///
-/// `None` when Prebid is not configured, manages no `SharedID` module, or
-/// keeps it in local storage.
-fn prebid_sharedid_cookie(settings: &Settings) -> Option<String> {
-    let prebid = match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
-        Ok(prebid) => prebid?,
-        Err(report) => {
-            log::warn!("Identity providers: Prebid config unreadable: {report}");
-            return None;
-        }
-    };
-    prebid
-        .managed_user_ids
-        .into_iter()
-        .filter(|entry| {
-            PREBID_SHAREDID_NAMES
-                .iter()
-                .any(|name| entry.name.eq_ignore_ascii_case(name))
-        })
-        .find_map(|entry| entry.storage)
-        .filter(|storage| storage.storage_type == PrebidUserIdStorageType::Cookie)
-        .map(|storage| storage.name)
-}
-
-/// Fills a `sharedid` provider's `cookie_names` with the cookie Prebid's
-/// `SharedID` module is configured to use, unless the provider sets its own.
+/// When Prebid stores the `SharedID` in a cookie, fills `cookie_names` with
+/// that cookie and turns `generate` on, unless the provider sets either
+/// itself: the server creates a `SharedID` for a reader who has none and
+/// writes it back to the cookie. When Prebid keeps the `SharedID` in local
+/// storage only, turns `generate` off: Prebid never reads a server-made ID
+/// there, so generating one would split the reader's identity.
 fn with_prebid_sharedid_cookie<'config>(
     config: &'config IdentityProviderConfig,
     settings: &Settings,
 ) -> Cow<'config, IdentityProviderConfig> {
-    if config.kind() != sharedid::SharedId::KIND
-        || config.settings.contains_key(sharedid::COOKIE_NAMES_SETTING)
-    {
+    if config.kind() != sharedid::SharedId::KIND {
         return Cow::Borrowed(config);
     }
-    let Some(cookie) = prebid_sharedid_cookie(settings) else {
-        return Cow::Borrowed(config);
-    };
-    let mut config = config.clone();
-    config.settings.insert(
-        sharedid::COOKIE_NAMES_SETTING.to_owned(),
-        serde_json::Value::from(vec![cookie]),
-    );
-    Cow::Owned(config)
+    match settings.sharedid_storage() {
+        SharedIdStorage::Cookie(cookie)
+            if !config.settings.contains_key(sharedid::COOKIE_NAMES_SETTING)
+                || !config.settings.contains_key(sharedid::GENERATE_SETTING) =>
+        {
+            let mut config = config.clone();
+            config
+                .settings
+                .entry(sharedid::COOKIE_NAMES_SETTING)
+                .or_insert_with(|| serde_json::Value::from(vec![cookie]));
+            config
+                .settings
+                .entry(sharedid::GENERATE_SETTING)
+                .or_insert(serde_json::Value::Bool(true));
+            Cow::Owned(config)
+        }
+        SharedIdStorage::LocalStorageOnly
+            if config.settings.get(sharedid::GENERATE_SETTING)
+                == Some(&serde_json::Value::Bool(true)) =>
+        {
+            log::warn!(
+                "Identity providers: `{}` does not generate SharedID because Prebid keeps it in local storage",
+                config.id
+            );
+            let mut config = config.clone();
+            config.settings.insert(
+                sharedid::GENERATE_SETTING.to_owned(),
+                serde_json::Value::Bool(false),
+            );
+            Cow::Owned(config)
+        }
+        _ => Cow::Borrowed(config),
+    }
 }
 
 fn build_phase_coordinator(
@@ -276,21 +308,57 @@ fn build_phase_coordinator(
     // Source ownership across both phases is checked when settings load
     // (`config::validate_identity_providers`), so only this phase's providers
     // are built and checked here.
-    let registered = settings
+    let configured = settings
         .ec
         .identity_providers
         .iter()
-        .filter(|config| config.enabled && config.collect == timing)
+        .filter(|config| config.enabled)
+        .cloned();
+    let registered = configured
+        .chain(pull_sync_providers(&settings.ec))
+        .filter(|config| config.collect == timing)
         .map(|config| {
-            let config = with_prebid_sharedid_cookie(config, settings);
+            let config = with_prebid_sharedid_cookie(&config, settings).into_owned();
             build(&config, &config.secrets)
-                .map(|provider| RegisteredProvider::new(config.into_owned(), provider))
+                .map(|provider| RegisteredProvider::new(config, provider))
         })
         .collect::<Result<Vec<_>, Report<ProviderConfigError>>>()?;
     if registered.is_empty() {
         return Ok(None);
     }
-    ProviderCoordinator::new(registered, partners, budget).map(Some)
+    let pull_sync_concurrency = NonZeroUsize::new(settings.ec.pull_sync_concurrency);
+    ProviderCoordinator::new(registered, partners, budget)
+        .map(|coordinator| Some(coordinator.with_pull_sync_concurrency(pull_sync_concurrency)))
+}
+
+/// Builds provider coordinators shared by serving adapters.
+///
+/// # Errors
+///
+/// Returns a configuration error when an enabled provider cannot be constructed.
+pub fn identity_providers(
+    settings: &Settings,
+) -> Result<trusted_server_core::ec::app::IdentityProviders, Report<TrustedServerError>> {
+    let partners = Arc::new(partner_registry(&settings.ec)?);
+    let page = build_coordinator_with(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    let after_response = build_after_response_coordinator(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    Ok(trusted_server_core::ec::app::IdentityProviders {
+        partners,
+        page,
+        after_response,
+    })
 }
 
 #[cfg(test)]
@@ -495,6 +563,39 @@ mod tests {
     }
 
     #[test]
+    fn pull_sync_partner_runs_after_the_response() {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![
+            toml::from_str(
+                r#"
+                name = "Pull partner"
+                source_domain = "partner.example.com"
+                pull_sync_enabled = true
+                pull_sync_url = "https://sync.example.com/pull"
+                pull_sync_allowed_domains = ["sync.example.com"]
+                ts_pull_token = "example-pull-token-32-bytes-minimum"
+                "#,
+            )
+            .expect("should parse partner"),
+        ];
+
+        let page = build_coordinator(&settings).expect("should build page providers");
+        let partners = Arc::new(partner_registry(&settings.ec).expect("should build partners"));
+        let after_response = build_after_response_coordinator(&settings, partners)
+            .expect("should build pull-sync providers")
+            .expect("should build an after-response coordinator");
+
+        assert!(
+            page.is_none(),
+            "should not run pull sync before the response"
+        );
+        assert!(
+            !after_response.is_empty(),
+            "should run pull sync after the response"
+        );
+    }
+
+    #[test]
     fn enabled_unknown_kind_fails_the_build() {
         let mut settings = create_test_settings();
         settings.ec.identity_providers = vec![
@@ -587,6 +688,69 @@ mod tests {
         assert!(
             matches!(config, Cow::Borrowed(_)),
             "should not take a local-storage key as a cookie name"
+        );
+    }
+
+    #[test]
+    fn sharedid_does_not_generate_when_prebid_uses_local_storage() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers[0]
+            .settings
+            .insert("generate".to_owned(), json!(true));
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "html5", "name": "_pubcid" }),
+        );
+
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(false)),
+            "should not generate a SharedID Prebid would never read"
+        );
+    }
+
+    #[test]
+    fn sharedid_generates_by_default_when_prebid_uses_a_cookie() {
+        // Arrange
+        let mut settings = settings_with_cookie_providers("page", "page");
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+
+        // Act
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        // Assert
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(true)),
+            "should create a SharedID for a reader who has none"
+        );
+    }
+
+    #[test]
+    fn sharedid_generate_setting_wins_over_the_default() {
+        // Arrange
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers[0]
+            .settings
+            .insert("generate".to_owned(), json!(false));
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+
+        // Act
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        // Assert
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(false)),
+            "should honour an explicit generate setting"
         );
     }
 

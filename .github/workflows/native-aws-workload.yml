@@ -1,0 +1,62 @@
+name: Native AWS deployment example
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/examples/native-aws-workload/**'
+      - '.tool-versions'
+      - '.github/workflows/native-aws-workload.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/examples/native-aws-workload/**'
+      - '.tool-versions'
+      - '.github/workflows/native-aws-workload.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+      TF_IN_AUTOMATION: 'true'
+      CHECKPOINT_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Read pinned tooling
+        id: versions
+        run: |
+          terraform=$(awk '$1 == "terraform" { print $2 }' .tool-versions)
+          node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)
+          test -n "$terraform"
+          test -n "$node"
+          printf 'terraform=%s\nnode=%s\n' "$terraform" "$node" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ steps.versions.outputs.terraform }}
+          terraform_wrapper: false
+
+      - name: Check the offline workflow contract
+        run: node --test deploy/examples/native-aws-workload/test-workflow.mjs
+
+      - name: Validate schema and credential-free mock plans
+        run: |
+          terraform -chdir=deploy/examples/native-aws-workload fmt -check -recursive
+          terraform -chdir=deploy/examples/native-aws-workload init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/examples/native-aws-workload validate
+          terraform -chdir=deploy/examples/native-aws-workload/retained init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/examples/native-aws-workload/retained validate
+          env -u NODE_OPTIONS -u NODE_PATH node deploy/examples/native-aws-workload/test-draft.mjs
+          git diff --exit-code -- deploy/examples/native-aws-workload/.terraform.lock.hcl deploy/examples/native-aws-workload/retained/.terraform.lock.hcl

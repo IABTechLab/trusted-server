@@ -70,6 +70,12 @@ pub enum EcKvWriteOutcome {
 /// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
 /// write precondition failures are part of the normal control flow and are
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
+///
+/// I/O returns local futures so native backends can yield without blocking the
+/// request runtime. Neither stores nor their futures need to be `Send` or `Sync`;
+/// a store the shared identity app holds across requests must be both (see
+/// [`crate::ec::app::IdentityPlatform`]).
+#[async_trait::async_trait(?Send)]
 pub trait EcKvStore {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
@@ -81,12 +87,18 @@ pub trait EcKvStore {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
-    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>>;
+    async fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>>;
 
     /// Checks exact-key existence against strongly consistent store state.
     ///
     /// A completed issuance must be visible even when [`Self::lookup`] lags.
     /// Prefix matches are insufficient and an inconclusive check is an error.
+    /// Logical expiry alone does not prove absence when a previously authorized
+    /// conditional write can still commit against the expired row. Such backends
+    /// must include physically held expired rows in this check for withdrawal
+    /// and orphan protection, even when lookup and listing hide logical expiry.
+    /// Returning `false` must establish that an old generation cannot still
+    /// update the apparently absent row.
     ///
     /// # Implementing this method
     ///
@@ -108,7 +120,7 @@ pub trait EcKvStore {
     /// Returns [`TrustedServerError::KvStore`] on store failure or when a
     /// bounded check cannot determine existence. Never falls back to an
     /// eventually consistent read.
-    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>>;
+    async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>>;
 
     /// Writes an entry according to the requested precondition mode.
     ///
@@ -117,7 +129,7 @@ pub trait EcKvStore {
     /// Returns [`TrustedServerError::KvStore`] on store open or write
     /// failure. Precondition failures are reported through the
     /// [`EcKvWriteOutcome`] instead.
-    fn insert(
+    async fn insert(
         &self,
         key: &str,
         write: EcKvWrite<'_>,
@@ -138,7 +150,7 @@ pub trait EcKvStore {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
-    fn list_keys_with_prefix(
+    async fn list_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
@@ -153,12 +165,12 @@ pub trait EcKvStore {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
-    fn count_keys_with_prefix(
+    async fn count_keys_with_prefix(
         &self,
         prefix: &str,
         limit: u32,
     ) -> Result<u32, Report<TrustedServerError>> {
-        let count = self.list_keys_with_prefix(prefix, limit)?.len();
+        let count = self.list_keys_with_prefix(prefix, limit).await?.len();
         #[allow(clippy::cast_possible_truncation)]
         Ok(count as u32)
     }
@@ -168,10 +180,10 @@ pub trait EcKvStore {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or delete failure.
-    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
+    async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -180,10 +192,12 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.
+    #[cfg(test)]
     pub(crate) struct WriteFailingEcKv {
         inner: InMemoryEcKv,
     }
 
+    #[cfg(test)]
     impl WriteFailingEcKv {
         pub(crate) fn new() -> Self {
             Self {
@@ -192,7 +206,7 @@ pub(crate) mod test_support {
         }
 
         /// Stores a row directly, bypassing the failing write path.
-        pub(crate) fn seed(&self, key: &str, body: &str, metadata: &str) {
+        pub(crate) async fn seed(&self, key: &str, body: &str, metadata: &str) {
             self.inner
                 .insert(
                     key,
@@ -203,22 +217,30 @@ pub(crate) mod test_support {
                         mode: EcKvWriteMode::Overwrite,
                     },
                 )
+                .await
                 .expect("should seed the in-memory store");
         }
     }
 
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for WriteFailingEcKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key)
-        }
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
         }
 
-        fn insert(
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
             &self,
             _key: &str,
             _write: EcKvWrite<'_>,
@@ -228,25 +250,29 @@ pub(crate) mod test_support {
                 message: "write failing test store".to_owned(),
             }))
         }
-        fn list_keys_with_prefix(
+
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
         ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit).await
         }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
         }
     }
 
     /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
     /// so tests can prove exactly how many reads a flow performs.
+    #[cfg(test)]
     pub(crate) struct CountingEcKv {
         inner: InMemoryEcKv,
         lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[cfg(test)]
     impl CountingEcKv {
         pub(crate) fn new(
             name: impl Into<String>,
@@ -259,39 +285,44 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for CountingEcKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
 
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             self.lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.lookup(key)
+            self.inner.lookup(key).await
         }
 
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
         }
 
-        fn insert(
+        async fn insert(
             &self,
             key: &str,
             write: EcKvWrite<'_>,
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            self.inner.insert(key, write)
+            self.inner.insert(key, write).await
         }
 
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
         ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit).await
         }
 
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
         }
     }
 
@@ -304,12 +335,14 @@ pub(crate) mod test_support {
     ///
     /// With `list_fails` set, the list API errors instead, modelling a store
     /// that can neither find the key nor prove it absent.
+    #[cfg(test)]
     pub(crate) struct StaleLookupEcKv {
         inner: InMemoryEcKv,
         stale_lookups_remaining: Mutex<u32>,
         list_fails: bool,
     }
 
+    #[cfg(test)]
     impl StaleLookupEcKv {
         pub(crate) fn new(name: impl Into<String>, stale_lookups: u32, list_fails: bool) -> Self {
             Self {
@@ -320,42 +353,49 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for StaleLookupEcKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
 
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            let mut remaining = self
-                .stale_lookups_remaining
-                .lock()
-                .expect("should lock stale-lookup counter");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Ok(None);
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            {
+                let mut remaining = self
+                    .stale_lookups_remaining
+                    .lock()
+                    .expect("should lock stale-lookup counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(None);
+                }
             }
-            self.inner.lookup(key)
+            self.inner.lookup(key).await
         }
 
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
             if self.list_fails {
                 return Err(Report::new(TrustedServerError::KvStore {
                     store_name: self.inner.store_name().to_owned(),
                     message: "existence check unavailable".to_owned(),
                 }));
             }
-            self.inner.key_exists(key)
+            self.inner.key_exists(key).await
         }
 
-        fn insert(
+        async fn insert(
             &self,
             key: &str,
             write: EcKvWrite<'_>,
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            self.inner.insert(key, write)
+            self.inner.insert(key, write).await
         }
 
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
@@ -366,11 +406,11 @@ pub(crate) mod test_support {
                     message: "list unavailable".to_owned(),
                 }));
             }
-            self.inner.list_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit).await
         }
 
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
         }
     }
 
@@ -395,12 +435,16 @@ pub(crate) mod test_support {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for InMemoryEcKv {
         fn store_name(&self) -> &str {
             &self.name
         }
 
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             let entries = self.entries.lock().expect("should lock in-memory store");
             Ok(entries.get(key).map(|stored| EcKvLookup {
                 body: stored.body.clone(),
@@ -409,12 +453,12 @@ pub(crate) mod test_support {
             }))
         }
 
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
             let entries = self.entries.lock().expect("should lock in-memory store");
             Ok(entries.contains_key(key))
         }
 
-        fn insert(
+        async fn insert(
             &self,
             key: &str,
             write: EcKvWrite<'_>,
@@ -447,7 +491,7 @@ pub(crate) mod test_support {
             Ok(EcKvWriteOutcome::Written)
         }
 
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
@@ -461,7 +505,7 @@ pub(crate) mod test_support {
                 .collect())
         }
 
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             let mut entries = self.entries.lock().expect("should lock in-memory store");
             entries.remove(key);
             Ok(())
@@ -470,10 +514,12 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] that fails every operation, mimicking a missing or
     /// unreachable platform store.
+    #[cfg(test)]
     pub(crate) struct FailingEcKv {
         name: String,
     }
 
+    #[cfg(test)]
     impl FailingEcKv {
         pub(crate) fn new(name: impl Into<String>) -> Self {
             Self { name: name.into() }
@@ -487,21 +533,26 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for FailingEcKv {
         fn store_name(&self) -> &str {
             &self.name
         }
 
-        fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        async fn lookup(
+            &self,
+            _key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             Err(self.error("lookup"))
         }
 
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
             let _ = key;
             Err(self.error("key_exists"))
         }
 
-        fn insert(
+        async fn insert(
             &self,
             _key: &str,
             _write: EcKvWrite<'_>,
@@ -509,7 +560,7 @@ pub(crate) mod test_support {
             Err(self.error("insert"))
         }
 
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             _prefix: &str,
             _limit: u32,
@@ -517,7 +568,7 @@ pub(crate) mod test_support {
             Err(self.error("list"))
         }
 
-        fn delete(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
+        async fn delete(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
             Err(self.error("delete"))
         }
     }

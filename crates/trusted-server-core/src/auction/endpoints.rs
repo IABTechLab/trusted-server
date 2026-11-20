@@ -9,7 +9,9 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    allows_eid_persistence, consent_allows_server_side_auction, gate_eids_by_consent,
+};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -18,9 +20,14 @@ use crate::ec::current_timestamp;
 use crate::ec::eid_types::UnixSeconds;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{MAX_STORED_UID_LENGTH, MAX_UID_LENGTH};
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
+use crate::ec::prebid_eids::{collect_eid_updates, parse_prebid_eids_cookie};
 use crate::ec::registry::PartnerRegistry;
+use crate::ec::sharedid::{
+    SHAREDID_OPTOUT_COOKIE, canonical_source, canonicalize_sharedid_eid,
+    strip_opted_out_sharedid_eids,
+};
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -46,6 +53,23 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
+/// Builds the `text/plain` 413 answered for an auction body over [`MAX_AUCTION_BODY_SIZE`].
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Auction`] when the response cannot be built.
+fn auction_body_too_large_response() -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(EdgeBody::from(format!(
+            "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+        )))
+        .change_context(TrustedServerError::Auction {
+            message: "Auction request body exceeded maximum size".to_string(),
+        })
+}
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -116,6 +140,8 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// # Errors
 ///
 /// Returns an error if:
+/// - The request body cannot be read (see [`read_request_body`]); a body over
+///   256 KiB is answered with a `text/plain` 413 instead
 /// - The request body cannot be parsed
 /// - The auction request conversion fails (e.g., invalid ad units)
 /// - The auction execution fails
@@ -129,40 +155,23 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Reject oversized bodies before core buffers/parses them. The Content-Length
-    // pre-check stops well-behaved clients early; the post-read check defends
-    // against clients that lie about (or omit) the header.
-    let content_length_exceeded = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
-    if content_length_exceeded {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
-
+    // The bounded read rejects a declared overflow before polling the body and
+    // stops a streamed body at the first chunk past the cap, so a client that
+    // omits or understates `Content-Length` is still held to it.
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
+    let body_bytes = match read_request_body(&parts.headers, body, MAX_AUCTION_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(report)
+            if matches!(
+                report.current_context(),
+                TrustedServerError::RequestTooLarge { .. }
+            ) =>
+        {
+            log::warn!("Rejecting auction request: {report:?}");
+            return auction_body_too_large_response();
+        }
+        Err(report) => return Err(report),
+    };
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
             message: "Failed to parse auction request body".to_string(),
@@ -184,8 +193,8 @@ pub async fn handle_auction(
             .insert(TraceClientSlotRefs::from_raw(&body_bytes));
     }
 
-    // Story 5 middleware contract: auction is a read-only EC route.
-    // It must not generate EC IDs; it only consumes pre-routed context.
+    // Auctions consume an existing EC and never generate identity.
+    // Explicit body EIDs can update its live row after the consent checks below.
     // Only forward the EC ID to auction partners when consent allows it.
     // Owned so the identity-graph snapshot can be stored back on `ec_context`
     // below without holding a borrow of it across the mutation.
@@ -195,6 +204,10 @@ pub async fn handle_auction(
         None
     };
     let consent_context = ec_context.consent().clone();
+
+    // Identity ingestion is independent of whether this deployment runs bidders.
+    let body_snapshot =
+        persist_auction_body(kv, registry, ec_context, &http_req, body.eids.as_ref()).await;
 
     if !orchestrator.is_enabled() {
         log::info!("/auction: auction is disabled; returning no-bid response");
@@ -331,27 +344,27 @@ pub async fn handle_auction(
     } else {
         None
     };
-    // Carry the full request-local EID set to response finalization so KV
-    // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
+    // Retain the parsed request-local EIDs for downstream identity consumers.
+    // The body ingestion below persists explicit body data separately from cookies.
     if let Some(eids) = &client_eids {
         ec_context.set_client_eids(eids.clone());
     }
 
-    // Resolve partner EIDs from the KV identity graph when the user has a valid
-    // EC and both KV and partner stores are available. Gate the read on a
-    // present registry: it consumes the row for stored-ID enrichment or
-    // remembered provider opt-outs. Policy-only reads never enrich stored IDs.
-    let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
-        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
-        _ => EcKvSnapshot::NotRead,
+    // Read the EC's row whenever an EC store exists: it decides whether the
+    // EC may go to bidders as `user.id` (see `bidder_ec_id`), and with a
+    // partner registry it supplies the server-side EIDs.
+    let auction_kv_snapshot = match body_snapshot {
+        Some(snapshot) => snapshot,
+        None => match (kv, ec_id.as_deref()) {
+            (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
+            _ => EcKvSnapshot::NotRead,
+        },
     };
-    // Ordinary reads may be reused by finalization. Policy-only reads stay
-    // local so they cannot affect writes or completeness-marker cookies.
-    if !ec_context.auction_policy_only() && !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
+    if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
     let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
+    let bidder_ec_id = bidder_ec_id(ec_id.as_deref(), kv, &auction_kv_snapshot);
 
     // Look up geo for device info.
     let geo = services
@@ -369,15 +382,18 @@ pub async fn handle_auction(
         services,
         &http_req,
         consent_context,
-        ec_id.as_deref(),
+        bidder_ec_id,
         geo,
     )?;
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
     let client_eids =
-        drop_denied_client_eids(client_eids, registry, &auction_kv_snapshot, ec_context);
-    let merged_eids = merge_auction_eids(client_eids, eids);
+        drop_vendor_denied_client_eids(client_eids, registry, &auction_kv_snapshot, ec_context);
+    let merged_eids = strip_opted_out_sharedid_eids(
+        merge_auction_eids(client_eids, eids),
+        extract_cookie_value(&http_req, SHAREDID_OPTOUT_COOKIE).is_some(),
+    );
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -393,7 +409,6 @@ pub async fn handle_auction(
         settings,
         request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
-        transport_timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
     };
@@ -510,6 +525,57 @@ fn retain_private_trace(
     response
 }
 
+/// Persists explicit body EIDs independently of bidder enablement.
+///
+/// No body, denied identity consent or no usable updates costs no record read.
+async fn persist_auction_body(
+    kv: Option<&KvIdentityGraph>,
+    registry: Option<&PartnerRegistry>,
+    context: &mut EcContext,
+    request: &Request<EdgeBody>,
+    raw: Option<&JsonValue>,
+) -> Option<EcKvSnapshot> {
+    if !context.ec_allowed() || !allows_eid_persistence(context.consent()) {
+        return None;
+    }
+    let (Some(graph), Some(registry), Some(ec_id)) =
+        (kv, registry, context.ec_value().map(str::to_owned))
+    else {
+        return None;
+    };
+    let body_eids = strip_opted_out_sharedid_eids(
+        drop_vendor_denied_client_eids(
+            parse_client_auction_eids(raw),
+            Some(registry),
+            context.kv_snapshot(),
+            context,
+        ),
+        extract_cookie_value(request, SHAREDID_OPTOUT_COOKIE).is_some(),
+    );
+    let updates = collect_eid_updates(None, None, body_eids.as_deref(), registry);
+    if updates.is_empty() {
+        return None;
+    }
+    let mut snapshot = graph.load_snapshot(&ec_id).await;
+    match graph
+        .commit_auction_body(&ec_id, &snapshot, &updates, registry)
+        .await
+    {
+        Ok(Some(entry)) => {
+            snapshot = EcKvSnapshot::Present {
+                ec_id,
+                entry: Box::new(entry),
+                // The provider returns no fresh generation after the CAS.
+                generation: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("Auction body EID persistence failed: {error:?}"),
+    }
+    context.set_kv_snapshot(snapshot.clone());
+    Some(snapshot)
+}
+
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
 ///
 /// Returns `None` when any prerequisite is missing (no KV store, no partner
@@ -522,7 +588,7 @@ pub(crate) fn resolve_auction_eids(
 ) -> Option<Vec<Eid>> {
     let registry = registry?;
 
-    if !ec_context.ec_allowed() || ec_context.auction_policy_only() {
+    if !ec_context.ec_allowed() {
         return None;
     }
 
@@ -537,12 +603,36 @@ pub(crate) fn resolve_auction_eids(
     }
 
     let now = UnixSeconds::new(current_timestamp());
+    // A source a provider's cookies on this request opted out of is withheld
+    // before the navigation's write clears it from the row.
     Some(
         entry
             .live_eids(registry, ec_context.consent(), now)
             .map(Eid::from)
+            .filter(|eid| !ec_context.source_opted_out_in_cookies(&eid.source))
             .collect(),
     )
+}
+
+/// The EC ID bidders may receive, as `user.id` and in a `ts-{ec}` request ID.
+///
+/// With an EC store, only an EC whose consented row `snapshot` holds is sent,
+/// the rule identity providers follow: a cookie EC with no row may never have
+/// been issued, and orphan recovery replaces it on the navigation. Without an
+/// EC store no EC has a row or is replaced, so `ec_id` passes unchanged.
+pub(crate) fn bidder_ec_id<'ec>(
+    ec_id: Option<&'ec str>,
+    kv: Option<&KvIdentityGraph>,
+    snapshot: &EcKvSnapshot,
+) -> Option<&'ec str> {
+    let ec_id = ec_id?;
+    if kv.is_none() {
+        return Some(ec_id);
+    }
+    snapshot
+        .entry_for(ec_id)
+        .is_some_and(|entry| entry.consent.ok)
+        .then_some(ec_id)
 }
 
 pub(crate) fn resolve_client_auction_eids(
@@ -638,14 +728,15 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 }
 
 /// Drops client EIDs whose source is owned by a configured identity provider
-/// whose TCF vendor consent is withheld, and, for a visitor whose jurisdiction
-/// is GDPR, client EIDs whose source a provider excludes where GDPR applies.
+/// whose TCF vendor consent is withheld, client EIDs whose source a provider's
+/// cookies on this request record an opt-out for, and, for a visitor whose
+/// jurisdiction is GDPR, client EIDs whose source a provider excludes where
+/// GDPR applies.
 ///
-/// Only sources marked by a configured provider carry a vendor ID or a GDPR
-/// exclusion, so with no providers configured the input is returned unchanged.
-/// Also withholds sources whose enabled owners have an active opt-out in the
-/// snapshot matching this request's EC ID.
-pub(crate) fn drop_denied_client_eids(
+/// Only sources marked by a configured provider carry a vendor ID, a GDPR
+/// exclusion or a cookie opt-out, so with no providers configured the input is
+/// returned unchanged.
+pub(crate) fn drop_vendor_denied_client_eids(
     client_eids: Option<Vec<Eid>>,
     registry: Option<&PartnerRegistry>,
     snapshot: &EcKvSnapshot,
@@ -654,19 +745,22 @@ pub(crate) fn drop_denied_client_eids(
     let Some(registry) = registry else {
         return client_eids;
     };
-    let mut eids = client_eids?;
     let consent = ec_context.consent();
-    let entry = ec_context
-        .ec_value()
-        .and_then(|ec_id| snapshot.entry_for(ec_id));
+    let mut eids = client_eids?;
+    let entry = ec_context.ec_value().and_then(|id| snapshot.entry_for(id));
     let now = UnixSeconds::new(current_timestamp());
-    eids.retain(|eid| {
-        !registry.get(&eid.source).is_some_and(|partner| {
-            partner.owner_vendor_consent_denied(consent)
-                || partner.excluded_for(consent)
-                || entry.is_some_and(|entry| partner.owner_opted_out(entry, now))
-        })
-    });
+    let denied = |source: &str| {
+        entry.is_some_and(|entry| registry.source_owner_opted_out(source, entry, now))
+            || ec_context.source_opted_out_in_cookies(source)
+            || registry.get(source).is_some_and(|partner| {
+                partner.owner_vendor_consent_denied(consent)
+                    || partner.excluded_for(consent)
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain)
+            })
+    };
+    // A SharedID EID is sent as `pubcid.org`, so that source's gate applies
+    // to it under either SharedID source.
+    eids.retain(|eid| !denied(&eid.source) && !denied(canonical_source(&eid.source)));
     Some(eids)
 }
 
@@ -677,7 +771,7 @@ pub(crate) fn merge_auction_eids(
     let mut merged: Vec<Eid> = Vec::new();
 
     // Server-resolved entries come first so their fields win on duplicates.
-    for eid in resolved_eids
+    for mut eid in resolved_eids
         .into_iter()
         .flatten()
         .chain(client_eids.into_iter().flatten())
@@ -685,6 +779,9 @@ pub(crate) fn merge_auction_eids(
         if eid.source.is_empty() {
             continue;
         }
+        // Either SharedID source is sent as `pubcid.org` with atype 1, so the
+        // same ID from the record, cookie and body merges into one EID.
+        canonicalize_sharedid_eid(&mut eid);
         let Eid {
             source,
             inserter,
@@ -752,24 +849,32 @@ pub(crate) fn merge_auction_eids(
 mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
-    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
-    use crate::auction::types::{AuctionRequest, AuctionResponse};
+    use crate::auction::test_support::{assert_no_user_eids, user_eids};
+
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::error::IntoHttpResponse as _;
+
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
+    use crate::platform::ClientInfo;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubBackend,
-        StubHttpClient, noop_services,
+        NoopConfigStore, NoopGeo, NoopSecretStore, build_services_with_outbound_client,
+        noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::body_read::body_read_failure_cases;
+    use crate::test_support::logging::LogCapture;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
+    use crate::test_support::tests::{
+        crate_test_settings_str, create_test_settings, run_pre_dispatch_hook,
+    };
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use edgezero_core::router::PreDispatchHook as _;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
+    use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -799,12 +904,16 @@ mod tests {
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    fn vendor_denied_context() -> EcContext {
+        EcContext::new_for_test(None, vendor_denied_consent())
     }
 
     fn vendor_denied_consent() -> ConsentContext {
@@ -876,11 +985,11 @@ mod tests {
         let client = client_eids_for(&["ids.example.com", "other.example.com"]);
 
         // Act
-        let kept = drop_denied_client_eids(
+        let kept = drop_vendor_denied_client_eids(
             client,
             Some(&registry),
             &EcKvSnapshot::NotRead,
-            &EcContext::new_for_test(None, vendor_denied_consent()),
+            &vendor_denied_context(),
         )
         .expect("should keep the list");
 
@@ -905,14 +1014,14 @@ mod tests {
         let gdpr = crate::test_support::tests::consent_granting_vendors(vec![1]);
 
         // Act
-        let under_gdpr = drop_denied_client_eids(
+        let under_gdpr = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
             &EcKvSnapshot::NotRead,
-            &EcContext::new_for_test(None, gdpr.clone()),
+            &EcContext::new_for_test(None, gdpr),
         )
         .expect("should keep the list");
-        let elsewhere = drop_denied_client_eids(
+        let elsewhere = drop_vendor_denied_client_eids(
             client_eids_for(&["uidapi.com", "ids.example.com"]),
             Some(&registry),
             &EcKvSnapshot::NotRead,
@@ -932,6 +1041,60 @@ mod tests {
             sources(&elsewhere),
             vec!["uidapi.com", "ids.example.com"],
             "should keep the browser EID outside GDPR"
+        );
+    }
+
+    #[test]
+    fn legacy_sharedid_client_eid_follows_the_pubcid_vendor_gate() {
+        let mut registry = partner_registry(&["pubcid.org", "ids.example.com"]);
+        assert!(
+            registry.mark_provider_owned("pubcid.org", std::num::NonZeroU16::new(42)),
+            "should mark the SharedID source"
+        );
+
+        let kept = drop_vendor_denied_client_eids(
+            client_eids_for(&["sharedid.org", "ids.example.com"]),
+            Some(&registry),
+            &EcKvSnapshot::NotRead,
+            &vendor_denied_context(),
+        )
+        .expect("should keep the list");
+
+        assert_eq!(
+            kept.iter()
+                .map(|eid| eid.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ids.example.com"],
+            "should drop a sharedid.org EID when the pubcid.org vendor is denied"
+        );
+    }
+
+    #[test]
+    fn client_eids_of_a_source_opted_out_in_provider_cookies_are_dropped() {
+        // Arrange
+        let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", None),
+            "should mark the provider source"
+        );
+        let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let kept = drop_vendor_denied_client_eids(
+            client_eids_for(&["IDS.example.com", "other.example.com"]),
+            Some(&registry),
+            &EcKvSnapshot::NotRead,
+            &ec_context,
+        )
+        .expect("should keep the list");
+
+        // Assert
+        let sources: Vec<&str> = kept.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should drop the browser EID of the opted-out source"
         );
     }
 
@@ -972,7 +1135,7 @@ mod tests {
                 ec_id: "example-ec".to_owned(),
             },
         ] {
-            let result = drop_denied_client_eids(
+            let result = drop_vendor_denied_client_eids(
                 client_eids_for(&["ids.example.com"]),
                 Some(&registry),
                 &snapshot,
@@ -988,6 +1151,52 @@ mod tests {
     }
 
     #[test]
+    fn remembered_opt_out_covers_both_sharedid_aliases_and_normalized_inputs() {
+        for owner_source in ["pubcid.org", "sharedid.org"] {
+            for client_source in ["pubcid.org", "sharedid.org", "PUBCID.ORG.", "SHAREDID.ORG."] {
+                let mut ec = create_test_settings().ec;
+                ec.partners = vec![
+                    counting_test_partner("pubcid.org"),
+                    counting_test_partner("sharedid.org"),
+                ];
+                ec.identity_providers =
+                    vec![toml::from_str(&format!(
+                    "id = \"example-provider\"\nkind = \"test\"\nsources = [\"{owner_source}\"]"
+                )).expect("should parse provider")];
+                let registry = PartnerRegistry::from_ec_with_kinds(&ec, |_| true)
+                    .expect("should build registry");
+                let mut entry = crate::ec::kv_types::KvEntry::tombstone(1);
+                entry.consent.ok = true;
+                entry.opt_outs.insert(
+                    crate::ec::eid_types::ProviderId::new("example-provider"),
+                    u64::MAX,
+                );
+                let context = make_ec_context(Jurisdiction::NonRegulated, Some("example-ec"));
+                let snapshot = EcKvSnapshot::Present {
+                    ec_id: "example-ec".to_owned(),
+                    entry: Box::new(entry),
+                    generation: None,
+                };
+                let result = drop_vendor_denied_client_eids(
+                    client_eids_for(&[client_source, "other.example.com"]),
+                    Some(&registry),
+                    &snapshot,
+                    &context,
+                )
+                .expect("should retain unrelated EID");
+                assert_eq!(
+                    result
+                        .iter()
+                        .map(|eid| eid.source.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["other.example.com"],
+                    "should suppress either SharedID alias: owner={owner_source}, client={client_source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn client_eids_are_unchanged_without_providers() {
         // Arrange
         let registry = partner_registry(&["ids.example.com"]);
@@ -995,11 +1204,11 @@ mod tests {
         let before = serde_json::to_string(&client).expect("should serialize");
 
         // Act
-        let kept = drop_denied_client_eids(
+        let kept = drop_vendor_denied_client_eids(
             client,
             Some(&registry),
             &EcKvSnapshot::NotRead,
-            &EcContext::new_for_test(None, vendor_denied_consent()),
+            &vendor_denied_context(),
         );
 
         // Assert
@@ -1008,6 +1217,16 @@ mod tests {
             before,
             "should leave client EIDs byte-identical with no providers"
         );
+    }
+
+    /// Endpoint of the `eid-capture` provider that `legacy_provider_map` configures.
+    const EID_CAPTURE_ENDPOINT: &str = "https://eid-capture.example/openrtb2/auction";
+
+    /// Builds the plan-backed orchestrator for test settings with `auction` in place.
+    fn orchestrator_with(auction: AuctionConfig) -> AuctionOrchestrator {
+        let mut settings = create_test_settings();
+        settings.auction = auction;
+        crate::auction::build_orchestrator(&settings).expect("should build the orchestrator")
     }
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
@@ -1026,6 +1245,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(crate::redacted::Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -1046,16 +1266,13 @@ mod tests {
         // for a second lookup, and it never writes KV: only the page load's
         // navigation may write (spec D1).
         let settings = create_test_settings();
-        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+        let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         });
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
-        }));
         let registry = PartnerRegistry::from_config(&[counting_test_partner("sharedid.org")])
             .expect("should build partner registry");
 
@@ -1064,7 +1281,10 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
-        graph.create(&ec_id, &live).expect("should seed live row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
         lookups.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
@@ -1115,9 +1335,10 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &crate::ec::sharedid::SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
@@ -1126,6 +1347,7 @@ mod tests {
         );
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("row should exist");
         assert!(
@@ -1135,21 +1357,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_context_but_never_kv() {
-        // `handle_auction` hands its parsed body EIDs to `ec_context`, but body
-        // EIDs go to bidders on that request only: finalization of an
-        // `/auction` request never writes them to KV (spec §5.1, D1).
+    async fn auction_body_eids_are_persisted_before_response() {
+        // A body UID must reach the existing record before the auction returns.
         let settings = create_test_settings();
-        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+        let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         });
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
-        }));
         let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
             .expect("should build partner registry");
 
@@ -1157,7 +1374,10 @@ mod tests {
         let ec_id = format!("{}.eidbdy", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
-        graph.create(&ec_id, &live).expect("should seed live row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
@@ -1202,6 +1422,20 @@ mod tests {
             "the endpoint must hand its parsed body EIDs to the request context"
         );
 
+        assert_eq!(
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read body persistence")
+                .expect("should retain live row")
+                .0
+                .ids
+                .get("id5-sync.com")
+                .map(|record| record.uid.as_str()),
+            Some("ID5_from_body"),
+            "should persist body data before the endpoint returns"
+        );
+
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
@@ -1209,111 +1443,301 @@ mod tests {
             Some(&graph),
             &registry,
             None, // No `ts-eids` cookie on this request at all.
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("row should exist");
+        assert_eq!(
+            stored
+                .ids
+                .get("id5-sync.com")
+                .map(|record| record.uid.as_str()),
+            Some("ID5_from_body"),
+            "should save the body's EID in the existing record"
+        );
         assert!(
-            stored.ids.is_empty(),
-            "the body's EIDs must not be persisted from an auction request"
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should ingest an auction body without identity cookies"
         );
     }
 
-    /// Provider that fails the test if it is ever contacted. Used to prove the
-    /// `/auction` consent gate short-circuits before any outbound bid request.
-    struct PanicOnBidProvider;
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for PanicOnBidProvider {
-        fn provider_name(&self) -> &str {
-            "panic_provider"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            panic!("provider must not be contacted when the consent gate denies the auction");
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("provider must not parse a response when the auction is gated off");
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("panic-backend".to_string())
-        }
+    #[tokio::test]
+    async fn auction_disabled_still_persists_consented_body_eids() {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("ids.example.com")])
+            .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("disabled-auction-body");
+        let ec_id = format!("{}.body01", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        graph
+            .create(&ec_id, &entry)
+            .await
+            .expect("should seed live row");
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let request = body_ingest_request(Some(
+            json!([{"source":"ids.example.com","uids":[{"id":"disabled-body-uid","atype":1}]}]),
+        ));
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut context,
+            &noop_services(),
+            request,
+        )
+        .await
+        .expect("should return disabled auction response");
+        assert!(
+            response.status().is_success(),
+            "should preserve disabled no-bid behavior"
+        );
+        let row = graph
+            .get(&ec_id)
+            .await
+            .expect("should read record")
+            .expect("should retain existing record")
+            .0;
+        assert_eq!(
+            row.ids.get("ids.example.com").map(|id| id.uid.as_str()),
+            Some("disabled-body-uid"),
+            "should persist body EIDs even when bidding is disabled"
+        );
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should keep auction response free of identity cookies"
+        );
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should read no-bid response");
+        let payload: JsonValue =
+            serde_json::from_slice(&bytes).expect("should parse no-bid response");
+        assert!(
+            payload
+                .get("seatbid")
+                .and_then(JsonValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "should return no bids while persisting the body EID: {payload}"
+        );
     }
 
-    /// Provider used to prove that direct `/auction` remains available when
-    /// publisher server-side ad templates are disabled.
-    struct TemplateSwitchProbeProvider {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for TemplateSwitchProbeProvider {
-        fn provider_name(&self) -> &'static str {
-            "template-switch-probe"
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.calls.lock().expect("should lock provider call count") += 1;
-            let request = Request::builder()
-                .method("POST")
-                .uri("https://bidder.example/auction")
-                .body(EdgeBody::empty())
-                .expect("should build probe provider request");
-            context
-                .services
-                .http_client()
-                .send_async(
-                    PlatformHttpRequest::new(request, "template-switch-probe-backend")
-                        .with_cache_bypass(),
-                )
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "probe provider launch failed".to_string(),
-                })
-                .map(ProviderRequestOutcome::pending)
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            Ok(AuctionResponse::success(
-                self.provider_name(),
-                Vec::new(),
-                0,
+    fn body_ingest_request(body_eids: Option<JsonValue>) -> Request<EdgeBody> {
+        let mut body = json!({
+            "adUnits": [{ "code": "slot", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+        });
+        body["eids"] = body_eids.unwrap_or(JsonValue::Null);
+        Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize auction body"),
             ))
-        }
+            .expect("should build auction request")
+    }
 
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
+    async fn ingest_body_for_test(
+        graph: &KvIdentityGraph,
+        registry: &PartnerRegistry,
+        ec: &mut EcContext,
+        request: Request<EdgeBody>,
+    ) {
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+            ..Default::default()
+        });
+        let _ = handle_auction(
+            &create_test_settings(),
+            &orchestrator,
+            Some(graph),
+            Some(registry),
+            ec,
+            &noop_services(),
+            request,
+        )
+        .await;
+    }
 
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("template-switch-probe-backend".to_string())
+    #[tokio::test]
+    async fn auction_body_ingest_preserves_missing_and_withdrawn_rows() {
+        let graph = KvIdentityGraph::in_memory("body-ingest");
+        let registry = partner_registry(&["ids.example.com"]);
+        for withdrawn in [false, true] {
+            let ec_id = format!("{}.bodyid", if withdrawn { "b" } else { "a" }.repeat(64));
+            if withdrawn {
+                graph
+                    .create(&ec_id, &crate::ec::kv_types::KvEntry::tombstone(1000))
+                    .await
+                    .expect("should seed withdrawn row");
+            }
+            let before = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect original row");
+            let mut ec = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            ingest_body_for_test(
+                &graph,
+                &registry,
+                &mut ec,
+                body_ingest_request(Some(json!([
+                    {"source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+                ]))),
+            )
+            .await;
+            let after = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect retained row");
+            assert_eq!(
+                after, before,
+                "should neither create a missing row nor revive a withdrawn row"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_requires_identity_and_eid_consent() {
+        let registry = partner_registry(&["ids.example.com"]);
+        let ec_id = format!("{}.bodyid", "c".repeat(64));
+        for purposes in [[false, false], [true, false], [false, true], [true, true]] {
+            let graph = KvIdentityGraph::in_memory("body-consent");
+            let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+            live.consent.ok = true;
+            graph
+                .create(&ec_id, &live)
+                .await
+                .expect("should seed live identity");
+            let mut consent = vendor_denied_consent();
+            let tcf = consent.tcf.as_mut().expect("should have TCF consent");
+            tcf.purpose_consents[0] = purposes[0];
+            tcf.purpose_consents[3] = purposes[1];
+            let mut ec = EcContext::new_for_test(Some(ec_id.clone()), consent);
+            ingest_body_for_test(
+                &graph,
+                &registry,
+                &mut ec,
+                body_ingest_request(Some(json!([
+                    {"source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+                ]))),
+            )
+            .await;
+            let row = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect record")
+                .expect("should retain record")
+                .0;
+            assert_eq!(
+                row.ids.contains_key("ids.example.com"),
+                purposes == [true, true],
+                "should require Purposes 1 and 4 for body persistence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_ignores_cookie_fallback_and_unknown_jurisdiction() {
+        let registry = partner_registry(&["ids.example.com"]);
+        let ec_id = format!("{}.bodyid", "e".repeat(64));
+        for unknown in [false, true] {
+            let graph = KvIdentityGraph::in_memory("body-only");
+            let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+            live.consent.ok = true;
+            graph
+                .create(&ec_id, &live)
+                .await
+                .expect("should seed live identity");
+            let mut ec = make_ec_context(
+                if unknown {
+                    Jurisdiction::Unknown
+                } else {
+                    Jurisdiction::NonRegulated
+                },
+                Some(&ec_id),
+            );
+            let eids =
+                json!([{ "source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}] }]);
+            let mut request = body_ingest_request(unknown.then(|| eids.clone()));
+            if !unknown {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    format!("ts-eids={}", BASE64.encode(eids.to_string()))
+                        .parse()
+                        .expect("should set cookie fallback"),
+                );
+            }
+            ingest_body_for_test(&graph, &registry, &mut ec, request).await;
+            let row = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect record")
+                .expect("should retain record")
+                .0;
+            assert!(
+                row.ids.is_empty(),
+                "should persist neither cookie-only fallback nor body data with unknown consent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_preserves_provider_ownership_and_cookie_optouts() {
+        let graph = KvIdentityGraph::in_memory("body-ownership");
+        let mut registry = partner_registry(&[
+            "owned.example.com",
+            "optout.example.com",
+            "pubcid.org",
+            "unowned.example.com",
+        ]);
+        assert!(
+            registry.mark_provider_owned("owned.example.com", std::num::NonZeroU16::new(42)),
+            "should mark source owner"
+        );
+        let ec_id = format!("{}.bodyid", "d".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live identity");
+        let mut ec = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec.set_cookie_opted_out_sources(vec!["optout.example.com".to_owned()]);
+        let mut request = body_ingest_request(Some(json!([
+            {"source": "owned.example.com", "uids": [{"id": "owned-uid", "atype": 1}]},
+            {"source": "optout.example.com", "uids": [{"id": "optout-uid", "atype": 1}]},
+            {"source": "sharedid.org", "uids": [{"id": "11111111-1111-4111-8111-111111111111", "atype": 1}]},
+            {"source": "unowned.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+        ])));
+        request.headers_mut().insert(
+            header::COOKIE,
+            "_pubcid_optout=1"
+                .parse()
+                .expect("should set optout cookie"),
+        );
+        ingest_body_for_test(&graph, &registry, &mut ec, request).await;
+        let row = graph
+            .get(&ec_id)
+            .await
+            .expect("should inspect record")
+            .expect("should retain record")
+            .0;
+        assert_eq!(
+            row.ids.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["unowned.example.com"],
+            "should ingest only unowned sources without optouts"
+        );
     }
 
     #[tokio::test]
@@ -1324,23 +1748,16 @@ mod tests {
         );
         let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
-        let calls = Arc::new(Mutex::new(0));
-        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
-            calls: Arc::clone(&calls),
-        }));
-
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"probe response".to_vec());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
-            .build();
+        let orchestrator =
+            crate::auction::build_orchestrator(&settings).expect("should build the orchestrator");
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            "https://bidder.example/auction",
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1369,7 +1786,7 @@ mod tests {
         .expect("direct auction should remain available");
 
         assert_eq!(
-            *calls.lock().expect("should lock provider call count"),
+            bidders.requests().len(),
             1,
             "disabling publisher templates must not disable direct /auction"
         );
@@ -1377,19 +1794,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
+        // The plan accepts a backslash in the endpoint query, but `EdgeZero`
+        // builds no request for it. The other endpoint gets the error Fastly
+        // reports when it cannot register the bidder backend.
+        let unbuildable = r"https://failing.example/auction?x=\";
+        let unregistered = "https://failing.example/auction";
+        for endpoint in [unbuildable, unregistered] {
+            let settings_toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = '{endpoint}'\nrouting = \"all_eligible\"\n",
+                crate_test_settings_str()
+            );
+            let settings =
+                Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the orchestrator");
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            bidders.respond_to(
+                http::Method::POST,
+                unregistered,
+                ScriptedReply::error(EdgeError::bad_gateway_with_detail(
+                    "Fastly failed to register a dynamic backend",
+                    BadGatewayReason::Unspecified,
+                    ProviderFailureDetail::Fastly {
+                        phase: ProviderFailurePhase::BackendRegistration,
+                        cause: FastlyFailureCause::BackendHostError { status: 1 },
+                    },
+                )),
+            );
+            let services = RuntimeServices {
+                outbound_client: bidders.http_client(),
+                clock: clock.monotonic_clock(),
+                ..services_with_telemetry(Arc::clone(&telemetry_sink))
+            };
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize launch-failure body"),
+                ))
+                .expect("should build launch-failure request");
+
+            let error = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await
+            .expect_err("should fail the auction endpoint when every planned launch fails");
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "{endpoint} should answer 502"
+            );
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert_eq!(
+                batches.len(),
+                1,
+                "{endpoint} should emit one telemetry batch"
+            );
+            let rows = batches[0].rows();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{endpoint} should emit one execution-failure summary"
+            );
+            assert_eq!(rows[0].event_kind, "summary");
+            assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
+            assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work() {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: false,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1436,6 +1945,7 @@ mod tests {
             Some("auction_disabled"),
             "should identify the disabled auction policy"
         );
+        bidders.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1466,20 +1976,21 @@ mod tests {
             ..Default::default()
         });
         let orchestrator = AuctionOrchestrator::from_plan(plan, Some(Arc::new(mediator)));
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(204, Vec::new());
-        http.push_response(204, Vec::new());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(StubBackend))
-            .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
-            .build();
+        let clock = TestClock::new();
+        let http = ScriptedHttpClient::new(&clock);
+        for endpoint in [
+            "https://bidder.example.com/auction",
+            "https://mediator.example.com/auction",
+        ] {
+            http.respond_to(
+                http::Method::POST,
+                endpoint,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
+        }
+        let services = build_services_with_outbound_client(&http, &clock);
         let body = json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SLOT_REF}}}]});
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri("https://publisher.example.com/auction")
             .header(header::COOKIE, "__Host-ts-console=1")
@@ -1487,11 +1998,13 @@ mod tests {
                 serde_json::to_vec(&body).expect("should encode source token"),
             ))
             .expect("should build request");
-        TracePreDispatchHook::new(
-            Arc::clone(&settings),
-            Arc::new(|_| panic!("should not load API setup metadata")),
+        let request = run_pre_dispatch_hook(
+            TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load API setup metadata")),
+            ),
+            request,
         )
-        .handle(&mut request)
         .await
         .expect("should freeze trace gate");
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
@@ -1527,14 +2040,15 @@ mod tests {
             evidence["slots"][0]["candidate"], "no_candidate",
             "should observe no delivered candidate"
         );
-        let bodies = http.recorded_request_bodies();
+        let sent = http.requests();
         assert_eq!(
-            bodies.len(),
+            sent.len(),
             2,
             "should actually serialize bidder and mediator requests"
         );
-        for bytes in bodies {
-            let body = String::from_utf8(bytes).expect("should serialize UTF-8 outbound JSON");
+        for request in sent {
+            let body = String::from_utf8(request.body.to_vec())
+                .expect("should serialize UTF-8 outbound JSON");
             for private in [
                 SLOT_REF,
                 auction_token,
@@ -1564,7 +2078,7 @@ mod tests {
                 )
                 .expect("should enable trace feature");
             let settings = Arc::new(settings);
-            let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            let orchestrator = orchestrator_with(AuctionConfig {
                 enabled: false,
                 ..Default::default()
             });
@@ -1589,11 +2103,13 @@ mod tests {
                     "__Host-ts-console=1".parse().expect("should build cookie"),
                 );
             }
-            TracePreDispatchHook::new(
-                Arc::clone(&settings),
-                Arc::new(|_| panic!("should not load API setup metadata")),
+            let request = run_pre_dispatch_hook(
+                TracePreDispatchHook::new(
+                    Arc::clone(&settings),
+                    Arc::new(|_| panic!("should not load API setup metadata")),
+                ),
+                request,
             )
-            .handle(&mut request)
             .await
             .expect("should freeze cookie gate");
             let response = handle_auction(
@@ -1687,15 +2203,18 @@ mod tests {
 
         let config = AuctionConfig {
             enabled: false,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -1703,7 +2222,7 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .header("cookie", "__Host-ts-console=1")
             .uri("https://test-publisher.example/auction")
@@ -1716,13 +2235,9 @@ mod tests {
             Arc::clone(&settings),
             Arc::new(|_| panic!("should not load setup metadata on API capture")),
         );
-        assert!(
-            hook.handle(&mut request)
-                .await
-                .expect("should freeze API cookies")
-                .is_none(),
-            "should retain ordinary API routing"
-        );
+        let request = run_pre_dispatch_hook(hook, request)
+            .await
+            .expect("should retain ordinary API routing");
 
         let response = handle_auction(
             &settings,
@@ -1769,64 +2284,7 @@ mod tests {
             response["ext"]["trusted_server"]["trace_auction"], facts,
             "should deliver the same checked terminal facts"
         );
-    }
-
-    #[tokio::test]
-    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
-        let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
-            crate_test_settings_str()
-        );
-        let settings =
-            Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
-        let plan = Arc::new(
-            crate::auction::compile_auction_plan(&settings)
-                .expect("should compile launch-failure plan"),
-        );
-        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
-        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
-        let body = json!({
-            "adUnits": [{
-                "code": "div-gpt-ad-1",
-                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
-            }]
-        });
-        let request = Request::builder()
-            .method("POST")
-            .uri("https://test-publisher.example/auction")
-            .body(EdgeBody::from(
-                serde_json::to_vec(&body).expect("should serialize launch-failure body"),
-            ))
-            .expect("should build launch-failure request");
-
-        let error = handle_auction(
-            &settings,
-            &orchestrator,
-            None,
-            None,
-            &mut ec_context,
-            &services,
-            request,
-        )
-        .await
-        .expect_err("all planned launch failures should fail the auction endpoint");
-
-        assert_eq!(
-            error.current_context().status_code(),
-            StatusCode::BAD_GATEWAY
-        );
-        let batches = telemetry_sink
-            .batches
-            .lock()
-            .expect("should lock telemetry batches");
-        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
-        let rows = batches[0].rows();
-        assert_eq!(rows.len(), 1, "should emit one execution-failure summary");
-        assert_eq!(rows[0].event_kind, "summary");
-        assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
-        assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
+        bidders.assert_no_requests();
     }
 
     #[tokio::test]
@@ -1838,15 +2296,18 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["never-contacted"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let orchestrator = orchestrator_with(config);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
-        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let bidders = ScriptedHttpClient::forbidding();
+        let services = RuntimeServices {
+            outbound_client: bidders.http_client(),
+            ..services_with_telemetry(Arc::clone(&telemetry_sink))
+        };
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
@@ -1912,214 +2373,275 @@ mod tests {
             !ndjson.contains(&ec_id),
             "telemetry must not serialize EC identifiers"
         );
+        bidders.assert_no_requests();
     }
 
-    /// Provider that records whether the auction request it received carried
-    /// EIDs, then fails its launch so no real transport handle is needed.
-    struct EidCapturingProvider {
-        had_eids: Arc<std::sync::Mutex<Option<bool>>>,
+    /// Runs one `/auction` request against a record holding `stored` under
+    /// `sharedid.org` and returns the EIDs the bidder received.
+    async fn sharedid_auction_eids(
+        consent: ConsentContext,
+        cookies: &str,
+        body_eids: serde_json::Value,
+    ) -> serde_json::Value {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
+        let registry = partner_registry(&["pubcid.org", "sharedid.org"]);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.shrdid", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        live.ids.insert(
+            "sharedid.org".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single(SHAREDID_UUID),
+        );
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the record");
+        let mut ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .header("cookie", cookies)
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ],
+                    "eids": body_eids
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The assertion is on the EIDs the bidder received, not the auction result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        let sent = bidders.requests();
+        assert_eq!(
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
+        assert!(
+            body["user"]["ext"].get("eids").is_none(),
+            "should not write user.ext.eids"
+        );
+        body["user"]["eids"].clone()
     }
 
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for EidCapturingProvider {
-        fn provider_name(&self) -> &str {
-            "eid_capturing_provider"
-        }
+    const SHAREDID_UUID: &str = "11111111-2222-4333-8444-555555555555";
 
-        async fn request_bids(
-            &self,
-            request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.had_eids.lock().expect("should lock captured eids") =
-                Some(request.user.eids.is_some());
-            Err(Report::new(TrustedServerError::Auction {
-                message: "capture only".to_string(),
-            }))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("parse_response must not run when the launch fails");
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("capture-backend".to_string())
-        }
-    }
-
-    struct EidSourceCapturingProvider {
-        sources: Arc<std::sync::Mutex<Option<Vec<String>>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for EidSourceCapturingProvider {
-        fn provider_name(&self) -> &str {
-            "eid_capturing_provider"
-        }
-
-        async fn request_bids(
-            &self,
-            request: &AuctionRequest,
-            _context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.sources.lock().expect("should lock captured sources") = Some(
-                request
-                    .user
-                    .eids
-                    .iter()
-                    .flatten()
-                    .map(|eid| eid.source.clone())
-                    .collect(),
-            );
-            Err(Report::new(TrustedServerError::Auction {
-                message: "capture only".to_string(),
-            }))
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            _response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            panic!("parse_response must not run when the launch fails");
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            100
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("capture-backend".to_string())
+    fn non_regulated_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
         }
     }
 
     #[tokio::test]
-    async fn auction_drops_opted_out_cookie_and_body_eids() {
-        // Arrange: an opted-out source is absent from ids; only client copies exist.
-        for (from_cookie, providers_enabled, policy_only) in [
-            (false, true, false),
-            (true, true, false),
-            (false, false, false),
-            (true, false, false),
-            (false, true, true),
-            (true, true, true),
-        ] {
-            let settings = create_test_settings();
-            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
-                enabled: true,
-                providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
-                timeout_ms: 2000,
-                mediator: None,
-                ..Default::default()
-            });
-            let sources = Arc::new(std::sync::Mutex::new(None));
-            orchestrator.register_provider(Arc::new(EidSourceCapturingProvider {
-                sources: Arc::clone(&sources),
-            }));
-            let services = noop_services();
-            let mut ec = settings.ec.clone();
-            ec.partners = vec![
-                counting_test_partner("ids.example.com"),
-                counting_test_partner("other.example.com"),
-                counting_test_partner("stored.example.com"),
-            ];
-            ec.identity_providers =
-                vec![toml::from_str(
-            "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]"
-        ).expect("should parse provider")];
-            if !providers_enabled {
-                ec.identity_providers.clear();
-            }
-            let registry =
-                PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
-            let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let graph = KvIdentityGraph::counting("test_store", Arc::clone(&lookups));
-            let ec_id = format!("{}.vndbdy", "a".repeat(64));
-            let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
-            live.consent.ok = true;
-            live.opt_outs.insert(
-                crate::ec::eid_types::ProviderId::new("example-provider"),
-                u64::MAX,
-            );
-            if policy_only {
-                live.ids.insert(
-                    "stored.example.com".to_owned(),
-                    crate::ec::kv_types::KvPartnerId::single("stored-only-uid"),
-                );
-            }
-            graph.create(&ec_id, &live).expect("should seed live row");
-            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
-            lookups.store(0, std::sync::atomic::Ordering::Relaxed);
-            if policy_only {
-                ec_context.restrict_to_auction_policy();
-            }
-            let eids = json!([
-                {"source": "IDS.EXAMPLE.COM.", "uids": [{"id": "owned-uid", "atype": 1}]},
-                {"source": "other.example.com", "uids": [{"id": "other-uid", "atype": 1}]}
-            ]);
-            let mut body = json!({"adUnits": [{"code": "div-gpt-ad-1", "mediaTypes": {"banner": {"sizes": [[300, 250]]}}}]});
-            let mut request = Request::builder()
-                .method("POST")
-                .uri("https://publisher.example.com/auction");
-            if from_cookie {
-                let encoded =
-                    BASE64.encode(serde_json::to_vec(&eids).expect("should serialize EIDs"));
-                request = request.header("cookie", format!("ts-eids={encoded}"));
-            } else {
-                body["eids"] = eids;
-            }
-            let req = request
-                .body(EdgeBody::from(
-                    serde_json::to_vec(&body).expect("should serialize body"),
-                ))
-                .expect("should build request");
+    async fn auction_sends_no_stored_sharedid_when_purpose_four_is_denied() {
+        let eids = sharedid_auction_eids(
+            crate::test_support::tests::purpose_one_only_consent(),
+            "other=1",
+            json!([]),
+        )
+        .await;
 
-            // Act
-            let _ = handle_auction(
-                &settings,
-                &orchestrator,
-                Some(&graph),
-                Some(&registry),
-                &mut ec_context,
-                &services,
-                req,
-            )
-            .await;
+        assert!(
+            eids.as_array()
+                .is_none_or(|eids| !eids.iter().any(|eid| eid["source"] == "pubcid.org")),
+            "should send no stored SharedID with Purpose 1 granted and Purpose 4 denied: {eids}"
+        );
+    }
 
-            // Assert
-            assert_eq!(
-                lookups.load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "should read the row once for either graph capability"
-            );
-            if policy_only {
-                assert!(
-                    matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
-                    "should not expose the policy snapshot to finalization"
-                );
+    #[tokio::test]
+    async fn auction_sends_one_canonical_sharedid_eid() {
+        let ts_eids = BASE64.encode(
+            serde_json::to_vec(&json!([
+                { "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 3 }] }
+            ]))
+            .expect("should serialize ts-eids"),
+        );
+
+        let eids = sharedid_auction_eids(
+            non_regulated_consent(),
+            &format!("ts-eids={ts_eids}; _pubcid={SHAREDID_UUID}"),
+            json!([
+                { "source": "sharedid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 3 }] },
+                { "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID }] }
+            ]),
+        )
+        .await;
+
+        assert_eq!(
+            eids,
+            json!([{ "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 1 }] }]),
+            "should send the SharedID from record, cookie and body as one pubcid.org EID with atype 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_sends_no_sharedid_eid_for_an_opted_out_reader() {
+        let eids = sharedid_auction_eids(
+            non_regulated_consent(),
+            "_pubcid_optout=1",
+            json!([{ "source": "pubcid.org", "uids": [{ "id": SHAREDID_UUID, "atype": 1 }] }]),
+        )
+        .await;
+
+        assert!(
+            eids.as_array()
+                .is_none_or(|eids| !eids.iter().any(|eid| eid["source"] == "pubcid.org")),
+            "should send no SharedID EID after an opt-out: {eids}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_remembered_opt_out_filters_cookie_and_body_on_repeated_visits() {
+        for enabled in [false, true] {
+            for from_cookie in [false, true] {
+                for opted_out in [false, true] {
+                    // Arrange
+                    let mut settings = create_test_settings();
+                    settings.ec.partners = vec![
+                        counting_test_partner("ids.example.com"),
+                        counting_test_partner("other.example.com"),
+                    ];
+                    if enabled {
+                        settings.ec.identity_providers = vec![toml::from_str(
+                            "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]"
+                        ).expect("should parse provider")];
+                    }
+                    let registry = PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+                        .expect("should build registry");
+                    let orchestrator = orchestrator_with(AuctionConfig {
+                        enabled: true,
+                        providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+                        timeout_ms: 2000,
+                        ..Default::default()
+                    });
+                    let clock = TestClock::new();
+                    let bidder = ScriptedHttpClient::new(&clock);
+                    let services = build_services_with_outbound_client(&bidder, &clock);
+                    let graph = KvIdentityGraph::in_memory("opt-out-store");
+                    let ec_id = format!("{}.opt001", "a".repeat(64));
+                    let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+                    entry.consent.ok = true;
+                    entry.opt_outs.insert(
+                        crate::ec::eid_types::ProviderId::new("example-provider"),
+                        if opted_out { u64::MAX } else { 1 },
+                    );
+                    graph.create(&ec_id, &entry).await.expect("should seed row");
+                    let client = json!([
+                        {"source": if enabled && opted_out { "IDS.EXAMPLE.COM." } else { "ids.example.com" },"uids":[{"id":"owned-client","atype":1}]},
+                        {"source":"other.example.com","uids":[{"id":"unrelated-client","atype":1}]}
+                    ]);
+                    for visit in 0..2 {
+                        bidder.respond_to(
+                            http::Method::POST,
+                            EID_CAPTURE_ENDPOINT,
+                            ScriptedReply::status(StatusCode::NO_CONTENT),
+                        );
+                        let mut body = json!({"adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]});
+                        let mut request = Request::builder()
+                            .method("POST")
+                            .uri("https://publisher.example.com/auction");
+                        if from_cookie {
+                            request = request.header(
+                                "cookie",
+                                format!(
+                                    "ts-eids={}",
+                                    BASE64.encode(
+                                        serde_json::to_vec(&client).expect("should encode EIDs")
+                                    )
+                                ),
+                            );
+                        } else {
+                            body["eids"] = client.clone();
+                        }
+                        let request = request
+                            .body(EdgeBody::from(
+                                serde_json::to_vec(&body).expect("should encode request"),
+                            ))
+                            .expect("should build request");
+                        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+                        // Act
+                        handle_auction(
+                            &settings,
+                            &orchestrator,
+                            Some(&graph),
+                            Some(&registry),
+                            &mut context,
+                            &services,
+                            request,
+                        )
+                        .await
+                        .expect("should handle auction");
+                        // Assert on delivery, including the positive and no-provider controls.
+                        let sent = bidder.requests();
+                        assert_eq!(sent.len(), visit + 1, "should dispatch every visit");
+                        let payload: serde_json::Value = serde_json::from_slice(&sent[visit].body)
+                            .expect("should decode bidder request");
+                        let mut sources: Vec<&str> = payload["user"]["eids"]
+                            .as_array()
+                            .expect("should deliver unrelated EID")
+                            .iter()
+                            .filter_map(|eid| eid["source"].as_str())
+                            .collect();
+                        sources.sort_unstable();
+                        let expected = if enabled && opted_out {
+                            vec!["other.example.com"]
+                        } else {
+                            vec!["ids.example.com", "other.example.com"]
+                        };
+                        assert_eq!(
+                            sources, expected,
+                            "should honor remembered policy: enabled={enabled}, cookie={from_cookie}, opted_out={opted_out}, visit={visit}"
+                        );
+                        let stored = graph
+                            .get(&ec_id)
+                            .await
+                            .expect("should read row")
+                            .expect("should retain row")
+                            .0;
+                        if opted_out {
+                            assert_eq!(
+                                stored.opt_outs, entry.opt_outs,
+                                "should never clear active memory from client IDs"
+                            );
+                        }
+                    }
+                }
             }
-            let sources = sources
-                .lock()
-                .expect("should lock captured sources")
-                .clone()
-                .expect("should dispatch the auction request to the bidder");
-            assert_eq!(
-                sources,
-                if providers_enabled {
-                    vec!["other.example.com"]
-                } else {
-                    vec!["IDS.EXAMPLE.COM.", "other.example.com"]
-                },
-                "should filter opted-out EIDs from either producer only with a configured owner"
-            );
         }
     }
 
@@ -2127,17 +2649,21 @@ mod tests {
     async fn auction_drops_vendor_denied_body_eids() {
         // Arrange: a provider with vendor 42 owns one source, consent denies it.
         let settings = create_test_settings();
-        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+        let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         });
-        let sources = Arc::new(std::sync::Mutex::new(None));
-        orchestrator.register_provider(Arc::new(EidSourceCapturingProvider {
-            sources: Arc::clone(&sources),
-        }));
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
         let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
         assert!(
             registry.mark_provider_owned("ids.example.com", std::num::NonZeroU16::new(42)),
@@ -2147,7 +2673,10 @@ mod tests {
         let ec_id = format!("{}.vndbdy", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
-        graph.create(&ec_id, &live).expect("should seed live row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
         let mut ec_context = EcContext::new_for_test(Some(ec_id), vendor_denied_consent());
         let req = Request::builder()
             .method("POST")
@@ -2176,16 +2705,188 @@ mod tests {
             Some(&graph),
             Some(&registry),
             &mut ec_context,
-            &noop_services(),
+            &services,
             req,
         )
         .await;
 
         // Assert
+        let sent = bidders.requests();
         assert_eq!(
-            *sources.lock().expect("should lock captured sources"),
-            Some(vec!["other.example.com".to_owned()]),
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
+        let sources: Vec<&str> = user_eids(&body, "should send the kept EIDs")
+            .iter()
+            .filter_map(|eid| eid["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
             "should drop the body EID of the vendor-denied provider source"
+        );
+    }
+
+    /// Runs `/auction` for a cookie EC against `graph` and returns the bid
+    /// request the bidder received.
+    async fn bid_request_for_cookie_ec(graph: &KvIdentityGraph, ec_id: &str) -> serde_json::Value {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(ec_id));
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(graph),
+            None,
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        let sent = bidders.requests();
+        assert_eq!(
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request")
+    }
+
+    #[tokio::test]
+    async fn auction_omits_user_id_for_a_cookie_ec_without_a_row() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.norow1", "a".repeat(64));
+
+        // Act
+        let body = bid_request_for_cookie_ec(&graph, &ec_id).await;
+
+        // Assert
+        assert!(
+            body["user"]["id"].is_null(),
+            "should not send a cookie EC with no row as user.id: {body}"
+        );
+        assert!(
+            !body.to_string().contains(&ec_id),
+            "should not send the EC anywhere in the bid request"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_sends_user_id_for_a_cookie_ec_with_a_consented_row() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.hasrow", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
+
+        // Act
+        let body = bid_request_for_cookie_ec(&graph, &ec_id).await;
+
+        // Assert
+        assert_eq!(
+            body["user"]["id"].as_str(),
+            Some(ec_id.as_str()),
+            "should send an EC with a consented row as user.id"
+        );
+    }
+
+    #[test]
+    fn bidder_ec_id_requires_a_consented_row_with_an_ec_store() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        let present = |entry: &crate::ec::kv_types::KvEntry| EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry.clone()),
+            generation: Some(1),
+        };
+        let cases = [
+            (EcKvSnapshot::NotRead, None, "an unread row"),
+            (
+                EcKvSnapshot::Missing {
+                    ec_id: ec_id.clone(),
+                },
+                None,
+                "a missing row",
+            ),
+            (
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.clone(),
+                },
+                None,
+                "an unreadable row",
+            ),
+            (
+                present(&crate::ec::kv_types::KvEntry::tombstone(1000)),
+                None,
+                "a withdrawal tombstone",
+            ),
+            (present(&live), Some(ec_id.as_str()), "a consented row"),
+        ];
+
+        for (snapshot, expected, label) in cases {
+            // Act
+            let sent = bidder_ec_id(Some(&ec_id), Some(&graph), &snapshot);
+
+            // Assert
+            assert_eq!(sent, expected, "should decide user.id for {label}");
+        }
+    }
+
+    #[test]
+    fn bidder_ec_id_passes_the_ec_without_an_ec_store() {
+        // Arrange
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        // Act
+        let sent = bidder_ec_id(Some(&ec_id), None, &EcKvSnapshot::NotRead);
+
+        // Assert
+        assert_eq!(
+            sent,
+            Some(ec_id.as_str()),
+            "should keep the EC where no EC store holds rows"
         );
     }
 
@@ -2200,17 +2901,20 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        let had_eids = Arc::new(std::sync::Mutex::new(None));
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::clone(&had_eids),
-        }));
-        let services = noop_services();
+        let orchestrator = orchestrator_with(config);
+        let clock = TestClock::new();
+        let bidders = ScriptedHttpClient::new(&clock);
+        bidders.respond_to(
+            http::Method::POST,
+            EID_CAPTURE_ENDPOINT,
+            ScriptedReply::status(StatusCode::NO_CONTENT),
+        );
+        let services = build_services_with_outbound_client(&bidders, &clock);
 
         // US-state jurisdiction with an explicit GPC opt-out: auction allowed,
         // EC identity denied.
@@ -2255,8 +2959,7 @@ mod tests {
             ))
             .expect("should build auction request");
 
-        // The capturing provider fails its launch, so the auction errors overall;
-        // the assertion is on the EIDs observed by the provider, not the result.
+        // The assertion is on the EIDs the bidder received, not the auction result.
         let _ = handle_auction(
             &settings,
             &orchestrator,
@@ -2268,10 +2971,19 @@ mod tests {
         )
         .await;
 
+        let sent = bidders.requests();
         assert_eq!(
-            *had_eids.lock().expect("should lock captured eids"),
-            Some(false),
-            "outgoing auction request must carry no EIDs when EC identity is denied"
+            sent.len(),
+            1,
+            "should send the auction request to the bidder"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&sent[0].body).expect("should send a JSON bid request");
+        assert_no_user_eids(
+            &body,
+            &format!(
+                "outgoing auction request must carry no EIDs when EC identity is denied: {body}"
+            ),
         );
     }
 
@@ -2325,6 +3037,38 @@ mod tests {
             sources,
             vec!["ids.example.com"],
             "should not send the GDPR-excluded source to bidders"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_withholds_a_source_opted_out_in_provider_cookies() {
+        // Arrange: the row still holds the provider's UID; this request's
+        // cookies record the opt-out the navigation's write has not applied.
+        let registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("ids.example.com", "held-id", 1);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("other-uid"),
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let eids = resolve_auction_eids(&snapshot, Some(&registry), &ec_context)
+            .expect("should resolve EIDs");
+
+        // Assert
+        let sources: Vec<&str> = eids.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should not send the opted-out source to bidders"
         );
     }
 
@@ -2744,6 +3488,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_auction_eids_keeps_one_sharedid_across_sources() {
+        let uid = |atype| Uid {
+            id: "11111111-2222-4333-8444-555555555555".to_owned(),
+            atype,
+            ext: None,
+        };
+        let resolved_eids = Some(vec![Eid::new("sharedid.org", vec![uid(Some(3))])]);
+        let client_eids = Some(vec![
+            Eid::new("pubcid.org", vec![uid(None)]),
+            Eid::new("sharedid.org", vec![uid(Some(3))]),
+        ]);
+
+        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
+
+        assert_eq!(
+            serde_json::to_value(&merged).expect("should serialize merged EIDs"),
+            json!([{
+                "source": "pubcid.org",
+                "uids": [{ "id": "11111111-2222-4333-8444-555555555555", "atype": 1 }]
+            }]),
+            "should keep one pubcid.org EID with atype 1"
+        );
+    }
+
+    #[test]
     fn merge_auction_eids_preserves_multiple_uids_per_source() {
         let client_eids = Some(vec![Eid::new(
             "sharedid.org".to_string(),
@@ -2880,50 +3649,111 @@ mod tests {
         });
     }
 
+    /// Returns an orchestrator with the auction disabled, so a parsed body gets a 200 no-bid.
+    fn disabled_orchestrator() -> AuctionOrchestrator {
+        orchestrator_with(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }
+
     #[test]
-    fn auction_rejects_streaming_body_instead_of_treating_as_empty() {
+    fn auction_reads_a_streamed_body() {
         futures::executor::block_on(async {
-            use bytes::Bytes;
-            use edgezero_core::body::Body as EdgeBody;
-            use http::{Method, Request as HttpRequest};
-
-            use crate::auction::build_orchestrator;
-            use crate::consent::ConsentContext;
-            use crate::ec::EcContext;
-            use crate::error::TrustedServerError;
-            use crate::platform::test_support::noop_services;
-            use crate::test_support::tests::create_test_settings;
-
             let settings = create_test_settings();
-            let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+            let orchestrator = disabled_orchestrator();
             let services = noop_services();
             let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
-            let stream = futures::stream::iter([Bytes::from_static(br#"{}"#)]);
-            let req = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("https://test.com/auction")
-                .body(EdgeBody::stream(stream))
-                .expect("should build request");
+            let body = serde_json::to_vec(&json!({
+                "adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }]
+            }))
+            .expect("should serialize the auction body");
+            let (head, tail) = body.split_at(body.len() / 2);
+            let chunks = [
+                bytes::Bytes::copy_from_slice(head),
+                bytes::Bytes::copy_from_slice(tail),
+            ];
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.example/auction")
+                .body(EdgeBody::stream(futures::stream::iter(chunks)))
+                .expect("should build the streamed auction request");
 
-            let result = handle_auction(
+            let response = handle_auction(
                 &settings,
                 &orchestrator,
                 None,
                 None,
                 &mut ec_context,
                 &services,
-                req,
+                request,
             )
-            .await;
+            .await
+            .expect("should parse a streamed auction body");
 
-            let err = match result {
-                Ok(_) => panic!("streaming body should be rejected"),
-                Err(err) => err,
-            };
-            assert!(
-                matches!(err.current_context(), TrustedServerError::BadRequest { .. }),
-                "streaming request body should fail as bad request"
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should answer a streamed body as it answers a buffered one"
             );
+        });
+    }
+
+    #[test]
+    fn auction_body_read_failures_map_to_statuses() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let orchestrator = disabled_orchestrator();
+            let services = noop_services();
+
+            for case in body_read_failure_cases(MAX_AUCTION_BODY_SIZE) {
+                let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+                let (request, expectation) = case.into_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://test-publisher.example/auction"),
+                );
+
+                let capture = LogCapture::start();
+                let outcome = handle_auction(
+                    &settings,
+                    &orchestrator,
+                    None,
+                    None,
+                    &mut ec_context,
+                    &services,
+                    request,
+                )
+                .await;
+
+                expectation.assert_outcome("/auction", &outcome);
+                if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                    let levels: Vec<log::Level> = capture
+                        .take_all()
+                        .iter()
+                        .map(|record| record.level)
+                        .collect();
+                    assert_eq!(
+                        levels,
+                        [log::Level::Warn],
+                        "should log the {} case once, at warn",
+                        expectation.name()
+                    );
+                    let response = outcome.expect("should answer an overflow with a response");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("text/plain"),
+                        "should keep the text/plain 413 body for the {} case",
+                        expectation.name()
+                    );
+                }
+            }
         });
     }
 }

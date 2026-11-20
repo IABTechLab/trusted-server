@@ -87,7 +87,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/mod.rs", include_str!("ec/mod.rs")),
         ("ec/partner.rs", include_str!("ec/partner.rs")),
         ("ec/prebid_eids.rs", include_str!("ec/prebid_eids.rs")),
-        ("ec/pull_sync.rs", include_str!("ec/pull_sync.rs")),
         ("ec/rate_limiter.rs", include_str!("ec/rate_limiter.rs")),
         ("ec/registry.rs", include_str!("ec/registry.rs")),
         ("edge_cookie.rs", include_str!("edge_cookie.rs")),
@@ -172,11 +171,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("models.rs", include_str!("models.rs")),
         ("openrtb.rs", include_str!("openrtb.rs")),
         ("platform/error.rs", include_str!("platform/error.rs")),
-        ("platform/http.rs", include_str!("platform/http.rs")),
-        (
-            "platform/image_optimizer.rs",
-            include_str!("platform/image_optimizer.rs"),
-        ),
         ("platform/kv.rs", include_str!("platform/kv.rs")),
         ("platform/mod.rs", include_str!("platform/mod.rs")),
         (

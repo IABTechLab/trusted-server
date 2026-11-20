@@ -6,17 +6,16 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::cache_policy::EdgeCacheHeader;
-use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
-use trusted_server_core::integrations::RequestFilterEffects;
-use trusted_server_core::proxy::AssetProxyCachePolicy;
-use trusted_server_core::response_privacy::{
-    TerminalPrivateResponse, enforce_private_no_store, enforce_set_cookie_cache_privacy,
-    enforce_uncacheable_cache_privacy,
+use trusted_server_core::constants::{
+    HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
+use trusted_server_core::error::{handler_error_response, http_error};
+use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::trace::TraceTerminalResponse;
+
+use crate::platform::geo_from_outcome;
 
 // ---------------------------------------------------------------------------
 // SanitizeRequestMiddleware
@@ -47,7 +46,7 @@ impl SanitizeRequestMiddleware {
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+            ctx.parts_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -60,8 +59,9 @@ impl Middleware for SanitizeRequestMiddleware {
 
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
-/// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. `X-TS-Version` carries the compiled-in git version. The
+/// Geo headers reflect the same immutable managed outcome used by handlers,
+/// without resolving the provider during finalization. Missing detail is omitted.
+/// `X-TS-Version` carries the compiled-in git version. The
 /// Fastly-specific headers (`X-TS-Fastly-Version`, `X-TS-ENV`) are skipped
 /// because the corresponding env vars are not set in a local dev context.
 ///
@@ -83,45 +83,14 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let mut response = next.run(ctx).await?;
-        let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
-        let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
-        apply_finalize_headers(&self.settings, &mut response);
-        if let Some(policy) = asset_cache_policy {
-            policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SMaxageFallback);
-        }
-        apply_terminal_response_effects(&mut response, request_filter_effects.as_ref());
+        let geo = geo_from_outcome(ctx.geo());
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => handler_error_response(error)?,
+        };
+        apply_finalize_headers(&self.settings, geo.as_ref(), &mut response);
         Ok(response)
     }
-}
-
-/// Applies request-filter effects, then restores privacy invariants.
-///
-/// Mirrors the Fastly entry point: effects may add a per-user `Set-Cookie`
-/// or a private directive after the standard headers ran.
-fn apply_terminal_response_effects(
-    response: &mut Response,
-    request_filter_effects: Option<&RequestFilterEffects>,
-) {
-    if response
-        .extensions()
-        .get::<TraceTerminalResponse>()
-        .is_some()
-    {
-        return;
-    }
-    let must_remain_private = response
-        .extensions()
-        .get::<TerminalPrivateResponse>()
-        .is_some();
-    if let Some(effects) = request_filter_effects {
-        effects.apply_to_response(response);
-    }
-    if must_remain_private {
-        enforce_private_no_store(response);
-    }
-    enforce_set_cookie_cache_privacy(response);
-    enforce_uncacheable_cache_privacy(response);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +102,7 @@ fn apply_terminal_response_effects(
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
+/// - `Err(report)` → internal error; [`http_error`] logs it once and answers 500.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
@@ -149,13 +118,10 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
-            }
+            Err(report) => return Ok(http_error(&report)),
         }
 
         next.run(ctx).await
@@ -168,18 +134,40 @@ impl Middleware for AuthMiddleware {
 
 /// Applies standard Trusted Server response headers to the given response.
 ///
-/// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted, followed by the compiled-in `X-TS-Version`.
-/// Fastly-specific headers are omitted.
+/// Clear stale upstream geographic headers, then emit only detail present in
+/// the request snapshot. Fastly-specific headers are omitted.
 /// Operator-configured `settings.response_headers` are applied last (with the
 /// shared cookie cache-privacy hardening) and can override any managed header.
-pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
-    response.headers_mut().insert(
+pub(crate) fn apply_finalize_headers(
+    settings: &Settings,
+    geo: Option<&GeoInfo>,
+    response: &mut Response,
+) {
+    for name in [
+        HEADER_X_GEO_CITY,
+        HEADER_X_GEO_COUNTRY,
+        HEADER_X_GEO_CONTINENT,
+        HEADER_X_GEO_COORDINATES,
+        HEADER_X_GEO_METRO_CODE,
+        HEADER_X_GEO_REGION,
         HEADER_X_GEO_INFO_AVAILABLE,
-        HeaderValue::from_static("false"),
-    );
+    ] {
+        response.headers_mut().remove(name);
+    }
+    if let Some(geo) = geo {
+        geo.set_response_headers(response);
+    } else {
+        response.headers_mut().insert(
+            HEADER_X_GEO_INFO_AVAILABLE,
+            HeaderValue::from_static("false"),
+        );
+    }
 
     trusted_server_core::version_header::apply_git_version_header(response);
+
+    // The finalize middleware runs once per request, so each skipped operator
+    // entry warns once.
+    trusted_server_core::response_privacy::warn_skipped_operator_response_headers(settings);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
@@ -201,12 +189,13 @@ mod tests {
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{Method, request_builder, response_builder};
+    use edgezero_core::http::{Method, StatusCode, request_builder, response_builder};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
     use futures::executor::block_on;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
+    use trusted_server_core::test_support::logging::LogCapture;
 
     fn empty_response() -> Response {
         response_builder()
@@ -252,11 +241,34 @@ mod tests {
     }
 
     #[test]
+    fn warns_once_about_a_skipped_operator_entry() {
+        let settings = settings_with_response_headers(vec![("connection", "keep-alive")]);
+        let mut response = empty_response();
+        let capture = LogCapture::start();
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        let skipped = capture
+            .take_warnings()
+            .into_iter()
+            .filter(|warning| warning.message.contains("`connection`"))
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "should warn once about the skipped operator entry"
+        );
+        assert!(
+            !response.headers().contains_key("connection"),
+            "should skip the operator entry"
+        );
+    }
+
+    #[test]
     fn sets_geo_unavailable_header() {
         let settings = settings_with_response_headers(vec![]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -274,7 +286,7 @@ mod tests {
             settings_with_response_headers(vec![("X-Geo-Info-Available", "operator-override")]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -291,7 +303,7 @@ mod tests {
         let settings = settings_with_response_headers(vec![("X-Custom-Header", "custom-value")]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, &mut response);
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response
@@ -301,6 +313,38 @@ mod tests {
             Some("custom-value"),
             "should apply operator-configured response headers"
         );
+    }
+
+    #[test]
+    fn partial_geo_emits_no_invented_or_stale_detail() {
+        let settings = settings_with_response_headers(vec![]);
+        let mut response = empty_response();
+        response
+            .headers_mut()
+            .insert("x-geo-coordinates", HeaderValue::from_static("0,0"));
+        response
+            .headers_mut()
+            .insert("x-geo-city", HeaderValue::from_static("stale-origin-city"));
+        let geo = GeoInfo::country_region("US", Some("CA".to_owned()));
+        apply_finalize_headers(&settings, Some(&geo), &mut response);
+        assert_eq!(response.headers()["x-geo-info-available"], "true");
+        assert_eq!(response.headers()["x-geo-country"], "US");
+        assert_eq!(response.headers()["x-geo-region"], "CA");
+        for name in [
+            "x-geo-coordinates",
+            "x-geo-city",
+            "x-geo-continent",
+            "x-geo-metro-code",
+        ] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should omit unavailable detail"
+            );
+        }
+        apply_finalize_headers(&settings, None, &mut response);
+        assert_eq!(response.headers()["x-geo-info-available"], "false");
+        assert!(!response.headers().contains_key("x-geo-country"));
+        assert!(!response.headers().contains_key("x-geo-region"));
     }
 
     #[test]
@@ -318,8 +362,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }
@@ -336,15 +380,95 @@ mod tests {
     }
 
     #[test]
+    fn auth_handle_logs_a_configuration_error_once() {
+        let mut settings = settings_with_response_headers(vec![]);
+        settings.handlers.clear();
+        let middleware = AuthMiddleware::new(Arc::new(settings));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/_ts/admin/keys/rotate")
+            .body(Body::empty())
+            .expect("should build an admin request");
+        let ctx = RequestContext::new(request, PathParams::new(HashMap::new()));
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(ctx, Next::new(&[], &*handler)))
+            .expect("should answer the configuration error");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer an admin path no handler covers with 500"
+        );
+        let levels: Vec<log::Level> = capture
+            .take_all()
+            .iter()
+            .map(|record| record.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [log::Level::Error],
+            "should log the configuration error once, at error"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_adds_version_header_to_a_handler_error() {
+        let version = trusted_server_core::constants::TS_GIT_VERSION
+            .expect("should compile a git version into the test build");
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings_with_response_headers(vec![])));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Err::<Response, EdgeError>(EdgeError::internal(std::io::Error::other(
+                "example handler failure",
+            )))
+        });
+        let capture = LogCapture::start();
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should render the handler error as a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer the handler error with its status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(version),
+            "should add x-ts-version to the handler error response"
+        );
+        let records = capture.take_all();
+        assert!(
+            matches!(
+                records.as_slice(),
+                [record] if record.level == log::Level::Error
+                    && !record.message.contains("example handler failure")
+            ),
+            "should log the handler error once, without its message"
+        );
+    }
+
+    #[test]
     fn emits_git_version_header() {
         let mut response = empty_response();
-        apply_finalize_headers(&settings_with_response_headers(vec![]), &mut response);
+        apply_finalize_headers(&settings_with_response_headers(vec![]), None, &mut response);
         assert_eq!(
             response
                 .headers()
                 .get("x-ts-version")
                 .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
+            Some(
+                trusted_server_core::constants::TS_GIT_VERSION
+                    .expect("should compile a git version into the test build")
+            ),
             "should report the compiled-in git version as x-ts-version"
         );
     }

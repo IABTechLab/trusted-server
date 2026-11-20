@@ -1,8 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::http::RequestParts;
 use error_stack::Report;
 use http::header;
-use http::{Request, Response, StatusCode};
+use http::{HeaderMap, Request, Response, StatusCode};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
@@ -62,7 +63,7 @@ impl EdgeTerminatedAuthorization {
 ///
 /// # Request mutation
 ///
-/// Takes `req` mutably because it owns [`EdgeTerminatedAuthorization`]. Any
+/// Takes the request head mutably because it owns [`EdgeTerminatedAuthorization`]. Any
 /// inherited marker is cleared on entry, and a fresh one is inserted only on the
 /// success path, so the marker present after this call always describes this
 /// call's own decision. Nothing else about the request is touched — in
@@ -82,15 +83,15 @@ impl EdgeTerminatedAuthorization {
 /// un-compilable path regex.
 pub fn enforce_basic_auth(
     settings: &Settings,
-    req: &mut Request<EdgeBody>,
+    req: &mut RequestParts,
 ) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
     // Cleared before any early return so no inherited marker can survive a call
     // that did not itself validate a credential. Without this, a request marked
     // upstream and then routed to an unprotected path would keep an assertion
     // nothing checked.
-    req.extensions_mut().remove::<EdgeTerminatedAuthorization>();
+    req.extensions.remove::<EdgeTerminatedAuthorization>();
 
-    let path = req.uri().path();
+    let path = req.uri.path();
     let Some(handler) = settings.handler_for_path(path)? else {
         if Settings::is_admin_path(path) {
             return Err(Report::new(TrustedServerError::Configuration {
@@ -100,7 +101,7 @@ pub fn enforce_basic_auth(
         return Ok(None);
     };
 
-    let Some((username, password, authorization_digest)) = extract_credentials(req) else {
+    let Some((username, password, authorization_digest)) = extract_credentials(&req.headers) else {
         return Ok(Some(unauthorized_response()));
     };
 
@@ -119,14 +120,14 @@ pub fn enforce_basic_auth(
     if bool::from(username_match & password_match) {
         // Record that TS itself consumed this credential, so the shared template
         // cache can distinguish it from a credential meant for the origin.
-        req.extensions_mut()
+        req.extensions
             .insert(EdgeTerminatedAuthorization(authorization_digest));
         Ok(None)
     } else {
-        if req.extensions().get::<TraceAuthLogPolicy>().is_some() {
+        if req.extensions.get::<TraceAuthLogPolicy>().is_some() {
             log::warn!("trace_auth_failed");
         } else {
-            log::warn!("Basic auth failed for path: {}", req.uri().path());
+            log::warn!("Basic auth failed for path: {}", req.uri.path());
         }
         Ok(Some(unauthorized_response()))
     }
@@ -142,11 +143,11 @@ pub fn enforce_basic_auth(
 /// operator credential was used.
 #[must_use]
 pub fn authenticated_username(req: &Request<EdgeBody>) -> Option<String> {
-    extract_credentials(req).map(|(username, _password, _digest)| username)
+    extract_credentials(req.headers()).map(|(username, _password, _digest)| username)
 }
 
-fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String, [u8; 32])> {
-    let mut header_values = req.headers().get_all(header::AUTHORIZATION).iter();
+fn extract_credentials(headers: &HeaderMap) -> Option<(String, String, [u8; 32])> {
+    let mut header_values = headers.get_all(header::AUTHORIZATION).iter();
     let header_value = header_values.next()?;
     if header_values.next().is_some() {
         return None;
@@ -192,16 +193,18 @@ mod tests {
 
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
-    fn build_request(method: Method, uri: &str) -> Request<EdgeBody> {
-        Request::builder()
+    fn build_request(method: Method, uri: &str) -> RequestParts {
+        let (parts, _body) = Request::builder()
             .method(method)
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build request")
+            .into_parts();
+        parts
     }
 
-    fn set_authorization(req: &mut Request<EdgeBody>, value: &str) {
-        req.headers_mut().insert(
+    fn set_authorization(req: &mut RequestParts, value: &str) {
+        req.headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_str(value).expect("should build authorization header"),
         );
@@ -244,24 +247,24 @@ mod tests {
             "valid credentials should be admitted"
         );
         let marker = req
-            .extensions()
+            .extensions
             .get::<EdgeTerminatedAuthorization>()
             .expect("should mark a credential this edge consumed");
         assert!(
-            marker.matches(req.headers()),
+            marker.matches(&req.headers),
             "the marker should match the unchanged validated authorization"
         );
 
-        req.headers_mut().insert(
+        req.headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer publisher-origin-credential"),
         );
         let marker = req
-            .extensions()
+            .extensions
             .get::<EdgeTerminatedAuthorization>()
             .expect("should retain the marker after an unrelated mutation");
         assert!(
-            !marker.matches(req.headers()),
+            !marker.matches(&req.headers),
             "the marker must not match a replacement authorization value"
         );
     }
@@ -272,7 +275,7 @@ mod tests {
         let mut req = build_request(Method::GET, "https://example.com/secure");
         let encoded = STANDARD.encode("user:pass");
         set_authorization(&mut req, &format!("Basic {encoded}"));
-        req.headers_mut().append(
+        req.headers.append(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer publisher-origin-credential"),
         );
@@ -282,7 +285,7 @@ mod tests {
             .expect("should challenge an ambiguous credential");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(
-            req.extensions()
+            req.extensions
                 .get::<EdgeTerminatedAuthorization>()
                 .is_none(),
             "a repeated authorization field must remain pass-through rather than being marked safe"
@@ -297,7 +300,7 @@ mod tests {
         let settings = create_test_settings();
         let mut req = build_request(Method::GET, "https://example.com/open");
         set_authorization(&mut req, "Basic dXNlcjpwYXNz");
-        req.extensions_mut()
+        req.extensions
             .insert(EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"));
 
         assert!(
@@ -307,7 +310,7 @@ mod tests {
             "an unprotected path should not challenge"
         );
         assert!(
-            req.extensions()
+            req.extensions
                 .get::<EdgeTerminatedAuthorization>()
                 .is_none(),
             "a marker no credential check produced must not survive this call"
@@ -320,17 +323,16 @@ mod tests {
         let mut req = build_request(Method::GET, "https://example.com/secure");
         let encoded = STANDARD.encode("user:wrong-pass");
         set_authorization(&mut req, &format!("Basic {encoded}"));
-        req.extensions_mut()
-            .insert(EdgeTerminatedAuthorization::for_test(
-                "Basic dXNlcjp3cm9uZy1wYXNz",
-            ));
+        req.extensions.insert(EdgeTerminatedAuthorization::for_test(
+            "Basic dXNlcjp3cm9uZy1wYXNz",
+        ));
 
         let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(
-            req.extensions()
+            req.extensions
                 .get::<EdgeTerminatedAuthorization>()
                 .is_none(),
             "a failed check must strip an inherited marker rather than honour it"
@@ -350,7 +352,7 @@ mod tests {
             "an unprotected path should not challenge"
         );
         assert!(
-            req.extensions()
+            req.extensions
                 .get::<EdgeTerminatedAuthorization>()
                 .is_none(),
             "a credential no handler consumed is pass-through and must stay disqualifying"
@@ -369,7 +371,7 @@ mod tests {
             .expect("should challenge");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(
-            req.extensions()
+            req.extensions
                 .get::<EdgeTerminatedAuthorization>()
                 .is_none(),
             "a failed credential must never be marked as terminated"
