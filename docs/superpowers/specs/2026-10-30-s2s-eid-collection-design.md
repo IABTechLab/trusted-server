@@ -1044,9 +1044,10 @@ those rules are not under test.
 /// Coordinates server-side identity lookups for one navigation.
 ///
 /// Implementations own eligibility, consent, destination checks, the shared
-/// time budget, validation, merging and mirror encoding. Providers never see
-/// KV, cookies, HTTP or the clock. Implementations never write KV: the caller
-/// plans the change with `plan_write` and spends the [`PageLoadWrite`] permit.
+/// time budget and validation. Providers never see KV, HTTP or the clock, and
+/// see cookies only as `RequestCookies`. Implementations never write KV: the
+/// caller plans the change with `plan_write` and spends the [`PageLoadWrite`]
+/// permit. The mirror is built by `ec::mirror::build_mirror`.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
