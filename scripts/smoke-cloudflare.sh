@@ -4,6 +4,8 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# Tool-manager shims resolve the declared versions from the working directory.
+cd "$REPO_ROOT"
 # shellcheck source=scripts/smoke-common.sh
 . "$REPO_ROOT/scripts/smoke-common.sh"
 
@@ -17,7 +19,8 @@ smoke_require_command pgrep
 
 EXPECTED_WRANGLER=$(awk '$1 == "wrangler" { print $2 }' "$REPO_ROOT/.tool-versions")
 [ -n "$EXPECTED_WRANGLER" ] || smoke_die "missing Wrangler pin in .tool-versions"
-ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')
+ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p') ||
+    smoke_die "could not run: wrangler --version"
 [ "$ACTUAL_WRANGLER" = "$EXPECTED_WRANGLER" ] ||
     smoke_die "Wrangler $EXPECTED_WRANGLER is required; found ${ACTUAL_WRANGLER:-unknown}"
 
@@ -35,6 +38,9 @@ cleanup() {
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
+
+# Keep Node and Wrangler shims pinned for CLI subprocesses and the copied Worker.
+cp "$REPO_ROOT/.tool-versions" "$WORKSPACE/.tool-versions"
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 CLOUDFLARE_ROOT="$REPO_ROOT/crates/trusted-server-adapter-cloudflare"
