@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-adapter-axum"
-description = "Axum entry point for Trusted Server — native dev server."
+description = "Axum entry point for Trusted Server — native production and development server."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

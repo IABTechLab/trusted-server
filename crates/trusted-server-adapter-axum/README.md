@@ -1,8 +1,9 @@
 # trusted-server-adapter-axum
 
-Native development adapter for Trusted Server. It runs the shared application
-through Axum on the host, without an edge simulator, and is not a production
-deployment target.
+Native adapter for Trusted Server. It runs the shared application through Axum
+on the host, without an edge simulator, for local development and as the
+production entry point. Edge Cookie record storage on Axum is not available
+yet.
 
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
@@ -15,8 +16,8 @@ installs the real router. Missing or invalid inputs stop the process with a
 non-zero exit. Local development uses an isolated EdgeZero config-store map and
 `EDGEZERO__SECRETS__*` values. Legacy `TRUSTED_SERVER_CONFIG_*` and
 `TRUSTED_SERVER_SECRET_*` variables cannot rescue missing prepared inputs.
-See the [native RC guide](../../docs/guide/native-rc-demo.md) for the
-production-style hosting and provider checks.
+See [Axum production startup](../../docs/guide/native-rc-demo.md) for the
+AWS providers and their checks.
 
 The binary runs through EdgeZero's Axum production startup,
 `run_production_app_with_initializer`, which installs the logger and binds the
