@@ -17,7 +17,7 @@
 
 **Lockr storage format (from Prebid's `lockrAIMIdSystem`):** each vendor token is stored as the raw `advertising_token` under the server-configured `key_name`, in a cookie and or localStorage. Lockr's own `ilui`, `<key_name>_expiry` and `lockr_expiry_keys` keys are localStorage only. No `inserter` field and no opt-out marker are stored.
 
-**Gating:** kinds without the capability (ConnectID, LiveIntent) have `deny_unknown_fields` settings without a `lockr` field, so a `lockr` table fails the provider build at startup. Lockr enabled with an empty `cookie_names` is rejected.
+**Gating:** kinds without the capability (ConnectID, LiveIntent, SharedID, Criteo, Unified ID) have `deny_unknown_fields` settings without a `lockr` field, so a `lockr` table fails the provider build at startup. Lockr enabled with an empty `cookie_names` is rejected.
 
 **Own-cookie settings:** every cookie-reading kind takes a `cookie_names` list (UID2's `token_cookie_name` and ConnectID's `cookie_name` are renamed). Lockr names move out of them into `[settings.lockr]`.
 

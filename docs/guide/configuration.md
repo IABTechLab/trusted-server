@@ -953,11 +953,13 @@ vendor ID.
 
 Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
 build every enabled provider and reject one whose `kind` or `settings` is
-invalid. They do not know the target adapter: the Axum, Cloudflare and Spin
-adapters refuse to start when an enabled provider is configured, so do not push
-an enabled provider to those services. On Fastly, an enabled
-provider whose `kind` this build does not include, or whose `settings` its kind
-rejects, also fails startup. Lookups always verify the provider's TLS
+invalid. `ts config validate` is adapter-agnostic. `ts config push` and
+`ts config diff` reject enabled providers for targets other than Fastly: the
+Axum, Cloudflare and Spin adapters refuse to start when an enabled provider is
+configured. On Fastly, invalid enabled provider configuration, such as a `kind`
+this build does not include or `settings` its kind rejects, prevents
+application startup; providers are not silently disabled for individual
+requests. Lookups always verify the provider's TLS
 certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
@@ -968,9 +970,19 @@ provider cleared on an opt-out is not refilled from the browser.
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the
 provider is not called for that EC again until the 30 days pass, unless the
-vendor's cookies hold an ID again: that means the visitor opted back in, so the
-opt-out is forgotten. An opt-out read from the vendor's cookies is not
-remembered, because the cookies are read again on every navigation.
+vendor's cookies hold a new ID: that means the visitor opted back in, so the
+opt-out is forgotten. A cookie that only repeats an ID the cookies or the row
+held when the opt-out was reported does not count, because a server refresh
+never rewrites the cookie; the row keeps short hashes of those IDs, not the
+IDs. A vendor that issues the same ID again after an opt-back-in is called
+again once the 30 days pass. An opt-out read from the vendor's cookies is not
+remembered, because the cookies are read again on every navigation. It also
+applies to the request it arrives on: on every route, the vendor's cookies are
+read before any ID leaves the server, and the provider's sources are withheld
+from the publisher auction, `/_ts/page-bids`, `/auction` and identify, whether
+the ID comes from the row or from the browser. No lookup is made to do so.
+An opt-out that clears a source also records its time in the row for a day, so
+a slower lookup dispatched before it cannot restore the source.
 
 Some kinds keep private refresh state with a UID, such as a vendor refresh
 token, and refresh it server side once it is due, also after the UID expires
@@ -993,6 +1005,10 @@ the EC row when the cookies hold none; no cookie is set.
 | `rate_limit_per_hour` | Integer | No       | Most lookups per EC hash per hour; unset means unlimited. See below                   |
 | `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
 | `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
+
+A `sharedid` provider without `sources` owns `pubcid.org`. Its default
+cookie is the one Prebid's SharedID `storage.name` names, before
+`_sharedid` and `_pubcid`.
 
 **Example**:
 
@@ -1055,9 +1071,8 @@ rewrites the row.
 `ts config validate`, `ts config push` and `ts config diff` also build every
 enabled provider of a registered kind, so a provider-specific setting error
 (for example a `liveramp` `endpoint` without `placement_id` and
-`custom_id_namespace`) fails the command before deploy. At runtime the same
-error would disable every identity provider for each request, with an error
-log.
+`custom_id_namespace`) fails the command before deploy. On Fastly the same
+error would prevent application startup.
 
 #### Provider kinds
 
@@ -1091,8 +1106,11 @@ they reach bid requests from the next page load.
 
 **Lockr.** The `id5`, `liveramp` and `uid2` kinds accept
 `[ec.identity_providers.settings.lockr]` (`enabled`, `cookie_names`), read
-after the vendor's own cookies and never where GDPR applies. The other kinds
-reject that table.
+after the vendor's own cookies and never where GDPR applies. Each kind's
+default Lockr key equals one of its own cookie names, which are already read,
+so enabling Lockr with the defaults reads no extra cookie: set `cookie_names`
+to the key configured in Lockr when it differs. The other kinds reject that
+table.
 
 **Opt-out.** An `id5` cookie or fetch reply whose ID is `0`, a `liveramp`
 lookup answered `204`, a `uid2` `optout` identity or refresh reply, and
@@ -1145,7 +1163,8 @@ publisher sends it; Trusted Server sends no login or hashed email.
 
 Cookie-only kinds: no endpoint and no server call; each takes exactly one
 source. `connectid` reads Yahoo's `connectId` JSON cookie. `sharedid` reads
-Prebid's `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
+the cookie Prebid's SharedID module is configured to use (its
+`managed_user_ids` `storage.name`), else `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
 cookie or stored ID it stores a random UUID in the row only (no cookie is
 set). Leave `generate` off unless Prebid keeps its opt-out in the
 `_pubcid_optout` cookie. `criteo` reads Prebid's `cto_bidid`,
@@ -3096,7 +3115,7 @@ Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
 within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+`__Host-ts-eids-mirror`, `sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,
