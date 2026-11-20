@@ -19,13 +19,17 @@ startup remains covered by #1635.
 
 ## Dependency and rollout
 
-Use an immutable revision from EdgeZero `preview/r2-after-response`: merge
-PR #509 head into current `rc/identity`, without modifying either source
-branch. The merge starts at `9d02d7b3185b49e81d9ac972ca3feef932ed848a`
-and incorporates `a5c176e1e8c52350e1eb73451a9f523483e36551`.
-Preview merge: `b256e5b1da9c3b61b661e039a680e1afeb4bfe23` (signed and verified).
-**Before merge, repin every EdgeZero dependency and lockfile entry to R2
-(edgezero#490). The preview revision is temporary and is not R2.**
+All six EdgeZero crates use `rc/identity` revision
+`9d02d7b3185b49e81d9ac972ca3feef932ed848a`, matching #1635 and the rest of the
+stack. This is R2 (edgezero#490), which already includes #509's bounded
+Fastly/Axum after-response implementation at `2620377a`. It supplies the task
+scheduler and shared shutdown grace used here; no additional EdgeZero runtime
+changes are required.
+
+#1646 (`feat/1574-axum-shared-identity`) also changes Fastly's
+`post_delivery.rs`, core's `ec/after_response.rs`, and Axum's `app.rs`/`lib.rs`.
+Whichever change lands second must merge the other and verify the combined
+lifecycle, rather than independently replacing its work.
 
 ## Design
 

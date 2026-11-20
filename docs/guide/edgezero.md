@@ -9,12 +9,10 @@ stores, and the Fastly, Axum, Cloudflare, and Spin adapter commands.
 ## Pinned version
 
 The workspace `Cargo.toml` pins all six EdgeZero crates to one git revision of
-`IABTechLab/edgezero`: `b256e5b1da9c3b61b661e039a680e1afeb4bfe23`, the
-temporary `preview/r2-after-response` integration commit. It merges the current
-`rc/identity` head with the head of EdgeZero #509 for bounded after-response
-coverage. **Repin all six dependencies and Cargo.lock to R2 (EdgeZero #490)
-before merging #1575.** The preview is not the R2 revision. After the integration
-work lands, the pin can move to an EdgeZero release tag.
+`IABTechLab/edgezero`: `9d02d7b3185b49e81d9ac972ca3feef932ed848a`, a commit of
+EdgeZero's `rc/identity` integration branch. That branch carries pull request
+275 and the identity work built on it. The pin moves with the branch until
+those pull requests merge, and then to an EdgeZero release tag.
 
 ## Lifecycle
 

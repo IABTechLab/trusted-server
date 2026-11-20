@@ -34,11 +34,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
-trusted-server-identity-providers = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
+trusted-server-identity-providers = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }

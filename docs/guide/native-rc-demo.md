@@ -20,9 +20,6 @@ the shared runner and scheduling plumbing; production activation needs A2
 (#1574), and CI proof of pending record-write completion needs A8 (#1579).
 Controlled fixtures exercise eligible work without adding a production store.
 
-The temporary EdgeZero preview pin for A3 **must be replaced by R2
-(edgezero#490) before merge**, including all workspace pins and lockfile entries.
-
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
 

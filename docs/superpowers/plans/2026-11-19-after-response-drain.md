@@ -6,16 +6,15 @@
 the request scheduler and registers owned work after successful response assembly.
 Normal Axum activation remains blocked on A2 #1574; A8 #1579 owns record CI proof.
 
-**Stack:** #1635. Temporary EdgeZero preview must be repinned to R2 (#490)
-before merge. No other EdgeZero implementation work is included.
+**Stack:** #1635, above #1531. EdgeZero uses R2 on `rc/identity`
+(`9d02d7b3185b49e81d9ac972ca3feef932ed848a`, edgezero#490), matching the base.
+No other EdgeZero implementation work is included.
 
-## Task 1: Preview dependency
+## Task 1: R2 dependency
 
-- [x] Merge #509 into `rc/identity` in an isolated clone; stop on conflicts.
-- [x] Run targeted task/hosting tests and lint, sign merge, verify locally,
-      push only `preview/r2-after-response`, and confirm GitHub Verified.
-- [x] Pin all six workspace EdgeZero dependencies by the merge revision and
-      update Cargo.lock without unrelated dependency upgrades.
+- [x] Verify R2 already contains #509's bounded Fastly/Axum after-response API.
+- [x] Match every workspace EdgeZero dependency and lockfile entry to #1635.
+- [x] Keep only this PR's identity-provider test dependency in the Cargo diff.
 
 ## Task 2: Shared execution, test first
 
@@ -66,7 +65,8 @@ Files: scoped native subprocess test fixture, crate Cargo manifest if needed,
 - [x] Review the combined implementation and resolve source/test findings.
 - [x] Document targeted verification separately from production activation.
 - [x] Keep the PR stacked on #1635 and state the narrowed A2/A8 acceptance.
-- [ ] Repin every EdgeZero dependency and lockfile entry to R2 before merge.
+- [x] Use the R2 dependency already shared by the stack.
+- [x] Document #1646 overlap: whichever change lands second must merge the other.
 
 ## Review log
 
