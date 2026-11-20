@@ -43,7 +43,7 @@ do not call either API may omit it. Provision high-entropy values under
 [Configuration](/guide/configuration#secret-store-migration).
 
 A partner with pull sync enabled (`pull_sync_enabled` and `pull_sync_url`)
-owns its source through the pull-sync provider. Browser EID ingestion and batch
+is pulled by a pull-sync provider, but its source is not provider-owned. Browser EID ingestion and batch
 sync keep filling that source, so a partner may use all three; pull sync only
 fills a source that holds no UID. See
 [Pull Sync on Navigations](/guide/edge-cookies#pull-sync-on-navigations).
