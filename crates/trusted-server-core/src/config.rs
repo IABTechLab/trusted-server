@@ -384,7 +384,8 @@ pub fn validate_settings_for_runtime(
     Ok(())
 }
 
-/// Rejects `proxy.certificate_check = false`, because origin TLS is always verified.
+/// Rejects `proxy.certificate_check = false`, because TLS is always verified on every
+/// outbound HTTPS request, including partner and identity requests.
 ///
 /// # Errors
 ///
@@ -396,7 +397,7 @@ fn reject_disabled_certificate_check(
         return Ok(());
     }
     Err(Report::new(TrustedServerError::Configuration {
-        message: "proxy.certificate_check = false is not supported; origin TLS is always verified"
+        message: "proxy.certificate_check = false is not supported; TLS is always verified on every outbound HTTPS request, including partner and identity requests"
             .to_owned(),
     }))
 }
@@ -491,11 +492,12 @@ fn reject_forbidden_operator_response_headers(
 
 /// Warns that a live `proxy.certificate_check = false` is ignored.
 ///
-/// A config that predates the rejection keeps serving, and origin TLS stays verified.
+/// A config that predates the rejection keeps serving, and TLS stays verified on every
+/// outbound HTTPS request.
 fn warn_ignored_certificate_check(settings: &Settings) {
     if !settings.proxy.certificate_check {
         log::warn!(
-            "proxy.certificate_check = false is ignored; origin TLS is always verified. Remove the setting before the next config push"
+            "proxy.certificate_check = false is ignored; TLS is always verified on every outbound HTTPS request, including partner and identity requests. Remove the setting before the next config push"
         );
     }
 }

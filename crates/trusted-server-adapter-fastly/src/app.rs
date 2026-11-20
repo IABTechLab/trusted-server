@@ -567,6 +567,38 @@ async fn dispatch_identity_lookups(
     })
 }
 
+/// Records on the EC context the sources whose identity providers' own
+/// cookies on this request record an opt-out.
+///
+/// Runs on every route before any identity egress, so the publisher auction,
+/// page-bids, `/auction` and identify withhold those sources on the request
+/// the opt-out cookie arrives on. Only cookies are read: no lookup is made.
+fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestState) {
+    let coordinators = [
+        state.page_identity.as_ref(),
+        state.after_response_identity.as_ref(),
+    ];
+    if coordinators.iter().all(Option::is_none) {
+        return;
+    }
+    let cookie_header = joined_cookie_header(req);
+    let cookies = RequestCookies::new(&cookie_header)
+        .at(UnixSeconds::new(
+            trusted_server_core::ec::current_timestamp(),
+        ))
+        .where_gdpr_applies(ec.ec_context.consent().gdpr_applies);
+    let sources: Vec<String> = coordinators
+        .into_iter()
+        .flatten()
+        .flat_map(|coordinator| coordinator.cookie_opted_out_sources(cookies))
+        .map(|source| source.as_str().to_owned())
+        .collect();
+    if !sources.is_empty() {
+        log::debug!("Identity egress: withholding sources opted out in cookies: {sources:?}");
+    }
+    ec.ec_context.set_cookie_opted_out_sources(sources);
+}
+
 /// Per-request EC identity state built before dispatch, mirroring the
 /// pre-routing prelude of the legacy `route_request` (device signals, bot
 /// gate, cookie capture, consent/geo-aware [`EcContext`], and KV graph
@@ -830,6 +862,7 @@ async fn execute_named(
     }
 
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -1024,6 +1057,7 @@ async fn dispatch_fallback(
     }
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
+    apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -1659,7 +1693,7 @@ mod tests {
     use trusted_server_core::ec::kv::KvIdentityGraph;
     use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::provider::{
-        EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+        CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
         ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
@@ -3593,6 +3627,52 @@ mod tests {
                     refresh: None,
                 }],
             }]))
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            if cookies.get("vendor_id") == Some("optout") {
+                CookieRead::OptedOut
+            } else {
+                CookieRead::Absent
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cookie_opt_outs_reach_the_ec_context_of_every_route() {
+        for after_response in [false, true] {
+            for (cookie, opted_out) in [("vendor_id=optout", true), ("vendor_id=c-1", false)] {
+                // Arrange
+                let fixture = identity_fixture(after_response);
+                let mut request = browser_request(Method::POST, "/auction", "empty");
+                request
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static(cookie));
+                let mut ec = super::EcRequestState {
+                    ec_context: EcContext::default(),
+                    kv_graph: None,
+                    finalize_kv_graph: None,
+                    eids_cookie: None,
+                    sharedid_cookie: None,
+                    is_real_browser: true,
+                    geo_info: None,
+                    setup_error: None,
+                };
+
+                // Act
+                super::apply_cookie_opt_outs(&fixture.state, &request, &mut ec);
+
+                // Assert
+                assert_eq!(
+                    ec.ec_context.source_opted_out_in_cookies("ids.example.com"),
+                    opted_out,
+                    "should withhold the source only when the provider's cookies opt out \
+                     (after_response={after_response}, cookie={cookie})"
+                );
+            }
         }
     }
 
