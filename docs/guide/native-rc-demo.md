@@ -14,11 +14,22 @@ The adapter uses the workspace EdgeZero pin; see
 
 From the repository root, with `ts` built from this checkout:
 
+Copy `trusted-server.example.toml` to `trusted-server.toml`, then add the native
+provider to its existing storage table before publishing:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+EdgeZero environment overlays only replace existing TOML keys; an environment
+variable cannot add this missing `provider` key to the starter.
+
 ```sh
-cp trusted-server.example.toml trusted-server.toml
-# Apply the native logical-record reference when publishing the copied starter.
-TRUSTED_SERVER__EC__STORAGE__PROVIDER=records \
-  ts config push --adapter axum --local --no-diff --yes
+set -a && source .env.dev && set +a
+export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
+ts config push --adapter axum --local --no-diff --yes
 EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
 EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero" \
 EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \

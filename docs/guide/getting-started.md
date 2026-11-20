@@ -76,14 +76,23 @@ The Axum server reads its config envelope from a local config-store file in
 variables. It does **not** auto-load `.env` files, so export the variables into
 your shell before starting the server.
 
+Copy `trusted-server.example.toml` to `trusted-server.toml`. In the copied
+file, add `provider` to the existing storage table:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+The starter's default provider is Fastly-only. Set the native provider explicitly
+in TOML: environment overlays can replace existing keys but cannot add one.
+
 ```bash
-# Create the local app config and apply the non-secret development overlay.
-cp trusted-server.example.toml trusted-server.toml
+# Apply the non-secret development overlay.
 set -a && source .env.dev && set +a
 # Axum listens on 8787, not the Viceroy port in .env.dev.
 export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
-# The starter's implicit storage provider is Fastly-only; publish native records.
-export TRUSTED_SERVER__EC__STORAGE__PROVIDER=records
 
 # Use the repository's default app-config store name and key for this quickstart.
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME

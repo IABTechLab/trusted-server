@@ -158,3 +158,9 @@ lifecycle contract; this is an explicit preservation boundary.
   when bidding is disabled and failed EC-route withdrawal acknowledgment.
   Updated native quickstarts to publish the explicit records provider and
   supply the local record data directory; reconciled current support guidance.
+
+- Follow-up consumer review found that environment overlays cannot add the
+  starter's missing storage provider key. Native quickstarts now require the
+  explicit TOML entry. CLI publication accepts Axum's shared provider
+  coordinators while preserving Cloudflare/Spin rejection, with a real
+  `ts config push` regression for an enabled provider.

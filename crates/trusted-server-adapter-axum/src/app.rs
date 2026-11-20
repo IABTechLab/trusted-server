@@ -57,9 +57,8 @@ pub struct AppState {
     pub(crate) settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
-    /// Identity state built once. The dev server has no EC record store and
-    /// applies no rate limit: its deployer limits traffic at the load
-    /// balancer.
+    /// Shared identity application bound to the prepared record service.
+    /// The deployer limits traffic at the load balancer.
     identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
@@ -492,8 +491,8 @@ fn named_routes() -> [NamedRoute; 17] {
         },
         // Partner APIs are answered locally so a partner's Bearer token and
         // mapping body never reach the publisher origin. Every method is
-        // claimed: the dev server has no EC record store, so identify and
-        // batch sync answer 501 and any other method answers 405.
+        // claimed: identify and batch sync use the shared record store when
+        // configured, otherwise answer 501. Other methods answer 405.
         NamedRoute {
             path: "/_ts/api/v1/identify",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,

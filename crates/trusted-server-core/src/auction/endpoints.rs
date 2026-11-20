@@ -1398,6 +1398,19 @@ mod tests {
             !response.headers().contains_key(header::SET_COOKIE),
             "should keep auction response free of identity cookies"
         );
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should read no-bid response");
+        let payload: JsonValue =
+            serde_json::from_slice(&bytes).expect("should parse no-bid response");
+        assert!(
+            payload
+                .get("seatbid")
+                .and_then(JsonValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "should return no bids while persisting the body EID: {payload}"
+        );
     }
 
     fn body_ingest_request(body_eids: Option<JsonValue>) -> Request<EdgeBody> {

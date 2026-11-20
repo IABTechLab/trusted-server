@@ -2,7 +2,7 @@
 //!
 //! [`TrustedServerAppConfig`] validation lives in core, which cannot build
 //! identity providers because the provider crate depends on core. On Fastly
-//! a provider that fails to build prevents application startup, so this
+//! and Axum, a provider that fails to build prevents application startup, so this
 //! wrapper adds [`validate_providers`] to the config checks: a
 //! provider-specific setting error then fails the command before deploy.
 //!
@@ -54,10 +54,10 @@ impl AppConfigMeta for CheckedAppConfig {
 
 /// Whether the named target adapter runs identity providers.
 ///
-/// Only the Fastly adapter runs them; the Axum, Cloudflare and Spin adapters
-/// refuse to start with an enabled provider.
+/// Fastly and Axum run the shared coordinators. Cloudflare and Spin refuse
+/// to start with an enabled provider.
 pub(crate) fn adapter_runs_identity_providers(adapter: &str) -> bool {
-    adapter == "fastly"
+    matches!(adapter, "fastly" | "axum")
 }
 
 /// [`CheckedAppConfig`] for a target adapter that does not run identity
@@ -167,12 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn fastly_runs_identity_providers_and_other_adapters_do_not() {
-        assert!(
-            adapter_runs_identity_providers("fastly"),
-            "should run providers on fastly"
-        );
-        for adapter in ["axum", "cloudflare", "spin"] {
+    fn supported_adapters_run_identity_providers() {
+        for adapter in ["fastly", "axum"] {
+            assert!(
+                adapter_runs_identity_providers(adapter),
+                "should run providers on {adapter}"
+            );
+        }
+        for adapter in ["cloudflare", "spin"] {
             assert!(
                 !adapter_runs_identity_providers(adapter),
                 "should not run providers on {adapter}"
