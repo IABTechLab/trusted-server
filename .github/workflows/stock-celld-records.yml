@@ -24,16 +24,20 @@ jobs:
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
-      - name: Select the service source from the Rust dependency tag
+      - name: Select the service source from the Rust dependency pin
         id: sdk
         shell: bash
         run: |
           node --input-type=module <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const manifest = readFileSync('Cargo.toml', 'utf8');
-          const tag = manifest.match(/^edgezero-core\s*=\s*\{[^\n]*\btag\s*=\s*"([^"\r\n]+)"/m)?.[1];
-          if (!tag) throw new Error('Expected an immutable EdgeZero dependency tag');
-          appendFileSync(process.env.GITHUB_OUTPUT, `ref=${tag}\n`);
+          const line = manifest.match(/^edgezero-core\s*=\s*\{[^\n]*$/m)?.[0] ?? '';
+          // A tag or a full commit SHA is immutable; a branch is not.
+          const ref =
+            line.match(/\btag\s*=\s*"([^"\r\n]+)"/)?.[1] ??
+            line.match(/\brev\s*=\s*"([0-9a-f]{40})"/)?.[1];
+          if (!ref) throw new Error('Expected an immutable EdgeZero dependency tag or full commit rev');
+          appendFileSync(process.env.GITHUB_OUTPUT, `ref=${ref}\n`);
           JS
 
       - uses: actions/checkout@v4
