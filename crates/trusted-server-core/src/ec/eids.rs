@@ -14,6 +14,7 @@ use crate::openrtb::{Eid, Uid};
 use super::eid_types::{RawJson, UnixSeconds};
 use super::kv_types::{KvEid, KvEntry, KvPartnerId};
 use super::registry::PartnerRegistry;
+use super::sharedid::{SHAREDID_ATYPE, canonical_source, is_sharedid_source};
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
@@ -106,7 +107,8 @@ impl KvEntry {
     ///
     /// A source whose owning provider has a TCF vendor ID is skipped while
     /// `consent` withholds that vendor's consent, and a source a provider
-    /// excludes where GDPR applies is skipped for a GDPR visitor.
+    /// excludes where GDPR applies is skipped for a GDPR visitor. A stored
+    /// `SharedID` is viewed under `pubcid.org` with agent type 1.
     pub fn live_eids<'row>(
         &'row self,
         registry: &'row PartnerRegistry,
@@ -119,9 +121,16 @@ impl KvEntry {
                     && !partner.owner_vendor_consent_denied(consent)
                     && !partner.excluded_for(consent)
             });
-            partner
-                .into_iter()
-                .flat_map(move |partner| source_views(source, record, partner.openrtb_atype, now))
+            partner.into_iter().flat_map(move |partner| {
+                // A stored SharedID is sent as `pubcid.org` with atype 1,
+                // whichever SharedID source holds it.
+                let atype = if is_sharedid_source(source) {
+                    SHAREDID_ATYPE
+                } else {
+                    partner.openrtb_atype
+                };
+                source_views(canonical_source(source), record, atype, now)
+            })
         })
     }
 }
