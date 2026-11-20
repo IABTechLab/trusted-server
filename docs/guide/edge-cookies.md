@@ -279,12 +279,13 @@ Trusted Server can mirror provider-written UIDs into a JavaScript-readable cooki
 - **Name**: `__Host-ts-eids-mirror`
 - **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=<EC cookie max age>`, host-only (no `Domain`) and not `HttpOnly`
 - **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
+- **Expiry**: every mirrored UID carries `exp`, at most 30 days ahead. A UID with a stated expiry keeps it (provider expiries are already capped at 30 days). A UID with no stated expiry gets the start of the current UTC day plus 30 days, so its `exp` changes once per UTC day: a returning reader whose mirror holds such UIDs gets at most one mirror `Set-Cookie` per UTC day.
 - **Contents source**: live UIDs written by an identity provider. Ownerless UIDs, from browser ingest, batch sync or legacy pull sync, are never mirrored.
 - **Pull-sync UIDs**: pull sync writes provider-owned UIDs, so a pull-sync partner with `mirror_enabled = true` has its UIDs mirrored. Any script on the page can read them, and the cookie is sent on every same-origin request, including to the publisher origin. Leave `mirror_enabled` off for a partner whose UIDs must not reach the page; its UIDs still reach the bidstream when `bidstream_enabled` is set.
 - **Vendor consent**: a source's UIDs are left out while the request's TCF string denies the `tcf_vendor_id` of any configured provider claiming that source, enabled or disabled, or while a provider excludes that source where GDPR applies and the visit is in a GDPR jurisdiction, as they are from the bidstream. They are also left out while a provider's own cookies on the request record an opt-out for that source, even before the row is cleared.
 - **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Where it cannot be rebuilt (other responses, or a navigation whose row cannot be read), it is also expired when it holds UIDs of a mirrored partner with such a denied vendor, GDPR exclusion or cookie opt-out, or when its value does not decode while any mirrored partner is so withheld. Responses to browsers without a mirror never get an expiring mirror `Set-Cookie`. Otherwise, when the identity row cannot be read (KV failure), the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
 
-Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID.
+Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID. Every mirrored UID carries `exp`.
 
 ## Configuration
 

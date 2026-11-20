@@ -1447,7 +1447,7 @@ still due.
 | Name      | `__Host-ts-eids-mirror`                                                                      |
 | Flags     | `Path=/; Secure; SameSite=Lax`; no `Domain`; not `HttpOnly`                                  |
 | Max-Age   | Same as the EC cookie                                                                        |
-| Value     | base64url of `{"v":1,"eids":[...]}`; each entry is an OpenRTB EID whose UIDs may carry `exp` |
+| Value     | base64url of `{"v":1,"eids":[...]}`; each entry is an OpenRTB EID whose UIDs all carry `exp` |
 | Size      | Encoded value at most 3,584 bytes                                                            |
 
 - **Contents:** live, provider-owned UIDs of sources whose partner sets both
@@ -1481,6 +1481,13 @@ still due.
 - **The server reads it only to decide whether to set or expire it**, and
   never trusts it over KV. Readers on the page must drop UIDs whose `exp`
   has passed and strip `exp` before use.
+- **Expiry:** every mirrored UID carries `exp`, at most 30 days ahead. A UID
+  with a stated expiry keeps it (already clamped to 30 days when written). A
+  UID with no stated expiry (D7) is mirrored with `exp` = the start of the
+  current UTC day plus 30 days; KV still serves it until replaced or removed.
+  The value is therefore stable within a UTC day, and a returning reader
+  whose mirror holds such UIDs gets at most one mirror `Set-Cookie` per UTC
+  day.
 
 ## 11. Consumers
 
