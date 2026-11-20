@@ -12,6 +12,54 @@ The Prebid integration enables server-side header bidding through Prebid Server 
 
 Prebid is the leading open-source header bidding solution that allows publishers to offer ad inventory to multiple demand sources simultaneously, maximizing revenue through competition.
 
+## Identity-only mode
+
+To enable identity-only mode, update the existing `[integrations.prebid]` table
+in your application configuration (`trusted-server.toml` or the configuration
+published to your deployment):
+
+```toml
+[integrations.prebid]
+enabled = true
+mode = "identity"
+```
+
+Keep your existing external bundle, module selection and managed User ID settings
+in that table. Do not add a second `[integrations.prebid]` table if one already
+exists. Publish the updated application configuration to activate the mode;
+deploying the application code alone does not select it.
+
+The default, `"auction"`, keeps the existing Trusted Server bidder and GPT refresh
+behavior. Unknown modes fail configuration parsing.
+
+Identity mode still loads the configured external Prebid bundle and applies
+managed User ID configuration and its existing consent handling. Publisher
+bidders, ad units and GPT refresh remain under publisher control: no
+`trustedServer` bidder is registered or added. Include the publisher's required
+bidder and User ID modules in the external bundle as usual. Identity mode leaves
+publisher auction timeout/debug settings untouched; configure them through Prebid.
+
+Before each publisher auction, tsjs reads `__Host-ts-eids-mirror` and adds its live
+IDs to that auction's first-party data. Existing publisher IDs and other data are
+preserved, and Prebid's normal activity controls apply before bidder delivery.
+The server writes this mirror only for eligible provider-owned IDs from partners
+with `bidstream_enabled` and `mirror_enabled`. Malformed mirrors and expired IDs
+are ignored. Removing or replacing the cookie takes effect on the next auction;
+mirror IDs are never stored in global Prebid configuration.
+
+Native Prebid User ID module IDs are captured into the existing one-day
+`ts-eids` cookie for server ingestion, including pages that never run an auction.
+Identity mode samples Prebid's unmodified, consent-filtered native getter after
+the publisher queue runs and once per second. It writes changed values only and
+clears stale capture when the native getter returns no usable IDs or fails.
+Visibility changes trigger a fresh read; background timers may be throttled by
+the browser. Sampling pauses on `pagehide` and resumes after a BFCache restore.
+No auction or forced ID refresh is started to obtain IDs.
+
+Mirrored IDs are not copied back into this cookie. This mode does not call an
+EC endpoint or independently grant consent. It does not disable server auctions
+configured elsewhere.
+
 ## Configuration
 
 Prebid configuration has two independent owners:
@@ -25,6 +73,8 @@ Prebid configuration has two independent owners:
 ```toml
 [integrations.prebid]
 enabled = true
+# Use "identity" for identity-only browser behavior; "auction" is the default.
+mode = "auction"
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -92,6 +142,7 @@ provider = "pbs-main"
 | Field                                           | Default                                                                | Ownership and behavior                                                              |
 | ----------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `enabled`                                       | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
+| `mode`                                          | `"auction"`                                                            | Use `"identity"` for ID capture/mirroring without browser auction or GPT hooks      |
 | `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                             |
 | `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
 | `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                        |
