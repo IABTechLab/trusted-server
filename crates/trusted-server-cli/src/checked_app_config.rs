@@ -1,9 +1,9 @@
 //! The app-config type that `ts config push`, `validate` and `diff` check.
 //!
 //! [`TrustedServerAppConfig`] validation lives in core, which cannot build
-//! identity providers because the provider crate depends on core. At runtime
-//! a provider that fails to build disables every provider for the request, so
-//! this wrapper adds [`validate_providers`] to the config checks: a
+//! identity providers because the provider crate depends on core. On Fastly
+//! a provider that fails to build prevents application startup, so this
+//! wrapper adds [`validate_providers`] to the config checks: a
 //! provider-specific setting error then fails the command before deploy.
 //!
 //! `push` and `diff` name a target adapter, so for one that does not run
