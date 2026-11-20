@@ -278,7 +278,7 @@ never write. They do not receive a permit, so the write API cannot be called
   still live, and the provider builds its refresh from the stored state
   (`LookupInput::current`). For example, a token provider keeps the vendor's
   refresh token and refreshes the token server side without any login input.
-  Vendor cookies are read first on every navigation; a usable cookie ID is
+  From F1, vendor cookies are read first on every navigation; a usable cookie ID is
   used instead of a refresh request. Refresh state that is empty, over 2048
   bytes or has no stated time is dropped and the UID is kept.
 - Once a UID expires its source is due like any source without a live UID,
@@ -507,8 +507,8 @@ serve that UID after its `exp`, and an older writer that re-saves the row drops
 `eids`, `opt_outs`, `opt_out_uids` and `revocations`. A UID served past its `exp` and dropped `eids` end at the
 next write by new code; a dropped opt-out is lost, so that provider is called
 again. Stored values are built only by validation
-(§8.2) or by deserializing rows TS wrote, so their fields are private to the
-`ec` module and exposed through accessors.
+(§8.2) or by deserializing rows TS wrote, so `KvEid` and `KvUid` fields are
+private to the `ec` module and exposed through accessors.
 
 ```rust
 /// A partner ID record within a KV entry, keyed by source domain.
@@ -614,9 +614,9 @@ The in-process `crate::openrtb::Eid` gains optional `inserter`, `matcher`,
 
 | Location                                   | Contents                                                                                                                                                 |
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trusted-server-core` `ec::eid_types`      | Value types and stored row types (§6).                                                                                                                   |
+| `trusted-server-core` `ec::eid_types`      | Value types (§6.2); stored row types are in `ec::kv_types` (§6.3).                                                                                       |
 | `trusted-server-core` `ec::provider`       | `IdentityProvider`, `ProviderKind`, the generic `build_kind` helper, input and output types, errors. No vendor code.                                     |
-| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`, validation, merge, mirror encoding.                       |
+| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`, validation. Merge lives in `ec::write_plan`.              |
 | `crates/trusted-server-identity-providers` | One module per provider kind, each implementing `ProviderKind` and `IdentityProvider`, and one `build` function that matches `kind` to a `ProviderKind`. |
 | `trusted-server-adapter-fastly`            | Builds providers through the provider crate and a `ProviderCoordinator` at startup, and drives the navigation path with `OutboundLookupTransport`.       |
 
@@ -946,7 +946,8 @@ The coordinator owns, for every provider:
    `LookupTransport` and gathered until all complete or the shared deadline
    passes. Late responses are dropped (§8.1.1).
 5. **Validation** (§8.2), **merge** (§8.3) and preparing the single write.
-6. **Mirror** encoding (§10) from the row as it stands after the navigation.
+6. **Mirror** encoding (§10) from the row as it stands after the navigation,
+   which PR B builds outside the coordinator in `ec::mirror`.
 7. **Logs and metrics** (§12).
 
 #### 8.1.1 `LookupTransport`
@@ -1012,8 +1013,8 @@ pub enum TransportError {
 impl core::error::Error for TransportError {}
 ```
 
-`OutboundLookupTransport` holds an `EdgeZero` `HttpClient` and its
-`MonotonicClock`, as the auction fan-out does. `start` builds every lookup as a
+`OutboundLookupTransport` holds an `EdgeZero` `HttpClient` and takes its cutoff
+from that client's clock, as the auction fan-out does. `start` builds every lookup as a
 buffered request with the budget as its total timeout, a 64 KiB response cap,
 response decoding and a cache bypass, then starts them all with
 `HttpClient::start_batch_until` and a cutoff of `clock.deadline_after(budget)`.
@@ -1030,7 +1031,8 @@ client and clock.
 
 The navigation path depends on the `IdentityCoordinator` trait, generic over
 the coordinator and the transport. The trait covers the coordinator's whole
-surface on a navigation: start lookups and collect them (PR B adds the mirror).
+surface on a navigation: start lookups and collect them. PR B builds the mirror
+with the free function `ec::mirror::build_mirror` (§10), not on this trait.
 It does not plan the row change: the free function `write_plan::plan_write`
 merges the results and plans it. Its production implementation is
 `ProviderCoordinator<P>`. Tests of coordinator rules (validation, merge,
@@ -1066,10 +1068,6 @@ pub trait IdentityCoordinator {
         transport: &T,
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults;
-
-    /// Builds the mirror cookie from the row as it stands after this
-    /// navigation: the committed row, or the snapshot when no write landed.
-    fn mirror(&self, row: Option<&KvEntry>, consent: &ConsentContext, now: UnixSeconds) -> MirrorCookie;
 }
 ```
 
