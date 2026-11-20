@@ -20,12 +20,12 @@
 ## Request
 
 - `POST <endpoint>/<partner_id>.json`, with `Content-Type: application/json` and `Origin: https://<publisher_domain>`.
-- Body, following ID5's server-side client (its Prebid Server module): `partner`, `provider` (`provider_name`, default the publisher domain), `domain` (the publisher domain), `origin = "trusted-server"`, `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, and `ip` (IPv4) or `ipv6` (only when routable, see `common::is_routable_ip`).
+- Body, following ID5's server-side client (its Prebid Server module): `partner`, `provider` (`provider_name`, default the publisher domain), `domain` (the publisher domain), `origin = "trusted-server"`, `v` (the crate version), `ts` (RFC 3339), `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, and `ip` (IPv4) or `ipv6` (only when routable, see `common::is_routable_ip`).
 - Confirm the `ip` and `ua` field names with ID5 for each partner account.
 
 ## Response
 
-- A non-2xx status or an unparseable body is `ProviderError::InvalidResponse`.
+- `204` is no match; another non-2xx status or an unparseable body is `ProviderError::InvalidResponse`.
 - `ids.<key>.eid` entries whose source is configured become `ProviderEid`s; every field, including `ext`, is borrowed from the body.
 - `cache_control.max_age_sec` becomes `ProviderExpiry::After` for every UID.
 - With no EID for the first source, a non-empty, non-`0` `universal_uid` becomes an EID with `atype = 1` and, when the reply has `ext.linkType`, UID `ext` `{"linkType": ...}`, as in the reference provider and Prebid.
