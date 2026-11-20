@@ -8,6 +8,12 @@ neither builds TS nor provisions infrastructure. An accepted reference must name
 the image whose inputs and runtime checks were actually reviewed; syntax alone
 is not qualification.
 
+For the [unified AWS example](../../examples/native-aws-workload/README.md), the
+provider binary must include
+`aws-appconfig-agent,aws-secrets-manager,geo-cloudfront,aws-dynamodb-ec`. The
+wrapper does not compile or enable those providers. EC storage comes from the
+published app-config `[ec.storage]`, not the wrapper's store-binding TOML.
+
 The image runs as UID/GID10001. `/run/trusted-server` must be an owned, writable
 private mount. Its declared volume does not establish ownership on an ECS task
 volume; that remains a deployment check. Keep the root filesystem read-only and

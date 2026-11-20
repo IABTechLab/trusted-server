@@ -1,0 +1,57 @@
+# Fictional inputs only. Replace with actual reviewed inputs in a private tfvars
+# file before planning. Use approved deployment credentials; there is no draft gate.
+run_id             = "review-example"
+owner              = "review-owner"
+aws_account_id     = "000000000000"
+aws_region         = "eu-west-2"
+availability_zones = ["eu-west-2a", "eu-west-2b"]
+demo_hostname      = "ts-demo.example.com"
+publisher_hostname = "publisher.example.com"
+# CloudFront only. True supplies fixed publisher host/HTTPS and the configured
+# forwarder secret server-side, so reviewer proxies need no token file. The
+# forwarder value enters private Terraform state/plans. Not demo-host browsing.
+preserve_publisher_hostname = false
+route53_zone_id             = "Z0000000000000"
+certificate_arn             = "arn:aws:acm:eu-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+# Unused with CloudFront. These CIDRs do not restrict CloudFront viewers.
+reviewer_ipv4_cidrs         = []
+application_image           = "000000000000.dkr.ecr.eu-west-2.amazonaws.com/review-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+agent_image                 = "public.ecr.aws/example/agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+config_envelope_file        = "example-envelope.json"
+# Copy the ec_storage output from the separately initialized retained/ root.
+ec_storage = {
+  provider  = "aws-dynamodb-records"
+  region    = "eu-west-2"
+  table     = "example-retained-ec"
+  namespace = "example-staging"
+}
+# Terraform generates the origin credential and reads origin-facing CIDRs from AWS.
+geo_front_door = {
+  rollout_phase                 = "dns-cutover"
+  viewer_certificate_arn        = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+  origin_credential_header_name = "x-fictional-origin-check"
+}
+application_secrets = {
+  handler_password = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-handler-AbCdEf"
+    version_id = "11111111111111111111111111111111"
+  }
+  publisher_proxy_secret = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-proxy-AbCdEf"
+    version_id = "22222222222222222222222222222222"
+  }
+  ec_passphrase = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-ec-AbCdEf"
+    version_id = "33333333333333333333333333333333"
+  }
+  browser_forwarder_secret = {
+    arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-forwarder-AbCdEf"
+    version_id = "55555555555555555555555555555555"
+  }
+}
+# Set existing task/execution boundary ARNs only if your organisation requires them.
+runtime_boundaries = null
+agent_token = {
+  arn        = "arn:aws:secretsmanager:eu-west-2:000000000000:secret:review-agent-AbCdEf"
+  version_id = "44444444444444444444444444444444"
+}

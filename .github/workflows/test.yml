@@ -189,8 +189,8 @@ jobs:
           path: ${{ runner.temp }}/trusted-server-finalize-axum-*/
           if-no-files-found: ignore
 
-      - name: Test template build digest inputs (native)
-        run: cargo test -p trusted-server-core --test template_build_digest
+      - name: Test build digest inputs and AWS config envelopes (native)
+        run: cargo test -p trusted-server-core --test template_build_digest --test aws_example_config
 
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
