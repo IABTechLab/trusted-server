@@ -1,6 +1,6 @@
 //! The one-KV-write-per-page-load rule, enforced by types.
 //!
-//! A request classified as a top-level document navigation receives a
+//! A request classified as a browser document navigation receives a
 //! [`NavigationPermit`]. Once the final response status is known it becomes a
 //! [`PageLoadWrite`], which [`KvIdentityGraph::commit_page_load`] consumes.
 //! Neither type is `Clone`, so one navigation makes at most one write before
@@ -15,43 +15,28 @@
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{Method, Request, StatusCode};
+use http::{Request, StatusCode};
 
 use super::EcKvSnapshot;
 use super::kv_types::KvEntry;
+use crate::http_util::is_navigation_request;
 
 /// Issued to a request classified as a page-load navigation.
 #[derive(Debug)]
 pub struct NavigationPermit(());
 
 impl NavigationPermit {
-    /// Returns a permit when `request` is a top-level document navigation:
-    /// `GET`, `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate`, and no
-    /// `prefetch` token in `Sec-Purpose`.
+    /// Returns a permit when `request` is a browser document navigation per
+    /// [`is_navigation_request`]: `Sec-Fetch-Dest: document`, or, without
+    /// Fetch Metadata, an `Accept` header naming `text/html`.
+    ///
+    /// The method is left to the caller, so each adapter keeps its own
+    /// navigation rule (Axum requires `GET`; Fastly accepts any method).
     ///
     /// Call once per request, from the publisher-proxy route only.
     #[must_use]
     pub fn classify(request: &Request<EdgeBody>) -> Option<Self> {
-        let headers = request.headers();
-        let header_is = |name: &str, expected: &str| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
-        };
-        let prefetch = headers
-            .get("sec-purpose")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split([';', ','])
-                    .any(|token| token.trim().eq_ignore_ascii_case("prefetch"))
-            });
-        let navigation = request.method() == Method::GET
-            && header_is("sec-fetch-dest", "document")
-            && header_is("sec-fetch-mode", "navigate")
-            && !prefetch;
-        navigation.then_some(Self(()))
+        is_navigation_request(request).then_some(Self(()))
     }
 
     /// Confirms the permit once the final response status is known.
@@ -217,10 +202,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_missing_fetch_metadata_iframes_and_prefetch() {
+    fn classify_follows_the_shared_navigation_rule() {
+        assert!(
+            NavigationPermit::classify(&request(&[("sec-fetch-dest", "document")])).is_some(),
+            "should permit a document navigation without Sec-Fetch-Mode"
+        );
+        assert!(
+            NavigationPermit::classify(&request(&[("accept", "text/html")])).is_some(),
+            "should fall back to an Accept header naming text/html without Fetch Metadata"
+        );
         assert!(
             NavigationPermit::classify(&request(&[])).is_none(),
-            "should reject without fetch metadata"
+            "should reject without fetch metadata or an HTML Accept header"
         );
         assert!(
             NavigationPermit::classify(&request(&[
@@ -230,11 +223,13 @@ mod tests {
             .is_none(),
             "should reject iframe"
         );
-        let mut prefetch = DOCUMENT.to_vec();
-        prefetch.push(("sec-purpose", "prefetch;prerender"));
         assert!(
-            NavigationPermit::classify(&request(&prefetch)).is_none(),
-            "should reject prefetch"
+            NavigationPermit::classify(&request(&[
+                ("sec-fetch-dest", "image"),
+                ("accept", "text/html")
+            ]))
+            .is_none(),
+            "should prefer Sec-Fetch-Dest over the Accept fallback"
         );
     }
 

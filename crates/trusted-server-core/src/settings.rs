@@ -511,8 +511,8 @@ pub struct EcPartner {
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
     /// Whether this partner's provider-written UIDs are mirrored to the
-    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
-    /// effect only with `bidstream_enabled`.
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default;
+    /// requires `bidstream_enabled`, and setting it alone is rejected.
     #[serde(
         default,
         skip_serializing_if = "is_false",
@@ -559,8 +559,9 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Whether this partner runs pull sync as an identity provider, which
-    /// makes its source provider-owned.
+    /// Whether this partner runs pull sync as an identity provider. Its
+    /// source is not provider-owned, so browser ingest and batch sync still
+    /// fill it.
     #[must_use]
     pub fn runs_pull_sync(&self) -> bool {
         self.pull_sync_enabled && self.pull_sync_url.is_some()
@@ -809,6 +810,10 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
+    /// Explicit persistence provider or the Fastly store-only shorthand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<crate::ec::storage::EcStorage>,
+
     /// Maximum number of pull-sync lookups dispatched per navigation; 0
     /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
@@ -882,6 +887,7 @@ impl Default for Ec {
         Self {
             passphrase: Redacted::default(),
             ec_store: None,
+            storage: None,
             pull_sync_concurrency: 0,
             cluster_trust_threshold: 0,
             cluster_recheck_secs: 0,
@@ -916,7 +922,7 @@ impl Ec {
         }
     }
 
-    /// Default maximum concurrent pull-sync requests.
+    /// Default maximum pull-sync lookups per navigation.
     #[must_use]
     pub const fn default_pull_sync_concurrency() -> usize {
         3
@@ -3091,7 +3097,7 @@ fn is_false(value: &bool) -> bool {
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
 ///
 /// Fail-closed superset: any key not listed here — notably `debug`, which
-/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// carries the resolved `OpenRTB` request (EC ID, `user.eids`, the TC
 /// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
 /// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
@@ -3715,6 +3721,7 @@ impl Settings {
     /// opportunity slot is invalid, or if
     /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.ec.validate_storage()?;
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;

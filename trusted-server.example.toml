@@ -88,10 +88,6 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 # Secret Store key for the secret used to derive EC identifiers.
 passphrase = "ec_passphrase"
-# KV store that persists EC identity state. This is the physical store name
-# bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
-# logical KV id is `trusted_server_kv`.
-ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
 # Optional identity-provider budgets (see [[ec.identity_providers]] below).
@@ -103,6 +99,13 @@ pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Fastly persistence uses this exact physical binding. Provider omission is
+# Fastly-only; native providers require explicit configuration. An ordinary
+# logical KV declaration does not select EC storage. Legacy ec.ec_store remains
+# supported on Fastly, but cannot be combined with this section.
+[ec.storage]
+store = "trusted_server_kv"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
@@ -171,8 +174,8 @@ pull_sync_concurrency = 3
 # not read where GDPR applies, because Lockr AIM does not run there. The
 # default Lockr key of each kind equals one of its own cookie names, which are
 # already read, so the capability changes nothing until `cookie_names` lists
-# the key configured in Lockr when it differs. connectid and liveintent reject
-# a `lockr` table.
+# the key configured in Lockr when it differs. kinds other than id5, liveramp
+# and uid2 reject a `lockr` table.
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -205,7 +208,8 @@ pull_sync_concurrency = 3
 # Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
 # `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
 # `ext`; the others are partner IDs, sent with UID `ext.provider` naming
-# LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
+# LiveIntent, except the Trade Desk ID, whose UID `ext` carries `rtiPartner`
+# and `provider` naming the publisher domain, with EID `matcher`.
 # `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
 # lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
 # distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner
@@ -302,8 +306,9 @@ pull_sync_concurrency = 3
 # [[integrations.prebid.managed_user_ids]] `storage.name` for the `sharedId`
 # module, or else from `_sharedid`, falling back to the legacy `_pubcid`, and
 # sends it as a device-based (atype 1) ID. `sources` defaults to
-# ["pubcid.org"], which needs a matching [[ec.partners]] entry. A stored
-# SharedID lives as long as the row and wins over a different cookie value.
+# ["pubcid.org"], which needs a matching [[ec.partners]] entry. Cookie IDs
+# are kept for 24 hours; generated IDs for 30 days. A different cookie ID
+# replaces the stored ID.
 # The `_pubcid_optout` cookie suppresses it. With generate = true, when no
 # cookie holds an ID and none is stored, Trusted Server generates a random UUID
 # and stores it in the row only (no cookie is set). Leave it off unless Prebid

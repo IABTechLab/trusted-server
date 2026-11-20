@@ -866,7 +866,7 @@ page or auction. When available, the opaque value follows the standard path:
 1. `pbjs.getUserIdsAsEids()` exposes an entry whose source is `liveramp.com`.
 2. The current `/auction` request includes that entry.
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
-   Server as `user.ext.eids`.
+   Server as `user.eids`.
 4. The browser also persists the opaque value in the bounded `ts-eids` cookie.
    The next top-level page navigation ingests it into an EC/KV partner
    configured with `source_domain = "liveramp.com"`, when that partner UID is
@@ -937,7 +937,7 @@ domain, booleans, source names, counts, and status codes:
 4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
 5. Confirm a controlled Prebid Server request contains that source in
-   `user.ext.eids`.
+   `user.eids`.
 6. Confirm a later top-level navigation ingests the source into the configured
    `liveramp.com` EC partner.
 7. Repeat with denied consent and confirm the envelope endpoint is not called,
@@ -957,7 +957,7 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
-4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
+4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.
 5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the SharedID cookie named by the `sharedId` entry's `storage.name`. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
 
 The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
@@ -979,7 +979,7 @@ sequenceDiagram
     K-->>T: KV-derived EIDs
     T->>T: Merge + dedupe client + KV EIDs
     T->>T: Apply consent gating
-    T->>P: OpenRTB request\nuser.ext.eids = merged set
+    T->>P: OpenRTB request\nuser.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
     Note over B,K: /auction writes nothing to KV; ts-eids and sharedId\nare ingested on the next top-level navigation
@@ -998,7 +998,7 @@ sequenceDiagram
 The downstream Prebid Server request includes:
 
 - `user.id` when EC forwarding is allowed
-- `user.ext.eids` containing the merged, deduplicated EID set
+- `user.eids` containing the merged, deduplicated EID set
 - only allowlisted consent cookies in `both` and `cookies_only`; no Cookie header in `openrtb_only`
 
 In practice, this gives operators both:
@@ -1069,7 +1069,7 @@ The shared OpenRTB driver builds Prebid Server requests:
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, a validated publisher-owned page URL with query and fragment removed, `site.publisher` from the domain, and the browser `Referer` as `site.ref`. Removing query and fragment data from `site.page` can reduce contextual targeting or per-page reporting for sites whose page identity depends on query parameters
 - Injects EC ID in the user object
-- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
+- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields

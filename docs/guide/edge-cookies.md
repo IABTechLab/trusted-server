@@ -42,7 +42,7 @@ maps to a stable base.
 
 ### Request Lifecycle
 
-Every request passes through four phases. A new EC is minted, and its row created, only on a top-level publisher navigation: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` token in `Sec-Purpose`, answered with a response that is not a 301, 302, 303, 307 or 308 redirect. Clients that send no Fetch Metadata get no EC, and a prefetch or prerender (`Sec-Purpose: prefetch;prerender`) never mints or writes. Integration proxies and `/auction` use an existing EC but never mint one, and read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
+Every request passes through four phases. A new EC is minted, and its row created, only on a browser document navigation through the publisher proxy: a request with `Sec-Fetch-Dest: document` or, from a client that sends no Fetch Metadata, an `Accept` header naming `text/html` (Axum also requires `GET`), answered with a response that is not a 301, 302, 303, 307 or 308 redirect. An EC ID collision on create retries with a fresh ID, up to five attempts, inside that navigation's one write. Integration proxies and `/auction` use an existing EC but never mint one, and read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
 
 ```mermaid
 sequenceDiagram
@@ -78,7 +78,7 @@ flowchart TD
 
     ConsentCheck -- "No" --> ExplicitWithdrawal{Explicit<br/>withdrawal?}
     ExplicitWithdrawal -- "Yes" --> CookiePresent{Cookie was<br/>present?}
-    CookiePresent -- "Yes" --> Withdraw["Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Expire ts-ec cookie once it lands<br/>Strip all x-ts-* headers"]
+    CookiePresent -- "Yes" --> Withdraw["Write withdrawal tombstone in ec_identity_store (24h TTL)<br/>Expire ts-ec cookie, even if the tombstone fails<br/>Strip all x-ts-* headers"]
     CookiePresent -- "No" --> HeaderOnly["Strip all x-ts-* headers only<br/>(no cookie expiry or KV tombstone)"]
     ExplicitWithdrawal -- "No" --> HeaderOnly
 
@@ -138,7 +138,7 @@ flowchart LR
 
     subgraph Server-initiated
         Batch["Batch Sync (S2S)<br/><i>POST /_ts/api/v1/batch-sync</i><br/>Partner POST + Bearer auth"]
-        Pull["Pull Sync (Background)<br/><i>TS calls partner URL</i><br/>Post-send on organic routes"]
+        Pull["Pull Sync (after response)<br/><i>TS calls partner URL</i><br/>After-response on page navigations"]
     end
 
     Prebid --> KV[(KV Identity Graph<br/>ids map)]
@@ -184,7 +184,7 @@ The SharedID cookie follows a similar path but is written directly by Prebid's S
 
 When Prebid stores the SharedID in a cookie (`storage.type` `cookie` or `cookie&html5`), a consented top-level navigation writes that cookie back from the EC record if the request carries none or a different value, so the stored SharedID wins. The cookie uses Prebid's `storage.name` and the EC cookie domain, is not `HttpOnly`, and is `Secure; SameSite=Lax` for one year. The response also keeps Prebid's `<name>_cst` consent-hash companion consistent, so Prebid does not rewrite the cookie from script; an unchanged cookie and companion get no `Set-Cookie`. Creation is always on with cookie storage: a consented navigation from a reader with no SharedID and no `_pubcid_optout` gets a random UUID, stored in the same navigation's page-load write (by the `sharedid` identity provider when one is configured, otherwise as a browser-ingested ID), so it adds no KV write. A stored SharedID always wins over a different cookie value, on both paths. With TCF Purpose 4 denied the cookies are left alone; with EC consent denied or `_pubcid_optout` present both are expired.
 
-Cookie persistence runs only on top-level publisher navigations: a `GET` through the publisher proxy with `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate` and no `prefetch` in `Sec-Purpose`. `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
+Cookie persistence runs only on the browser document navigations through the publisher proxy that may mint an EC (see [Request Lifecycle](#request-lifecycle)). `POST /auction`, `GET /_ts/page-bids`, static assets, analytics, integration requests, filter short circuits, and other subresources do not persist these cookies.
 
 Each navigation makes at most one conditional page-load write, which carries browser ingest and page-phase identity-provider results together. If another writer wins, the navigation's changes are dropped without a re-read; a later navigation offers them again. Two writes sit outside that rule: a consent withdrawal's tombstone is written on any request that carries the EC cookie, with bounded retries, and `collect = "after_response"` identity providers make one follow-up write after the response is sent. On the navigation that mints an EC, the page-load write is the one that creates the row; it carries only the results of providers whose requests do not carry the EC ID, and if the create fails those results are dropped. Other providers are first looked up on the next navigation, and the first page's own auction carries no provider IDs. See [Identity providers](/guide/configuration#identity-providers). Batch sync and pull sync write through their own channels.
 
@@ -192,7 +192,7 @@ Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted 
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
-EIDs can reach the EC identity graph from either server-side pull sync or browser-side Prebid sync. During a Prebid-routed auction, Trusted Server combines those stored IDs with any same-request EIDs from Prebid.js, applies consent gating, and forwards the merged set to Prebid Server as OpenRTB `user.ext.eids`. Prebid Server then passes those EIDs downstream to demand partners in its OpenRTB requests.
+EIDs can reach the EC identity graph from either server-side pull sync or browser-side Prebid sync. During a Prebid-routed auction, Trusted Server combines those stored IDs with any same-request EIDs from Prebid.js, applies consent gating, and forwards the merged set to Prebid Server as OpenRTB `user.eids`. Prebid Server then passes those EIDs downstream to demand partners in its OpenRTB requests.
 
 ```mermaid
 sequenceDiagram
@@ -204,7 +204,7 @@ sequenceDiagram
     participant DSP as Downstream Partners / DSPs
 
     alt Pull sync seeds partner UID
-        TS->>DSP: Pull sync lookup on a page navigation<br/>(EC ID + consent context)
+        TS->>DSP: Pull sync lookup on a page navigation<br/>(EC ID)
         DSP-->>TS: Partner UID for EC
         TS->>KV: Upsert ids[source_domain] = UID
     else Prebid sync seeds browser EIDs
@@ -221,8 +221,8 @@ sequenceDiagram
     TS->>KV: Resolve EC-backed source-domain IDs
     KV-->>TS: Stored partner UIDs
     TS->>TS: Convert stored UIDs to EIDs<br/>Merge + dedupe with request eids[]<br/>Apply consent gating
-    TS->>PS: OpenRTB request<br/>user.ext.eids = merged EID set
-    PS->>DSP: OpenRTB bid request<br/>user.ext.eids preserved for bidders
+    TS->>PS: OpenRTB request<br/>user.eids = merged EID set
+    PS->>DSP: OpenRTB bid request<br/>EIDs preserved for bidders
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
@@ -268,11 +268,11 @@ Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source
 
 ### Pull Sync on Navigations
 
-Pull sync runs as an identity provider after the response has been sent, on top-level page navigations from recognized browsers that send Fetch Metadata (`Sec-Fetch-Dest: document` and `Sec-Fetch-Mode: navigate`) and are not prefetches. Requests that fail the browser check never trigger it. Before it became a provider, it also ran after `/auction` responses and on navigations without Fetch Metadata. It uses the after-response budget (`identity_after_response_budget_ms`, shared with the other after-response providers), so a slow partner never delays the page; a partner that answers after the budget is not filled, where each pull used to wait up to 15 seconds for a first byte. Its result reaches the row in the follow-up write and is served from the next page load. Like other after-response lookups, it never creates a row. Browser EID ingestion (`ts-eids` and the SharedID cookie) still fills a pull-sync partner's source when it holds no UID, and batch sync still accepts the partner's mappings, as before. A source that already holds any live UID, including a browser-supplied or batch-synced one, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC. On Fastly that limit is enforced as a per-minute budget of at least one, so values below 60 behave like 60 per hour. At most `pull_sync_concurrency` partners are pulled per navigation (0 means no limit), unlike before, when every eligible partner was pulled in batches of that size; a partner past the cap is logged as `skipped_concurrency_cap`. The partner order rotates every hour, so partners past the cap still get turns. When every pull-sync source is already held and no configured provider runs after the response, the after-response phase makes no KV read. A configured after-response provider always runs, so an opt-out or a changed ID in its own cookies is noticed while its sources hold live UIDs.
+Pull sync runs as an identity provider after the response has been sent, on the browser document navigations that may mint an EC, from recognized browsers. Requests that fail the browser check never trigger it. Before it became a provider, it also ran after `/auction` responses. It uses the after-response budget (`identity_after_response_budget_ms`, shared with the other after-response providers), so a slow partner never delays the page; a partner that answers after the budget is not filled, where each pull used to wait up to 15 seconds for a first byte. Its result reaches the row in the follow-up write and is served from the next page load. Like other after-response lookups, it never creates a row. Browser EID ingestion (`ts-eids` and the SharedID cookie) still fills a pull-sync partner's source when it holds no UID, and batch sync still accepts the partner's mappings, as before. A source that already holds any live UID, including a browser-supplied or batch-synced one, is not pulled again; a source with no UID is pulled at most `pull_sync_rate_limit` times per hour per EC hash (the IP-derived part of the EC ID, so ECs from one IP share it). A source is also not pulled while the EC row has no room left for a UID of the longest length pull sync accepts, so a full row is not pulled for on every navigation; pulling resumes once pruning frees room. On Fastly that limit is enforced as a per-minute budget of at least one, so values below 60 behave like 60 per hour. At most `pull_sync_concurrency` partners are pulled per navigation (0 means no limit), unlike before, when every eligible partner was pulled in batches of that size; a partner past the cap is logged as `skipped_concurrency_cap`. The partner order rotates every hour, so partners past the cap still get turns. When every pull-sync source is already held and no configured provider runs after the response, the after-response phase makes no KV read. A configured after-response provider always runs, so an opt-out or a changed ID in its own cookies is noticed while its sources hold live UIDs.
 
 The former `ts-ec-pull-complete` completeness marker is retired. A response to a request that still carries it expires the leftover cookie. The marker used to let a returning navigation skip reading the EC row before the origin response when no auction, browser EID cookie or withdrawal needed it; that navigation now reads the row. With the default inline mode the read overlaps the origin fetch.
 
-Explicit withdrawal expires `ts-ec` once the row is tombstoned or proven absent. While the tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read), `ts-ec` is kept so the next request that carries it retries the withdrawal.
+Explicit withdrawal expires `ts-ec` even when the row's tombstone cannot be written (KV unavailable, CAS retries exhausted, or a row that cannot be read). The failure is logged, and the consent-update endpoint answers `503` so the caller knows the row may still be live.
 
 ### EID Mirror Cookie
 
@@ -283,8 +283,8 @@ Trusted Server can mirror provider-written UIDs into a JavaScript-readable cooki
 - **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
 - **Contents source**: live UIDs written by an identity provider. Ownerless UIDs, from browser ingest, batch sync or legacy pull sync, are never mirrored.
 - **Pull-sync UIDs**: pull sync writes provider-owned UIDs, so a pull-sync partner with `mirror_enabled = true` has its UIDs mirrored. Any script on the page can read them, and the cookie is sent on every same-origin request, including to the publisher origin. Leave `mirror_enabled` off for a partner whose UIDs must not reach the page; its UIDs still reach the bidstream when `bidstream_enabled` is set.
-- **Vendor consent**: a source's UIDs are left out while the request's TCF string denies the `tcf_vendor_id` of any configured provider claiming that source, enabled or disabled, or while a provider excludes that source where GDPR applies and the visit is in a GDPR jurisdiction, as they are from the bidstream.
-- **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Where it cannot be rebuilt (other responses, or a navigation whose row cannot be read), it is also expired when it holds UIDs of a mirrored partner with such a denied vendor or GDPR exclusion, or when its value does not decode while any mirrored partner is so withheld. Responses to browsers without a mirror get no mirror `Set-Cookie`. Otherwise, when the identity row cannot be read (KV failure), the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
+- **Vendor consent**: a source's UIDs are left out while the request's TCF string denies the `tcf_vendor_id` of any configured provider claiming that source, enabled or disabled, or while a provider excludes that source where GDPR applies and the visit is in a GDPR jurisdiction, as they are from the bidstream. They are also left out while a provider's own cookies on the request record an opt-out for that source, even before the row is cleared.
+- **Updates** (best effort): page navigations rebuild it from the row after that navigation's write. It is expired only when the request carried it, either because no live provider UID qualifies or because EC and EID consent is missing (on any response). Where it cannot be rebuilt (other responses, or a navigation whose row cannot be read), it is also expired when it holds UIDs of a mirrored partner with such a denied vendor, GDPR exclusion or cookie opt-out, or when its value does not decode while any mirrored partner is so withheld. Responses to browsers without a mirror never get an expiring mirror `Set-Cookie`. Otherwise, when the identity row cannot be read (KV failure), the mirror is left untouched, and a mirror that cannot be built is skipped without failing the response.
 
 Readers must drop UIDs whose `exp` (Unix seconds) has passed and strip `exp` before using a UID.
 

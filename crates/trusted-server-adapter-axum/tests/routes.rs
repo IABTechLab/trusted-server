@@ -18,6 +18,7 @@ use edgezero_core::app::App;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
@@ -28,9 +29,6 @@ use trusted_server_core::test_support::scripted_client::{
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
-
-/// Environment variable from which the Axum binary reads its app config.
-const AXUM_CONFIG_ENV: &str = "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG";
 
 /// How long the startup test waits for the binary to exit.
 const STARTUP_EXIT_DEADLINE: Duration = Duration::from_secs(10);
@@ -83,9 +81,8 @@ fn assert_route_registered(method: &str, path: &str) {
 
 /// A `TrustedServerApp` served over loopback TCP, with an HTTP client for it.
 ///
-/// The app has no `EdgeZero` stores attached. The Axum adapter reads its
-/// config and secrets from environment-backed platform stores, and these tests
-/// inject settings directly, so no route needs one.
+/// These tests inject settings directly and attach empty immutable store
+/// snapshots. Production startup supplies the prepared config and secret values.
 struct TestServer {
     server: AxumTestServer,
     client: reqwest::Client,
@@ -240,11 +237,22 @@ fn read_pipe(pipe: Option<impl std::io::Read>) -> String {
 
 #[test]
 fn axum_main_exits_non_zero_when_settings_fail() {
-    // A clean environment keeps developer store-name overrides out of the
-    // test. The config value is not a Trusted Server app-config envelope.
+    let workspace = tempfile::tempdir().expect("should create isolated native config");
+    let contents = serde_json::to_vec(&serde_json::json!({
+        CONFIG_BLOB_KEY: "not-a-trusted-server-config-envelope"
+    }))
+    .expect("should serialize the local config map");
+    std::fs::write(
+        workspace
+            .path()
+            .join(format!("local-config-{DEFAULT_CONFIG_STORE_ID}.json")),
+        contents,
+    )
+    .expect("should publish the invalid app-config value");
     let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
         .env_clear()
-        .env(AXUM_CONFIG_ENV, "not-a-trusted-server-config-envelope")
+        .env("EDGEZERO__ADAPTER__CONFIG_DIR", workspace.path())
+        .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
         .env("EDGEZERO__ADAPTER__PORT", free_loopback_port().to_string())
         .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
@@ -272,13 +280,68 @@ fn axum_main_exits_non_zero_when_settings_fail() {
         "should log the settings failure report; output:\n{output}"
     );
     assert!(
-        output.contains("trusted-server-adapter-axum failed"),
+        output.contains("trusted-server-adapter-axum failed:"),
         "should log the startup failure before exiting; output:\n{output}"
     );
     assert!(
         !output.contains("starting axum server"),
         "should not reach the listener; output:\n{output}"
     );
+}
+
+#[tokio::test]
+async fn consent_route_rejects_other_methods_and_foreign_origins_locally() {
+    // CONNECT is registered defensively, but HTTP authority-form targets cannot
+    // address this path. Core's method tests cover its application rejection.
+    assert_route_registered("CONNECT", "/_ts/consent");
+    let server = TestServer::with_test_settings().await;
+    for method in ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "TRACE"] {
+        assert_route_registered(method, "/_ts/consent");
+        let response = send(server.request(method, "/_ts/consent")).await;
+        assert_eq!(
+            response.status().as_u16(),
+            405,
+            "should reject {method} locally"
+        );
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(response.headers()["allow"], "POST");
+    }
+    let response = send(
+        server
+            .request("POST", "/_ts/consent")
+            .header("origin", "https://foreign.example.com")
+            .header("content-type", "application/json")
+            .body(r#"{"gppString":null,"applicableSections":[]}"#),
+    )
+    .await;
+    assert_eq!(
+        response.status().as_u16(),
+        403,
+        "should reject a foreign origin"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    server.assert_no_outbound_requests();
+}
+
+#[tokio::test]
+async fn consent_route_without_storage_is_unavailable_and_does_not_mint() {
+    let server = TestServer::with_test_settings().await;
+    let origin = format!("http://{}", server.server.address());
+    let response = send(
+        server
+            .request("POST", "/_ts/consent")
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(r#"{"gppString":null,"applicableSections":[]}"#),
+    )
+    .await;
+    assert_eq!(
+        response.status().as_u16(),
+        503,
+        "should not acknowledge unavailable storage"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    server.assert_no_outbound_requests();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -324,6 +387,7 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
+        ("POST", "/_ts/consent"),
         // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
         // paths are spelled out as literals rather than referencing
         // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the

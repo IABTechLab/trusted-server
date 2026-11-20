@@ -501,6 +501,7 @@ mod tests {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "trusted_server_kv"
             "#,
         )
         .expect("should parse sandbox test settings")
@@ -769,6 +770,39 @@ mod tests {
             sandbox.initialization_attempts(),
             1,
             "the framework counter should agree"
+        );
+    }
+
+    #[test]
+    fn a_retained_application_shares_its_identity_state_across_requests() {
+        let mut sandbox = Sandbox::default();
+        sandbox
+            .initialize(|| Ok::<_, &str>(test_retained()))
+            .expect("should build the first request");
+        let first = Arc::clone(
+            &sandbox
+                .state()
+                .expect("should retain the first build")
+                .state
+                .identity,
+        );
+
+        sandbox
+            .initialize(|| -> Result<RetainedApp, &str> {
+                panic!("the second request must not rebuild a retained application")
+            })
+            .expect("should reuse the retained application");
+        let second = Arc::clone(
+            &sandbox
+                .state()
+                .expect("should keep the retained build")
+                .state
+                .identity,
+        );
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "should share one identity app, and so one partner registry and record store, across requests"
         );
     }
 

@@ -24,13 +24,10 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::identify::answer_identify_locally;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
@@ -75,6 +72,8 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built with the app. This adapter has no EC record store.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -139,14 +138,21 @@ fn build_state_with_services(
     settings
         .publisher
         .drop_origin_host_header_override_for_spin();
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Spin)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -434,10 +440,6 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Spin adapter.
 ///
@@ -597,28 +599,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
 
         let cache_purge_unsupported_handler =
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
-
-        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-        };
-
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
-        let s = Arc::clone(&state);
-        let admin_eids_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let req = ctx.into_request()?;
-                let result = PartnerRegistry::from_ec(&s.settings.ec).and_then(|registry| {
-                    handle_admin_eids_lookup(
-                        &registry,
-                        s.settings.sharedid_storage().cookie_name(),
-                        &req,
-                    )
-                });
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
 
         // Partner APIs are answered locally so a partner's Bearer token and
         // mapping body never reach the publisher origin. Every method is
@@ -787,6 +767,22 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx)?;
             let mut req = ctx.into_request()?;
+            if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+                // Reserve this path without an identity graph; never forward
+                // consent snapshots or acknowledge an unpersisted revocation.
+                return Ok(
+                    match trusted_server_core::ec::consent_update::prepare_consent_update(
+                        &services, req,
+                    )
+                    .await
+                    {
+                        Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(
+                            &req, None,
+                        ),
+                        Err(response) => *response,
+                    },
+                );
+            }
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -891,7 +887,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // from Spin's synthetic runtime headers) so no handler can opt out of
             // the de-spoofing invariant. Runs after auth so the basic-auth gate
             // continues to see the original request, matching prior behaviour.
-            .middleware(NormalizeMiddleware::new())
+            .middleware(NormalizeMiddleware::new());
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups; without a record store, admin EC lookup answers 501.
+        builder = state.identity.mount(builder);
+        builder = builder
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
             .get("/health", |_ctx: RequestContext| async {
@@ -910,14 +910,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
-            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
-            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -1034,6 +1026,28 @@ mod tests {
         let (mut parts, body) = request.into_parts();
         normalize_spin_request(&mut parts);
         *req = Request::from_parts(parts, body);
+    }
+
+    #[test]
+    fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
+        for storage in [
+            serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
+        ] {
+            let mut settings = Settings::default();
+            settings.ec.storage =
+                Some(serde_json::from_value(storage).expect("should parse pure provider settings"));
+            let error = build_state_with_settings(settings)
+                .err()
+                .expect("should reject unsupported EC provider before route work");
+            assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
+        }
+        let mut settings = Settings::default();
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
+        assert!(
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
     }
 
     fn multi_provider_settings() -> Settings {

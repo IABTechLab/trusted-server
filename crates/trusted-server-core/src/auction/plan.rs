@@ -138,8 +138,9 @@ pub struct ProviderConfig {
     pub profile: String,
     /// Fixed provider endpoint.
     pub endpoint: String,
-    /// Permit unencrypted HTTP for this provider only. Defaults to false.
-    /// Use only for explicitly approved demo/test endpoints.
+    /// Permit non-loopback unencrypted HTTP for this provider only. Defaults to false.
+    /// The existing literal-loopback exception remains. Use this opt-in only for
+    /// explicitly approved demo/test endpoints.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_insecure_http: bool,
     /// Optional profile-default timeout override.
@@ -550,7 +551,7 @@ fn canonicalize_endpoint(
 ) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
     let mut endpoint = Url::parse(value).map_err(|error| {
         configuration_error(format!(
-            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1]: {error}"
+            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], unless this provider explicitly enables allow_insecure_http: {error}"
         ))
     })?;
     if !(endpoint.scheme() == "https"
@@ -562,7 +563,7 @@ fn canonicalize_endpoint(
         || endpoint.fragment().is_some()
     {
         return Err(configuration_error(format!(
-            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], with a host and no credentials or fragment"
+            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], unless this provider explicitly enables allow_insecure_http; a host and no credentials or fragment are always required"
         )));
     }
     if profile_id == "aps"

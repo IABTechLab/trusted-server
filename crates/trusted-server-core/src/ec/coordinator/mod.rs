@@ -8,7 +8,7 @@ pub mod results;
 pub mod transport;
 mod validate;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,9 +23,13 @@ use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
-use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::eid_types::{
+    AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue, UnixSeconds,
+};
 use crate::ec::generation::ec_hash;
-use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
+use crate::ec::kv_types::{
+    KvEid, KvEntry, KvPartnerId, KvUid, MAX_ENTRY_BYTES, MAX_UID_LENGTH, opt_out_uid_hash,
+};
 use crate::ec::provider::{
     ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
     ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
@@ -33,6 +37,7 @@ use crate::ec::provider::{
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::{PULL_SYNC_KIND, PartnerRegistry};
+use crate::ec::write_plan::{member_len, serialized_len};
 
 use crate::settings::IdentityProviderConfig;
 
@@ -41,7 +46,9 @@ use crate::settings::IdentityProviderConfig;
 /// Implementations own eligibility, consent, destination checks, the shared
 /// time budget and validation. Providers never see KV, HTTP or the clock,
 /// and see cookies only as [`RequestCookies`]. Implementations never write
-/// KV: they return the change and the caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+/// KV: they return validated [`LookupResults`]; the caller plans the row
+/// change with [`crate::ec::write_plan::plan_write`] and spends the
+/// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -113,6 +120,11 @@ pub struct PendingLookups<Pending> {
     contexts: Vec<Tagged<String>>,
     /// Providers whose IDs were read from first-party cookies, validated.
     from_cookies: Vec<Tagged<ProviderLookup>>,
+    /// The row's revocations at dispatch, so a result a newer opt-out
+    /// superseded is discarded at the write.
+    revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each provider sent a request.
+    known_uids: Vec<Tagged<Vec<String>>>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
@@ -127,6 +139,8 @@ impl<Pending> Default for PendingLookups<Pending> {
             excluded: Vec::new(),
             contexts: Vec::new(),
             from_cookies: Vec::new(),
+            revocations: BTreeMap::new(),
+            known_uids: Vec::new(),
         }
     }
 }
@@ -185,6 +199,11 @@ struct ProviderPolicy {
     /// Whether this is a pull-sync partner, counted against
     /// [`ProviderCoordinator::with_pull_sync_concurrency`].
     pull_sync: bool,
+    /// For a pull-sync partner, the most bytes its UID can add to a row.
+    /// A row without that room is never sent to the partner: the write
+    /// planner would drop the UID for size, and the empty source would be
+    /// pulled again on every navigation.
+    pull_uid_reserve: Option<usize>,
 }
 
 /// The production coordinator, built once at startup.
@@ -261,7 +280,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
 
     /// Caps the pull-sync lookups dispatched per navigation
     /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
-    /// skipped as rate limited and retried on a later navigation.
+    /// skipped (`skipped_concurrency_cap`) and retried on a later navigation.
     #[must_use]
     pub fn with_pull_sync_concurrency(mut self, max: Option<NonZeroUsize>) -> Self {
         self.pull_sync_concurrency = max;
@@ -285,8 +304,17 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 config.id
             )));
         }
+        let id = ProviderId::new(&config.id);
+        let pull_sync = config.kind() == PULL_SYNC_KIND;
+        let pull_uid_reserve = pull_sync.then(|| {
+            sources
+                .iter()
+                .map(|source| pull_uid_reserve(&id, source))
+                .max()
+                .unwrap_or(0)
+        });
         Ok(Registered {
-            id: ProviderId::new(&config.id),
+            id,
             policy: ProviderPolicy {
                 sources,
                 allowed_domains: config
@@ -296,7 +324,8 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                     .collect(),
                 tcf_vendor_id: config.tcf_vendor_id,
                 rate_limit_per_hour: config.rate_limit_per_hour,
-                pull_sync: config.kind() == PULL_SYNC_KIND,
+                pull_sync,
+                pull_uid_reserve,
             },
             provider,
         })
@@ -306,6 +335,26 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
+    }
+
+    /// Sources of every provider whose first-party cookies record an
+    /// opt-out.
+    ///
+    /// Read on every request before any identity egress, so an opt-out
+    /// applies to the request it arrives on, not only to the navigation write
+    /// that later clears the row. Only cookies are read: no lookup is made.
+    #[must_use]
+    pub fn cookie_opted_out_sources(&self, cookies: RequestCookies<'_>) -> Vec<SourceDomain> {
+        self.providers
+            .iter()
+            .filter(|registered| {
+                matches!(
+                    registered.provider.read_request_cookies(cookies),
+                    CookieRead::OptedOut
+                )
+            })
+            .flat_map(|registered| registered.policy.sources.iter().cloned())
+            .collect()
     }
 
     /// Whether `source` holds a UID of this provider whose refresh is due.
@@ -360,6 +409,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let capabilities = registered.provider.capabilities();
         let mut input_blocked = false;
         let mut due = Vec::new();
+        let mut row_len = None;
         for source in &registered.policy.sources {
             let record = entry.and_then(|entry| entry.ids.get(source.as_str()));
             // A UID whose provider asked for a refresh makes its source due;
@@ -382,6 +432,21 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             });
             if held {
                 continue;
+            }
+            // A row too full to take the partner's UID is not pulled for: the
+            // planner would drop the UID for size, leaving the source empty,
+            // so the partner would be called again on every navigation. Batch
+            // sync refuses the same row with `row_full`. Pruning that frees
+            // room makes the source due again.
+            if let (Some(reserve), Some(entry)) = (registered.policy.pull_uid_reserve, entry) {
+                let len = *row_len.get_or_insert_with(|| serialized_len(entry));
+                if len.saturating_add(reserve) > MAX_ENTRY_BYTES {
+                    log::debug!(
+                        "Identity lookup: provider={} skips '{source}' (row of {len} bytes has no room for its UID)",
+                        registered.id
+                    );
+                    continue;
+                }
             }
             let needs_input = capabilities
                 .sources
@@ -446,7 +511,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let registered = &self.providers[provider.get()];
         let cleared = if matches!(
             status,
-            LookupStatus::Skipped(SkipReason::OptedOut | SkipReason::Region)
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::Region)
         ) {
             registered.policy.sources.to_vec()
         } else {
@@ -514,11 +579,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 // re-read on every navigation instead.
                 return ProviderLookup {
                     opt_out: OptOutMemory::Remember,
-                    ..self.lookup(
-                        provider,
-                        LookupStatus::Skipped(SkipReason::OptedOut),
-                        Vec::new(),
-                    )
+                    ..self.lookup(provider, LookupStatus::OptedOut, Vec::new())
                 };
             }
             Err(report) => {
@@ -596,6 +657,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .minted_entry
             .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
         let entry = stored.or(minted);
+        pending.revocations = entry
+            .map(|entry| entry.revocations.clone())
+            .unwrap_or_default();
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
@@ -638,6 +702,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let remembered_opt_out =
                 entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
             let mut opted_back_in = false;
+            let mut cookie_uids = Vec::new();
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             due.retain(|source| !excluded.contains(source));
             // The vendor's own first-party cookies are read on every
@@ -654,11 +719,28 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         "Identity lookup: provider={} opted out in its cookies",
                         registered.id
                     );
-                    pending.early.push(skip(SkipReason::OptedOut));
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::OptedOut,
+                    });
                     continue;
                 }
                 CookieRead::Found(eids) => {
                     let mut found = self.validated(provider, eids, lookup.now);
+                    cookie_uids = uid_hashes(found.entries.iter().flat_map(|(_, eids)| eids));
+                    // Cookies that repeat only UIDs known when the vendor's
+                    // server reported the remembered opt-out show no renewed
+                    // identity: a server refresh never rewrites them.
+                    let repeats_opted_out = remembered_opt_out.is_some_and(|entry| {
+                        entry.repeats_opted_out_uids(&registered.id, &cookie_uids)
+                    });
+                    if repeats_opted_out {
+                        log::debug!(
+                            "Identity lookup: provider={} cookies repeat the opted-out IDs",
+                            registered.id
+                        );
+                        found.status = LookupStatus::NoMatch;
+                    }
                     // A cookie older than a server-side refresh does not
                     // roll the refreshed UID back.
                     if registered.provider.keeps_fresher_stored_uids() {
@@ -822,6 +904,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.contexts.push(Tagged { provider, value });
             }
             pull_sync_dispatched += usize::from(registered.policy.pull_sync);
+            pending.known_uids.push(Tagged {
+                provider,
+                value: known_uid_hashes(entry, &registered.policy.sources, cookie_uids),
+            });
             requests.push(Tagged {
                 provider,
                 value: request,
@@ -851,6 +937,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             excluded,
             contexts,
             from_cookies,
+            revocations,
+            known_uids,
         } = pending;
         let responses = match in_flight {
             Some(in_flight) => transport.gather(in_flight).await,
@@ -898,8 +986,70 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for lookup in &lookups {
             log_outcome(lookup);
         }
+        let known_uids = known_uids
+            .into_iter()
+            .map(|Tagged { provider, value }| (self.providers[provider.get()].id.clone(), value))
+            .collect();
         LookupResults::new(&ec_id, lookups)
+            .dispatched_with(revocations)
+            .with_known_uids(known_uids)
     }
+}
+
+/// The most bytes a pull-sync partner's record for `source` adds to a row.
+///
+/// Measures the record pull sync stores for the longest UID it accepts
+/// ([`MAX_UID_LENGTH`] bytes needing no JSON escaping), with the widest agent
+/// type and no expiry.
+fn pull_uid_reserve(owner: &ProviderId, source: &SourceDomain) -> usize {
+    let uid = UidValue::try_from("x".repeat(MAX_UID_LENGTH))
+        .expect("should accept a UID at the pull-sync length limit");
+    let atype = AgentType::try_from(i32::MAX).expect("should accept a non-negative agent type");
+    let stored = KvUid::new(uid, atype, None, Some(owner.clone()), Expiry::Never);
+    KvPartnerId::from_eids(
+        vec![KvEid::new(EidFields::default(), vec![stored])],
+        UnixSeconds::new(0),
+    )
+    .map_or(usize::MAX, |record| member_len(source.as_str(), &record))
+}
+
+/// Hashes of the UIDs in `eids`, without duplicates.
+fn uid_hashes<'eid>(eids: impl Iterator<Item = &'eid KvEid>) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for uid in eids.flat_map(KvEid::uids) {
+        let hash = opt_out_uid_hash(uid.id().as_str());
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// Hashes of the UIDs known for a provider at dispatch: those its cookies
+/// held and those the row stores for its sources.
+fn known_uid_hashes(
+    entry: Option<&KvEntry>,
+    sources: &[SourceDomain],
+    mut hashes: Vec<String>,
+) -> Vec<String> {
+    let records = sources
+        .iter()
+        .filter_map(|source| entry.and_then(|entry| entry.ids.get(source.as_str())));
+    for record in records {
+        let stored = if record.is_provider_written() {
+            uid_hashes(record.eids().iter())
+        } else if record.uid.is_empty() {
+            Vec::new()
+        } else {
+            vec![opt_out_uid_hash(&record.uid)]
+        };
+        for hash in stored {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+    }
+    hashes
 }
 
 /// Drops `sources` from a provider's result and removes them from the row.
@@ -937,8 +1087,10 @@ fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLook
 /// Merges the statuses and entries of [`merge_lookups`].
 fn merge_entries(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
     let LookupStatus::Found { dropped, .. } = later.status else {
-        return if later.status == LookupStatus::Skipped(SkipReason::OptedOut)
-            || !matches!(earlier.status, LookupStatus::Found { .. })
+        return if matches!(
+            later.status,
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::OptedOut)
+        ) || !matches!(earlier.status, LookupStatus::Found { .. })
         {
             later
         } else {
@@ -1820,6 +1972,97 @@ mod tests {
         assert!(lookup.entries.is_empty(), "should store no oversized UID");
     }
 
+    fn single_pull_sync_coordinator() -> ProviderCoordinator<EchoProvider> {
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"pull-sync:ids.example.com\"\nkind = \"{PULL_SYNC_KIND}\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]"
+        ))
+        .expect("should parse config");
+        coordinator_with(RegisteredProvider::new(
+            config,
+            echo_provider(SourceInput::Anonymous),
+        ))
+    }
+
+    #[test]
+    fn pull_uid_reserve_covers_the_longest_pulled_uid() {
+        // Arrange
+        let coordinator = single_pull_sync_coordinator();
+        let reserve = coordinator.providers[0]
+            .policy
+            .pull_uid_reserve
+            .expect("should reserve room for a pull-sync partner");
+        let transport = CannedTransport::new(|| {
+            Ok(TransportResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::from("x".repeat(MAX_UID_LENGTH)),
+            })
+        });
+
+        // Act
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        let (source, eids) = lookup
+            .entries
+            .first()
+            .cloned()
+            .expect("should return the pulled UID");
+        let record =
+            KvPartnerId::from_eids(eids, UnixSeconds::new(1000)).expect("should hold a live UID");
+        assert!(
+            member_len(source.as_str(), &record) <= reserve,
+            "should reserve at least the bytes the longest pulled UID adds to the row"
+        );
+    }
+
+    #[test]
+    fn pull_sync_does_not_recall_a_partner_for_a_full_row() {
+        // Arrange
+        let coordinator = single_pull_sync_coordinator();
+        let reserve = coordinator.providers[0]
+            .policy
+            .pull_uid_reserve
+            .expect("should reserve room for a pull-sync partner");
+        let transport = CannedTransport::new(ok_reply);
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        let mut filler = 0;
+        while serialized_len(&entry) + reserve <= MAX_ENTRY_BYTES {
+            entry.ids.insert(
+                format!("filler-{filler}.example.com"),
+                KvPartnerId::single("f".repeat(256)),
+            );
+            filler += 1;
+        }
+        assert!(
+            serialized_len(&entry) <= MAX_ENTRY_BYTES,
+            "should build a row within the size cap"
+        );
+        let snapshot = seeded_snapshot(&entry);
+
+        // Act
+        let navigations: Vec<LookupStatus> = (0..2)
+            .map(|_| only_status(&run(&coordinator, &transport, &snapshot, &granting())))
+            .collect();
+
+        // Assert
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call the partner for a row with no room for its UID"
+        );
+        assert_eq!(
+            navigations,
+            vec![LookupStatus::Skipped(SkipReason::NotDue); 2],
+            "should report the source as not due on every navigation"
+        );
+        assert!(
+            !coordinator.any_due(Some(&entry), UnixSeconds::new(1000)),
+            "should let the caller skip the row read for a full row"
+        );
+    }
+
     #[test]
     fn pull_sync_concurrency_none_is_unlimited() {
         let coordinator = pull_sync_pair(None);
@@ -2260,6 +2503,29 @@ mod tests {
     }
 
     #[test]
+    fn cookie_opted_out_sources_lists_only_providers_whose_cookies_opt_out() {
+        // Arrange
+        let coordinator = cookie_coordinator();
+
+        // Act
+        let opted_out =
+            coordinator.cookie_opted_out_sources(RequestCookies::new("other=1; vendor_id=optout"));
+        let holding_id = coordinator.cookie_opted_out_sources(RequestCookies::new("vendor_id=c-1"));
+        let without_cookie = coordinator.cookie_opted_out_sources(RequestCookies::new(""));
+
+        // Assert
+        assert_eq!(
+            opted_out,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should list the sources of the provider whose cookies opt out"
+        );
+        assert!(
+            holding_id.is_empty() && without_cookie.is_empty(),
+            "should list nothing when the cookies hold an ID or are absent"
+        );
+    }
+
+    #[test]
     fn cookie_opt_out_skips_the_lookup_and_clears_the_sources() {
         let coordinator = cookie_coordinator();
         let transport = CannedTransport::new(ok_reply);
@@ -2277,7 +2543,7 @@ mod tests {
             let lookup = results.iter().next().expect("should report the provider");
             assert_eq!(
                 lookup.status,
-                LookupStatus::Skipped(SkipReason::OptedOut),
+                LookupStatus::OptedOut,
                 "should skip for the opt-out"
             );
             assert_eq!(
@@ -2565,12 +2831,12 @@ mod tests {
 
         let merged = merge_lookups(
             found_lookup("a.example.com", "c-1"),
-            status_lookup(LookupStatus::Skipped(SkipReason::OptedOut)),
+            status_lookup(LookupStatus::OptedOut),
         );
 
         assert_eq!(
             merged.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should let a lookup opt-out win over cookie IDs"
         );
     }
@@ -2644,6 +2910,97 @@ mod tests {
             "should forget the remembered opt-out"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_unchanged_cookie_keeps_a_server_opt_out_until_a_renewed_id_arrives() {
+        // Arrange: the held UID's refresh is due and the cookie repeats it;
+        // the vendor's server answers the refresh with an opt-out.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let provider = ProviderId::new("example-provider");
+        let first_snapshot = snapshot_holding(refreshable_record(900));
+        let first = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(optout_reply),
+            &first_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&first_snapshot, &first)
+        else {
+            panic!("should plan the opt-out write")
+        };
+        assert!(
+            entry.opted_out(&provider, UnixSeconds::new(1000))
+                && !entry.ids.contains_key("ids.example.com"),
+            "should remember the server opt-out and clear the source"
+        );
+        let second_snapshot = seeded_snapshot(&entry);
+
+        // Act: the next navigation sends the same cookie, then a later one a
+        // renewed ID.
+        let unchanged_transport = CannedTransport::new(ok_reply);
+        let unchanged = run_with_cookies(
+            &coordinator,
+            &unchanged_transport,
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let renewed = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(ok_reply),
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-renewed",
+        );
+
+        // Assert
+        let unchanged_lookup = unchanged.iter().next().expect("should report the provider");
+        assert_eq!(
+            unchanged_lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should keep skipping the provider for an unchanged cookie"
+        );
+        assert_eq!(
+            unchanged_lookup.opt_out,
+            OptOutMemory::Unchanged,
+            "should not forget the server opt-out for an unchanged cookie"
+        );
+        assert!(
+            planned_change(&second_snapshot, &unchanged).is_none(),
+            "should neither restore the opted-out UID nor write"
+        );
+        assert!(
+            unchanged_transport.sent.borrow().is_empty(),
+            "should not call the opted-out provider"
+        );
+        let renewed_lookup = renewed.iter().next().expect("should report the provider");
+        assert_eq!(
+            renewed_lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the opt-out for a renewed cookie ID"
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&second_snapshot, &renewed)
+        else {
+            panic!("should plan the opt-back-in write")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "c-renewed",
+            "should store the renewed cookie ID"
+        );
+        assert!(
+            !entry.opted_out(&provider, UnixSeconds::new(1000)) && entry.opt_out_uids.is_empty(),
+            "should forget the opt-out and its UID hashes"
+        );
     }
 
     #[test]
@@ -2796,6 +3153,32 @@ mod tests {
     }
 
     #[test]
+    fn results_carry_the_revocations_the_dispatch_saw() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.revocations.insert(provider.clone(), 900);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results.revocation_at_dispatch(&provider),
+            Some(900),
+            "should hand the dispatch's revocations to the write"
+        );
+    }
+
+    #[test]
     fn an_opted_out_reply_clears_the_sources() {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(optout_reply);
@@ -2805,7 +3188,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out"
         );
         assert_eq!(
@@ -2829,7 +3212,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out the provider reads from a 204"
         );
         assert_eq!(
