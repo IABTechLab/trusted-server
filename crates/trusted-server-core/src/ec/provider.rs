@@ -50,6 +50,10 @@ pub trait IdentityProvider: Send + Sync {
 
     /// Parses a provider response, borrowing from its body.
     ///
+    /// A `404` is reported as no match before this is called; every other
+    /// status, `204` included, is handed to the provider, which decides
+    /// whether it means no match, an opt-out or an error.
+    ///
     /// # Errors
     ///
     /// Returns [`ProviderError::InvalidResponse`] when the body cannot be
@@ -69,6 +73,48 @@ pub trait IdentityProvider: Send + Sync {
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
         let _ = lookup;
         None
+    }
+
+    /// Reads IDs from the vendor's own first-party cookies on the request.
+    ///
+    /// Runs on every consented navigation, before the due check, so a
+    /// changed cookie or an opt-out is noticed even while the provider's
+    /// sources hold live UIDs. Returned entries go through the same
+    /// validation, consent gates and write plan as lookup results, and a
+    /// kept UID makes the provider skip its lookup for this navigation.
+    /// [`CookieRead::OptedOut`] skips the lookup and removes the provider's
+    /// stored UIDs. The default reads nothing.
+    fn read_request_cookies<'cookie>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+    ) -> CookieRead<'cookie> {
+        let _ = cookies;
+        CookieRead::Absent
+    }
+
+    /// Whether `source`'s IDs must not be collected or kept where GDPR applies.
+    ///
+    /// Where the visitor's jurisdiction is GDPR, the coordinator neither looks
+    /// up nor stores an excluded source and removes the UIDs the row holds for
+    /// it. A provider whose every source is excluded is skipped entirely: its
+    /// cookies are not read and no lookup is made. The default excludes
+    /// nothing.
+    fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+        let _ = source;
+        false
+    }
+
+    /// Whether a stored UID that outlives the one a cookie carries is kept
+    /// over the cookie's.
+    ///
+    /// For a provider that refreshes its IDs server side, a refresh updates
+    /// the row but not the browser's cookie, so the next navigation's older
+    /// cookie would otherwise roll the refreshed UID back. When this returns
+    /// `true`, a cookie UID whose absolute expiry is earlier than a live
+    /// stored UID's is ignored; a cookie opt-out still wins. The default
+    /// always takes the cookie.
+    fn keeps_fresher_stored_uids(&self) -> bool {
+        false
     }
 
     /// Whether this provider's request carries the EC ID.
@@ -107,6 +153,153 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn sends_ec_id(&self) -> bool {
         (**self).sends_ec_id()
+    }
+
+    fn read_request_cookies<'cookie>(
+        &self,
+        cookies: RequestCookies<'cookie>,
+    ) -> CookieRead<'cookie> {
+        (**self).read_request_cookies(cookies)
+    }
+
+    fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+        (**self).excluded_where_gdpr_applies(source)
+    }
+
+    fn keeps_fresher_stored_uids(&self) -> bool {
+        (**self).keeps_fresher_stored_uids()
+    }
+}
+
+/// What a provider found in the vendor's own first-party cookies.
+#[derive(Debug)]
+pub enum CookieRead<'cookie> {
+    /// The cookies hold IDs.
+    Found(Vec<ProviderEid<'cookie>>),
+    /// The cookies record that the user opted out of the vendor.
+    OptedOut,
+    /// The cookies hold no usable ID and no opt-out.
+    Absent,
+}
+
+impl<'cookie> CookieRead<'cookie> {
+    /// The IDs found, or `None` for an opt-out or no ID.
+    #[must_use]
+    pub fn into_found(self) -> Option<Vec<ProviderEid<'cookie>>> {
+        match self {
+            Self::Found(eids) => Some(eids),
+            Self::OptedOut | Self::Absent => None,
+        }
+    }
+}
+
+impl<'cookie> From<Option<Vec<ProviderEid<'cookie>>>> for CookieRead<'cookie> {
+    fn from(eids: Option<Vec<ProviderEid<'cookie>>>) -> Self {
+        eids.map_or(Self::Absent, Self::Found)
+    }
+}
+
+/// The request's `Cookie` header, lent to providers that read their own
+/// first-party cookies.
+///
+/// It also carries the request time, so a provider judges a cookie's stated
+/// expiry against the navigation's one clock reading rather than its own.
+/// Its `Debug` output names the cookies but never prints their values.
+#[derive(Clone, Copy)]
+pub struct RequestCookies<'a> {
+    header: &'a str,
+    now: UnixSeconds,
+    gdpr_applies: bool,
+}
+
+impl Default for RequestCookies<'_> {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl core::fmt::Debug for RequestCookies<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.header
+                    .split(';')
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(name, _)| name.trim()),
+            )
+            .finish()
+    }
+}
+
+impl<'a> RequestCookies<'a> {
+    /// Wraps a `Cookie` header value (pairs separated by `;`).
+    #[must_use]
+    pub fn new(header: &'a str) -> Self {
+        Self {
+            header,
+            now: UnixSeconds::new(0),
+            gdpr_applies: false,
+        }
+    }
+
+    /// The same cookies, for a request where GDPR does or does not apply.
+    ///
+    /// The coordinator sets it from the request consent, for readers whose
+    /// cookie writers stay off where GDPR applies.
+    #[must_use]
+    pub fn where_gdpr_applies(self, gdpr_applies: bool) -> Self {
+        Self {
+            gdpr_applies,
+            ..self
+        }
+    }
+
+    /// Whether GDPR applies to the request.
+    #[must_use]
+    pub fn gdpr_applies(&self) -> bool {
+        self.gdpr_applies
+    }
+
+    /// The same cookies, read at request time `now`.
+    ///
+    /// The coordinator sets it before handing the cookies to a provider.
+    #[must_use]
+    pub fn at(self, now: UnixSeconds) -> Self {
+        Self { now, ..self }
+    }
+
+    /// The request time the cookies are read at.
+    #[must_use]
+    pub fn now(&self) -> UnixSeconds {
+        self.now
+    }
+
+    /// Returns the first non-empty value of cookie `name`, undecoded and
+    /// unquoted.
+    ///
+    /// Empty values are skipped, so an empty duplicate (another path or
+    /// domain) does not hide a later value; a name with only empty values
+    /// reads as absent.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&'a str> {
+        self.get_all(name).next()
+    }
+
+    /// Every non-empty value of the cookie `name`, in header order.
+    ///
+    /// A request can carry several cookies with one name (set on different
+    /// paths or domains); opt-out checks must look at all of them.
+    pub fn get_all<'name>(&self, name: &'name str) -> impl Iterator<Item = &'a str> + 'name
+    where
+        'a: 'name,
+    {
+        self.header
+            .split(';')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(move |(key, _)| key.trim() == name)
+            .map(|(_, value)| value.trim().trim_matches('"'))
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -172,6 +365,11 @@ pub struct LookupInput<'a> {
     pub due_sources: &'a [SourceDomain],
     /// This provider's currently stored entries, borrowed from the row.
     pub current: OwnedEntries<'a>,
+    /// The request's cookies, for a vendor first-party cookie a lookup
+    /// sends as input.
+    pub cookies: RequestCookies<'a>,
+    /// Request time; providers use it instead of reading the clock.
+    pub now: UnixSeconds,
     /// Always `None` in V1.
     pub hashed_email: Option<&'a HashedEmail>,
 }
@@ -328,8 +526,8 @@ pub struct ProviderEid<'body> {
     pub matcher: Option<Cow<'body, str>>,
     /// `OpenRTB` `mm`.
     pub mm: Option<i32>,
-    /// EID-level `ext`.
-    pub ext: Option<&'body RawValue>,
+    /// EID-level `ext`, borrowed from the body or built by the provider.
+    pub ext: Option<Cow<'body, RawValue>>,
     /// UIDs of the entry.
     pub uids: Vec<ProviderUid<'body>>,
 }
@@ -341,8 +539,8 @@ pub struct ProviderUid<'body> {
     pub id: Cow<'body, str>,
     /// Agent type; filled from partner config when missing.
     pub atype: Option<i32>,
-    /// UID-level `ext`.
-    pub ext: Option<&'body RawValue>,
+    /// UID-level `ext`, borrowed from the body or built by the provider.
+    pub ext: Option<Cow<'body, RawValue>>,
     /// Expiry as the provider states it.
     pub expiry: ProviderExpiry,
     /// Private refresh state kept with the UID in the row and never served.
@@ -418,8 +616,10 @@ pub trait ProviderKind {
 /// Shared configuration every provider receives at build time.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderCommon<'a> {
-    /// Configured lookup endpoint.
-    pub endpoint: &'a Url,
+    /// Configured provider ID, for logs that must tell instances apart.
+    pub id: &'a str,
+    /// Configured lookup endpoint, absent for cookie-only kinds.
+    pub endpoint: Option<&'a Url>,
     /// Configured sources.
     pub sources: &'a [SourceDomain],
     /// Resolved secrets.
@@ -453,17 +653,31 @@ pub fn build_kind<K: ProviderKind>(
     let settings = K::Settings::deserialize(serde_json::Value::Object(config.settings.clone()))
         .change_context(ProviderConfigError::Invalid)
         .attach_with(|| format!("settings for provider `{}` are invalid", config.id))?;
-    let endpoint = Url::parse(&config.endpoint)
-        .change_context(ProviderConfigError::Invalid)
-        .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))?;
+    let endpoint = parse_endpoint(config)?;
     let sources = parse_sources(config)?;
     let common = ProviderCommon {
-        endpoint: &endpoint,
+        id: &config.id,
+        endpoint: endpoint.as_ref(),
         sources: &sources,
         secrets,
     };
     let provider = K::build(&common, settings)?;
     Ok(Box::new(provider))
+}
+
+/// Parses a provider's configured endpoint, when one is set.
+fn parse_endpoint(
+    config: &IdentityProviderConfig,
+) -> Result<Option<Url>, Report<ProviderConfigError>> {
+    config
+        .endpoint
+        .as_deref()
+        .map(|endpoint| {
+            Url::parse(endpoint)
+                .change_context(ProviderConfigError::Invalid)
+                .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))
+        })
+        .transpose()
 }
 
 /// Parses and normalizes a provider's configured sources.
@@ -492,7 +706,7 @@ pub(crate) fn destination_allowed<S: AsRef<str>>(url: &Url, allowed_domains: &[S
 }
 
 /// Checks the configuration rules core owns for every enabled provider
-/// (spec §12.1): the endpoint is an `https` URL whose host is in
+/// (spec §12.1): a configured endpoint is an `https` URL whose host is in
 /// `allowed_domains`, it claims at least one source, every source has an
 /// `[[ec.partners]]` entry, no source is claimed by two enabled providers, and
 /// every enabled provider has a non-empty id of its own.
@@ -521,10 +735,9 @@ pub fn validate_enabled_configs<'a>(
                 config.id
             )));
         }
-        let endpoint = Url::parse(&config.endpoint)
-            .change_context(ProviderConfigError::Invalid)
-            .attach_with(|| format!("endpoint for provider `{}` is not a URL", config.id))?;
-        if !destination_allowed(&endpoint, &config.allowed_domains) {
+        let endpoint = parse_endpoint(config)?;
+        if endpoint.is_some_and(|endpoint| !destination_allowed(&endpoint, &config.allowed_domains))
+        {
             return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
                 "endpoint for provider `{}` must be https with a host in allowed_domains",
                 config.id
@@ -716,6 +929,34 @@ mod tests {
     }
 
     #[test]
+    fn cookies_get_all_returns_every_non_empty_duplicate() {
+        let cookies = RequestCookies::new("id=; other=x; id=first; id=second");
+
+        assert_eq!(
+            cookies.get_all("id").collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "should return every non-empty value in order"
+        );
+        assert_eq!(
+            cookies.get("id"),
+            Some("first"),
+            "should get the first value"
+        );
+    }
+
+    #[test]
+    fn cookies_debug_prints_names_but_not_values() {
+        let cookies = RequestCookies::new("session=example-secret; vendor_id=v-1");
+
+        let printed = format!("{cookies:?}");
+
+        assert_eq!(
+            printed, r#"["session", "vendor_id"]"#,
+            "should print only cookie names"
+        );
+    }
+
+    #[test]
     fn request_debug_hides_query_and_headers() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -772,9 +1013,9 @@ mod tests {
     #[test]
     fn validate_enabled_configs_rejects_endpoint_outside_allowlist() {
         let mut outside = config(&json!({}));
-        outside.endpoint = "https://other.example.com/".to_owned();
+        outside.endpoint = Some("https://other.example.com/".to_owned());
         let mut plain_http = config(&json!({}));
-        plain_http.endpoint = "http://ids.example.com/".to_owned();
+        plain_http.endpoint = Some("http://ids.example.com/".to_owned());
 
         for rejected in [outside, plain_http] {
             let error = validate_enabled_configs([&rejected], &partners())
@@ -870,10 +1111,38 @@ mod tests {
         let first = config(&json!({}));
         let mut disabled = config(&json!({}));
         disabled.enabled = false;
-        disabled.endpoint = "https://other.example.com/".to_owned();
+        disabled.endpoint = Some("https://other.example.com/".to_owned());
 
         validate_enabled_configs([&first, &disabled], &partners())
             .expect("should ignore disabled provider");
+    }
+
+    #[test]
+    fn validate_enabled_configs_accepts_cookie_only_provider_without_endpoint() {
+        let mut cookie_only = config(&json!({}));
+        cookie_only.endpoint = None;
+
+        validate_enabled_configs([&cookie_only], &partners())
+            .expect("should accept a provider without endpoint");
+    }
+
+    #[test]
+    fn request_cookies_finds_named_values() {
+        let cookies = RequestCookies::new("a=1; vendor_id=\"v-1\" ;empty=; vendor_id=v-2");
+
+        assert_eq!(
+            cookies.get("vendor_id"),
+            Some("v-1"),
+            "should find first value"
+        );
+        assert_eq!(cookies.get("a"), Some("1"), "should find leading cookie");
+        assert_eq!(cookies.get("empty"), None, "should ignore empty values");
+        assert_eq!(
+            RequestCookies::new("vendor_id=; vendor_id=v-2").get("vendor_id"),
+            Some("v-2"),
+            "should skip an empty duplicate before a later value"
+        );
+        assert_eq!(cookies.get("missing"), None, "should miss absent cookies");
     }
 
     #[test]

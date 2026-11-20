@@ -124,7 +124,7 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
@@ -415,6 +415,7 @@ pub(crate) struct AfterResponseLookups {
     pub(crate) ec_id: String,
     pub(crate) client_ip: Option<IpAddr>,
     pub(crate) user_agent: Option<String>,
+    pub(crate) cookie_header: String,
 }
 
 /// Identity work a navigation hands to the entry point.
@@ -449,6 +450,7 @@ pub(crate) fn take_navigation_lookups() -> NavigationLookups {
 struct ProviderRequestSignals<'a> {
     client_ip: Option<IpAddr>,
     user_agent: Option<&'a str>,
+    cookie_header: String,
 }
 
 impl<'a> ProviderRequestSignals<'a> {
@@ -461,8 +463,21 @@ impl<'a> ProviderRequestSignals<'a> {
                 .headers()
                 .get(header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
+            cookie_header: joined_cookie_header(req),
         }
     }
+}
+
+/// Joins every `Cookie` header on the request into one `; `-separated value.
+///
+/// HTTP/2 and HTTP/3 clients may split cookies across several headers.
+fn joined_cookie_header(req: &Request) -> String {
+    req.headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Captures the request signals for after-response identity lookups on a
@@ -485,6 +500,7 @@ fn prepare_after_response_lookups(
         ec_id,
         client_ip: signals.client_ip,
         user_agent: signals.user_agent.map(str::to_owned),
+        cookie_header: signals.cookie_header,
     })
 }
 
@@ -526,6 +542,7 @@ async fn dispatch_identity_lookups(
                     user_agent: signals.user_agent,
                 },
                 publisher_domain: &state.settings.publisher.domain,
+                cookies: RequestCookies::new(&signals.cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(now),
             },
@@ -536,6 +553,38 @@ async fn dispatch_identity_lookups(
         transport,
         pending,
     })
+}
+
+/// Records on the EC context the sources whose identity providers' own
+/// cookies on this request record an opt-out.
+///
+/// Runs on every route before any identity egress, so the publisher auction,
+/// page-bids, `/auction` and identify withhold those sources on the request
+/// the opt-out cookie arrives on. Only cookies are read: no lookup is made.
+fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestState) {
+    let coordinators = [
+        state.page_identity.as_ref(),
+        state.after_response_identity.as_ref(),
+    ];
+    if coordinators.iter().all(Option::is_none) {
+        return;
+    }
+    let cookie_header = joined_cookie_header(req);
+    let cookies = RequestCookies::new(&cookie_header)
+        .at(UnixSeconds::new(
+            trusted_server_core::ec::current_timestamp(),
+        ))
+        .where_gdpr_applies(ec.ec_context.consent().gdpr_applies);
+    let sources: Vec<String> = coordinators
+        .into_iter()
+        .flatten()
+        .flat_map(|coordinator| coordinator.cookie_opted_out_sources(cookies))
+        .map(|source| source.as_str().to_owned())
+        .collect();
+    if !sources.is_empty() {
+        log::debug!("Identity egress: withholding sources opted out in cookies: {sources:?}");
+    }
+    ec.ec_context.set_cookie_opted_out_sources(sources);
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -802,6 +851,7 @@ async fn execute_named(
     }
 
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -999,6 +1049,7 @@ async fn dispatch_fallback(
     }
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
+    apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -1629,9 +1680,9 @@ mod tests {
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::ec::eid_types::SourceDomain;
     use trusted_server_core::ec::provider::{
-        EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+        CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
-        ProviderResponse, ProviderUid, SourceCapability, SourceInput,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
     use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;
@@ -3352,6 +3403,29 @@ mod tests {
         request
     }
 
+    #[test]
+    fn provider_cookies_join_every_cookie_header() {
+        // Arrange: HTTP/2 clients may split cookies across headers.
+        let mut request = navigation_request("/article");
+        let headers = request.headers_mut();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
+        headers.append(header::COOKIE, HeaderValue::from_static("vendor_id=c-1"));
+
+        // Act
+        let joined = super::joined_cookie_header(&request);
+
+        // Assert
+        assert_eq!(
+            joined, "a=1; b=2; vendor_id=c-1",
+            "should join every Cookie header"
+        );
+        assert_eq!(
+            RequestCookies::new(&joined).get("vendor_id"),
+            Some("c-1"),
+            "should let providers read a cookie from a later header"
+        );
+    }
+
     fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
         response
             .extensions_mut()
@@ -3512,6 +3586,52 @@ mod tests {
                     refresh: None,
                 }],
             }]))
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            if cookies.get("vendor_id") == Some("optout") {
+                CookieRead::OptedOut
+            } else {
+                CookieRead::Absent
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cookie_opt_outs_reach_the_ec_context_of_every_route() {
+        for after_response in [false, true] {
+            for (cookie, opted_out) in [("vendor_id=optout", true), ("vendor_id=c-1", false)] {
+                // Arrange
+                let fixture = identity_fixture(after_response);
+                let mut request = browser_request(Method::POST, "/auction", "empty");
+                request
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static(cookie));
+                let mut ec = super::EcRequestState {
+                    ec_context: EcContext::default(),
+                    kv_graph: None,
+                    finalize_kv_graph: None,
+                    eids_cookie: None,
+                    sharedid_cookie: None,
+                    is_real_browser: true,
+                    geo_info: None,
+                    setup_error: None,
+                };
+
+                // Act
+                super::apply_cookie_opt_outs(&fixture.state, &request, &mut ec);
+
+                // Assert
+                assert_eq!(
+                    ec.ec_context.source_opted_out_in_cookies("ids.example.com"),
+                    opted_out,
+                    "should withhold the source only when the provider's cookies opt out \
+                     (after_response={after_response}, cookie={cookie})"
+                );
+            }
         }
     }
 

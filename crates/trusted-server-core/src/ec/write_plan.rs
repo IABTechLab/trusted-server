@@ -11,7 +11,7 @@
 use std::collections::btree_map;
 
 use super::EcKvSnapshot;
-use super::coordinator::results::{LookupResults, LookupStatus, SkipReason};
+use super::coordinator::results::{LookupResults, LookupStatus, OptOutMemory, SkipReason};
 use super::eid_types::{SourceDomain, UnixSeconds};
 use super::kv::PartnerIdUpdate;
 use super::kv_types::{KvEntry, KvPartnerId, MAX_ENTRY_BYTES};
@@ -142,13 +142,33 @@ fn apply_lookups(
             continue;
         }
         // A newer request may have recorded this provider's opt-out after
-        // the lookup was dispatched; never restore its UIDs over it.
-        if opted_out && !remembered_skip && lookup.status != LookupStatus::OptedOut {
+        // the lookup was dispatched; never restore its UIDs over it, unless
+        // the vendor's cookies showed the visitor opted back in.
+        if opted_out
+            && !remembered_skip
+            && lookup.status != LookupStatus::OptedOut
+            && lookup.opt_out != OptOutMemory::Forget
+        {
             log::info!(
                 "EC write planner: discarding results of opted-out provider '{}'",
                 lookup.provider
             );
             continue;
+        }
+        // An opt-out recorded after the lookup was dispatched, which a cookie
+        // opt-out leaves only as a revocation, supersedes its results. An
+        // opt-out of its own still applies.
+        let superseded = entry.revocations.get(&lookup.provider).copied()
+            != lookups.revocation_at_dispatch(&lookup.provider);
+        if superseded && !remembered_skip && lookup.status != LookupStatus::OptedOut {
+            log::info!(
+                "EC write planner: discarding results of provider '{}' superseded by a newer opt-out",
+                lookup.provider
+            );
+            continue;
+        }
+        if lookup.opt_out == OptOutMemory::Forget {
+            entry.forget_opt_out(&lookup.provider);
         }
         for (source, eids) in &lookup.entries {
             if let Some(record) = KvPartnerId::from_eids(eids.clone(), now) {
@@ -156,18 +176,26 @@ fn apply_lookups(
                 written.push(source.clone());
             }
         }
-        // Only an opt-out the provider reported in this navigation starts
-        // the memory period; a remembered one keeps its end time.
-        if lookup.status == LookupStatus::OptedOut {
-            entry.remember_opt_out(&lookup.provider, now);
+        // Only an opt-out the vendor's server reported in this navigation
+        // starts the memory period; a remembered one keeps its end time, and
+        // a cookie opt-out is re-read on every navigation instead.
+        if lookup.opt_out == OptOutMemory::Remember {
+            entry.remember_opt_out(&lookup.provider, now, lookups.known_uids(&lookup.provider));
         }
+        let mut removed = false;
         for source in &lookup.cleared {
             if entry.ids.remove(source.as_str()).is_some() {
+                removed = true;
                 log::info!(
                     "EC write planner: removing '{source}' after provider '{}' opt-out",
                     lookup.provider
                 );
             }
+        }
+        // Only an opt-out that changes the row records a revocation, so it
+        // never adds a write of its own.
+        if removed && lookup.status == LookupStatus::OptedOut {
+            entry.record_revocation(&lookup.provider, now);
         }
     }
     written
@@ -398,6 +426,7 @@ mod tests {
                     vec![KvEid::new(EidFields::default(), uids)],
                 )],
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         )
     }
@@ -621,6 +650,10 @@ mod tests {
     }
 
     fn failed_lookup(status: LookupStatus) -> LookupResults {
+        lookup_with_memory(status, OptOutMemory::Unchanged)
+    }
+
+    fn lookup_with_memory(status: LookupStatus, opt_out: OptOutMemory) -> LookupResults {
         LookupResults::new(
             EC_ID,
             vec![ProviderLookup {
@@ -628,8 +661,92 @@ mod tests {
                 status,
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out,
             }],
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cookie_opt_out_is_not_remembered() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let mut lookups = failed_lookup(LookupStatus::OptedOut);
+        let cleared = lookups.iter().next().expect("should hold a lookup").clone();
+        lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                ..cleared
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(
+            &present(&provider_entry(&["p-1"])).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.ids.contains_key("ids.example.com"),
+            "should clear the opted-out source"
+        );
+        assert!(
+            entry.opt_outs.is_empty(),
+            "should not remember an opt-out read from cookies"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_opt_back_in_forgets_the_opt_out_and_stores_the_ids() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = live_entry();
+        entry
+            .opt_outs
+            .insert(provider.clone(), 2000 + OPT_OUT_MEMORY_SECONDS);
+        let found = found("ids.example.com", &["c-1"]);
+        let lookup = found.iter().next().expect("should hold a lookup").clone();
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                opt_out: OptOutMemory::Forget,
+                ..lookup
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert!(
+            !entry.opt_outs.contains_key(&provider),
+            "should forget the remembered opt-out"
+        );
+        assert!(
+            entry.ids.contains_key("ids.example.com"),
+            "should store the cookie ID"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -645,6 +762,7 @@ mod tests {
                 status: LookupStatus::OptedOut,
                 entries: Vec::new(),
                 cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -668,7 +786,7 @@ mod tests {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let provider = ProviderId::new("example-provider");
-        let reported = failed_lookup(LookupStatus::OptedOut);
+        let reported = lookup_with_memory(LookupStatus::OptedOut, OptOutMemory::Remember);
         let skipped = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
 
         // Act: the reported opt-out is remembered.
@@ -725,6 +843,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::OptedOut),
                 entries: Vec::new(),
                 cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -752,7 +871,7 @@ mod tests {
         let provider = ProviderId::new("example-provider");
         let mut entry = provider_entry(&["p-1"]);
         entry.opt_outs.insert(provider.clone(), 1999);
-        let lookups = failed_lookup(LookupStatus::OptedOut);
+        let lookups = lookup_with_memory(LookupStatus::OptedOut, OptOutMemory::Remember);
 
         // Act
         let change = plan_write(&input(
@@ -848,6 +967,7 @@ mod tests {
                 status: LookupStatus::Skipped(SkipReason::NotDue),
                 entries: Vec::new(),
                 cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
             }],
         );
 
@@ -1327,6 +1447,92 @@ mod tests {
         assert!(
             change.is_none(),
             "should not write the opted-out provider's older result"
+        );
+    }
+
+    fn cookie_opt_out() -> LookupResults {
+        LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::OptedOut,
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_opt_out_that_removes_a_source_records_a_revocation() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+
+        // Act
+        let removing = plan_write(&input(
+            &present(&provider_entry(&["p-1"])).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ))
+        .expect("should plan update");
+        let removing_nothing = plan_write(&input(
+            &present(&live_entry()).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ));
+
+        // Assert
+        let RowChange::Update { entry, .. } = removing else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.revocations.get(&provider).copied(),
+            Some(2000),
+            "should record when the opt-out removed the provider's sources"
+        );
+        assert!(
+            entry.opt_outs.is_empty(),
+            "should not remember a cookie opt-out"
+        );
+        assert!(
+            removing_nothing.is_none(),
+            "should not write only to record a revocation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn found_result_dispatched_before_a_newer_cookie_opt_out_is_discarded() {
+        // Arrange: a cookie opt-out removed the source at 1990, after this
+        // lookup was dispatched against a row without that revocation.
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = live_entry();
+        entry.revocations.insert(provider.clone(), 1990);
+        let stale = found("ids.example.com", &["late-result"]);
+        let fresh = found("ids.example.com", &["new-id"])
+            .dispatched_with(std::iter::once((provider, 1990)).collect());
+
+        // Act
+        let stale_change = plan_write(&input(&present(&entry).await, None, &[], &stale, &registry));
+        let fresh_change = plan_write(&input(&present(&entry).await, None, &[], &fresh, &registry))
+            .expect("should plan update");
+
+        // Assert
+        assert!(
+            stale_change.is_none(),
+            "should not restore the source with a result the opt-out superseded"
+        );
+        let RowChange::Update { entry, .. } = fresh_change else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "new-id",
+            "should write a result dispatched after the opt-out"
         );
     }
 }
