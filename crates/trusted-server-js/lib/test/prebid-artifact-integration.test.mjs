@@ -331,11 +331,10 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // The original shim measures 40,354 characters. Shared strict trace JSON
-    // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
-    // its runtime or private rendering helpers must still fail this regression.
-    expect(shimCode.length).toBeLessThan(52_500);
+    // Trace lifecycle, identity capture and EC route consent reporting keep the
+    // shim below 66.5 KB. Importing the separate Prebid runtime (above 200 KB)
+    // must fail this guard.
+    expect(shimCode.length).toBeLessThan(66_500);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
@@ -785,5 +784,229 @@ describe('active trace through real Prebid 10.26 registered adapters', () => {
       }
     },
     10000
+  );
+});
+
+describe('identity-only mode through the production Prebid bidder consumer', () => {
+  it('captures native IDs without an auction and follows actual native consent filtering', async () => {
+    const dom = createPage();
+    try {
+      const pageWindow = dom.window;
+      const stubs = installNetworkAndConsoleStubs(pageWindow);
+      installServerState(pageWindow);
+      pageWindow.__tsjs_prebid.mode = 'identity';
+      pageWindow.eval(managedUserIdArtifact.bundleCode);
+      // A publisher ATS callback that has not completed keeps Prebid's actual
+      // async initialization pending while the synchronous shared ID is usable.
+      pageWindow.ats = { retrieveEnvelope: vi.fn() };
+      const pbjs = pageWindow.pbjs;
+      const consent = (allowed) => ({
+        consentManagement: {
+          gdpr: {
+            cmpApi: 'static',
+            consentData: {
+              gdprApplies: true,
+              tcString: 'CPexampleConsent',
+              purpose: { consents: { 1: allowed }, legitimateInterests: {} },
+              vendor: { consents: { 123: allowed }, legitimateInterests: {} },
+              publisher: { restrictions: {} },
+              specialFeatureOptins: {},
+            },
+            rules: [{ purpose: 'storage', enforcePurpose: true, enforceVendor: true }],
+          },
+        },
+      });
+      pbjs.setConfig({
+        ...consent(true),
+        gvlMapping: { sharedId: 123, identityLink: 123 },
+        userSync: {
+          auctionDelay: 0,
+          syncDelay: 3000,
+          autoRefresh: true,
+          userIds: [
+            { name: 'sharedId', value: { pubcid: 'no-auction-native' } },
+            { name: 'identityLink', params: { pid: 'example-publisher-id', notUse3P: true } },
+          ],
+        },
+      });
+      const requestBids = vi.spyOn(pbjs, 'requestBids');
+      let asyncIdsSettled = false;
+      pbjs.getUserIdsAsync().then(() => {
+        asyncIdsSettled = true;
+      });
+      pageWindow.eval(shimCode);
+      const cookieEids = () => {
+        const encoded = pageWindow.document.cookie
+          .split('; ')
+          .find((part) => part.startsWith('ts-eids='))
+          ?.slice('ts-eids='.length);
+        return encoded === undefined ? undefined : JSON.parse(pageWindow.atob(encoded));
+      };
+      await expect
+        .poll(cookieEids, { timeout: 5000 })
+        .toEqual([{ source: 'pubcid.org', uids: [{ id: 'no-auction-native', atype: 1 }] }]);
+      expect(asyncIdsSettled).toBe(false);
+      expect(pbjs.getConfig('userSync.auctionDelay')).toBe(0);
+      const mirror = [{ source: 'mirror.example', uids: [{ id: 'not-native', atype: 1 }] }];
+      pageWindow.document.cookie = `__Host-ts-eids-mirror=${Buffer.from(JSON.stringify({ v: 1, eids: mirror })).toString('base64url')}; Path=/; Secure`;
+      pbjs.setConfig(consent(false));
+      await expect.poll(() => pbjs.getUserIdsAsEids(), { timeout: 5000 }).toEqual([]);
+      await expect.poll(cookieEids, { timeout: 5000 }).toBeUndefined();
+      pbjs.setConfig(consent(true));
+      await expect
+        .poll(cookieEids, { timeout: 5000 })
+        .toEqual([{ source: 'pubcid.org', uids: [{ id: 'no-auction-native', atype: 1 }] }]);
+      expect(requestBids).not.toHaveBeenCalled();
+      expect(asyncIdsSettled).toBe(false);
+      expect(stubs.requests).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.dispatchEvent(new dom.window.PageTransitionEvent('pagehide'));
+      dom.window.close();
+    }
+  }, 20000);
+
+  it.each([false, true])(
+    'keeps mirror data request-local and honors transmitEids denial=%s',
+    async (denied) => {
+      const dom = createPage();
+      try {
+        const pageWindow = dom.window;
+        const stubs = installNetworkAndConsoleStubs(pageWindow);
+        installServerState(pageWindow);
+        pageWindow.TextDecoder = TextDecoder;
+        pageWindow.__tsjs_prebid.mode = 'identity';
+        pageWindow.eval(noAnalyticsArtifact.bundleCode);
+        const pbjs = pageWindow.pbjs;
+        const received = [];
+        const adapterCode = 'exampleIdentityConsumer';
+        pbjs.registerBidAdapter(undefined, adapterCode, {
+          code: adapterCode,
+          gvlid: 123,
+          supportedMediaTypes: ['banner'],
+          isBidRequestValid: () => true,
+          buildRequests(bids, bidderRequest) {
+            received.push({
+              eids: structuredClone(bidderRequest.ortb2.user?.ext?.eids ?? []),
+              bidEids: structuredClone(bids[0].userIdAsEids ?? []),
+            });
+            return [];
+          },
+          interpretResponse: () => [],
+        });
+        pbjs.setConfig({
+          bidderTimeout: 50,
+          gvlMapping: { sharedId: 123 },
+          consentManagement: {
+            gdpr: {
+              cmpApi: 'static',
+              consentData: {
+                getTCData: {
+                  gdprApplies: true,
+                  tcString: 'CPexampleTCStringForTests',
+                  purpose: { consents: { 1: true, 2: true, 4: !denied }, legitimateInterests: {} },
+                  vendor: { consents: { 123: true }, legitimateInterests: {} },
+                  publisher: { restrictions: {} },
+                  specialFeatureOptins: {},
+                },
+              },
+              rules: [
+                {
+                  purpose: 'personalizedAds',
+                  enforcePurpose: true,
+                  enforceVendor: true,
+                  eidsRequireP4Consent: true,
+                },
+              ],
+            },
+          },
+          userSync: { userIds: [{ name: 'sharedId', value: { pubcid: 'native-fixture-id' } }] },
+        });
+        const globalPublisher = {
+          source: 'global-overlap.example',
+          ext: { owner: 'publisher' },
+          uids: [{ id: 'global-overlap', atype: 1 }],
+        };
+        const requestPublisher = {
+          source: 'request-overlap.example',
+          ext: { owner: 'publisher' },
+          uids: [{ id: 'request-overlap', atype: 1 }],
+        };
+        pbjs.setConfig({ ortb2: { user: { eids: [globalPublisher] } } });
+        const originalGlobal = structuredClone(pbjs.getConfig('ortb2'));
+        const registration = vi.spyOn(pbjs, 'registerBidAdapter');
+        const refresh = vi.fn();
+        pageWindow.googletag = {
+          cmd: { push: (callback) => callback() },
+          pubads: () => ({ refresh }),
+        };
+        pageWindow.eval(shimCode);
+        const mirror = [
+          {
+            source: 'mirror.example',
+            ext: { origin: 'fixture' },
+            uids: [{ id: 'server-fixture-id', atype: 1 }],
+          },
+        ];
+        mirror.push(
+          { ...globalPublisher, ext: { owner: 'mirror' } },
+          { ...requestPublisher, ext: { owner: 'mirror' } }
+        );
+        pageWindow.document.cookie = `__Host-ts-eids-mirror=${Buffer.from(JSON.stringify({ v: 1, eids: mirror })).toString('base64url')}; Path=/; Secure`;
+        const adUnits = [
+          {
+            code: 'identity-unit',
+            mediaTypes: { banner: { sizes: [[300, 250]] } },
+            bids: [{ bidder: adapterCode, params: {} }],
+          },
+        ];
+        const requestData = { user: { ext: { eids: [requestPublisher] } } };
+        const originalRequest = structuredClone(requestData);
+        const run = () =>
+          new Promise((resolve) =>
+            pbjs.requestBids({ adUnits, ortb2: requestData, bidsBackHandler: resolve })
+          );
+        await run();
+        expect(received).toHaveLength(1);
+        const native = pbjs.getUserIdsAsEids();
+        expect(native.flatMap((eid) => eid.uids).map((uid) => uid.id)).toContain(
+          'native-fixture-id'
+        );
+        if (denied) {
+          expect(received[0]).toEqual({ eids: [], bidEids: [] });
+        } else {
+          expect(received[0].eids).toEqual(
+            expect.arrayContaining([mirror[0], globalPublisher, requestPublisher, ...native])
+          );
+          expect(received[0].bidEids).toEqual(received[0].eids);
+          for (const publisher of [globalPublisher, requestPublisher]) {
+            expect(received[0].eids.filter((eid) => eid.source === publisher.source)).toEqual([
+              publisher,
+            ]);
+          }
+        }
+        const ingestCookie = pageWindow.document.cookie
+          .split('; ')
+          .find((part) => part.startsWith('ts-eids='));
+        expect(JSON.parse(pageWindow.atob(ingestCookie.slice('ts-eids='.length)))).toEqual(native);
+        pageWindow.document.cookie = '__Host-ts-eids-mirror=; Path=/; Secure; Max-Age=0';
+        await run();
+        expect(received).toHaveLength(2);
+        expect(received[1].eids.some((eid) => eid.source === 'mirror.example')).toBe(false);
+        expect(pbjs.getConfig('ortb2')).toEqual(originalGlobal);
+        expect(requestData).toEqual(originalRequest);
+        expect(registration).not.toHaveBeenCalled();
+        expect(pageWindow.googletag.pubads().refresh).toBe(refresh);
+        expect(adUnits[0].bids.map((bid) => bid.bidder)).toEqual([adapterCode]);
+        expect(
+          stubs.requests.some((request) =>
+            requestUrl(request.url ?? request.resource).includes('/auction')
+          )
+        ).toBe(false);
+        expectNoUnexpectedNetworkActivity(stubs);
+      } finally {
+        dom.window.close();
+      }
+    }
   );
 });
