@@ -42,7 +42,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    drop_vendor_denied_client_eids, merge_auction_eids, resolve_auction_eids,
+    bidder_ec_id, drop_vendor_denied_client_eids, merge_auction_eids, resolve_auction_eids,
     resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
@@ -4875,10 +4875,9 @@ pub async fn handle_publisher_request(
         has_navigation_permit: ec_context.has_navigation_permit(),
         has_ec_id: active_ec_id.is_some(),
         has_kv: kv.is_some(),
-        auction_needs_row: should_run_auction
-            && auction
-                .registry
-                .is_some_and(|registry| !registry.is_empty()),
+        // The row decides whether the EC goes to bidders as `user.id`, and
+        // supplies the auction's stored EIDs.
+        auction_needs_row: should_run_auction,
         privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
         // A freshly generated EC already holds an authoritative `Missing`
         // snapshot: its row is only created by this navigation's write.
@@ -4921,6 +4920,8 @@ pub async fn handle_publisher_request(
         // before this point can be an in-request confirmed row to protect.
         ec_context.set_kv_snapshot(graph.load_snapshot(active_ec_id).await);
     }
+    // Bidders get the EC only when this request read its consented row.
+    let bidder_ec = bidder_ec_id(ec_id, kv, ec_context.kv_snapshot());
 
     // Dispatch SSP bid requests while req still has the original client headers
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
@@ -4936,7 +4937,7 @@ pub async fn handle_publisher_request(
                     matched_slots: &matched_slots,
                     request_path: &request_path,
                 },
-                ec_id,
+                bidder_ec,
                 &consent_context,
                 &request_info,
                 &settings.publisher.domain,
@@ -4995,7 +4996,7 @@ pub async fn handle_publisher_request(
             let mut auction_request = trace_request.take().unwrap_or_else(|| {
                 build_auction_request(
                     &slots_ctx,
-                    ec_id,
+                    bidder_ec,
                     &consent_context,
                     &request_info,
                     &settings.publisher.domain,
@@ -5761,20 +5762,15 @@ pub(crate) fn build_auction_request(
         request_info.scheme, publisher_domain, slots_ctx.request_path
     );
     let page_url = sanitize_publisher_page_url(Some(&page_candidate), publisher_domain);
-    let ec_id = ec_id.filter(|id| !id.is_empty());
-    let request_id = ec_id.map_or_else(
-        || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
-        |id| format!("ts-{id}"),
-    );
-    AuctionRequest {
-        id: request_id,
+    let mut request = AuctionRequest {
+        id: String::new(),
         slots,
         publisher: PublisherInfo {
             domain: publisher_domain.to_owned(),
             page_url: Some(page_url.clone()),
         },
         user: UserInfo {
-            id: ec_id.map(str::to_string),
+            id: None,
             consent: Some(consent_context.clone()),
             eids: None,
         },
@@ -5788,7 +5784,20 @@ pub(crate) fn build_auction_request(
             page: page_url,
         }),
         context: std::collections::HashMap::new(),
-    }
+    };
+    set_auction_ec_identity(&mut request, ec_id);
+    request
+}
+
+/// Sets the auction's EC identity: `user.id` and a `ts-{ec}` request ID, or,
+/// without an EC, no `user.id` and a random `ts-req-` request ID.
+fn set_auction_ec_identity(request: &mut AuctionRequest, ec_id: Option<&str>) {
+    let ec_id = ec_id.filter(|id| !id.is_empty());
+    request.id = ec_id.map_or_else(
+        || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
+        |id| format!("ts-{id}"),
+    );
+    request.user.id = ec_id.map(str::to_owned);
 }
 
 /// Mint the browser-visible auction correlation token for GPT diagnostics.
@@ -7399,11 +7408,12 @@ pub async fn handle_page_bids(
             };
             // Load the identity-graph snapshot only now that a live auction is
             // actually running (enabled, consent-granted, slots matched, not a
-            // bot/prefetch) and a partner registry exists to consume server-side
-            // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
-            // never reach here, so they incur no billable KV read.
-            let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
-                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id).await,
+            // bot/prefetch). The row decides whether the EC goes to bidders as
+            // `user.id`, and with a partner registry it supplies server-side
+            // EIDs. Kill-switch, no-slot and bot/prefetch requests never reach
+            // here, so they incur no billable KV read.
+            let page_bids_kv_snapshot = match (kv, ec_id.as_deref()) {
+                (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
@@ -7413,16 +7423,22 @@ pub async fn handle_page_bids(
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
-            let mut auction_request = trace_request.take().unwrap_or_else(|| {
-                build_auction_request(
+            let bidder_ec = bidder_ec_id(ec_id.as_deref(), kv, &page_bids_kv_snapshot);
+            let mut auction_request = match trace_request.take() {
+                // The trace request was built before the row was read.
+                Some(mut request) => {
+                    set_auction_ec_identity(&mut request, bidder_ec);
+                    request
+                }
+                None => build_auction_request(
                     &slots_ctx,
-                    ec_id.as_deref(),
+                    bidder_ec,
                     &consent_context,
                     &request_info,
                     &settings.publisher.domain,
                     user_agent,
-                )
-            });
+                ),
+            };
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
@@ -28976,6 +28992,169 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .expect("should return ok response");
 
             assert_configured_domain(&bidder, &telemetry_sink);
+        }
+
+        /// [`EcContext`] permitting the auction, carrying `ec_id` as a cookie EC.
+        fn cookie_ec_context(ec_id: &str) -> EcContext {
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            EcContext::new_for_test(Some(ec_id.to_owned()), consent)
+        }
+
+        /// An EC store holding a consented row for `ec_id` when `with_row`.
+        async fn graph_for(ec_id: &str, with_row: bool) -> KvIdentityGraph {
+            let graph = KvIdentityGraph::in_memory("test_store");
+            if with_row {
+                let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+                live.consent.ok = true;
+                graph
+                    .create(ec_id, &live)
+                    .await
+                    .expect("should seed live row");
+            }
+            graph
+        }
+
+        /// Runs `/_ts/page-bids` for a cookie EC and returns the bid request.
+        async fn page_bids_bid_request(ec_id: &str, with_row: bool) -> serde_json::Value {
+            let settings = settings_with_capturing_provider();
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let (services, bidder) = services_with(&PublisherUpstream::new(), telemetry_sink);
+            let graph = graph_for(ec_id, with_row).await;
+            let mut ec_context = cookie_ec_context(ec_id);
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                Some(&graph),
+                AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            sent_auction(&bidder)
+        }
+
+        /// Runs a publisher navigation for a cookie EC and returns the bid request.
+        async fn navigation_bid_request(ec_id: &str, with_row: bool) -> serde_json::Value {
+            let settings = settings_with_capturing_provider();
+            let orchestrator = crate::auction::build_orchestrator(&settings)
+                .expect("should build the auction orchestrator");
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = PublisherUpstream::new();
+            stub.queue_origin(
+                200,
+                b"<html><head></head><body>ok</body></html>".to_vec(),
+                Vec::new(),
+            );
+            let (services, bidder) = services_with(&stub, telemetry_sink);
+            let graph = graph_for(ec_id, with_row).await;
+            let mut ec_context = cookie_ec_context(ec_id);
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let (_, _owner) = handle_publisher_request(
+                &settings,
+                &services,
+                Some(&graph),
+                &mut ec_context,
+                AuctionDispatch {
+                    integration_registry: &IntegrationRegistry::empty_for_tests(),
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                PublisherOriginOptions {
+                    edge_header: EdgeCacheHeader::SMaxageFallback,
+                    input_cap: None,
+                    response_decoding: ResponseDecoding::Original,
+                },
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            sent_auction(&bidder)
+        }
+
+        fn assert_no_ec_identity(request: &serde_json::Value, ec_id: &str, path: &str) {
+            assert!(
+                request["user"]["id"].is_null(),
+                "{path} should not send a cookie EC with no row as user.id: {request}"
+            );
+            assert!(
+                !request.to_string().contains(ec_id),
+                "{path} should not send the EC anywhere in the bid request, request.id included"
+            );
+        }
+
+        fn assert_ec_identity(request: &serde_json::Value, ec_id: &str, path: &str) {
+            assert_eq!(
+                request["user"]["id"].as_str(),
+                Some(ec_id),
+                "{path} should send an EC with a consented row as user.id"
+            );
+            assert_eq!(
+                request["id"].as_str(),
+                Some(format!("ts-{ec_id}").as_str()),
+                "{path} should derive request.id from an EC with a consented row"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_sends_user_id_only_for_a_cookie_ec_with_a_row() {
+            // Arrange
+            let ec_id = format!("{}.pbrow1", "a".repeat(64));
+
+            // Act
+            let without_row = page_bids_bid_request(&ec_id, false).await;
+            let with_row = page_bids_bid_request(&ec_id, true).await;
+
+            // Assert
+            assert_no_ec_identity(&without_row, &ec_id, "page-bids");
+            assert_ec_identity(&with_row, &ec_id, "page-bids");
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_sends_user_id_only_for_a_cookie_ec_with_a_row() {
+            // Arrange
+            let ec_id = format!("{}.navrw1", "a".repeat(64));
+
+            // Act
+            let without_row = navigation_bid_request(&ec_id, false).await;
+            let with_row = navigation_bid_request(&ec_id, true).await;
+
+            // Assert
+            assert_no_ec_identity(&without_row, &ec_id, "navigation");
+            assert_ec_identity(&with_row, &ec_id, "navigation");
         }
 
         #[tokio::test]
