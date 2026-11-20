@@ -2,29 +2,28 @@
 
 Issue #1599 implements the browser half of ID-9, plus WB-6's merge of route
 results and SID-2's localStorage opt-out copy, from the server-side identity
-design. Stack on #1620 (identity-only tsjs mode, #1594), which supplies the
-request-local mirror merge this builds on.
+design. Stack on #1646 (`feat/1574-axum-shared-identity`), which supplies the
+shared EC route, and merge #1620 (identity-only tsjs mode, #1594) as the other
+browser dependency.
 
-The server route is #1598 (T19). It does not exist on any branch yet. This
-change defines the browser side of the route contract below and stays inactive
-until the server injects the route path. The end-to-end acceptance criteria of
-#1599 that need the route's `Set-Cookie`, record and provider behavior close
-with T19.
+The route and server contract are implemented by #1646. This change also
+supplies the part of #1598 (T19) needed for activation: server-side Prebid
+head injection tied to the mounted identity app's record-store capability.
+Safari lifetime and deployed qualification remain separate acceptance work.
 
 ## Activation
 
-The browser client runs in both Prebid modes when the injected
-`window.__tsjs_prebid.ecRoute` is a path on the page's own origin: it begins
-with exactly one `/` and resolves to `location.origin`. Anything else disables
-it. The Rust injection of `ecRoute` belongs to T19, which owns the configurable
-route path (default `/_ts/api/v1/ec`) and mounts the route; until then no page
-calls a route that is not there.
+The server injects `window.__tsjs_prebid.ecRoute` as `/_ts/api/v1/ec` only
+when Prebid uses identity mode and the mounted shared identity app has a bound
+record store. Auction mode, absent stores and adapters returning 501 omit it.
+The capability is set after store binding, rather than inferred from settings.
+The assignment follows config creation and precedes the external Prebid bundle
+and tsjs execution, including the prepared head-injection path.
 
-Both modes report consent, so a reader who consents after the page loads gets
-an EC on that page view and a withdrawal reaches the server without waiting for
-the next navigation. Only identity mode merges route results into Prebid;
-auction mode's server auction reads identity from the record and merges
-nothing client-side.
+The browser accepts only a path beginning with exactly one `/` that resolves
+to `location.origin`. It reports consent and merges the answer in identity mode.
+Its existing transport can accept a manually supplied route in auction mode,
+but normal server injection does not activate that path.
 
 ## Consent capture
 
@@ -39,8 +38,9 @@ synthesize consent. With no CMP API there is no reading and no call.
   `vendor.legitimateInterests`. Other events, and refusals, are not readings;
   the previous reading stands. Remove a listener from the API that accepted it.
   A replaced TCF API is resubscribed.
-- **GPP:** reuse #1535's reviewed `GppConsentCapture`, moved into the Prebid
-  integration with its tests. It installs an accessor on `__gpp` only when the
+- **GPP:** reuse #1535's reviewed `GppConsentCapture` from
+  `src/shared/gpp_capture.ts`, shared by Prebid and Sourcepoint with common
+  API tests in `test/shared/gpp_capture.test.ts`. It installs an accessor on `__gpp` only when the
   global is a plain writable property, as #1535 does. A ready snapshot with
   `applicableSections` all in 1..65535 is a reading of `gppString` and
   `applicableSections`. Its unavailable callback (pending registration, a
@@ -73,7 +73,11 @@ uses the request's cookie as a navigation does. A TCF reading with
 reading with `gdprApplies === false` sends nothing for TCF: the server's EID
 gate keys GDPR off the TC string's presence, so telling it to drop the cookie
 would release IDs a navigation withholds. `applicableSections` appears only
-with `gppString`, and GPP values use #1535's cookie-safe validation.
+with `gppString`, contains at most 32 IDs, and GPP values use #1535's
+cookie-safe validation. Readings with more than 32 IDs are omitted rather than
+truncated. Exact request bodies are checked against the server's shared
+`crates/trusted-server-js/lib/test/fixtures/ec-route-contract.json` fixture
+both at queue serialization and at the fetch boundary.
 
 A snapshot with nothing to send makes no call. A TCF reading with
 `gdprApplies === true` and an invalid `tcString` is not sent; a GPP reading in

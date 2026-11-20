@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import contract from '../../fixtures/ec-route-contract.json';
 import { EcRouteClient, validEcRoute } from '../../../src/integrations/prebid/ec_route';
 
 const mirrorName = '__Host-ts-eids-mirror';
@@ -81,6 +82,21 @@ describe('EcRouteClient', () => {
     clearCookies();
     vi.restoreAllMocks();
   });
+
+  for (const fixture of contract.cases) {
+    it(`fetches the exact shared request body: ${fixture.name}`, () => {
+      const body = fixture.body;
+      client.report({
+        ...('tcString' in body ? tcf(body.tcString!) : {}),
+        ...('gppString' in body
+          ? { gpp: { gppString: body.gppString!, applicableSections: body.applicableSections! } }
+          : {}),
+      });
+      expect(calls.map((call) => call.body)).toEqual(
+        fixture.clientPosts ? [JSON.stringify(body)] : []
+      );
+    });
+  }
 
   it('posts the snapshot with same-origin, uncached, keepalive options', () => {
     client.report(tcf('CPa.AA'));

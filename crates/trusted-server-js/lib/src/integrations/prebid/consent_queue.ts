@@ -1,4 +1,5 @@
-import { isCookieSafeGppString } from './gpp_capture';
+import { isCookieSafeGppString } from '../../shared/gpp_capture';
+
 import type { TcfReading } from './tcf_reader';
 
 /** One ready GPP decision. */
@@ -54,6 +55,7 @@ function sendableGpp(reading: GppReading | undefined): reading is GppReading {
   return (
     !!reading &&
     isCookieSafeGppString(reading.gppString) &&
+    reading.applicableSections.length <= 32 &&
     reading.applicableSections.every((id) => Number.isInteger(id) && id > 0 && id <= 65535)
   );
 }

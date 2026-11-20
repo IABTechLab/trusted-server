@@ -62,17 +62,17 @@ elsewhere.
 
 ### Consent reporting to the EC route
 
-When the server injects an EC route path into the page, tsjs reports the
-publisher CMP's TCF and GPP decisions to that same-origin route in both modes,
-so a reader who consents after the page loads gets an Edge Cookie on that page
+In identity mode, when the mounted EC route has a record store, the server
+injects `window.__tsjs_prebid.ecRoute = "/_ts/api/v1/ec"`. tsjs reports the
+publisher CMP's TCF and GPP decisions to that same-origin route, so a reader who consents after the page loads gets an Edge Cookie on that page
 view and a withdrawal reaches the server without waiting for the next
 navigation. tsjs only observes the existing `__tcfapi` and `__gpp` APIs; it
 never installs a CMP. Without an injected route, or with no CMP on the page, no
-call is made. The server-side route ships separately; until it injects the
-path, this reporting stays off.
+call is made. Auction mode and adapters without a bound identity record store
+omit the route, including adapters where it returns 501.
 
 Each report is a `POST` with the CMP's TC string (when GDPR applies) and GPP
-string. Reports are sent in order, one at a time. A newer grant replaces a
+string, with at most 32 applicable GPP section IDs. Reports are sent in order, one at a time. A newer grant replaces a
 grant still waiting to be sent, but a possible withdrawal is never replaced:
 it is sent after the call in flight and before any later change. A failed
 withdrawal is resent on the next consent change, focus or visibility change;
@@ -83,8 +83,8 @@ of the mirror cookie while that cookie is unchanged. While a possible
 withdrawal is waiting or in flight, no mirrored or route IDs are merged; a
 TCF denial of Purpose 1 or 4 also deletes the mirror cookie at once. A merge
 happens when the publisher calls `requestBids`, so a withdrawal made while
-Prebid is still delaying that auction does not reach it. Auction mode reports
-consent but merges nothing in the browser.
+Prebid is still delaying that auction does not reach it. Auction mode merges
+nothing in the browser.
 
 CMPs that keep their decision outside the standard `euconsent-v2` and `__gpp`
 cookies cause each page's first report to be treated as a possible withdrawal,

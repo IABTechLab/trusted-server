@@ -1,10 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  GppConsentCapture,
-  type GppApi,
-  type GppWindow,
-} from '../../../src/integrations/prebid/gpp_capture';
+import { GppConsentCapture, type GppApi, type GppWindow } from '../../src/shared/gpp_capture';
 
 type Callback = Parameters<GppApi>[1];
 const ready = (gppString = 'synthetic-gpp-allow', applicableSections = [7]) => ({

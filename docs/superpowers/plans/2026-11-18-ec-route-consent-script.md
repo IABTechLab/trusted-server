@@ -8,7 +8,9 @@ cookie, as the spec `2026-11-18-ec-route-consent-script-design.md` defines.
 a TCF reader, #1535's GPP capture, a pure ordering queue, a route client, and an
 opt-out sync. `index.ts` wires them after managed User ID setup in both modes;
 identity mode's auction wrapper chooses its merge source from the route client.
-No Rust change: T19 injects `ecRoute`.
+The shared EC route comes from #1646. The Prebid head injector also supplies
+T19's activation: identity mode receives `ecRoute` only after the mounted
+identity app has a bound record store. Auction mode and 501 apps omit it.
 
 **Tech stack:** TypeScript, Vitest (jsdom), Prebid 10.26, esbuild bundle build.
 
@@ -20,10 +22,10 @@ No Rust change: T19 injects `ecRoute`.
       marker and `Max-Age` bounds, no overwrite of an unmarked cookie, marker
       removal when inactive, storage/cookie throwing leaves state untouched,
       `isPubcidOptedOut()` with cookie-only and localStorage-only opt-outs.
-- [x] **GPP capture** (`src/integrations/prebid/gpp_capture.ts`). Move #1535's
-      `gpp_capture.ts` and its test file unchanged apart from import paths and
-      log prefixes; run its tests. Add tests that `[-1]` and not-ready states
-      report unavailable.
+- [x] **GPP capture** (`src/shared/gpp_capture.ts`). Share #1535's capture
+      between Prebid and Sourcepoint; move common tests to
+      `test/shared/gpp_capture.test.ts` and retain Sourcepoint cookie-bridge
+      coverage. `[-1]` and not-ready states report unavailable.
 - [x] **TCF reader** (`src/integrations/prebid/tcf_reader.ts`). Tests first:
       terminal events and `gdprApplies === false` are readings; `cmpuishown`,
       refusal and missing status are not; listener removed from the accepting
@@ -40,7 +42,8 @@ No Rust change: T19 injects `ecRoute`.
       at the head; failed grant dropped and a new identical reading resent.
 - [x] **Route client** (`src/integrations/prebid/ec_route.ts`). Tests first
       with a mocked `fetch`: path validation (relative, `//host`, absolute
-      other origin, non-string); body shape and fetch options;
+      other origin, non-string); exact shared server fixture bodies and fetch
+      options; reject GPP snapshots exceeding 32 applicable sections;
       200/204/other/network/oversize/invalid envelope; one call in flight;
       discard when waiting; clear on barrier and discard; suppression until
       applied; mirror cookie expired on a known withdrawal, including one
@@ -64,10 +67,12 @@ No Rust change: T19 injects `ecRoute`.
       (Rust gates for non-regression: crate builds embed the JS bundle).
 - [x] **Independent code review** with fresh reviewers; resolve all blocking
       and optional findings; re-run affected tests.
-- [ ] **Runtime verification** through Fastly (Viceroy) and Axum serving the
-      built tsjs, real Chrome: preservation without `ecRoute`; with a fixture
-      `ecRoute` and a controlled responder: route ID reaches a controlled
-      bidder, A, B, C ordering, suppression, opt-out cookie copy.
+- [x] **Runtime verification** through Fastly (Viceroy) and Axum serving the
+      built tsjs and real Chrome behind the publisher proxy: actual server
+      injection, local record storage, controlled TCF/GPP CMPs, returned IDs
+      reaching a real Prebid consumer, live records and withdrawal tombstones,
+      A/B/C ordering, suppression, unchanged returning readers and opt-out.
+      Keep unsupported Safari lifetime and real-CMP qualification explicit.
 
 ## Commands
 

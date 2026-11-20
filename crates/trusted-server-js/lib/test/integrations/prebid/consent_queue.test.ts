@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import contract from '../../fixtures/ec-route-contract.json';
 import {
   classify,
   ConsentQueue,
@@ -20,6 +21,29 @@ const gpp = (gppString: string, applicableSections = [7]) => ({
 const noCookies: CookieView = {};
 
 describe('requestBody', () => {
+  for (const fixture of contract.cases) {
+    it(`matches the shared server request contract: ${fixture.name}`, () => {
+      const body = fixture.body;
+      const snapshot: ConsentSnapshot = {
+        ...('tcString' in body ? tcf(body.tcString!) : {}),
+        ...('gppString' in body ? gpp(body.gppString!, body.applicableSections!) : {}),
+      };
+      expect(requestBody(snapshot)).toBe(fixture.clientPosts ? JSON.stringify(body) : undefined);
+    });
+  }
+
+  it('accepts 32 applicable sections and drops a reading with 33', () => {
+    const sections = Array.from({ length: 32 }, (_, index) => index + 1);
+    expect(JSON.parse(requestBody(gpp('DBA', sections))!)).toEqual({
+      gppString: 'DBA',
+      applicableSections: sections,
+    });
+    expect(requestBody(gpp('DBA', [...sections, 33]))).toBeUndefined();
+    expect(requestBody({ ...tcf('CPa.AA'), ...gpp('DBA', [...sections, 33]) })).toBe(
+      JSON.stringify({ tcString: 'CPa.AA' })
+    );
+  });
+
   it('sends only the readings present', () => {
     expect(JSON.parse(requestBody(tcf('CPa.AA'))!)).toEqual({ tcString: 'CPa.AA' });
     expect(requestBody(tcf('', [], false)), 'out-of-scope TCF leaves the cookie').toBe(undefined);

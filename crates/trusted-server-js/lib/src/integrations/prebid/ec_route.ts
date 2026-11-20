@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import { GppConsentCapture, type GppWindow } from '../../shared/gpp_capture';
 
 import {
   ConsentQueue,
@@ -10,7 +11,6 @@ import {
   type CookieView,
   type QueueEntry,
 } from './consent_queue';
-import { GppConsentCapture, type GppWindow } from './gpp_capture';
 import {
   expireMirrorCookie,
   liveMirrorEids,
