@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-adapter-axum"
-description = "Axum entry point for Trusted Server — native dev server."
+description = "Axum entry point for Trusted Server — native production and development server."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -39,6 +39,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
+trusted-server-identity-providers = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

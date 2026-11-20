@@ -786,3 +786,35 @@ fn config_validate_and_push_reject_unknown_integration_ids_and_fields() {
         }
     }
 }
+
+#[test]
+fn axum_publishes_enabled_identity_provider() {
+    let project = migrated_project();
+    let mut config = fs::read_to_string(&project.config_path).expect("should read config");
+    config.push_str(
+        r#"
+[[ec.partners]]
+name = "liveramp"
+source_domain = "liveramp.example.com"
+bidstream_enabled = true
+
+[[ec.identity_providers]]
+id = "liveramp"
+kind = "liveramp"
+endpoint = "https://envelope.example.com/api/identity/v2/envelope"
+allowed_domains = ["envelope.example.com"]
+sources = ["liveramp.example.com"]
+[ec.identity_providers.settings]
+placement_id = 14
+custom_id_namespace = "ana-example"
+"#,
+    );
+    fs::write(&project.config_path, config).expect("should write enabled provider config");
+
+    let published = pushed_config_with_env(&project, REWRITE_ENV, "true");
+
+    assert_eq!(
+        published["ec"]["identity_providers"][0]["id"], "liveramp",
+        "should publish a provider supported by the Axum runtime"
+    );
+}

@@ -9,7 +9,9 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    allows_eid_persistence, consent_allows_server_side_auction, gate_eids_by_consent,
+};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -18,7 +20,7 @@ use crate::ec::current_timestamp;
 use crate::ec::eid_types::UnixSeconds;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{MAX_STORED_UID_LENGTH, MAX_UID_LENGTH};
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
+use crate::ec::prebid_eids::{collect_eid_updates, parse_prebid_eids_cookie};
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::sharedid::{
     SHAREDID_OPTOUT_COOKIE, canonical_source, canonicalize_sharedid_eid,
@@ -191,8 +193,8 @@ pub async fn handle_auction(
             .insert(TraceClientSlotRefs::from_raw(&body_bytes));
     }
 
-    // Story 5 middleware contract: auction is a read-only EC route.
-    // It must not generate EC IDs; it only consumes pre-routed context.
+    // Auctions consume an existing EC and never generate identity.
+    // Explicit body EIDs can update its live row after the consent checks below.
     // Only forward the EC ID to auction partners when consent allows it.
     // Owned so the identity-graph snapshot can be stored back on `ec_context`
     // below without holding a borrow of it across the mutation.
@@ -202,6 +204,10 @@ pub async fn handle_auction(
         None
     };
     let consent_context = ec_context.consent().clone();
+
+    // Identity ingestion is independent of whether this deployment runs bidders.
+    let body_snapshot =
+        persist_auction_body(kv, registry, ec_context, &http_req, body.eids.as_ref()).await;
 
     if !orchestrator.is_enabled() {
         log::info!("/auction: auction is disabled; returning no-bid response");
@@ -338,9 +344,8 @@ pub async fn handle_auction(
     } else {
         None
     };
-    // Carry the full request-local EID set to response finalization so KV
-    // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
+    // Retain the parsed request-local EIDs for downstream identity consumers.
+    // The body ingestion below persists explicit body data separately from cookies.
     if let Some(eids) = &client_eids {
         ec_context.set_client_eids(eids.clone());
     }
@@ -348,14 +353,13 @@ pub async fn handle_auction(
     // Read the EC's row whenever an EC store exists: it decides whether the
     // EC may go to bidders as `user.id` (see `bidder_ec_id`), and with a
     // partner registry it supplies the server-side EIDs.
-    let auction_kv_snapshot = match (kv, ec_id.as_deref()) {
-        (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
-        _ => EcKvSnapshot::NotRead,
+    let auction_kv_snapshot = match body_snapshot {
+        Some(snapshot) => snapshot,
+        None => match (kv, ec_id.as_deref()) {
+            (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id).await,
+            _ => EcKvSnapshot::NotRead,
+        },
     };
-    // Hand the loaded row to the request context so response finalization —
-    // which runs on an EC context the adapter owns, after this handler returns
-    // — ingests `ts-eids`/`sharedId` updates from this read instead of paying
-    // for a second lookup.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
@@ -518,6 +522,52 @@ fn retain_private_trace(
         response.extensions_mut().insert(trace);
     }
     response
+}
+
+/// Persists explicit body EIDs independently of bidder enablement.
+///
+/// No body, denied identity consent or no usable updates costs no record read.
+async fn persist_auction_body(
+    kv: Option<&KvIdentityGraph>,
+    registry: Option<&PartnerRegistry>,
+    context: &mut EcContext,
+    request: &Request<EdgeBody>,
+    raw: Option<&JsonValue>,
+) -> Option<EcKvSnapshot> {
+    if !context.ec_allowed() || !allows_eid_persistence(context.consent()) {
+        return None;
+    }
+    let (Some(graph), Some(registry), Some(ec_id)) =
+        (kv, registry, context.ec_value().map(str::to_owned))
+    else {
+        return None;
+    };
+    let body_eids = strip_opted_out_sharedid_eids(
+        drop_vendor_denied_client_eids(parse_client_auction_eids(raw), Some(registry), context),
+        extract_cookie_value(request, SHAREDID_OPTOUT_COOKIE).is_some(),
+    );
+    let updates = collect_eid_updates(None, None, body_eids.as_deref(), registry);
+    if updates.is_empty() {
+        return None;
+    }
+    let mut snapshot = graph.load_snapshot(&ec_id).await;
+    match graph
+        .commit_auction_body(&ec_id, &snapshot, &updates, registry)
+        .await
+    {
+        Ok(Some(entry)) => {
+            snapshot = EcKvSnapshot::Present {
+                ec_id,
+                entry: Box::new(entry),
+                // The provider returns no fresh generation after the CAS.
+                generation: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("Auction body EID persistence failed: {error:?}"),
+    }
+    context.set_kv_snapshot(snapshot.clone());
+    Some(snapshot)
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -1187,10 +1237,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_context_but_never_kv() {
-        // `handle_auction` hands its parsed body EIDs to `ec_context`, but body
-        // EIDs go to bidders on that request only: finalization of an
-        // `/auction` request never writes them to KV (spec §5.1, D1).
+    async fn auction_body_eids_are_persisted_before_response() {
+        // A body UID must reach the existing record before the auction returns.
         let settings = create_test_settings();
         let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
@@ -1254,6 +1302,20 @@ mod tests {
             "the endpoint must hand its parsed body EIDs to the request context"
         );
 
+        assert_eq!(
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read body persistence")
+                .expect("should retain live row")
+                .0
+                .ids
+                .get("id5-sync.com")
+                .map(|record| record.uid.as_str()),
+            Some("ID5_from_body"),
+            "should persist body data before the endpoint returns"
+        );
+
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
@@ -1271,9 +1333,290 @@ mod tests {
             .await
             .expect("should read store")
             .expect("row should exist");
+        assert_eq!(
+            stored
+                .ids
+                .get("id5-sync.com")
+                .map(|record| record.uid.as_str()),
+            Some("ID5_from_body"),
+            "should save the body's EID in the existing record"
+        );
         assert!(
-            stored.ids.is_empty(),
-            "the body's EIDs must not be persisted from an auction request"
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should ingest an auction body without identity cookies"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_disabled_still_persists_consented_body_eids() {
+        let settings = create_test_settings();
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("ids.example.com")])
+            .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("disabled-auction-body");
+        let ec_id = format!("{}.body01", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        graph
+            .create(&ec_id, &entry)
+            .await
+            .expect("should seed live row");
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let request = body_ingest_request(Some(
+            json!([{"source":"ids.example.com","uids":[{"id":"disabled-body-uid","atype":1}]}]),
+        ));
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut context,
+            &noop_services(),
+            request,
+        )
+        .await
+        .expect("should return disabled auction response");
+        assert!(
+            response.status().is_success(),
+            "should preserve disabled no-bid behavior"
+        );
+        let row = graph
+            .get(&ec_id)
+            .await
+            .expect("should read record")
+            .expect("should retain existing record")
+            .0;
+        assert_eq!(
+            row.ids.get("ids.example.com").map(|id| id.uid.as_str()),
+            Some("disabled-body-uid"),
+            "should persist body EIDs even when bidding is disabled"
+        );
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should keep auction response free of identity cookies"
+        );
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should read no-bid response");
+        let payload: JsonValue =
+            serde_json::from_slice(&bytes).expect("should parse no-bid response");
+        assert!(
+            payload
+                .get("seatbid")
+                .and_then(JsonValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "should return no bids while persisting the body EID: {payload}"
+        );
+    }
+
+    fn body_ingest_request(body_eids: Option<JsonValue>) -> Request<EdgeBody> {
+        let mut body = json!({
+            "adUnits": [{ "code": "slot", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+        });
+        body["eids"] = body_eids.unwrap_or(JsonValue::Null);
+        Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize auction body"),
+            ))
+            .expect("should build auction request")
+    }
+
+    async fn ingest_body_for_test(
+        graph: &KvIdentityGraph,
+        registry: &PartnerRegistry,
+        ec: &mut EcContext,
+        request: Request<EdgeBody>,
+    ) {
+        let orchestrator = orchestrator_with(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid-capture"]),
+            ..Default::default()
+        });
+        let _ = handle_auction(
+            &create_test_settings(),
+            &orchestrator,
+            Some(graph),
+            Some(registry),
+            ec,
+            &noop_services(),
+            request,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_preserves_missing_and_withdrawn_rows() {
+        let graph = KvIdentityGraph::in_memory("body-ingest");
+        let registry = partner_registry(&["ids.example.com"]);
+        for withdrawn in [false, true] {
+            let ec_id = format!("{}.bodyid", if withdrawn { "b" } else { "a" }.repeat(64));
+            if withdrawn {
+                graph
+                    .create(&ec_id, &crate::ec::kv_types::KvEntry::tombstone(1000))
+                    .await
+                    .expect("should seed withdrawn row");
+            }
+            let before = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect original row");
+            let mut ec = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            ingest_body_for_test(
+                &graph,
+                &registry,
+                &mut ec,
+                body_ingest_request(Some(json!([
+                    {"source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+                ]))),
+            )
+            .await;
+            let after = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect retained row");
+            assert_eq!(
+                after, before,
+                "should neither create a missing row nor revive a withdrawn row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_requires_identity_and_eid_consent() {
+        let registry = partner_registry(&["ids.example.com"]);
+        let ec_id = format!("{}.bodyid", "c".repeat(64));
+        for purposes in [[false, false], [true, false], [false, true], [true, true]] {
+            let graph = KvIdentityGraph::in_memory("body-consent");
+            let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+            live.consent.ok = true;
+            graph
+                .create(&ec_id, &live)
+                .await
+                .expect("should seed live identity");
+            let mut consent = vendor_denied_consent();
+            let tcf = consent.tcf.as_mut().expect("should have TCF consent");
+            tcf.purpose_consents[0] = purposes[0];
+            tcf.purpose_consents[3] = purposes[1];
+            let mut ec = EcContext::new_for_test(Some(ec_id.clone()), consent);
+            ingest_body_for_test(
+                &graph,
+                &registry,
+                &mut ec,
+                body_ingest_request(Some(json!([
+                    {"source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+                ]))),
+            )
+            .await;
+            let row = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect record")
+                .expect("should retain record")
+                .0;
+            assert_eq!(
+                row.ids.contains_key("ids.example.com"),
+                purposes == [true, true],
+                "should require Purposes 1 and 4 for body persistence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_ignores_cookie_fallback_and_unknown_jurisdiction() {
+        let registry = partner_registry(&["ids.example.com"]);
+        let ec_id = format!("{}.bodyid", "e".repeat(64));
+        for unknown in [false, true] {
+            let graph = KvIdentityGraph::in_memory("body-only");
+            let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+            live.consent.ok = true;
+            graph
+                .create(&ec_id, &live)
+                .await
+                .expect("should seed live identity");
+            let mut ec = make_ec_context(
+                if unknown {
+                    Jurisdiction::Unknown
+                } else {
+                    Jurisdiction::NonRegulated
+                },
+                Some(&ec_id),
+            );
+            let eids =
+                json!([{ "source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}] }]);
+            let mut request = body_ingest_request(unknown.then(|| eids.clone()));
+            if !unknown {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    format!("ts-eids={}", BASE64.encode(eids.to_string()))
+                        .parse()
+                        .expect("should set cookie fallback"),
+                );
+            }
+            ingest_body_for_test(&graph, &registry, &mut ec, request).await;
+            let row = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect record")
+                .expect("should retain record")
+                .0;
+            assert!(
+                row.ids.is_empty(),
+                "should persist neither cookie-only fallback nor body data with unknown consent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_body_ingest_preserves_provider_ownership_and_cookie_optouts() {
+        let graph = KvIdentityGraph::in_memory("body-ownership");
+        let mut registry = partner_registry(&[
+            "owned.example.com",
+            "optout.example.com",
+            "pubcid.org",
+            "unowned.example.com",
+        ]);
+        assert!(
+            registry.mark_provider_owned("owned.example.com", std::num::NonZeroU16::new(42)),
+            "should mark source owner"
+        );
+        let ec_id = format!("{}.bodyid", "d".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live identity");
+        let mut ec = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec.set_cookie_opted_out_sources(vec!["optout.example.com".to_owned()]);
+        let mut request = body_ingest_request(Some(json!([
+            {"source": "owned.example.com", "uids": [{"id": "owned-uid", "atype": 1}]},
+            {"source": "optout.example.com", "uids": [{"id": "optout-uid", "atype": 1}]},
+            {"source": "sharedid.org", "uids": [{"id": "11111111-1111-4111-8111-111111111111", "atype": 1}]},
+            {"source": "unowned.example.com", "uids": [{"id": "body-uid", "atype": 1}]}
+        ])));
+        request.headers_mut().insert(
+            header::COOKIE,
+            "_pubcid_optout=1"
+                .parse()
+                .expect("should set optout cookie"),
+        );
+        ingest_body_for_test(&graph, &registry, &mut ec, request).await;
+        let row = graph
+            .get(&ec_id)
+            .await
+            .expect("should inspect record")
+            .expect("should retain record")
+            .0;
+        assert_eq!(
+            row.ids.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["unowned.example.com"],
+            "should ingest only unowned sources without optouts"
         );
     }
 

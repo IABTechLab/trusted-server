@@ -1,13 +1,16 @@
 # trusted-server-adapter-axum
 
-Native development adapter for Trusted Server. It runs the shared application
-through Axum on the host, without an edge simulator, and is not a production
-deployment target.
+Native adapter for Trusted Server. It runs the shared application through Axum
+on the host, without an edge simulator, for local development and as the
+production entry point. The shared core identity app uses an EdgeZero-prepared
+record service for Edge Cookies, partner APIs and body EID persistence.
 
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
-unavailable; config/secret snapshots are not live identity storage.
+unavailable; live identity records use the separate prepared record capability.
+The logical record store is declared unconditionally, so its local provider
+requires a writable `EDGEZERO__ADAPTER__DATA_DIR`.
 
 Before listening, the native initializer reads the declared prepared stores,
 validates one bounded config envelope and its active secret references, and
@@ -15,11 +18,11 @@ installs the real router. Missing or invalid inputs stop the process with a
 non-zero exit. Local development uses an isolated EdgeZero config-store map and
 `EDGEZERO__SECRETS__*` values. Legacy `TRUSTED_SERVER_CONFIG_*` and
 `TRUSTED_SERVER_SECRET_*` variables cannot rescue missing prepared inputs.
-See the [native RC guide](../../docs/guide/native-rc-demo.md) for the
-production-style hosting and provider checks.
+See [Axum production startup](../../docs/guide/native-rc-demo.md) for the
+AWS providers and their checks.
 
 The binary runs through EdgeZero's Axum production startup,
-`run_production_app_with_initializer`, which installs the logger and binds the
+`run_production_app_with_options_and_initializer`, which installs the logger and binds the
 listener; the adapter installs no logger of its own. The log level comes from
 `EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener address from
 `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default

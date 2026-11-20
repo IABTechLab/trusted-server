@@ -7,8 +7,19 @@
 //! [`IdentityPlatform`], so no identity route rebuilds that state per request.
 //!
 //! [`IdentityApp::mount`] registers the identity routes the core app owns on
-//! the adapter's router. Today these are the admin lookups; identify and
-//! batch sync stay in the adapters until the EC lifecycle moves into core.
+//! the adapter's router. The shared app owns identity request preparation,
+//! partner dispatch, record persistence and response finalization; adapters
+//! supply platform services and response-delivery scheduling.
+
+mod lookups;
+
+pub use lookups::{AfterResponseLookups, IdentityLookups, joined_cookie_header};
+mod lifecycle;
+mod route;
+#[cfg(test)]
+mod route_tests;
+pub use lifecycle::IdentityRequest;
+pub use route::EC_PATH;
 
 use std::sync::Arc;
 

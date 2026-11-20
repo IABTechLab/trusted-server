@@ -9,7 +9,9 @@ use edgezero_adapter_fastly::request::{
 };
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+#[cfg(test)]
+use edgezero_core::http::Request as HttpRequest;
+use edgezero_core::http::{Extensions, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use fastly::http::Method as FastlyMethod;
@@ -17,9 +19,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
@@ -38,6 +38,8 @@ mod deadline_network;
 mod delivery;
 mod ec_record_store;
 mod esi_assembly;
+#[cfg(test)]
+mod identity_conformance;
 mod management_api;
 mod middleware;
 mod platform;
@@ -356,18 +358,28 @@ fn serve(
     // until `finalize` collects them. Drop anything an earlier request on
     // this sandbox left there, which cancels its requests.
     drop(take_navigation_lookups());
-    let delivery = send_request_with_registries_and_hooks(
-        &retained.app,
-        TrustedServerApp::stores(),
-        req,
-        prepare,
-        |response: &mut HttpResponse| finalize_response(response, &inputs),
-    );
+    let delivery = with_finalization(&inputs, |finalize| {
+        send_request_with_registries_and_hooks(
+            &retained.app,
+            TrustedServerApp::stores(),
+            req,
+            prepare,
+            finalize,
+        )
+    });
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
     // A detached response never reaches `finalize`; release its lookups now.
     drop(take_navigation_lookups());
+}
+
+/// Supplies the production finalization callback to a request lifecycle.
+fn with_finalization<T>(
+    inputs: &FinalizeInputs<'_>,
+    send: impl FnOnce(&mut dyn FnMut(&mut HttpResponse) -> Option<FinalizeState>) -> T,
+) -> T {
+    send(&mut |response| finalize_response(response, inputs))
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -674,31 +686,21 @@ async fn apply_edgezero_ec_finalize(
         }
         !redirect
     });
-    if let Some(IdentityLookups {
-        coordinator,
-        transport,
-        pending,
-    }) = identity
-    {
-        let results = coordinator.collect(&transport, pending).await;
-        ec_state.ec_context.set_lookup_results(results);
-    }
     let identity_app = &state.identity;
-    let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity_app.identity_graph()
-    } else {
-        None
-    };
-    ec_finalize_response(
-        identity_app.settings(),
-        &mut ec_state.ec_context,
-        finalize_kv_graph.as_ref(),
-        identity_app.partners(),
-        ec_state.eids_cookie.as_deref(),
-        &ec_state.sharedid,
-        response,
-    )
-    .await;
+    if let Some(lookups) = identity {
+        identity_app
+            .collect_identity_lookups(lookups, &mut ec_state.ec_context)
+            .await;
+    }
+    identity_app
+        .finalize(
+            &mut ec_state.ec_context,
+            ec_state.eids_cookie.as_deref(),
+            &ec_state.sharedid,
+            ec_state.use_finalize_kv,
+            response,
+        )
+        .await;
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -790,20 +792,6 @@ pub(crate) fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })
-}
-
-/// Extracts a named cookie value from the request's `Cookie` header.
-pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
-    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
 }
 
 /// Derives device signals from TLS, H2, and UA request data.
@@ -1468,19 +1456,25 @@ mod tests {
         // A returning reader withdraws consent with GPC in a US state.
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let request = edgezero_core::http::request_builder()
+            .method(Method::GET)
             .uri("https://www.example.com/article")
+            .header("sec-fetch-dest", "document")
             .header("cookie", format!("ts-ec={ec_id}"))
             .header("sec-gpc", "1")
             .body(EdgeBody::empty())
             .expect("should build the reader request");
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");
+        ec_context.set_navigation_permit(
+            NavigationPermit::classify(&request).expect("should classify the document navigation"),
+        );
         let mut page = response_builder()
+            .header("content-type", "text/html; charset=utf-8")
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build the page response");

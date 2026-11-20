@@ -1,14 +1,18 @@
-# Axum development server
+# Axum server
 
-The Axum adapter runs Trusted Server as a native local process. It is the
-shortest path for inspecting requests without an edge runtime; it is not a
-production deployment target.
+The Axum adapter runs Trusted Server as a native process. Locally it is the
+shortest path for inspecting requests without an edge runtime. The same binary
+is the production entry point: it loads config and secrets from prepared stores
+(local files, or AWS AppConfig and Secrets Manager), refuses to listen when
+any of them is missing, and drains in-flight requests on SIGTERM. See
+[Axum production startup](./native-rc-demo). Edge Cookie records and partner APIs run through the shared identity app over
+EdgeZero's prepared record service; see [native EC persistence](./native-ec-persistence).
 
 ## Support status
 
-| Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `axum`  | development    | real   | exit 1         | no             | multiple         | outermost sanitize         | none                  |
+| Adapter | Release status     | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------- | ------------------ | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
+| `axum`  | production startup | real   | exit 1         | no             | multiple         | outermost sanitize         | none                  |
 
 This row is the canonical status summary. Axum supports multiple
 auction providers and exposes a real `/health` handler. A startup failure stops
@@ -30,6 +34,12 @@ local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
 envelope and active secret references, and installs immutable snapshots and
 the actual router before listening.
 
+The smoke also supplies a writable `EDGEZERO__ADAPTER__DATA_DIR`. The record
+store is always declared and EdgeZero prepares its local provider before TS
+loads application config, even when `ec.storage` is absent. Every local-provider
+start needs that directory; remote-only bindings do not. See
+[Getting started](./getting-started), Option B, for the complete shell setup.
+
 Local secrets use these variables:
 
 - `EDGEZERO__SECRETS__HANDLER_PASSWORD`
@@ -39,7 +49,7 @@ Local secrets use these variables:
 Only referenced secrets are captured during startup. Changes to provider files
 or values require restarting the process. Legacy `TRUSTED_SERVER_CONFIG_*`
 and `TRUSTED_SERVER_SECRET_*` variables are not fallback inputs. The
-[native RC guide](./native-rc-demo) covers provider selection and lifecycle
+[Axum production startup](./native-rc-demo) covers provider selection and lifecycle
 checks.
 
 Before the positive request, the smoke omits the config and each secret in
@@ -102,10 +112,11 @@ sessions.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
+Axum implements the read-only `/_ts/admin/eids` diagnostic and EC record lookup
+through the configured shared record service. Record lookup returns 501 without
+identity storage; key rotation and other administrative mutations remain
+unsupported. It sanitizes forwarded client-IP headers but does not resolve
+`[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

@@ -380,7 +380,10 @@ Every PR must pass:
 14. Fastly absolute-deadline network fixtures under Viceroy (the harness builds the adapter test binary itself): `node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"`
 15. Worker auction-deadline runtime fixtures (`worker-auction-deadlines.yml`): build and lint the runtime fixture, then run it under the local runtime. For Cloudflare, `cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare` and `node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"` (requires wrangler and the `Cargo.lock` wasm-bindgen CLI). For Spin, `cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin` and `node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"`. CI lints each fixture with the same `cargo clippy` arguments plus `-- -D warnings`
 16. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
-17. Fastly response diff script: `node --test scripts/fastly-response-diff.test.mjs` with the `.tool-versions` Node
+17. Native provider acceptance script helpers: `node --test 'scripts/tests/*.test.mjs'` with the `.tool-versions` Node (the full Docker run, `node scripts/test-native-providers.mjs <absolute binary path>`, stays local)
+18. Fastly response diff script: `node --test scripts/fastly-response-diff.test.mjs` with the `.tool-versions` Node
+
+19. Serving runtime process-environment guard: `scripts/test-runtime-env.sh && scripts/lint-runtime-env.sh`. Production code must use `trusted_server_core::runtime_env!` with a compile-time `TRUSTED_SERVER__` name or a justified Fastly metadata exception. Build scripts, compile-time inputs, tests, operator tools, platform bindings and EdgeZero internals are outside this gate.
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

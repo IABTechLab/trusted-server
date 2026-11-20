@@ -7182,6 +7182,7 @@ dependencies = [
  "tokio",
  "toml",
  "trusted-server-core",
+ "trusted-server-identity-providers",
  "url",
 ]
 

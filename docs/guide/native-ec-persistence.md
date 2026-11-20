@@ -22,7 +22,7 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TS_EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. The portable manifest and Axum startup always declare `trusted_server_kv` with the shared EC record layout before provider preparation. Select its provider through `EDGEZERO__STORE_BINDINGS_FILE`; without a remote binding, EdgeZero prepares its local persistent record provider. In that local-provider case, supply a writable `EDGEZERO__ADAPTER__DATA_DIR` even when application identity storage is disabled. Remote-only bindings do not require the directory.
 
 Published application config selects the logical prepared store, not an endpoint or credentials:
 
@@ -32,7 +32,7 @@ provider = "records"
 store = "trusted_server_kv"
 ```
 
-A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TS_EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+A configured record reference must already have the declared layout and capability before initialization. An undeclared store ID or raw binding is an error, not permission to construct a provider late. Obsolete `TS_EC_RECORDS_ENABLED` and `TS_EC_DYNAMODB_ENABLED` switches are no longer read; migrate to the declared logical store and EdgeZero binding. Omitting `ec.storage` leaves identity without a graph, while the declared provider is still prepared. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 
@@ -78,11 +78,11 @@ Provider preparation and runtime operations use EdgeZero's bounded, single-attem
 
 ## Eligibility and route boundaries
 
-Persistence does not grant consent. Native eligibility uses checked client metadata and existing browser/navigation rules, not invented Fastly TLS or JA4 signals. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
+Persistence does not grant consent. Native eligibility uses trusted client metadata, consent and the shared navigation policy. Missing JA4 does not block creation; no User-Agent-only gate or fabricated TLS signal is used. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
 
-Read-only identify does not create identities. Withdrawal remains writable for privacy-hardened clients, writes an authoritative tombstone, removes partner IDs and expires the browser cookie. Finalization is awaited before committing response headers.
+Identify does not create identities. A withdrawal on an identity lifecycle request remains writable for privacy-hardened clients and tombstones the record. Identity cookie writes are restricted to eligible HTML navigation or EC-route responses, including method-neutral HTML error documents and cached-document `304` responses without Content-Type. Explicit withdrawal is the privacy exception: the same response expires the browser EC cookie regardless of method, status or content type, including on API responses. Finalization is awaited before committing response headers.
 
-Native admin EC management, native S2S batch parity with Fastly, and native post-send pull sync remain separate work.
+The shared identity app owns identify, S2S batch sync and read-only admin lookup on the same record service. Provider and pull-sync orchestration is shared, with Axum follow-up work registered through EdgeZero's bounded, shutdown-drained after-response API. Broader provider and browser feature qualification remains #1581. Native administrative mutations remain unsupported.
 
 ## Browser hostname and consent transport
 
