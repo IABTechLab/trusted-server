@@ -167,12 +167,18 @@ impl FastlyAdapter {
                 || ORIGIN.to_owned(),
                 |request| format!("https://origin.example.com{}", request.path),
             ),
-            ScriptedReply::status(StatusCode::OK)
-                .header(
-                    "content-type",
-                    api.map_or("text/html", |request| request.origin_content_type),
-                )
-                .body(DOCUMENT),
+            {
+                let reply = ScriptedReply::status(
+                    api.map_or(StatusCode::OK, |request| request.origin_status),
+                );
+                let mime = api.map_or("text/html", |request| request.origin_content_type);
+                let reply = if mime.is_empty() {
+                    reply
+                } else {
+                    reply.header("content-type", mime)
+                };
+                reply.body(DOCUMENT)
+            },
         );
         let geo = (navigation.geo == Geo::Gdpr).then(|| GeoInfo {
             country: "DE".to_owned(),

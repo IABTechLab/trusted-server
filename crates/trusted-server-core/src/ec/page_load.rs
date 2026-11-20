@@ -39,8 +39,7 @@ impl NavigationPermit {
     /// [`is_navigation_request`]: `Sec-Fetch-Dest: document`, or, without
     /// Fetch Metadata, an `Accept` header naming `text/html`.
     ///
-    /// This classifier checks navigation signals only. The shared identity
-    /// application requires `GET` before calling it for a publisher navigation.
+    /// This classifier checks navigation signals independently of method.
     ///
     /// Call once per request, from the publisher-proxy route only.
     #[must_use]

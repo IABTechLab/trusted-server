@@ -12,7 +12,7 @@ survive unknown geography. Identify, batch sync and admin lookup use the one
 shared graph; identify and batch sync answer locally with 501 without it.
 Auction body EIDs are saved for an existing live record under EID consent,
 including deployments with bidding disabled.
-Identity cookies are emitted only on HTML navigation or EC route responses.
+Identity cookies are emitted only on eligible HTML navigation or EC route responses, including cached-document `304` responses. Explicit withdrawal is the privacy exception: its EC deletion must accompany tombstoning on the same response regardless of method, status or content type.
 Adapters supply platform services and call the shared app, without implementing
 `EcKvStore` or invoking lifecycle/identity handlers directly.
 
@@ -23,17 +23,14 @@ EC generation, finalization and partner handlers themselves. Axum's separate
 graph does not populate the shared app, and its batch route always returns 501.
 The portable T5 runner supports navigation on Fastly only. No minting EC route
 is mounted. Auction parsing captures body EIDs but a regression deliberately
-asserts they never reach storage. Finalization can expire identity cookies on
-arbitrary responses. These behaviors must change to satisfy A2.
+asserts they never reach storage. Finalization can write identity cookies on arbitrary responses. Ordinary identity cookie output must be restricted to eligible document/EC responses while preserving explicit-withdrawal EC expiry everywhere.
 
 ## Design
 
 Expand core `IdentityApp` with request lifecycle and partner route operations.
 A request-local state holds consent, EC context and browser cookie inputs;
 platform-derived geo/client signals remain inputs through `RuntimeServices`.
-Core classifies navigation and EC response eligibility: a document must be a
-GET navigation with a final HTML Content-Type and successful (2xx) status; a request
-Accept header alone cannot authorize cookies on JSON/error/asset responses.
+Core classifies navigation and EC response eligibility: document navigation is method-neutral and keeps lifecycle writes on HTML responses of any nonredirect status. Redirect statuses 301, 302, 303, 307 and 308 remain excluded. A navigation returning `304 Not Modified` retains its permit even without Content-Type because it validates the cached document. Otherwise final HTML Content-Type is required; a request Accept header alone cannot authorize identity issuance on JSON/asset responses.
 Core generates identity,
 executes partner handlers and finalizes persistence/cookies. Fastly retains its
 existing delivery bridge, limiter, geo and provider transport; lifecycle and
@@ -70,9 +67,7 @@ Introduce an explicit existing-record body-EID commit path, separate from the
 navigation write permit. It preserves Purpose 1/4 and partner/vendor consent,
 source ownership, opt-outs, conditional writes and withdrawal tombstones. It
 never creates or recovers an EC from an auction and emits no identity cookie.
-Keep authoritative withdrawal handling on routes participating in the identity
-lifecycle while suppressing their identity cookie output; subsequent eligible
-responses can clear browser state. Configured asset-only proxy routes retain
+Keep authoritative withdrawal handling on routes participating in the identity lifecycle. The same response expires the browser EC cookie independently of method, status and content type, including when the tombstone write fails. This EC deletion is the explicit privacy exception to the HTML document/EC route identity-cookie boundary; other identity cookie output remains suppressed on ineligible responses. Configured asset-only proxy routes retain
 Fastly's existing streaming path without identity ingestion or finalization;
 explicit reconciliation uses the EC/consent route. This preserves the asset
 contract while WB-1 keeps every such response free of identity cookies.
@@ -168,3 +163,7 @@ lifecycle contract; this is an explicit preservation boundary.
   explicit TOML entry. CLI publication accepts Axum's shared provider
   coordinators while preserving Cloudflare/Spin rejection, with a real
   `ts config push` regression for an enabled provider.
+
+### Approved Fastly compatibility correction
+
+The subsequent comparison with #1641 found that the GET-only and successful-2xx-only restrictions recorded above were implementation choices without an independent requirement basis. The user approved superseding both choices: preserve method-neutral publisher navigation, permit HTML error documents, and retain `304 Not Modified` navigation permission even without Content-Type. The five redirect statuses remain excluded. Explicit withdrawal must expire the EC cookie on the same response as tombstoning regardless of method, status or content type; this privacy exception supersedes the earlier API-cookie suppression choice. Keep the shared split-Cookie-field `ts-eids` capture as an intentional compatibility improvement, with regression coverage.

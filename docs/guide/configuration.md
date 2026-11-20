@@ -1039,12 +1039,11 @@ token = "example_provider_token"
 
 `collect = "after_response"` lookups run after the response is sent, within
 `identity_after_response_budget_ms`, with a configured record service and an
-eligible successful HTML document navigation or admitted EC POST. The request's
+eligible HTML document navigation or admitted EC POST. Navigation eligibility is method-neutral and includes HTML error documents and cached-document `304` responses without Content-Type. The request's
 own write must have succeeded (or had nothing to change), the row must be live,
 and the EC must not have been minted on this request. A row recovered from an
 orphaned cookie gets a newly minted EC, so its lookups wait for a later request.
-Redirects and error document responses, including an origin-failure `502`, do
-not authorize follow-up writes. Results reach the row in a conditional follow-up
+Redirect statuses 301, 302, 303, 307 and 308 do not authorize follow-up writes. Non-HTML responses other than cached-document `304` also lose the navigation permit; HTML error documents retain it. Results reach the row in a conditional follow-up
 write. Providers run on Fastly and Axum; Axum registers this work with EdgeZero's
 bounded, shutdown-drained after-response API.
 

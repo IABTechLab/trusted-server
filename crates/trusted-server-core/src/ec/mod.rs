@@ -678,7 +678,11 @@ impl EcContext {
     }
 
     /// Whether this request still holds its page-load write permit.
-    pub(crate) fn has_navigation_permit(&self) -> bool {
+    ///
+    /// Adapters use this shared decision to dispatch page providers and permit
+    /// orphan recovery before response finalization consumes the permit.
+    #[must_use]
+    pub fn has_navigation_permit(&self) -> bool {
         self.navigation_permit.0.is_some()
     }
 

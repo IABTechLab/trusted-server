@@ -874,7 +874,7 @@ async fn ec_route_creates_record_and_rejects_cross_origin_before_writes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn identify_withdrawal_updates_storage_without_identity_cookies() {
+async fn identify_withdrawal_tombstones_and_expires_browser_ec() {
     let store = Store::default();
     let created = call(
         &allowed_router(store.clone()),
@@ -906,14 +906,20 @@ async fn identify_withdrawal_updates_storage_without_identity_cookies() {
         403,
         "should refuse withdrawn identity lookup"
     );
+    let cookies: Vec<_> = denied
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .collect();
+    assert_eq!(
+        cookies.len(),
+        1,
+        "should emit only EC withdrawal deletion on identify"
+    );
+    let deletion = cookies[0].to_str().expect("should decode EC deletion");
     assert!(
-        denied
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .next()
-            .is_none(),
-        "should keep identity API cookie-free"
+        deletion.starts_with("ts-ec=;") && deletion.contains("Max-Age=0"),
+        "should expire browser EC on the tombstoning response"
     );
     let row: serde_json::Value = serde_json::from_slice(
         &store

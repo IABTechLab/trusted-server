@@ -22,7 +22,6 @@ use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
-use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
@@ -291,14 +290,12 @@ async fn dispatch_ec_route(
                 }))
             }),
         EcRoute::Publisher => {
-            let navigation = method == Method::GET
-                && is_navigation_request(&req)
-                && state.settings.asset_route_for_path(&path).is_none();
             state
                 .identity
                 .prepare_navigation(&mut ec.context, &req, ec.creation_allowed)
                 .await;
-            let eligible = navigation && ec.creation_allowed && graph.is_some();
+            let eligible =
+                ec.context.has_navigation_permit() && ec.creation_allowed && graph.is_some();
             if eligible {
                 page_lookups = state
                     .identity

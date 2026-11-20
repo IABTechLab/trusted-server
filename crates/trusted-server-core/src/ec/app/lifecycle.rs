@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use edgezero_core::http::{Method, Request, Response, header};
+use edgezero_core::http::{Method, Request, Response, StatusCode, header};
 use error_stack::Report;
 
 use super::IdentityApp;
@@ -10,6 +10,8 @@ use crate::constants::{
     COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
+use crate::ec::consent::ec_consent_withdrawn;
+use crate::ec::cookies::expire_ec_cookie;
 use crate::ec::device::DeviceSignals;
 use crate::ec::finalize::ec_finalize_response;
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
@@ -102,12 +104,12 @@ impl IdentityApp {
         request: &Request,
         allowed: bool,
     ) {
-        if request.method() != Method::GET
-            || !is_navigation_request(request)
-            || self
-                .settings
-                .asset_route_for_path(request.uri().path())
-                .is_some()
+        if !is_navigation_request(request)
+            || (matches!(*request.method(), Method::GET | Method::HEAD)
+                && self
+                    .settings
+                    .asset_route_for_path(request.uri().path())
+                    .is_some())
         {
             return;
         }
@@ -132,8 +134,9 @@ impl IdentityApp {
 
     /// Finalizes one request before its response headers are released.
     ///
-    /// Withdrawal still reaches authoritative storage on other responses, but
-    /// identity cookie output is restricted to HTML documents and EC routes.
+    /// Positive identity cookies are restricted to document and EC responses.
+    /// Withdrawal expires the EC cookie on every finalized response, including
+    /// when authoritative storage is unavailable.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -142,19 +145,23 @@ impl IdentityApp {
         use_store: bool,
         response: &mut Response,
     ) {
+        let withdrawal = ec_consent_withdrawn(context.consent()) && context.cookie_was_present();
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
+        // A document revalidation inherits the cached representation: 304
+        // commonly omits Content-Type, and keeps the navigation permission.
         let document = context.has_navigation_permit()
-            && response.status().is_success()
-            && response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| {
-                    value.split(';').next().is_some_and(|mime| {
-                        mime.trim().eq_ignore_ascii_case("text/html")
-                            || mime.trim().eq_ignore_ascii_case("application/xhtml+xml")
-                    })
-                });
+            && !NavigationPermit::is_redirect(response.status())
+            && (response.status() == StatusCode::NOT_MODIFIED
+                || response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.split(';').next().is_some_and(|mime| {
+                            mime.trim().eq_ignore_ascii_case("text/html")
+                                || mime.trim().eq_ignore_ascii_case("application/xhtml+xml")
+                        })
+                    }));
         let eligible = document || ec_route;
         if !eligible {
             let _ = context.take_navigation_permit();
@@ -187,6 +194,11 @@ impl IdentityApp {
             response.headers_mut().remove(header::SET_COOKIE);
             for cookie in cookies {
                 response.headers_mut().append(header::SET_COOKIE, cookie);
+            }
+            // Rebuild only our withdrawal deletion after filtering, so an
+            // origin-supplied positive identity cookie cannot escape the gate.
+            if withdrawal {
+                expire_ec_cookie(&self.settings, response);
             }
         }
     }
@@ -358,5 +370,71 @@ impl IdentityApp {
         }) {
             log::error!("Identity follow-up registration fails: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cookie_value;
+    use crate::ec::EcContext;
+    use crate::ec::app::{IdentityApp, IdentityPlatform};
+    use crate::settings::ProxyAssetRoute;
+    use crate::test_support::tests::create_test_settings;
+    use edgezero_core::http::{Request, header};
+    use futures::executor::block_on;
+    use std::sync::Arc;
+
+    #[test]
+    fn post_to_asset_path_retains_publisher_navigation() {
+        let mut settings = create_test_settings();
+        settings.proxy.asset_routes.push(ProxyAssetRoute::new(
+            "/assets/",
+            "https://assets.example.com",
+        ));
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        for method in [
+            edgezero_core::http::Method::POST,
+            edgezero_core::http::Method::GET,
+            edgezero_core::http::Method::HEAD,
+        ] {
+            let request = http::Request::builder()
+                .method(method.clone())
+                .uri("/assets/article")
+                .header("sec-fetch-dest", "document")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build publisher request");
+            let mut context = EcContext::default();
+            block_on(app.prepare_navigation(&mut context, &request, false));
+            assert_eq!(
+                context.has_navigation_permit(),
+                method == edgezero_core::http::Method::POST,
+                "should exclude only actual GET/HEAD asset routes"
+            );
+        }
+    }
+
+    #[test]
+    fn captures_eids_from_later_cookie_field() {
+        let mut request = Request::default();
+        request.headers_mut().append(
+            header::COOKIE,
+            "unrelated=first".parse().expect("should parse cookie"),
+        );
+        request.headers_mut().append(
+            header::COOKIE,
+            "ts-eids=second; other=value"
+                .parse()
+                .expect("should parse cookie"),
+        );
+        request.headers_mut().append(
+            header::COOKIE,
+            "ts-eids=third".parse().expect("should parse cookie"),
+        );
+        assert_eq!(
+            cookie_value(&request, "ts-eids").as_deref(),
+            Some("second"),
+            "should capture first matching EID across cookie fields"
+        );
     }
 }

@@ -693,7 +693,9 @@ pub struct ApiRequest {
     pub store_enabled: bool,
     /// Whether bidding is enabled independently of identity storage.
     pub auction_enabled: bool,
-    /// Publisher response type for fallback controls.
+    /// Publisher response status for fallback controls.
+    pub origin_status: StatusCode,
+    /// Publisher response type for fallback controls; empty omits the header.
     pub origin_content_type: &'static str,
 }
 
@@ -708,6 +710,7 @@ impl ApiRequest {
             body: String::new(),
             store_enabled: true,
             auction_enabled: true,
+            origin_status: StatusCode::OK,
             origin_content_type: "application/json",
         }
     }
@@ -759,36 +762,121 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
     .expect("should configure conformance partner and SharedID");
 }
 
+fn assert_ec_expired(response: &Observation) {
+    assert!(
+        response
+            .cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
+        "should expire browser EC in the withdrawal response"
+    );
+}
+
 /// Executes the shared HTTP acceptance cases against a real adapter.
 ///
 /// # Panics
 /// Panics when the adapter violates identity persistence, locality or cookie scope.
 pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) {
-    let mut posted_document = ApiRequest::new(http::Method::POST, "/article");
-    posted_document.origin_content_type = "text/html";
-    posted_document.headers = vec![
+    let mut orphan = ApiRequest::new(http::Method::POST, "/article");
+    orphan.origin_content_type = "text/html";
+    let orphan_id = format!("{}.abc123", "a".repeat(64));
+    let eids = base64::engine::general_purpose::STANDARD.encode(serde_json::json!([{"source":"partner.example.com","uids":[{"id":"orphan-input","atype":1}]}]).to_string());
+    orphan.headers = vec![
         ("sec-fetch-dest".to_owned(), "document".to_owned()),
-        ("sec-fetch-mode".to_owned(), "navigate".to_owned()),
-        ("accept".to_owned(), "text/html".to_owned()),
-        ("cookie".to_owned(), tcf_consent_cookie(true)),
+        (
+            "cookie".to_owned(),
+            format!(
+                "{}; ts-ec={orphan_id}; ts-eids={eids}",
+                tcf_consent_cookie(true)
+            ),
+        ),
     ];
-    let posted = adapter.exchange(&posted_document);
-    assert_eq!(
-        posted.response.status,
+    let recovered = assert_created(&adapter.exchange(&orphan).response, store);
+    assert_ne!(
+        recovered, orphan_id,
+        "should recover orphaned identity on POST"
+    );
+    for key in
+        block_on(store.list_keys_with_prefix("", 100)).expect("should list orphan fixture keys")
+    {
+        block_on(store.delete(&key)).expect("should remove isolated orphan fixture");
+    }
+    for (method, status, mime) in [
+        (http::Method::POST, StatusCode::OK, "text/html"),
+        (http::Method::GET, StatusCode::NOT_FOUND, "text/html"),
+        (
+            http::Method::GET,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/html",
+        ),
+        (http::Method::GET, StatusCode::NOT_MODIFIED, ""),
+        (http::Method::GET, StatusCode::OK, "text/html"),
+    ] {
+        let mut document = ApiRequest::new(method.clone(), "/article");
+        document.origin_status = status;
+        document.origin_content_type = mime;
+        document.headers = vec![
+            ("sec-fetch-dest".to_owned(), "document".to_owned()),
+            ("sec-fetch-mode".to_owned(), "navigate".to_owned()),
+            ("accept".to_owned(), "text/html".to_owned()),
+            ("cookie".to_owned(), tcf_consent_cookie(true)),
+        ];
+        let observed = adapter.exchange(&document);
+        assert_eq!(
+            observed.response.status, status,
+            "should preserve publisher status"
+        );
+        assert_eq!(observed.origin_requests, 1, "should reach publisher");
+        let identity = assert_created(&observed.response, store);
+        document.headers.retain(|(name, _)| name != "cookie");
+        document.headers.push((
+            "cookie".to_owned(),
+            format!("{}; ts-ec={identity}", tcf_consent_cookie(false)),
+        ));
+        // Withdrawal must also delete on a redirect without an HTML response.
+        if method == http::Method::GET && status == StatusCode::OK {
+            document.origin_status = StatusCode::FOUND;
+            document.origin_content_type = "application/octet-stream";
+        }
+        let withdrawn = adapter.exchange(&document);
+        assert_ec_expired(&withdrawn.response);
+        let row =
+            block_on(KvIdentityGraph::new(store.clone()).get(&normalize_ec_id_for_kv(&identity)))
+                .expect("should read withdrawal")
+                .expect("should retain tombstone")
+                .0;
+        assert!(
+            !row.consent.ok,
+            "should tombstone on every document method/status"
+        );
+        for key in block_on(store.list_keys_with_prefix("", 100))
+            .expect("should list isolated document fixture keys")
+        {
+            block_on(store.delete(&key)).expect("should remove isolated document fixture key");
+        }
+    }
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
         StatusCode::OK,
-        "should serve the POST document control"
-    );
-    assert_eq!(
-        posted.origin_requests, 1,
-        "should reach the publisher for POST document control"
-    );
-    assert_no_identity_cookies(&posted.response);
-    assert!(
-        block_on(store.list_keys_with_prefix("", 100))
-            .expect("should inspect POST document rows")
-            .is_empty(),
-        "should never mint from a POST document"
-    );
+    ] {
+        let mut excluded = ApiRequest::new(http::Method::GET, "/article");
+        excluded.origin_status = status;
+        excluded.origin_content_type = if status == StatusCode::OK {
+            ""
+        } else {
+            "text/html"
+        };
+        excluded.headers = vec![
+            ("sec-fetch-dest".to_owned(), "document".to_owned()),
+            ("sec-fetch-mode".to_owned(), "navigate".to_owned()),
+            ("cookie".to_owned(), tcf_consent_cookie(true)),
+        ];
+        assert_no_identity_cookies(&adapter.exchange(&excluded).response);
+    }
     let ec_path = "/_ts/api/v1/ec";
     let tcf_cookie = tcf_consent_cookie(true);
     let tcf = tcf_cookie
@@ -1175,7 +1263,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         ),
     ));
     let withdrawn_api = adapter.exchange(&denied_api);
-    assert_no_identity_cookies(&withdrawn_api.response);
+    assert_ec_expired(&withdrawn_api.response);
     assert!(
         !block_on(graph.get(&key))
             .expect("should read API withdrawal")
@@ -1183,7 +1271,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             .0
             .consent
             .ok,
-        "should preserve authoritative API withdrawal despite cookie suppression"
+        "should preserve authoritative API withdrawal with browser expiry"
     );
 
     let denied_tcf = tcf_consent_cookie(false);

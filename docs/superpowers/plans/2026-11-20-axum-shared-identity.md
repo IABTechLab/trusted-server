@@ -132,3 +132,5 @@ and the existing image smoke harness before building a new probe.
   Incorporated concrete EC controls, payload limits, successful-HTML status
   eligibility and explicit provider/scheduling ownership from spec round 2.
   No unresolved blocking or optional document findings remain.
+
+- Approved compatibility follow-up supersedes the original GET/2xx-only policy: preserve method-neutral nonredirect HTML navigation, cached-document `304` without Content-Type, and same-response EC expiry on every explicit withdrawal. Add portable positive/error/redirect/withdrawal controls and split-Cookie-field coverage, rerun Axum/Fastly conformance and the production Fastly browser comparison, and publish a signed correction with hosted CI results.

@@ -118,7 +118,6 @@ use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
-use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
@@ -885,12 +884,11 @@ async fn dispatch_fallback(
             return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
         }
 
-        let is_navigation = method == Method::GET && is_navigation_request(&req);
         state
             .identity
             .prepare_navigation(&mut ec.ec_context, &req, ec.is_real_browser)
             .await;
-        let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        let is_publisher_navigation = ec.is_real_browser && ec.ec_context.has_navigation_permit();
 
         // Identity lookups start before the origin fetch so they overlap it;
         // the entry point collects them before EC finalization.
@@ -3119,6 +3117,16 @@ mod tests {
             Some(EidSyncSource::Navigation)
         );
 
+        let posted = route(
+            &router,
+            browser_request(Method::POST, "/article", "document"),
+        );
+        assert_eq!(
+            eid_sync_source_of(&posted),
+            Some(EidSyncSource::Navigation),
+            "should classify POST documents for page identity work"
+        );
+
         let mut navigation_without_browser_signals =
             browser_request(Method::GET, "/another-article", "document");
         navigation_without_browser_signals
@@ -3518,8 +3526,8 @@ mod tests {
         });
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
-        // Identity writes and follow-up permits require a successful HTML
-        // document, so this fixture must serve a real publisher response.
+        // Identity writes and follow-up permits require an eligible document,
+        // so this fixture must serve a real publisher response.
         client.respond_to(
             Method::GET,
             &format!("{}/article", state.settings.publisher.origin_url),
