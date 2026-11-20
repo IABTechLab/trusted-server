@@ -174,8 +174,8 @@ store = "trusted_server_kv"
 # not read where GDPR applies, because Lockr AIM does not run there. The
 # default Lockr key of each kind equals one of its own cookie names, which are
 # already read, so the capability changes nothing until `cookie_names` lists
-# the key configured in Lockr when it differs. connectid and liveintent reject
-# a `lockr` table.
+# the key configured in Lockr when it differs. kinds other than id5, liveramp
+# and uid2 reject a `lockr` table.
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -208,7 +208,8 @@ store = "trusted_server_kv"
 # Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
 # `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
 # `ext`; the others are partner IDs, sent with UID `ext.provider` naming
-# LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
+# LiveIntent, except the Trade Desk ID, whose UID `ext` carries `rtiPartner`
+# and `provider` naming the publisher domain, with EID `matcher`.
 # `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
 # lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
 # distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner

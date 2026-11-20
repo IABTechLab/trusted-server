@@ -206,13 +206,14 @@ fn apply_lookups(
     written
 }
 
-fn serialized_len(entry: &KvEntry) -> usize {
+/// Serialized bytes of `entry`, or `usize::MAX` when it cannot serialize.
+pub(crate) fn serialized_len(entry: &KvEntry) -> usize {
     serde_json::to_vec(entry).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// Serialized bytes one `ids` member adds to the row: its record, its
 /// escaped key, the colon and a separating comma.
-fn member_len(source: &str, record: &KvPartnerId) -> usize {
+pub(crate) fn member_len(source: &str, record: &KvPartnerId) -> usize {
     let key = serde_json::to_vec(source).map_or(usize::MAX, |bytes| bytes.len());
     let value = serde_json::to_vec(record).map_or(usize::MAX, |bytes| bytes.len());
     key.saturating_add(value).saturating_add(2)

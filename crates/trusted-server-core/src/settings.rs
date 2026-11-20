@@ -511,8 +511,8 @@ pub struct EcPartner {
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
     /// Whether this partner's provider-written UIDs are mirrored to the
-    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default; takes
-    /// effect only with `bidstream_enabled`.
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default;
+    /// requires `bidstream_enabled`, and setting it alone is rejected.
     #[serde(
         default,
         skip_serializing_if = "is_false",
@@ -559,8 +559,9 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Whether this partner runs pull sync as an identity provider, which
-    /// makes its source provider-owned.
+    /// Whether this partner runs pull sync as an identity provider. Its
+    /// source is not provider-owned, so browser ingest and batch sync still
+    /// fill it.
     #[must_use]
     pub fn runs_pull_sync(&self) -> bool {
         self.pull_sync_enabled && self.pull_sync_url.is_some()
@@ -921,7 +922,7 @@ impl Ec {
         }
     }
 
-    /// Default maximum concurrent pull-sync requests.
+    /// Default maximum pull-sync lookups per navigation.
     #[must_use]
     pub const fn default_pull_sync_concurrency() -> usize {
         3

@@ -1006,6 +1006,10 @@ the EC row when the cookies hold none; no cookie is set.
 | `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
 | `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
 
+A `sharedid` provider without `sources` owns `pubcid.org`. Its default
+cookie is the one Prebid's SharedID `storage.name` names, before
+`_sharedid` and `_pubcid`.
+
 **Example**:
 
 ```toml
@@ -1159,10 +1163,13 @@ publisher sends it; Trusted Server sends no login or hashed email.
 
 Cookie-only kinds: no endpoint and no server call; each takes exactly one
 source. `connectid` reads Yahoo's `connectId` JSON cookie. `sharedid` reads
-Prebid's `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
-cookie or stored ID it stores a random UUID in the row only (no cookie is
-set). Leave `generate` off unless Prebid keeps its opt-out in the
-`_pubcid_optout` cookie. `criteo` reads Prebid's `cto_bidid`,
+Prebid's `_sharedid`, falling back to `_pubcid`; when Prebid's SharedID uses
+cookie storage, it reads the cookie Prebid's SharedID module is configured to
+use (its `managed_user_ids` `storage.name`) instead and `generate` defaults to
+`true`. With `generate = true` and no cookie or stored ID it stores a random
+UUID in the row, and a navigation writes it back to Prebid's cookie. A stored
+ID wins over a different cookie value. When Prebid keeps the SharedID in local
+storage only, `generate` is forced off. `criteo` reads Prebid's `cto_bidid`,
 percent-decoded. `unifiedid` reads the `TDID` field of Prebid's
 `pbjs-unifiedid` cookie and stores it with UID `ext` `{"rtiPartner":"TDID"}`.
 

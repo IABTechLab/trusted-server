@@ -4,7 +4,7 @@
 
 **Status:** Implemented; checkboxes are not updated.
 
-**Goal:** Store the Prebid SharedID (publisher common ID) from its first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "sharedid"`. No server call. When no cookie ID and no live stored ID exist, TS generates a random UUID v4 into KV only (no cookie set); a later Prebid cookie replaces it.
+**Goal:** Store the Prebid SharedID (publisher common ID) from its first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "sharedid"`. No server call. With `generate = true` (default off), when no cookie ID and no live stored ID exist, TS generates a random UUID v4 into KV only (no cookie set); a later Prebid cookie replaces it.
 
 **Architecture:** `crates/trusted-server-identity-providers/src/sharedid.rs` holds `SharedId` (a `ProviderKind`), `SharedIdSettings` and `SharedIdProvider`. The provider implements `IdentityProvider::read_request_cookies` and `generate`; `build_request` always fails, so no lookup is sent. `common::device_eid` builds the agent type 1 EID.
 
@@ -13,7 +13,7 @@
 ## Cookie
 
 - Prebid's `sharedIdSystem` writes a bare UUID to the publisher-configured cookie, usually `_sharedid`; older pages use `_pubcid`.
-- Default `cookie_names = ["_sharedid", "_pubcid"]`, read in order.
+- Default: the cookie Prebid's configured SharedID `storage.name` names, else `cookie_names = ["_sharedid", "_pubcid"]`, read in order.
 - The `_pubcid_optout` cookie suppresses the ID, as in Prebid.
 - A blank or opt-out (all-zero) value reads as no ID.
 
