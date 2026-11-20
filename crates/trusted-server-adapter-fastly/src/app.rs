@@ -295,6 +295,12 @@ fn identity_app_with_providers(
     providers: IdentityProviders,
 ) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
     let record_store = settings.ec.ec_store.as_deref().map(|store_name| {
+        // A conformance run substitutes its inspectable fixture store, so
+        // every identity route and EC finalization reads and writes it.
+        #[cfg(test)]
+        if let Some(store) = crate::identity_conformance::fixture_store(store_name) {
+            return store;
+        }
         Arc::new(FastlyEcKvStore::new(store_name)) as Arc<dyn EcKvStore + Send + Sync>
     });
     IdentityApp::build(

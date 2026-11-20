@@ -38,6 +38,8 @@ mod deadline_network;
 mod delivery;
 mod ec_kv;
 mod esi_assembly;
+#[cfg(test)]
+mod identity_conformance;
 mod management_api;
 mod middleware;
 mod platform;
@@ -356,18 +358,28 @@ fn serve(
     // until `finalize` collects them. Drop anything an earlier request on
     // this sandbox left there, which cancels its requests.
     drop(take_navigation_lookups());
-    let delivery = send_request_with_registries_and_hooks(
-        &retained.app,
-        TrustedServerApp::stores(),
-        req,
-        prepare,
-        |response: &mut HttpResponse| finalize_response(response, &inputs),
-    );
+    let delivery = with_finalization(&inputs, |finalize| {
+        send_request_with_registries_and_hooks(
+            &retained.app,
+            TrustedServerApp::stores(),
+            req,
+            prepare,
+            finalize,
+        )
+    });
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
     // A detached response never reaches `finalize`; release its lookups now.
     drop(take_navigation_lookups());
+}
+
+/// Supplies the production finalization callback to a request lifecycle.
+fn with_finalization<T>(
+    inputs: &FinalizeInputs<'_>,
+    send: impl FnOnce(&mut dyn FnMut(&mut HttpResponse) -> Option<FinalizeState>) -> T,
+) -> T {
+    send(&mut |response| finalize_response(response, inputs))
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
