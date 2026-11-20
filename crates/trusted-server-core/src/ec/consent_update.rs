@@ -58,7 +58,7 @@ pub(crate) fn mark_reconciliation_failed(response: &mut Response<EdgeBody>) {
     }
 }
 
-fn same_origin(services: &RuntimeServices, req: &Request<EdgeBody>) -> bool {
+pub(super) fn same_origin(services: &RuntimeServices, req: &Request<EdgeBody>) -> bool {
     let Some(origin) = req
         .headers()
         .get(header::ORIGIN)

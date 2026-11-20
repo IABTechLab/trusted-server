@@ -6,11 +6,13 @@
 //! Neither type is `Clone`, so one navigation makes at most one write before
 //! its response.
 //!
-//! Two writes fall outside this rule. [`AfterResponseWrite`], confirmed
+//! Three writes fall outside this rule. [`AfterResponseWrite`], confirmed
 //! alongside the page load's permit, allows one follow-up update after the
 //! response has been sent, carrying only the results of after-response
 //! identity lookups. A consent withdrawal's tombstone is a privacy write on
-//! any request that carries the EC cookie, and takes no permit.
+//! any request that carries the EC cookie, and takes no permit. Auction body EIDs
+//! use a separate conditional update of an existing live row; that operation
+//! cannot create or recover identity and never receives a navigation permit.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
@@ -26,6 +28,13 @@ use crate::http_util::is_navigation_request;
 pub struct NavigationPermit(());
 
 impl NavigationPermit {
+    /// Authorizes the single write of an admitted same-origin EC POST.
+    ///
+    /// Called only by the shared EC route after bounded consent validation.
+    pub(crate) fn for_ec_route() -> Self {
+        Self(())
+    }
+
     /// Returns a permit when `request` is a browser document navigation per
     /// [`is_navigation_request`]: `Sec-Fetch-Dest: document`, or, without
     /// Fetch Metadata, an `Accept` header naming `text/html`.

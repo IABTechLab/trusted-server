@@ -1,0 +1,151 @@
+# Axum identity through the shared application
+
+Issue: #1574. This implements A2 from the server-side identity design, on the
+record backend in #1641 with production startup #1635, conformance #1613 and
+environment guard #1637 merged into the branch. The PR targets #1641.
+
+## Required behavior
+
+A consented HTML navigation or explicit EC route creates an EC record before
+issuing `ts-ec`. A failed store never issues an unbacked cookie. Returning ECs
+survive unknown geography. Identify, batch sync and admin lookup use the one
+shared graph; identify and batch sync answer locally with 501 without it.
+Auction body EIDs are saved for an existing live record under EID consent.
+Identity cookies are emitted only on HTML navigation or EC route responses.
+Adapters supply platform services and call the shared app, without implementing
+`EcKvStore` or invoking lifecycle/identity handlers directly.
+
+## Existing code and gaps
+
+`ec/app.rs` owns identity state and admin routes, but Axum and Fastly still call
+EC generation, finalization and partner handlers themselves. Axum's separate
+graph does not populate the shared app, and its batch route always returns 501.
+The portable T5 runner supports navigation on Fastly only. No minting EC route
+is mounted. Auction parsing captures body EIDs but a regression deliberately
+asserts they never reach storage. Finalization can expire identity cookies on
+arbitrary responses. These behaviors must change to satisfy A2.
+
+## Design
+
+Expand core `IdentityApp` with request lifecycle and partner route operations.
+A request-local state holds consent, EC context and browser cookie inputs;
+platform-derived geo/client signals remain inputs through `RuntimeServices`.
+Core classifies navigation and EC response eligibility: a document must be a
+GET navigation with a final HTML Content-Type and successful (2xx) status; a request
+Accept header alone cannot authorize cookies on JSON/error/asset responses.
+Core generates identity,
+executes partner handlers and finalizes persistence/cookies. Fastly retains its
+existing delivery bridge, limiter, geo and provider transport; lifecycle and
+handler decisions live in core. This includes before/after-response provider
+and pull-sync orchestration: eligibility, live-row consent checks, dispatch,
+collection and conditional follow-up commit. The delivery bridge only invokes
+core after successful delivery and supplies a fresh outbound client. Axum uses
+its prepared provider handle to build
+the shared app once. Cloudflare and Spin retain their unsupported-store startup
+checks and call the core facade for identity operations they expose.
+
+Mount `/_ts/api/v1/ec` in core: same-origin POST accepts a bounded consent
+snapshot (`tcfString`, `gppString`, `applicableSections`; 16 KiB body,
+8 KiB per string, at most 32 section IDs in 1..=65535), replacing only those
+consent signals for the request; it returns private no-store JSON containing only
+the allowed mirror view. GET returns private 204, never mints or runs providers,
+and can restore an existing SharedID from a readable record. Other methods are
+answered locally. Malformed snapshots return 400, oversized bodies 413,
+and missing/cross-site Origin 403 before record or provider work. Browser CMP capture/ordering remains T19/T20; A2 tests the HTTP
+contract, not new injected client behavior. POST uses the same consent and
+record-first creation as navigation. Provider construction uses the existing provider crate on Axum as on Fastly;
+provider/pull-sync decisions use core. Validate the runner's available completion
+hooks before selecting after-response scheduling; any missing drained-task API
+is an EdgeZero obligation, never a detached adapter task. Broader provider
+feature qualification remains #1581.
+No new cookie is issued for missing/denied consent,
+missing trusted client IP or storage failure. Read-only partner APIs do not mint.
+No User-Agent-only requirement is added for native creation; use the shared
+request policy and available trusted signals.
+
+Introduce an explicit existing-record body-EID commit path, separate from the
+navigation write permit. It preserves Purpose 1/4 and partner/vendor consent,
+source ownership, opt-outs, conditional writes and withdrawal tombstones. It
+never creates or recovers an EC from an auction and emits no identity cookie.
+Keep authoritative withdrawal handling on routes participating in the identity
+lifecycle while suppressing their identity cookie output; subsequent eligible
+responses can clear browser state. Configured asset-only proxy routes retain
+Fastly's existing streaming path without identity ingestion or finalization;
+explicit reconciliation uses the EC/consent route. This preserves the asset
+contract while WB-1 keeps every such response free of identity cookies.
+
+## Store declaration and configuration
+
+`edgezero.toml` already declares `trusted_server_kv`. Axum declares its record
+layout in `Hooks::configure` and its logical ID in `Hooks::stores` unconditionally.
+EdgeZero prepares the provider using local default or native bindings. Application
+`ec.storage = { provider = "records", store = "trusted_server_kv" }` activates the
+graph; omitting it is the no-store application control. Provider settings belong
+to EdgeZero, including AWS endpoint/credential selection for DynamoDB Local.
+Delete obsolete `TS_EC_*` reads and document migration to the binding file.
+An ordinary-only or `KvError::Unsupported` binding rejects startup before listen.
+AWS SDK dependencies remain test-only table administration helpers.
+
+The unconditional declaration prepares a local record provider even when identity
+is disabled; tests and operators need a writable EdgeZero data directory. Config
+and secrets continue to use A1's prepared immutable startup snapshots.
+The temporary `TS_NATIVE_GEO_PROFILE_FILE` exception is narrowly justified by
+#1529 / #1532; geo selection remains a separate AX-2 obligation.
+
+## Alternatives and boundaries
+
+Renaming the old switches would preserve adapter-local selection and violate
+the declared-store requirement. Porting the old Axum stores would duplicate
+EdgeZero providers. The selected approach uses the existing record API and
+shared app, preserving Fastly's lazy record opening. No EdgeZero implementation
+or infrastructure provisioning belongs in this PR.
+
+A2 supplies identity behavior and evidence. #1579 owns integrating the
+SIGTERM-during-write scenario into CI; #1581 owns broader Axum identity feature
+qualification. Local runtime evidence here does not substitute for either gate.
+
+## Verification
+
+Extend T5 so identical navigation scenarios execute on Axum and Fastly, then add
+partner locality with capturing origin, EC route cookies, body persistence,
+non-document cookie suppression and unsupported-store startup cases. Exercise
+positive persistence and rejected-write controls before response release.
+Include a positive native creation control with trusted IP, consent and no JA4;
+never fabricate TLS metadata to pass a Fastly-specific pre-T12 baseline. State
+explicitly which shared signal policy each adapter scenario exercises.
+Use existing Axum test geo injection for conformance; production probes use the
+existing protected CloudFront profile with loopback admission and known country.
+Run targeted adapter/core tests and clippy, formatting, and #1637's unweakened
+guard. Do not run the full CI list locally.
+
+Build the actual Axum production binary with `aws-dynamodb-ec` and
+`geo-cloudfront`. Run with disposable prepared config/secrets and DynamoDB Local
+in Docker. Through Chrome and the publisher proxy, observe the issued cookie and
+persisted row; repeat with a failed provider and no-store control. Exercise
+identify/batch locally and SIGTERM during an in-flight record write, observing
+both response completion and the durable record. Record exact source/artifact
+identity and scenario limits. Preserve operator files and stop all owned
+processes/containers; remove disposable worktrees after publication.
+
+Tests also require POST withdrawal/tombstone, GET restoring existing SharedID
+without providers, missing Origin, and JSON excluding non-mirrored, expired and
+vendor-denied IDs.
+
+## Review log
+
+- Round 1: independent source review identified unspecified EC route methods,
+  consent payload and response view, and missing final HTML response gating.
+  Defined POST/GET behavior, bounded consent snapshots, mirror-only JSON,
+  T19/T20 client boundary and the final HTML condition. Also explicitly moved
+  provider/pull-sync eligibility and follow-up orchestration into core, leaving
+  only delivery scheduling and platform transport in the bridge.
+
+- Round 2: fresh independent review found no architectural blocker. Clarified
+  successful HTML status, concrete payload limits, negative consent/origin and
+  mirror-view controls, and provider construction/scheduling ownership. All
+  blocking and optional document findings are incorporated.
+
+Implementation review also required a shared GET-only navigation policy and
+API withdrawal persistence without cookie output. Dedicated regressions cover
+both. The configured streaming asset path keeps its pre-existing no-identity
+lifecycle contract; this is an explicit preservation boundary.

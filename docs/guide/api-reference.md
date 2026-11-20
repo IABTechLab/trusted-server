@@ -37,13 +37,14 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/ec`                       | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/api/v1/identify`                 | `OPTIONS`                                                  | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
@@ -318,6 +319,34 @@ Partners are configured statically in `[[ec.partners]]` and loaded into an in-me
 
 ---
 
+### GET, POST /\_ts/api/v1/ec
+
+The shared identity app serves this endpoint on Fastly and Axum. It is always
+answered locally and uses the configured record service. Without application
+identity storage it returns `501`. Every response is private and `no-store`.
+
+A same-origin `POST` accepts a JSON snapshot with `tcfString`, `gppString` and
+`applicableSections`. Nullable strings replace the corresponding consent
+cookies for this request; a missing consent grant stays denied where required.
+The body limit is 16 KiB, each signal is limited to 8 KiB, and at most 32 GPP
+section IDs in `1..=65535` are accepted. Malformed snapshots return `400`,
+oversized bodies `413`, and missing or cross-site `Origin` returns `403` before
+record or provider work.
+
+With consent and no EC, the app creates the record before setting `ts-ec`.
+SharedID and mirror cookies follow their existing consent, configuration and
+opt-out rules. A storage failure never issues an unbacked identity. A withdrawal
+tombstones the existing record and expires identity cookies on this response.
+The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
+excluding expired, non-mirrored and vendor-denied IDs.
+
+`GET` returns an empty `204` and can restore an existing SharedID cookie from
+the record. It never creates an EC, changes consent or runs providers. Other
+methods return `405` with `Allow: GET, POST`. Browser CMP capture and ordered
+client consent updates are qualified separately from this server contract.
+
+---
+
 ### GET /\_ts/api/v1/identify
 
 Returns EC identity plus the authenticated partner's UID and EID for the current user.
@@ -336,9 +365,10 @@ below `[publisher].domain` receive reflected credentialed CORS for
 The endpoint requires the EC store and a statically configured
 `[[ec.partners]]` token. Without an EC store, `GET` returns
 `501 {"error":"ec_store_not_configured"}` locally, after the same origin
-policy (`403` for a denied origin, reflected CORS for an allowed one). Only
-Fastly has an EC store today, so Axum, Cloudflare and Spin always answer `501`
-to `GET`; their `OPTIONS` preflight is still answered locally. Every other
+policy (`403` for a denied origin, reflected CORS for an allowed one).
+Fastly and Axum use the shared identity app when a record store is configured.
+Cloudflare and Spin reject unsupported storage configuration and answer `501`
+to `GET`; `OPTIONS` preflight is still answered locally. Every other
 method returns `405` with `Allow: GET, OPTIONS`. No request on this path is
 proxied to the publisher origin.
 
@@ -385,8 +415,8 @@ same result), or `kv_unavailable`. Authentication failure returns `401 {"error":
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
 or CORS headers. It requires the EC KV store; without one it returns
-`501 {"error":"ec_store_not_configured"}` locally. Only Fastly has an EC store
-today, so Axum, Cloudflare and Spin always answer `501`. Every method other
+`501 {"error":"ec_store_not_configured"}` locally. Fastly and Axum execute
+batch sync through the shared record store; Cloudflare and Spin answer `501`. Every method other
 than `POST` returns `405 {"error":"method_not_allowed"}` with `Allow: POST`. No
 request on this path is proxied to the publisher origin.
 

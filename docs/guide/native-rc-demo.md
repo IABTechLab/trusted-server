@@ -18,6 +18,7 @@ From the repository root, with `ts` built from this checkout:
 cp trusted-server.example.toml trusted-server.toml
 ts config push --adapter axum --local --no-diff --yes
 EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
+EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero" \
 EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \
 EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)" \
 EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
@@ -85,15 +86,16 @@ and digest. AppConfig Agent returns that envelope document itself. Secrets
 Manager returns each whole secret value, not a selected JSON field. Local
 publication does not publish to AWS.
 
-| Input                                       | Meaning                                       |
-| ------------------------------------------- | --------------------------------------------- |
-| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps |
-| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                |
-| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                   |
-| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                         |
-| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                      |
-| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings  |
-| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased            |
+| Input                                       | Meaning                                                   |
+| ------------------------------------------- | --------------------------------------------------------- |
+| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps             |
+| `EDGEZERO__ADAPTER__DATA_DIR`               | Writable directory for the declared local record provider |
+| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                            |
+| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                               |
+| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                                     |
+| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                                  |
+| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings              |
+| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased                        |
 
 Legacy `TRUSTED_SERVER_CONFIG_*`, `TRUSTED_SERVER_SECRET_*` and runtime
 `TRUSTED_SERVER__*` settings cannot rescue missing prepared inputs. Typed CLI

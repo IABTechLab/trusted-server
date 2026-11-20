@@ -164,6 +164,7 @@ impl ServerFixture {
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &self.root)
+            .env("EDGEZERO__ADAPTER__DATA_DIR", &self.root)
             .env("EDGEZERO__SECRETS__PROXY_KEY", PROXY_SECRET)
             .env("EDGEZERO__SECRETS__ADMIN_KEY", ADMIN_PASSWORD)
             // Valid legacy inputs: a fallback to them would let a missing
@@ -179,9 +180,7 @@ impl ServerFixture {
             .stderr(Stdio::piped());
         let bindings = self.root.join("record-bindings.toml");
         if bindings.is_file() {
-            command
-                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings)
-                .env("TS_EC_RECORDS_ENABLED", "true");
+            command.env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
         }
         if let Some(profile) = profile {
             let path = self.root.join("native-geo.toml");
@@ -369,12 +368,13 @@ fn storage_envelope(storage: serde_json::Value) -> String {
 }
 
 #[test]
-fn active_legacy_ec_environment_cannot_disable_or_override_published_storage() {
+fn obsolete_ec_environment_does_not_select_or_override_declared_storage() {
     let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
     for envelope in [ENVELOPE, configured.as_str()] {
         let mut server = ServerFixture::new(Some(envelope));
         server.spawn_inputs(false, false, None, Some("true"));
-        server.assert_failed_before_listen("TS_EC_DYNAMODB_ENABLED is obsolete");
+        server.wait_ready();
+        server.assert_logs_hold_no_secrets();
     }
 }
 
@@ -388,6 +388,13 @@ fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
 
     let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
     let mut server = ServerFixture::new(Some(&configured));
+    server.spawn(false, false);
+    server.wait_ready();
+    server.assert_logs_hold_no_secrets();
+
+    let mut server = ServerFixture::new(Some(&storage_envelope(
+        json!({"provider":"records","store":"undeclared-identity"}),
+    )));
     server.spawn(false, false);
     server.assert_failed_before_listen("configured EC record store is not prepared");
 
@@ -1035,7 +1042,11 @@ mod managed_geo_consumers {
 fn handwritten_store_metadata_matches_the_manifest() {
     let manifest = include_str!("../../../edgezero.toml");
     let stores = TrustedServerApp::stores();
-    for (kind, metadata) in [("config", stores.config), ("secrets", stores.secrets)] {
+    for (kind, metadata) in [
+        ("config", stores.config),
+        ("secrets", stores.secrets),
+        ("kv", stores.kv),
+    ] {
         let StoreMetadata { default, ids } =
             metadata.expect("should declare required native store");
         let section = manifest
@@ -1076,7 +1087,4 @@ fn handwritten_store_metadata_matches_the_manifest() {
         DEFAULT_SECRET_STORE_ID,
         "should default to the core secret store id"
     );
-    assert!(stores.kv.is_none(), "should not prepare unused generic KV");
-    // The portable manifest may declare KV for other adapters. Native startup
-    // selects only its handwritten config/secret metadata above.
 }
