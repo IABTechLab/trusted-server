@@ -104,6 +104,44 @@
         "createsIdentity": false
       },
       "seedIdentity": true
+    },
+    {
+      "name": "GPP-only US grant supplies the consent decision",
+      "clientPosts": true,
+      "body": {
+        "gppString": "DBABLA~BVQqAAAAAgA.QA",
+        "applicableSections": [7]
+      },
+      "cookie": "",
+      "geo": "us-california",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": true
+      },
+      "seedIdentity": false
+    },
+    {
+      "name": "Posted GPP opt-out overrides a US Privacy grant",
+      "clientPosts": true,
+      "body": {
+        "gppString": "DBABRg~BVVVVVVVVWA.AA",
+        "applicableSections": [9]
+      },
+      "cookie": "us_privacy=1YNN",
+      "geo": "us-california",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": false
+      },
+      "seedIdentity": true
     }
   ]
 }

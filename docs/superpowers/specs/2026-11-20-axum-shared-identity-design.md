@@ -58,7 +58,9 @@ the 32-entry cap. The `window.__tsjs_prebid.ecRoute` injection remains owed by
 through both adapters in conformance tests. An empty browser snapshot makes no
 call; the fixture also tests a server-only `{}` body. The route returns private no-store JSON containing only
 the allowed mirror view. GET returns private 204, never mints or runs providers,
-and can restore an existing SharedID from a readable record. Other methods are
+and can restore an existing SharedID from a readable record only when current
+EC and EID permission both allow. Denied GETs emit no identity cookies and do
+not change or tombstone the record; reconciliation remains a POST operation. Other methods are
 answered locally. Malformed snapshots return 400, oversized bodies 413,
 and missing/cross-site Origin 403 before record or provider work. Browser CMP capture/ordering remains T19/T20; A2 tests the HTTP
 contract, not new injected client behavior. POST uses the same consent and

@@ -169,12 +169,12 @@ Page content and request bodies are processed in-flight and are not persisted. E
 
 ## Runtime Targets
 
-| Adapter                             | Target                    | Use case                                                          |
-| ----------------------------------- | ------------------------- | ----------------------------------------------------------------- |
-| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                      |
-| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                  |
-| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                        |
-| `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
+| Adapter                             | Target                    | Use case                                                                                     |
+| ----------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------- |
+| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                                                 |
+| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                                             |
+| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                                                   |
+| `trusted-server-adapter-axum`       | native                    | Native production serving, local development and integration testing (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
 

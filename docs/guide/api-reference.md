@@ -363,9 +363,12 @@ The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
 excluding expired, non-mirrored and vendor-denied IDs.
 
 `GET` returns an empty `204` and can restore an existing SharedID cookie from
-the record. It never creates an EC, changes consent or runs providers. Other
-methods return `405` with `Allow: GET, POST`. Browser CMP capture and ordered
-client consent updates are qualified separately from this server contract.
+its record only when current EC and EID permission both allow. It never
+creates an EC, changes consent or runs providers. A denied GET emits no identity
+cookies and leaves the stored record unchanged; consent reconciliation and
+withdrawal use POST. Other methods return `405` with `Allow: GET, POST`.
+Browser CMP capture and ordered client consent updates are qualified separately
+from this server contract.
 
 ---
 
