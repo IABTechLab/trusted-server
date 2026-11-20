@@ -1,14 +1,14 @@
 //! Server-side identity lookup coordination (spec §8).
 //!
 //! [`ProviderCoordinator`] owns eligibility, consent, destination checks, a
-//! deadline-bounded fan-out through a [`LookupTransport`], validation and
+//! cutoff-bounded fan-out through a [`LookupTransport`], validation and
 //! planning of the navigation's single row change. Providers stay pure.
 
 pub mod results;
 pub mod transport;
 mod validate;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,9 +16,7 @@ use std::time::Duration;
 use error_stack::Report;
 
 use self::results::{LookupResults, LookupStatus, OptOutMemory, ProviderLookup, SkipReason};
-use self::transport::{
-    Deadline, LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse,
-};
+use self::transport::{LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse};
 use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
@@ -27,7 +25,7 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::generation::ec_hash;
-use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
+use crate::ec::kv_types::{KvEid, KvEntry, KvUid, opt_out_uid_hash};
 use crate::ec::provider::{
     ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
     ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
@@ -43,7 +41,9 @@ use crate::settings::IdentityProviderConfig;
 /// Implementations own eligibility, consent, destination checks, the shared
 /// time budget and validation. Providers never see KV, HTTP or the clock,
 /// and see cookies only as [`RequestCookies`]. Implementations never write
-/// KV: they return the change and the caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+/// KV: they return validated [`LookupResults`]; the caller plans the row
+/// change with [`crate::ec::write_plan::plan_write`] and spends the
+/// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -56,7 +56,7 @@ pub trait IdentityCoordinator {
         lookup: &LookupContext<'_>,
     ) -> PendingLookups<T::Pending>;
 
-    /// Waits for dispatched lookups until all finish or the deadline passes,
+    /// Waits for dispatched lookups until all finish or the cutoff passes,
     /// then parses and validates each response.
     ///
     /// Never fails: per-provider failures are recorded in [`LookupResults`].
@@ -97,8 +97,10 @@ pub struct LookupContext<'a> {
 /// (empty) and `Debug` (counts only) are implemented by hand so they do not
 /// require bounds on `Pending`.
 pub struct PendingLookups<Pending> {
-    requests: Vec<Tagged<Pending>>,
-    deadline: Option<Deadline>,
+    /// Requests the transport started together, if any.
+    in_flight: Option<Pending>,
+    /// How many requests were started.
+    started: usize,
     /// EC ID the lookups were dispatched for.
     ec_id: String,
     /// Request time, for validating `exp` and resolving relative expiry.
@@ -113,13 +115,18 @@ pub struct PendingLookups<Pending> {
     contexts: Vec<Tagged<String>>,
     /// Providers whose IDs were read from first-party cookies, validated.
     from_cookies: Vec<Tagged<ProviderLookup>>,
+    /// The row's revocations at dispatch, so a result a newer opt-out
+    /// superseded is discarded at the write.
+    revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each provider sent a request.
+    known_uids: Vec<Tagged<Vec<String>>>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
     fn default() -> Self {
         Self {
-            requests: Vec::new(),
-            deadline: None,
+            in_flight: None,
+            started: 0,
             ec_id: String::new(),
             now: UnixSeconds::new(0),
             early: Vec::new(),
@@ -127,6 +134,8 @@ impl<Pending> Default for PendingLookups<Pending> {
             excluded: Vec::new(),
             contexts: Vec::new(),
             from_cookies: Vec::new(),
+            revocations: BTreeMap::new(),
+            known_uids: Vec::new(),
         }
     }
 }
@@ -134,7 +143,7 @@ impl<Pending> Default for PendingLookups<Pending> {
 impl<Pending> std::fmt::Debug for PendingLookups<Pending> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingLookups")
-            .field("requests", &self.requests.len())
+            .field("requests", &self.started)
             .field("early", &self.early.len())
             .field("generated", &self.generated.len())
             .field("from_cookies", &self.from_cookies.len())
@@ -146,7 +155,7 @@ impl<Pending> PendingLookups<Pending> {
     /// Whether nothing was dispatched, generated or skipped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+        self.started == 0
             && self.early.is_empty()
             && self.generated.is_empty()
             && self.from_cookies.is_empty()
@@ -261,7 +270,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
 
     /// Caps the pull-sync lookups dispatched per navigation
     /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
-    /// skipped as rate limited and retried on a later navigation.
+    /// skipped (`skipped_concurrency_cap`) and retried on a later navigation.
     #[must_use]
     pub fn with_pull_sync_concurrency(mut self, max: Option<NonZeroUsize>) -> Self {
         self.pull_sync_concurrency = max;
@@ -306,6 +315,26 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
+    }
+
+    /// Sources of every provider whose first-party cookies record an
+    /// opt-out.
+    ///
+    /// Read on every request before any identity egress, so an opt-out
+    /// applies to the request it arrives on, not only to the navigation write
+    /// that later clears the row. Only cookies are read: no lookup is made.
+    #[must_use]
+    pub fn cookie_opted_out_sources(&self, cookies: RequestCookies<'_>) -> Vec<SourceDomain> {
+        self.providers
+            .iter()
+            .filter(|registered| {
+                matches!(
+                    registered.provider.read_request_cookies(cookies),
+                    CookieRead::OptedOut
+                )
+            })
+            .flat_map(|registered| registered.policy.sources.iter().cloned())
+            .collect()
     }
 
     /// Whether `source` holds a UID of this provider whose refresh is due.
@@ -446,7 +475,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         let registered = &self.providers[provider.get()];
         let cleared = if matches!(
             status,
-            LookupStatus::Skipped(SkipReason::OptedOut | SkipReason::Region)
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::Region)
         ) {
             registered.policy.sources.to_vec()
         } else {
@@ -514,11 +543,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 // re-read on every navigation instead.
                 return ProviderLookup {
                     opt_out: OptOutMemory::Remember,
-                    ..self.lookup(
-                        provider,
-                        LookupStatus::Skipped(SkipReason::OptedOut),
-                        Vec::new(),
-                    )
+                    ..self.lookup(provider, LookupStatus::OptedOut, Vec::new())
                 };
             }
             Err(report) => {
@@ -596,11 +621,13 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .minted_entry
             .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
         let entry = stored.or(minted);
+        pending.revocations = entry
+            .map(|entry| entry.revocations.clone())
+            .unwrap_or_default();
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
-        let deadline = Deadline::after(self.budget);
-        pending.deadline = Some(deadline);
+        let mut requests = Vec::new();
         let mut pull_sync_dispatched = 0_usize;
         for index in self.dispatch_order(lookup.now) {
             let registered = &self.providers[index];
@@ -639,6 +666,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             let remembered_opt_out =
                 entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
             let mut opted_back_in = false;
+            let mut cookie_uids = Vec::new();
             let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             due.retain(|source| !excluded.contains(source));
             // The vendor's own first-party cookies are read on every
@@ -655,11 +683,28 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                         "Identity lookup: provider={} opted out in its cookies",
                         registered.id
                     );
-                    pending.early.push(skip(SkipReason::OptedOut));
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::OptedOut,
+                    });
                     continue;
                 }
                 CookieRead::Found(eids) => {
                     let mut found = self.validated(provider, eids, lookup.now);
+                    cookie_uids = uid_hashes(found.entries.iter().flat_map(|(_, eids)| eids));
+                    // Cookies that repeat only UIDs known when the vendor's
+                    // server reported the remembered opt-out show no renewed
+                    // identity: a server refresh never rewrites them.
+                    let repeats_opted_out = remembered_opt_out.is_some_and(|entry| {
+                        entry.repeats_opted_out_uids(&registered.id, &cookie_uids)
+                    });
+                    if repeats_opted_out {
+                        log::debug!(
+                            "Identity lookup: provider={} cookies repeat the opted-out IDs",
+                            registered.id
+                        );
+                        found.status = LookupStatus::NoMatch;
+                    }
                     // A cookie older than a server-side refresh does not
                     // roll the refreshed UID back.
                     if registered.provider.keeps_fresher_stored_uids() {
@@ -809,27 +854,24 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Destination));
                 continue;
             }
-            let context = request.context.take();
-            match transport.start(request, deadline).await {
-                Ok(value) => {
-                    pull_sync_dispatched += usize::from(registered.policy.pull_sync);
-                    pending.requests.push(Tagged { provider, value });
-                    if let Some(value) = context {
-                        pending.contexts.push(Tagged { provider, value });
-                    }
-                }
-                Err(report) => {
-                    log::warn!(
-                        "Identity lookup: provider={} send failed: {}",
-                        registered.id,
-                        report.current_context()
-                    );
-                    pending.early.push(Tagged {
-                        provider,
-                        value: LookupStatus::TransportFailed,
-                    });
-                }
+            if let Some(value) = request.context.take() {
+                pending.contexts.push(Tagged { provider, value });
             }
+            pull_sync_dispatched += usize::from(registered.policy.pull_sync);
+            pending.known_uids.push(Tagged {
+                provider,
+                value: known_uid_hashes(entry, &registered.policy.sources, cookie_uids),
+            });
+            requests.push(Tagged {
+                provider,
+                value: request,
+            });
+        }
+        // Every request is built before any leaves, and all leave together
+        // under one cutoff.
+        if !requests.is_empty() {
+            pending.started = requests.len();
+            pending.in_flight = Some(transport.start(requests, self.budget));
         }
         pending
     }
@@ -840,8 +882,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         pending: PendingLookups<T::Pending>,
     ) -> LookupResults {
         let PendingLookups {
-            requests,
-            deadline,
+            in_flight,
+            started: _,
             ec_id,
             now,
             early,
@@ -849,10 +891,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             excluded,
             contexts,
             from_cookies,
+            revocations,
+            known_uids,
         } = pending;
-        let responses = match deadline {
-            Some(deadline) if !requests.is_empty() => transport.gather(requests, deadline).await,
-            _ => Vec::new(),
+        let responses = match in_flight {
+            Some(in_flight) => transport.gather(in_flight).await,
+            None => Vec::new(),
         };
         let mut slots: Vec<Option<ProviderLookup>> =
             (0..self.providers.len()).map(|_| None).collect();
@@ -896,8 +940,53 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for lookup in &lookups {
             log_outcome(lookup);
         }
+        let known_uids = known_uids
+            .into_iter()
+            .map(|Tagged { provider, value }| (self.providers[provider.get()].id.clone(), value))
+            .collect();
         LookupResults::new(&ec_id, lookups)
+            .dispatched_with(revocations)
+            .with_known_uids(known_uids)
     }
+}
+
+/// Hashes of the UIDs in `eids`, without duplicates.
+fn uid_hashes<'eid>(eids: impl Iterator<Item = &'eid KvEid>) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for uid in eids.flat_map(KvEid::uids) {
+        let hash = opt_out_uid_hash(uid.id().as_str());
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// Hashes of the UIDs known for a provider at dispatch: those its cookies
+/// held and those the row stores for its sources.
+fn known_uid_hashes(
+    entry: Option<&KvEntry>,
+    sources: &[SourceDomain],
+    mut hashes: Vec<String>,
+) -> Vec<String> {
+    let records = sources
+        .iter()
+        .filter_map(|source| entry.and_then(|entry| entry.ids.get(source.as_str())));
+    for record in records {
+        let stored = if record.is_provider_written() {
+            uid_hashes(record.eids().iter())
+        } else if record.uid.is_empty() {
+            Vec::new()
+        } else {
+            vec![opt_out_uid_hash(&record.uid)]
+        };
+        for hash in stored {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+    }
+    hashes
 }
 
 /// Drops `sources` from a provider's result and removes them from the row.
@@ -935,8 +1024,10 @@ fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLook
 /// Merges the statuses and entries of [`merge_lookups`].
 fn merge_entries(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
     let LookupStatus::Found { dropped, .. } = later.status else {
-        return if later.status == LookupStatus::Skipped(SkipReason::OptedOut)
-            || !matches!(earlier.status, LookupStatus::Found { .. })
+        return if matches!(
+            later.status,
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::OptedOut)
+        ) || !matches!(earlier.status, LookupStatus::Found { .. })
         {
             later
         } else {
@@ -1203,26 +1294,30 @@ mod tests {
     }
 
     impl LookupTransport for CannedTransport {
-        type Pending = ();
+        type Pending = Vec<ProviderIndex>;
 
-        async fn start(
+        fn start(
             &self,
-            request: ProviderRequest,
-            _deadline: Deadline,
-        ) -> Result<(), Report<TransportError>> {
-            self.sent.borrow_mut().push(request.url.to_string());
-            Ok(())
+            requests: Vec<Tagged<ProviderRequest>>,
+            _budget: Duration,
+        ) -> Vec<ProviderIndex> {
+            requests
+                .into_iter()
+                .map(|Tagged { provider, value }| {
+                    self.sent.borrow_mut().push(value.url.to_string());
+                    provider
+                })
+                .collect()
         }
 
         async fn gather(
             &self,
-            pending: Vec<Tagged<()>>,
-            _deadline: Deadline,
+            pending: Vec<ProviderIndex>,
         ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
             pending
                 .into_iter()
-                .map(|tagged| Tagged {
-                    provider: tagged.provider,
+                .map(|provider| Tagged {
+                    provider,
                     value: (self.reply)(),
                 })
                 .collect()
@@ -1405,10 +1500,13 @@ mod tests {
             .status
     }
 
+    /// Reads back `entry` from a store seeded with it, at a synchronous test boundary.
     fn seeded_snapshot(entry: &KvEntry) -> EcKvSnapshot {
-        let graph = KvIdentityGraph::in_memory("coord");
-        graph.create(EC_ID, entry).expect("should seed");
-        graph.load_snapshot(EC_ID)
+        futures::executor::block_on(async {
+            let graph = KvIdentityGraph::in_memory("coord");
+            graph.create(EC_ID, entry).await.expect("should seed");
+            graph.load_snapshot(EC_ID).await
+        })
     }
 
     #[test]
@@ -2251,6 +2349,29 @@ mod tests {
     }
 
     #[test]
+    fn cookie_opted_out_sources_lists_only_providers_whose_cookies_opt_out() {
+        // Arrange
+        let coordinator = cookie_coordinator();
+
+        // Act
+        let opted_out =
+            coordinator.cookie_opted_out_sources(RequestCookies::new("other=1; vendor_id=optout"));
+        let holding_id = coordinator.cookie_opted_out_sources(RequestCookies::new("vendor_id=c-1"));
+        let without_cookie = coordinator.cookie_opted_out_sources(RequestCookies::new(""));
+
+        // Assert
+        assert_eq!(
+            opted_out,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should list the sources of the provider whose cookies opt out"
+        );
+        assert!(
+            holding_id.is_empty() && without_cookie.is_empty(),
+            "should list nothing when the cookies hold an ID or are absent"
+        );
+    }
+
+    #[test]
     fn cookie_opt_out_skips_the_lookup_and_clears_the_sources() {
         let coordinator = cookie_coordinator();
         let transport = CannedTransport::new(ok_reply);
@@ -2268,7 +2389,7 @@ mod tests {
             let lookup = results.iter().next().expect("should report the provider");
             assert_eq!(
                 lookup.status,
-                LookupStatus::Skipped(SkipReason::OptedOut),
+                LookupStatus::OptedOut,
                 "should skip for the opt-out"
             );
             assert_eq!(
@@ -2556,12 +2677,12 @@ mod tests {
 
         let merged = merge_lookups(
             found_lookup("a.example.com", "c-1"),
-            status_lookup(LookupStatus::Skipped(SkipReason::OptedOut)),
+            status_lookup(LookupStatus::OptedOut),
         );
 
         assert_eq!(
             merged.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should let a lookup opt-out win over cookie IDs"
         );
     }
@@ -2635,6 +2756,97 @@ mod tests {
             "should forget the remembered opt-out"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_unchanged_cookie_keeps_a_server_opt_out_until_a_renewed_id_arrives() {
+        // Arrange: the held UID's refresh is due and the cookie repeats it;
+        // the vendor's server answers the refresh with an opt-out.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let provider = ProviderId::new("example-provider");
+        let first_snapshot = snapshot_holding(refreshable_record(900));
+        let first = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(optout_reply),
+            &first_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&first_snapshot, &first)
+        else {
+            panic!("should plan the opt-out write")
+        };
+        assert!(
+            entry.opted_out(&provider, UnixSeconds::new(1000))
+                && !entry.ids.contains_key("ids.example.com"),
+            "should remember the server opt-out and clear the source"
+        );
+        let second_snapshot = seeded_snapshot(&entry);
+
+        // Act: the next navigation sends the same cookie, then a later one a
+        // renewed ID.
+        let unchanged_transport = CannedTransport::new(ok_reply);
+        let unchanged = run_with_cookies(
+            &coordinator,
+            &unchanged_transport,
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let renewed = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(ok_reply),
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-renewed",
+        );
+
+        // Assert
+        let unchanged_lookup = unchanged.iter().next().expect("should report the provider");
+        assert_eq!(
+            unchanged_lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should keep skipping the provider for an unchanged cookie"
+        );
+        assert_eq!(
+            unchanged_lookup.opt_out,
+            OptOutMemory::Unchanged,
+            "should not forget the server opt-out for an unchanged cookie"
+        );
+        assert!(
+            planned_change(&second_snapshot, &unchanged).is_none(),
+            "should neither restore the opted-out UID nor write"
+        );
+        assert!(
+            unchanged_transport.sent.borrow().is_empty(),
+            "should not call the opted-out provider"
+        );
+        let renewed_lookup = renewed.iter().next().expect("should report the provider");
+        assert_eq!(
+            renewed_lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the opt-out for a renewed cookie ID"
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&second_snapshot, &renewed)
+        else {
+            panic!("should plan the opt-back-in write")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "c-renewed",
+            "should store the renewed cookie ID"
+        );
+        assert!(
+            !entry.opted_out(&provider, UnixSeconds::new(1000)) && entry.opt_out_uids.is_empty(),
+            "should forget the opt-out and its UID hashes"
+        );
     }
 
     #[test]
@@ -2787,6 +2999,32 @@ mod tests {
     }
 
     #[test]
+    fn results_carry_the_revocations_the_dispatch_saw() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.revocations.insert(provider.clone(), 900);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results.revocation_at_dispatch(&provider),
+            Some(900),
+            "should hand the dispatch's revocations to the write"
+        );
+    }
+
+    #[test]
     fn an_opted_out_reply_clears_the_sources() {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(optout_reply);
@@ -2796,7 +3034,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out"
         );
         assert_eq!(
@@ -2820,7 +3058,7 @@ mod tests {
         let lookup = results.iter().next().expect("should report the provider");
         assert_eq!(
             lookup.status,
-            LookupStatus::Skipped(SkipReason::OptedOut),
+            LookupStatus::OptedOut,
             "should report the opt-out the provider reads from a 204"
         );
         assert_eq!(

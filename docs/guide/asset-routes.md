@@ -10,11 +10,11 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 
 1. Match the longest configured `proxy.asset_routes` prefix.
 2. Optionally rewrite the request path with `path_pattern` and `target_path`.
-3. Build Image Optimizer metadata from the request query when the route enables it.
+3. Build EdgeZero Image Optimizer options from the request query when the route enables it.
 4. Apply the origin query policy.
 5. For S3-authenticated requests with Image Optimizer enabled, preflight the original object with an uncached signed `HEAD` before invoking IO.
 6. Add origin authentication headers when the route configures auth.
-7. Send the request to the resolved backend origin, with IO metadata when enabled.
+7. Send the request to the resolved backend origin, with the Image Optimizer options when enabled.
 8. Return the origin status, body, and safe headers.
 
 On Fastly, the signed preflight bypasses the readthrough cache so the cache cannot change its method after signing. A successful or `304` preflight allows the final IO request to use its normal caching path. Even when the optimized image is already cached, each qualifying request first waits for an uncached origin `HEAD`. Account for that S3 request volume, cost, and latency. Origin throttling or unavailability can prevent a cached derivative from being served.
@@ -23,7 +23,7 @@ An unsuccessful preflight does not invoke IO. For a `HEAD` client, Trusted Serve
 
 Requests without effective IO do not preflight. Signed raw `HEAD` requests also bypass the readthrough cache, including SVG/SVGZ, debug-bypassed requests, and routes with absent or disabled IO. Raw `GET` requests retain normal readthrough caching.
 
-The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer metadata stays separate from the origin URL and is translated by the Fastly adapter.
+The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer options stay separate from the origin URL. They go on the final `GET` or `HEAD` as EdgeZero Image Optimizer options, never on the S3 preflight `HEAD`. EdgeZero's Fastly client applies them; the Axum, Cloudflare, and Spin clients reject them before sending.
 
 ## Basic route
 
@@ -174,7 +174,7 @@ A request such as:
 /.image/id/example.jpg?profile=medium&ar=1-1&x=44&y=63
 ```
 
-uses the `medium` profile, applies the allowed `1-1` crop override, buckets offsets to the configured values, strips the origin query, signs the S3 request if auth is enabled, and sends Fastly IO metadata through the Fastly adapter.
+uses the `medium` profile, applies the allowed `1-1` crop override, buckets offsets to the configured values, strips the origin query, signs the S3 request if auth is enabled, and sends the final request with EdgeZero Image Optimizer options, which only EdgeZero's Fastly client applies.
 
 ## Supported profile parameters
 
@@ -203,7 +203,7 @@ The asset route still matches. Path rewrite, origin query policy, and S3 signing
 
 ## Local testing notes
 
-Viceroy does not perform real Fastly Image Optimizer transformations. Local tests can verify routing, query stripping, SigV4 headers, and metadata attachment. End-to-end image transformation verification requires a deployed Fastly Compute service with Image Optimizer enabled.
+Viceroy does not perform Fastly Image Optimizer transformations. When the host cannot run Image Optimizer, EdgeZero's Fastly client fails the request and the asset proxy answers 502. Local tests verify routing, query stripping, SigV4 headers, and the options the request carries, read back through the scripted client. End-to-end image transformation verification requires a deployed Fastly Compute service with Image Optimizer enabled.
 
 ## Security checklist
 

@@ -131,15 +131,40 @@ fn apply_lookups(
 ) -> Vec<SourceDomain> {
     let mut written = Vec::new();
     for lookup in lookups.iter() {
+        let opted_out = entry.opted_out(&lookup.provider, now);
+        let remembered_skip = lookup.status == LookupStatus::Skipped(SkipReason::OptedOut);
+        // A skip because of a remembered opt-out that lapsed since dispatch
+        // is stale: the provider was not asked, so it must not renew the
+        // opt-out or clear sources a newer lookup may have written.
+        if remembered_skip && !opted_out {
+            log::info!(
+                "EC write planner: discarding skip on lapsed opt-out of provider '{}'",
+                lookup.provider
+            );
+            continue;
+        }
         // A newer request may have recorded this provider's opt-out after
         // the lookup was dispatched; never restore its UIDs over it, unless
         // the vendor's cookies showed the visitor opted back in.
-        if entry.opted_out(&lookup.provider, now)
-            && lookup.status != LookupStatus::Skipped(SkipReason::OptedOut)
+        if opted_out
+            && !remembered_skip
+            && lookup.status != LookupStatus::OptedOut
             && lookup.opt_out != OptOutMemory::Forget
         {
             log::info!(
                 "EC write planner: discarding results of opted-out provider '{}'",
+                lookup.provider
+            );
+            continue;
+        }
+        // An opt-out recorded after the lookup was dispatched, which a cookie
+        // opt-out leaves only as a revocation, supersedes its results. An
+        // opt-out of its own still applies.
+        let superseded = entry.revocations.get(&lookup.provider).copied()
+            != lookups.revocation_at_dispatch(&lookup.provider);
+        if superseded && !remembered_skip && lookup.status != LookupStatus::OptedOut {
+            log::info!(
+                "EC write planner: discarding results of provider '{}' superseded by a newer opt-out",
                 lookup.provider
             );
             continue;
@@ -153,16 +178,26 @@ fn apply_lookups(
                 written.push(source.clone());
             }
         }
+        // Only an opt-out the vendor's server reported in this navigation
+        // starts the memory period; a remembered one keeps its end time, and
+        // a cookie opt-out is re-read on every navigation instead.
         if lookup.opt_out == OptOutMemory::Remember {
-            entry.remember_opt_out(&lookup.provider, now);
+            entry.remember_opt_out(&lookup.provider, now, lookups.known_uids(&lookup.provider));
         }
+        let mut removed = false;
         for source in &lookup.cleared {
             if entry.ids.remove(source.as_str()).is_some() {
+                removed = true;
                 log::info!(
                     "EC write planner: removing '{source}' after provider '{}' opt-out",
                     lookup.provider
                 );
             }
+        }
+        // Only an opt-out that changes the row records a revocation, so it
+        // never adds a write of its own.
+        if removed && lookup.status == LookupStatus::OptedOut {
+            entry.record_revocation(&lookup.provider, now);
         }
     }
     written
@@ -361,10 +396,10 @@ mod tests {
         entry
     }
 
-    fn present(entry: &KvEntry) -> EcKvSnapshot {
+    async fn present(entry: &KvEntry) -> EcKvSnapshot {
         let graph = KvIdentityGraph::in_memory("plan");
-        graph.create(EC_ID, entry).expect("should seed row");
-        graph.load_snapshot(EC_ID)
+        graph.create(EC_ID, entry).await.expect("should seed row");
+        graph.load_snapshot(EC_ID).await
     }
 
     fn found(source: &str, ids: &[&str]) -> LookupResults {
@@ -481,14 +516,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unchanged_returning_row_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchanged_returning_row_plans_no_write() {
         let registry = registry(&[]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("browser.example.com".to_owned(), KvPartnerId::single("b-1"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let ingest = [PartnerIdUpdate::new("browser.example.com", "b-2")];
         let lookups = LookupResults::default();
 
@@ -498,14 +533,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookup_replaces_provider_source_with_cas_update() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookup_replaces_provider_source_with_cas_update() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("legacy"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let lookups = found("ids.example.com", &["p-1", "p-2"]);
 
         let change = plan_write(&input(&snapshot, None, &[], &lookups, &registry))
@@ -521,10 +556,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tombstoned_row_plans_nothing() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn tombstoned_row_plans_nothing() {
         let registry = registry(&[]);
-        let snapshot = present(&KvEntry::tombstone(1000));
+        let snapshot = present(&KvEntry::tombstone(1000)).await;
         let lookups = found("ids.example.com", &["p-1"]);
         assert!(
             plan_write(&input(&snapshot, None, &[], &lookups, &registry)).is_none(),
@@ -633,12 +668,12 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_cookie_opt_out_is_not_remembered() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cookie_opt_out_is_not_remembered() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
-        let mut lookups = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
+        let mut lookups = failed_lookup(LookupStatus::OptedOut);
         let cleared = lookups.iter().next().expect("should hold a lookup").clone();
         lookups = LookupResults::new(
             EC_ID,
@@ -650,7 +685,7 @@ mod tests {
 
         // Act
         let change = plan_write(&input(
-            &present(&provider_entry(&["p-1"])),
+            &present(&provider_entry(&["p-1"])).await,
             None,
             &ingest,
             &lookups,
@@ -672,8 +707,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_opt_back_in_forgets_the_opt_out_and_stores_the_ids() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_opt_back_in_forgets_the_opt_out_and_stores_the_ids() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
@@ -693,8 +728,14 @@ mod tests {
         );
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
-            .expect("should plan update");
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
 
         // Assert
         let RowChange::Update { entry, .. } = change else {
@@ -710,17 +751,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opt_out_removes_the_provider_sources_and_blocks_browser_fallback() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&provider_entry(&["p-1"]));
+        let snapshot = present(&provider_entry(&["p-1"])).await;
         let ingest = ingest_owned();
         let lookups = LookupResults::new(
             EC_ID,
             vec![ProviderLookup {
                 provider: ProviderId::new("example-provider"),
-                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                status: LookupStatus::OptedOut,
                 entries: Vec::new(),
                 cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
                 opt_out: OptOutMemory::Unchanged,
@@ -741,23 +782,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opt_out_is_remembered_without_extending_it() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opt_out_is_remembered_without_extending_it() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let provider = ProviderId::new("example-provider");
-        let lookups = lookup_with_memory(
-            LookupStatus::Skipped(SkipReason::OptedOut),
-            OptOutMemory::Remember,
-        );
+        let reported = lookup_with_memory(LookupStatus::OptedOut, OptOutMemory::Remember);
+        let skipped = failed_lookup(LookupStatus::Skipped(SkipReason::OptedOut));
 
-        // Act: the first opt-out is remembered.
+        // Act: the reported opt-out is remembered.
         let first = plan_write(&input(
-            &present(&provider_entry(&["p-1"])),
+            &present(&provider_entry(&["p-1"])).await,
             None,
             &ingest,
-            &lookups,
+            &reported,
             &registry,
         ))
         .expect("should plan update");
@@ -773,15 +812,92 @@ mod tests {
             "should remember the opt-out for the memory period"
         );
 
-        // Act: a skip because of the remembered opt-out changes nothing.
-        let again = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        // Act: a skip because of the remembered opt-out, or the provider
+        // reporting it again, changes nothing.
+        for lookups in [&skipped, &reported] {
+            let again = plan_write(&input(
+                &present(&entry).await,
+                None,
+                &ingest,
+                lookups,
+                &registry,
+            ));
 
-        // Assert
-        assert!(again.is_none(), "should not extend a remembered opt-out");
+            // Assert
+            assert!(again.is_none(), "should not extend a remembered opt-out");
+        }
     }
 
-    #[test]
-    fn lapsed_opt_out_alone_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn skip_on_an_opt_out_that_lapsed_since_dispatch_is_discarded() {
+        // Arrange: the lookup was dispatched while the opt-out was
+        // remembered; it lapsed at 1999, before this plan at 2000. A newer
+        // lookup has since stored the provider's UID again.
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = provider_entry(&["p-new"]);
+        entry.opt_outs.insert(provider.clone(), 1999);
+        let lookups = LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider,
+                status: LookupStatus::Skipped(SkipReason::OptedOut),
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        );
+
+        // Act
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
+
+        // Assert
+        assert!(
+            change.is_none(),
+            "should neither renew the lapsed opt-out nor clear the provider's UID"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reported_opt_out_after_a_lapsed_one_is_remembered_again() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let ingest: [PartnerIdUpdate; 0] = [];
+        let provider = ProviderId::new("example-provider");
+        let mut entry = provider_entry(&["p-1"]);
+        entry.opt_outs.insert(provider.clone(), 1999);
+        let lookups = lookup_with_memory(LookupStatus::OptedOut, OptOutMemory::Remember);
+
+        // Act
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
+
+        // Assert
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.opt_outs[&provider],
+            2000 + OPT_OUT_MEMORY_SECONDS,
+            "should start a new memory period from the provider's report"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lapsed_opt_out_alone_plans_no_write() {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let mut entry = live_entry();
@@ -790,13 +906,19 @@ mod tests {
             .insert(ProviderId::new("example-provider"), 1000);
         let lookups = LookupResults::default();
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         assert!(change.is_none(), "should not write only to prune");
     }
 
-    #[test]
-    fn lapsed_opt_out_is_pruned_with_a_real_change() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lapsed_opt_out_is_pruned_with_a_real_change() {
         let registry = registry(&["ids.example.com"]);
         let ingest = [PartnerIdUpdate::new("browser.example.com", "b-1")];
         let mut entry = live_entry();
@@ -805,8 +927,14 @@ mod tests {
             .insert(ProviderId::new("example-provider"), 1000);
         let lookups = LookupResults::default();
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry))
-            .expect("should plan update");
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ))
+        .expect("should plan update");
 
         let RowChange::Update { entry, .. } = change else {
             panic!("should update existing row")
@@ -814,8 +942,8 @@ mod tests {
         assert!(entry.opt_outs.is_empty(), "should forget a lapsed opt-out");
     }
 
-    #[test]
-    fn not_due_skip_with_an_expired_uid_plans_no_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_due_skip_with_an_expired_uid_plans_no_write() {
         let registry = registry(&["ids.example.com"]);
         let ingest: [PartnerIdUpdate; 0] = [];
         let mut entry = live_entry();
@@ -845,7 +973,13 @@ mod tests {
             }],
         );
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         assert!(
             change.is_none(),
@@ -853,8 +987,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_ingest_fills_a_slot_freed_by_an_expired_record() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_fills_a_slot_freed_by_an_expired_record() {
         // The source is not provider-owned (its provider was disabled), so the
         // browser may fill it once the expired provider record is pruned.
         let registry = registry(&[]);
@@ -877,7 +1011,13 @@ mod tests {
             .expect("should build provider record"),
         );
 
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         let Some(RowChange::Update { entry, .. }) = change else {
             panic!("should plan an update that fills the freed slot");
@@ -903,11 +1043,11 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn browser_ingest_skips_a_provider_owned_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_skips_a_provider_owned_source() {
         // Arrange
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
 
         for status in [
@@ -928,11 +1068,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn browser_ingest_fills_a_source_owned_only_by_pull_sync() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_fills_a_source_owned_only_by_pull_sync() {
         // Arrange: pull sync runs for the source, but no configured provider owns it.
         let registry = registry(&[]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::Skipped(SkipReason::NotDue));
 
@@ -950,11 +1090,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opted_out_source_is_not_refilled_from_the_browser_on_the_next_navigation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn opted_out_source_is_not_refilled_from_the_browser_on_the_next_navigation() {
         // Arrange: the row after an opt-out holds nothing for the source.
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
         let lookups = LookupResults::default();
 
@@ -996,10 +1136,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_fallback_is_not_stored_when_provider_found_the_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_is_not_stored_when_provider_found_the_source() {
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&live_entry());
+        let snapshot = present(&live_entry()).await;
         let ingest = ingest_owned();
         let lookups = found("ids.example.com", &["p-1"]);
 
@@ -1014,10 +1154,10 @@ mod tests {
         assert!(record.is_provider_written(), "should keep provider eids");
     }
 
-    #[test]
-    fn browser_fallback_never_overwrites_a_live_provider_uid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_never_overwrites_a_live_provider_uid() {
         let registry = registry(&["ids.example.com"]);
-        let snapshot = present(&provider_entry(&["p-1"]));
+        let snapshot = present(&provider_entry(&["p-1"])).await;
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::NoMatch);
 
@@ -1027,14 +1167,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_fallback_does_not_overwrite_an_existing_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_fallback_does_not_overwrite_an_existing_fallback() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry
             .ids
             .insert("ids.example.com".to_owned(), KvPartnerId::single("older"));
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let ingest = ingest_owned();
         let lookups = failed_lookup(LookupStatus::NoMatch);
 
@@ -1044,15 +1184,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn later_provider_result_replaces_browser_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_provider_result_replaces_browser_fallback() {
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
         entry.ids.insert(
             "ids.example.com".to_owned(),
             KvPartnerId::single("browser-id"),
         );
-        let snapshot = present(&entry);
+        let snapshot = present(&entry).await;
         let lookups = found("ids.example.com", &["p-1"]);
 
         let change = plan_write(&input(
@@ -1201,8 +1341,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provider_uid_wins_over_browser_uid_when_only_one_fits() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_uid_wins_over_browser_uid_when_only_one_fits() {
         // Arrange: room for either new UID alone, not both.
         let registry = registry(&["ids.example.com"]);
         let entry = fill_to(live_entry(), MAX_ENTRY_BYTES - 800);
@@ -1211,7 +1351,13 @@ mod tests {
         let lookups = found("ids.example.com", &[provider_uid.as_str()]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         let Some(RowChange::Update { entry, .. }) = change else {
@@ -1232,8 +1378,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_that_no_longer_fits_keeps_the_stored_provider_record() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_that_no_longer_fits_keeps_the_stored_provider_record() {
         // Arrange: the stored provider UID fits; its larger refresh does not.
         let registry = registry(&["ids.example.com"]);
         let entry = fill_to(provider_entry(&["p-old"]), MAX_ENTRY_BYTES - 300);
@@ -1241,7 +1387,13 @@ mod tests {
         let lookups = found("ids.example.com", &[fresh.as_str()]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &[],
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         assert!(
@@ -1250,8 +1402,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browser_ingest_never_evicts_a_stored_record_to_fit() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_ingest_never_evicts_a_stored_record_to_fit() {
         // Arrange: a stored provider record plus fillers, just under the cap.
         let registry = registry(&["ids.example.com"]);
         let big: Vec<String> = (0..18)
@@ -1280,7 +1432,13 @@ mod tests {
         let lookups = LookupResults::default();
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &ingest, &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &ingest,
+            &lookups,
+            &registry,
+        ));
 
         // Assert: the browser UID is dropped, so nothing changes.
         assert!(
@@ -1289,8 +1447,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn found_result_never_restores_uids_over_a_newer_opt_out() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn found_result_never_restores_uids_over_a_newer_opt_out() {
         // Arrange: another request recorded the opt-out after this lookup ran.
         let registry = registry(&["ids.example.com"]);
         let mut entry = live_entry();
@@ -1301,12 +1459,104 @@ mod tests {
         let lookups = found("ids.example.com", &["p-restored"]);
 
         // Act
-        let change = plan_write(&input(&present(&entry), None, &[], &lookups, &registry));
+        let change = plan_write(&input(
+            &present(&entry).await,
+            None,
+            &[],
+            &lookups,
+            &registry,
+        ));
 
         // Assert
         assert!(
             change.is_none(),
             "should not write the opted-out provider's older result"
+        );
+    }
+
+    fn cookie_opt_out() -> LookupResults {
+        LookupResults::new(
+            EC_ID,
+            vec![ProviderLookup {
+                provider: ProviderId::new("example-provider"),
+                status: LookupStatus::OptedOut,
+                entries: Vec::new(),
+                cleared: vec![SourceDomain::try_from("ids.example.com").expect("should parse")],
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_opt_out_that_removes_a_source_records_a_revocation() {
+        // Arrange
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+
+        // Act
+        let removing = plan_write(&input(
+            &present(&provider_entry(&["p-1"])).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ))
+        .expect("should plan update");
+        let removing_nothing = plan_write(&input(
+            &present(&live_entry()).await,
+            None,
+            &[],
+            &cookie_opt_out(),
+            &registry,
+        ));
+
+        // Assert
+        let RowChange::Update { entry, .. } = removing else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.revocations.get(&provider).copied(),
+            Some(2000),
+            "should record when the opt-out removed the provider's sources"
+        );
+        assert!(
+            entry.opt_outs.is_empty(),
+            "should not remember a cookie opt-out"
+        );
+        assert!(
+            removing_nothing.is_none(),
+            "should not write only to record a revocation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn found_result_dispatched_before_a_newer_cookie_opt_out_is_discarded() {
+        // Arrange: a cookie opt-out removed the source at 1990, after this
+        // lookup was dispatched against a row without that revocation.
+        let registry = registry(&["ids.example.com"]);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = live_entry();
+        entry.revocations.insert(provider.clone(), 1990);
+        let stale = found("ids.example.com", &["late-result"]);
+        let fresh = found("ids.example.com", &["new-id"])
+            .dispatched_with(std::iter::once((provider, 1990)).collect());
+
+        // Act
+        let stale_change = plan_write(&input(&present(&entry).await, None, &[], &stale, &registry));
+        let fresh_change = plan_write(&input(&present(&entry).await, None, &[], &fresh, &registry))
+            .expect("should plan update");
+
+        // Assert
+        assert!(
+            stale_change.is_none(),
+            "should not restore the source with a result the opt-out superseded"
+        );
+        let RowChange::Update { entry, .. } = fresh_change else {
+            panic!("should update existing row")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "new-id",
+            "should write a result dispatched after the opt-out"
         );
     }
 }

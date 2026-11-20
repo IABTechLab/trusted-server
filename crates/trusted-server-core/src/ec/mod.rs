@@ -99,12 +99,13 @@ use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
 use self::page_load::{AfterResponseWrite, NavigationPermit};
 
-/// Bounded request classifications that may persist browser EID cookies.
+/// Bounded request classifications that may read browser EID cookies.
 ///
 /// Adapters classify publisher navigations and `POST /auction` only after
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
-/// admitted SPA navigation, while EC finalization classifies new identities.
-/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+/// admitted SPA navigation. Only a publisher navigation holding a
+/// [`NavigationPermit`] persists the cookies; `Auction` and `PageBids` read them
+/// for bidders only. Challenged or blocked requests remain unclassified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -340,6 +341,9 @@ pub struct EcContext {
     lookup_results: LookupResults,
     /// New row built by [`Self::generate_if_needed`], written by finalize.
     pending_entry: Option<Box<KvEntry>>,
+    /// Sources of identity providers whose first-party cookies on this
+    /// request record an opt-out; their IDs never leave the server for it.
+    cookie_opted_out_sources: Vec<String>,
 }
 
 impl EcContext {
@@ -427,6 +431,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         })
     }
 
@@ -446,7 +451,7 @@ impl EcContext {
     ///
     /// Returns an error if the client IP is unavailable and generation is
     /// needed, or if HMAC generation fails.
-    pub fn generate_if_needed(
+    pub async fn generate_if_needed(
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
@@ -605,6 +610,24 @@ impl EcContext {
         self.client_eids = Some(eids);
     }
 
+    /// Records the sources of identity providers whose first-party cookies on
+    /// this request record an opt-out.
+    ///
+    /// Every identity egress of the request withholds them: stored UIDs and
+    /// EIDs the browser supplies alike.
+    pub fn set_cookie_opted_out_sources(&mut self, sources: Vec<String>) {
+        self.cookie_opted_out_sources = sources;
+    }
+
+    /// Whether a provider's cookies on this request record an opt-out for
+    /// `source`.
+    #[must_use]
+    pub fn source_opted_out_in_cookies(&self, source: &str) -> bool {
+        self.cookie_opted_out_sources
+            .iter()
+            .any(|opted_out| opted_out.eq_ignore_ascii_case(source))
+    }
+
     /// Returns the current request's own EIDs, if the route captured any.
     #[must_use]
     pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
@@ -757,6 +780,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -787,6 +811,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 
@@ -820,6 +845,7 @@ impl EcContext {
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
             pending_entry: None,
+            cookie_opted_out_sources: Vec::new(),
         }
     }
 }
@@ -880,8 +906,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_defers_row_creation_to_the_page_load_write() {
         let settings = create_test_settings();
         let mut ec_context = EcContext::new_for_test_with_ip(
             None,
@@ -892,11 +918,12 @@ mod tests {
 
         ec_context
             .generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should mint EC");
 
         let ec_id = ec_context.ec_value().expect("should set EC").to_owned();
         assert!(
-            graph.get(&ec_id).expect("should read").is_none(),
+            graph.get(&ec_id).await.expect("should read").is_none(),
             "should not write during generation"
         );
         assert!(
@@ -1026,8 +1053,8 @@ mod tests {
         assert_eq!(snapshot.generation_for("ec-1"), None);
     }
 
-    #[test]
-    fn leftover_pull_marker_is_expired() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn leftover_pull_marker_is_expired() {
         let settings = create_test_settings();
         let req = create_test_request(&[("cookie", "ts-ec-pull-complete=x")]);
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
@@ -1042,7 +1069,8 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+        )
+        .await;
 
         assert!(
             response
@@ -1190,8 +1218,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_skips_when_ec_exists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
         let cookie = format!("ts-ec={ec_id}");
@@ -1200,6 +1228,7 @@ mod tests {
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
+            .await
             .expect("should not error when EC already exists");
 
         assert_eq!(

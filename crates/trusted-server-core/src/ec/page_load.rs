@@ -307,16 +307,18 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn commit_create_reports_existing_row() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_create_reports_existing_row() {
         let graph = KvIdentityGraph::in_memory("page_load");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         graph
             .commit_page_load(permit(), &ec_id, RowChange::Create(live_entry()))
+            .await
             .expect("should create row");
 
         let error = graph
             .commit_page_load(permit(), &ec_id, RowChange::Create(live_entry()))
+            .await
             .expect_err("should refuse second create");
 
         assert!(
@@ -325,17 +327,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn commit_update_with_stale_generation_conflicts_without_retry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_update_with_stale_generation_conflicts_without_retry() {
         let graph = KvIdentityGraph::in_memory("page_load");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         graph
             .create(&ec_id, &live_entry())
+            .await
             .expect("should seed row");
-        let snapshot = graph.load_snapshot(&ec_id);
+        let snapshot = graph.load_snapshot(&ec_id).await;
         let expected = Generation::of(&snapshot, &ec_id).expect("should read generation");
         graph
             .create_or_revive(&ec_id, &live_entry())
+            .await
             .expect("should no-op on live row");
         graph
             .commit_page_load(
@@ -346,6 +350,7 @@ mod tests {
                     expected,
                 },
             )
+            .await
             .expect("should write at current generation");
 
         let error = graph
@@ -357,6 +362,7 @@ mod tests {
                     expected,
                 },
             )
+            .await
             .expect_err("should reject stale generation");
 
         assert!(
