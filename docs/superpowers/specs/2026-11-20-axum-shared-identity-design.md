@@ -43,9 +43,20 @@ the shared app once. Cloudflare and Spin retain their unsupported-store startup
 checks and call the core facade for identity operations they expose.
 
 Mount `/_ts/api/v1/ec` in core: same-origin POST accepts a bounded consent
-snapshot (`tcfString`, `gppString`, `applicableSections`; 16 KiB body,
-8 KiB per string, at most 32 section IDs in 1..=65535), replacing only those
-consent signals for the request; it returns private no-store JSON containing only
+snapshot (optional `tcString`, `gppString`, `applicableSections`; 16 KiB body,
+4 KiB effective TCF decoder limit, 8 KiB GPP limit, at most 32 integer section
+IDs in 1..=65535). Unknown fields, including `tcfString`, are rejected. Posted
+values replace only their matching request cookies; omitted fields retain
+those cookies. Present fields must have the declared string or array type;
+null is rejected. Complete posted strings must match the client's cookie-safe
+alphabets (`[A-Za-z0-9._-]+` for TCF, `[A-Za-z0-9._~=-]+` for GPP), so a
+TCF supplementary segment cannot inject another cookie. Posted empty sections clear `__gpp_sid`; absent
+sections retain it, defaulting to empty without a cookie. The client must match
+the 32-entry cap. The `window.__tsjs_prebid.ecRoute` injection remains owed by
+#1622. The shared browser/server JSON fixture lives at
+`crates/trusted-server-js/lib/test/fixtures/ec-route-contract.json` and is POSTed
+through both adapters in conformance tests. An empty browser snapshot makes no
+call; the fixture also tests a server-only `{}` body. The route returns private no-store JSON containing only
 the allowed mirror view. GET returns private 204, never mints or runs providers,
 and can restore an existing SharedID from a readable record. Other methods are
 answered locally. Malformed snapshots return 400, oversized bodies 413,

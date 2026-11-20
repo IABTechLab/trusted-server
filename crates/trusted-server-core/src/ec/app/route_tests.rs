@@ -147,9 +147,7 @@ async fn ec_route_refused_client_with_existing_identity_never_calls_page_provide
             .uri(format!("https://publisher.example.com{EC_PATH}"))
             .header(header::ORIGIN, "https://publisher.example.com")
             .header(header::COOKIE, format!("ts-ec={EXISTING_EC}"))
-            .body(Body::from(
-                json!({"tcfString": null, "gppString": null, "applicableSections": []}).to_string(),
-            ))
+            .body(Body::from(json!({}).to_string()))
             .expect("should build same-origin returning EC request");
         request.extensions_mut().insert(RuntimeRequestOrigin::new(
             InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
