@@ -1,0 +1,109 @@
+{
+  "description": "Exact sendable request shapes from the Prebid consent queue. The empty snapshot makes no client POST; {} is tested as a server-only contract case. TCF timestamps are zero; route conformance disables age checks for these static parser fixtures.",
+  "cases": [
+    {
+      "name": "TCF only",
+      "clientPosts": true,
+      "body": {
+        "tcString": "CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA"
+      },
+      "cookie": "",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": true
+      },
+      "seedIdentity": false
+    },
+    {
+      "name": "GPP only with sections retains TCF grant",
+      "clientPosts": true,
+      "body": {
+        "gppString": "DBABLA~BVQqAAAAAgA.QA",
+        "applicableSections": [7]
+      },
+      "cookie": "euconsent-v2=CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": true
+      },
+      "seedIdentity": false
+    },
+    {
+      "name": "TCF and GPP",
+      "clientPosts": true,
+      "body": {
+        "tcString": "CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA",
+        "gppString": "DBABLA~BVQqAAAAAgA.QA",
+        "applicableSections": [7]
+      },
+      "cookie": "",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": true
+      },
+      "seedIdentity": false
+    },
+    {
+      "name": "Withdrawal replaces TCF grant",
+      "clientPosts": true,
+      "body": {
+        "tcString": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "cookie": "euconsent-v2=CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": false
+      },
+      "seedIdentity": true
+    },
+    {
+      "name": "Empty retains request consent",
+      "clientPosts": false,
+      "body": {},
+      "cookie": "euconsent-v2=CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": true
+      },
+      "seedIdentity": false
+    },
+    {
+      "name": "GPP only retains TCF denial",
+      "clientPosts": true,
+      "body": {
+        "gppString": "DBABLA~BVQqAAAAAgA.QA",
+        "applicableSections": [7]
+      },
+      "cookie": "euconsent-v2=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expected": {
+        "status": 200,
+        "json": {
+          "v": 1,
+          "eids": []
+        },
+        "createsIdentity": false
+      },
+      "seedIdentity": true
+    }
+  ]
+}

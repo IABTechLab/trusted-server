@@ -1,9 +1,13 @@
 #[cfg(test)]
 pub(crate) mod body_read;
 #[cfg(any(test, feature = "test-utils"))]
+pub mod identity_conformance;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod logging;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod publisher_input_cap;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod record_ec;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod scripted_client;
 
@@ -692,11 +696,13 @@ pub mod nextjs_auction {
         ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             Ok(Some(GeoInfo {
                 country: "AU".to_owned(),
-                city: "Example City".to_owned(),
-                continent: "Oceania".to_owned(),
-                latitude: 0.0,
-                longitude: 0.0,
-                metro_code: 0,
+                city: Some("Example City".to_owned()),
+                continent: Some("Oceania".to_owned()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                }),
+                metro_code: Some(0),
                 region: None,
                 asn: None,
             }))

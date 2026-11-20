@@ -210,11 +210,13 @@ pub(crate) fn apply_finalize_headers(
     apply_git_version_header(response);
 
     apply_fastly_version_header(
-        std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+        trusted_server_core::runtime_env!(ENV_FASTLY_SERVICE_VERSION)
+            .ok()
+            .as_deref(),
         response,
     );
 
-    if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+    if trusted_server_core::runtime_env!(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
         response
             .headers_mut()
             .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
@@ -304,7 +306,7 @@ pub(crate) fn per_request_synthesized_headers(
 
     SynthesizedResponseHeaders::new(fields).unwrap_or_else(|error| {
         log::warn!("Keeping only the version headers in the synthesized response headers: {error}");
-        let service_version = std::env::var(ENV_FASTLY_SERVICE_VERSION).ok();
+        let service_version = trusted_server_core::runtime_env!(ENV_FASTLY_SERVICE_VERSION).ok();
         SynthesizedResponseHeaders::new(version_synthesized_headers(service_version.as_deref()))
             .unwrap_or_else(|error| {
                 log::warn!("Synthesizing no response headers: {error}");
@@ -981,12 +983,14 @@ mod tests {
 
     fn sample_geo(city: &str) -> GeoInfo {
         GeoInfo {
-            city: city.to_owned(),
+            city: Some(city.to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_owned()),
             asn: None,
         }

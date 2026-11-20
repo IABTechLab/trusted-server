@@ -72,7 +72,9 @@ pub enum EcKvWriteOutcome {
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
 ///
 /// I/O returns local futures so native backends can yield without blocking the
-/// request runtime. Neither stores nor their futures need to be `Send` or `Sync`.
+/// request runtime. Neither stores nor their futures need to be `Send` or `Sync`;
+/// a store the shared identity app holds across requests must be both (see
+/// [`crate::ec::app::IdentityPlatform`]).
 #[async_trait::async_trait(?Send)]
 pub trait EcKvStore {
     /// Returns the platform store name, used in log and error messages.
@@ -91,6 +93,12 @@ pub trait EcKvStore {
     ///
     /// A completed issuance must be visible even when [`Self::lookup`] lags.
     /// Prefix matches are insufficient and an inconclusive check is an error.
+    /// Logical expiry alone does not prove absence when a previously authorized
+    /// conditional write can still commit against the expired row. Such backends
+    /// must include physically held expired rows in this check for withdrawal
+    /// and orphan protection, even when lookup and listing hide logical expiry.
+    /// Returning `false` must establish that an old generation cannot still
+    /// update the apparently absent row.
     ///
     /// # Implementing this method
     ///
@@ -175,7 +183,7 @@ pub trait EcKvStore {
     async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -184,10 +192,12 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.
+    #[cfg(test)]
     pub(crate) struct WriteFailingEcKv {
         inner: InMemoryEcKv,
     }
 
+    #[cfg(test)]
     impl WriteFailingEcKv {
         pub(crate) fn new() -> Self {
             Self {
@@ -212,6 +222,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for WriteFailingEcKv {
         fn store_name(&self) -> &str {
@@ -255,11 +266,13 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
     /// so tests can prove exactly how many reads a flow performs.
+    #[cfg(test)]
     pub(crate) struct CountingEcKv {
         inner: InMemoryEcKv,
         lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[cfg(test)]
     impl CountingEcKv {
         pub(crate) fn new(
             name: impl Into<String>,
@@ -272,6 +285,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for CountingEcKv {
         fn store_name(&self) -> &str {
@@ -321,12 +335,14 @@ pub(crate) mod test_support {
     ///
     /// With `list_fails` set, the list API errors instead, modelling a store
     /// that can neither find the key nor prove it absent.
+    #[cfg(test)]
     pub(crate) struct StaleLookupEcKv {
         inner: InMemoryEcKv,
         stale_lookups_remaining: Mutex<u32>,
         list_fails: bool,
     }
 
+    #[cfg(test)]
     impl StaleLookupEcKv {
         pub(crate) fn new(name: impl Into<String>, stale_lookups: u32, list_fails: bool) -> Self {
             Self {
@@ -337,6 +353,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for StaleLookupEcKv {
         fn store_name(&self) -> &str {
@@ -497,10 +514,12 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] that fails every operation, mimicking a missing or
     /// unreachable platform store.
+    #[cfg(test)]
     pub(crate) struct FailingEcKv {
         name: String,
     }
 
+    #[cfg(test)]
     impl FailingEcKv {
         pub(crate) fn new(name: impl Into<String>) -> Self {
             Self { name: name.into() }
@@ -514,6 +533,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for FailingEcKv {
         fn store_name(&self) -> &str {

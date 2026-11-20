@@ -232,7 +232,7 @@ interface InjectedManagedUserId {
 }
 
 interface InjectedManagedUserIdStorage {
-  type: 'cookie' | 'html5';
+  type: 'cookie' | 'html5' | 'cookie&html5';
   name: string;
   expires?: number;
   refreshInSeconds?: number;

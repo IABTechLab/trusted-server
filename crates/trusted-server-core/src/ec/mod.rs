@@ -14,6 +14,7 @@
 //!
 //! # Module structure
 //!
+//! - [`app`] — Identity app built once and shared by every adapter
 //! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
@@ -39,8 +40,10 @@ mod auth;
 
 pub mod admin;
 pub mod after_response;
+pub mod app;
 pub mod batch_sync;
 pub mod consent;
+pub mod consent_update;
 pub mod cookies;
 pub mod coordinator;
 pub mod device;
@@ -58,7 +61,10 @@ pub mod partner;
 pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
+pub mod record_backend;
 pub mod registry;
+pub mod sharedid;
+pub mod storage;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -442,7 +448,9 @@ impl EcContext {
     ///
     /// Never writes KV. When `kv` is available, the new row is held as the
     /// pending entry and created by the navigation's single page-load write
-    /// in finalize; the EC is issued only if that write succeeds.
+    /// in finalize, which retries an ID collision with a fresh ID (see
+    /// [`KvIdentityGraph::commit_page_load_create`]); the EC is issued only if
+    /// that write succeeds.
     ///
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
@@ -490,7 +498,7 @@ impl EcContext {
 
         if kv.is_some() {
             // The row is created by the navigation's single page-load write in
-            // finalize; a collision there leaves this EC unissued.
+            // finalize, which retries an ID collision with a fresh ID.
             self.pending_entry = Some(Box::new(entry));
             self.kv_snapshot = EcKvSnapshot::Missing {
                 ec_id: ec_id.clone(),
@@ -670,7 +678,11 @@ impl EcContext {
     }
 
     /// Whether this request still holds its page-load write permit.
-    pub(crate) fn has_navigation_permit(&self) -> bool {
+    ///
+    /// Adapters use this shared decision to dispatch page providers and permit
+    /// orphan recovery before response finalization consumes the permit.
+    #[must_use]
+    pub fn has_navigation_permit(&self) -> bool {
         self.navigation_permit.0.is_some()
     }
 
@@ -1067,7 +1079,7 @@ mod tests {
             None,
             &registry::PartnerRegistry::empty(),
             None,
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         )
         .await;

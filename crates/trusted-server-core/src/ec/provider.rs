@@ -117,6 +117,17 @@ pub trait IdentityProvider: Send + Sync {
         false
     }
 
+    /// Whether a live stored UID is kept over any UID a cookie carries.
+    ///
+    /// For a publisher first-party ID such as `SharedID`, the stored value
+    /// wins over a different browser value and the response writes it back.
+    /// When this returns `true`, a cookie UID for a source the row holds a
+    /// live UID for is ignored; a cookie opt-out still wins. The default
+    /// always takes the cookie.
+    fn keeps_stored_uids(&self) -> bool {
+        false
+    }
+
     /// Whether this provider's request carries the EC ID.
     ///
     /// A provider that does not send it may run on the navigation that mints
@@ -168,6 +179,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn keeps_fresher_stored_uids(&self) -> bool {
         (**self).keeps_fresher_stored_uids()
+    }
+
+    fn keeps_stored_uids(&self) -> bool {
+        (**self).keeps_stored_uids()
     }
 }
 

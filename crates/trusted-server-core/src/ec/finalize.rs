@@ -27,6 +27,10 @@ use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::{PartnerConfig, PartnerRegistry};
+use super::sharedid::{
+    SharedIdRequest, apply_sharedid_write_back, created_sharedid_update,
+    drop_opted_out_sharedid_updates, expire_sharedid_on_denied_consent,
+};
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
 
@@ -49,19 +53,20 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// issued.
 ///
 /// Consent withdrawal is the one exception: on any request carrying the EC
-/// cookie, the KV tombstone is written as the authoritative revocation marker
-/// and the EC cookie is expired once every tombstone is in place (or the row
-/// is proven absent).
+/// cookie, the browser response clears the EC cookie immediately and the KV
+/// tombstone is the authoritative revocation marker.
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
-/// from the request *before* routing consumes it.
+/// from the request *before* routing consumes it. `sharedid` carries the
+/// request's `SharedID` cookies; on a navigation the response writes them
+/// back from the EC record under the `SharedID` consent rules.
 pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
-    sharedid_cookie: Option<&str>,
+    sharedid: &SharedIdRequest,
     response: &mut Response<EdgeBody>,
 ) {
     let navigation = finalize_response_inner(
@@ -70,7 +75,7 @@ pub async fn ec_finalize_response(
         kv,
         registry,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
         response,
     )
     .await;
@@ -210,7 +215,7 @@ async fn finalize_response_inner(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
-    sharedid_cookie: Option<&str>,
+    sharedid: &SharedIdRequest,
     response: &mut Response<EdgeBody>,
 ) -> bool {
     let (permit, after_response) = ec_context
@@ -222,6 +227,7 @@ async fn finalize_response_inner(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
+        expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -236,16 +242,24 @@ async fn finalize_response_inner(
 
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
         let collected = if ec_context.eid_sync_source().is_some() || ec_context.ec_generated() {
-            collect_eid_updates(
-                eids_cookie,
-                sharedid_cookie,
-                ec_context.client_eids(),
-                registry,
+            drop_opted_out_sharedid_updates(
+                collect_eid_updates(
+                    eids_cookie,
+                    sharedid.readable_value(),
+                    ec_context.client_eids(),
+                    registry,
+                ),
+                sharedid,
             )
         } else {
             Vec::new()
         };
         let had_eid_updates = !collected.is_empty();
+        let mut collected = collected;
+        // A reader with no SharedID anywhere gets one in this write.
+        if navigation && let Some(created) = created_sharedid_update(sharedid, registry) {
+            collected.push(created);
+        }
         let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
         let commit = PageLoadCommit {
             settings,
@@ -266,6 +280,11 @@ async fn finalize_response_inner(
         // the page-load write succeeded or had nothing to change.
         if page_write_ok && let Some(after_response) = after_response {
             ec_context.set_after_response_permit(after_response);
+        }
+        // Write-back reads the row as the page-load write left it.
+        if navigation {
+            apply_sharedid_write_back(settings, ec_context, graph, registry, sharedid, response)
+                .await;
         }
     } else if ec_context.ec_generated() {
         // Do not emit a generated EC when there is no KV graph: that would
@@ -333,7 +352,7 @@ async fn commit_generated(
         log::info!("Skipping generated EC: not a page-load navigation");
         return false;
     };
-    let Some(change) = commit.plan(
+    let Some(RowChange::Create(entry)) = commit.plan(
         ec_context,
         commit.ec_id,
         ec_context.kv_snapshot(),
@@ -342,13 +361,17 @@ async fn commit_generated(
         log::warn!("Skipping generated EC: no row change was planned");
         return false;
     };
-    match commit
+    // A collision retries with a fresh ID inside the one page-load write.
+    let outcome = commit
         .graph
-        .commit_page_load(permit, commit.ec_id, change)
-        .await
-    {
-        Ok(committed) => {
-            ec_context.set_kv_snapshot(present_snapshot(commit.ec_id, committed));
+        .commit_page_load_create(permit, (commit.ec_id.to_owned(), entry), || {
+            fresh_create_candidate(commit, ec_context, &new_entry)
+        })
+        .await;
+    match outcome {
+        Ok((ec_id, committed)) => {
+            let snapshot = present_snapshot(&ec_id, committed);
+            ec_context.replace_with_generated(ec_id, snapshot);
             set_ec_cookie_on_response(commit.settings, ec_context, response);
             true
         }
@@ -359,6 +382,34 @@ async fn commit_generated(
                 report.current_context()
             );
             false
+        }
+    }
+}
+
+/// Builds a create candidate for a fresh EC ID: the ID and the row planned
+/// for it from `new_entry`.
+///
+/// Returns `None` when no ID can be generated or no create is planned.
+fn fresh_create_candidate(
+    commit: &PageLoadCommit<'_>,
+    ec_context: &EcContext,
+    new_entry: &KvEntry,
+) -> Option<(String, KvEntry)> {
+    let Some(client_ip) = ec_context.client_ip() else {
+        log::warn!("Fresh EC ID skipped because client IP is unavailable");
+        return None;
+    };
+    let ec_id = generate_ec_id(commit.settings, client_ip)
+        .inspect_err(|err| log::warn!("Fresh EC ID generation failed: {err:?}"))
+        .ok()?;
+    let missing = EcKvSnapshot::Missing {
+        ec_id: ec_id.clone(),
+    };
+    match commit.plan(ec_context, &ec_id, &missing, Some(new_entry)) {
+        Some(RowChange::Create(entry)) => Some((ec_id, entry)),
+        _ => {
+            log::warn!("Fresh EC ID skipped: no row creation was planned");
+            None
         }
     }
 }
@@ -460,8 +511,11 @@ fn gate_eid_updates_by_consent(
 }
 
 /// Replaces a proven-orphaned EC with a new ID whose row is created by this
-/// navigation's single write. One attempt: a collision leaves the orphan in
-/// place for a later navigation.
+/// navigation's single write. An ID collision retries with a fresh ID, up to
+/// [`MAX_CREATE_ATTEMPTS`] attempts; when all fail the orphan stays in place
+/// for a later navigation.
+///
+/// [`MAX_CREATE_ATTEMPTS`]: super::kv::MAX_CREATE_ATTEMPTS
 async fn recover_orphaned_ec(
     commit: &PageLoadCommit<'_>,
     ec_context: &mut EcContext,
@@ -469,19 +523,6 @@ async fn recover_orphaned_ec(
     response: &mut Response<EdgeBody>,
 ) {
     let orphan_id = commit.ec_id.to_owned();
-    let Some(client_ip) = ec_context.client_ip().map(str::to_owned) else {
-        log::warn!("Orphan EC recovery skipped because client IP is unavailable");
-        ec_context.set_kv_snapshot(EcKvSnapshot::Failed { ec_id: orphan_id });
-        return;
-    };
-    let new_id = match generate_ec_id(commit.settings, &client_ip) {
-        Ok(ec_id) => ec_id,
-        Err(err) => {
-            log::warn!("Orphan EC recovery ID generation failed: {err:?}");
-            ec_context.set_kv_snapshot(EcKvSnapshot::Failed { ec_id: orphan_id });
-            return;
-        }
-    };
     let mut new_entry = KvEntry::new(
         ec_context.consent(),
         ec_context.geo_info(),
@@ -492,15 +533,19 @@ async fn recover_orphaned_ec(
         .device_signals()
         .map(super::device::DeviceSignals::to_kv_device);
 
-    let missing = EcKvSnapshot::Missing {
-        ec_id: new_id.clone(),
-    };
-    let Some(change) = commit.plan(ec_context, &new_id, &missing, Some(&new_entry)) else {
-        log::warn!("Orphan EC recovery skipped: no row change was planned");
+    let Some(first) = fresh_create_candidate(commit, ec_context, &new_entry) else {
+        log::warn!("Orphan EC recovery skipped: no replacement ID could be built");
+        ec_context.set_kv_snapshot(EcKvSnapshot::Failed { ec_id: orphan_id });
         return;
     };
-    match commit.graph.commit_page_load(permit, &new_id, change).await {
-        Ok(committed) => {
+    let outcome = commit
+        .graph
+        .commit_page_load_create(permit, first, || {
+            fresh_create_candidate(commit, ec_context, &new_entry)
+        })
+        .await;
+    match outcome {
+        Ok((new_id, committed)) => {
             let snapshot = present_snapshot(&new_id, committed);
             ec_context.replace_with_generated(new_id, snapshot);
             set_ec_cookie_on_response(commit.settings, ec_context, response);
@@ -631,9 +676,9 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBod
 /// The tombstone is a privacy write outside the one-write-per-page-load rule:
 /// it is written on any finalized request (`/auction`, a redirect, a request
 /// without Fetch Metadata), so a withdrawal never waits for a later
-/// navigation. The EC cookie is expired once every row is tombstoned or
-/// proven absent; a failed tombstone keeps the cookie so the next request
-/// retries.
+/// navigation. The EC cookie is expired even when a tombstone fails: a failed
+/// or unavailable tombstone is logged and marks a consent-update response
+/// failed (503).
 async fn finalize_unusable_consent(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -647,39 +692,44 @@ async fn finalize_unusable_consent(
     if !(consent_withdrawn && ec_context.cookie_was_present()) {
         return;
     }
-    let Some(graph) = kv else {
-        // No identity graph holds a row to tombstone, so the cookie is the
-        // only identity state left to clear.
-        expire_ec_cookie(settings, response);
-        return;
-    };
 
-    let mut complete = true;
-    for ec_id in withdrawal_ec_ids(ec_context) {
-        // Only the active ID has a snapshot in the context to start from and
-        // to correct, so post-send work sees the tombstone just written.
-        let initial = if ec_context.kv_snapshot().belongs_to(&ec_id) {
-            ec_context.kv_snapshot().clone()
-        } else {
-            EcKvSnapshot::NotRead
-        };
-        let outcome = graph
-            .tombstone_existing_from_snapshot(&ec_id, initial)
-            .await;
-        if matches!(outcome, EcKvSnapshot::Failed { .. }) {
-            log::warn!(
-                "EC withdrawal tombstone for '{}' failed; keeping the cookie so the next \
-                 request retries",
-                log_id(&ec_id)
-            );
-            complete = false;
-        }
-        if ec_context.ec_value() == Some(ec_id.as_str()) {
-            ec_context.set_kv_snapshot(outcome);
+    expire_ec_cookie(settings, response);
+
+    let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+
+    // The identity-graph tombstone is the authoritative withdrawal marker.
+    // A consent-update acknowledgment must reflect failed/unavailable writes.
+    let mut withdrawal_failed = !ids_to_withdraw.is_empty() && kv.is_none();
+    if let Some(graph) = kv {
+        for ec_id in &ids_to_withdraw {
+            // The graph hands back the post-withdrawal snapshot, so post-send
+            // work that reads the context sees the tombstone just written.
+            // Only the active ID has a snapshot in the context to correct.
+            let initial = if ec_context.kv_snapshot().belongs_to(ec_id) {
+                ec_context.kv_snapshot().clone()
+            } else {
+                EcKvSnapshot::NotRead
+            };
+            let outcome = graph.tombstone_existing_from_snapshot(ec_id, initial).await;
+            // The browser cookie is already cleared, so a failed tombstone
+            // leaves a live row that server-side consumers still read as
+            // consented. Report every failure, including the non-active cookie
+            // ID whose outcome is not retained on the request context.
+            if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                withdrawal_failed = true;
+                log::warn!(
+                    "EC withdrawal tombstone failed for '{}': the identity-graph row may \
+                     still be live with consent granted",
+                    log_id(ec_id)
+                );
+            }
+            if ec_context.ec_value() == Some(ec_id.as_str()) {
+                ec_context.set_kv_snapshot(outcome);
+            }
         }
     }
-    if complete {
-        expire_ec_cookie(settings, response);
+    if withdrawal_failed {
+        super::consent_update::mark_reconciliation_failed(response);
     }
 }
 
@@ -700,6 +750,10 @@ mod tests {
     use base64::Engine as _;
 
     use std::num::NonZeroU16;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+
+    use error_stack::Report;
 
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
@@ -709,8 +763,16 @@ mod tests {
         DropCounts, LookupResults, LookupStatus, OptOutMemory, ProviderLookup,
     };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
+    use crate::ec::kv::MAX_CREATE_ATTEMPTS;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{
+        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    };
+    use crate::ec::kv_types::KvPartnerId;
     use crate::ec::kv_types::{KvEid, KvUid};
     use crate::ec::page_load::NavigationPermit;
+    use crate::ec::sharedid::SharedIdStorage;
+    use crate::error::TrustedServerError;
     use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -863,7 +925,7 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -918,7 +980,7 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -945,10 +1007,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn withdrawal_keeps_the_cookie_when_the_tombstone_write_fails() {
-        // A tombstone write that still fails after its bounded CAS retries
-        // keeps the EC cookie, so the next request that carries it retries;
-        // clearing it would orphan a live row (spec §9.2).
+    async fn withdrawal_still_expires_the_cookie_when_the_store_is_unavailable() {
+        // Cookie expiry is the primary enforcement, so it has to survive a
+        // store that cannot answer at all — the case where the identity-graph
+        // marker is exactly what goes missing.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("dead01");
         let consent = ConsentContext {
@@ -964,7 +1026,6 @@ mod tests {
             entry: Box::new(live_entry()),
             generation: Some(1),
         });
-        ec_context.set_navigation_permit(NavigationPermit::for_test());
         let kv = KvIdentityGraph::failing("test-store");
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", "stale");
@@ -976,14 +1037,15 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
 
+        let set_cookie = get_header_str(&response, "set-cookie").unwrap_or_default();
         assert!(
-            !ec_cookie_emitted(&response),
-            "should keep the EC cookie when the tombstone write fails"
+            set_cookie.contains("Max-Age=0"),
+            "should expire the EC cookie even when the store is unavailable: {set_cookie}"
         );
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1022,7 +1084,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1075,7 +1137,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1110,7 +1172,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1145,7 +1207,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1188,7 +1250,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1252,7 +1314,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1303,7 +1365,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1364,7 +1426,7 @@ mod tests {
                 Some(&graph),
                 &registry,
                 None,
-                Some(cookie_id),
+                &SharedIdRequest::with_value_for_test(cookie_id),
                 &mut response,
             )
             .await;
@@ -1407,7 +1469,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("generated-cookie-id"),
+            &SharedIdRequest::with_value_for_test("generated-cookie-id"),
             &mut response,
         )
         .await;
@@ -1459,7 +1521,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1538,7 +1600,7 @@ mod tests {
             Some(&graph),
             &registry,
             Some(&eids_cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1551,6 +1613,493 @@ mod tests {
         assert!(
             stored.ids.is_empty(),
             "should persist neither the auction body nor the cookie EIDs"
+        );
+    }
+
+    /// Runs a returning navigation's finalize against a live record and
+    /// returns the `SharedID` it stores under `pubcid.org`.
+    async fn stored_sharedid_after_navigation(
+        consent: ConsentContext,
+        sharedid: &SharedIdRequest,
+        client_eids: Vec<Eid>,
+    ) -> Option<String> {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("shrdid");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &consent,
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the live row");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            consent,
+        );
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        ec_context.set_client_eids(client_eids);
+        let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
+            .expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            sharedid,
+            &mut response,
+        )
+        .await;
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .expect("should keep the row");
+        stored.ids.get("pubcid.org").map(|id| id.uid.clone())
+    }
+
+    fn sharedid_body_eid(id: &str) -> Eid {
+        Eid::new(
+            "pubcid.org",
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        )
+    }
+
+    const STORED_SHAREDID: &str = "11111111-2222-4333-8444-555555555555";
+    const OTHER_SHAREDID: &str = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+
+    fn pubcid_request(cookies: &str) -> SharedIdRequest {
+        let req = http::Request::builder()
+            .uri("https://example.com/")
+            .header(http::header::COOKIE, cookies)
+            .body(())
+            .expect("should build request");
+        SharedIdRequest::for_write_back(&SharedIdStorage::Cookie("_pubcid".to_owned()), &req)
+    }
+
+    fn pubcid_set_cookies(response: &Response<EdgeBody>) -> Vec<String> {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("_pubcid"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One `SharedID` write-back case: what the record holds, the request and
+    /// whether it is a navigation.
+    struct WriteBackCase<'a> {
+        consent: ConsentContext,
+        stored: Option<&'a str>,
+        sharedid: SharedIdRequest,
+        navigation: bool,
+        lookups: LookupResults,
+    }
+
+    /// Runs a returning reader's finalize and returns the `_pubcid` cookies
+    /// the response sets and the `SharedID` the record holds afterwards.
+    async fn run_write_back(case: WriteBackCase<'_>) -> (Vec<String>, Option<String>) {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("wrback");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        if let Some(stored) = case.stored {
+            live.ids
+                .insert("pubcid.org".to_owned(), KvPartnerId::single(stored));
+        }
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the live row");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            case.consent,
+        );
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        if case.navigation {
+            ec_context.set_navigation_permit(NavigationPermit::for_test());
+        }
+        ec_context.set_lookup_results(case.lookups);
+        let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
+            .expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            &case.sharedid,
+            &mut response,
+        )
+        .await;
+
+        let stored = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .and_then(|(entry, _)| entry.ids.get("pubcid.org").map(|id| id.uid.clone()));
+        (pubcid_set_cookies(&response), stored)
+    }
+
+    fn navigation_case<'a>(stored: Option<&'a str>, cookies: &str) -> WriteBackCase<'a> {
+        WriteBackCase {
+            consent: granting_consent(),
+            stored,
+            sharedid: pubcid_request(cookies),
+            navigation: true,
+            lookups: LookupResults::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_generated_by_the_provider_is_written_back_in_the_same_navigation() {
+        let generated = KvUid::new(
+            UidValue::try_from(STORED_SHAREDID).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("sharedid")),
+            Expiry::Never,
+        );
+        let lookups = LookupResults::new(
+            &sample_ec_id("wrback"),
+            vec![ProviderLookup {
+                provider: ProviderId::new("sharedid"),
+                status: LookupStatus::Found {
+                    kept: 1,
+                    dropped: DropCounts::default(),
+                },
+                entries: vec![(
+                    SourceDomain::try_from("pubcid.org").expect("should build source"),
+                    vec![KvEid::new(EidFields::default(), vec![generated])],
+                )],
+                cleared: Vec::new(),
+                opt_out: OptOutMemory::Unchanged,
+            }],
+        );
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            lookups,
+            ..navigation_case(None, "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies
+                .first()
+                .is_some_and(|cookie| cookie.starts_with(&format!("_pubcid={STORED_SHAREDID};"))),
+            "should set the SharedID the provider generated in this navigation's write: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_record_present_and_cookie_absent_sets_both_cookies() {
+        let settings = create_test_settings();
+        let domain = settings.publisher.ec_cookie_domain();
+
+        let (cookies, _) = run_write_back(navigation_case(Some(STORED_SHAREDID), "other=1")).await;
+
+        assert_eq!(
+            cookies.len(),
+            2,
+            "should set the cookie and its companion: {cookies:?}"
+        );
+        assert_eq!(
+            cookies[0],
+            format!(
+                "_pubcid={STORED_SHAREDID}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age=31536000"
+            ),
+            "should set the stored SharedID, readable by Prebid, for a year"
+        );
+        assert!(
+            cookies[1].starts_with("_pubcid_cst=")
+                && cookies[1].ends_with("; Path=/; Secure; SameSite=Lax; Max-Age=31536000"),
+            "should set the consent-hash companion: {}",
+            cookies[1]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_unchanged_returning_reader_gets_no_set_cookie() {
+        let (first, _) = run_write_back(navigation_case(Some(STORED_SHAREDID), "other=1")).await;
+        let consent_hash = first[1]
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value.to_owned())
+            .expect("should set a consent hash");
+
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}; _pubcid_cst={consent_hash}"),
+        ))
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should set no cookie for unchanged cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_equal_cookie_without_a_companion_sets_only_the_companion() {
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}"),
+        ))
+        .await;
+
+        assert_eq!(cookies.len(), 1, "should set one cookie: {cookies:?}");
+        assert!(
+            cookies[0].starts_with("_pubcid_cst="),
+            "should re-set only the companion: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_stored_value_wins_over_a_different_cookie() {
+        let (cookies, stored) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={OTHER_SHAREDID}"),
+        ))
+        .await;
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(STORED_SHAREDID),
+            "should keep the stored SharedID"
+        );
+        assert!(
+            cookies[0].starts_with(&format!("_pubcid={STORED_SHAREDID};")),
+            "should restore the stored value in the cookie: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_opt_out_expires_both_cookies() {
+        let (cookies, _) = run_write_back(navigation_case(
+            Some(STORED_SHAREDID),
+            &format!("_pubcid={STORED_SHAREDID}; _pubcid_optout=1"),
+        ))
+        .await;
+
+        assert_eq!(cookies.len(), 2, "should expire both cookies: {cookies:?}");
+        assert!(
+            cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+            "should expire both cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_denied_ec_consent_expires_both_cookies() {
+        let denied = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            ..ConsentContext::default()
+        };
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            consent: denied,
+            ..navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={STORED_SHAREDID}"))
+        })
+        .await;
+
+        assert_eq!(cookies.len(), 2, "should expire both cookies: {cookies:?}");
+        assert!(
+            cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+            "should expire both cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_purpose_four_denied_leaves_the_cookie_alone() {
+        for cookies in ["other=1".to_owned(), format!("_pubcid={OTHER_SHAREDID}")] {
+            let (set, _) = run_write_back(WriteBackCase {
+                consent: purpose_one_only_consent(),
+                ..navigation_case(Some(STORED_SHAREDID), &cookies)
+            })
+            .await;
+
+            assert!(
+                set.is_empty(),
+                "Purpose 4 denied should set no SharedID cookie for `{cookies}`: {set:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_written_on_a_subresource_response() {
+        let (cookies, _) = run_write_back(WriteBackCase {
+            navigation: false,
+            ..navigation_case(Some(STORED_SHAREDID), "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should not write back without a navigation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_written_without_cookie_storage() {
+        let req = http::Request::builder()
+            .uri("https://example.com/")
+            .header(http::header::COOKIE, "other=1")
+            .body(())
+            .expect("should build request");
+
+        let (cookies, _) = run_write_back(WriteBackCase {
+            sharedid: SharedIdRequest::for_write_back(&SharedIdStorage::LocalStorageOnly, &req),
+            ..navigation_case(Some(STORED_SHAREDID), "other=1")
+        })
+        .await;
+
+        assert!(
+            cookies.is_empty(),
+            "should not write a cookie Prebid keeps in local storage"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_created_stored_and_set_on_a_consented_first_visit() {
+        let (cookies, stored) = run_write_back(navigation_case(None, "other=1")).await;
+
+        let created = stored.expect("should store a created SharedID");
+        assert!(
+            uuid::Uuid::parse_str(&created).is_ok_and(|id| id.get_version_num() == 4),
+            "should create a UUID v4 as Prebid writes: {created}"
+        );
+        assert!(
+            cookies
+                .first()
+                .is_some_and(|cookie| cookie.starts_with(&format!("_pubcid={created};"))),
+            "should set the created SharedID: {cookies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharedid_is_not_created_without_consent_storage_or_with_an_opt_out() {
+        let html5_request = || {
+            let req = http::Request::builder()
+                .uri("https://example.com/")
+                .header(http::header::COOKIE, "other=1")
+                .body(())
+                .expect("should build request");
+            SharedIdRequest::for_write_back(&SharedIdStorage::LocalStorageOnly, &req)
+        };
+        let cases = [
+            (
+                "opt-out",
+                WriteBackCase {
+                    sharedid: pubcid_request("_pubcid_optout=1"),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "Purpose 4 denied",
+                WriteBackCase {
+                    consent: purpose_one_only_consent(),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "local storage only",
+                WriteBackCase {
+                    sharedid: html5_request(),
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+            (
+                "subresource",
+                WriteBackCase {
+                    navigation: false,
+                    ..navigation_case(None, "other=1")
+                },
+            ),
+        ];
+
+        for (label, case) in cases {
+            let (cookies, stored) = run_write_back(case).await;
+
+            assert_eq!(stored, None, "should create no SharedID with {label}");
+            assert!(
+                cookies.iter().all(|cookie| cookie.ends_with("Max-Age=0")),
+                "should set no SharedID with {label}: {cookies:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_the_sharedid_cookie_under_pubcid() {
+        let stored = stored_sharedid_after_navigation(
+            granting_consent(),
+            &SharedIdRequest::with_value_for_test("cookie-shared"),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(
+            stored.as_deref(),
+            Some("cookie-shared"),
+            "should store the SharedID cookie under pubcid.org"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_no_sharedid_for_an_opted_out_reader() {
+        let stored = stored_sharedid_after_navigation(
+            granting_consent(),
+            &SharedIdRequest::opted_out_for_test("cookie-shared"),
+            vec![sharedid_body_eid("body-shared")],
+        )
+        .await;
+
+        assert_eq!(
+            stored, None,
+            "should store no SharedID from the cookie or the request EIDs after an opt-out"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finalize_stores_no_sharedid_when_purpose_four_is_denied() {
+        let stored = stored_sharedid_after_navigation(
+            purpose_one_only_consent(),
+            &SharedIdRequest::with_value_for_test("cookie-shared"),
+            vec![sharedid_body_eid("body-shared")],
+        )
+        .await;
+
+        assert_eq!(
+            stored, None,
+            "should store no SharedID with Purpose 1 granted and Purpose 4 denied"
         );
     }
 
@@ -1603,7 +2152,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1670,7 +2219,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1718,7 +2267,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("fallback-cookie-id"),
+            &SharedIdRequest::with_value_for_test("fallback-cookie-id"),
             &mut response,
         )
         .await;
@@ -1760,7 +2309,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            Some("shared-cookie-id"),
+            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
             &mut response,
         )
         .await;
@@ -1810,7 +2359,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1859,7 +2408,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1920,7 +2469,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -1970,7 +2519,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2002,7 +2551,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2026,7 +2575,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2063,7 +2612,7 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2229,7 +2778,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2372,7 +2921,7 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2589,7 +3138,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2619,7 +3168,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2698,7 +3247,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2726,7 +3275,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2753,7 +3302,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2782,7 +3331,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2828,7 +3377,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2890,7 +3439,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2926,7 +3475,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut repeated_response,
         )
         .await;
@@ -2954,7 +3503,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn finalize_withdrawal_keeps_ec_cookie_but_expires_marker_on_kv_failure() {
+    async fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("failw1");
         let consent = ConsentContext {
@@ -2976,7 +3525,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -2993,8 +3542,10 @@ mod tests {
             "KV failure should not change response status"
         );
         assert!(
-            cookies.iter().all(|cookie| !cookie.starts_with("ts-ec=;")),
-            "KV failure should keep the EC cookie so a later navigation can tombstone the row"
+            cookies
+                .iter()
+                .any(|cookie| { cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0") }),
+            "KV failure should not prevent EC cookie deletion"
         );
         assert!(
             cookies.iter().any(|cookie| {
@@ -3022,7 +3573,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3052,7 +3603,7 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3107,7 +3658,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3145,7 +3696,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3188,7 +3739,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3223,7 +3774,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3261,7 +3812,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3277,7 +3828,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn generated_ec_collision_is_not_retried_or_issued() {
+    async fn generated_ec_collision_retries_with_a_fresh_id() {
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
         let mut ec_context = EcContext::new_for_test_with_ip(
@@ -3289,9 +3840,9 @@ mod tests {
             .generate_if_needed(&settings, Some(&graph))
             .await
             .expect("should mint");
-        let ec_id = ec_context.ec_value().expect("should mint").to_owned();
+        let colliding_id = ec_context.ec_value().expect("should mint").to_owned();
         graph
-            .create(&ec_id, &live_entry())
+            .create(&colliding_id, &live_entry())
             .await
             .expect("should seed a colliding row");
         ec_context.set_navigation_permit(NavigationPermit::for_test());
@@ -3303,14 +3854,220 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
 
+        let issued = ec_context.ec_value().expect("should keep an EC").to_owned();
+        assert_ne!(issued, colliding_id, "should retry with a fresh EC ID");
+        assert!(
+            graph
+                .get(&issued)
+                .await
+                .expect("should read the fresh row")
+                .is_some(),
+            "should create the fresh ID's row before issuing it"
+        );
+        assert!(
+            get_header_str(&response, "set-cookie")
+                .is_some_and(|cookie| cookie.starts_with(&format!("ts-ec={issued}"))),
+            "should issue the fresh EC ID"
+        );
+    }
+
+    /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
+    /// precondition failure, forcing a create to retry with a fresh ID.
+    struct AddCollidingEcKv {
+        inner: InMemoryEcKv,
+        collisions_remaining: Mutex<u32>,
+        add_attempts: Mutex<u32>,
+    }
+
+    impl AddCollidingEcKv {
+        fn new(collisions: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("add-colliding-store"),
+                collisions_remaining: Mutex::new(collisions),
+                add_attempts: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for Rc<AddCollidingEcKv> {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
+        }
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+        async fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::Add) {
+                *self
+                    .add_attempts
+                    .lock()
+                    .expect("should lock attempt counter") += 1;
+                let mut remaining = self
+                    .collisions_remaining
+                    .lock()
+                    .expect("should lock collision counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write).await
+        }
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn colliding_graph(collisions: u32) -> (KvIdentityGraph, Rc<AddCollidingEcKv>) {
+        let store = Rc::new(AddCollidingEcKv::new(collisions));
+        (KvIdentityGraph::new(Rc::clone(&store)), store)
+    }
+
+    fn add_attempts(store: &AddCollidingEcKv) -> u32 {
+        *store
+            .add_attempts
+            .lock()
+            .expect("should lock attempt counter")
+    }
+
+    async fn finalize_minted_navigation(
+        settings: &Settings,
+        graph: &KvIdentityGraph,
+        ip: &str,
+    ) -> (EcContext, Response<EdgeBody>) {
+        let mut ec_context =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some(ip.to_owned()));
+        ec_context
+            .generate_if_needed(settings, Some(graph))
+            .await
+            .expect("should mint");
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        let mut response = empty_response();
+        ec_finalize_response(
+            settings,
+            &mut ec_context,
+            Some(graph),
+            &PartnerRegistry::empty(),
+            None,
+            &SharedIdRequest::default(),
+            &mut response,
+        )
+        .await;
+        (ec_context, response)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_retries_id_collision_then_persists() {
+        let settings = create_test_settings();
+        let (graph, store) = colliding_graph(2);
+
+        let (ec, response) = finalize_minted_navigation(&settings, &graph, "192.0.2.5").await;
+
+        assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
+        assert!(ec.ec_generated(), "should mark the EC as generated");
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "generation should seed a present snapshot"
+        );
+        assert_eq!(
+            add_attempts(&store),
+            3,
+            "should make one Add per collision plus the one that lands"
+        );
+        assert!(
+            ec_cookie_emitted(&response),
+            "should issue the EC once its row is persisted"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_errors_after_collision_exhaustion() {
+        let settings = create_test_settings();
+        // Collide on every attempt so the bounded retry is exhausted.
+        let (graph, store) = colliding_graph(u32::MAX);
+
+        let (_ec, response) = finalize_minted_navigation(&settings, &graph, "192.0.2.6").await;
+
+        assert_eq!(
+            add_attempts(&store),
+            MAX_CREATE_ATTEMPTS,
+            "should stop after the bounded number of attempts"
+        );
         assert!(
             !ec_cookie_emitted(&response),
-            "should not issue an EC whose row was not created"
+            "must not issue an EC ID it could not persist"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_recovery_retries_id_collision_then_persists() {
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let (graph, store) = colliding_graph(2);
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            granting_consent(),
+            Some("192.0.2.11".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
+            ec_id: orphaned_ec.clone(),
+        });
+        ec_context.set_navigation_permit(NavigationPermit::for_test());
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            &SharedIdRequest::default(),
+            &mut response,
+        )
+        .await;
+
+        let replacement = ec_context.ec_value().expect("should rotate orphan");
+        assert_ne!(replacement, orphaned_ec, "should rotate to a fresh ID");
+        assert!(
+            graph
+                .get(replacement)
+                .await
+                .expect("should read replacement")
+                .is_some(),
+            "replacement cookie should have a backing row"
+        );
+        assert_eq!(
+            add_attempts(&store),
+            3,
+            "should make one Add per collision plus the one that lands"
+        );
+        assert!(
+            ec_cookie_emitted(&response),
+            "should emit replacement cookie after persistence"
         );
     }
 
@@ -3371,7 +4128,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3393,7 +4150,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn minted_ec_collision_drops_its_lookup_results() {
+    async fn minted_ec_collision_retries_without_its_lookup_results() {
         // Arrange
         let settings = create_test_settings();
         let graph = KvIdentityGraph::in_memory("finalize");
@@ -3411,7 +4168,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3426,9 +4183,16 @@ mod tests {
             !entry.ids.contains_key("provider.example.com"),
             "should not write lookup results into another visitor's row"
         );
+        let issued = ec_context.ec_value().expect("should keep an EC").to_owned();
+        assert_ne!(issued, ec_id, "should retry with a fresh EC ID");
+        let (fresh, _) = graph
+            .get(&issued)
+            .await
+            .expect("should read the fresh row")
+            .expect("should create the fresh row");
         assert!(
-            get_header(&response, "set-cookie").is_none(),
-            "should not issue an EC whose row was not created"
+            !fresh.ids.contains_key("provider.example.com"),
+            "should not carry lookups made for the colliding ID into the fresh row"
         );
     }
 
@@ -3475,7 +4239,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3508,7 +4272,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3539,7 +4303,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3581,7 +4345,7 @@ mod tests {
             Some(&graph),
             &registry_for("partner.example.com"),
             Some(&cookie),
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3614,7 +4378,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3645,7 +4409,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3677,7 +4441,7 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;
@@ -3743,7 +4507,7 @@ mod tests {
             Some(&graph),
             &registry_for("provider.example.com"),
             None,
-            None,
+            &SharedIdRequest::default(),
             &mut response,
         )
         .await;

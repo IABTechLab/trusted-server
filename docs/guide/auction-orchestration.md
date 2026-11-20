@@ -786,6 +786,12 @@ Common provider fields and defaults:
 | `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
 | `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
 
+HTTPS remains the default. The existing plain-HTTP exception for literal
+`127.0.0.1` and `[::1]` endpoints remains available without the opt-in.
+`localhost` and `127.0.0.2` do not qualify for that exception. Other HTTP endpoints
+require that provider's `allow_insecure_http = true`. Credentials, fragments and
+non-HTTP schemes remain invalid even with the opt-in.
+
 A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
 `[::1]`.
 

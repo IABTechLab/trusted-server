@@ -45,19 +45,21 @@ Fastly Compute adapter (WASM binary, `wasm32-wasip1` target):
 
 ### trusted-server-adapter-axum
 
-Native Axum dev/test adapter (native binary):
+Native Axum adapter (native binary):
 
-- Local development and integration-test adapter — not a production-equivalent runtime
-- Platform implementations backed by environment variables instead of Fastly stores
+- Production entry point and local development server. The shared identity app
+  uses a prepared EdgeZero record service for identity and partner APIs
+- Config and secrets are read once at startup from EdgeZero-prepared stores
+  (local files, or AWS AppConfig and Secrets Manager) into read-only snapshots
 - Listens on `http://localhost:8787` by default
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                                    | Axum dev server                                                                                                                                                                                  |
+| Feature                                    | Axum                                                                                                                                                                                             |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
-| Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
-| Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
+| KV store                                   | Generic platform KV unavailable; EC records use the prepared record capability                                                                                                                   |
+| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                      |
+| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                    |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
 | Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                              |
 | Startup failure                            | The process exits non-zero before it listens                                                                                                                                                     |

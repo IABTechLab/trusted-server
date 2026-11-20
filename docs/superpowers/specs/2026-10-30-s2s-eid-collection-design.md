@@ -51,8 +51,13 @@ server-side collection, and both feed the same consent-gated KV row.
   from the page.
 - Proxying vendor identity JavaScript through TS.
 - Concrete vendor implementations (each gets its own spec, see §13.2 F1).
-- Adapters other than Fastly. KV identity remains Fastly-only; Axum,
+- Adapters other than Fastly. Identity providers remain Fastly-only;
   Cloudflare and Spin get this design when EC identity is ported to them.
+  Native (Axum) EC persistence, added separately, refuses to start with an
+  enabled provider. From #1566 up, native and Fastly EC follow the shared
+  async EC rules instead of this design's minting, collision and withdrawal
+  rules (§12.3 "EC minting" and "Withdrawal"); the single page-load write and
+  "backing row before cookie" still hold.
 - Cross-browser linking.
 - Vendor segment products and ad-server targeting.
 - Batch sync and admin write paths, except how batch sync treats a
@@ -325,7 +330,12 @@ never write. They do not receive a permit, so the write API cannot be called
   | `ProviderKind`        | vendor (typed construction) | one per provider kind     | —                                 |
   | `LookupTransport`     | runtime / environment       | `OutboundLookupTransport` | test transport; F4 mock transport |
   | `IdentityCoordinator` | orchestration policy        | `ProviderCoordinator<P>`  | test fake for navigation tests    |
-  | `EcKvStore` (exists)  | KV backend                  | Fastly KV                 | existing in-memory test store     |
+  | `EcKvStore` (exists)  | KV backend                  | core `RecordEcKvStore`    | existing in-memory test store     |
+
+  `RecordEcKvStore` runs over an `EdgeZero` record binding. Fastly selects it
+  through core's `LazyRecordEcKvStore`, which opens the binding on the first
+  EC operation, so a missing store fails only EC work. No adapter crate
+  implements `EcKvStore` outside tests.
 
 - **Static dispatch on the request path.** The coordinator, transport and
   navigation code are generic. The new traits use native `async fn` (with
@@ -1583,21 +1593,33 @@ PR A changes behaviour that operators and integrators can observe:
   top-level publisher navigation: a `GET` with `Sec-Fetch-Dest: document`,
   `Sec-Fetch-Mode: navigate`, no `prefetch` in `Sec-Purpose`, and a response
   that is not a 301, 302, 303, 307 or 308 redirect. Clients without Fetch
-  Metadata get no EC, and integration proxies no longer mint one.
+  Metadata get no EC, and integration proxies no longer mint one. From #1566
+  up the shared async EC rules apply instead: an EC is minted on any browser
+  document navigation (`Sec-Fetch-Dest: document`, or an `Accept` header
+  naming `text/html` without Fetch Metadata; Axum also requires `GET`), and
+  an ID collision on create or orphan recovery retries with a fresh ID, up to
+  five attempts, inside the navigation's one write.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
-  until a later navigation finds its row.
+  until a later navigation finds its row. With an EC KV store, an EC goes to
+  bidders as `user.id` only when the request read a consented row for it
+  (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
 - **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
   `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
   ingests those cookies.
 - **Withdrawal.** The EC cookie is expired only once every tombstone is
   written or the row is proven absent; while a tombstone fails, the cookie is
   kept so the next request retries. On main the cookie was expired first.
+  From #1566 up the shared async EC rule applies instead: an explicit
+  withdrawal expires the cookie even when a tombstone fails, and the failure
+  is logged and marks the consent-update response failed (503).
 - **Vendor consent.** On Fastly, a provider's `tcf_vendor_id` gates every ID
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
-  reports `row_full`. A row written before the cap is trimmed only when a
+  reports `row_full`, and pull sync does not call a partner whose empty source
+  has no room left for its longest UID, so a full row is not pulled for on
+  every navigation; either resumes once pruning frees room. A row written before the cap is trimmed only when a
   write also carries a real change: its largest stored records are dropped
   first, so the change that triggered the write still lands. A provider
   refresh that no longer fits keeps the record it would replace.
