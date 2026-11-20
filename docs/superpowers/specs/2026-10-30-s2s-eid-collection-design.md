@@ -278,7 +278,7 @@ never write. They do not receive a permit, so the write API cannot be called
   still live, and the provider builds its refresh from the stored state
   (`LookupInput::current`). For example, a token provider keeps the vendor's
   refresh token and refreshes the token server side without any login input.
-  Vendor cookies are read first on every navigation; a usable cookie ID is
+  From F1, vendor cookies are read first on every navigation; a usable cookie ID is
   used instead of a refresh request. Refresh state that is empty, over 2048
   bytes or has no stated time is dropped and the UID is kept.
 - Once a UID expires its source is due like any source without a live UID,
@@ -507,8 +507,8 @@ serve that UID after its `exp`, and an older writer that re-saves the row drops
 `eids`, `opt_outs`, `opt_out_uids` and `revocations`. A UID served past its `exp` and dropped `eids` end at the
 next write by new code; a dropped opt-out is lost, so that provider is called
 again. Stored values are built only by validation
-(§8.2) or by deserializing rows TS wrote, so their fields are private to the
-`ec` module and exposed through accessors.
+(§8.2) or by deserializing rows TS wrote, so `KvEid` and `KvUid` fields are
+private to the `ec` module and exposed through accessors.
 
 ```rust
 /// A partner ID record within a KV entry, keyed by source domain.
@@ -614,9 +614,9 @@ The in-process `crate::openrtb::Eid` gains optional `inserter`, `matcher`,
 
 | Location                                   | Contents                                                                                                                                                 |
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trusted-server-core` `ec::eid_types`      | Value types and stored row types (§6).                                                                                                                   |
+| `trusted-server-core` `ec::eid_types`      | Value types (§6.2); stored row types are in `ec::kv_types` (§6.3).                                                                                       |
 | `trusted-server-core` `ec::provider`       | `IdentityProvider`, `ProviderKind`, the generic `build_kind` helper, input and output types, errors. No vendor code.                                     |
-| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`, validation, merge, mirror encoding.                       |
+| `trusted-server-core` `ec::coordinator`    | `IdentityCoordinator`, `ProviderCoordinator<P>`, `LookupTransport`, `OutboundLookupTransport`, validation. Merge lives in `ec::write_plan`.              |
 | `crates/trusted-server-identity-providers` | One module per provider kind, each implementing `ProviderKind` and `IdentityProvider`, and one `build` function that matches `kind` to a `ProviderKind`. |
 | `trusted-server-adapter-fastly`            | Builds providers through the provider crate and a `ProviderCoordinator` at startup, and drives the navigation path with `OutboundLookupTransport`.       |
 
@@ -946,7 +946,8 @@ The coordinator owns, for every provider:
    `LookupTransport` and gathered until all complete or the shared deadline
    passes. Late responses are dropped (§8.1.1).
 5. **Validation** (§8.2), **merge** (§8.3) and preparing the single write.
-6. **Mirror** encoding (§10) from the row as it stands after the navigation.
+6. **Mirror** encoding (§10) from the row as it stands after the navigation,
+   which PR B builds outside the coordinator in `ec::mirror`.
 7. **Logs and metrics** (§12).
 
 #### 8.1.1 `LookupTransport`
@@ -1012,8 +1013,8 @@ pub enum TransportError {
 impl core::error::Error for TransportError {}
 ```
 
-`OutboundLookupTransport` holds an `EdgeZero` `HttpClient` and its
-`MonotonicClock`, as the auction fan-out does. `start` builds every lookup as a
+`OutboundLookupTransport` holds an `EdgeZero` `HttpClient` and takes its cutoff
+from that client's clock, as the auction fan-out does. `start` builds every lookup as a
 buffered request with the budget as its total timeout, a 64 KiB response cap,
 response decoding and a cache bypass, then starts them all with
 `HttpClient::start_batch_until` and a cutoff of `clock.deadline_after(budget)`.
@@ -1030,7 +1031,8 @@ client and clock.
 
 The navigation path depends on the `IdentityCoordinator` trait, generic over
 the coordinator and the transport. The trait covers the coordinator's whole
-surface on a navigation: start lookups and collect them (PR B adds the mirror).
+surface on a navigation: start lookups and collect them. PR B builds the mirror
+with the free function `ec::mirror::build_mirror` (§10), not on this trait.
 It does not plan the row change: the free function `write_plan::plan_write`
 merges the results and plans it. Its production implementation is
 `ProviderCoordinator<P>`. Tests of coordinator rules (validation, merge,
@@ -1042,9 +1044,10 @@ those rules are not under test.
 /// Coordinates server-side identity lookups for one navigation.
 ///
 /// Implementations own eligibility, consent, destination checks, the shared
-/// time budget, validation, merging and mirror encoding. Providers never see
-/// KV, cookies, HTTP or the clock. Implementations never write KV: the caller
-/// plans the change with `plan_write` and spends the [`PageLoadWrite`] permit.
+/// time budget and validation. Providers never see KV, HTTP or the clock, and
+/// see cookies only as `RequestCookies`. Implementations never write KV: the
+/// caller plans the change with `plan_write` and spends the [`PageLoadWrite`]
+/// permit. The mirror is built by `ec::mirror::build_mirror`.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -1241,7 +1244,7 @@ where
         }
     }
     // `ec_finalize_response` then applies the mirror (§10) with
-    // `ec::mirror::build_mirror(row, consent, partners, now)`.
+    // `ec::mirror::build_mirror(row, ec_context, partners, now)`.
     ec.apply_cookies(&mut response, row.as_ref());
     response
 }
@@ -1452,11 +1455,13 @@ still due.
   EID-level and UID-level fields. A source's UIDs are left out while the
   request denies consent to any TCF vendor gating that source: the
   `tcf_vendor_id` of every configured provider claiming it, enabled or
-  disabled (§8.6).
+  disabled (§8.6). It also leaves out a source a provider excludes where GDPR
+  applies on a GDPR visit, or whose provider cookies on the request record an
+  opt-out.
 - **Fill order:** sources in `[[ec.partners]]` config order; entries and UIDs in
   stored order. Each UID is added if the encoded value still fits; otherwise it
   is skipped and filling continues. KV keeps the complete set.
-- **Built** by `ec::mirror::build_mirror(row, consent, partners, now)`, called
+- **Built** by `ec::mirror::build_mirror(row, ec_context, partners, now)`, called
   from `ec_finalize_response`, on consented navigations from the row as it
   stands after the navigation: the committed row, or the snapshot when no
   write landed. It is **set** only when its value differs from the one the
@@ -1467,7 +1472,8 @@ still due.
   on a navigation whose mirror would be empty; and, where the mirror cannot be
   rebuilt (non-navigations, or a navigation whose row cannot be read), when it
   holds UIDs of a mirrored partner with a gating TCF vendor the request
-  denies or a source excluded where GDPR applies on a GDPR visit. A carried
+  denies, a source excluded where GDPR applies on a GDPR visit, or one a
+  provider's cookies on the request opt out of. A carried
   value that does not decode is treated as holding them whenever any
   mirrored partner is so withheld.
 - **Left untouched** on a navigation whose row cannot be read authoritatively
@@ -1580,7 +1586,9 @@ PR A changes behaviour that operators and integrators can observe:
   Metadata get no EC, and integration proxies no longer mint one.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
-  until a later navigation finds its row.
+  until a later navigation finds its row. With an EC KV store, an EC goes to
+  bidders as `user.id` only when the request read a consented row for it
+  (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
 - **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
   `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
   ingests those cookies.
@@ -1591,7 +1599,9 @@ PR A changes behaviour that operators and integrators can observe:
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
-  reports `row_full`. A row written before the cap is trimmed only when a
+  reports `row_full`, and pull sync does not call a partner whose empty source
+  has no room left for its longest UID, so a full row is not pulled for on
+  every navigation; either resumes once pruning frees room. A row written before the cap is trimmed only when a
   write also carries a real change: its largest stored records are dropped
   first, so the change that triggered the write still lands. A provider
   refresh that no longer fits keeps the record it would replace.
