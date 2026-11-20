@@ -364,6 +364,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    crate::proxy_policy::CompiledProxyPolicy::compile(&settings.proxy.identity_endpoints)?;
     warn_ignored_certificate_check(settings);
     warn_ignored_origin_readthrough(settings);
     warn_origin_url_userinfo(settings);

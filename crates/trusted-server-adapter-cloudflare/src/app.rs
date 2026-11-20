@@ -210,10 +210,11 @@ fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -684,7 +685,8 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             .get(
                 "/first-party/proxy",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_first_party_proxy(&s.settings, &services, req).await
+                    let ec = build_ec_context(&s.settings, &services, &req);
+                    handle_first_party_proxy(&s.settings, &services, &ec, req).await
                 }),
             )
             .get(

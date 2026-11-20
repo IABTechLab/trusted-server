@@ -1603,7 +1603,7 @@ mod tests {
 
         assert!(!config.copy_request_headers);
         assert!(!config.follow_redirects);
-        assert!(!config.forward_ec_id);
+        assert!(config.query_identity == crate::proxy_policy::ProxyQueryIdentity::Disabled);
         assert!(config.stream_passthrough);
         assert!(config.stream_response);
 

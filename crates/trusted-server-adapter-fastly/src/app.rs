@@ -242,8 +242,9 @@ pub(crate) fn load_settings_from_config_store(
 }
 
 pub(crate) fn build_state_from_settings(
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
     // Each request's synthesized set leaves these entries out at debug, so
@@ -983,7 +984,7 @@ async fn run_named_route(
             .await
         }
         NamedRouteHandler::FirstPartyProxy => {
-            handle_first_party_proxy(&state.settings, services, req).await
+            handle_first_party_proxy(&state.settings, services, &ec.ec_context, req).await
         }
         NamedRouteHandler::FirstPartyClick => {
             handle_first_party_click(&state.settings, services, req).await
@@ -1689,6 +1690,8 @@ mod tests {
     use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::ec::eid_types::SourceDomain;
+    use trusted_server_core::ec::kv::KvIdentityGraph;
+    use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::provider::{
         CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
@@ -4295,6 +4298,127 @@ mod tests {
             observed.server_region.as_deref(),
             Some("US-East"),
             "filter should see the captured server region"
+        );
+    }
+
+    #[test]
+    fn proxy_policy_named_route_preserves_withdrawal_and_terminal_privacy() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        let graph = KvIdentityGraph::new(crate::ec_kv::FastlyEcKvStore::new("ec_identity_store"));
+        let identity = format!("{}.Pd1234", "9".repeat(64));
+        let mut entry = KvEntry::tombstone(1_700_000_000);
+        entry.consent.ok = true;
+        block_on(graph.create(&identity, &entry)).expect("should seed a live test identity");
+        let state = app_state_for_settings(settings.clone());
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut request = empty_request(
+            Method::GET,
+            "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=invalid",
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-ec={identity}; us_privacy=1YYN"))
+                .expect("should attach withdrawal cookies"),
+        );
+        request
+            .headers_mut()
+            .insert("sec-gpc", HeaderValue::from_static("1"));
+        // The geo the entry point's lookup would hold for a US privacy state.
+        let geo = GeoInfo {
+            country: "US".to_owned(),
+            region: Some("CA".to_owned()),
+            city: "Example City".to_owned(),
+            continent: "NA".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            asn: None,
+        };
+        let origin = ScriptedHttpClient::forbidding();
+        insert_outbound_client(&mut request, HttpClient::with_client(origin.clone()));
+        request
+            .extensions_mut()
+            .insert(RequestGeo::new(None, Some(geo)));
+        request.extensions_mut().insert(ClientInfo::default());
+        let mut response = block_on(router.oneshot(request)).expect("should route request");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should preserve the existing invalid-signature status"
+        );
+        {
+            let finalize = response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .expect("should retain normal named-route finalization state");
+            assert!(
+                finalize.use_finalize_kv,
+                "should keep authoritative withdrawal writes even without browser signals"
+            );
+            assert!(
+                !finalize.ec_context.ec_generated(),
+                "should not mint identity on an asset request"
+            );
+        }
+        response.extensions_mut().insert(RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, max-age=600"),
+                HeaderMutation::set("etag", "late-filter-validator"),
+            ],
+        });
+        let counters = crate::sandbox::SandboxCounters {
+            ordinal: 1,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        // The actual entry-point finalizer: EC finalization, then the late
+        // request-filter effects and the terminal privacy that must survive them.
+        crate::finalize_response(
+            &mut response,
+            &crate::FinalizeInputs {
+                state: &state,
+                geo: None,
+                counters: &counters,
+            },
+        );
+        origin.assert_no_requests();
+        let record = block_on(graph.get(&identity))
+            .expect("should read withdrawn record")
+            .expect("should retain a tombstone")
+            .0;
+        assert!(
+            !record.consent.ok,
+            "should tombstone the identity through normal route finalization"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0"))),
+            "should expire the withdrawn EC cookie"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("should set privacy"),
+            "no-store, private",
+            "should retain terminal privacy after late filters"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should remove late identity validators"
         );
     }
 
