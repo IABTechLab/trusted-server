@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::consent::ConsentContext;
 use crate::consent::allows_eid_persistence;
+use crate::ec::EcContext;
 use crate::ec::consent::ec_consent_granted;
 use crate::ec::eid_types::{Expiry, UnixSeconds};
 use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
@@ -38,8 +39,9 @@ impl MirrorValue {
 ///
 /// Holds live, provider-written UIDs of partners with both
 /// `bidstream_enabled` and `mirror_enabled` while no TCF vendor gating the
-/// source is denied consent and no provider excludes it where GDPR applies
-/// for this visitor, in partner config order, as unpadded base64url JSON
+/// source is denied consent, no provider excludes it where GDPR applies for
+/// this visitor and no provider's cookies on this request record an opt-out
+/// for it, in partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
@@ -53,10 +55,11 @@ impl MirrorValue {
 #[must_use]
 pub fn build_mirror(
     row: Option<&KvEntry>,
-    consent: &ConsentContext,
+    ec_context: &EcContext,
     partners: &PartnerRegistry,
     now: UnixSeconds,
 ) -> MirrorCookie {
+    let consent = ec_context.consent();
     let Some(row) = row.filter(|row| row.consent.ok && mirror_consent(consent)) else {
         return MirrorCookie::Expire;
     };
@@ -65,12 +68,14 @@ pub fn build_mirror(
     // page while a TCF vendor gating its source (that of any configured
     // provider claiming it, enabled or disabled) is denied consent, or while
     // a provider excludes its source where GDPR applies, as it never reaches
-    // the bidstream (`KvEntry::live_eids`).
+    // the bidstream (`KvEntry::live_eids`). Nor while the provider's cookies
+    // on this request record an opt-out the row may not reflect yet.
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
             && partner.mirror_enabled
             && !partner.owner_vendor_consent_denied(consent)
             && !partner.excluded_for(consent)
+            && !ec_context.source_opted_out_in_cookies(&partner.source_domain)
     }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
             continue;
@@ -300,6 +305,10 @@ mod tests {
         }
     }
 
+    fn context(consent: ConsentContext) -> EcContext {
+        EcContext::new_for_test(None, consent)
+    }
+
     fn decode(value: &MirrorValue) -> Value {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(value.as_str())
@@ -316,7 +325,7 @@ mod tests {
 
         let MirrorCookie::Set(value) = build_mirror(
             Some(&entry),
-            &granting(),
+            &context(granting()),
             &partners(true),
             UnixSeconds::new(1000),
         ) else {
@@ -339,7 +348,7 @@ mod tests {
             matches!(
                 build_mirror(
                     Some(&entry),
-                    &ConsentContext::default(),
+                    &context(ConsentContext::default()),
                     &partners(true),
                     now
                 ),
@@ -349,17 +358,58 @@ mod tests {
         );
         assert!(
             matches!(
-                build_mirror(Some(&entry), &granting(), &partners_with(false, false), now),
+                build_mirror(
+                    Some(&entry),
+                    &context(granting()),
+                    &partners_with(false, false),
+                    now
+                ),
                 MirrorCookie::Expire
             ),
             "should expire for non-bidstream sources"
         );
         assert!(
             matches!(
-                build_mirror(None, &granting(), &partners(true), now),
+                build_mirror(None, &context(granting()), &partners(true), now),
                 MirrorCookie::Expire
             ),
             "should expire without a row"
+        );
+    }
+
+    #[test]
+    fn withholds_uids_of_a_source_opted_out_in_provider_cookies() {
+        // Arrange: the row still holds the UID; the provider's cookies on this
+        // request record an opt-out that a later write clears it for.
+        let entry = row(vec![uid("live", Expiry::Never)]);
+        let mut opted_out = context(granting());
+        opted_out.set_cookie_opted_out_sources(vec!["IDS.example.com".to_owned()]);
+        let mut other_opted_out = context(granting());
+        other_opted_out.set_cookie_opted_out_sources(vec!["other.example.com".to_owned()]);
+
+        // Act
+        let withheld = build_mirror(
+            Some(&entry),
+            &opted_out,
+            &partners(true),
+            UnixSeconds::new(1000),
+        );
+        let kept = build_mirror(
+            Some(&entry),
+            &other_opted_out,
+            &partners(true),
+            UnixSeconds::new(1000),
+        );
+
+        // Assert
+        assert_eq!(
+            withheld,
+            MirrorCookie::Expire,
+            "should not mirror a source its provider's cookies opt out of"
+        );
+        assert!(
+            matches!(kept, MirrorCookie::Set(_)),
+            "should still mirror when another source is opted out"
         );
     }
 
@@ -369,7 +419,7 @@ mod tests {
 
         let mirror = build_mirror(
             Some(&entry),
-            &granting(),
+            &context(granting()),
             &partners_with(true, false),
             UnixSeconds::new(1000),
         );
@@ -401,13 +451,13 @@ mod tests {
 
         let denied = build_mirror(
             Some(&entry),
-            &consent_granting_vendors(vec![1]),
+            &context(consent_granting_vendors(vec![1])),
             &registry,
             now,
         );
         let granted = build_mirror(
             Some(&entry),
-            &consent_granting_vendors(vec![9999]),
+            &context(consent_granting_vendors(vec![9999])),
             &registry,
             now,
         );
@@ -435,11 +485,11 @@ mod tests {
 
         let gdpr = build_mirror(
             Some(&entry),
-            &consent_granting_vendors(Vec::new()),
+            &context(consent_granting_vendors(Vec::new())),
             &registry,
             now,
         );
-        let elsewhere = build_mirror(Some(&entry), &granting(), &registry, now);
+        let elsewhere = build_mirror(Some(&entry), &context(granting()), &registry, now);
 
         assert_eq!(
             gdpr,
@@ -482,13 +532,13 @@ mod tests {
         // Act
         let owner_only = build_mirror(
             Some(&entry),
-            &consent_granting_vendors(vec![7]),
+            &context(consent_granting_vendors(vec![7])),
             &registry,
             now,
         );
         let both = build_mirror(
             Some(&entry),
-            &consent_granting_vendors(vec![7, 42]),
+            &context(consent_granting_vendors(vec![7, 42])),
             &registry,
             now,
         );
@@ -521,7 +571,12 @@ mod tests {
         .expect("should build partner");
         let pull = PartnerRegistry::from_config(&[pull_partner]).expect("should build registry");
 
-        let mirror = build_mirror(Some(&entry), &granting(), &pull, UnixSeconds::new(1000));
+        let mirror = build_mirror(
+            Some(&entry),
+            &context(granting()),
+            &pull,
+            UnixSeconds::new(1000),
+        );
 
         assert_eq!(
             mirror,
@@ -537,7 +592,7 @@ mod tests {
 
         let decision = build_mirror(
             Some(&entry),
-            &granting(),
+            &context(granting()),
             &partners(true),
             UnixSeconds::new(1000),
         );
@@ -563,7 +618,7 @@ mod tests {
 
         let MirrorCookie::Set(value) = build_mirror(
             Some(&entry),
-            &granting(),
+            &context(granting()),
             &partners(true),
             UnixSeconds::new(1000),
         ) else {
@@ -589,7 +644,7 @@ mod tests {
 
         let MirrorCookie::Set(value) = build_mirror(
             Some(&entry),
-            &granting(),
+            &context(granting()),
             &partners(true),
             UnixSeconds::new(1000),
         ) else {
@@ -620,7 +675,7 @@ mod tests {
 
             let MirrorCookie::Set(value) = build_mirror(
                 Some(&entry),
-                &granting(),
+                &context(granting()),
                 &partners(true),
                 UnixSeconds::new(1000),
             ) else {

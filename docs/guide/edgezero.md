@@ -97,7 +97,7 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
   60 s for a streamed one. A redirect chain also has a 60 s deadline. EdgeZero
   enforces the connect timeout natively on Fastly only. On Axum, Cloudflare,
   and Spin it is best effort, and the total timeout still bounds the request.
-- Origin TLS is always verified.
+- TLS is always verified on every outbound HTTPS request.
 - A request that sets no `Accept-Encoding` carries `Accept-Encoding: identity`.
 - Hop-by-hop fields, and fields that `Connection` names, never reach an
   upstream or come back from one. A request or response header whose value is
