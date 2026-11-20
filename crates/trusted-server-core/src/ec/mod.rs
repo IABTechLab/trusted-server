@@ -60,6 +60,7 @@ pub mod partner;
 pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
+pub mod record_backend;
 pub mod registry;
 pub mod sharedid;
 pub mod write_plan;

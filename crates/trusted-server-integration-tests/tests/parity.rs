@@ -2323,6 +2323,7 @@ mod trace_parity {
             HttpClient::with_client(outbound.clone()),
         )
         .expect("should build native Axum forwarded routes");
+        let executor = AxumOutboundExecutor::new();
         for duplicate in [false, true] {
             let request = forwarded_request("/_ts/trace/enable");
             let (mut parts, _) = request.into_parts();
@@ -2337,10 +2338,6 @@ mod trace_parity {
                     http::HeaderValue::from_static(FORWARDER_SECRET),
                 );
             }
-            // The converted request carries a client bound to this executor,
-            // but the router-state script answers every outbound call, so the
-            // executor never runs.
-            let executor = AxumOutboundExecutor::new();
             let request = into_core_request(
                 AxumRequest::from_parts(parts, AxumBody::empty()),
                 executor.handle(),
