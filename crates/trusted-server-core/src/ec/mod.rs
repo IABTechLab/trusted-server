@@ -111,7 +111,8 @@ use self::page_load::{AfterResponseWrite, NavigationPermit};
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
 /// admitted SPA navigation. Only a publisher navigation holding a
 /// [`NavigationPermit`] persists the cookies; `Auction` and `PageBids` read them
-/// for bidders only. Challenged or blocked requests remain unclassified.
+/// for bidders only. `Auction` also saves the EIDs its request body carried to
+/// a live row, filling missing partner UIDs. Challenged or blocked requests remain unclassified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
