@@ -325,13 +325,33 @@ The shared identity app serves this endpoint on Fastly and Axum. It is always
 answered locally and uses the configured record service. Without application
 identity storage it returns `501`. Every response is private and `no-store`.
 
-A same-origin `POST` accepts a JSON snapshot with `tcfString`, `gppString` and
-`applicableSections`. Nullable strings replace the corresponding consent
-cookies for this request; a missing consent grant stays denied where required.
-The body limit is 16 KiB, each signal is limited to 8 KiB, and at most 32 GPP
-section IDs in `1..=65535` are accepted. Malformed snapshots return `400`,
-oversized bodies `413`, and missing or cross-site `Origin` returns `403` before
-record or provider work.
+A same-origin `POST` accepts a JSON snapshot with optional `tcString`,
+`gppString` and `applicableSections` fields. `tcString` follows the IAB
+`__tcfapi` name; `tcfString` and other unknown fields are rejected. A posted
+string replaces its matching request cookie (`euconsent-v2` or `__gpp`).
+Omitted fields retain their matching request cookies, including `__gpp_sid`
+when sections are omitted. Present fields must have the declared string or
+array type; null is rejected. Posted
+`applicableSections` replaces `__gpp_sid`; an empty array clears that hint.
+Sections default to empty when neither a posted array nor a request cookie
+exists. Missing consent still stays denied where required.
+
+Posted strings must use the client's cookie-safe alphabets: `[A-Za-z0-9._-]+`
+for TCF and `[A-Za-z0-9._~=-]+` for GPP. The complete string is validated before
+reconstructing request cookies, including any TCF supplementary segments.
+
+The body limit is 16 KiB. TCF strings have an effective 4 KiB decoder limit;
+GPP strings are limited to 8 KiB. A posted sections array accepts at most
+32 integer IDs, each in `1..=65535`. The browser client must match this cap.
+Malformed snapshots return `400`, oversized bodies `413`, and missing or
+cross-site `Origin` returns `403` before record or provider work.
+
+The shared request/response fixture is
+`crates/trusted-server-js/lib/test/fixtures/ec-route-contract.json`; Axum and
+Fastly conformance tests POST each case through their real routes. An empty
+client snapshot makes no call; the fixture also covers a server-only `{}` POST.
+The `window.__tsjs_prebid.ecRoute` injection is still owed by the browser
+consent script work in #1622; this PR supplies the server contract.
 
 With consent and no EC, the app creates the record before setting `ts-ec`.
 SharedID and mirror cookies follow their existing consent, configuration and
@@ -343,9 +363,12 @@ The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
 excluding expired, non-mirrored and vendor-denied IDs.
 
 `GET` returns an empty `204` and can restore an existing SharedID cookie from
-the record. It never creates an EC, changes consent or runs providers. Other
-methods return `405` with `Allow: GET, POST`. Browser CMP capture and ordered
-client consent updates are qualified separately from this server contract.
+its record only when current EC and EID permission both allow. It never
+creates an EC, changes consent or runs providers. A denied GET emits no identity
+cookies and leaves the stored record unchanged; consent reconciliation and
+withdrawal use POST. Other methods return `405` with `Allow: GET, POST`.
+Browser CMP capture and ordered client consent updates are qualified separately
+from this server contract.
 
 ---
 

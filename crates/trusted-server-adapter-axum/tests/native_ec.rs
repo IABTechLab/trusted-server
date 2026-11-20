@@ -825,10 +825,8 @@ fn ec_post(cookie: Option<&str>) -> Request {
             .parse()
             .expect("should set same origin"),
     );
-    *req.body_mut() = Body::from(
-        serde_json::to_vec(&json!({"tcfString":null,"gppString":null,"applicableSections":[]}))
-            .expect("should encode consent snapshot"),
-    );
+    *req.body_mut() =
+        Body::from(serde_json::to_vec(&json!({})).expect("should encode consent snapshot"));
     req
 }
 

@@ -139,7 +139,13 @@ impl Adapter for FastlyAdapter {
     }
 
     fn exchange(&mut self, request: &ApiRequest) -> ApiObservation {
-        self.execute(&Navigation::default(), Some(request))
+        self.execute(
+            &Navigation {
+                geo: request.geo,
+                ..Navigation::default()
+            },
+            Some(request),
+        )
     }
 }
 
@@ -180,18 +186,22 @@ impl FastlyAdapter {
                 reply.body(DOCUMENT)
             },
         );
-        let geo = (navigation.geo == Geo::Gdpr).then(|| GeoInfo {
-            country: "DE".to_owned(),
-            city: None,
-            continent: Some("EU".to_owned()),
-            coordinates: Some(GeoCoordinates {
-                latitude: 0.0,
-                longitude: 0.0,
+        let geo = match navigation.geo {
+            Geo::Gdpr => Some(GeoInfo {
+                country: "DE".to_owned(),
+                city: None,
+                continent: Some("EU".to_owned()),
+                coordinates: Some(GeoCoordinates {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                }),
+                metro_code: Some(0),
+                region: None,
+                asn: None,
             }),
-            metro_code: Some(0),
-            region: None,
-            asn: None,
-        });
+            Geo::UsCalifornia => Some(GeoInfo::country_region("US", Some("CA".to_owned()))),
+            Geo::Missing | Geo::Failed => None,
+        };
         let counters = SandboxCounters {
             ordinal: 1,
             builds: 1,

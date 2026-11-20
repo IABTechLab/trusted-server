@@ -31,9 +31,22 @@ const MAX_SIGNAL: usize = 8 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ConsentSnapshot {
+    #[serde(default, rename = "tcString", deserialize_with = "posted_field")]
     tcf_string: Option<String>,
+    #[serde(default, deserialize_with = "posted_field")]
     gpp_string: Option<String>,
-    applicable_sections: Vec<i32>,
+    #[serde(default, deserialize_with = "posted_field")]
+    applicable_sections: Option<Vec<i32>>,
+}
+
+// Keep omission distinct from a posted empty array; posted fields must have
+// their declared type, so null cannot silently stand in for a CMP reading.
+fn posted_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl IdentityApp {
@@ -105,7 +118,9 @@ impl IdentityApp {
             let mut response = response(StatusCode::NO_CONTENT);
             if let Ok(mut identity) = self.read_request(services, &request) {
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
-                if let Some(graph) = identity.graph.as_ref() {
+                if identity.context.ec_allowed()
+                    && let Some(graph) = identity.graph.as_ref()
+                {
                     apply_sharedid_write_back(
                         &self.settings,
                         &mut identity.context,
@@ -216,15 +231,23 @@ async fn prepare_snapshot(
     let snapshot: ConsentSnapshot =
         serde_json::from_slice(&bytes).map_err(|_| Box::new(response(StatusCode::BAD_REQUEST)))?;
     if snapshot.tcf_string.as_ref().is_some_and(|value| {
-        value.len() > MAX_SIGNAL || crate::consent::tcf::decode_tc_string(value).is_err()
+        value.len() > MAX_SIGNAL
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            || crate::consent::tcf::decode_tc_string(value).is_err()
     }) || snapshot.gpp_string.as_ref().is_some_and(|value| {
-        value.len() > MAX_SIGNAL || crate::consent::gpp::decode_gpp_string(value).is_err()
-    }) || snapshot.applicable_sections.len() > 32
-        || snapshot
-            .applicable_sections
-            .iter()
-            .any(|id| !(1..=65535).contains(id))
-        || (snapshot.gpp_string.is_none() && !snapshot.applicable_sections.is_empty())
+        value.len() > MAX_SIGNAL
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._~=-".contains(&byte))
+            || crate::consent::gpp::decode_gpp_string(value).is_err()
+    }) || snapshot
+        .applicable_sections
+        .as_ref()
+        .is_some_and(|sections| {
+            sections.len() > 32 || sections.iter().any(|id| !(1..=65535).contains(id))
+        })
     {
         return Err(Box::new(response(StatusCode::BAD_REQUEST)));
     }
@@ -235,7 +258,13 @@ async fn prepare_snapshot(
             .map_err(|_| Box::new(response(StatusCode::BAD_REQUEST)))?;
         for pair in value.split(';').map(str::trim) {
             let name = pair.split_once('=').map_or(pair, |(name, _)| name.trim());
-            if !["euconsent-v2", "__gpp", "__gpp_sid"].contains(&name) {
+            let replaced = match name {
+                "euconsent-v2" => snapshot.tcf_string.is_some(),
+                "__gpp" => snapshot.gpp_string.is_some(),
+                "__gpp_sid" => snapshot.applicable_sections.is_some(),
+                _ => false,
+            };
+            if !replaced {
                 cookies.push(pair.to_owned());
             }
         }
@@ -246,11 +275,12 @@ async fn prepare_snapshot(
     if let Some(gpp) = snapshot.gpp_string {
         cookies.push(format!("__gpp={gpp}"));
     }
-    if !snapshot.applicable_sections.is_empty() {
+    if let Some(sections) = snapshot.applicable_sections
+        && !sections.is_empty()
+    {
         cookies.push(format!(
             "__gpp_sid={}",
-            snapshot
-                .applicable_sections
+            sections
                 .iter()
                 .map(i32::to_string)
                 .collect::<Vec<_>>()
@@ -279,4 +309,114 @@ fn response(status: StatusCode) -> Response {
 fn private_error(mut response: Response) -> Response {
     enforce_terminal_private_cache_privacy(&mut response);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_util::RuntimeRequestOrigin;
+    use crate::platform::test_support::noop_services;
+    use edgezero_core::body::Body;
+    use edgezero_core::ingress::{InboundOrigin, OriginSource};
+
+    async fn snapshot(body: serde_json::Value) -> Result<Request, Box<Response>> {
+        let mut request = edgezero_core::http::request_builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/_ts/api/v1/ec")
+            .header(header::ORIGIN, "https://publisher.example.com")
+            .header(
+                header::COOKIE,
+                "euconsent-v2=old-tcf; __gpp=old-gpp; __gpp_sid=7; unrelated=keep",
+            )
+            .body(Body::from(body.to_string()))
+            .expect("should build snapshot request");
+        request.headers_mut().append(
+            header::COOKIE,
+            header::HeaderValue::from_static("other=keep-too"),
+        );
+        request.extensions_mut().insert(RuntimeRequestOrigin::new(
+            InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+                .expect("should parse public origin"),
+        ));
+        prepare_snapshot(&noop_services(), request).await
+    }
+
+    #[tokio::test]
+    async fn absent_snapshot_fields_keep_each_request_cookie() {
+        for (body, expected) in [
+            (
+                json!({}),
+                "euconsent-v2=old-tcf; __gpp=old-gpp; __gpp_sid=7; unrelated=keep; other=keep-too",
+            ),
+            (
+                json!({"tcString": "CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA"}),
+                "__gpp=old-gpp; __gpp_sid=7; unrelated=keep; other=keep-too; euconsent-v2=CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                json!({"applicableSections": []}),
+                "euconsent-v2=old-tcf; __gpp=old-gpp; unrelated=keep; other=keep-too",
+            ),
+            (
+                json!({"applicableSections": [1, 65535]}),
+                "euconsent-v2=old-tcf; __gpp=old-gpp; unrelated=keep; other=keep-too; __gpp_sid=1,65535",
+            ),
+            (
+                json!({"gppString": "DBABLA~BVQqAAAAAgA.QA"}),
+                "euconsent-v2=old-tcf; __gpp_sid=7; unrelated=keep; other=keep-too; __gpp=DBABLA~BVQqAAAAAgA.QA",
+            ),
+        ] {
+            let request = snapshot(body).await.expect("should accept optional fields");
+            assert_eq!(
+                request.headers()[header::COOKIE],
+                expected,
+                "should replace only posted consent cookies"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_cookie_delimiters_in_posted_strings() {
+        let tcf = "CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA";
+        let body = json!({"tcString": format!("{tcf}.; ts-ec=injected")});
+        assert_eq!(
+            snapshot(body)
+                .await
+                .expect_err("should reject cookie injection")
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "should validate the complete posted string before cookie serialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_unknown_fields_and_invalid_sections() {
+        for body in [
+            json!({"tcfString": "CAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAAAAAAAAAAAAA"}),
+            json!({"tcString": "invalid"}),
+            json!({"unknown": true}),
+            json!({"tcString": null}),
+            json!({"gppString": null}),
+            json!({"applicableSections": null}),
+            json!({"applicableSections": [0]}),
+            json!({"applicableSections": [65536]}),
+            json!({"applicableSections": [-1]}),
+            json!({"applicableSections": [1.5]}),
+            json!({"applicableSections": vec![7; 33]}),
+        ] {
+            assert_eq!(
+                snapshot(body)
+                    .await
+                    .expect_err("should reject invalid contract")
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "should validate every posted section and reject unknown fields"
+            );
+        }
+        assert!(
+            snapshot(json!({"applicableSections": vec![7; 32]}))
+                .await
+                .is_ok(),
+            "should accept exactly 32 section IDs"
+        );
+    }
 }

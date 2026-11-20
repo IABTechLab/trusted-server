@@ -193,6 +193,8 @@ pub fn tcf_consent_cookie(granted: bool) -> String {
 pub enum Geo {
     /// A GDPR location.
     Gdpr,
+    /// A US state with opt-out privacy rules.
+    UsCalifornia,
     /// No location was found.
     Missing,
     /// The location service failed.
@@ -685,6 +687,8 @@ pub struct ApiRequest {
     pub method: http::Method,
     /// First-party path.
     pub path: String,
+    /// Trusted location supplied by the adapter fixture.
+    pub geo: Geo,
     /// Browser and partner headers.
     pub headers: Vec<(String, String)>,
     /// Serialized request body.
@@ -706,6 +710,7 @@ impl ApiRequest {
         Self {
             method,
             path: path.to_owned(),
+            geo: Geo::Gdpr,
             headers: Vec::new(),
             body: String::new(),
             store_enabled: true,
@@ -731,6 +736,8 @@ pub struct ApiObservation {
 /// # Panics
 /// Panics if the static partner or integration fixtures cannot deserialize.
 pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
+    // Shared JSON uses fixed TCF timestamps; age policy has separate consent tests.
+    settings.consent.check_expiration = false;
     settings.integrations.insert_config("prebid", &serde_json::json!({
         "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
         "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
@@ -762,6 +769,108 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
     .expect("should configure conformance partner and SharedID");
 }
 
+// Static cross-language consent strings test transport and policy, not age.
+fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../trusted-server-js/lib/test/fixtures/ec-route-contract.json"
+    ))
+    .expect("should parse the shared browser/server contract fixture");
+    for case in fixture["cases"]
+        .as_array()
+        .expect("should have contract cases")
+    {
+        let mut post = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
+        post.body = case["body"].to_string();
+        if case["geo"] == "us-california" {
+            post.geo = Geo::UsCalifornia;
+        }
+        post.headers = vec![
+            (
+                "origin".to_owned(),
+                "https://publisher.example.com".to_owned(),
+            ),
+            (
+                "cookie".to_owned(),
+                case["cookie"]
+                    .as_str()
+                    .expect("should have cookie input")
+                    .to_owned(),
+            ),
+        ];
+        let seeded = if case["seedIdentity"] == true {
+            let mut seed = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
+            seed.body = fixture["cases"][0]["body"].to_string();
+            seed.headers.push((
+                "origin".to_owned(),
+                "https://publisher.example.com".to_owned(),
+            ));
+            let identity = assert_created(&adapter.exchange(&seed).response, store);
+            post.headers[1].1.push_str(&format!("; ts-ec={identity}"));
+            Some(identity)
+        } else {
+            None
+        };
+        let observed = adapter.exchange(&post);
+        assert_eq!(
+            observed.response.status.as_u16(),
+            case["expected"]["status"]
+                .as_u64()
+                .expect("should have expected status") as u16,
+            "should accept shared contract case: {}",
+            case["name"]
+        );
+        assert_eq!(
+            observed.origin_requests, 0,
+            "should answer contract POST locally"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&observed.response.body)
+                .expect("should decode mirror response"),
+            case["expected"]["json"],
+            "should return the expected mirror for {}",
+            case["name"]
+        );
+        assert!(
+            observed
+                .cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("no-store") && value.contains("private")),
+            "should keep consent responses private"
+        );
+        if case["expected"]["createsIdentity"] == true {
+            assert_created(&observed.response, store);
+        } else {
+            assert!(
+                !observed
+                    .response
+                    .cookies
+                    .iter()
+                    .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.starts_with("ts-ec=;")),
+                "should honor denied consent in {}",
+                case["name"]
+            );
+            let identity = seeded.expect("should seed a withdrawal identity");
+            assert_ec_expired(&observed.response);
+            let row = block_on(
+                KvIdentityGraph::new(store.clone()).get(&normalize_ec_id_for_kv(&identity)),
+            )
+            .expect("should read contract withdrawal")
+            .expect("should retain withdrawal tombstone")
+            .0;
+            assert!(
+                !row.consent.ok,
+                "should durably withdraw in {}",
+                case["name"]
+            );
+        }
+        for key in block_on(store.list_keys_with_prefix("", 100))
+            .expect("should list contract fixture keys")
+        {
+            block_on(store.delete(&key)).expect("should clean isolated contract record");
+        }
+    }
+}
+
 fn assert_ec_expired(response: &Observation) {
     assert!(
         response
@@ -777,6 +886,7 @@ fn assert_ec_expired(response: &Observation) {
 /// # Panics
 /// Panics when the adapter violates identity persistence, locality or cookie scope.
 pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) {
+    verify_ec_route_fixture(adapter, store);
     let mut orphan = ApiRequest::new(http::Method::POST, "/article");
     orphan.origin_content_type = "text/html";
     let orphan_id = format!("{}.abc123", "a".repeat(64));
@@ -882,7 +992,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let tcf = tcf_cookie
         .strip_prefix("euconsent-v2=")
         .expect("should encode TCF");
-    let consent_body = serde_json::json!({"tcfString": tcf, "applicableSections": []}).to_string();
+    let consent_body = serde_json::json!({"tcString": tcf, "applicableSections": []}).to_string();
     let mut post = ApiRequest::new(http::Method::POST, ec_path);
     post.body = consent_body.clone();
     post.headers.push((
@@ -1156,6 +1266,61 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     );
     assert_no_identity_cookies(&empty_get.response);
 
+    for (geo, privacy, gpc, should_restore) in [
+        (Geo::UsCalifornia, "1YNN", false, true),
+        (Geo::UsCalifornia, "1YNN", true, false),
+        (Geo::UsCalifornia, "1YYN", false, false),
+        (Geo::Missing, "1YNN", false, false),
+    ] {
+        let before = block_on(graph.get(&key))
+            .expect("should read the consented GET fixture")
+            .expect("should retain the GET fixture record");
+        let mut pixel = ApiRequest::new(http::Method::GET, ec_path);
+        pixel.geo = geo;
+        pixel.headers.push((
+            "cookie".to_owned(),
+            format!("ts-ec={identity}; us_privacy={privacy}"),
+        ));
+        if gpc {
+            pixel.headers.push(("sec-gpc".to_owned(), "1".to_owned()));
+        }
+        let observed = adapter.exchange(&pixel);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::NO_CONTENT,
+            "should answer EC GET under every current consent decision"
+        );
+        assert!(
+            observed.response.body.is_empty(),
+            "should keep the pixel response empty"
+        );
+        assert_eq!(observed.origin_requests, 0, "should answer EC GET locally");
+        if should_restore {
+            assert!(
+                observed
+                    .response
+                    .cookies
+                    .iter()
+                    .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0")),
+                "should positively restore SharedID with current EC permission"
+            );
+        } else {
+            assert_no_identity_cookies(&observed.response);
+        }
+        let after = block_on(graph.get(&key))
+            .expect("should read the record after EC GET")
+            .expect("should retain the live record after EC GET");
+        assert_eq!(
+            after.1, before.1,
+            "should never write or tombstone a record from EC GET"
+        );
+        assert_eq!(
+            serde_json::to_value(after.0).expect("should serialize the GET record"),
+            serde_json::to_value(before.0).expect("should serialize the original record"),
+            "should leave consent and IDs unchanged on EC GET"
+        );
+    }
+
     post.headers.push(("cookie".to_owned(), cookies.clone()));
     let mirrored = adapter.exchange(&post);
     let mirror: serde_json::Value =
@@ -1196,7 +1361,11 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
 
     for (body, status) in [
         (
-            serde_json::json!({"tcfString":"invalid", "applicableSections":[]}).to_string(),
+            serde_json::json!({"tcString":"invalid", "applicableSections":[]}).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"tcString": format!("{tcf}.; ts-ec=injected")}).to_string(),
             StatusCode::BAD_REQUEST,
         ),
         ("x".repeat(16 * 1024 + 1), StatusCode::PAYLOAD_TOO_LARGE),
@@ -1235,7 +1404,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let denied_tcf = tcf_consent_cookie(false);
     let mut failed_withdrawal = ApiRequest::new(http::Method::POST, ec_path);
     failed_withdrawal.headers = post.headers.clone();
-    failed_withdrawal.body = serde_json::json!({"tcfString":denied_tcf.strip_prefix("euconsent-v2=").expect("should encode denied consent"),"applicableSections":[]}).to_string();
+    failed_withdrawal.body = serde_json::json!({"tcString":denied_tcf.strip_prefix("euconsent-v2=").expect("should encode denied consent"),"applicableSections":[]}).to_string();
     store.reject_writes(true);
     let failed_withdrawal = adapter.exchange(&failed_withdrawal);
     store.reject_writes(false);
@@ -1278,7 +1447,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let denied_tcf = denied_tcf
         .strip_prefix("euconsent-v2=")
         .expect("should encode denied TCF");
-    post.body = serde_json::json!({"tcfString":denied_tcf,"applicableSections":[]}).to_string();
+    post.body = serde_json::json!({"tcString":denied_tcf,"applicableSections":[]}).to_string();
     let withdrawn = adapter.exchange(&post);
     assert!(
         withdrawn
@@ -1326,7 +1495,7 @@ pub fn verify_failed_ec_creation(adapter: &mut impl Adapter, store: &RecordingSt
         "origin".to_owned(),
         "https://publisher.example.com".to_owned(),
     ));
-    post.body = serde_json::json!({"tcfString":cookie.strip_prefix("euconsent-v2=").expect("should encode TCF"),"applicableSections":[]}).to_string();
+    post.body = serde_json::json!({"tcString":cookie.strip_prefix("euconsent-v2=").expect("should encode TCF"),"applicableSections":[]}).to_string();
     let failed = adapter.exchange(&post);
     assert_eq!(
         failed.origin_requests, 0,

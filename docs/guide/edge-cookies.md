@@ -223,13 +223,13 @@ sequenceDiagram
     B->>TS: POST /auction<br/>adUnits + eids[] + ts-ec cookie
     TS->>KV: Resolve EC-backed source-domain IDs
     KV-->>TS: Stored partner UIDs
+    TS->>KV: Conditionally save explicit request eids[] to the live record<br/>TCF Purpose 1 + 4 under GDPR; no cookie-only persistence
     TS->>TS: Convert stored UIDs to EIDs<br/>Merge + dedupe with request eids[]<br/>Apply consent gating
     TS->>PS: OpenRTB request<br/>user.eids = merged EID set
     PS->>DSP: OpenRTB bid request<br/>EIDs preserved for bidders
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
-    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ ts-eids/SharedID cookies (TCF Purpose 1 + 4 under GDPR)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
