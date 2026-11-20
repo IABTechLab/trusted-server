@@ -1006,6 +1006,10 @@ the EC row when the cookies hold none; no cookie is set.
 | `secrets.token`       | String  | No       | Key in `trusted_server_secrets` for the provider's API token                          |
 | `settings`            | Table   | No       | Provider-specific settings, parsed by the provider kind                               |
 
+A `sharedid` provider without `sources` owns `pubcid.org`. Its default
+cookie is the one Prebid's SharedID `storage.name` names, before
+`_sharedid` and `_pubcid`.
+
 **Example**:
 
 ```toml
@@ -1159,7 +1163,8 @@ publisher sends it; Trusted Server sends no login or hashed email.
 
 Cookie-only kinds: no endpoint and no server call; each takes exactly one
 source. `connectid` reads Yahoo's `connectId` JSON cookie. `sharedid` reads
-Prebid's `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
+the cookie Prebid's SharedID module is configured to use (its
+`managed_user_ids` `storage.name`), else `_sharedid`, falling back to `_pubcid`; with `generate = true` and no
 cookie or stored ID it stores a random UUID in the row only (no cookie is
 set). Leave `generate` off unless Prebid keeps its opt-out in the
 `_pubcid_optout` cookie. `criteo` reads Prebid's `cto_bidid`,
@@ -3107,7 +3112,7 @@ Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
 within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+`__Host-ts-eids-mirror`, `sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,
