@@ -10,7 +10,8 @@ opt-out sync. `index.ts` wires them after managed User ID setup in both modes;
 identity mode's auction wrapper chooses its merge source from the route client.
 The shared EC route comes from #1646. The Prebid head injector also supplies
 T19's activation: identity mode receives `ecRoute` only after the mounted
-identity app has a bound record store. Auction mode and 501 apps omit it.
+identity app has a bound record store and Sourcepoint is disabled. Auction mode,
+501 apps and Sourcepoint-owned consent pages omit it.
 
 **Tech stack:** TypeScript, Vitest (jsdom), Prebid 10.26, esbuild bundle build.
 

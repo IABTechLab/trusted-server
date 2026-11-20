@@ -155,6 +155,45 @@ describe('EC route consent reporting through the Prebid integration', () => {
     expect(lastAuctionEids()).toEqual([routeId]);
   });
 
+  it('reports replacement-CMP withdrawal after an obsolete callback reuses its listener ID', async () => {
+    function independentCmp() {
+      const listeners = new Map<number, TcfCallback>();
+      return {
+        listeners,
+        api: vi.fn((command: string, _version: number, callback: TcfCallback, id?: number) => {
+          if (command === 'addEventListener') listeners.set(1, callback);
+          if (command === 'removeEventListener') listeners.delete(id!);
+        }),
+        emit(data: Record<string, unknown>) {
+          for (const callback of listeners.values()) callback({ ...data, listenerId: 1 }, true);
+        },
+      };
+    }
+    const first = independentCmp();
+    page.__tcfapi = first.api;
+    await install({ mode: 'identity', ecRoute: '/_ts/api/v1/ec' });
+    first.emit(granted);
+    calls[0].resolve(Response.json({ v: 1, eids: [routeId] }));
+    await settle();
+    const stale = first.listeners.get(1)!;
+    const second = independentCmp();
+    page.__tcfapi = second.api;
+    await vi.advanceTimersByTimeAsync(1000);
+    second.emit(granted);
+    stale({ ...granted, listenerId: 1 }, true);
+    second.emit({ ...granted, tcString: 'CPwithdraw.AA', purpose: { consents: { 1: false } } });
+
+    expect(calls.map((call) => JSON.parse(call.body).tcString)).toEqual([
+      'CPa.AA',
+      'CPwithdraw.AA',
+    ]);
+    (window as unknown as { pbjs: { requestBids: (o: unknown) => unknown } }).pbjs.requestBids({});
+    expect(
+      lastAuctionEids(),
+      'replacement withdrawal suppresses the previously applied route ID'
+    ).toBeUndefined();
+  });
+
   it('discovers a CMP that appears after install on the capture tick', async () => {
     await install({ mode: 'identity', ecRoute: '/_ts/api/v1/ec' });
     const cmp = tcfCmp();

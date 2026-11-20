@@ -601,9 +601,11 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
-    /// Returns head snippets with the mounted EC route's store capability.
+    /// Returns head snippets with the page's EC consent-reporting eligibility.
     ///
-    /// Integrations that do not report consent retain their ordinary snippets.
+    /// Reporting needs a mounted record-backed route and no other enabled
+    /// consent writer. Integrations that do not report consent retain their
+    /// ordinary snippets.
     ///
     /// # Examples
     ///
@@ -1180,8 +1182,12 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = Vec::new();
+        // Sourcepoint owns consent synchronization even when SDK rewriting is off.
+        // Keep one server-selected writer rather than racing independent queues.
+        let ec_reporting_available =
+            self.ec_route_available && !self.integration_enabled("sourcepoint");
         for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts_with_ec_route(ctx, self.ec_route_available);
+            let mut next = injector.head_inserts_with_ec_route(ctx, ec_reporting_available);
             if !next.is_empty() {
                 inserts.append(&mut next);
             }

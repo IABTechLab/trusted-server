@@ -71,6 +71,15 @@ never installs a CMP. Without an injected route, or with no CMP on the page, no
 call is made. Auction mode and adapters without a bound identity record store
 omit the route, including adapters where it returns 501.
 
+When Sourcepoint is enabled, it remains the page's only consent reporter through
+`/_ts/consent`, so Prebid receives no `ecRoute`. This holds even when
+`rewrite_sdk = false` or the CMP loads later. Prebid still captures native IDs
+and merges the navigation mirror in identity mode. Sourcepoint's endpoint does
+not mint identity: these pages wait for a later eligible navigation to establish
+an EC after consent. A TCF-only server reconciliation can also wait for that
+navigation. A future migration must move both reporters onto one queue and
+define identity minting and null-clear behavior together.
+
 Each report is a `POST` with the CMP's TC string (when GDPR applies) and GPP
 string, with at most 32 applicable GPP section IDs. Reports are sent in order, one at a time. A newer grant replaces a
 grant still waiting to be sent, but a possible withdrawal is never replaced:
@@ -78,7 +87,8 @@ it is sent after the call in flight and before any later change. A failed
 withdrawal is resent on the next consent change, focus or visibility change;
 a failed grant is dropped until the CMP reports again.
 
-In identity mode the route's answer is merged into publisher auctions in place
+When EC reporting is active, the route's answer is merged into identity-mode
+publisher auctions in place
 of the mirror cookie while that cookie is unchanged. While a possible
 withdrawal is waiting or in flight, no mirrored or route IDs are merged; a
 TCF denial of Purpose 1 or 4 also deletes the mirror cookie at once. A merge

@@ -15,7 +15,12 @@ Safari lifetime and deployed qualification remain separate acceptance work.
 
 The server injects `window.__tsjs_prebid.ecRoute` as `/_ts/api/v1/ec` only
 when Prebid uses identity mode and the mounted shared identity app has a bound
-record store. Auction mode, absent stores and adapters returning 501 omit it.
+record store and Sourcepoint is not enabled. Auction mode, absent stores and
+adapters returning 501 omit it. Enabled Sourcepoint owns consent synchronization
+through `/_ts/consent`, regardless of SDK rewriting or current CMP availability,
+so Prebid's EC reporter stays off on those pages. This prevents independent
+queues from racing; identity capture and navigation-mirror merging remain active.
+Those Sourcepoint pages do not gain EC-route minting on the current page.
 The capability is set after store binding, rather than inferred from settings.
 The assignment follows config creation and precedes the external Prebid bundle
 and tsjs execution, including the prepared head-injection path.
@@ -37,7 +42,10 @@ synthesize consent. With no CMP API there is no reading and no call.
   `purpose.legitimateInterests`, `vendor.consents` and
   `vendor.legitimateInterests`. Other events, and refusals, are not readings;
   the previous reading stands. Remove a listener from the API that accepted it.
-  A replaced TCF API is resubscribed.
+  A replaced TCF API is resubscribed. Listener IDs belong to their accepting
+  API, so stale callbacks never remove IDs through an unrelated replacement.
+  A transferred listener held by an unreachable stub stays inert under the
+  generation guard instead of risking the active CMP subscription.
 - **GPP:** reuse #1535's reviewed `GppConsentCapture` from
   `src/shared/gpp_capture.ts`, shared by Prebid and Sourcepoint with common
   API tests in `test/shared/gpp_capture.test.ts`. It installs an accessor on `__gpp` only when the

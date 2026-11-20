@@ -84,21 +84,15 @@ export class TcfReader {
       const listenerId = fields(data).listenerId;
       const hasId = listenerId !== undefined && listenerId !== null;
       if (generation !== this.generation) {
-        // A stub hands queued listeners to the real CMP, so a superseded
-        // subscription can fire with an id it never reported before. The
-        // drained stub no longer reaches the CMP that now holds the listener,
-        // so remove it through the current API, and through the accepting API
-        // when that is a different, still-callable CMP. Once.
+        // Listener IDs belong to the API that accepted the subscription.
+        // A replacement CMP may reuse the same ID for its active listener.
+        // An unreachable stub listener stays inert behind the generation guard.
         if (hasId && !staleRemoved) {
           staleRemoved = true;
-          const current = this.target.__tcfapi;
-          for (const owner of new Set([current, api])) {
-            if (typeof owner !== 'function') continue;
-            try {
-              (owner as TcfApi).call(this.target, 'removeEventListener', 2, () => {}, listenerId);
-            } catch (error) {
-              log.warn('[tsjs-prebid] stale TCF consent listener cleanup failed', error);
-            }
+          try {
+            api.call(this.target, 'removeEventListener', 2, () => {}, listenerId);
+          } catch (error) {
+            log.warn('[tsjs-prebid] stale TCF consent listener cleanup failed', error);
           }
         }
         return;

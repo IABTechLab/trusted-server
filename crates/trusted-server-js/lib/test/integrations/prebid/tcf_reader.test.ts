@@ -113,19 +113,46 @@ describe('TcfReader', () => {
     expect(readings).toEqual([]);
   });
 
-  it('removes a superseded stub subscription from the CMP that now holds it', () => {
+  it('preserves replacement withdrawals when independent CMPs reuse a listener ID', () => {
+    const { target, readings, reader } = setup();
+    const first = cmp();
+    target.__tcfapi = first.api;
+    reader.refresh();
+    const stale = first.listeners.get(1)!;
+
+    const second = cmp();
+    target.__tcfapi = second.api;
+    reader.refresh();
+    second.emit(granted);
+    stale({ ...granted, listenerId: 1 }, true);
+    second.emit({
+      ...granted,
+      tcString: 'CPwithdraw.AA',
+      purpose: { consents: { 1: false, 4: false } },
+    });
+
+    expect(second.listeners.size, 'the replacement still owns its listener').toBe(1);
+    expect(readings.map((reading) => reading.tcString)).toEqual(['CPgrant.AA', 'CPwithdraw.AA']);
+    expect(first.listeners.size, 'cleanup reaches only the accepting CMP').toBe(0);
+  });
+
+  it('cleans a superseded forwarding stub through its accepting API only', () => {
     const { target, readings, reader } = setup();
     let queued: Callback | undefined;
-    const stub = vi.fn((command: string, _version: number, callback: Callback) => {
-      if (command === 'addEventListener') queued = callback;
-    });
+    const real = cmp();
+    const stub = vi.fn(
+      (command: string, version: number, callback: Callback, parameter?: unknown) => {
+        if (command === 'addEventListener') queued = callback;
+        if (command === 'removeEventListener') real.api(command, version, callback, parameter);
+      }
+    );
     target.__tcfapi = stub;
     reader.refresh();
-    const real = cmp();
     target.__tcfapi = real.api;
     reader.refresh();
 
-    // The real CMP drains the stub queue and answers the old listener.
+    // The forwarding stub's transferred listener belongs to the real CMP.
+    real.listeners.set(7, queued!);
     queued!({ ...granted, listenerId: 7 }, true);
     queued!({ ...granted, listenerId: 7 }, true);
     const removals = (fn: ReturnType<typeof vi.fn>) =>
@@ -133,6 +160,9 @@ describe('TcfReader', () => {
     expect(removals(real.api), 'the real CMP receives the removal once').toEqual([
       ['removeEventListener', 2, expect.any(Function), 7],
     ]);
+    expect(removals(stub)).toHaveLength(1);
+    expect(real.listeners.has(7)).toBe(false);
+    expect(real.listeners.has(1), 'the replacement retains its own subscription').toBe(true);
     expect(readings).toEqual([]);
   });
 
