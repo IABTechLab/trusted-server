@@ -27,7 +27,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
 use crate::consent::ConsentContext;
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
@@ -41,8 +41,10 @@ use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
 use super::prebid_eids::{
     analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
+    partner_for_source,
 };
 use super::registry::PartnerRegistry;
+use super::sharedid::{SharedIdRequest, drop_opted_out_sharedid_updates};
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
 const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
@@ -553,8 +555,11 @@ struct AdminEidsResponse {
     /// Parse failure detail when the `ts-eids` cookie could not be decoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_error: Option<String>,
-    /// Whether a `sharedId` cookie was present on the request.
+    /// Whether the configured `SharedID` cookie was present on the request.
     sharedid_present: bool,
+    /// Whether the request carried `_pubcid_optout`, which keeps the
+    /// `SharedID` out of the ingestion preview.
+    sharedid_opted_out: bool,
     /// Number of partners configured in the registry.
     partners_configured: usize,
     /// Preview of what cookie ingestion would write into the EC entry's
@@ -598,10 +603,12 @@ enum DroppedEidReason {
 
 /// Handles `GET /_ts/admin/eids`.
 ///
-/// Echoes the request's `ts-eids` and `sharedId` cookies: the parsed EID
-/// list plus a preview of what cookie ingestion would write into the EC
-/// entry's `ids` map given the configured partner registry. Pure request
-/// inspection — no KV access — so it works on every adapter.
+/// Echoes the request's `ts-eids` cookie and the `SharedID` cookie named
+/// `sharedid_cookie`: the parsed EID list plus a preview of what cookie
+/// ingestion would write into the EC entry's `ids` map given the configured
+/// partner registry. A `_pubcid_optout` cookie keeps the `SharedID` out of
+/// the preview. Pure request inspection — no KV access — so it works on
+/// every adapter.
 ///
 /// Always responds `200 OK`; missing or malformed cookies are reported in
 /// the payload instead of as errors.
@@ -612,10 +619,11 @@ enum DroppedEidReason {
 /// payload fails JSON serialization.
 pub fn handle_admin_eids_lookup(
     registry: &PartnerRegistry,
+    sharedid_cookie: Option<&str>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid_cookie = extract_cookie_value(req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(sharedid_cookie, req);
 
     let (eids, parse_error, diagnostic_sources, mut updates) = match &eids_cookie {
         None => (None, None, Vec::new(), Vec::new()),
@@ -640,12 +648,12 @@ pub fn handle_admin_eids_lookup(
     // `/auction` request-body EIDs, the consent gate on identity-graph writes,
     // and UIDs already stored in KV, so it lists candidate matches rather than
     // exactly what a request would store.
-    if let Some(value) = &sharedid_cookie
+    if let Some(value) = sharedid.readable_value()
         && let Some(update) = collect_sharedid_update(value, registry)
     {
         updates.push(update);
     }
-    let matched = dedupe_partner_updates(updates)
+    let matched = drop_opted_out_sharedid_updates(dedupe_partner_updates(updates), &sharedid)
         .into_iter()
         .map(|update| MatchedPartnerId {
             source_domain: update.partner_id,
@@ -667,7 +675,7 @@ pub fn handle_admin_eids_lookup(
     let unmatched = source_has_valid_uid
         .into_iter()
         .filter_map(|(source, has_valid_uid)| {
-            let reason = if registry.find_by_source_domain(&source).is_none() {
+            let reason = if partner_for_source(&source, registry).is_none() {
                 DroppedEidReason::NoPartner
             } else if !has_valid_uid {
                 DroppedEidReason::NoValidUid
@@ -682,7 +690,8 @@ pub fn handle_admin_eids_lookup(
         cookie_present: eids_cookie.is_some(),
         eids,
         parse_error,
-        sharedid_present: sharedid_cookie.is_some(),
+        sharedid_present: sharedid.has_value(),
+        sharedid_opted_out: sharedid.opted_out(),
         partners_configured: registry.len(),
         ingest: IngestPreview { matched, unmatched },
     };
@@ -716,6 +725,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     use crate::ec::kv::TombstoneOutcome;
+    use crate::ec::sharedid::LEGACY_SHAREDID_COOKIE;
 
     use super::*;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
@@ -1403,7 +1413,8 @@ mod tests {
         let req = get_request("/_ts/admin/eids");
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1438,7 +1449,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response);
@@ -1481,7 +1493,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
         let json = response_json(response);
 
         assert!(
@@ -1514,7 +1527,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
         let json = response_json(response);
 
         let matched = json["ingest"]["matched"]
@@ -1536,7 +1550,8 @@ mod tests {
         let req = get_request_with_cookie("/_ts/admin/eids", "ts-eids=!!!not-base64!!!");
 
         let response =
-            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+            handle_admin_eids_lookup(&test_registry(), Some(LEGACY_SHAREDID_COOKIE), &req)
+                .expect("should handle eids lookup");
 
         assert_eq!(
             response.status(),
@@ -1571,8 +1586,8 @@ mod tests {
         .expect("should build sharedid test registry");
         let req = get_request_with_cookie("/_ts/admin/eids", "sharedId=shared-uid-123");
 
-        let response =
-            handle_admin_eids_lookup(&registry, &req).expect("should handle eids lookup");
+        let response = handle_admin_eids_lookup(&registry, Some(LEGACY_SHAREDID_COOKIE), &req)
+            .expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response);
@@ -1585,6 +1600,57 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    #[test]
+    fn eids_lookup_reads_the_configured_sharedid_cookie_under_pubcid() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("pubcid.org", true)])
+            .expect("should build pubcid test registry");
+        let req = get_request_with_cookie(
+            "/_ts/admin/eids",
+            "sharedId=legacy-uid; _pubcid=configured-uid",
+        );
+
+        let response = handle_admin_eids_lookup(&registry, Some("_pubcid"), &req)
+            .expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(
+            json["sharedid_present"], true,
+            "should see the configured cookie"
+        );
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match only the configured cookie");
+        assert_eq!(matched[0]["source_domain"], "pubcid.org");
+        assert_eq!(matched[0]["uid"], "configured-uid");
+    }
+
+    #[test]
+    fn eids_lookup_previews_no_sharedid_after_an_opt_out() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("pubcid.org", true)])
+            .expect("should build pubcid test registry");
+        let req = get_request_with_cookie(
+            "/_ts/admin/eids",
+            "_pubcid=configured-uid; _pubcid_optout=1",
+        );
+
+        let response = handle_admin_eids_lookup(&registry, Some("_pubcid"), &req)
+            .expect("should handle eids lookup");
+
+        let json = response_json(response);
+        assert_eq!(
+            json["sharedid_opted_out"], true,
+            "should report the opt-out"
+        );
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "should preview no SharedID after an opt-out"
+        );
     }
 
     #[test]

@@ -633,7 +633,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
                     let partner_registry = PartnerRegistry::from_ec(&s.settings.ec)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
+                    handle_admin_eids_lookup(
+                        &partner_registry,
+                        s.settings.sharedid_storage().cookie_name(),
+                        &req,
+                    )
                 }),
             )
             .post(

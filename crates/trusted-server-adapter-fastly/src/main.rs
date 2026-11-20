@@ -698,7 +698,7 @@ async fn apply_edgezero_ec_finalize(
         finalize_kv_graph.as_ref(),
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
-        ec_state.sharedid_cookie.as_deref(),
+        &ec_state.sharedid,
         response,
     )
     .await;
@@ -1486,7 +1486,7 @@ mod tests {
             ec_context,
             use_finalize_kv: false,
             eids_cookie: None,
-            sharedid_cookie: None,
+            sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
         });
 
         let state = finalize_response(&mut page, &inputs);

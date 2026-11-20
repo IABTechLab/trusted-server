@@ -413,7 +413,7 @@ mod tests {
                 ec_context,
                 use_finalize_kv: false,
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             },
             after_response: None,
         }
@@ -446,7 +446,7 @@ mod tests {
             Some(&kv),
             &app.partner_registry,
             None,
-            None,
+            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         ));
         state.partner_registry = app.partner_registry();
