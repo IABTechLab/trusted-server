@@ -426,6 +426,13 @@ async function launch(label, originEndpoint, proxyEndpoint) {
   const fixture = {
     ec: {
       passphrase: 'ec_key',
+      storage: {
+        provider: 'dynamodb',
+        region: 'us-east-1',
+        table,
+        namespace,
+        local_endpoint: proxyEndpoint,
+      },
       partners: [
         {
           name: 'synthetic fixture',
@@ -466,11 +473,6 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     AWS_EC2_METADATA_DISABLED: 'true',
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
-    TS_EC_DYNAMODB_ENABLED: 'true',
-    TS_EC_DYNAMODB_REGION: 'us-east-1',
-    TS_EC_DYNAMODB_TABLE: table,
-    TS_EC_DYNAMODB_NAMESPACE: namespace,
-    TS_EC_DYNAMODB_LOCAL_ENDPOINT: proxyEndpoint,
     TS_NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
     EDGEZERO__ADAPTER__CONFIG_DIR: root,
     EDGEZERO__ADAPTER__DATA_DIR: opt.binary ? dir : '/data',

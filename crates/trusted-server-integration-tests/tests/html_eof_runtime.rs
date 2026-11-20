@@ -677,7 +677,14 @@ fn actual_runtime() -> HarnessResult<()> {
         harness.cancellation.check()?;
         let port = available_port()?;
         // Auction controls deliberately use an unreachable bidder and verify empty-bid assembly.
-        let config = config::fixture_config(&template, case, origin.port, available_port()?, port)?;
+        let config = config::fixture_config(
+            &template,
+            &adapter,
+            case,
+            origin.port,
+            available_port()?,
+            port,
+        )?;
         fs::write(harness.workspace.join("trusted-server.toml"), config)
             .change_context(HarnessError::Io)?;
         fs::write(harness.workspace.join("fastly.toml"), "manifest_version = 3\nname = 'example-finalization'\nlanguage = 'rust'\n[local_server]\n").change_context(HarnessError::Io)?;

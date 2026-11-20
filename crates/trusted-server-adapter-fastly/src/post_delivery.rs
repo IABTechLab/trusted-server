@@ -339,7 +339,7 @@ mod tests {
     // Pull sync after delivery, against the local identity store
     // -----------------------------------------------------------------------
 
-    /// EC ID `fastly.toml` seeds, consented, in the local `ec_identity_store`.
+    /// EC ID `fastly.toml` seeds, consented, in logical `trusted_server_kv`.
     fn seeded_ec_id() -> String {
         format!("{}.test01", "a".repeat(64))
     }
@@ -352,7 +352,7 @@ mod tests {
     /// Settings with Tinybird, the local identity store, and one pull-sync partner.
     fn pull_sync_settings() -> Settings {
         let mut settings = settings_with_tinybird();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings.ec.partners = vec![EcPartner {
             name: "Example partner".to_owned(),
             source_domain: "partner.example.com".to_owned(),

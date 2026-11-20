@@ -501,7 +501,7 @@ mod tests {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
-            ec_store = "ec_identity_store"
+            ec_store = "trusted_server_kv"
             "#,
         )
         .expect("should parse sandbox test settings")

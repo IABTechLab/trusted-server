@@ -138,6 +138,9 @@ fn build_state_with_services(
     settings
         .publisher
         .drop_origin_host_header_override_for_spin();
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Spin)?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -1023,6 +1026,28 @@ mod tests {
         let (mut parts, body) = request.into_parts();
         normalize_spin_request(&mut parts);
         *req = Request::from_parts(parts, body);
+    }
+
+    #[test]
+    fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
+        for storage in [
+            serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
+        ] {
+            let mut settings = Settings::default();
+            settings.ec.storage =
+                Some(serde_json::from_value(storage).expect("should parse pure provider settings"));
+            let error = build_state_with_settings(settings)
+                .err()
+                .expect("should reject unsupported EC provider before route work");
+            assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
+        }
+        let mut settings = Settings::default();
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
+        assert!(
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
     }
 
     fn multi_provider_settings() -> Settings {

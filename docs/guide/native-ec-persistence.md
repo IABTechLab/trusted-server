@@ -18,7 +18,17 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build the native adapter with `aws-dynamodb-ec`, which forwards to EdgeZero's default-off `aws-dynamodb-records` feature. For this adoption stage, `TS_EC_DYNAMODB_ENABLED=true` declares the EC record requirement before preparation. Absence or `false` leaves EC persistence disabled. Invalid values or selecting it without the compiled feature fail startup.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TS_EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
+
+Published application config selects the logical prepared store, not an endpoint or credentials:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TS_EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 
@@ -34,7 +44,11 @@ namespace = "example-staging"
 
 Use the existing native binding-file selection mechanism. Keep its config/secret mappings in the same document. A raw `aws-dynamodb` binding does not satisfy the record requirement. Missing capability, a mismatched layout or failed selected-provider preparation is fatal before readiness, not permission to fall back to memory.
 
+For celld, use the same logical ID with `provider = "celld-records"`, its endpoint/store and access policy in that native binding document. Run the EdgeZero-owned `services/celld-store` application on official, unmodified celld 0.6.3. The matching EdgeZero revision must provide record API version 1, scoped pagination and no-expiry support. Ordinary KV and records share its rows and retained namespace allocator. Old or KV-only services fail read-only preparation; no fork listener, downgrade or migration is used.
+
 Region, table, namespace, credentials and endpoint behavior belong to EdgeZero's binding/provider configuration. The old `TS_EC_DYNAMODB_REGION`, `TS_EC_DYNAMODB_TABLE`, `TS_EC_DYNAMODB_NAMESPACE` and `TS_EC_DYNAMODB_LOCAL_ENDPOINT` do not configure another TS-owned provider. Tests use an explicitly isolated DynamoDB Local process with dummy credentials. No hosted IAM or deployment qualification is implied.
+
+Fastly uses the same shared adapter and the logical `trusted_server_kv` declaration. Its compatibility `ec_store`/`provider="fastly"` references name logical IDs, not arbitrary physical store names. The application rejects undeclared IDs at startup. Request handling, response finalization and separately gated post-delivery pull sync retain the prepared handle; none reopens a store from settings. Link the desired physical Fastly store under that logical ID through the normal deployment workflow; these changes do not perform that operation.
 
 ## Key placement and generation lifetime
 
@@ -64,11 +78,15 @@ Persistence does not grant consent. Native eligibility uses checked client metad
 
 Read-only identify does not create identities. Withdrawal remains writable for privacy-hardened clients, writes an authoritative tombstone, removes partner IDs and expires the browser cookie. Finalization is awaited before committing response headers.
 
-Native admin EC management, Fastly S2S batch parity and post-send pull-sync integration are separate work.
+Native admin EC management, native S2S batch parity with Fastly, and native post-send pull sync remain separate work.
 
 ## Executed local acceptance and remaining deployment work
 
 The native lifecycle suite now runs through the shared adapter over real persistent records. It covers persistence-before-cookie, app recreation, consent/route exclusions, withdrawal, orphan recovery, cancellation, metadata/body coherence, stale tokens and native page traversal. The explicit `record_dynamodb` target exercises independent native Add/CAS, allocator-only Query pages, concurrent identity updates and withdrawal through DynamoDB Local.
+
+The real celld fixture exercises route persistence, process restart, withdrawal, stale-token rejection, concurrent updates and outage through the same adapter. The production-binary tests prepare records from native bindings and the published logical selector, exercise actual HTTP issuance and withdrawal, restart against retained service state and refuse readiness on service outage. They require `CELLD_EC_TEST_BINARY` pointing to official celld and `EDGEZERO_CELLD_STORE_SERVICE` pointing to `services/celld-store` in the same SDK revision used by the Rust dependencies. Missing prerequisites fail rather than skip. The stock-celld workflow checks out that dependency tag, verifies the official runtime digest and executes all three ignored integration cases through a nonzero sentinel check. Historical modified-celld receipts do not prove this path.
+
+Fastly's WASM/Viceroy suite exercises the shared lifecycle and keeps response-finalization and post-delivery permissions separate. The separate SDK Viceroy independent-CAS race has a known emulator atomicity failure, deferred from this stock-celld integration. Do not describe that failed check as passing or as production Fastly qualification.
 
 These checks do not qualify a rebuilt application image, retained infrastructure, workload credentials, installed IAM/boundary policies, capacity, fleet failover, restore or real browser consent transport. The historical `test-native-ec-image.mjs` fixture targets the previous TS-owned backend and must be adapted before it can count as new-format image acceptance.
 

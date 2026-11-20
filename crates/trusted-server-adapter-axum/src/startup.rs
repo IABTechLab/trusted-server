@@ -14,6 +14,7 @@ use error_stack::Report;
 use trusted_server_core::config_payload::{
     DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID, VerifiedConfigBlob,
 };
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::integrations::datadome::{DataDomeConfig, ProtectionMatcherConfig};
 use trusted_server_core::platform::{
     PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
@@ -259,10 +260,24 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
     let mut state = build_state_with_settings(settings).map_err(settings_error)?;
     // EC records stay live. Only the validated provider handle is shared, never
     // mutable identity rows in the immutable config/secret snapshot.
-    if let Some(provider) = crate::record_ec::acquire(stores)? {
-        Arc::get_mut(&mut state)
-            .expect("should uniquely own initializing app state")
-            .set_ec_store(provider);
+    let provider_settings = Arc::clone(&state.settings);
+    match provider_settings
+        .ec
+        .resolve_storage(EcRuntime::Native)
+        .map_err(settings_error)?
+    {
+        None => {}
+        Some(EcStorageSelection::Records(store_id)) => {
+            let provider = crate::record_ec::acquire(stores, store_id)?;
+            Arc::get_mut(&mut state)
+                .expect("should uniquely own initializing app state")
+                .set_ec_store(provider);
+        }
+        Some(EcStorageSelection::Fastly(_)) => {
+            return Err(configuration_error(
+                "Fastly EC storage is unsupported by the native adapter",
+            ));
+        }
     }
     let router = router_builder(&state).build();
     if deadline.is_expired_at(clock.now()) {
