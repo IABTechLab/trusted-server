@@ -311,6 +311,9 @@ jobs:
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
 
+      - name: Guard adapter identity wiring
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test adapter_identity_guard
+
       - name: Clippy (parity test crate)
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
 
