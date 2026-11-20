@@ -7,7 +7,9 @@ aws_region         = "eu-west-2"
 availability_zones = ["eu-west-2a", "eu-west-2b"]
 demo_hostname      = "ts-demo.example.com"
 publisher_hostname = "publisher.example.com"
-# CloudFront only. Opt in for a publisher-origin browser proxy, not demo-host browsing.
+# CloudFront only. True supplies fixed publisher host/HTTPS and the configured
+# forwarder secret server-side, so reviewer proxies need no token file. The
+# forwarder value enters private Terraform state/plans. Not demo-host browsing.
 preserve_publisher_hostname = false
 route53_zone_id             = "Z0000000000000"
 certificate_arn             = "arn:aws:acm:eu-west-2:000000000000:certificate/00000000-0000-0000-0000-000000000000"

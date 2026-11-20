@@ -1,6 +1,10 @@
 mock_provider "aws" {
   override_during = plan
 
+  mock_data "aws_secretsmanager_secret_version" {
+    defaults = { secret_string = "FictionalForwarderToken0000000000000000000000" }
+  }
+
   mock_resource "aws_appconfig_application" {
     override_during = plan
     defaults        = { id = "app1234" }

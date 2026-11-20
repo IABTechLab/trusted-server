@@ -195,7 +195,7 @@ The table has deletion protection and `prevent_destroy`. Reserve both `ec:<names
 
 ## 6. Export the exact application envelope
 
-Copy `example-config.toml` to `$TS_WORK/trusted-server.aws.toml`. Replace the fictional publisher fields and all four storage fields using `ec-storage.json`. The file contains secret **reference names**, not values. For publisher-origin browsing, keep `[trusted_forwarder]` and use the same browser token reference seeded above. Sourcepoint capture is enabled without SDK rewriting; it does not install the publisher's CMP. Auctions and Prebid are disabled.
+Copy `example-config.toml` to `$TS_WORK/trusted-server.aws.toml`. Replace the fictional publisher fields and all four storage fields using `ec-storage.json`. The file contains secret **reference names**, not values. For publisher-origin browsing, keep `[trusted_forwarder]` and its separately seeded secret reference. With `preserve_publisher_hostname = true`, CloudFront supplies the matching token and fixed publisher host/HTTPS scheme. Reviewers need no local forwarder token. Sourcepoint capture is enabled without SDK rewriting; it does not install the publisher's CMP. Auctions and Prebid are disabled.
 
 Add `[response_headers]` with `"X-Robots-Tag" = "noindex, nofollow"` for evaluation traffic. Keep the handler rule excluding only exact `/health`; admin and consent routes still require evaluation authentication. Do not alter consent defaults to make an identity appear.
 
@@ -268,6 +268,8 @@ Copy `terraform.tfvars.example` to `$TS_WORK/workload.tfvars` and replace every 
 
 Do not supply `geo_front_door.origin_credential_value` or `cloudfront_ipv4_cidrs`. Terraform derives literal forwarding CIDRs from entries in the existing AWS-managed origin-facing CloudFront prefix list, the same source used for security-group admission. Forwarding CIDRs are a task-startup snapshot. A refreshed Terraform plan/apply updates the task definition when list entries change; the application does not poll or hot-reload the list. Reviewer CIDRs do not restrict CloudFront viewers. The example uses `reviewer_ipv4_cidrs = []` for this topology. For direct ALB ingress with `geo_front_door = null`, supply a nonempty set of valid IPv4 CIDRs; there is no prefix-width or count limit. Application authentication protects evaluation traffic.
 
+Publisher-preserving CloudFront reads the exact Secrets Manager ARN/version selected by the envelope's `trusted_forwarder.shared_secret` binding. The deployment principal needs that value-read permission and any required KMS decryption. The value enters private workload state/plans and the CloudFront origin configuration, not application TOML or AppConfig. Reviewers need no token file. Keep this forwarding secret distinct from origin admission and the Agent token.
+
 For Geo, workload Terraform owns `random_password.origin_credential`, distinct from all five secrets. It generates a stable password used only by the ALB rule and CloudFront origin header. There is no credential-value output or ECS/AppConfig exposure. The sensitive value remains in restricted workload plans/state, so do not publish those files. Ordinary applies and configuration/application updates do not rotate it. Preserve the workload state and keep the header-name input stable for rollback. `staged` and `origin-enabled` are not uninterrupted migration steps; selecting Geo removes the unprotected path before DNS cutover. Plan existing-installation migrations separately.
 
 ```bash
@@ -291,14 +293,14 @@ Do not substitute `ts deploy --adapter axum`. Verify the ECS image digest, healt
 
 ## 9. Browser and consent acceptance
 
-Obtain approval for the proxy's development CA and use a dedicated evaluation browser profile. With owner-readable `browser-auth.txt` and `browser-forwarder-token.txt` from step 4:
+Obtain approval for the proxy's development CA and use a dedicated evaluation browser profile. The source example uses site-wide Basic auth, so its proxy command uses owner-readable `browser-auth.txt` from step 4. CloudFront supplies forwarder authentication server-side; do not distribute `browser-forwarder-token.txt`. If the owner instead uses admin-only Basic auth, omit `--basic-auth-file` too.
 
 ```bash
 export TS_DEMO_HOSTNAME='ts-demo.example.com'
 ts dev proxy ca install
 ts dev proxy --map "publisher.example.com=$TS_DEMO_HOSTNAME" --rewrite-host \
   --basic-auth-file "$TS_WORK/browser-auth.txt" \
-  --forwarder-secret-file "$TS_WORK/browser-forwarder-token.txt" --launch chrome
+  --launch chrome
 ```
 
 Replace both example hostnames with the agreed values. Keep TLS verification enabled. Do not use `--insecure` or `--upstream-plaintext`. The browser stays on the publisher origin while upstream Host/TLS use the evaluation endpoint. An ordinary page at the evaluation hostname cannot accept the publisher-scoped EC cookie. Changing only `publisher.cookie_domain` does not change EC scope, which derives from `publisher.domain`.

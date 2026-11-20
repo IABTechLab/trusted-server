@@ -105,7 +105,7 @@ try {
       assert.notEqual(
         match[1],
         "aws_secretsmanager_secret_version",
-        "application and Agent secret values must not enter Terraform state",
+        "Terraform must not create application or Agent secret values; publisher forwarding reads one separately seeded version",
       );
     }
   }
@@ -241,8 +241,14 @@ try {
             "Geo ALB peers and ordinary proxy networks must stay distinct, and the credential value must never reach ECS.",
           ),
           check(
-            `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == 2 && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == local.geo_credential_value])`,
-            "Origin custom headers must be exactly the private credential and deployment-fixed forwarded Host override, never arbitrary viewer values or extra headers.",
+            `var.preserve_publisher_hostname == ${preservePublisher} && length(one(aws_cloudfront_distribution.geo[0].origin).custom_header) == ${preservePublisher ? 4 : 2} && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Host" && h.value == ${forwardedHost}]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == var.geo_front_door.origin_credential_header_name && h.value == local.geo_credential_value])`,
+            "Origin headers must fix the configured identity; publisher mode also owns scheme and forwarder authentication.",
+          ),
+          check(
+            preservePublisher
+              ? `length(data.aws_secretsmanager_secret_version.publisher_forwarder) == 1 && data.aws_secretsmanager_secret_version.publisher_forwarder["browser_forwarder_secret"].secret_id == var.application_secrets.browser_forwarder_secret.arn && data.aws_secretsmanager_secret_version.publisher_forwarder["browser_forwarder_secret"].version_id == var.application_secrets.browser_forwarder_secret.version_id && issensitive(data.aws_secretsmanager_secret_version.publisher_forwarder["browser_forwarder_secret"].secret_string) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == "X-Forwarded-Proto" && h.value == "https"]) && anytrue([for h in one(aws_cloudfront_distribution.geo[0].origin).custom_header : h.name == local.app_config.trusted_forwarder.auth_header && h.value == "FictionalForwarderToken0000000000000000000000"]) && !strcontains(aws_ecs_task_definition.review.container_definitions, "FictionalForwarderToken0000000000000000000000") && !strcontains(aws_appconfig_hosted_configuration_version.review.content, "FictionalForwarderToken0000000000000000000000")`
+              : `length(data.aws_secretsmanager_secret_version.publisher_forwarder) == 0`,
+            "Only publisher mode may read the exact configured secret version, stamp it into CloudFront, and keep its value out of ECS/AppConfig.",
           ),
           check(
             `toset(aws_cloudfront_distribution.geo[0].aliases) == toset([var.demo_hostname]) && one(aws_cloudfront_distribution.geo[0].viewer_certificate).acm_certificate_arn == var.geo_front_door.viewer_certificate_arn && aws_lb_listener.https.certificate_arn == var.certificate_arn && one(one(aws_lb_listener.https.default_action).fixed_response).status_code == "404"`,
@@ -265,6 +271,42 @@ try {
             "DNS must cut over only after separate protected-origin acceptance.",
           ),
         ].join("\n")}
+      }\n`;
+    }
+    for (const [name, change] of [
+      [
+        "missing_forwarder",
+        (e) => {
+          delete e.data.trusted_forwarder;
+        },
+      ],
+      [
+        "missing_binding",
+        (e) => {
+          e.data.trusted_forwarder.shared_secret = "unbound_reference";
+        },
+      ],
+      [
+        "header_collision",
+        (e) => {
+          e.data.trusted_forwarder.auth_header = "x-fictional-origin-check";
+        },
+      ],
+    ]) {
+      const envelope = JSON.parse(
+        fs.readFileSync(path.join(root, "example-envelope.json"), "utf8"),
+      );
+      change(envelope);
+      const file = `publisher-forwarder-${name}.json`;
+      fs.writeFileSync(path.join(fixture, file), JSON.stringify(envelope));
+      contract += `\nrun "publisher_forwarder_reject_${name}" {
+        command = plan
+        variables {
+          geo_front_door = ${geoInput("dns-cutover")}
+          preserve_publisher_hostname = true
+          config_envelope_file = "${file}"
+        }
+        expect_failures = [aws_cloudfront_distribution.geo[0]]
       }\n`;
     }
     contract += `\nrun "managed_origin_ranges_follow_aws" {
@@ -437,7 +479,7 @@ try {
         contract += `\nrun "explicit_off_unchanged_${preservePublisher ? "publisher" : "demo_default"}" {
           command = plan
           variables { ${preservePublisher ? "preserve_publisher_hostname = true" : ""} }
-          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(random_password.origin_credential) == 0 && length(aws_acm_certificate_validation.viewer) == 0 && aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs`, "Explicit null must preserve the old Off topology and runtime regardless of browser identity.")}
+          ${check(`var.preserve_publisher_hostname == ${preservePublisher} && length(random_password.origin_credential) == 0 && length(aws_acm_certificate_validation.viewer) == 0 && aws_acm_certificate_validation.regional.certificate_arn == var.certificate_arn && length(aws_cloudfront_distribution.geo) == 0 && length(aws_ecs_service.geo) == 0 && length(aws_ecs_service.review) == 1 && aws_ecs_service.review[0].desired_count == 1 && one(aws_lb_listener_rule.publisher.action).type == "forward" && !contains(keys(local.application_environment), "TS_NATIVE_GEO_PROFILE_TOML") && local.trusted_proxy_cidrs == local.alb_subnet_cidrs && length(data.aws_secretsmanager_secret_version.publisher_forwarder) == 0`, "Explicit null must preserve the old Off topology and avoid secret reads regardless of browser identity.")}
         }\n`;
       }
       for (const [name, table] of [

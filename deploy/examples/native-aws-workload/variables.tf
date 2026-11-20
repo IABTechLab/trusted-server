@@ -62,7 +62,7 @@ variable "publisher_hostname" {
 }
 
 variable "preserve_publisher_hostname" {
-  description = "CloudFront-only opt-in for a publisher-origin browser proxy: fix X-Forwarded-Host to publisher_hostname instead of demo_hostname. Does not change demo TLS, ALB Host admission or production DNS."
+  description = "CloudFront-only publisher-origin mode: fix forwarded host/proto and authenticate them using the envelope's trusted_forwarder secret version. Reviewers need no token file. The forwarding secret enters private workload state/plans; demo TLS, ALB admission and production DNS are unchanged."
   type        = bool
   default     = false
 }
@@ -175,7 +175,7 @@ variable "ec_storage" {
 }
 
 variable "application_secrets" {
-  description = "Existing separately seeded whole-value Secrets Manager references keyed by the actual TS config secret names. Values never enter Terraform. These supplied secrets are retained outside this workload."
+  description = "Existing separately seeded whole-value Secrets Manager references keyed by the actual TS config secret names. Values stay outside application inputs. Publisher-preserving CloudFront reads only the configured forwarder secret into private state/plans. These supplied secrets are retained outside this workload."
   type = map(object({
     arn        = string
     version_id = string
