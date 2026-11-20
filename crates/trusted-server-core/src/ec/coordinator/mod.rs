@@ -41,7 +41,9 @@ use crate::settings::IdentityProviderConfig;
 /// Implementations own eligibility, consent, destination checks, the shared
 /// time budget and validation. Providers never see KV, HTTP or the clock,
 /// and see cookies only as [`RequestCookies`]. Implementations never write
-/// KV: they return the change and the caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+/// KV: they return validated [`LookupResults`]; the caller plans the row
+/// change with [`crate::ec::write_plan::plan_write`] and spends the
+/// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
