@@ -140,6 +140,26 @@ run_case() {
         fi
         APP_PID=""
         smoke_wait_log "$log_path" "$expected_diagnostic"
+        # Diagnostics name config paths, never reference keys: a key is an
+        # operator-supplied string that could hold a misplaced secret.
+        local reference
+        for reference in handler_password publisher_proxy_secret ec_passphrase; do
+            if grep -qF "$reference" "$log_path"; then
+                smoke_die "$case_name printed the reference key $reference"
+            fi
+        done
+        # A diagnostic that lists every path would hide which secret is absent.
+        local path
+        for path in 'handlers[0].password' publisher.proxy_secret ec.passphrase; do
+            case "$expected_diagnostic" in
+                *"\`$path\`"*) ;;
+                *)
+                    if grep -qF "\`$path\`" "$log_path"; then
+                        smoke_die "$case_name named the present secret path $path"
+                    fi
+                    ;;
+            esac
+        done
     else
         while [ "$attempt" -lt 100 ]; do
             smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
@@ -168,13 +188,13 @@ run_case missing-config "$BASE_PORT" "" \
     "Trusted Server config envelope is missing"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
     "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "required app-config secret at \`handlers[0].password\` is missing"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "required app-config secret at \`publisher.proxy_secret\` is missing"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" exit \
-    "a required app-config secret is missing"
+    "required app-config secret at \`ec.passphrase\` is missing"
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

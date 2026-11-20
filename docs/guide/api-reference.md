@@ -16,12 +16,12 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
