@@ -46,7 +46,9 @@ use crate::settings::IdentityProviderConfig;
 /// Implementations own eligibility, consent, destination checks, the shared
 /// time budget and validation. Providers never see KV, HTTP or the clock,
 /// and see cookies only as [`RequestCookies`]. Implementations never write
-/// KV: they return the change and the caller spends the [`crate::ec::page_load::PageLoadWrite`] permit.
+/// KV: they return validated [`LookupResults`]; the caller plans the row
+/// change with [`crate::ec::write_plan::plan_write`] and spends the
+/// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
     /// Starts lookups for every eligible provider without waiting.
@@ -278,7 +280,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
 
     /// Caps the pull-sync lookups dispatched per navigation
     /// (`ec.pull_sync_concurrency`). Due pull-sync partners past the cap are
-    /// skipped as rate limited and retried on a later navigation.
+    /// skipped (`skipped_concurrency_cap`) and retried on a later navigation.
     #[must_use]
     pub fn with_pull_sync_concurrency(mut self, max: Option<NonZeroUsize>) -> Self {
         self.pull_sync_concurrency = max;
