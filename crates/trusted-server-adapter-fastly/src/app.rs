@@ -88,7 +88,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::ec_record_store::LazyEcRecordStore;
+use crate::ec_record_store::open_ec_records;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
@@ -124,7 +124,7 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::record_backend::EcRecordLayout;
+use trusted_server_core::ec::record_backend::{EcRecordLayout, LazyRecordEcKvStore};
 use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
@@ -338,7 +338,11 @@ pub(crate) fn open_identity_record_store(
         None => return Ok(None),
         Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
     };
-    Ok(Some(Arc::new(LazyEcRecordStore::new(store_id.to_owned()))))
+    let name = store_id.to_owned();
+    Ok(Some(Arc::new(LazyRecordEcKvStore::new(
+        store_id.to_owned(),
+        Box::new(move |layout| open_ec_records(&name, layout)),
+    ))))
 }
 
 // ---------------------------------------------------------------------------

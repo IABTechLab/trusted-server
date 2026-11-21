@@ -4,6 +4,7 @@
 //! graph retains entry validation and caller-specific conflict/recovery policy.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use edgezero_core::key_value_store::{KvError, KvHandle};
@@ -206,15 +207,147 @@ impl EcKvStore for RecordEcKvStore {
     }
 }
 
+/// Opens the `EdgeZero` KV binding behind a [`LazyRecordEcKvStore`].
+///
+/// The adapter supplies it: it receives the EC [`RecordLayout`] and returns a
+/// handle over its platform's record-capable provider.
+pub type EcRecordOpener = Box<dyn Fn(RecordLayout) -> Result<KvHandle, KvError> + Send + Sync>;
+
+/// An [`EcKvStore`] that opens its record binding on the first EC operation.
+///
+/// An adapter that holds one store per process or sandbox but must not open
+/// the platform binding at startup (Fastly opens it on first use, so a missing
+/// or failing store fails only EC work rather than every route) selects the
+/// store with this type. The open outcome, success or failure, is cached for
+/// the store's lifetime, the way `EdgeZero`'s declared stores cache theirs.
+/// Record-contract checks still run on that first open through
+/// [`RecordEcKvStore::new`].
+pub struct LazyRecordEcKvStore {
+    store_name: String,
+    open: EcRecordOpener,
+    opened: OnceLock<Result<RecordEcKvStore, String>>,
+}
+
+impl core::fmt::Debug for LazyRecordEcKvStore {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("LazyRecordEcKvStore")
+            .field("store_name", &self.store_name)
+            .field("opened", &self.opened.get().map(Result::is_ok))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LazyRecordEcKvStore {
+    /// Selects the store without opening it or performing I/O.
+    #[must_use]
+    pub fn new(store_name: String, open: EcRecordOpener) -> Self {
+        Self {
+            store_name,
+            open,
+            opened: OnceLock::new(),
+        }
+    }
+
+    /// Returns whether the first EC operation has already tried to open the store.
+    #[must_use]
+    pub fn is_opened(&self) -> bool {
+        self.opened.get().is_some()
+    }
+
+    /// Opens the store on first use and returns the cached outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] naming the store when the
+    /// binding failed to open or does not meet the EC record contract.
+    pub fn store(&self) -> Result<&RecordEcKvStore, Report<TrustedServerError>> {
+        self.opened
+            .get_or_init(|| {
+                self.open_store().inspect_err(|message| {
+                    log::warn!(
+                        "EC record store '{}' is unavailable: {message}",
+                        self.store_name
+                    );
+                })
+            })
+            .as_ref()
+            .map_err(|message| {
+                Report::new(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: message.clone(),
+                })
+            })
+    }
+
+    fn open_store(&self) -> Result<RecordEcKvStore, String> {
+        let layout = RecordLayout::new(EcRecordLayout)
+            .map_err(|error| format!("invalid EC record layout: {error}"))?;
+        let handle = (self.open)(layout)
+            .map_err(|error| format!("failed to open EC record store: {error}"))?;
+        RecordEcKvStore::new(self.store_name.clone(), &handle).map_err(|report| {
+            match report.current_context() {
+                TrustedServerError::KvStore { message, .. } => message.clone(),
+                other => other.to_string(),
+            }
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl EcKvStore for LazyRecordEcKvStore {
+    fn store_name(&self) -> &str {
+        &self.store_name
+    }
+
+    async fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.store()?.lookup(key).await
+    }
+
+    async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.store()?.key_exists(key).await
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        write: EcKvWrite<'_>,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        self.store()?.insert(key, write).await
+    }
+
+    async fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        self.store()?.list_keys_with_prefix(prefix, limit).await
+    }
+
+    async fn count_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<u32, Report<TrustedServerError>> {
+        self.store()?.count_keys_with_prefix(prefix, limit).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.store()?.delete(key).await
+    }
+}
+
 fn invalid_layout() -> KvError {
     KvError::Validation("invalid EC record layout".to_owned())
 }
 
 fn store_error(store_name: &str, error: &KvError) -> Report<TrustedServerError> {
-    let message = if matches!(error, KvError::MutationUncertain) {
-        "EC record mutation completion is uncertain"
-    } else {
-        "EC record operation failed"
+    let message = match error {
+        KvError::MutationUncertain => "EC record mutation completion is uncertain",
+        KvError::Unsupported { .. } => {
+            "EC record store does not support the EdgeZero record contract; identity storage needs a record-capable store"
+        }
+        _ => "EC record operation failed",
     };
     Report::new(TrustedServerError::KvStore {
         store_name: store_name.to_owned(),
@@ -224,7 +357,102 @@ fn store_error(store_name: &str, error: &KvError) -> Report<TrustedServerError> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use edgezero_core::key_value_store::NoopKvStore;
+
     use super::*;
+
+    const ROOT_KEY: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
+
+    fn counting_opener(
+        opens: &Arc<AtomicUsize>,
+        open: fn() -> Result<KvHandle, KvError>,
+    ) -> EcRecordOpener {
+        let opens = Arc::clone(opens);
+        Box::new(move |_layout| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            open()
+        })
+    }
+
+    fn ordinary_only_handle() -> Result<KvHandle, KvError> {
+        Ok(KvHandle::new(Arc::new(NoopKvStore)))
+    }
+
+    #[test]
+    fn ordinary_only_binding_is_rejected_for_the_record_contract() {
+        let handle = KvHandle::new(Arc::new(NoopKvStore));
+
+        let error = RecordEcKvStore::new("example_ec_store".to_owned(), &handle)
+            .expect_err("should reject a binding without the record contract");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::KvStore { store_name, message }
+                    if store_name == "example_ec_store" && message.contains("record contract")
+            ),
+            "should name the store and the unmet record contract, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn lazy_store_opens_on_first_use_and_caches_a_failed_open() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let store = LazyRecordEcKvStore::new(
+            "example_ec_store".to_owned(),
+            counting_opener(&opens, || Err(KvError::Unavailable)),
+        );
+        assert!(
+            !store.is_opened() && opens.load(Ordering::SeqCst) == 0,
+            "should not open the store until the first EC operation"
+        );
+
+        let first = futures::executor::block_on(store.lookup(ROOT_KEY))
+            .expect_err("should fail the EC operation for an unlinked store");
+        let second = futures::executor::block_on(store.key_exists(ROOT_KEY))
+            .expect_err("should keep failing EC operations for an unlinked store");
+
+        for error in [first, second] {
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::KvStore { store_name, .. } if store_name == "example_ec_store"
+                ),
+                "should report a KV store error naming the store, got {error:?}"
+            );
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "should cache the failed open instead of reopening per operation"
+        );
+    }
+
+    #[test]
+    fn lazy_store_reports_an_ordinary_only_binding_on_first_use() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let store = LazyRecordEcKvStore::new(
+            "example_ec_store".to_owned(),
+            counting_opener(&opens, ordinary_only_handle),
+        );
+
+        let error = futures::executor::block_on(store.delete(ROOT_KEY))
+            .expect_err("should fail EC work on a binding without the record contract");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::KvStore { message, .. } if message.contains("record contract")
+            ),
+            "should explain the unmet record contract, got {error:?}"
+        );
+        assert!(store.is_opened(), "should cache the rejected binding");
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "should open exactly once");
+    }
 
     #[test]
     fn roots_and_markers_have_disjoint_stable_partitions() {
