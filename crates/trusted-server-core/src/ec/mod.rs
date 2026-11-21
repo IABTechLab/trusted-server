@@ -111,7 +111,8 @@ use self::page_load::{AfterResponseWrite, NavigationPermit};
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
 /// admitted SPA navigation. Only a publisher navigation holding a
 /// [`NavigationPermit`] persists the cookies; `Auction` and `PageBids` read them
-/// for bidders only. Challenged or blocked requests remain unclassified.
+/// for bidders only. `Auction` also saves the EIDs its request body carried to
+/// a live row, filling missing partner UIDs. Challenged or blocked requests remain unclassified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -712,6 +713,13 @@ impl EcContext {
     /// Provider lookup results collected for this navigation.
     pub(crate) fn lookup_results(&self) -> &LookupResults {
         &self.lookup_results
+    }
+
+    /// Whether provider lookup results were collected, for adapter tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn has_lookup_results_for_test(&self) -> bool {
+        !self.lookup_results.is_empty()
     }
 
     /// Takes the row built by [`Self::generate_if_needed`].
