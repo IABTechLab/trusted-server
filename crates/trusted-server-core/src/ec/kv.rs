@@ -27,6 +27,10 @@ use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
 
+/// Maximum Add attempts, each with a fresh ID, when creating the row of a new
+/// EC ID collides with an existing row.
+pub const MAX_CREATE_ATTEMPTS: u32 = 5;
+
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
 /// shared network; the exact count doesn't matter.
@@ -385,7 +389,8 @@ impl KvIdentityGraph {
     /// Returns [`KvWriteError::Conflict`] when the row changed since it was
     /// read, [`KvWriteError::AlreadyExists`] when a create finds a row, or
     /// [`KvWriteError::Store`] on a serialization or store failure, including
-    /// a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
+    /// a row over [`MAX_ENTRY_BYTES`]. Callers must not retry; a create that
+    /// may retry an ID collision goes through [`Self::commit_page_load_create`].
     pub async fn commit_page_load(
         &self,
         permit: PageLoadWrite,
@@ -401,6 +406,57 @@ impl KvIdentityGraph {
         };
         self.write_row(ec_id, &entry, ENTRY_TTL, mode).await?;
         Ok(entry)
+    }
+
+    /// Creates the row of a new EC ID (a generated EC or orphan recovery) as
+    /// the navigation's single write, retrying an ID collision with a fresh ID.
+    ///
+    /// `first` is the planned `(ec_id, entry)`. When an Add finds an existing
+    /// row, `fresh` builds the next candidate with a new ID, for at most
+    /// [`MAX_CREATE_ATTEMPTS`] Add attempts in all. A collision writes
+    /// nothing, so at most one row is written. The `permit` is consumed.
+    ///
+    /// Returns the ID and entry that were written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvWriteError::AlreadyExists`] when every attempt collided or
+    /// `fresh` could not build another candidate, or [`KvWriteError::Store`]
+    /// on a serialization or store failure, including a row over
+    /// [`MAX_ENTRY_BYTES`].
+    pub async fn commit_page_load_create(
+        &self,
+        permit: PageLoadWrite,
+        first: (String, KvEntry),
+        mut fresh: impl FnMut() -> Option<(String, KvEntry)>,
+    ) -> Result<(String, KvEntry), Report<KvWriteError>> {
+        permit.spend();
+        let (mut ec_id, mut entry) = first;
+        let mut attempt = 1;
+        loop {
+            match self
+                .write_row(&ec_id, &entry, ENTRY_TTL, EcKvWriteMode::Add)
+                .await
+            {
+                Ok(()) => return Ok((ec_id, entry)),
+                Err(report) if matches!(report.current_context(), KvWriteError::AlreadyExists) => {
+                    log::warn!(
+                        "Generated EC ID collision on attempt {attempt}/{MAX_CREATE_ATTEMPTS}"
+                    );
+                    if attempt >= MAX_CREATE_ATTEMPTS {
+                        return Err(report.attach(format!(
+                            "no unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
+                        )));
+                    }
+                    let Some(next) = fresh() else {
+                        return Err(report.attach("no fresh EC ID could be built"));
+                    };
+                    (ec_id, entry) = next;
+                    attempt += 1;
+                }
+                Err(report) => return Err(report),
+            }
+        }
     }
 
     /// Applies a navigation's follow-up update after its response was sent.

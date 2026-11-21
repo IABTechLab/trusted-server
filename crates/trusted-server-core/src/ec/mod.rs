@@ -448,7 +448,9 @@ impl EcContext {
     ///
     /// Never writes KV. When `kv` is available, the new row is held as the
     /// pending entry and created by the navigation's single page-load write
-    /// in finalize; the EC is issued only if that write succeeds.
+    /// in finalize, which retries an ID collision with a fresh ID (see
+    /// [`KvIdentityGraph::commit_page_load_create`]); the EC is issued only if
+    /// that write succeeds.
     ///
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
@@ -496,7 +498,7 @@ impl EcContext {
 
         if kv.is_some() {
             // The row is created by the navigation's single page-load write in
-            // finalize; a collision there leaves this EC unissued.
+            // finalize, which retries an ID collision with a fresh ID.
             self.pending_entry = Some(Box::new(entry));
             self.kv_snapshot = EcKvSnapshot::Missing {
                 ec_id: ec_id.clone(),

@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_revocation_returns_failure_and_keeps_the_browser_cookie() {
+    async fn failed_revocation_returns_failure_while_expiring_the_browser_cookie() {
         let settings = create_test_settings();
         let req = prepare_consent_update(
             &noop_services(),
@@ -601,21 +601,15 @@ mod tests {
             &mut response,
         )
         .await;
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "should report the failed revocation"
-        );
-        // The cookie stays so the next request retries the tombstone.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            !response
+            response
                 .headers()
                 .get_all(header::SET_COOKIE)
                 .iter()
                 .any(|value| value
                     .to_str()
-                    .is_ok_and(|value| value.starts_with("ts-ec="))),
-            "should keep the EC cookie until the tombstone is written"
+                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0")))
         );
     }
 }
