@@ -10,24 +10,49 @@
 
 ## Outcome
 
-Trusted Server links Auctioneer into its Fastly application and runs it as a local auction provider. Operators configure it through `trusted-server.toml`, using the existing validation, push, and runtime extraction flow. Auctioneer supplies preparation, bidder policy, fan-out, local selection, and targeting. Trusted Server supplies the runtime, routing, competition between providers, and creative delivery.
+Trusted Server first adopts Auctioneer's OpenRTB types across its existing OpenRTB paths, then links Auctioneer into its Fastly application as a local auction provider. Operators configure it through `trusted-server.toml`, using the existing validation, push, and runtime extraction flow. Auctioneer supplies the shared protocol model, preparation, bidder policy, fan-out, local selection, and targeting. Trusted Server supplies the runtime, routing, competition between providers, and creative delivery.
 
 This is the Trusted Server specification for [epic #1505](https://github.com/IABTechLab/trusted-server/issues/1505) and its existing delivery tickets. It reconciles the accepted [Fastly local-provider contract](https://github.com/IABTechLab/auctioneer/blob/9b83deaa680ad8e867169db3b4ebb195b8a1b33c/docs/superpowers/specs/2026-11-05-trusted-server-fastly-local-provider-design.md) with the settings-first bridge merged in [Auctioneer PR #159](https://github.com/IABTechLab/auctioneer/pull/159). The upstream contract remains authoritative for shared engine behavior; this specification defines the host changes needed to consume it.
 
-The first delivery is Fastly banner/display. Other Trusted Server hosts, video/native/AMP delivery, new currency conversion, new creative renderers, and live publisher qualification are outside this change. Auctioneer retains ownership of bidder discovery, implementation, and adapter qualification.
+The first local Auctioneer host delivery is Fastly banner/display. The prerequisite OpenRTB type migration affects shared paths and must preserve existing behavior on every Trusted Server adapter. Local Auctioneer hosts on other adapters, video/native/AMP delivery, new currency conversion, new creative renderers, and live publisher qualification are outside this change. Auctioneer retains ownership of bidder discovery, implementation, and adapter qualification.
 
 ## Existing tickets and ownership
 
-| Trusted Server ticket                                             | Deliverable                                                                                 | Auctioneer relationship                                                                 |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| [#1509](https://github.com/IABTechLab/trusted-server/issues/1509) | Review this host specification and reconcile host answers with the accepted contract        | #34, accepted through PR #152 and tracking reconciliation #153                          |
-| [#1510](https://github.com/IABTechLab/trusted-server/issues/1510) | Typed settings, validated policy, real host services, original timing, and funded ownership | #51; PR #159 supplies the portable API, while real host handoff acceptance remains open |
-| [#1511](https://github.com/IABTechLab/trusted-server/issues/1511) | Link the actual Fastly artifact, execute the local provider, preserve routing and delivery  | #76; acceptance requires the bridge and qualified Fastly serving path, including #88    |
-| [#1512](https://github.com/IABTechLab/trusted-server/issues/1512) | Supply the host artifact harness and controlled display flow                                | #91 records standalone/embedded equivalence using that artifact                         |
+| Trusted Server ticket                                             | Deliverable                                                                                                                                      | Auctioneer relationship                                                                 |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| [#1509](https://github.com/IABTechLab/trusted-server/issues/1509) | Review this host specification and reconcile host answers with the accepted contract                                                             | #34, accepted through PR #152 and tracking reconciliation #153                          |
+| [#1510](https://github.com/IABTechLab/trusted-server/issues/1510) | Host binding after the shared OpenRTB model prerequisite: typed settings, validated policy, real services, original timing, and funded ownership | #51; PR #159 supplies the portable API, while real host handoff acceptance remains open |
+| [#1511](https://github.com/IABTechLab/trusted-server/issues/1511) | Link the actual Fastly artifact, execute the local provider, preserve routing and delivery                                                       | #76; acceptance requires the bridge and qualified Fastly serving path, including #88    |
+| [#1512](https://github.com/IABTechLab/trusted-server/issues/1512) | Supply the host artifact harness and controlled display flow                                                                                     | #91 records standalone/embedded equivalence using that artifact                         |
 
 The SDK cutover is [#1507](https://github.com/IABTechLab/trusted-server/issues/1507), implemented by [PR #1506](https://github.com/IABTechLab/trusted-server/pull/1506); its specification is tracked in #1513. Qualification is separately tracked in [#1508](https://github.com/IABTechLab/trusted-server/issues/1508). Follow PR #1506's current decisions: cutover merge and production deployment do not wait for the EdgeZero EZ-Q1 qualification record. This scheduling decision does not establish Auctioneer host acceptance or waive its selected Fastly serving and resource requirements.
 
 Use these tickets rather than creating parallel integration tasks. Epic #1505 coordinates the work; its completion is not a prerequisite of its own leaves. The wider protocol modularity work in #1336 and Cloudflare/Spin work in #1484 are not prerequisites for this selected Fastly path.
+
+## Required shared OpenRTB model
+
+Adopting `auctioneer-openrtb` throughout Trusted Server is a prerequisite to host binding and local-provider integration. Land it as a separately reviewed implementation change before #1510's bridge work and #1511's local execution. It can progress independently of the EdgeZero cutover because the shared protocol package does not itself depend on EdgeZero. SDK alignment remains a separate prerequisite for passing actual host services to the engine.
+
+Use Auctioneer's raw `BidRequest`, `BidResponse`, `SeatBid`, `Bid`, and nested OpenRTB types for all existing remote-provider builders/readers, legacy Prebid/APS paths, and direct auction wire output. The dependency is present in default builds on all adapters; only the engine and local executor remain behind the `auctioneer` feature. The eventual bridge and shared model must resolve to the same reviewed Auctioneer source revision, without parallel versions or a host fork.
+
+Retire `trusted-server-openrtb`, its generated bindings/proto pipeline, and `trusted-server-openrtb-codegen` after all consumers and behavior tests migrate. Update the workspace, aliases, CI, and documentation together. A re-export facade for the shared types and project-owned extension helpers is acceptable; copied standard structs, a maintained second generated model, and serialization/reparse conversion between competing OpenRTB models do not satisfy this prerequisite.
+
+Keep `AuctionRequest`, routing/permissions, and host bid/delivery facts protocol-neutral. Convert those facts to the shared raw model at protocol boundaries. Sharing raw types does not apply Auctioneer's engine-specific preparation or bidder policy to remote providers; each existing protocol/profile keeps its validation, signing, response admission, and error ownership. Full completion of #1336's protocol modularity work remains outside this prerequisite.
+
+The existing models are not a source-compatible substitution. The inspected shared model requires request/response/bid IDs and bid price, uses integer flags and a wider `tmax`, and represents extension/unknown fields differently from Trusted Server's generated model. Preserve the installed wire and admission behavior through explicit compatibility controls:
+
+| Area                           | Required compatibility                                                                                                                                                                                                                          |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request and response encoding  | Preserve omitted/default fields, numeric widths, supported flag encodings, currency, banner sizes, notification fields, and existing no-bid forms                                                                                               |
+| Extensions and identity        | Preserve permitted Prebid/APS/Trusted Server extensions, signing payloads, consent/EID placement and privacy gates; a shared unknown-field map does not authorize new forwarding                                                                |
+| Decoding and failure isolation | Preserve currently supported malformed/missing-field handling, per-bid rejection versus provider failure, and valid siblings; do not turn absent IDs into fabricated identities or lose unrelated bids through stricter whole-response decoding |
+| Presence and bounds            | Preserve missing/null/value distinctions wherever policy consumes them, existing byte/node/depth caps, and bounded allocation/work; sharing a type does not grant wire provenance                                                               |
+
+Existing response readers use tolerant raw JSON framing to isolate malformed bids and apply profile-specific admission. Preserve that bounded framing where required; do not replace it with strict whole-response deserialization that discards valid siblings. Use the shared raw types at typed protocol boundaries while keeping neutral admitted host bids and their existing numeric/delivery rules.
+
+Where upstream's raw model or codec cannot express a required compatibility case, make the minimal reviewed change in Auctioneer and keep the prerequisite open until it is available and verified. Maintain strict standalone engine policy in its existing preparation/validation boundary. Do not silently change Trusted Server's wire contract, weaken engine checks, or introduce shadow wire structs to get the migration through. Any intentional compatibility change returns to explicit design review.
+
+The prerequisite is accepted only when the default builds use the shared types, the old model/codegen have no live consumers or build jobs, and positive/negative remote protocol, privacy, signing, direct-output and cross-adapter controls pass. This evidence is required before host-binding implementation starts; merely adding the new crate beside the old one is insufficient.
 
 ## Source baseline and dependency alignment
 
@@ -86,7 +111,7 @@ Use the existing TOML/environment overlay, `TrustedServerAppConfig`, signed blob
 
 Bidder credentials remain references to host-selected secret services. Preserve Auctioneer's lazy, bounded credential lookup after admission and deadline checks. Do not indiscriminately register these references as Trusted Server `KeyInDefault` leaves: that path resolves static secrets eagerly during configuration extraction. The host binds the store; Auctioneer's credential source validates and resolves the applicable bidder credential when permitted.
 
-Gate the new dependency and execution code behind a consistent `auctioneer` Cargo feature in core, the native CLI, and Fastly. Existing default builds retain their behavior. Builds without local support reject a configured local declaration, and unsupported deployment targets reject it during validation. This feature selects integration support, not a handwritten bidder cohort. Once a local declaration has been published, rollback to a binary that predates the schema requires restoring its matching compatible configuration blob.
+Keep `auctioneer-openrtb` available to existing protocol paths in default builds. Gate Auctioneer engine dependencies and local execution behind a consistent `auctioneer` Cargo feature in core, the native CLI, and Fastly. Default builds preserve their existing wire and privacy behavior using the shared model. Builds without local support reject a configured local declaration, and unsupported deployment targets reject it during validation. This feature selects local integration support, not a handwritten bidder cohort. Once a local declaration has been published, rollback to a binary that predates the schema requires restoring its matching compatible configuration blob.
 
 ## Routing and typed input
 
@@ -96,11 +121,11 @@ Only demand assigned to the local provider enters its request. Remote routing, i
 
 Remote stored requests can expand to bidders the host cannot inspect. For this first delivery, reject an auction that combines local demand with opaque remote stored demand before either affected path dispatches. Mixed local/remote auctions must use inspectable explicit bidder assignments. Remote-only stored-request behavior remains unchanged; an operator assertion about an opaque expansion is not proof of unique routing.
 
-Convert Trusted Server's provider-routed `AuctionRequest` explicitly into Auctioneer's typed `BidRequest`; the repositories' Rust models are not interchangeable. Preserve request and impression IDs, offered banner dimensions, floor semantics, selected bidder parameters, publisher/site/device context, and permitted user data. Account selection follows the accepted host policy and Auctioneer's established resolution rules; an untrusted context value cannot select another tenant. Exclude unsupported media before local routing.
+Convert Trusted Server's provider-routed neutral `AuctionRequest` explicitly into the shared `auctioneer-openrtb` `BidRequest`, already adopted by the prerequisite. This is a neutral-to-protocol conversion, not a conversion between two OpenRTB models. Preserve request and impression IDs, offered banner dimensions, floor semantics, selected bidder parameters, publisher/site/device context, and permitted user data. Account selection follows the accepted host policy and Auctioneer's established resolution rules; an untrusted context value cannot select another tenant. Exclude unsupported media before local routing.
 
 Do not serialize and reparse a whole request to cross the bridge. Admit and fund the host's conversion storage before allocating it, then retain Auctioneer's own typed depth/node/width and parameter validation. Missing/null/value distinctions and unknown original wire provenance must remain honest; a reconstructed typed request cannot manufacture raw-wire evidence.
 
-The current `AuctionRequest` serialization explicitly omits consent and EIDs, so it is unsuitable as a bridge representation. Populate the Auctioneer fields consumed by its canonical preparation, including the expected consent/EID locations, rather than assuming the existing remote OpenRTB shape is structurally identical.
+The neutral `AuctionRequest` serialization explicitly omits consent and EIDs, so it is unsuitable as a bridge representation. Populate the shared raw fields consumed by Auctioneer's canonical preparation, including the expected consent/EID locations. The local and remote paths share the model while retaining their explicit profile and policy projections.
 
 ## Consent and identity
 
@@ -196,6 +221,10 @@ Keep the completed owner until all borrowed data is gone, or transfer surviving 
 
 These controls are required implementation evidence. Reuse existing configuration, provider-plan, privacy, publisher EOF, Fastly/Viceroy, and Auctioneer conformance tests at the boundary they already own.
 
+### Shared model prerequisite
+
+Before #1510's host binding, prove that default and feature-off builds on Fastly, Axum, Cloudflare and Spin use `auctioneer-openrtb`, that no retired model/codegen remains in the workspace/dependency graph or CI, and that the compatibility matrix above passes for standard, Prebid and APS paths. Migrate applicable old wire-model tests before retiring their crate. Capture source-bound before/after request/output and response-admission cases, including missing IDs, accepted flag forms, unknown extensions, permitted consent/EIDs, signing, malformed bids with valid siblings, no-bid and notifications. This prerequisite does not enable new media or local execution on other hosts.
+
 ### Host contract and service binding
 
 For #1509, record agreement with the accepted upstream contract and the host deltas defined here. For #1510, prove:
@@ -227,7 +256,7 @@ Bind observations to exact host/Auctioneer/SDK revisions, features, artifact dig
 ## Delivery and verification sequence
 
 1. Complete host contract review under #1509, using the current PR #1506 cutover decisions rather than stale historical SDK gates.
-2. Land or rebase onto the cutover and align the reviewed Auctioneer/EdgeZero graph. Record the compatibility delta and affected checks.
+2. Land the shared OpenRTB model migration and its compatibility evidence as a separate prerequisite change. Independently land or rebase onto the cutover and align the reviewed Auctioneer/EdgeZero graph. Both prerequisites must be satisfied before host binding; record their exact merged commits and affected checks.
 3. Implement #1510's typed configuration, validation, explicit request services, and funded binding. Coordinate real handoff evidence with Auctioneer #51.
 4. Implement #1511's compiled local execution, progress driver, result projection, and delivery capabilities. Gate accepted Fastly serving on the applicable upstream requirements.
 5. Implement #1512's controlled artifact flow and equivalence evidence, then record the result with Auctioneer #91.
@@ -243,6 +272,7 @@ Deployment uses the existing operator workflow after the corresponding artifact 
 - [Merged settings-first preparation API](https://github.com/IABTechLab/auctioneer/blob/499f0e540e95e1c86b730c1030aabef28de01d0a/crates/auctioneer-core/src/auction/prepare.rs), [services and funding](https://github.com/IABTechLab/auctioneer/blob/499f0e540e95e1c86b730c1030aabef28de01d0a/crates/auctioneer-core/src/auction/services.rs), and [retained results](https://github.com/IABTechLab/auctioneer/blob/499f0e540e95e1c86b730c1030aabef28de01d0a/crates/auctioneer-core/src/auction/result.rs).
 - [Cutover provider plan](https://github.com/IABTechLab/trusted-server/blob/feaf3df5d1c9bb2dca64158480725cb555ab9c26/crates/trusted-server-core/src/auction/plan.rs), [orchestrator](https://github.com/IABTechLab/trusted-server/blob/feaf3df5d1c9bb2dca64158480725cb555ab9c26/crates/trusted-server-core/src/auction/orchestrator.rs), [runtime services](https://github.com/IABTechLab/trusted-server/blob/feaf3df5d1c9bb2dca64158480725cb555ab9c26/crates/trusted-server-core/src/platform/types.rs), and [Fastly binding](https://github.com/IABTechLab/trusted-server/blob/feaf3df5d1c9bb2dca64158480725cb555ab9c26/crates/trusted-server-adapter-fastly/src/app.rs).
 - [Current cutover design and maintainer decisions](https://github.com/IABTechLab/trusted-server/blob/feaf3df5d1c9bb2dca64158480725cb555ab9c26/docs/superpowers/specs/2026-10-17-edgezero-pr275-hard-cutover-design.md) and [inspected Auctioneer dependency manifest](https://github.com/IABTechLab/auctioneer/blob/05f2a56e9555be9c46a789c868100e37162abe5b/Cargo.toml).
+- [Shared raw request model](https://github.com/IABTechLab/auctioneer/blob/05f2a56e9555be9c46a789c868100e37162abe5b/crates/auctioneer-openrtb/src/types/bid_request.rs), [response model](https://github.com/IABTechLab/auctioneer/blob/05f2a56e9555be9c46a789c868100e37162abe5b/crates/auctioneer-openrtb/src/types/bid_response.rs), and [presence representation](https://github.com/IABTechLab/auctioneer/blob/05f2a56e9555be9c46a789c868100e37162abe5b/crates/auctioneer-openrtb/src/types/field.rs).
 - [Auctioneer linked-artifact acceptance #76](https://github.com/IABTechLab/auctioneer/issues/76) and [equivalence acceptance #91](https://github.com/IABTechLab/auctioneer/issues/91).
 
 ## Review log
@@ -250,3 +280,4 @@ Deployment uses the existing operator workflow after the corresponding artifact 
 - Round 1 (Codex agent, 2026-11-22): found that mandatory nonempty creative markup would reject valid APS renderer bids. Changed local admission to allow an admitted existing typed renderer with required metadata and capability, while rejecting arbitrary executable descriptors.
 - Round 2 (Codex agent, 2026-11-22): verified the renderer correction and found no remaining blocking gaps. Added an explicit cutoff control with one completed local bidder and one suspended bidder, preserving the permitted completed candidate without further network waits.
 - Round 3 (Codex plan-document reviewer, 2026-11-22): checked the implementation plan against this specification and the source boundaries. Found no blocking mismatch or required design change; clarified artifact identity in the plan's controlled-flow evidence.
+- Round 4 (Codex spec and plan reviewers, 2026-11-22): reviewed the user-required shared OpenRTB prerequisite against existing builders/readers, identity consumers and upstream raw models. Both approved the mandatory default-build migration, compatibility controls, tolerant sibling handling, old model/codegen retirement, and subsequent host-integration gates with no blocking findings.
