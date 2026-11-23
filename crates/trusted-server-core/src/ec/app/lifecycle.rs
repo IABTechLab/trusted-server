@@ -30,7 +30,8 @@ pub struct IdentityRequest {
     pub context: EcContext,
     /// The app's shared record service, if configured.
     pub graph: Option<KvIdentityGraph>,
-    /// Whether available trusted device signals allow creation.
+    /// Whether available trusted device signals allow creation under
+    /// `[ec].browser_gate`.
     pub creation_allowed: bool,
     /// Browser EIDs captured before routing consumes the request.
     pub eids_cookie: Option<String>,
@@ -48,8 +49,11 @@ impl IdentityApp {
 
     /// Reads consent, identity and trusted platform signals once for a request.
     ///
-    /// Missing JA4 never prevents creation. User-Agent is analytics metadata,
-    /// not an independent authorization gate.
+    /// `[ec].browser_gate` decides whether the signals allow creation. Under
+    /// the default `lenient` rule, missing JA4 never prevents creation and
+    /// User-Agent is analytics metadata, not an independent authorization
+    /// gate. `strict` also requires a JA4 class and a recognized User-Agent
+    /// platform.
     ///
     /// # Errors
     ///
@@ -84,7 +88,7 @@ impl IdentityApp {
                     services.client_info().h2_fingerprint.as_deref(),
                 )
             });
-        let creation_allowed = signals.known_browser != Some(false);
+        let creation_allowed = signals.allows_creation(self.settings.ec.browser_gate);
         context.set_device_signals(signals);
         Ok(IdentityRequest {
             context,
@@ -378,7 +382,9 @@ mod tests {
     use super::cookie_value;
     use crate::ec::EcContext;
     use crate::ec::app::{IdentityApp, IdentityPlatform};
-    use crate::settings::ProxyAssetRoute;
+    use crate::ec::device::DeviceSignals;
+    use crate::platform::test_support::noop_services;
+    use crate::settings::{BrowserGate, ProxyAssetRoute};
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::http::{Request, header};
     use futures::executor::block_on;
@@ -410,6 +416,31 @@ mod tests {
                 context.has_navigation_permit(),
                 method == edgezero_core::http::Method::POST,
                 "should exclude only actual GET/HEAD asset routes"
+            );
+        }
+    }
+
+    #[test]
+    fn read_request_applies_the_configured_browser_gate() {
+        for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+            let mut settings = create_test_settings();
+            settings.ec.browser_gate = gate;
+            let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+                .expect("should build identity app");
+            let mut request = Request::default();
+            request.extensions_mut().insert(DeviceSignals::derive(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Example/1.0",
+                None,
+                None,
+            ));
+
+            let identity = app
+                .read_request(&noop_services(), &request)
+                .expect("should read identity request");
+
+            assert_eq!(
+                identity.creation_allowed, allowed,
+                "should apply the {gate:?} rule to a browser without JA4"
             );
         }
     }

@@ -18,6 +18,7 @@
 use sha2::{Digest as _, Sha256};
 
 use super::kv_types::KvDevice;
+use crate::settings::BrowserGate;
 
 /// Device signals derived from a single request.
 ///
@@ -78,11 +79,25 @@ impl DeviceSignals {
     /// consistency checks can be added later if product requirements demand
     /// stronger spoof resistance.
     ///
-    /// `known_browser` is still computed and stored on [`KvDevice`] for
-    /// analytics but does not gate identity operations.
+    /// This check ignores `known_browser`; [`Self::allows_creation`] applies
+    /// it, and this check only under [`BrowserGate::Strict`].
     #[must_use]
     pub fn looks_like_browser(&self) -> bool {
         self.ja4_class.is_some() && self.platform_class.is_some()
+    }
+
+    /// Returns `true` when these signals allow Edge Cookie creation under
+    /// `gate`.
+    ///
+    /// Both rules block a known non-browser fingerprint.
+    /// [`BrowserGate::Strict`] also requires [`Self::looks_like_browser`].
+    #[must_use]
+    pub fn allows_creation(&self, gate: BrowserGate) -> bool {
+        let known_non_browser = self.known_browser == Some(false);
+        match gate {
+            BrowserGate::Lenient => !known_non_browser,
+            BrowserGate::Strict => !known_non_browser && self.looks_like_browser(),
+        }
     }
 
     /// Converts these signals into a [`KvDevice`] for KV storage.
@@ -570,5 +585,53 @@ mod tests {
             !signals.looks_like_browser(),
             "unrecognizable UA should be rejected even with JA4"
         );
+    }
+
+    #[test]
+    fn lenient_gate_allows_creation_without_ja4() {
+        let signals = DeviceSignals::derive(CHROME_MAC_UA, None, None);
+
+        assert!(
+            signals.allows_creation(BrowserGate::Lenient),
+            "should not block a client only because JA4 is missing"
+        );
+    }
+
+    #[test]
+    fn strict_gate_requires_ja4_and_platform() {
+        for (ua, ja4, allowed) in [
+            (
+                CHROME_MAC_UA,
+                Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+                true,
+            ),
+            (CHROME_MAC_UA, None, false),
+            (BOT_UA, Some("t13d1516h2_8daaf6152771_e5627efa2ab1"), false),
+        ] {
+            let signals = DeviceSignals::derive(ua, ja4, None);
+
+            assert_eq!(
+                signals.allows_creation(BrowserGate::Strict),
+                allowed,
+                "should require both JA4 and platform for {ua:?} with JA4 {ja4:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_gates_block_a_known_non_browser() {
+        let mut signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+            None,
+        );
+        signals.known_browser = Some(false);
+
+        for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+            assert!(
+                !signals.allows_creation(gate),
+                "should block a known non-browser fingerprint under {gate:?}"
+            );
+        }
     }
 }
