@@ -1,17 +1,26 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
-use bytes::Bytes;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_adapter_spin::config_store::SpinConfigStore;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
-use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    ClientInfo, GeoInfo, KvHandleStore, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
+
+/// Key-value label that holds the startup app config and the request-time
+/// config, including request-signing metadata.
+///
+/// Spin grants this label to a component without runtime configuration. The
+/// adapter's generic runtime KV store uses its own `trusted_server_kv` label
+/// and never this one.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub(crate) const SPIN_DEFAULT_CONFIG_LABEL: &str = "default";
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
@@ -20,8 +29,10 @@ const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 // Noop stubs — used when a handle is absent (native CI, missing binding)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 struct NoopConfigStore;
 
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 #[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
@@ -57,7 +68,7 @@ impl PlatformSecretStore for NoopSecretStore {
 }
 
 // ---------------------------------------------------------------------------
-// edgezero handle adapters — injected by edgezero_adapter_spin::run_app
+// edgezero handle adapters
 // ---------------------------------------------------------------------------
 
 /// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
@@ -65,8 +76,10 @@ impl PlatformSecretStore for NoopSecretStore {
 /// Spin config stores are KV-backed, so reads preserve the requested key
 /// verbatim. Writes are unsupported on current Spin runtime config and return
 /// typed errors.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 #[async_trait::async_trait(?Send)]
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
@@ -152,49 +165,6 @@ fn spin_secret_variable_name(
     Ok(format!("{store_variable}_{key_variable}"))
 }
 
-/// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
-///
-/// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
-/// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
-/// returns `KvError::Unsupported` rather than silently writing a non-expiring
-/// record. `KvHandle` returns `KvError::Validation` for invalid keys, TTLs, or
-/// values before delegating to the backend. Callers of the generic platform KV
-/// interface must handle that capability difference explicitly.
-struct KvHandleAdapter(KvHandle);
-
-#[async_trait::async_trait(?Send)]
-impl KvStore for KvHandleAdapter {
-    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
-        self.0.get_bytes(key).await
-    }
-
-    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        self.0.put_bytes(key, value).await
-    }
-
-    async fn put_bytes_with_ttl(
-        &self,
-        key: &str,
-        value: Bytes,
-        ttl: Duration,
-    ) -> Result<(), KvError> {
-        self.0.put_bytes_with_ttl(key, value, ttl).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        self.0.delete(key).await
-    }
-
-    async fn list_keys_page(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, KvError> {
-        self.0.list_keys_page(prefix, cursor, limit).await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SpinSecretStoreAdapter — WASM target + spin feature only
 // ---------------------------------------------------------------------------
@@ -249,9 +219,19 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Spin request.
 ///
-/// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
-/// before routing. Secrets are read synchronously from Spin component
-/// variables because Trusted Server's platform secret trait is sync.
+/// Config reads come from the `default` key-value label that startup reads,
+/// whatever store name the caller passes, so request-signing metadata
+/// (`current-kid`, `active-kids` and public JWKs) and any other request-time
+/// config key live there. The host build has no Spin runtime and answers every
+/// config read with an error.
+///
+/// KV is the `trusted_server_kv` handle `EdgeZero` registers because
+/// [`TrustedServerApp`](crate::app::TrustedServerApp) declares that store. It
+/// opens the label of the same name on first use; a component without that
+/// label answers each KV operation with `KvError::OpenFailed`.
+///
+/// Secrets are read synchronously from Spin component variables because
+/// Trusted Server's platform secret trait is sync.
 ///
 /// The outbound client is the one the request context carries, with the proxy
 /// marker turned off, and the clock is the context's monotonic clock.
@@ -266,14 +246,17 @@ pub fn build_runtime_services(
     let client_ip = extract_client_ip(ctx);
     let outbound_client = request_outbound_client(ctx)?;
 
-    let config_store: Arc<dyn PlatformConfigStore> = ctx
-        .config_store_default()
-        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
-        .unwrap_or_else(|| Arc::new(NoopConfigStore));
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    let config_store: Arc<dyn PlatformConfigStore> =
+        Arc::new(ConfigStoreHandleAdapter(ConfigStoreHandle::new(Arc::new(
+            SpinConfigStore::for_label(SPIN_DEFAULT_CONFIG_LABEL.to_owned()),
+        ))));
+    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+    let config_store: Arc<dyn PlatformConfigStore> = Arc::new(NoopConfigStore);
 
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
-        .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
+        .map(|handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>)
         .unwrap_or_else(|| Arc::new(UnavailableKvStore));
 
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]

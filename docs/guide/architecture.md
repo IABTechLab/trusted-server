@@ -57,7 +57,7 @@ Native Axum adapter (native binary):
 
 | Feature                                    | Axum                                                                                                                                                                                             |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
+| KV store                                   | Unsupported (`KvError::Unavailable`) until #1587 → #1574 wire EdgeZero-declared storage                                                                                                          |
 | Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
 | Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                    |
 | Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
@@ -69,7 +69,7 @@ Native Axum adapter (native binary):
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
+- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_kv` label
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning
@@ -142,16 +142,17 @@ Data collection operations are subject to available consent signals (TCF v2 form
 
 ### Fastly KV Store
 
-Used for:
-
-- Counter storage
-- Domain mappings
-- Configuration cache
-- EC ID state
+Edge Cookie records use the configured `ec.ec_store` KV Store
+(`ec_identity_store` by default). The separate `trusted_server_kv` store is
+wired for generic runtime KV, with no normal production consumer yet.
+Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
+and batch-sync counters use Edge Rate Limiting counters rather than KV.
 
 ### Data Persistence
 
-Page content and request bodies are processed in-flight and are not persisted. EC ID state and related metadata are stored in KV stores as configured.
+Request bodies are processed in-flight. EC state and related metadata use the
+configured identity KV Store. When shared-template caching is enabled, Fastly
+Core Cache can retain transformed HTML templates; this is separate from KV.
 
 ## Performance Characteristics
 
@@ -169,12 +170,12 @@ Page content and request bodies are processed in-flight and are not persisted. E
 
 ## Runtime Targets
 
-| Adapter                             | Target                    | Use case                                                          |
-| ----------------------------------- | ------------------------- | ----------------------------------------------------------------- |
-| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                      |
-| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                  |
-| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                        |
-| `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
+| Adapter                             | Target                    | Use case                                                         |
+| ----------------------------------- | ------------------------- | ---------------------------------------------------------------- |
+| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                     |
+| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Cloudflare Workers (development support; see adapter guide)      |
+| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                       |
+| `trusted-server-adapter-axum`       | native                    | Production startup and local development (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
 

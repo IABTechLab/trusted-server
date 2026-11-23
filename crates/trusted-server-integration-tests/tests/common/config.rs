@@ -280,6 +280,37 @@ pub fn navigation_auction_app_config_envelope(
     })
 }
 
+/// Enables `[request_signing]` in an existing fixture.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when the envelope is invalid or has no
+/// `[request_signing]` section.
+pub fn envelope_with_request_signing(envelope_json: &str) -> TestResult<String> {
+    let envelope: BlobEnvelope = serde_json::from_str(envelope_json)
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(error.to_string()))?;
+    envelope
+        .verify()
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(error.to_string()))?;
+    let app_config: TrustedServerAppConfig = serde_json::from_value(envelope.data)
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(error.to_string()))?;
+    let mut settings = app_config.into_settings();
+    settings
+        .request_signing
+        .as_mut()
+        .ok_or_else(|| {
+            Report::new(TestError::ConfigGeneration)
+                .attach("fixture should configure [request_signing]")
+        })?
+        .enabled = true;
+    let app_config = TrustedServerAppConfig::new(settings)
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(format!("{error:?}")))?;
+    let data = serde_json::to_value(app_config)
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(error.to_string()))?;
+    serde_json::to_string(&BlobEnvelope::new(data, envelope.generated_at))
+        .map_err(|error| Report::new(TestError::ConfigGeneration).attach(error.to_string()))
+}
+
 /// Retargets an existing fixture without changing its policies or secret references.
 pub fn envelope_with_public_origin(envelope_json: &str, public_origin: &str) -> TestResult<String> {
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json)
@@ -557,8 +588,12 @@ mod tests {
         let stores = &parsed["local_server"]["kv_stores"];
 
         assert!(
-            stores["counter_store"].is_array(),
-            "fastly.toml should define counter_store for batch-sync rate limiting"
+            stores.get("counter_store").is_none(),
+            "fastly.toml should not declare the Edge Rate Limiting counter as a KV store"
+        );
+        assert!(
+            stores["trusted_server_kv"].is_array(),
+            "fastly.toml should link the generic runtime KV store under its logical ID"
         );
         let ec_entries = stores["ec_identity_store"]
             .as_array()

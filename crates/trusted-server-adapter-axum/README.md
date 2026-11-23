@@ -8,8 +8,10 @@ yet.
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
-unavailable; config/secret snapshots are not live identity storage. Its
-`/health`, `/ready`, and startup-failure responses follow the shared
+unavailable (`KvError::Unavailable`) until #1587 then #1574 connect identity
+storage through EdgeZero's declared store. There is no adapter-local KV store;
+config/secret snapshots are not live identity storage. Its `/health`, `/ready`,
+and startup-failure responses follow the shared
 [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
 
 Before listening, the native initializer reads the declared prepared stores,

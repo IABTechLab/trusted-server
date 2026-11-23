@@ -74,13 +74,17 @@ authority, scheme, and client-address headers in the innermost middleware.
 | startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`503`) | startup error (`503`) | startup error (`503`) | startup error (`503`) |
 
 `real`, `unsupported`, `guarded`, `publisher fallback`, `unavailable`, and
-`startup error` are distinct observable dispositions. An em dash means that the
-adapter has no local route; the publisher fallback can therefore receive that
-path. The startup rows show what each path answers when startup fails, in place
-of every normal route. Axum, Cloudflare, and Spin serve a separate failure
-router. Fastly answers `/health` before it assembles the app and the other
-startup rows at its entry point; a method outside the listed seven gets
-EdgeZero's JSON error at the failure's status, normally `500`.
+`startup error` are distinct observable dispositions. On Cloudflare,
+`/.well-known/trusted-server.json` and `/verify-signature` are routed, but the
+Worker has no request-time config store for signing metadata: discovery
+answers the shared `500` and `/verify-signature` answers `200` with
+`verified: false`. An em dash means that the adapter has no local route; the
+publisher fallback can therefore receive that path. The startup rows show what
+each path answers when startup fails, in place of every normal route. Axum,
+Cloudflare, and Spin serve a separate failure router. Fastly answers `/health`
+before it assembles the app and the other startup rows at its entry point; a
+method outside the listed seven gets EdgeZero's JSON error at the failure's
+status, normally `500`.
 
 ## Contract conventions
 
