@@ -2,8 +2,10 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Response, StatusCode, header};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
@@ -1204,4 +1206,143 @@ async fn unsupported_ec_routes_clean_withdrawal_marker_without_changing_other_re
         missing_deletions.is_empty(),
         "should clean accepted withdrawal even without store or enabled renewal: {missing_deletions:?}"
     );
+}
+
+struct ObservedGeo {
+    lookups: Arc<AtomicUsize>,
+}
+
+impl PlatformGeo for ObservedGeo {
+    fn lookup(&self, _ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(GeoInfo::country_region("US", Some("TN".to_owned()))))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_ec_post_without_marker_skips_body_and_identity_reads() {
+    let fixture = Fixture::new(false).await;
+    let app = IdentityApp::build(
+        Arc::clone(fixture.app.settings()),
+        IdentityPlatform::default(),
+    )
+    .expect("should build unsupported EC app without record storage");
+    let geo_lookups = Arc::new(AtomicUsize::new(0));
+    let services = RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .outbound_client(fixture.services.outbound_client().clone())
+        .clock(fixture.services.clock().clone())
+        .geo(Arc::new(ObservedGeo {
+            lookups: Arc::clone(&geo_lookups),
+        }))
+        .client_info(fixture.services.client_info().clone())
+        .build();
+    // Exercise the observers first on the accepted marker-cleanup path.
+    for marker_present in [true, false] {
+        geo_lookups.store(0, Ordering::SeqCst);
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let observed_reads = Arc::clone(&body_reads);
+        let body = Body::stream(futures::stream::once(async move {
+            observed_reads.fetch_add(1, Ordering::SeqCst);
+            Bytes::from_static(b"{}")
+        }));
+        let mut request = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/_ts/api/v1/ec")
+            .header(header::ORIGIN, "https://publisher.example.com")
+            .header(
+                header::COOKIE,
+                if marker_present {
+                    "us_privacy=1YYN; ts-ec-issued-at=carried"
+                } else {
+                    "us_privacy=1YYN"
+                },
+            )
+            .body(body)
+            .expect("should create observed unsupported EC POST");
+        request.extensions_mut().insert(RuntimeRequestOrigin::new(
+            InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+                .expect("should provide trusted publisher ingress"),
+        ));
+
+        let response = app.ec_route(&services, request).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should preserve unsupported EC POST status"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, private",
+            "should preserve unsupported response privacy"
+        );
+        if marker_present {
+            assert!(
+                geo_lookups.load(Ordering::SeqCst) > 0,
+                "should observe request identity reading on marker cleanup control"
+            );
+            assert!(
+                body_reads.load(Ordering::SeqCst) > 0,
+                "should observe consent body validation on marker cleanup control"
+            );
+            assert!(
+                cookies(&response).iter().any(|value| {
+                    value.starts_with("ts-ec-issued-at=;") && value.contains("Max-Age=0")
+                }),
+                "should prove the marker cleanup control reaches accepted withdrawal"
+            );
+        } else {
+            assert_eq!(
+                body_reads.load(Ordering::SeqCst),
+                0,
+                "should return bare 501 before reading the consent body without a marker"
+            );
+            assert_eq!(
+                geo_lookups.load(Ordering::SeqCst),
+                0,
+                "should return bare 501 before request identity reading without a marker"
+            );
+            assert!(
+                cookies(&response).is_empty(),
+                "should leave the unsupported response free of cookie changes"
+            );
+        }
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should retain buffered unsupported response")
+                .is_empty(),
+            "should preserve the empty unsupported response body"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn marker_candidate_limit_accepts_eighth_recent_copy_and_ignores_ninth() {
+    let fixture = Fixture::new(true).await;
+    fixture.seed(true).await;
+    let now = current_timestamp();
+    let recent = marker_at(&fixture, now);
+    let due = marker_at(&fixture, now - 86_401);
+    let oversized = format!("ts-ec-issued-at={}", "a".repeat(81));
+    for preceding in [due.as_str(), oversized.as_str(), "ts-ec-issued-at=invalid"] {
+        for (preceding_count, expected) in [(7, 0), (8, 2)] {
+            let response = fixture
+                .visit(Case {
+                    marker: vec![preceding; preceding_count].join("; "),
+                    extra_cookie_fields: vec![recent.clone()],
+                    ..Case::default()
+                })
+                .await;
+            assert_eq!(
+                cookies(&response).len(),
+                expected,
+                "should examine only the first eight candidates across Cookie fields, counting every due, oversized or invalid copy; preceding_count={preceding_count} preceding={preceding}"
+            );
+        }
+    }
 }

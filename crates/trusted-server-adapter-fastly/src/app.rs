@@ -883,7 +883,8 @@ async fn dispatch_fallback(
         if let Some(asset_route) = matched_asset_route {
             let mut response =
                 dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
-            // Keep assets outside record finalization while honoring enabled marker withdrawal.
+            // Keep assets outside record finalization; marker withdrawal also applies
+            // when threshold refresh is unset.
             state
                 .identity
                 .finalize_refresh_withdrawal(&ec.ec_context, &mut response);
@@ -4358,7 +4359,8 @@ mod tests {
     fn dispatch_asset_route_withdrawal_cleans_marker_without_identity_finalization() {
         let mut missing_cleanup = Vec::new();
         for method in [Method::GET, Method::HEAD] {
-            for (enabled, withdrawn) in [(true, true), (false, true), (true, false)] {
+            for (enabled, withdrawn) in [(true, true), (false, true), (true, false), (false, false)]
+            {
                 let mut settings = test_settings();
                 settings.proxy.asset_routes.push(
                     trusted_server_core::settings::ProxyAssetRoute::new(

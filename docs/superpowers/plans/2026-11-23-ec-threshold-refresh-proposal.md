@@ -66,8 +66,9 @@ Modify: `ec/mod.rs`, `ec/cookies.rs`, and `constants.rs` as narrowly required.
       HMAC/SHA256/base64 crates and EC passphrase. Add no production clock
       override and no runtime environment read.
 - [ ] Capture optional incoming marker across Cookie fields before routing,
-      only with the setting enabled; any verified recent duplicate suppresses
-      renewal. Keep timestamp data out of records and logs. While disabled,
+      only with the setting enabled; any verified recent duplicate among the
+      first eight candidates suppresses renewal. Invalid/oversized copies count
+      toward that cap. Keep timestamp data out of records and logs. While disabled,
       scan only the marker name on explicit withdrawal for cleanup; otherwise
       prove input parsing and record calls remain unchanged.
 - [ ] Run the new module tests green; format touched Rust files.

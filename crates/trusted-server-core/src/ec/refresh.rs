@@ -5,6 +5,8 @@ use hmac::{Hmac, KeyInit as _, Mac};
 use sha2::Sha256;
 
 pub(crate) const MAX_MARKER_BYTES: usize = 80;
+/// Maximum carried candidates captured for authentication on one request.
+pub(crate) const MAX_MARKER_CANDIDATES: usize = 8;
 const AUTHENTICATION_PREFIX: &[u8] = b"trusted-server/ec-cookie-issued-at/v1\0";
 
 /// Encodes an authenticated issuance timestamp bound to the publisher and full EC ID.

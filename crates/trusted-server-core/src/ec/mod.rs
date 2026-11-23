@@ -223,7 +223,7 @@ fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<Strin
 }
 
 /// Visits marker candidates across all Cookie fields without allocating their values.
-fn refresh_marker_values(req: &Request<EdgeBody>) -> impl Iterator<Item = &str> {
+pub(crate) fn refresh_marker_values(req: &Request<EdgeBody>) -> impl Iterator<Item = &str> {
     req.headers()
         .get_all(http::header::COOKIE)
         .iter()
@@ -238,6 +238,7 @@ fn refresh_marker_values(req: &Request<EdgeBody>) -> impl Iterator<Item = &str> 
 fn capture_refresh_marker(req: &Request<EdgeBody>) -> (bool, Vec<String>) {
     let mut present = false;
     let markers = refresh_marker_values(req)
+        .take(refresh::MAX_MARKER_CANDIDATES)
         .inspect(|_| present = true)
         .filter(|value| value.len() <= refresh::MAX_MARKER_BYTES)
         .map(str::to_owned)

@@ -97,20 +97,25 @@ bytes. Do not change publisher normalization or outbound cookie-domain
 formatting. Include a fixed cross-language MAC test vector in implementation
 tests and use the same byte protocol for controlled browser seeding.
 
-Enabled instances capture bounded candidates across all Cookie fields before
-routing consumes the request. If any candidate authenticates for this EC and
+Enabled instances capture at most the first eight candidates across all Cookie
+fields before routing consumes the request, counting malformed or oversized
+copies toward that limit. If any of those candidates authenticates for this EC and
 publisher and is recent, skip renewal, even when another copy is invalid,
 oversized or due. Duplicate names alone must not force cookie writes. If no
 candidate verifies as recent, missing, malformed, oversized, wrong-version,
 bad-MAC, wrong-EC/domain or future values have unknown age and cause bootstrap;
 valid due values cause renewal. Refresh the unchanged EC and issue a fresh
 signed marker together, subject to every document, consent and live-record
-gate below. Never infer age from record creation or update time.
+gate below. A recent valid copy beyond the first eight is ignored and extra
+duplicates can therefore cause additional private renewals. Never infer age
+from record creation or update time.
 
-Disabled instances do not capture or verify marker values. Only on explicit
-withdrawal do they scan Cookie fields for the marker name, without authenticating
-its value, and expire a carried marker. Missing or unresolved consent does not
-trigger that cleanup.
+Disabled instances do not capture or verify marker values. Unsupported EC routes
+first probe for marker-name presence only: without a marker, return the bare 501
+before geo lookup, identity/consent parsing, EC context info logging or body reads. With a
+carried marker, accepted explicit withdrawal can expire it without authenticating
+its value. Other disabled identity paths scan for its name only on explicit
+withdrawal. Missing or unresolved consent does not trigger cleanup.
 
 Use `checked_current_timestamp`, checked subtraction, and seconds arithmetic.
 With unavailable/pre-epoch time, emit no refresh or initialization. Future
@@ -172,7 +177,8 @@ responses cannot leak positive origin-supplied companion cookies. Reconstruct
 only required withdrawal deletion after filtering, including marker-only
 withdrawal on a non-document, the EC GET/POST routes and configured Fastly asset
 bypasses. EC requests without record storage retain their private empty 501
-response and perform only best-effort marker cleanup, with no record access,
+response and perform only best-effort marker cleanup when a marker is carried
+or refresh is enabled, with no record access,
 creation, SharedID write-back or provider calls. A POST must pass the existing
 same-origin and snapshot validation before its effective consent can authorize
 cleanup; rejected events retain the original cookie-free 501.
@@ -258,7 +264,8 @@ The opaque signed marker can still link requests while carried, even after the
 EC cookie itself disappears. Deleting it on withdrawal reduces that re-linking
 risk across disable/re-enable transitions; it does not erase previously logged
 requests or guarantee the browser accepts deletion. Missing or unresolved consent
-alone must not be interpreted as withdrawal.
+alone must not be interpreted as withdrawal. Copies with a different `Path` or a host-only domain
+survive this scoped withdrawal deletion, just as copies of `ts-ec` do.
 
 ## Acceptance and verification
 

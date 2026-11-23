@@ -907,10 +907,13 @@ a due `ts-ec-issued-at` marker renews the same `ts-ec` value for one year and
 sets a fresh signed HttpOnly marker. A missing or invalid marker bootstraps
 by renewing both together. Assets, API requests, no-consent responses and
 withdrawal never renew returning cookies. If duplicate markers are carried,
-any authenticated recent copy suppresses renewal. Explicit withdrawal deletes a
-carried marker even after the setting is removed. While disabled, only explicit
-withdrawal scans for its name to emit deletion; marker values are not captured
-or verified, and no refresh record read or new cache-key restriction is introduced.
+any authenticated recent copy among the first eight candidates suppresses
+renewal; malformed and oversized copies also count toward that limit. Explicit withdrawal deletes a
+carried marker even after the setting is removed. While disabled, unsupported
+EC routes probe for marker-name presence and return the bare 501 without reading
+the request body or identity/consent state when none is present. Only explicit
+withdrawal emits deletion; marker values are not captured or verified, and no
+refresh record read or new cache-key restriction is introduced.
 Every other disabled path keeps its existing behavior.
 
 Disabling stops renewal but leaves a carried marker until expiry or explicit

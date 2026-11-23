@@ -17,7 +17,7 @@ use crate::ec::eid_types::UnixSeconds;
 use crate::ec::mirror::{MirrorCookie, build_mirror};
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::apply_sharedid_write_back;
-use crate::ec::{EidSyncSource, current_timestamp};
+use crate::ec::{EidSyncSource, current_timestamp, refresh_marker_values};
 use crate::error::{IntoHttpResponse as _, http_error};
 use crate::http_util::read_request_body;
 use crate::platform::RuntimeServices;
@@ -113,6 +113,11 @@ impl IdentityApp {
         }
         if self.identity_graph().is_none() {
             let mut result = response(StatusCode::NOT_IMPLEMENTED);
+            if self.settings.ec.refresh_after_days.is_none()
+                && refresh_marker_values(&request).next().is_none()
+            {
+                return result;
+            }
             // Preserve the unsupported response while still honoring accepted withdrawal.
             // Validate posted consent before cleanup; rejected events keep the original 501.
             let request = if request.method() == Method::POST {
