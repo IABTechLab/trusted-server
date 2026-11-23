@@ -3895,12 +3895,10 @@ mod tests {
 
     #[test]
     fn browser_device_signals_from_extension_reach_ec_finalize_state() {
-        // Regression guard for the EdgeZero JA4/H2 signal loss: the entry point
-        // derives DeviceSignals from the original FastlyRequest (the only place
-        // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
-        // them in the request extensions. A browser-shaped signal must survive
-        // dispatch so the EC bot gate classifies the request as a real browser
-        // and keeps the KV-backed generation/finalize path active.
+        // Regression guard for device signals supplied in the request
+        // extensions: a browser-shaped signal must survive dispatch so the EC
+        // bot gate classifies the request as a real browser and keeps the
+        // KV-backed generation/finalize path active.
         let router = test_router();
         let mut req = empty_request(Method::GET, "/some-page");
         req.extensions_mut().insert(DeviceSignals::derive(
@@ -4021,6 +4019,56 @@ mod tests {
             bot.is_none(),
             "should never prepare pull sync for a client that fails the browser check"
         );
+    }
+
+    #[test]
+    fn ec_request_state_refuses_a_ja4_that_contradicts_the_user_agent() {
+        use edgezero_core::ingress::{
+            CapturedTarget, HeaderFidelity, RequestIngress, TargetUnavailable,
+        };
+        use edgezero_core::ja4::{CapturedJa4, Ja4Fingerprint, Ja4Source};
+        use trusted_server_core::test_support::identity_conformance::{
+            BROWSER_JA4, NON_BROWSER_JA4,
+        };
+
+        let state = build_state_from_settings(test_settings()).expect("should build app state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+        for (ja4, allowed) in [(BROWSER_JA4, true), (NON_BROWSER_JA4, false)] {
+            // As EdgeZero's Fastly ingress records the runtime TLS JA4.
+            let mut req = request_builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/article")
+                .header(
+                    header::USER_AGENT,
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                )
+                .body(Body::empty())
+                .expect("should build request");
+            req.extensions_mut().insert(
+                RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                )
+                .with_ja4(CapturedJa4::Captured {
+                    fingerprint: Ja4Fingerprint::parse(ja4).expect("should parse fixture JA4"),
+                    source: Ja4Source::RuntimeTls,
+                }),
+            );
+
+            let ec = super::build_ec_request_state(&state.identity, &services, &req);
+
+            assert_eq!(
+                ec.is_real_browser, allowed,
+                "should allow creation only when the JA4 {ja4:?} matches the Chrome User-Agent"
+            );
+        }
     }
 
     #[test]

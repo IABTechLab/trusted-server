@@ -100,7 +100,8 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 # Device-signal rule for EC creation. "lenient" (default) blocks only known
-# non-browser fingerprints; "strict" also requires trusted JA4 and a
+# non-browsers, such as a trusted JA4 whose TLS client family contradicts the
+# User-Agent's browser family; "strict" also requires trusted JA4 and a
 # recognized User-Agent platform, so clients without JA4 create no EC.
 # browser_gate = "lenient"
 

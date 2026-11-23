@@ -201,6 +201,17 @@ pub enum Geo {
     Failed,
 }
 
+/// A public Chromium JA4 matching the runners' Chrome User-Agent.
+///
+/// From `FoxIO`'s `ja4plus-mapping.csv` (Chromium Browser); see
+/// `ec::ja4_family`.
+pub const BROWSER_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+
+/// A public Python JA4, a non-browser TLS stack.
+///
+/// From `FoxIO`'s `ja4plus-mapping.csv` (Python); see `ec::ja4_family`.
+pub const NON_BROWSER_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
+
 /// A request to execute through an adapter's complete application lifecycle.
 pub struct Navigation {
     /// Consent cookie representation to encode.
@@ -209,8 +220,8 @@ pub struct Navigation {
     pub ec_cookie: Option<String>,
     /// The platform's location result.
     pub geo: Geo,
-    /// Whether to supply trusted JA4 metadata where the adapter exposes it.
-    pub browser: bool,
+    /// The trusted JA4 the runner supplies, or `None` for no trusted JA4.
+    pub ja4: Option<&'static str>,
     /// Fetch destination; a script is deliberately ineligible for creation.
     pub destination: &'static str,
 }
@@ -221,7 +232,7 @@ impl Default for Navigation {
             consent: Consent::Granted,
             ec_cookie: None,
             geo: Geo::Gdpr,
-            browser: true,
+            ja4: Some(BROWSER_JA4),
             destination: "document",
         }
     }
@@ -276,11 +287,13 @@ pub enum Scenario {
     Returning,
     /// Missing trusted JA4 permits creation with consent and a trusted IP.
     MissingTrustedJa4,
+    /// A browser User-Agent with a non-browser trusted JA4 prevents creation.
+    ContradictingJa4,
 }
 
 impl Scenario {
     /// Navigation scenarios shared by all supported identity adapters.
-    pub const NAVIGATION_SCENARIOS: [Self; 9] = [
+    pub const NAVIGATION_SCENARIOS: [Self; 10] = [
         Self::Fresh,
         Self::WriteFailure,
         Self::UnknownGeo,
@@ -290,6 +303,7 @@ impl Scenario {
         Self::Subresource,
         Self::Returning,
         Self::MissingTrustedJa4,
+        Self::ContradictingJa4,
     ];
 
     /// Executes the scenario and checks the response against authoritative storage.
@@ -320,13 +334,18 @@ impl Scenario {
             Self::DeniedConsent => request.consent = Consent::Denied,
             Self::MissingConsent => request.consent = Consent::Missing,
             Self::Subresource => request.destination = "script",
-            Self::MissingTrustedJa4 => request.browser = false,
+            Self::MissingTrustedJa4 => request.ja4 = None,
+            Self::ContradictingJa4 => request.ja4 = Some(NON_BROWSER_JA4),
             _ => {}
         }
         let response = adapter.navigate(&request);
         assert_document(&response);
         match self {
-            Self::WriteFailure | Self::DeniedConsent | Self::MissingConsent | Self::Subresource => {
+            Self::WriteFailure
+            | Self::DeniedConsent
+            | Self::MissingConsent
+            | Self::Subresource
+            | Self::ContradictingJa4 => {
                 assert!(
                     ec_cookies(&response).is_empty(),
                     "should not issue or delete an EC for a fresh denied request in {self:?}"

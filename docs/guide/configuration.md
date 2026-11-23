@@ -896,12 +896,15 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 `browser_gate` decides which clients may create an Edge Cookie from their trusted
 device signals. Consent and the navigation policy apply under both rules.
 
-- `lenient` (default) blocks only clients whose JA4 and HTTP/2 fingerprints
-  match a known non-browser pattern. A client without trusted JA4, such as one
-  behind a proxy or on a runtime that supplies none, stays eligible for EC
-  creation.
+- `lenient` (default) blocks only known non-browsers: clients whose trusted
+  JA4 names a TLS client family that contradicts the User-Agent's browser
+  family, such as a Chrome User-Agent over Python's TLS stack (see
+  [Edge Cookies](/guide/edge-cookies#request-lifecycle)). A client without
+  trusted JA4, such as one behind a proxy or on a runtime that supplies none,
+  or with a JA4 the rule does not recognize, stays eligible for EC creation.
 - `strict` also requires a JA4 class and a recognized User-Agent platform. A
-  client without trusted JA4 creates no EC.
+  client without trusted JA4 creates no EC. `strict` blocks everything
+  `lenient` blocks.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

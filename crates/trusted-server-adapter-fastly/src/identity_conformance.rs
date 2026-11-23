@@ -246,7 +246,7 @@ impl FastlyAdapter {
         }
         // Production's native read and `prepare` run unchanged. The fixture
         // replaces only the values Viceroy cannot supply: a routable client IP,
-        // its geo result and, for browser scenarios, JA4-backed device signals.
+        // its geo result and, where the scenario has one, a trusted JA4.
         let mut values = ClientRequestValues::read(&mut request, &self.settings, false);
         let ip = Some("192.0.2.7".parse().expect("should parse fixture IP"));
         values.client_info = ClientInfo {
@@ -258,13 +258,12 @@ impl FastlyAdapter {
         } else {
             RequestGeo::new(ip, geo.clone())
         };
-        if navigation.browser {
-            values.device_signals = Some(DeviceSignals::derive(
-                USER_AGENT,
-                Some("t13d1516h2_example_example"),
-                None,
-            ));
-        }
+        // Viceroy reports no JA4, and EdgeZero replaces any ingress a hook
+        // supplies, so the scenario's JA4 reaches the shared app as the device
+        // signals it would derive from `ctx.ja4()`.
+        let device_signals = navigation
+            .ja4
+            .map(|ja4| DeviceSignals::derive(USER_AGENT, Some(ja4), None));
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let mut cache_control = None;
@@ -279,6 +278,9 @@ impl FastlyAdapter {
                 request,
                 |_request, extensions| {
                     values.prepare(extensions, &self.settings, &queue);
+                    if let Some(device_signals) = device_signals {
+                        extensions.insert(device_signals);
+                    }
                     extensions.insert(HttpClient::with_client(origin));
                     // This synthetic request bypasses runtime URI capture.
                     extensions.insert(RuntimeRequestOrigin::new(

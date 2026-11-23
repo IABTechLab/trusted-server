@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use edgezero_core::http::{Method, Request, Response, StatusCode, header};
+use edgezero_core::ingress::RequestIngress;
+use edgezero_core::ja4::CapturedJa4;
 use error_stack::Report;
 
 use super::IdentityApp;
@@ -49,11 +51,12 @@ impl IdentityApp {
 
     /// Reads consent, identity and trusted platform signals once for a request.
     ///
-    /// `[ec].browser_gate` decides whether the signals allow creation. Under
-    /// the default `lenient` rule, missing JA4 never prevents creation and
-    /// User-Agent is analytics metadata, not an independent authorization
-    /// gate. `strict` also requires a JA4 class and a recognized User-Agent
-    /// platform.
+    /// JA4 comes only from `EdgeZero`'s request ingress, the source of
+    /// `ctx.ja4()`. `[ec].browser_gate` decides whether the signals allow
+    /// creation. Both rules refuse a trusted JA4 whose TLS client family
+    /// contradicts the User-Agent's browser family; a missing or unrecognized
+    /// JA4 never does. `strict` also requires a JA4 class and a recognized
+    /// User-Agent platform.
     ///
     /// # Errors
     ///
@@ -84,7 +87,7 @@ impl IdentityApp {
                     .unwrap_or_default();
                 DeviceSignals::derive(
                     user_agent,
-                    services.client_info().tls_ja4.as_deref(),
+                    trusted_ja4(request),
                     services.client_info().h2_fingerprint.as_deref(),
                 )
             });
@@ -320,6 +323,16 @@ impl IdentityApp {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EcRouteResponse;
 
+/// The JA4 `EdgeZero` captured for this request, as `ctx.ja4()` reads it.
+///
+/// Absent, missing, malformed or unexposed JA4 reads as `None`.
+fn trusted_ja4(request: &Request) -> Option<&str> {
+    match request.extensions().get::<RequestIngress>()?.ja4()? {
+        CapturedJa4::Captured { fingerprint, .. } => Some(fingerprint.as_str()),
+        CapturedJa4::Unavailable(_) => None,
+    }
+}
+
 fn cookie_value(request: &Request, name: &str) -> Option<String> {
     request
         .headers()
@@ -384,9 +397,14 @@ mod tests {
     use crate::ec::app::{IdentityApp, IdentityPlatform};
     use crate::ec::device::DeviceSignals;
     use crate::platform::test_support::noop_services;
+    use crate::platform::{ClientInfo, RuntimeServices};
     use crate::settings::{BrowserGate, ProxyAssetRoute};
     use crate::test_support::tests::create_test_settings;
-    use edgezero_core::http::{Request, header};
+    use edgezero_core::http::{HeaderValue, Request, header};
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, RequestIngress, TargetUnavailable,
+    };
+    use edgezero_core::ja4::{CapturedJa4, Ja4Fingerprint, Ja4Source, Ja4Unavailable};
     use futures::executor::block_on;
     use std::sync::Arc;
 
@@ -443,6 +461,124 @@ mod tests {
                 "should apply the {gate:?} rule to a browser without JA4"
             );
         }
+    }
+
+    const CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const FIREFOX_UA: &str =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0";
+    const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+        AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+    // Public fingerprints from FoxIO's ja4plus-mapping.csv; see `ec::ja4_family`.
+    const CHROMIUM_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+    const FIREFOX_JA4: &str = "t13d1715h2_5b57614c22b0_7121afd63204";
+    const SAFARI_JA4: &str = "t13d2014h2_a09f3c656075_14788d8d241b";
+    const PYTHON_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
+
+    /// Reads a request with `user_agent` and the ingress JA4 claim `ja4`
+    /// under `gate`, as the shared app does for every adapter.
+    fn creation_allowed(
+        gate: BrowserGate,
+        services: &RuntimeServices,
+        user_agent: &str,
+        ja4: Option<CapturedJa4>,
+    ) -> bool {
+        let mut settings = create_test_settings();
+        settings.ec.browser_gate = gate;
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(user_agent).expect("should encode User-Agent"),
+        );
+        if let Some(ja4) = ja4 {
+            request.extensions_mut().insert(
+                RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                )
+                .with_ja4(ja4),
+            );
+        }
+        app.read_request(services, &request)
+            .expect("should read identity request")
+            .creation_allowed
+    }
+
+    fn captured(ja4: &str) -> Option<CapturedJa4> {
+        Some(CapturedJa4::Captured {
+            fingerprint: Ja4Fingerprint::parse(ja4).expect("should parse fixture JA4"),
+            source: Ja4Source::RuntimeTls,
+        })
+    }
+
+    #[test]
+    fn read_request_refuses_a_trusted_ja4_that_contradicts_the_user_agent() {
+        for (user_agent, ja4) in [
+            (CHROME_UA, PYTHON_JA4),
+            (FIREFOX_UA, PYTHON_JA4),
+            (SAFARI_UA, PYTHON_JA4),
+            (FIREFOX_UA, CHROMIUM_JA4),
+            (SAFARI_UA, CHROMIUM_JA4),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    !creation_allowed(gate, &noop_services(), user_agent, captured(ja4)),
+                    "should refuse {user_agent:?} with a contradicting JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_creates_for_current_browser_ja4s() {
+        for (user_agent, ja4) in [
+            (CHROME_UA, CHROMIUM_JA4),
+            (FIREFOX_UA, FIREFOX_JA4),
+            (SAFARI_UA, SAFARI_JA4),
+            // Test-only: a fictional cipher hash that no list names.
+            (CHROME_UA, "t13d1516h2_000000000000_000000000000"),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    creation_allowed(gate, &noop_services(), user_agent, captured(ja4)),
+                    "should allow {user_agent:?} with JA4 {ja4:?} under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_does_not_refuse_a_request_without_trusted_ja4() {
+        for ja4 in [
+            None,
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::NotExposed)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Missing)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Malformed)),
+        ] {
+            assert!(
+                creation_allowed(BrowserGate::Lenient, &noop_services(), CHROME_UA, ja4),
+                "should not refuse a browser for lacking trusted JA4"
+            );
+        }
+    }
+
+    #[test]
+    fn read_request_takes_ja4_only_from_edgezero_ingress() {
+        let services = RuntimeServices {
+            client_info: ClientInfo {
+                tls_ja4: Some(PYTHON_JA4.to_owned()),
+                ..ClientInfo::default()
+            },
+            ..noop_services()
+        };
+
+        assert!(
+            creation_allowed(BrowserGate::Lenient, &services, CHROME_UA, None),
+            "should ignore a JA4 that did not come through EdgeZero's ingress"
+        );
     }
 
     #[test]

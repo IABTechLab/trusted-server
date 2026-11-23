@@ -6,7 +6,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, StatusCode, header, request_builder};
-use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ingress::{
+    CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress, TargetUnavailable,
+};
+use edgezero_core::ja4::{CapturedJa4, Ja4Fingerprint, Ja4Source};
 use error_stack::Report;
 use futures::executor::block_on;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
@@ -173,8 +176,6 @@ impl AxumAdapter {
             cookies.push(format!("ts-ec={identity}"));
         }
         let document = navigation.destination == "document";
-        // Native has no trusted JA4. Every scenario exercises the shared
-        // missing-JA4 policy with a trusted IP and real parsed consent.
         let request: Request = request_builder()
             .method(Method::GET)
             .uri("https://publisher.example.com/article")
@@ -202,12 +203,26 @@ impl AxumAdapter {
         } else {
             request
         };
-        // This router seam bypasses native ingress; supply only its validated
-        // public origin, without inventing TLS or JA4 fingerprints.
+        // This router seam bypasses native ingress; supply its validated
+        // public origin and, where the scenario has one, the JA4 a trusted
+        // proxy header gives `ctx.ja4()`.
         request.extensions_mut().insert(RuntimeRequestOrigin::new(
             InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
                 .expect("should validate fixture public origin"),
         ));
+        if let Some(ja4) = navigation.ja4 {
+            request.extensions_mut().insert(
+                RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                )
+                .with_ja4(CapturedJa4::Captured {
+                    fingerprint: Ja4Fingerprint::parse(ja4).expect("should parse fixture JA4"),
+                    source: Ja4Source::TrustedProxyHeader,
+                }),
+            );
+        }
         let response = block_on(router.oneshot(request)).expect("should dispatch the real router");
         let cache_control = response
             .headers()
