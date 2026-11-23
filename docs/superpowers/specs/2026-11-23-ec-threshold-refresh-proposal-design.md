@@ -171,7 +171,12 @@ Include the companion in enabled identity-cookie filtering. Ineligible
 responses cannot leak positive origin-supplied companion cookies. Reconstruct
 only required withdrawal deletion after filtering, including marker-only
 withdrawal on a non-document, the EC GET/POST routes and configured Fastly asset
-bypasses. When disabled, marker classification applies only to explicit
+bypasses. EC requests without record storage retain their private empty 501
+response and perform only best-effort marker cleanup, with no record access,
+creation, SharedID write-back or provider calls. A POST must pass the existing
+same-origin and snapshot validation before its effective consent can authorize
+cleanup; rejected events retain the original cookie-free 501.
+When disabled, marker classification applies only to explicit
 withdrawal cleanup; every other disabled response retains its existing handling.
 
 ## Storage, concurrency, privacy and cache consequences

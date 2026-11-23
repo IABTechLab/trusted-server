@@ -3,6 +3,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Response, StatusCode, header};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
@@ -1043,5 +1044,164 @@ async fn disabled_refresh_withdrawal_expires_marker_without_ec_in_later_cookie_f
         response.headers()[header::CACHE_CONTROL],
         "private, max-age=0",
         "should keep cleanup response out of shared caches"
+    );
+}
+
+fn fresh_tcf_without_storage_consent() -> String {
+    let mut bytes = [0_u8; 32];
+    // Version 2, no purpose/vendor grants, and current Created/LastUpdated fields.
+    bytes[0] = 2 << 2;
+    let deciseconds = current_timestamp()
+        .checked_mul(10)
+        .expect("should represent the fixture's TCF clock");
+    for start in [6, 42] {
+        for index in 0..36 {
+            let position = start + index;
+            let bit = ((deciseconds >> (35 - index)) & 1) as u8;
+            bytes[position / 8] |= bit << (7 - position % 8);
+        }
+    }
+    let value = URL_SAFE_NO_PAD.encode(bytes);
+    let decoded = crate::consent::tcf::decode_tc_string(&value)
+        .expect("should encode a current valid TCF withdrawal fixture");
+    assert!(
+        !decoded.has_storage_consent(),
+        "should deny storage in the posted fixture"
+    );
+    value
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_ec_routes_clean_withdrawal_marker_without_changing_other_responses() {
+    let body_withdrawal = json!({"tcString": fresh_tcf_without_storage_consent()}).to_string();
+    let mut missing_deletions = Vec::new();
+    for enabled in [false, true] {
+        let mut fixture = Fixture::new(enabled).await;
+        fixture.app = IdentityApp::build(
+            Arc::clone(fixture.app.settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build unsupported EC app without record storage");
+        for (method, cookie, body, origin, deleted) in [
+            (
+                Method::GET,
+                "us_privacy=1YYN; ts-ec-issued-at=carried",
+                "",
+                "https://publisher.example.com",
+                true,
+            ),
+            (
+                Method::POST,
+                "us_privacy=1YYN; ts-ec-issued-at=carried",
+                "{}",
+                "https://publisher.example.com",
+                true,
+            ),
+            (
+                Method::POST,
+                "ts-ec-issued-at=carried",
+                body_withdrawal.as_str(),
+                "https://publisher.example.com",
+                true,
+            ),
+            (
+                Method::GET,
+                "us_privacy=1YNN; ts-ec-issued-at=carried",
+                "",
+                "https://publisher.example.com",
+                false,
+            ),
+            (
+                Method::POST,
+                "us_privacy=1YNN; ts-ec-issued-at=carried",
+                "{}",
+                "https://publisher.example.com",
+                false,
+            ),
+            (
+                Method::POST,
+                "ts-ec-issued-at=carried",
+                "{}",
+                "https://publisher.example.com",
+                false,
+            ),
+            (
+                Method::POST,
+                "us_privacy=1YYN; ts-ec-issued-at=carried",
+                "invalid",
+                "https://publisher.example.com",
+                false,
+            ),
+            (
+                Method::POST,
+                "us_privacy=1YYN; ts-ec-issued-at=carried",
+                "{}",
+                "https://other.example.com",
+                false,
+            ),
+            (
+                Method::POST,
+                "us_privacy=1YYN",
+                "{}",
+                "https://publisher.example.com",
+                false,
+            ),
+            (
+                Method::GET,
+                "us_privacy=1YYN",
+                "",
+                "https://publisher.example.com",
+                false,
+            ),
+        ] {
+            let mut request = http::Request::builder()
+                .method(method.clone())
+                .uri("https://publisher.example.com/_ts/api/v1/ec")
+                .header(header::ORIGIN, origin)
+                .header(header::COOKIE, cookie)
+                .body(Body::from(body))
+                .expect("should create unsupported EC request");
+            request.extensions_mut().insert(RuntimeRequestOrigin::new(
+                InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+                    .expect("should provide trusted publisher ingress"),
+            ));
+            let response = fixture.app.ec_route(&fixture.services, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "should preserve unsupported status for {method}, enabled={enabled}"
+            );
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store, private",
+                "should preserve unsupported response privacy"
+            );
+            let set = cookies(&response);
+            if deleted {
+                if set.len() != 1
+                    || !set[0].starts_with("ts-ec-issued-at=;")
+                    || !set[0].contains("Max-Age=0")
+                {
+                    missing_deletions.push((enabled, method, body));
+                }
+            } else {
+                assert!(
+                    set.is_empty(),
+                    "should leave non-withdrawal or rejected requests byte-identical: {set:?}"
+                );
+            }
+            assert!(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should retain buffered unsupported response")
+                    .is_empty(),
+                "should preserve empty unsupported response body"
+            );
+        }
+    }
+    assert!(
+        missing_deletions.is_empty(),
+        "should clean accepted withdrawal even without store or enabled renewal: {missing_deletions:?}"
     );
 }

@@ -111,18 +111,25 @@ impl IdentityApp {
                 .insert(header::ALLOW, header::HeaderValue::from_static("GET, POST"));
             return response;
         }
-        let has_graph = self.identity_graph().is_some();
-        let refresh_get =
-            self.settings.ec.refresh_after_days.is_some() && request.method() == Method::GET;
-        if !has_graph && !refresh_get {
-            return response(StatusCode::NOT_IMPLEMENTED);
+        if self.identity_graph().is_none() {
+            let mut result = response(StatusCode::NOT_IMPLEMENTED);
+            // Preserve the unsupported response while still honoring accepted withdrawal.
+            // Validate posted consent before cleanup; rejected events keep the original 501.
+            let request = if request.method() == Method::POST {
+                match prepare_snapshot(services, request).await {
+                    Ok(request) => request,
+                    Err(_) => return result,
+                }
+            } else {
+                request
+            };
+            if let Ok(identity) = self.read_request(services, &request) {
+                self.finalize_refresh_withdrawal(&identity.context, &mut result);
+            }
+            return result;
         }
         if request.method() == Method::GET {
-            let mut response = response(if has_graph {
-                StatusCode::NO_CONTENT
-            } else {
-                StatusCode::NOT_IMPLEMENTED
-            });
+            let mut response = response(StatusCode::NO_CONTENT);
             if let Ok(mut identity) = self.read_request(services, &request) {
                 self.finalize_refresh_withdrawal(&identity.context, &mut response);
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
