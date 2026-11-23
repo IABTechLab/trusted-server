@@ -2,7 +2,7 @@ use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_axum::context::AxumRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -16,13 +16,12 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::identify::answer_identify_locally;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -42,15 +41,13 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
 
 use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::build_runtime_services;
+use crate::startup::NativeStoreSnapshot;
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -61,26 +58,11 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built once. The dev server has no EC record store and
+    /// applies no rate limit: its deployer limits traffic at the load
+    /// balancer.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
-        &AxumPlatformConfigStore,
-        &AxumPlatformSecretStore,
-        &store_name,
-        &config_key,
-        &trusted_server_core::settings_data::default_secret_store_name(),
-    )?;
-    build_state_with_settings(settings)
 }
 
 /// Build the application state from explicit settings.
@@ -104,10 +86,14 @@ fn build_state_with_services(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -172,8 +158,8 @@ where
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
-/// users. Geo comes from the platform (a no-op on the local Axum dev server, so
-/// jurisdiction stays Unknown there unless the request carries TCF consent). A
+/// users. Geo comes from the immutable managed request snapshot. Off, untrusted
+/// or unavailable results remain Unknown unless real consent supplies it. A
 /// malformed consent string is logged and falls back to the default
 /// (fail-closed) context rather than being silently swallowed.
 fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
@@ -294,8 +280,6 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -325,7 +309,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 19] {
+fn named_routes() -> [NamedRoute; 16] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -357,26 +341,6 @@ fn named_routes() -> [NamedRoute; 19] {
             path: "/_ts/admin/cache/purge",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::CachePurgeNotSupported,
-        },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -504,15 +468,6 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
-                    }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Identify => answer_identify_locally(&state.settings, &req),
                     NamedRouteHandler::BatchSync => Ok(answer_batch_sync_locally(&req)),
@@ -592,7 +547,10 @@ fn publisher_fallback_methods() -> [Method; 7] {
 }
 
 /// Returns a [`RouterService`] that preserves probes and returns generic 503s on ordinary routes.
-fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+///
+/// The native initializer installs it when initialization fails. The failure
+/// is never read, so no detail of it reaches a response.
+pub(crate) fn startup_error_router(_error: &dyn core::fmt::Debug) -> RouterService {
     let handler = |ctx: RequestContext| {
         let response = startup_unavailable_response(ctx.method());
         async move { Ok::<Response, EdgeError>(response) }
@@ -623,17 +581,26 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        // A startup failure serves the failure router rather than failing
-        // assembly, so liveness stays up and readiness and every supported
-        // route answer the fixed unavailable response. The report is logged
-        // once here and never reaches a caller.
-        Ok(match build_state() {
-            Ok(state) => router_builder(&state).build(),
-            Err(report) => {
-                log::error!("{report:?}");
-                startup_error_router(&report)
-            }
-        })
+        // The prepared-store initializer installs the complete router, or the
+        // failure router when initialization fails, before listening.
+        Ok(RouterService::builder().build())
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+            kv: crate::native_geo::kv_selected().then_some(StoreMetadata {
+                default: crate::native_geo::GEO_STORE_ID,
+                ids: &[crate::native_geo::GEO_STORE_ID],
+            }),
+        }
     }
 }
 
@@ -717,6 +684,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     let forwarder_settings = Arc::clone(&state.settings);
 
     let mut router = RouterService::builder()
+        .with_state(Arc::new(NativeStoreSnapshot::empty()))
         .received_head_preparer(move |headers, extensions| {
             if extensions
                 .get::<trusted_server_core::forwarder::ForwarderPreparation>()
@@ -744,6 +712,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+
+    // The core identity app registers `GET` on the admin EC and EIDs lookups;
+    // without a record store, admin EC lookup answers 501. Their other methods
+    // reach the catch-all fallback, which denies admin diagnostics locally.
+    router = state.identity.mount(router);
 
     for route in named_routes() {
         for method in route.primary_methods {

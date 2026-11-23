@@ -21,13 +21,10 @@ use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
 use trusted_server_core::ec::identify::answer_identify_locally;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -84,6 +81,8 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built with the app. This adapter has no EC record store.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -218,10 +217,14 @@ fn build_state_with_services(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
@@ -334,10 +337,6 @@ fn cache_purge_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
-}
-
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -613,7 +612,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups; without a record store, admin EC lookup answers 501.
+        router = state.identity.mount(router);
+        router = router
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -642,26 +645,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
-            .get(
-                "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_ec(&s.settings.ec)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
-                }),
-            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -820,16 +803,7 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
         .get("cf-ipcountry")
         .and_then(|value| value.to_str().ok())
         .filter(|country| *country != "XX")
-        .map(|country| GeoInfo {
-            city: String::new(),
-            country: country.to_owned(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: None,
-            asn: None,
-        });
+        .map(|country| GeoInfo::country_region(country, None));
     TraceMetadata {
         client_info: ClientInfo {
             client_ip,

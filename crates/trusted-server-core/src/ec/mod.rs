@@ -14,6 +14,7 @@
 //!
 //! # Module structure
 //!
+//! - [`app`] — Identity app built once and shared by every adapter
 //! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`] — EC-specific consent gating wrapper
@@ -39,6 +40,7 @@ mod auth;
 
 pub mod admin;
 pub mod after_response;
+pub mod app;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
@@ -59,6 +61,7 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod registry;
+pub mod sharedid;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -1067,7 +1070,7 @@ mod tests {
             None,
             &registry::PartnerRegistry::empty(),
             None,
-            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         )
         .await;

@@ -25,21 +25,29 @@ From the repository root, run:
 ```
 
 The script creates and strictly validates an isolated config, then runs `ts
-config push --adapter axum --local`. That push writes the config envelope to
-the temporary `.edgezero/` directory; the Axum process does not read that file
-directly. The script reads the envelope and exports it as
-`TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG`.
+config push --adapter axum --local`. It places the exported envelope in the
+`trusted_server_config` entry of an isolated
+`local-config-trusted_server_config.json` map. The process reads that prepared
+local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
+envelope and active secret references, and installs immutable snapshots and
+the actual router before listening.
 
-Secrets use `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`. The exact required variables
-are:
+Local secrets use these variables:
 
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD`
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET`
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
+- `EDGEZERO__SECRETS__HANDLER_PASSWORD`
+- `EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET`
+- `EDGEZERO__SECRETS__EC_PASSPHRASE`
+
+Only referenced secrets are captured during startup. Changes to provider files
+or values require restarting the process. Legacy `TRUSTED_SERVER_CONFIG_*`
+and `TRUSTED_SERVER_SECRET_*` variables are not fallback inputs. The
+[native RC guide](./native-rc-demo) covers provider selection and lifecycle
+checks.
 
 Before the positive request, the smoke omits the config and each secret in
-separate process starts. Each publisher request must return 503 and its log must identify
-the missing environment variable or exact setting path. This prevents a port,
+separate process starts. Each start must keep Axum listening with the failure
+router: each publisher request must return 503 and its log must identify the
+missing prepared config or required app-config secret. This prevents a port,
 launcher, or origin error from satisfying a negative case.
 
 The final publisher request must return 200, include the stub-origin sentinel,
@@ -57,10 +65,11 @@ for the shared assertions.
 
 ## Listener address
 
-EdgeZero's Axum `run_app` binds the listener at `EDGEZERO__ADAPTER__HOST` and
-`EDGEZERO__ADAPTER__PORT`, `127.0.0.1:8787` when unset. A host that is not an
-IP address or a port that is not a non-zero number falls back to the default
-with a startup warning. The adapter does not read `PORT`.
+EdgeZero's Axum production startup binds the listener at
+`EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT`, `127.0.0.1:8787` when
+unset. A host that is not an IP address or a port that is not a non-zero
+number stops startup before the listener binds. The adapter does not read
+`PORT`.
 
 ## Ingress limits
 
@@ -85,15 +94,15 @@ connection.
 
 ## Logging
 
-EdgeZero's Axum dev server installs the logger, and Trusted Server installs
-none of its own. It logs to standard output at `info` by default. Set
+EdgeZero's Axum production startup installs the logger, and Trusted Server
+installs none of its own. It logs to standard output at `info` by default. Set
 `EDGEZERO__LOGGING__LEVEL` to a single level (`trace`, `debug`, `info`,
 `warn`, `error`, or `off`, in any case) to change it, for example
 `EDGEZERO__LOGGING__LEVEL=debug cargo run -p trusted-server-adapter-axum`.
 An unrecognized value, including a per-module filter such as
-`trusted_server=debug`, falls back to `info` without a warning. `RUST_LOG` is
-not read. EdgeZero's startup warnings, logged under the `edgezero::boot`
-target, stay at `warn` whatever the level.
+`trusted_server=debug`, stops startup. `RUST_LOG` is not read. EdgeZero's
+startup warnings, logged under the `edgezero::boot` target, stay at `warn`
+whatever the level.
 
 The `trace` level can log auction payloads and TCF consent strings, for example
 the `adserver_mock` mediation request, and the full Prebid Server response

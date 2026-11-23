@@ -9,7 +9,6 @@ pub const COOKIE_TS_EIDS: &str = "ts-eids";
 /// JS-readable mirror of provider-owned bidstream UIDs (spec §10).
 pub const COOKIE_TS_EIDS_MIRROR: &str = "__Host-ts-eids-mirror";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
-pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
 pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
