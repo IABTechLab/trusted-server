@@ -523,6 +523,7 @@ async function verifyAfterExit(app, put) {
     label: app.label,
     key: put.key,
     generation: row.generation.N,
+    item: structuredClone(row),
   })
   return row
 }
