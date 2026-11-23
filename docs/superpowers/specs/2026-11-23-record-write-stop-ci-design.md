@@ -17,9 +17,12 @@ exit or assert elapsed signal-to-exit time against the configured grace.
 
 The existing startup test repeatedly probes the published health port, requires
 nonzero, non-OOM exit and an initialization diagnostic, and rejects `phase=ready`.
-The startup assertion will also reject a listening lifecycle event. This combines
-port probes with lifecycle evidence; it does not claim syscall-level detection of
-a transient listener that emits no lifecycle event.
+For the missing-secret case, a disposable seccomp profile makes both `bind` and
+`listen` fail with EPERM. The process must still report `Trusted Server
+initialization failed`: an early bind failure must not substitute for secret
+validation. Keep the port probes and ready lifecycle assertion as additional
+checks. A disposable production-runner mutation that adopts the listener before
+polling `prepare` must fail this test, without being pushed.
 
 ## Design
 
@@ -42,9 +45,9 @@ a dedicated cookie name, a fictional registered source and a five-second task
 budget. Mint a record without that cookie and verify the source is absent. On a
 returning navigation, supply a distinctive UID. Pause only the conditional
 `PutItem` containing that UID; consume the entire response while the write is
-still paused. Send SIGTERM, observe draining while the write remains blocked,
-prove the selected write remains pending and the process remains running when
-draining is observed, then release it. Retain the exact acknowledged native
+still paused. Send SIGTERM, observe draining, and hold the selected write for
+another 250 ms. Then assert the process is still running and that exact write
+is still pending before release. Retain the exact acknowledged native
 payload and response-complete, signal, drain, release and exit events. Require
 successful normal exit within the same stop bound and
 read and compare its full native row, UID and generation from DynamoDB afterwards.
@@ -58,7 +61,9 @@ shows that dependency is necessary, stop for approval before any merge.
 Use disposable local controls, never pushed: terminate immediately on the
 pending-write SIGTERM; delay exit beyond the stop bound; corrupt a post-exit row;
 disable after-response scheduling; bypass missing-secret rejection; and open a
-listener before secret validation while emitting the ready/listening event.
+listener before polling startup preparation. Under the missing-secret seccomp
+profile that must fail at the required initialization diagnostic, rather than
+pass because the listener was briefly open or emitted no readiness event.
 Each new protection must reject its corresponding supported violation at the
 intended assertion; unrelated setup failures do not qualify. Restore all
 mutations before clean verification. Preserve
@@ -68,3 +73,6 @@ restart, health and route checks. Cleanup must remove only owned resources.
 Targeted local image scripts and runtime verification establish the local
 contract; hosted CI must finish on the published draft revision. No AWS account,
 browser, full local CI gate list or changes to operator files are required.
+
+Grace enforcement for a write deliberately held past the configured grace is
+not tested here. That timeout/cancellation case remains a possible follow-up.

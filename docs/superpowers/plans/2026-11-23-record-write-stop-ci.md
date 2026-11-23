@@ -15,7 +15,8 @@ DynamoDB Local and the existing prepared-store fixtures.
 - [x] Confirm the unchanged current-head startup and record image scripts pass.
       Demonstrate abrupt pending-write termination and secret-check bypass fail.
 - [x] Review the spec and this plan independently, resolving all findings before
-      implementation. Preserve the approved port-probe/lifecycle approach.
+      implementation. Preserve port probes and the ready lifecycle assertion; add the approved
+      missing-secret seccomp ordering check.
 - [x] In `scripts/test-native-ec-image.mjs`, centralize the three-second grace and
       500 ms Docker observation allowance. Bound signal, drain observation,
       response completion and process exit from one monotonic signal-time deadline;
@@ -35,14 +36,17 @@ DynamoDB Local and the existing prepared-store fixtures.
 - [x] Add a separate returning-navigation shutdown case. Pause only that UID's
       conditional write, await the entire response while still paused, verify
       the seed has no UID, send SIGTERM, observe draining while the selected write is still pending and the process is
-      alive, record full response-body completion plus signal/drain/release/exit ordering
+      alive after another 250 ms hold, record full response-body completion plus
+      signal/drain/hold/release/exit ordering
       and the held key/condition/UID/expected generation, release, require
       normal bounded exit and verify UID/generation in DynamoDB after exit.
       Demonstrate that disabling scheduling/draining makes the case fail. If
       #1636 proves necessary, stop before merging it.
 - [x] In `scripts/test-native-container.mjs`, preserve repeated HTTP port probes
-      and nonzero/non-OOM exit checks; reject both ready and listening lifecycle
-      events. Demonstrate a premature-listen mutation emits the event and fails.
+      and nonzero/non-OOM exit checks; reject the ready lifecycle
+      event. Deny bind/listen with EPERM for the missing-secret case and require
+      the initialization error. Demonstrate a disposable listener-before-prepare
+      mutation fails that diagnostic, without pushing the mutation.
 - [x] Keep `.github/workflows/native-container.yml` path filtering and existing
       production-image steps. Update descriptive step text only if needed.
 - [x] Run both targeted scripts on the unchanged production image with the new
@@ -80,3 +84,6 @@ app and store instead; report that topology and local architecture separately
 from hosted Ubuntu evidence. Tests must never contact AWS or read operator
 configuration. Negative controls must fail at the intended assertion, rather
 than during setup or unrelated checks.
+
+Grace enforcement with a write held past the configured grace is not tested;
+retain it as a possible follow-up in the PR description.

@@ -204,7 +204,10 @@ const dockerWithin = async (deadline, ...args) =>
       timeout:
         deadline === undefined
           ? 20000
-          : Math.min(20000, remaining(deadline, 'SIGTERM observation deadline')),
+          : Math.min(
+              20000,
+              remaining(deadline, 'SIGTERM observation deadline')
+            ),
       maxBuffer: 1024 * 1024,
     })
   ).stdout.trim()
@@ -442,7 +445,12 @@ async function state(app, deadline) {
       Signal: app.child.signalCode,
     }
   return JSON.parse(
-    await dockerWithin(deadline, 'inspect', '--format={{json .State}}', app.name)
+    await dockerWithin(
+      deadline,
+      'inspect',
+      '--format={{json .State}}',
+      app.name
+    )
   )
 }
 async function logs(app, deadline) {
@@ -487,6 +495,8 @@ async function drain(app, held, completeResponse = async () => {}) {
     remaining(deadline, message),
     'runner must begin drain while real storage is paused'
   )
+  event('shutdown-draining', { label: app.label, key: held.key })
+  await beforeDeadline(delay(250), deadline, message)
   assert(
     (await state(app, deadline)).Running,
     'runner must stay alive while the write is pending'
@@ -495,7 +505,7 @@ async function drain(app, held, completeResponse = async () => {}) {
     pending.has(held),
     'selected record write must remain pending during drain'
   )
-  event('shutdown-draining', { label: app.label, key: held.key })
+  event('shutdown-hold-verified', { label: app.label, key: held.key })
   held.resolve()
   event('shutdown-write-released', { label: app.label, key: held.key })
   await beforeDeadline(completeResponse(), deadline, message)
@@ -538,7 +548,12 @@ async function stop(app, graceful = true) {
   if (graceful)
     assert.equal((await state(app)).ExitCode, 0, 'runner must exit normally')
 }
-async function launch(label, originEndpoint, proxyEndpoint, afterResponse = false) {
+async function launch(
+  label,
+  originEndpoint,
+  proxyEndpoint,
+  afterResponse = false
+) {
   const port = await freePort()
   const dir = join(work, label)
   await mkdir(dir, { mode: 0o755 })
@@ -1073,7 +1088,10 @@ try {
       logicalKeyMatches(put.key, delayedEc) &&
       put.sequence < completed.value.responseSequence
   )
-  assert(delayedPut, 'response cookie must follow the acknowledged request write')
+  assert(
+    delayedPut,
+    'response cookie must follow the acknowledged request write'
+  )
   assert.deepEqual(
     delayedPut.item,
     heldRequest.item,
