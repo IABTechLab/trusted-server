@@ -19,25 +19,16 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
-use trusted_server_core::ec::after_response::{
-    after_response_lookups_allowed, commit_after_response_lookups,
-};
-use trusted_server_core::ec::coordinator::transport::OutboundLookupTransport;
-use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupContext};
-use trusted_server_core::ec::current_timestamp;
-use trusted_server_core::ec::eid_types::UnixSeconds;
-use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::app::IdentityApp;
 use trusted_server_core::settings::Settings;
 
 use crate::app::{AfterResponseLookups, EcFinalizeState};
-use crate::maybe_identity_graph;
-use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
 
 /// Inputs a routed response's finalize step hands to post-delivery work.
 pub(crate) struct FinalizeState {
-    pub(crate) partner_registry: Arc<PartnerRegistry>,
+    /// The identity app built once with the retained application state.
+    pub(crate) identity: Arc<IdentityApp>,
     pub(crate) ec_state: EcFinalizeState,
     /// The navigation's after-response identity lookups, if any.
     pub(crate) after_response: Option<AfterResponseLookups>,
@@ -83,18 +74,11 @@ async fn post_delivery_work(
     send_queued_batches(client, &settings.tinybird, queue, log_context).await;
     if let Some(state) = state {
         let FinalizeState {
-            partner_registry,
+            identity,
             mut ec_state,
             after_response,
         } = state;
-        run_after_response_lookups(
-            &mut ec_state,
-            after_response,
-            &partner_registry,
-            settings,
-            client,
-        )
-        .await;
+        run_after_response_lookups(&mut ec_state, after_response, &identity, client).await;
     }
 }
 
@@ -107,8 +91,7 @@ async fn post_delivery_work(
 pub(crate) async fn run_after_response_lookups(
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
-    partner_registry: &PartnerRegistry,
-    settings: &Settings,
+    identity: &IdentityApp,
     client: &HttpClient,
 ) {
     let Some(lookups) = lookups else {
@@ -120,63 +103,9 @@ pub(crate) async fn run_after_response_lookups(
         );
         return;
     };
-    if ec_state.ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
-        log::debug!("After-response lookups skipped: EC changed during the request");
-        return;
-    }
-    // The request snapshot holds the row as finalize left it. A source held
-    // there is still held in the live row unless consent was withdrawn, which
-    // blocks the lookup anyway, so the live read is skipped when nothing is due.
-    // Only pull sync can be skipped: configured providers always run, so their
-    // cookie opt-outs and regional exclusions are processed.
-    let now = UnixSeconds::new(current_timestamp());
-    let request_entry = ec_state.ec_context.kv_snapshot().entry_for(&lookups.ec_id);
-    if !lookups.coordinator.any_due(request_entry, now) {
-        log::debug!("After-response lookups skipped: nothing due");
-        return;
-    }
-    let Some(graph) = maybe_identity_graph(settings) else {
-        return;
-    };
-    let snapshot = graph.load_snapshot(&lookups.ec_id).await;
-    if !after_response_lookups_allowed(
-        &snapshot,
-        &lookups.ec_id,
-        ec_state.ec_context.ec_generated(),
-    ) {
-        log::debug!("After-response lookups skipped: new EC or no live row");
-        return;
-    }
-    let transport = OutboundLookupTransport::new(client);
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    let pending = lookups
-        .coordinator
-        .dispatch(
-            &transport,
-            &LookupContext {
-                ec_id: &lookups.ec_id,
-                snapshot: &snapshot,
-                minted_entry: None,
-                consent: ec_state.ec_context.consent(),
-                client: ClientSignals {
-                    ip: lookups.client_ip,
-                    user_agent: lookups.user_agent.as_deref(),
-                },
-                publisher_domain: &settings.publisher.domain,
-                cookies: RequestCookies::new(&lookups.cookie_header),
-                rate_limiter: &limiter,
-                now,
-            },
-        )
+    lookups
+        .run(&ec_state.ec_context, permit, identity, client)
         .await;
-    if pending.is_empty() {
-        return;
-    }
-    let results = lookups.coordinator.collect(&transport, pending).await;
-    let outcome =
-        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results)
-            .await;
-    log::info!("After-response lookups: write outcome={outcome}");
 }
 
 #[cfg(test)]
@@ -390,12 +319,14 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build the reader request");
         let geo = GeoInfo {
-            city: "Tokyo".to_owned(),
+            city: Some("Tokyo".to_owned()),
             country: "JP".to_owned(),
-            continent: "Asia".to_owned(),
-            latitude: 35.6762,
-            longitude: 139.6503,
-            metro_code: 0,
+            continent: Some("Asia".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 35.6762,
+                longitude: 139.6503,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };
@@ -406,18 +337,17 @@ mod tests {
             Some(&geo),
         )
         .expect("should read the reader's EC context");
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app");
+        let kv = require_identity_graph(&identity).expect("should open the local identity store");
         ec_context.set_kv_snapshot(futures::executor::block_on(kv.load_snapshot(ec_id)));
         FinalizeState {
-            partner_registry: Arc::new(
-                PartnerRegistry::from_config(&settings.ec.partners)
-                    .expect("should build the partner registry"),
-            ),
+            identity,
             ec_state: EcFinalizeState {
                 ec_context,
                 use_finalize_kv: false,
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             },
             after_response: None,
         }
@@ -439,7 +369,8 @@ mod tests {
         state.ec_state.ec_context.set_navigation_permit(
             NavigationPermit::classify(&navigation).expect("should permit a navigation"),
         );
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let kv =
+            require_identity_graph(&app.identity).expect("should open the local identity store");
         let mut response = edgezero_core::http::response_builder()
             .status(StatusCode::OK)
             .body(edgezero_core::body::Body::empty())
@@ -448,16 +379,16 @@ mod tests {
             settings,
             &mut state.ec_state.ec_context,
             Some(&kv),
-            &app.partner_registry,
+            app.identity.partners(),
             None,
-            None,
+            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             &mut response,
         ));
-        state.partner_registry = app.partner_registry();
+        state.identity = Arc::clone(&app.identity);
         state.after_response = Some(AfterResponseLookups {
             coordinator: Arc::clone(
-                app.after_response_identity
-                    .as_ref()
+                app.identity
+                    .after_response_identity()
                     .expect("should run pull sync after the response"),
             ),
             ec_id: ec_id.to_owned(),
@@ -529,7 +460,9 @@ mod tests {
     /// The row is removed again, so each run starts with pull sync due.
     fn pull_once(settings: &Settings) -> (RecordedRequest, KvEntry) {
         let ec_id = certificate_check_ec_id();
-        let kv = require_identity_graph(settings).expect("should open the local identity store");
+        let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app");
+        let kv = require_identity_graph(&identity).expect("should open the local identity store");
         let mut live = KvEntry::tombstone(trusted_server_core::ec::current_timestamp());
         live.consent.ok = true;
         futures::executor::block_on(kv.create(&ec_id, &live)).expect("should seed a live row");

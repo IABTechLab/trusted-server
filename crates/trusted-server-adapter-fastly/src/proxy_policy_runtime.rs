@@ -99,12 +99,14 @@ fn reader_request(signed: &str, reader: &str) -> Request {
 
 fn context(settings: &Settings, services: &RuntimeServices, request: &Request) -> EcContext {
     let geo = GeoInfo {
-        city: "Example City".to_owned(),
+        city: Some("Example City".to_owned()),
         country: "US".to_owned(),
-        continent: "NA".to_owned(),
-        latitude: 0.0,
-        longitude: 0.0,
-        metro_code: 0,
+        continent: Some("NA".to_owned()),
+        coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+            latitude: 0.0,
+            longitude: 0.0,
+        }),
+        metro_code: Some(0),
         region: Some("CA".to_owned()),
         asn: None,
     };

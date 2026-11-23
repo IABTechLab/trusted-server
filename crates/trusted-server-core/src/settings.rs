@@ -22,10 +22,12 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::sharedid::SharedIdStorage;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
+use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::proxy_policy::{CompiledProxyPolicy, ProxyIdentityEndpoint};
 use crate::redacted::Redacted;
@@ -853,7 +855,9 @@ pub struct Ec {
 
     /// Time budget, in milliseconds, for lookups of providers with
     /// `collect = "after_response"`, measured from their dispatch after the
-    /// response has been sent.
+    /// response has been sent. On Axum this also bounds the complete registered
+    /// task, including row reads and the guarded follow-up write. Shutdown may
+    /// cancel it sooner when the shared grace expires.
     #[serde(
         default = "Ec::default_identity_after_response_budget_ms",
         skip_serializing_if = "Ec::is_default_identity_after_response_budget_ms",
@@ -3114,7 +3118,7 @@ fn is_false(value: &bool) -> bool {
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
 ///
 /// Fail-closed superset: any key not listed here — notably `debug`, which
-/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// carries the resolved `OpenRTB` request (EC ID, `user.eids`, the TC
 /// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
 /// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
@@ -3751,6 +3755,7 @@ impl Settings {
             handler.prepare_runtime()?;
         }
 
+        let sharedid_storage = self.sharedid_storage();
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3763,11 +3768,18 @@ impl Settings {
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
-            co.validate_runtime().map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("Invalid creative opportunity slot config: {err}"),
+            co.validate_runtime()
+                .and_then(|()| {
+                    crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
+                        co.template_cache_key_cookies(),
+                        sharedid_storage.cookie_name(),
+                    )
                 })
-            })?;
+                .map_err(|err| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("Invalid creative opportunity slot config: {err}"),
+                    })
+                })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -4117,6 +4129,27 @@ impl Settings {
         T: IntegrationConfig,
     {
         self.integrations.get_typed(integration_id)
+    }
+
+    /// Returns where Prebid keeps the `SharedID`, from the `sharedId` entry
+    /// of `integrations.prebid.managed_user_ids`.
+    ///
+    /// Parses the Prebid configuration on every call, so callers on a hot
+    /// path resolve it once at startup. An unreadable Prebid configuration
+    /// counts as [`SharedIdStorage::Unconfigured`].
+    #[must_use]
+    pub fn sharedid_storage(&self) -> SharedIdStorage {
+        match self.integration_config::<PrebidIntegrationConfig>("prebid") {
+            Ok(prebid) => SharedIdStorage::from_managed_user_ids(
+                prebid
+                    .as_ref()
+                    .map_or(&[][..], |prebid| prebid.managed_user_ids.as_slice()),
+            ),
+            Err(report) => {
+                log::warn!("SharedID: Prebid config unreadable: {report}");
+                SharedIdStorage::Unconfigured
+            }
+        }
     }
 }
 

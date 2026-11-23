@@ -19,9 +19,7 @@ use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_h
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
-use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::health::{
@@ -42,6 +40,8 @@ mod deadline_network;
 mod delivery;
 mod ec_kv;
 mod esi_assembly;
+#[cfg(test)]
+mod identity_conformance;
 mod management_api;
 mod middleware;
 mod platform;
@@ -58,7 +58,6 @@ use crate::app::{
     TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
 };
 use crate::delivery::handle_delivery;
-use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{
     HEADER_X_TS_FINALIZED, apply_finalize_headers, per_request_synthesized_headers,
     resolve_geo_for_response,
@@ -384,18 +383,28 @@ fn serve(
     // until `finalize` collects them. Drop anything an earlier request on
     // this sandbox left there, which cancels its requests.
     drop(take_navigation_lookups());
-    let delivery = send_request_with_registries_and_hooks(
-        &retained.app,
-        TrustedServerApp::stores(),
-        req,
-        prepare,
-        |response: &mut HttpResponse| finalize_response(response, &inputs),
-    );
+    let delivery = with_finalization(&inputs, |finalize| {
+        send_request_with_registries_and_hooks(
+            &retained.app,
+            TrustedServerApp::stores(),
+            req,
+            prepare,
+            finalize,
+        )
+    });
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
     // A detached response never reaches `finalize`; release its lookups now.
     drop(take_navigation_lookups());
+}
+
+/// Supplies the production finalization callback to a request lifecycle.
+fn with_finalization<T>(
+    inputs: &FinalizeInputs<'_>,
+    send: impl FnOnce(&mut dyn FnMut(&mut HttpResponse) -> Option<FinalizeState>) -> T,
+) -> T {
+    send(&mut |response| finalize_response(response, inputs))
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -494,8 +503,8 @@ impl ClientRequestValues {
 
 /// What the `finalize` step reads besides the routed response.
 struct FinalizeInputs<'a> {
-    /// The retained application state; its settings, partner registry and
-    /// identity coordinators.
+    /// The retained application state; its settings and the identity app
+    /// with its partner registry and identity coordinators.
     state: &'a AppState,
     /// The geo lookup the entry point ran once for this request.
     geo: Option<&'a GeoInfo>,
@@ -555,14 +564,14 @@ fn finalize_response(
         // hostcalls. Keep this bridge here, never in native or worker executors.
         // Identity lookups are collected inside it, so their wait never nests
         // in the router's executor.
-        let partner_registry = futures::executor::block_on(apply_edgezero_ec_finalize(
+        futures::executor::block_on(apply_edgezero_ec_finalize(
             inputs.state,
             &mut ec_state,
             identity,
             response,
         ));
         FinalizeState {
-            partner_registry,
+            identity: Arc::clone(&inputs.state.identity),
             ec_state,
             after_response,
         }
@@ -722,7 +731,8 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-/// Runs EC finalization for a routed response and returns the partner registry.
+/// Runs EC finalization for a routed response with the identity app's partner
+/// registry and record store.
 ///
 /// Collects `identity` lookups first, unless the response is a redirect,
 /// whose navigation writes nothing. The caller drives this future with the
@@ -732,8 +742,7 @@ async fn apply_edgezero_ec_finalize(
     ec_state: &mut EcFinalizeState,
     identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
-) -> Arc<PartnerRegistry> {
-    let settings = state.settings.as_ref();
+) {
     // A redirect skips the write, so do not wait for lookups it would discard.
     let identity = identity.filter(|_| {
         let redirect = NavigationPermit::is_redirect(response.status());
@@ -751,23 +760,22 @@ async fn apply_edgezero_ec_finalize(
         let results = coordinator.collect(&transport, pending).await;
         ec_state.ec_context.set_lookup_results(results);
     }
-    let partner_registry = state.partner_registry();
+    let identity_app = &state.identity;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        identity_app.identity_graph()
     } else {
         None
     };
     ec_finalize_response(
-        settings,
+        identity_app.settings(),
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
-        &partner_registry,
+        identity_app.partners(),
         ec_state.eids_cookie.as_deref(),
-        ec_state.sharedid_cookie.as_deref(),
+        &ec_state.sharedid,
         response,
     )
     .await;
-    partner_registry
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -841,30 +849,24 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings
-        .ec
-        .ec_store
-        .as_ref()
-        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
-}
-
-/// Constructs a `KvIdentityGraph` from settings, or returns an error if the
+/// Returns the identity graph held by the identity app, or an error if the
 /// `ec_store` config is not set.
 ///
 /// Only tests open the graph this way; request paths use
-/// [`maybe_identity_graph`].
+/// [`IdentityApp::identity_graph`](trusted_server_core::ec::app::IdentityApp::identity_graph).
 #[cfg(test)]
 pub(crate) fn require_identity_graph(
-    settings: &Settings,
-) -> Result<KvIdentityGraph, error_stack::Report<trusted_server_core::error::TrustedServerError>> {
-    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+    identity: &trusted_server_core::ec::app::IdentityApp,
+) -> Result<
+    trusted_server_core::ec::kv::KvIdentityGraph,
+    error_stack::Report<trusted_server_core::error::TrustedServerError>,
+> {
+    identity.identity_graph().ok_or_else(|| {
         error_stack::Report::new(trusted_server_core::error::TrustedServerError::KvStore {
             store_name: "ec.ec_store".to_owned(),
             message: "ec.ec_store is not configured".to_owned(),
         })
-    })?;
-    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+    })
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -1505,12 +1507,14 @@ mod tests {
 
     fn sample_geo() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_owned(),
+            city: Some("San Francisco".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_owned()),
             asn: None,
         }
@@ -1553,7 +1557,7 @@ mod tests {
             ec_context,
             use_finalize_kv: false,
             eids_cookie: None,
-            sharedid_cookie: None,
+            sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
         });
 
         let state = finalize_response(&mut page, &inputs);
@@ -1932,12 +1936,14 @@ mod tests {
     fn entry_point_finalize_withholds_geo_from_401() {
         let settings = test_settings();
         let request_geo = GeoInfo {
-            city: "Springfield".to_owned(),
+            city: Some("Springfield".to_owned()),
             country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
-            latitude: 39.78,
-            longitude: -89.65,
-            metro_code: 648,
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 39.78,
+                longitude: -89.65,
+            }),
+            metro_code: Some(648),
             region: Some("IL".to_owned()),
             asn: None,
         };

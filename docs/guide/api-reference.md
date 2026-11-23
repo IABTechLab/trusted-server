@@ -16,12 +16,12 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
 All adapters serve GET/HEAD `/health` and `/ready`. Liveness covers both
 initialized and failed-startup states; readiness shows each state separately. See the [operational response contract](#operational-probe-contract)
@@ -972,7 +972,7 @@ curl -u 'admin:<resolved-admin-password>' \
 
 ### GET /\_ts/admin/eids
 
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
+Parses the request's `ts-eids` cookie and the SharedID cookie (Prebid's configured `storage.name`, or `sharedId` without one) and previews which configured partner IDs cookie ingestion would match or drop. A `_pubcid_optout` cookie keeps the SharedID out of the preview and sets `sharedid_opted_out`. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
 
 After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
 
