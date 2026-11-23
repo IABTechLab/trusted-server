@@ -8,17 +8,21 @@ loaded by a separate tag.
 
 ## Adapter support
 
-| Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
-This table summarizes the adapter implementations. “Startup health” means
-`/health` still answers 200 when startup fails. Only Fastly does, because it
-answers `/health` before it builds the application, so that answer does not
-mean configuration loaded. “Provider fan-out” describes whether the adapter
+This table summarizes the adapter implementations. All adapters keep GET/HEAD
+`/health` live after caught initialization failure; GET/HEAD `/ready` returns
+503 until initialization succeeds, so a liveness answer does not mean
+configuration loaded. Readiness does not poll request-time dependencies. See
+the canonical
+[operational response contract](./api-reference#operational-probe-contract) for
+exact responses, authentication exemptions, and platform timing limits.
+“Provider fan-out” describes whether the adapter
 can dispatch one auction to multiple configured providers. See the individual
 [Fastly](/guide/fastly), [Axum](/guide/axum-dev),
 [Cloudflare](/guide/cloudflare), and [Spin](/guide/spin) deployment guides for

@@ -6,14 +6,16 @@ through Spin variables.
 
 ## Support status
 
-| Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization            |
-| ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | -------------------------------- |
-| `spin`  | experimental   | real   | `503`          | no             | multiple         | outermost sanitize         | innermost Spin-header derivation |
+| Adapter | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization            |
+| ------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | -------------------------------- |
+| `spin`  | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | innermost Spin-header derivation |
 
 This row is the canonical status summary. Spin supports multiple auction
-providers. When startup fails, every route, `/health` included, answers 503
-with a generic `Service Unavailable` error, and the full report goes only to
-the log.
+providers. GET/HEAD `/health` and `/ready` answer after component and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable, and the full report goes
+only to the log. See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 EdgeZero's Spin `run_app` installs the log backend, and Trusted Server
 installs none of its own. Records go to the component's stderr, which `spin up`
@@ -78,6 +80,14 @@ sentinel, rewrite its origin URL to the Spin listener, and omit the original
 URL. The exit trap stops Spin and the stub origin and removes the isolated
 manifest, SQLite store, response captures, and logs.
 
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
+
 ## Runtime boundaries
 
 Use the same store mapping and encoded variables in the deployment provider;
@@ -111,7 +121,9 @@ reads.
 
 The integration CI installs the pinned Spin and runs the `spin_runtime_`
 tests against the production component, including discovery with signing
-metadata in `default`. The local smoke above remains a manual check.
+metadata in `default`. The health/startup CI matrix runs the production smoke
+with the pinned Spin runtime. Manual verification should also record the
+tested commit and exact tool versions.
 
 Compare the [Fastly](./fastly), [Cloudflare](./cloudflare), and
 [Axum](./axum-dev) adapter journeys.

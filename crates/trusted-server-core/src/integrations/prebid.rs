@@ -256,6 +256,9 @@ pub enum PrebidUserIdStorageType {
     Cookie,
     /// Store the module's value in browser local storage.
     Html5,
+    /// Store the module's value in both a browser cookie and local storage.
+    #[serde(rename = "cookie&html5")]
+    CookieAndHtml5,
 }
 
 /// Browser storage settings forwarded verbatim to a Prebid User ID module.
@@ -2945,19 +2948,15 @@ impl PrebidAuctionProvider {
                 ip: d.ip.clone(),
                 geo: d.geo.as_ref().map(|geo| Geo {
                     country: Some(geo.country.clone()),
-                    city: Some(geo.city.clone()),
+                    city: geo.city.clone(),
                     region: geo.region.clone(),
-                    lat: Some(geo.latitude),
-                    lon: Some(geo.longitude),
-                    // DMA/metro code: convert i64 to string for OpenRTB.
-                    // Fastly returns 0 for "no metro code"; negative values
-                    // are not realistic for DMA codes so the > 0 guard is
-                    // sufficient.
-                    metro: if geo.metro_code > 0 {
-                        Some(geo.metro_code.to_string())
-                    } else {
-                        None
-                    },
+                    lat: geo.coordinates.map(|coordinates| coordinates.latitude),
+                    lon: geo.coordinates.map(|coordinates| coordinates.longitude),
+                    // Fastly returns 0 for "no metro code".
+                    metro: geo
+                        .metro_code
+                        .filter(|code| *code > 0)
+                        .map(|code| code.to_string()),
                     r#type: Some(2),
                     ..Default::default()
                 }),
@@ -4288,6 +4287,39 @@ refresh_in_seconds = 3600
             storage.refresh_in_seconds,
             Some(3600),
             "should preserve refresh interval"
+        );
+    }
+
+    #[test]
+    fn managed_user_ids_accept_prebid_cookie_and_html5_storage() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "exampleId"
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie&html5"
+name = "example_env"
+"#,
+        );
+
+        let [entry] = config.managed_user_ids.as_slice() else {
+            panic!("should parse exactly one managed User ID entry");
+        };
+        let storage = entry.storage.as_ref().expect("should parse storage");
+
+        assert_eq!(
+            storage.storage_type,
+            PrebidUserIdStorageType::CookieAndHtml5,
+            "should accept Prebid's combined storage mechanism"
+        );
+        assert_eq!(
+            serde_json::to_value(storage.storage_type).expect("should serialize storage type"),
+            json!("cookie&html5"),
+            "should forward the combined mechanism to Prebid unchanged"
         );
     }
 
@@ -6117,12 +6149,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "Berlin".to_string(),
+                city: Some("Berlin".to_string()),
                 country: "DE".to_string(),
-                continent: "EU".to_string(),
-                latitude: 52.52,
-                longitude: 13.405,
-                metro_code: 0,
+                continent: Some("EU".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 52.52,
+                    longitude: 13.405,
+                }),
+                metro_code: Some(0),
                 region: None,
                 asn: None,
             }),
@@ -6211,12 +6245,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6250,12 +6286,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6684,12 +6722,14 @@ external_bundle_sri = "sha384-AAAA"
             user_agent: Some("TestAgent".to_string()),
             ip: Some("1.2.3.4".to_string()),
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
+                city: Some("New York".to_string()),
                 country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 40.7128,
-                longitude: -74.006,
-                metro_code: 501,
+                continent: Some("NA".to_string()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 40.7128,
+                    longitude: -74.006,
+                }),
+                metro_code: Some(501),
                 region: Some("NY".to_string()),
                 asn: None,
             }),
@@ -6718,9 +6758,62 @@ external_bundle_sri = "sha384-AAAA"
             Some("501"),
             "should set metro (DMA code)"
         );
-        assert_eq!(geo.country.as_deref(), Some("US"));
-        assert_eq!(geo.city.as_deref(), Some("New York"));
-        assert_eq!(geo.region.as_deref(), Some("NY"));
+        assert_eq!(
+            geo.country.as_deref(),
+            Some("US"),
+            "should export the supplied US country to Prebid"
+        );
+        assert_eq!(
+            geo.city.as_deref(),
+            Some("New York"),
+            "should export the supplied New York city to Prebid"
+        );
+        assert_eq!(
+            geo.region.as_deref(),
+            Some("NY"),
+            "should export the supplied NY region to Prebid"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_partial_geo_omits_missing_detail_and_preserves_supplied_zero() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+        for coordinates in [
+            None,
+            Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+        ] {
+            let mut auction_request = create_test_auction_request();
+            let mut geo = GeoInfo::country_region("US", Some("CA".to_owned()));
+            geo.coordinates = coordinates;
+            auction_request.device = Some(DeviceInfo {
+                user_agent: None,
+                ip: None,
+                geo: Some(geo),
+            });
+            let openrtb = provider.to_openrtb(
+                &auction_request,
+                &context,
+                None,
+                make_request_info(&context),
+            );
+            let serialized = serde_json::to_value(openrtb).expect("should serialize request");
+            let geo = &serialized["device"]["geo"];
+            let mut expected = serde_json::json!({"country": "US", "region": "CA", "type": 2});
+            if coordinates.is_some() {
+                expected["lat"] = serde_json::json!(0.0);
+                expected["lon"] = serde_json::json!(0.0);
+            }
+            assert_eq!(
+                *geo, expected,
+                "should export only supplied US/CA Geo detail to Prebid with coordinates {coordinates:?}"
+            );
+        }
     }
 
     #[test]

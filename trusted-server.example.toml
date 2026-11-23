@@ -171,8 +171,8 @@ pull_sync_concurrency = 3
 # not read where GDPR applies, because Lockr AIM does not run there. The
 # default Lockr key of each kind equals one of its own cookie names, which are
 # already read, so the capability changes nothing until `cookie_names` lists
-# the key configured in Lockr when it differs. connectid and liveintent reject
-# a `lockr` table.
+# the key configured in Lockr when it differs. kinds other than id5, liveramp
+# and uid2 reject a `lockr` table.
 # [[ec.identity_providers]]
 # id = "id5"
 # kind = "id5"
@@ -205,7 +205,8 @@ pull_sync_concurrency = 3
 # Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
 # `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
 # `ext`; the others are partner IDs, sent with UID `ext.provider` naming
-# LiveIntent (the Trade Desk ID also with `rtiPartner` and EID `matcher`).
+# LiveIntent, except the Trade Desk ID, whose UID `ext` carries `rtiPartner`
+# and `provider` naming the publisher domain, with EID `matcher`.
 # `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
 # lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
 # distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner
@@ -302,8 +303,9 @@ pull_sync_concurrency = 3
 # [[integrations.prebid.managed_user_ids]] `storage.name` for the `sharedId`
 # module, or else from `_sharedid`, falling back to the legacy `_pubcid`, and
 # sends it as a device-based (atype 1) ID. `sources` defaults to
-# ["pubcid.org"], which needs a matching [[ec.partners]] entry. A stored
-# SharedID lives as long as the row and wins over a different cookie value.
+# ["pubcid.org"], which needs a matching [[ec.partners]] entry. Cookie IDs
+# are kept for 24 hours; generated IDs for 30 days. A different cookie ID
+# replaces the stored ID.
 # The `_pubcid_optout` cookie suppresses it. With generate = true, when no
 # cookie holds an ID and none is stored, Trusted Server generates a random UUID
 # and stores it in the row only (no cookie is set). Leave it off unless Prebid
@@ -439,13 +441,32 @@ proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
-# Must be true. Origin TLS is always verified, and validation rejects false.
+# Must be true. TLS is always verified on every outbound HTTPS request, and
+# validation rejects false.
 # certificate_check = true
 # Allowlist for first-party proxy signing, initial fetch targets, and redirect
 # targets. Supports exact ("example.com") and wildcard ("*.example.com", also
 # matches apex).
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
+# Empty allowed_domains permits valid hosts; identity_endpoints is separately
+# DEFAULT OFF: omitted/empty grants no creative-proxy EC disclosure.
+# Explicit opt-in only after reviewing destinations, redirects, and consent.
+# IDs must be unique, 1-64 ASCII letters/digits/underscore/hyphen.
+# Each HTTPS DNS origin requires exactly one path_exact or path_prefix.
+# Prefixes must be / or end in /; query strings do not select a rule.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
+# Matching endpoints always bypass upstream caching and make the final response
+# private/no-store, even without eligible existing-cookie EC. No ID is generated.
+# Deploy compatible binaries first, then publish nonempty endpoint rules.
 #
 # Route first-party asset paths to a different backend origin. Longest matching
 # prefix wins; only GET/HEAD participate; query string is preserved.
