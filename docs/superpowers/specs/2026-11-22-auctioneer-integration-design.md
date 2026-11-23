@@ -28,7 +28,7 @@ The first local Auctioneer host delivery is Fastly banner/display. The prerequis
 
 The SDK cutover is [#1507](https://github.com/IABTechLab/trusted-server/issues/1507), implemented by [PR #1506](https://github.com/IABTechLab/trusted-server/pull/1506); its specification is tracked in #1513. Qualification is separately tracked in [#1508](https://github.com/IABTechLab/trusted-server/issues/1508). Follow PR #1506's current decisions: cutover merge and production deployment do not wait for the EdgeZero EZ-Q1 qualification record. This scheduling decision does not establish Auctioneer host acceptance or waive its selected Fastly serving and resource requirements.
 
-Use these delivery tickets rather than parallel integration implementations. Epic #1505 coordinates the work; its completion is not a prerequisite of its own leaves. Cloudflare/Spin local-host work in #1484 is outside this selected Fastly path.
+Use these delivery tickets rather than parallel integration implementations. Epic #1505 coordinates the work; its completion is not a prerequisite of its own leaves. Cloudflare/Spin fan-out work in #1484 is not a prerequisite for this selected Fastly path.
 
 #1510 remains the host resource-proof coordination owner named by Auctioneer #76. #1511 supplies the linked production artifact and execution observations; #1512 supplies its controlled flow and comparison. Those implementation commits can land in order without waiting for #1510 issue closure, but #1510's resource handoff is not accepted until their combined-artifact evidence is available. This avoids a cyclic issue-completion dependency while filing the evidence where upstream expects it.
 
