@@ -101,6 +101,15 @@ ts config push --adapter fastly
 ts serve --adapter fastly
 ```
 
+For Axum, follow [Getting started, Option B](./getting-started#option-b-axum-server):
+`ts config push --adapter axum --local` writes the local config map beneath the
+manifest's `.edgezero` directory. Export `EDGEZERO__ADAPTER__CONFIG_DIR` pointing
+there, a writable `EDGEZERO__ADAPTER__DATA_DIR`, and the referenced
+`EDGEZERO__SECRETS__*` values before `ts serve --adapter axum` in the same shell.
+Serve inherits those inputs and runs the manifest's serve command (the repository
+uses `cargo run -p trusted-server-adapter-axum`). It does not publish config,
+load `.env` files, or generate secrets. Restart after changing config or secrets.
+
 ## Configuration commands
 
 Create a starter Trusted Server config:

@@ -99,6 +99,10 @@ run_case() {
     jq --null-input --arg envelope "$config_value" \
         'if $envelope == "" then {} else {trusted_server_config: $envelope} end' \
         >"$config_dir/local-config-trusted_server_config.json"
+    if [ "$case_name" = "positive" ]; then
+        # Read the publication output unchanged, without a conversion step.
+        config_dir="$WORKSPACE/.edgezero"
+    fi
     local env_args=(
         env -i
         "PATH=$PATH"
@@ -196,6 +200,9 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" exit \
     "required app-config secret at \`ec.passphrase\` is missing"
+run_case malformed-envelope "$((BASE_PORT + 5))" "{invalid" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" exit \
+    "failed to parse Trusted Server app-config blob envelope"
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

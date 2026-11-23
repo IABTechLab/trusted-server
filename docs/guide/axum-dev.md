@@ -27,9 +27,9 @@ From the repository root, run:
 ```
 
 The script creates and strictly validates an isolated config, then runs `ts
-config push --adapter axum --local`. It places the exported envelope in the
-`trusted_server_config` entry of an isolated
-`local-config-trusted_server_config.json` map. The process reads that prepared
+config push --adapter axum --local`. The positive start reads the pushed
+`local-config-trusted_server_config.json` map unchanged, including its
+`trusted_server_config` entry. The process reads that prepared
 local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
 envelope and active secret references, and installs immutable snapshots and
 the actual router before listening.
@@ -39,6 +39,9 @@ store is always declared and EdgeZero prepares its local provider before TS
 loads application config, even when `ec.storage` is absent. Every local-provider
 start needs that directory; remote-only bindings do not. See
 [Getting started](./getting-started), Option B, for the complete shell setup.
+After that setup, `ts serve --adapter axum` launches the repository manifest's
+`cargo run -p trusted-server-adapter-axum` command with the same exported
+directories and secrets. Serve does not publish config or load dotenv files.
 
 Local secrets use these variables:
 
@@ -52,10 +55,12 @@ and `TRUSTED_SERVER_SECRET_*` variables are not fallback inputs. The
 [Axum production startup](./native-rc-demo) covers provider selection and lifecycle
 checks.
 
-Before the positive request, the smoke omits the config and each secret in
-separate process starts. Each start must fail before Axum listens: the process
+Before the positive request, the smoke omits the config and each secret, and
+supplies a malformed envelope in separate process starts.
+Each start must fail before Axum listens: the process
 must exit non-zero and its log must identify the missing prepared config or
-required app-config secret. This prevents a port, launcher, or origin error from
+required app-config secret, or identify an envelope parse failure.
+This prevents a port, launcher, or origin error from
 satisfying a negative case.
 
 The final publisher request must return 200, include the stub-origin sentinel,
