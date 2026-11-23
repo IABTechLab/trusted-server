@@ -110,17 +110,22 @@ pub(crate) async fn run_after_response_lookups(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use edgezero_adapter_fastly::delivery::DeliveryError;
     use edgezero_core::http::{Method, StatusCode};
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseDecoding, ResponseMode};
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
     use trusted_server_core::ec::EcContext;
+    use trusted_server_core::ec::coordinator::transport::MAX_PROVIDER_RESPONSE_BYTES;
     use trusted_server_core::ec::finalize::ec_finalize_response;
+    use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::page_load::NavigationPermit;
     use trusted_server_core::geo::GeoInfo;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::EcPartner;
     use trusted_server_core::test_support::scripted_client::{
-        ScriptedHttpClient, ScriptedReply, TestClock,
+        ExpectedTransport, RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
     };
 
     use super::*;
@@ -276,9 +281,9 @@ mod tests {
         format!("{}.test01", "a".repeat(64))
     }
 
-    /// Pull-sync URL the example partner receives for [`seeded_ec_id`].
-    fn partner_pull_url() -> String {
-        format!("https://sync.example.com/pull?ec_id={}", seeded_ec_id())
+    /// Pull-sync URL the example partner receives for `ec_id`.
+    fn partner_pull_url(ec_id: &str) -> String {
+        format!("https://sync.example.com/pull?ec_id={ec_id}")
     }
 
     /// Settings with Tinybird, the local identity store, and one pull-sync partner.
@@ -305,20 +310,23 @@ mod tests {
         settings
     }
 
-    /// Finalize state for a returning browser whose EC row the local store holds.
-    fn returning_reader_state(settings: &Settings) -> FinalizeState {
+    /// Finalize state for a returning browser whose EC row, `ec_id`, the local
+    /// store holds.
+    fn returning_reader_state(settings: &Settings, ec_id: &str) -> FinalizeState {
         let request = edgezero_core::http::request_builder()
             .uri("https://test-publisher.example.com/article")
-            .header("cookie", format!("ts-ec={}", seeded_ec_id()))
+            .header("cookie", format!("ts-ec={ec_id}"))
             .body(edgezero_core::body::Body::empty())
             .expect("should build the reader request");
         let geo = GeoInfo {
-            city: "Tokyo".to_owned(),
+            city: Some("Tokyo".to_owned()),
             country: "JP".to_owned(),
-            continent: "Asia".to_owned(),
-            latitude: 35.6762,
-            longitude: 139.6503,
-            metro_code: 0,
+            continent: Some("Asia".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 35.6762,
+                longitude: 139.6503,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };
@@ -332,9 +340,7 @@ mod tests {
         let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
             .expect("should build identity app");
         let kv = require_identity_graph(&identity).expect("should open the local identity store");
-        ec_context.set_kv_snapshot(futures::executor::block_on(
-            kv.load_snapshot(&seeded_ec_id()),
-        ));
+        ec_context.set_kv_snapshot(futures::executor::block_on(kv.load_snapshot(ec_id)));
         FinalizeState {
             identity,
             ec_state: EcFinalizeState {
@@ -350,10 +356,10 @@ mod tests {
     /// [`returning_reader_state`] after finalize confirmed the reader's
     /// navigation, with the after-response pull-sync lookups the entry point
     /// captured for it.
-    fn returning_reader_after_response_state(settings: &Settings) -> FinalizeState {
+    fn returning_reader_after_response_state(settings: &Settings, ec_id: &str) -> FinalizeState {
         let app = crate::app::build_state_from_settings(settings.clone())
             .expect("should build the app state");
-        let mut state = returning_reader_state(settings);
+        let mut state = returning_reader_state(settings, ec_id);
         let navigation = edgezero_core::http::request_builder()
             .uri("https://test-publisher.example.com/article")
             .header("sec-fetch-dest", "document")
@@ -385,7 +391,7 @@ mod tests {
                     .after_response_identity()
                     .expect("should run pull sync after the response"),
             ),
-            ec_id: seeded_ec_id(),
+            ec_id: ec_id.to_owned(),
             client_ip: None,
             user_agent: None,
             cookie_header: String::new(),
@@ -405,12 +411,12 @@ mod tests {
             )
             .respond_to(
                 Method::GET,
-                &partner_pull_url(),
+                &partner_pull_url(&seeded_ec_id()),
                 ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"example-partner-uid"}"#),
             );
         let settings = pull_sync_settings();
         let (queue, _body) = queue_with_one_auction(&client);
-        let state = returning_reader_after_response_state(&settings);
+        let state = returning_reader_after_response_state(&settings, &seeded_ec_id());
 
         // The origin aborted after the page head was committed.
         handle_delivery(
@@ -436,10 +442,111 @@ mod tests {
             requested,
             vec![
                 (Method::POST, EVENTS_URI.to_owned()),
-                (Method::GET, partner_pull_url()),
+                (Method::GET, partner_pull_url(&seeded_ec_id())),
             ],
             "should send the telemetry first, then reach the pull-sync partner"
         );
+    }
+
+    /// EC ID only [`pull_once`] writes, so its pulls never touch the row
+    /// `fastly.toml` seeds for the other pull-sync tests.
+    fn certificate_check_ec_id() -> String {
+        format!("{}.cert01", "c".repeat(64))
+    }
+
+    /// Runs after-response pull sync for a returning reader of a fresh live row
+    /// and returns the request it sent and the row it left.
+    ///
+    /// The row is removed again, so each run starts with pull sync due.
+    fn pull_once(settings: &Settings) -> (RecordedRequest, KvEntry) {
+        let ec_id = certificate_check_ec_id();
+        let identity = crate::app::build_identity_app(Arc::new(settings.clone()))
+            .expect("should build identity app");
+        let kv = require_identity_graph(&identity).expect("should open the local identity store");
+        let mut live = KvEntry::tombstone(trusted_server_core::ec::current_timestamp());
+        live.consent.ok = true;
+        futures::executor::block_on(kv.create(&ec_id, &live)).expect("should seed a live row");
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            &partner_pull_url(&ec_id),
+            ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+        );
+        let state = returning_reader_after_response_state(settings, &ec_id);
+
+        clock.drive(post_delivery_work(
+            Some(state),
+            &TelemetryQueue::default(),
+            settings,
+            &client.http_client().with_proxy_marker(false),
+            &"",
+        ));
+
+        let requests = client.requests();
+        let [request] = requests.as_slice() else {
+            panic!("should send one pull request, got {requests:?}");
+        };
+        let (entry, _) = futures::executor::block_on(kv.get(&ec_id))
+            .expect("should read the local identity store")
+            .expect("should keep the row");
+        futures::executor::block_on(kv.delete(&ec_id)).expect("should remove the test row");
+        (request.clone(), entry)
+    }
+
+    #[test]
+    fn after_response_pull_sync_ignores_relaxed_certificate_check() {
+        let strict = pull_sync_settings();
+        assert!(
+            strict.proxy.certificate_check,
+            "should default to verified TLS"
+        );
+        // A live config that still sets `false` loads with a warning and keeps the
+        // value, so post-delivery work and the app state built from it receive it.
+        let mut relaxed = pull_sync_settings();
+        relaxed.proxy.certificate_check = false;
+
+        let (strict_request, strict_entry) = pull_once(&strict);
+        let (relaxed_request, relaxed_entry) = pull_once(&relaxed);
+
+        assert_eq!(
+            relaxed_request.method, strict_request.method,
+            "should pull with the same method"
+        );
+        assert_eq!(
+            relaxed_request.uri, strict_request.uri,
+            "should pull the same HTTPS URL"
+        );
+        // Compare without printing header values, which carry the bearer token.
+        assert!(
+            relaxed_request.headers == strict_request.headers,
+            "should send the same headers"
+        );
+        assert_eq!(
+            relaxed_request.body, strict_request.body,
+            "should send the same body"
+        );
+        for request in [&strict_request, &relaxed_request] {
+            request.assert_transport(ExpectedTransport {
+                timeout: Duration::from_millis(strict.ec.identity_after_response_budget_ms),
+                response_mode: ResponseMode::Buffered {
+                    max_bytes: u64::try_from(MAX_PROVIDER_RESPONSE_BYTES)
+                        .expect("should fit the lookup body cap in u64"),
+                },
+                response_decoding: ResponseDecoding::Decode,
+                cache_policy: OutboundCachePolicy::Bypass,
+            });
+        }
+        for entry in [&strict_entry, &relaxed_entry] {
+            assert_eq!(
+                entry
+                    .ids
+                    .get("partner.example.com")
+                    .map(|id| id.uid.as_str()),
+                Some("synced-uid"),
+                "should persist the partner UID with either setting"
+            );
+        }
     }
 
     #[test]
@@ -447,7 +554,7 @@ mod tests {
         let client = ScriptedHttpClient::forbidding();
         let clock = TestClock::new();
         let settings = pull_sync_settings();
-        let state = returning_reader_state(&settings);
+        let state = returning_reader_state(&settings, &seeded_ec_id());
         let mut state = Some(state);
 
         handle_delivery(

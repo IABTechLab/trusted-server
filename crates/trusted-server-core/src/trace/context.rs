@@ -140,7 +140,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue, header};
     use serde_json::json;
 
-    use crate::platform::{ClientInfo, GeoInfo};
+    use crate::platform::{ClientInfo, GeoCoordinates, GeoInfo};
     use crate::trace::cookies::inspect_cookies;
 
     fn captured_at() -> chrono::DateTime<Utc> {
@@ -151,12 +151,14 @@ mod tests {
 
     fn geo() -> GeoInfo {
         GeoInfo {
-            city: "fictional-private-city".to_owned(),
+            city: Some("fictional-private-city".to_owned()),
             country: "US".to_owned(),
-            continent: "fictional-private-continent".to_owned(),
-            latitude: 12.345,
-            longitude: 56.789,
-            metro_code: 123,
+            continent: Some("fictional-private-continent".to_owned()),
+            coordinates: Some(GeoCoordinates {
+                latitude: 12.345,
+                longitude: 56.789,
+            }),
+            metro_code: Some(123),
             region: Some("CA".to_owned()),
             asn: Some(64512),
         }

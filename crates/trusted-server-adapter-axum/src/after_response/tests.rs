@@ -252,12 +252,14 @@ impl Hooks for FixtureApp {
                     .expect("should seed live row");
                 let req = ctx.into_request()?;
                 let geo = GeoInfo {
-                    city: "Example".to_owned(),
+                    city: Some("Example".to_owned()),
                     country: "JP".to_owned(),
-                    continent: "Asia".to_owned(),
-                    latitude: 0.0,
-                    longitude: 0.0,
-                    metro_code: 0,
+                    continent: Some("Asia".to_owned()),
+                    coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                        latitude: 0.0,
+                        longitude: 0.0,
+                    }),
+                    metro_code: Some(0),
                     region: None,
                     asn: None,
                 };
@@ -783,12 +785,14 @@ async fn registration_case(permit: bool) -> RegistrationCase {
         .body(Body::empty())
         .expect("should build fixture navigation");
     let geo = GeoInfo {
-        city: "Example".to_owned(),
+        city: Some("Example".to_owned()),
         country: "JP".to_owned(),
-        continent: "Asia".to_owned(),
-        latitude: 0.0,
-        longitude: 0.0,
-        metro_code: 0,
+        continent: Some("Asia".to_owned()),
+        coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+            latitude: 0.0,
+            longitude: 0.0,
+        }),
+        metro_code: Some(0),
         region: None,
         asn: None,
     };

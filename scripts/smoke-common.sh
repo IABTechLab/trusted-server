@@ -12,6 +12,12 @@ smoke_require_command() {
     command -v "$1" >/dev/null 2>&1 || smoke_die "required command not found: $1"
 }
 
+smoke_require_python() {
+    smoke_require_command python3
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
+        smoke_die "Python 3.11 or newer is required for runtime config-store fixtures"
+}
+
 smoke_require_spin_version() {
     # `.tool-versions` is the single source of truth for the pinned version, so
     # the floor is read from there rather than restated here. spin-sdk 8 imports
@@ -92,9 +98,13 @@ smoke_wait_http() {
     local body_path="$3"
     local headers_path="$4"
     local attempt=0
+    local credentials=()
+    if [ "${SMOKE_AUTHENTICATE:-false}" = true ]; then
+        credentials=(--user "admin:$SMOKE_HANDLER_VALUE")
+    fi
     SMOKE_HTTP_STATUS="000"
     while [ "$attempt" -lt 60 ]; do
-        SMOKE_HTTP_STATUS=$(curl --silent --show-error \
+        SMOKE_HTTP_STATUS=$(curl --silent --show-error --max-time 5 "${credentials[@]}" \
             --output "$body_path" \
             --dump-header "$headers_path" \
             --write-out '%{http_code}' \
@@ -171,8 +181,8 @@ smoke_start_origin() {
 smoke_resolve_ts_binary() {
     local repository="$1"
     local candidate="${TS_BIN:-$repository/target/debug/ts}"
-    if [ ! -x "$candidate" ]; then
-        cargo build --manifest-path "$repository/Cargo.toml" -p trusted-server-cli --bin ts
+    if [ -z "${TS_BIN:-}" ]; then
+        cargo build --locked --manifest-path "$repository/Cargo.toml" -p trusted-server-cli --bin ts
     fi
     [ -x "$candidate" ] || smoke_die "Trusted Server CLI not executable: $candidate"
     SMOKE_TS_BIN="$candidate"
@@ -202,3 +212,127 @@ SMOKE_EC_ENV=TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE
 SMOKE_HANDLER_VALUE=smoke-admin-password-32-bytes-ok
 SMOKE_PROXY_VALUE=smoke-publisher-proxy-secret-32-bytes
 SMOKE_EC_VALUE=smoke-edge-cookie-passphrase-32-bytes
+
+# Preserve only synthetic logs and HTTP captures, never runtime config or secrets.
+smoke_preserve_artifacts() {
+    local workspace="$1"
+    [ -n "${SMOKE_ARTIFACT_DIR:-}" ] || return 0
+    mkdir -p "$SMOKE_ARTIFACT_DIR"
+    python3 - "$workspace" "$SMOKE_ARTIFACT_DIR" <<'PY'
+import pathlib, shutil, sys
+source, destination = map(pathlib.Path, sys.argv[1:])
+for path in list(source.rglob('*')):
+    if path.resolve().is_relative_to(destination.resolve()):
+        continue
+    if path.is_file() and (path.suffix in ('.log', '.body', '.headers', '.wire') or path.name.endswith('_stderr.txt')):
+        target = destination / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+PY
+}
+
+# The generated fixture contains only ASCII and integer numeric values. Sorting
+# keys and compact JSON therefore matches BlobEnvelope's canonical v1 encoding.
+smoke_mutate_envelope() {
+    local envelope="$1"
+    local mode="$2"
+    SMOKE_ENVELOPE="$envelope" python3 - "$mode" <<'PY'
+import hashlib, json, os, sys
+envelope = json.loads(os.environ['SMOKE_ENVELOPE'])
+data = envelope['data']
+canonical = lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+assert hashlib.sha256(canonical(data)).hexdigest() == envelope['sha256'], 'fixture canonicalization mismatch'
+if sys.argv[1] == 'invalid':
+    data['publisher']['domain'] = ''
+elif sys.argv[1] == 'hostile':
+    data['handlers'][0]['path'] = '^/'
+    data['response_headers'] = {
+        'cache-control': 'public, max-age=9999',
+        'content-type': 'application/x-smoke-hostile',
+        'set-cookie': 'smoke-private-sentinel=1',
+        'www-authenticate': 'Basic realm="smoke-private-sentinel"',
+    }
+else:
+    raise ValueError('unknown mutation')
+envelope['sha256'] = hashlib.sha256(canonical(data)).hexdigest()
+print(json.dumps(envelope, separators=(',', ':')))
+PY
+}
+
+smoke_origin_count() {
+    # Python's origin logs one line per request and flushes stderr immediately.
+    grep -c '"[A-Z]* /' "$1/origin.log" || true
+}
+
+smoke_assert_operational() {
+    local base_url="$1"
+    local state="$2"
+    local prefix="$3"
+    local before after path status expected content_type
+    local workspace
+    workspace=$(dirname "$prefix")
+    before=$(smoke_origin_count "$workspace")
+    local paths=(health ready)
+    [ "$state" != unavailable ] || paths+=(smoke/startup-unavailable)
+    for path in "${paths[@]}"; do
+        status=200
+        expected=ok
+        content_type=text/plain
+        if [ "$path" != health ]; then
+            expected=ready
+            if [ "$state" = unavailable ]; then
+                status=503
+                expected=$'Service Unavailable\n'
+                content_type='text/plain; charset=utf-8'
+            fi
+        fi
+        # Capture arbitrary failure paths in the same flat response directory.
+        local capture_path=${path//\//-}
+        # Keep the publisher status in SMOKE_HTTP_STATUS untouched.
+        local probe_status
+        probe_status=$(curl --silent --show-error --max-time 10 \
+            --output "$prefix-$capture_path.body" --dump-header "$prefix-$capture_path.headers" \
+            --write-out '%{http_code}' "$base_url/$path?smoke=1")
+        [ "$probe_status" = "$status" ] || smoke_die "$path returned $probe_status, expected $status"
+        printf '%s' "$expected" | cmp -s - "$prefix-$capture_path.body" || smoke_die "$path body differs"
+        python3 - "$base_url/$path?smoke=head" "$prefix-$capture_path" "$status" "$content_type" <<'PY'
+import pathlib, socket, sys, urllib.parse
+url, prefix, status, content_type = sys.argv[1:]
+parsed = urllib.parse.urlsplit(url)
+
+def check_headers(raw):
+    lines = raw.decode('iso-8859-1').split('\r\n')
+    assert lines[0].split()[1] == status, lines[0]
+    headers = {}
+    for line in lines[1:]:
+        if ':' in line:
+            name, value = line.split(':', 1)
+            headers.setdefault(name.lower(), []).append(value.strip())
+    assert headers.get('content-type') == [content_type], headers
+    assert headers.get('cache-control') == ['no-store'], headers
+    assert 'set-cookie' not in headers and 'www-authenticate' not in headers, headers
+
+check_headers(pathlib.Path(prefix + '.headers').read_bytes().strip())
+with socket.create_connection((parsed.hostname, parsed.port), timeout=10) as connection:
+    connection.sendall(f'HEAD {parsed.path}?{parsed.query} HTTP/1.1\r\nHost: {parsed.netloc}\r\nConnection: close\r\n\r\n'.encode())
+    wire = bytearray()
+    while True:
+        part = connection.recv(65536)
+        if not part:
+            break
+        wire.extend(part)
+pathlib.Path(prefix + '-head.wire').write_bytes(wire)
+headers, body = bytes(wire).split(b'\r\n\r\n', 1)
+check_headers(headers)
+assert not body, f'HEAD returned {len(body)} bytes on the wire'
+PY
+    done
+    after=$(smoke_origin_count "$workspace")
+    [ "$before" = "$after" ] || smoke_die "probe forwarded to publisher origin"
+}
+
+smoke_assert_unavailable_body() {
+    local body_path="$1"
+    printf 'Service Unavailable\n' | cmp -s - "$body_path" ||
+        smoke_die "startup failure must have the fixed public body"
+}

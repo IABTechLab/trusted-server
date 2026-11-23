@@ -207,12 +207,14 @@ fn write_client(
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
 fn geo_from_fastly(geo: &Geo) -> GeoInfo {
     GeoInfo {
-        city: geo.city().to_string(),
+        city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),
-        continent: format!("{:?}", geo.continent()),
-        latitude: geo.latitude(),
-        longitude: geo.longitude(),
-        metro_code: geo.metro_code(),
+        continent: Some(format!("{:?}", geo.continent())),
+        coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+            latitude: geo.latitude(),
+            longitude: geo.longitude(),
+        }),
+        metro_code: Some(geo.metro_code()),
         region: geo.region().map(str::to_string),
         asn: None,
     }
@@ -225,6 +227,8 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
 /// one host geo lookup however many steps use geo.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RequestGeo {
+    #[cfg(test)]
+    fail_lookup: bool,
     client_ip: Option<IpAddr>,
     geo: Option<GeoInfo>,
 }
@@ -233,12 +237,28 @@ impl RequestGeo {
     /// Holds `geo` as the lookup result for `client_ip`.
     #[cfg(test)]
     pub(crate) fn new(client_ip: Option<IpAddr>, geo: Option<GeoInfo>) -> Self {
-        Self { client_ip, geo }
+        Self {
+            client_ip,
+            geo,
+            fail_lookup: false,
+        }
+    }
+
+    /// Simulates a failed platform lookup without changing production geo handling.
+    #[cfg(test)]
+    pub(crate) fn failing(client_ip: Option<IpAddr>) -> Self {
+        Self {
+            client_ip,
+            geo: None,
+            fail_lookup: true,
+        }
     }
 
     /// Looks up `client_ip` once with Fastly's geo database.
     pub(crate) fn lookup_once(client_ip: Option<IpAddr>) -> Self {
         Self {
+            #[cfg(test)]
+            fail_lookup: false,
             client_ip,
             geo: client_ip
                 .and_then(geo_lookup)
@@ -264,6 +284,10 @@ impl PlatformGeo for RequestGeo {
     /// Any other IP gets `Ok(None)`: there is no data for an IP this request
     /// did not resolve.
     fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        #[cfg(test)]
+        if self.fail_lookup {
+            return Err(Report::new(PlatformError::Geo));
+        }
         if client_ip == self.client_ip {
             Ok(self.geo.clone())
         } else {
@@ -383,12 +407,14 @@ mod tests {
         let request_geo = RequestGeo::new(
             Some(resolved_ip),
             Some(GeoInfo {
-                city: "Springfield".to_owned(),
+                city: Some("Springfield".to_owned()),
                 country: "US".to_owned(),
-                continent: "NorthAmerica".to_owned(),
-                latitude: 39.78,
-                longitude: -89.65,
-                metro_code: 648,
+                continent: Some("NorthAmerica".to_owned()),
+                coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                    latitude: 39.78,
+                    longitude: -89.65,
+                }),
+                metro_code: Some(648),
                 region: Some("IL".to_owned()),
                 asn: None,
             }),
@@ -402,7 +428,7 @@ mod tests {
             .expect("should answer another IP");
 
         assert_eq!(
-            held.map(|geo| geo.city),
+            held.and_then(|geo| geo.city),
             Some("Springfield".to_owned()),
             "should return the held geo for the resolved IP"
         );
