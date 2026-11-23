@@ -402,8 +402,11 @@ fn build_lookup_response(
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
-                Ok(entry) => {
+                Ok(mut entry) => {
                     payload.tombstone = Some(!entry.consent.ok);
+                    // Matches the auction read, which leaves out what it
+                    // cannot read; `entry` above still shows the stored row.
+                    entry.drop_unreadable_ids();
                     match entry.validate() {
                         Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
                         Err(message) => {

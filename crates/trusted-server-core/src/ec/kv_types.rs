@@ -6,7 +6,6 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -14,8 +13,8 @@ use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 
 use super::eid_types::{
-    AgentType, EidFields, Expiry, MAX_EID_FIELD_BYTES, MatchMethod, ProviderId, RawJson, UidValue,
-    UnixSeconds, optional_exp,
+    AgentType, EidFields, Expiry, MAX_EID_FIELD_BYTES, ProviderId, RawJson, UidValue, UnixSeconds,
+    optional_exp,
 };
 use crate::consent::ConsentContext;
 use crate::geo::GeoInfo;
@@ -158,7 +157,11 @@ pub const MAX_ENTRY_BYTES: usize = 16 * 1024;
 /// `uid` is always present so older readers keep working. Records written by
 /// an identity provider also carry full-fidelity `eids`; new code reads
 /// `eids` whenever it is non-empty and treats `uid` as derived.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization is lenient (see [`ReadSkips`]): it never fails on the
+/// record's own content, and [`KvEntry::drop_unreadable_ids`] removes a
+/// record it could not read.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KvPartnerId {
     /// First live UID of `eids`, or the single UID for records written by
     /// browser ingest, batch sync or older versions.
@@ -166,6 +169,179 @@ pub struct KvPartnerId {
     /// Full-fidelity entries written by a provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     eids: Vec<KvEid>,
+    /// Whether the stored record could not be read, or held provider entries
+    /// none of which could be read.
+    #[serde(skip)]
+    unreadable: bool,
+    /// Stored values the read left out of this record.
+    #[serde(skip)]
+    skipped: ReadSkips,
+}
+
+/// Stored values a lenient row read left out.
+///
+/// A row written by a later build, or kept across a rollback, can hold values
+/// this build rejects: an unknown `mm`, or a UID, `ext`, `inserter` or
+/// `matcher` over a limit this build lowered. The read skips each such value
+/// alone and keeps the rest of the row. [`KvEntry::drop_unreadable_ids`]
+/// returns the totals so the caller can log them.
+///
+/// The next write of the row persists it without the skipped values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadSkips {
+    /// Partner records removed: unreadable, or left without a UID this build
+    /// can hold.
+    pub records: usize,
+    /// Provider EID entries that could not be read.
+    pub eids: usize,
+    /// UIDs that could not be read, including any over
+    /// [`MAX_STORED_UID_LENGTH`].
+    pub uids: usize,
+    /// Invalid `mm`, `ext`, `inserter` or `matcher` values read as absent.
+    pub fields: usize,
+}
+
+impl ReadSkips {
+    /// Whether the read left nothing out.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl<'de> Deserialize<'de> for KvPartnerId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        Ok(serde_json::from_str::<StoredPartnerId>(raw.get())
+            .map_or_else(|_| Self::unreadable(), StoredPartnerId::read))
+    }
+}
+
+/// Stored shape of [`KvPartnerId`], with each entry kept raw so one invalid
+/// entry is skipped alone.
+#[derive(Deserialize)]
+struct StoredPartnerId {
+    uid: String,
+    #[serde(default)]
+    eids: Vec<Box<RawValue>>,
+}
+
+impl StoredPartnerId {
+    fn read(self) -> KvPartnerId {
+        let mut skipped = ReadSkips::default();
+        let eids: Vec<KvEid> = self
+            .eids
+            .iter()
+            .filter_map(|raw| read_eid(raw, &mut skipped))
+            .collect();
+        KvPartnerId {
+            uid: self.uid,
+            // A provider record whose entries all failed would otherwise read
+            // as a single-UID record holding its stale `uid`.
+            unreadable: !self.eids.is_empty() && eids.is_empty(),
+            eids,
+            skipped,
+        }
+    }
+}
+
+/// Stored shape of [`KvEid`]: optional fields and UIDs kept raw so each
+/// invalid one is skipped alone.
+#[derive(Deserialize)]
+struct StoredEid {
+    #[serde(default)]
+    inserter: Option<Box<RawValue>>,
+    #[serde(default)]
+    matcher: Option<Box<RawValue>>,
+    #[serde(default)]
+    mm: Option<Box<RawValue>>,
+    #[serde(default)]
+    ext: Option<Box<RawValue>>,
+    uids: Vec<Box<RawValue>>,
+}
+
+/// Stored shape of [`KvUid`], with `ext` kept raw so an invalid one is read as
+/// absent. Any other invalid value skips the UID.
+#[derive(Deserialize)]
+struct StoredUid {
+    id: UidValue,
+    atype: AgentType,
+    #[serde(default)]
+    ext: Option<Box<RawValue>>,
+    #[serde(default)]
+    owner: Option<ProviderId>,
+    #[serde(
+        default,
+        rename = "exp",
+        deserialize_with = "optional_exp::deserialize"
+    )]
+    expiry: Expiry,
+    #[serde(default)]
+    refresh: Option<KvRefresh>,
+}
+
+/// Reads one stored EID entry, or `None` when it cannot be read or holds no
+/// readable UID.
+fn read_eid(raw: &RawValue, skipped: &mut ReadSkips) -> Option<KvEid> {
+    let Ok(stored) = serde_json::from_str::<StoredEid>(raw.get()) else {
+        skipped.eids += 1;
+        return None;
+    };
+    let uids: Vec<KvUid> = stored
+        .uids
+        .iter()
+        .filter_map(|raw| read_uid(raw, skipped))
+        .collect();
+    if uids.is_empty() {
+        return None;
+    }
+    let fields = EidFields {
+        inserter: read_eid_field(stored.inserter.as_deref(), skipped),
+        matcher: read_eid_field(stored.matcher.as_deref(), skipped),
+        mm: read_optional(stored.mm.as_deref(), skipped),
+        ext: read_optional(stored.ext.as_deref(), skipped),
+    };
+    Some(KvEid::new(fields, uids))
+}
+
+/// Reads one stored UID, or `None` when it cannot be read.
+fn read_uid(raw: &RawValue, skipped: &mut ReadSkips) -> Option<KvUid> {
+    let Ok(stored) = serde_json::from_str::<StoredUid>(raw.get()) else {
+        skipped.uids += 1;
+        return None;
+    };
+    Some(KvUid {
+        id: stored.id,
+        atype: stored.atype,
+        ext: read_optional(stored.ext.as_deref(), skipped),
+        owner: stored.owner,
+        expiry: stored.expiry,
+        refresh: stored.refresh,
+    })
+}
+
+/// Reads an optional stored value, counting an invalid one and reading it as
+/// absent.
+fn read_optional<T: de::DeserializeOwned>(
+    raw: Option<&RawValue>,
+    skipped: &mut ReadSkips,
+) -> Option<T> {
+    let value = serde_json::from_str(raw?.get()).ok();
+    if value.is_none() {
+        skipped.fields += 1;
+    }
+    value
+}
+
+/// Reads a stored `inserter` or `matcher`, reading one over
+/// [`MAX_EID_FIELD_BYTES`] as absent.
+fn read_eid_field(raw: Option<&RawValue>, skipped: &mut ReadSkips) -> Option<Box<str>> {
+    let value: Box<str> = read_optional(raw, skipped)?;
+    if value.len() > MAX_EID_FIELD_BYTES {
+        skipped.fields += 1;
+        return None;
+    }
+    Some(value)
 }
 
 impl KvPartnerId {
@@ -175,6 +351,16 @@ impl KvPartnerId {
         Self {
             uid: uid.into(),
             eids: Vec::new(),
+            unreadable: false,
+            skipped: ReadSkips::default(),
+        }
+    }
+
+    /// A record whose stored form could not be read.
+    fn unreadable() -> Self {
+        Self {
+            unreadable: true,
+            ..Self::single(String::new())
         }
     }
 
@@ -184,8 +370,8 @@ impl KvPartnerId {
     #[must_use]
     pub fn from_eids(eids: Vec<KvEid>, now: UnixSeconds) -> Option<Self> {
         let mut record = Self {
-            uid: String::new(),
             eids,
+            ..Self::single(String::new())
         };
         record.prune_expired(now);
         (!record.eids.is_empty()).then_some(record)
@@ -255,9 +441,12 @@ impl KvPartnerId {
 
     /// Drops entries left without UIDs and resyncs `uid`.
     ///
-    /// Returns whether the record still holds a UID within
+    /// Returns whether the record was read and still holds a UID within
     /// [`MAX_STORED_UID_LENGTH`].
     fn retain_readable(&mut self) -> bool {
+        if self.unreadable {
+            return false;
+        }
         if self.eids.is_empty() {
             return self.uid.len() <= MAX_STORED_UID_LENGTH;
         }
@@ -290,79 +479,13 @@ impl KvPartnerId {
 /// One stored EID entry with its EID-level fields.
 ///
 /// Stored flat (`{"inserter": .., "uids": [..]}`). Serialization flattens
-/// [`EidFields`]; deserialization goes through a flat private representation
-/// because serde's `flatten` cannot deserialize the `RawValue` behind `ext`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "KvEidRepr")]
+/// [`EidFields`]; it is read only as part of a [`KvPartnerId`], through
+/// [`StoredEid`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KvEid {
     #[serde(flatten)]
     fields: EidFields,
     uids: Vec<KvUid>,
-}
-
-/// Flat stored shape of [`KvEid`], used only to deserialize it.
-#[derive(Deserialize)]
-struct KvEidRepr {
-    #[serde(default)]
-    inserter: Option<Box<str>>,
-    #[serde(default)]
-    matcher: Option<Box<str>>,
-    #[serde(default)]
-    mm: Option<MatchMethod>,
-    #[serde(default)]
-    ext: Option<RawJson>,
-    #[serde(deserialize_with = "deserialize_readable_uids")]
-    uids: Vec<KvUid>,
-}
-
-/// The `id` of a stored UID, read without validating the rest of it.
-#[derive(Deserialize)]
-struct StoredId<'a> {
-    #[serde(borrow)]
-    id: Cow<'a, str>,
-}
-
-/// Deserializes stored UIDs, skipping any whose `id` exceeds
-/// [`MAX_STORED_UID_LENGTH`].
-///
-/// A row written under a higher limit then still loads; an entry left
-/// without UIDs is removed by [`KvEntry::drop_unreadable_ids`]. Any other
-/// invalid UID still fails the row.
-fn deserialize_readable_uids<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<KvUid>, D::Error> {
-    let raw = Vec::<Box<RawValue>>::deserialize(deserializer)?;
-    let mut uids = Vec::with_capacity(raw.len());
-    for value in &raw {
-        let oversized = serde_json::from_str::<StoredId<'_>>(value.get())
-            .is_ok_and(|stored| stored.id.len() > MAX_STORED_UID_LENGTH);
-        if oversized {
-            continue;
-        }
-        uids.push(serde_json::from_str(value.get()).map_err(de::Error::custom)?);
-    }
-    Ok(uids)
-}
-
-impl From<KvEidRepr> for KvEid {
-    fn from(repr: KvEidRepr) -> Self {
-        let KvEidRepr {
-            inserter,
-            matcher,
-            mm,
-            ext,
-            uids,
-        } = repr;
-        Self {
-            fields: EidFields {
-                inserter,
-                matcher,
-                mm,
-                ext,
-            },
-            uids,
-        }
-    }
 }
 
 impl KvEid {
@@ -385,8 +508,8 @@ impl KvEid {
     }
 }
 
-/// One stored UID with its owner and expiry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One stored UID with its owner and expiry; read through [`StoredUid`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KvUid {
     id: UidValue,
     atype: AgentType,
@@ -668,15 +791,24 @@ pub(crate) fn validated_stored_domain(domain: &str) -> Option<String> {
 }
 
 impl KvEntry {
-    /// Removes partner records holding no UID this build can serve.
+    /// Removes partner records the read could not use and returns what the
+    /// read left out of the row.
     ///
-    /// Lets this build load rows written by one with a higher
-    /// [`MAX_STORED_UID_LENGTH`] instead of rejecting the whole row. Returns the
-    /// number of records removed.
-    pub fn drop_unreadable_ids(&mut self) -> usize {
+    /// Removes records that could not be read and records holding no UID this
+    /// build can serve, so a row written by a build with other limits loads
+    /// instead of failing whole. Call it once after deserializing a row.
+    pub fn drop_unreadable_ids(&mut self) -> ReadSkips {
+        let mut skipped = ReadSkips::default();
         let before = self.ids.len();
-        self.ids.retain(|_, record| record.retain_readable());
-        before - self.ids.len()
+        self.ids.retain(|_, record| {
+            let held = core::mem::take(&mut record.skipped);
+            skipped.eids += held.eids;
+            skipped.uids += held.uids;
+            skipped.fields += held.fields;
+            record.retain_readable()
+        });
+        skipped.records = before - self.ids.len();
+        skipped
     }
 
     /// Creates a new live entry from the current request context.
@@ -882,6 +1014,11 @@ impl KvEntry {
         }
 
         for (partner_id, partner_uid) in &self.ids {
+            if partner_uid.unreadable {
+                return Err(format!(
+                    "partner ID '{partner_id}' could not be read; call drop_unreadable_ids first"
+                ));
+            }
             if partner_uid.uid.len() > MAX_STORED_UID_LENGTH {
                 return Err(format!(
                     "partner ID '{partner_id}' exceeds MAX_STORED_UID_LENGTH ({})",
@@ -1887,9 +2024,10 @@ mod tests {
     #[test]
     fn validate_rejects_empty_provider_eid() {
         let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
-        let record: KvPartnerId =
-            serde_json::from_value(serde_json::json!({ "uid": "v", "eids": [{ "uids": [] }] }))
-                .expect("should parse");
+        let record = KvPartnerId {
+            eids: vec![KvEid::new(EidFields::default(), Vec::new())],
+            ..KvPartnerId::single("v")
+        };
         entry.ids.insert("ids.example.com".to_owned(), record);
         assert!(entry.validate().is_err(), "should reject EID with no UIDs");
     }
@@ -1911,9 +2049,16 @@ mod tests {
             KvPartnerId::single("x".repeat(MAX_STORED_UID_LENGTH + 1)),
         );
 
-        let dropped = entry.drop_unreadable_ids();
+        let skipped = entry.drop_unreadable_ids();
 
-        assert_eq!(dropped, 1, "should drop the oversized record");
+        assert_eq!(
+            skipped,
+            ReadSkips {
+                records: 1,
+                ..ReadSkips::default()
+            },
+            "should count the dropped oversized record"
+        );
         assert_eq!(
             entry.ids.keys().collect::<Vec<_>>(),
             vec!["ids.example.com"],
@@ -1944,9 +2089,17 @@ mod tests {
         let mut entry: KvEntry =
             serde_json::from_str(&json).expect("should parse a row with oversized UIDs");
 
-        let dropped = entry.drop_unreadable_ids();
+        let skipped = entry.drop_unreadable_ids();
 
-        assert_eq!(dropped, 1, "should drop the record left without UIDs");
+        assert_eq!(
+            skipped,
+            ReadSkips {
+                records: 1,
+                uids: 2,
+                ..ReadSkips::default()
+            },
+            "should count both skipped UIDs and the record left without UIDs"
+        );
         let partial = entry
             .ids
             .get("partial.example.com")
@@ -1987,38 +2140,268 @@ mod tests {
         assert_eq!(back, record, "should round-trip EID-level fields");
     }
 
+    /// A row holding `record` under `bad.example.com` beside a valid
+    /// provider record under `good.example.com`.
+    fn row_beside_valid_record(record: &serde_json::Value) -> String {
+        serde_json::json!({
+            "v": SCHEMA_VERSION,
+            "created": 1,
+            "consent": { "ok": true, "updated": 1 },
+            "geo": { "country": "US" },
+            "ids": {
+                "bad.example.com": record,
+                "good.example.com": { "uid": "g", "eids": [{ "mm": 3, "uids": [
+                    { "id": "g", "atype": 1, "owner": "example-provider" }
+                ] }] }
+            }
+        })
+        .to_string()
+    }
+
+    /// Reads `text` as a stored row, as the KV read path does.
+    fn read_row(text: &str) -> (KvEntry, ReadSkips) {
+        let mut entry: KvEntry = serde_json::from_str(text).expect("should parse the row");
+        let skipped = entry.drop_unreadable_ids();
+        entry.validate().expect("should validate the row read");
+        (entry, skipped)
+    }
+
+    fn assert_valid_record_kept(entry: &KvEntry) {
+        let good = entry
+            .ids
+            .get("good.example.com")
+            .expect("should keep the valid record");
+        assert_eq!(good.uid, "g", "should keep the valid record's UID");
+        assert_eq!(
+            good.eids()[0].fields().mm,
+            Some(MatchMethod::Authenticated),
+            "should keep the valid record's fields"
+        );
+    }
+
     #[test]
-    fn provider_record_rejects_invalid_stored_ext() {
+    fn invalid_stored_field_is_read_as_absent() {
+        let long = "a".repeat(crate::ec::eid_types::MAX_EID_FIELD_BYTES + 1);
         let big = "x".repeat(crate::ec::eid_types::MAX_EXT_BYTES);
+        let uid = serde_json::json!({ "id": "v", "atype": 1 });
         let cases = [
-            serde_json::json!({ "uid": "v", "eids": [{ "ext": [1], "uids": [{ "id": "v", "atype": 1 }] }] }),
-            serde_json::json!({ "uid": "v", "eids": [{ "ext": { "k": big }, "uids": [{ "id": "v", "atype": 1 }] }] }),
-            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1, "ext": { "k": big } }] }] }),
-            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1, "ext": "text" }] }] }),
+            ("unknown mm", serde_json::json!({ "mm": 6, "uids": [uid] })),
+            (
+                "non-integer mm",
+                serde_json::json!({ "mm": "3", "uids": [uid] }),
+            ),
+            (
+                "oversized EID ext",
+                serde_json::json!({ "ext": { "k": big }, "uids": [uid] }),
+            ),
+            (
+                "non-object EID ext",
+                serde_json::json!({ "ext": [1], "uids": [uid] }),
+            ),
+            (
+                "oversized inserter",
+                serde_json::json!({ "inserter": long, "uids": [uid] }),
+            ),
+            (
+                "oversized matcher",
+                serde_json::json!({ "matcher": long, "uids": [uid] }),
+            ),
+            (
+                "non-string inserter",
+                serde_json::json!({ "inserter": 7, "uids": [uid] }),
+            ),
+            (
+                "oversized UID ext",
+                serde_json::json!({ "uids": [{ "id": "v", "atype": 1, "ext": { "k": big } }] }),
+            ),
+            (
+                "non-object UID ext",
+                serde_json::json!({ "uids": [{ "id": "v", "atype": 1, "ext": "text" }] }),
+            ),
         ];
 
-        for case in cases {
-            let text = serde_json::to_string(&case).expect("should encode case");
-            assert!(
-                serde_json::from_str::<KvPartnerId>(&text).is_err(),
-                "should reject invalid stored ext: {text}"
+        for (name, eid) in cases {
+            let (entry, skipped) = read_row(&row_beside_valid_record(
+                &serde_json::json!({ "uid": "v", "eids": [eid] }),
+            ));
+
+            assert_eq!(
+                skipped,
+                ReadSkips {
+                    fields: 1,
+                    ..ReadSkips::default()
+                },
+                "should count one skipped field for {name}"
             );
+            let bad = entry
+                .ids
+                .get("bad.example.com")
+                .unwrap_or_else(|| panic!("should keep the record with {name}"));
+            assert_eq!(bad.uid, "v", "should keep the UID beside {name}");
+            let eid = &bad.eids()[0];
+            assert_eq!(
+                eid.fields(),
+                &EidFields::default(),
+                "should read {name} as absent"
+            );
+            assert_eq!(eid.uids()[0].ext(), None, "should read {name} as absent");
+            assert_valid_record_kept(&entry);
         }
     }
 
     #[test]
+    fn invalid_stored_uid_is_skipped_alone() {
+        let kept = serde_json::json!({ "id": "kept", "atype": 1 });
+        let cases = [
+            ("empty id", serde_json::json!({ "id": " ", "atype": 1 })),
+            ("non-string id", serde_json::json!({ "id": 5, "atype": 1 })),
+            ("missing atype", serde_json::json!({ "id": "x" })),
+            (
+                "negative atype",
+                serde_json::json!({ "id": "x", "atype": -1 }),
+            ),
+            (
+                "non-string owner",
+                serde_json::json!({ "id": "x", "atype": 1, "owner": 2 }),
+            ),
+            (
+                "non-numeric exp",
+                serde_json::json!({ "id": "x", "atype": 1, "exp": "soon" }),
+            ),
+            (
+                "malformed refresh",
+                serde_json::json!({ "id": "x", "atype": 1, "refresh": { "state": "s" } }),
+            ),
+        ];
+
+        for (name, uid) in cases {
+            let (entry, skipped) = read_row(&row_beside_valid_record(&serde_json::json!({
+                "uid": "x",
+                "eids": [{ "uids": [uid, kept] }]
+            })));
+
+            assert_eq!(
+                skipped,
+                ReadSkips {
+                    uids: 1,
+                    ..ReadSkips::default()
+                },
+                "should count one skipped UID for {name}"
+            );
+            let bad = entry
+                .ids
+                .get("bad.example.com")
+                .unwrap_or_else(|| panic!("should keep the record beside {name}"));
+            assert_eq!(bad.uid, "kept", "should resync uid past {name}");
+            assert_eq!(bad.eids()[0].uids().len(), 1, "should skip only {name}");
+            assert_valid_record_kept(&entry);
+        }
+    }
+
+    #[test]
+    fn unreadable_stored_record_is_skipped_alone() {
+        let cases = [
+            ("non-string uid", serde_json::json!({ "uid": 5 }), 0),
+            ("missing uid", serde_json::json!({ "eids": [] }), 0),
+            ("non-object record", serde_json::json!("text"), 0),
+            (
+                "non-array eids",
+                serde_json::json!({ "uid": "x", "eids": {} }),
+                0,
+            ),
+            (
+                "EID without uids",
+                serde_json::json!({ "uid": "x", "eids": [{ "mm": 3 }] }),
+                1,
+            ),
+            (
+                "non-object EID",
+                serde_json::json!({ "uid": "x", "eids": [5] }),
+                1,
+            ),
+        ];
+
+        for (name, record, eids) in cases {
+            let (entry, skipped) = read_row(&row_beside_valid_record(&record));
+
+            assert_eq!(
+                skipped,
+                ReadSkips {
+                    records: 1,
+                    eids,
+                    ..ReadSkips::default()
+                },
+                "should count the record skipped for {name}"
+            );
+            assert!(
+                !entry.ids.contains_key("bad.example.com"),
+                "should drop the record with {name}"
+            );
+            assert_valid_record_kept(&entry);
+        }
+    }
+
+    #[test]
+    fn unreadable_record_fails_validation_until_dropped() {
+        let text = row_beside_valid_record(&serde_json::json!({ "uid": 5 }));
+        let entry: KvEntry = serde_json::from_str(&text).expect("should parse the row");
+
+        assert!(
+            entry.validate().is_err(),
+            "should not write back a placeholder for an unreadable record"
+        );
+    }
+
+    #[test]
+    fn row_read_leniently_is_written_without_skipped_values() {
+        let text = row_beside_valid_record(&serde_json::json!({
+            "uid": "v",
+            "eids": [{ "mm": 6, "uids": [
+                { "id": "v", "atype": 1 },
+                { "id": "x", "atype": -1 }
+            ] }]
+        }));
+        let (mut entry, _) = read_row(&text);
+
+        let written = serde_json::to_value(&entry).expect("should serialize the row");
+
+        assert_eq!(
+            written["ids"]["bad.example.com"],
+            serde_json::json!({ "uid": "v", "eids": [{ "uids": [{ "id": "v", "atype": 1 }] }] }),
+            "should write the record without the skipped field and UID"
+        );
+        assert!(
+            entry.drop_unreadable_ids().is_empty(),
+            "should report nothing on a second pass"
+        );
+    }
+
+    #[test]
     fn validate_rejects_oversized_inserter_and_matcher() {
-        let long = "a".repeat(crate::ec::eid_types::MAX_EID_FIELD_BYTES + 1);
-        for field in ["inserter", "matcher"] {
-            let mut eid = serde_json::json!({ "uids": [{ "id": "v", "atype": 1 }] });
-            eid[field] = serde_json::Value::String(long.clone());
-            let record: KvPartnerId =
-                serde_json::from_value(serde_json::json!({ "uid": "v", "eids": [eid] }))
-                    .expect("should parse record");
+        let long: Box<str> = "a"
+            .repeat(crate::ec::eid_types::MAX_EID_FIELD_BYTES + 1)
+            .into();
+        let cases = [
+            EidFields {
+                inserter: Some(long.clone()),
+                ..EidFields::default()
+            },
+            EidFields {
+                matcher: Some(long),
+                ..EidFields::default()
+            },
+        ];
+        for fields in cases {
+            let eid = KvEid::new(fields, vec![provider_uid("v", Expiry::Never)]);
+            let record =
+                KvPartnerId::from_eids(vec![eid], UnixSeconds::new(1)).expect("should build");
             let mut entry = KvEntry::minimal("ids.example.com", "v", 1);
             entry.ids.insert("ids.example.com".to_owned(), record);
 
-            assert!(entry.validate().is_err(), "should reject oversized {field}");
+            assert!(
+                entry.validate().is_err(),
+                "should refuse to write an oversized inserter or matcher"
+            );
         }
     }
 
