@@ -10,7 +10,7 @@ use error_stack::Report;
 use serde::Deserialize;
 
 /// Path to the separately delivered TS native Geo boot profile.
-pub const PROFILE_FILE_ENV: &str = "TS_NATIVE_GEO_PROFILE_FILE";
+pub const PROFILE_FILE_ENV: &str = "TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE";
 
 pub(crate) const GEO_STORE_ID: &str = "geo_index";
 
