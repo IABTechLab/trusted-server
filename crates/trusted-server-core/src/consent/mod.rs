@@ -1108,12 +1108,14 @@ mod tests {
         core[19] = 0x80;
         let grant = URL_SAFE_NO_PAD.encode(core);
         let geo = GeoInfo {
-            city: String::new(),
+            city: None,
             country: "GB".to_owned(),
-            continent: "EU".to_owned(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            continent: Some("EU".to_owned()),
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: None,
         };

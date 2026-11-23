@@ -18,6 +18,7 @@ use edgezero_core::app::App;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
@@ -28,9 +29,6 @@ use trusted_server_core::test_support::scripted_client::{
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
-
-/// Environment variable from which the Axum binary reads its app config.
-const AXUM_CONFIG_ENV: &str = "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG";
 
 /// How long the startup test waits for the binary to listen.
 const STARTUP_LISTEN_DEADLINE: Duration = Duration::from_secs(10);
@@ -83,9 +81,8 @@ fn assert_route_registered(method: &str, path: &str) {
 
 /// A `TrustedServerApp` served over loopback TCP, with an HTTP client for it.
 ///
-/// The app has no `EdgeZero` stores attached. The Axum adapter reads its
-/// config and secrets from environment-backed platform stores, and these tests
-/// inject settings directly, so no route needs one.
+/// These tests inject settings directly and attach empty immutable store
+/// snapshots. Production startup supplies the prepared config and secret values.
 struct TestServer {
     server: AxumTestServer,
     client: reqwest::Client,
@@ -248,12 +245,25 @@ fn read_pipe(pipe: Option<impl std::io::Read>) -> String {
 
 #[test]
 fn axum_main_serves_the_failure_router_when_settings_fail() {
-    // A clean environment keeps developer store-name overrides out of the
-    // test. The config value is not a Trusted Server app-config envelope.
+    // The prepared local config holds a value that is not a Trusted Server
+    // app-config envelope, so the native initializer fails after preparation.
+    let workspace = tempfile::tempdir().expect("should create isolated native config");
+    let contents = serde_json::to_vec(&serde_json::json!({
+        CONFIG_BLOB_KEY: "not-a-trusted-server-config-envelope"
+    }))
+    .expect("should serialize the local config map");
+    std::fs::write(
+        workspace
+            .path()
+            .join(format!("local-config-{DEFAULT_CONFIG_STORE_ID}.json")),
+        contents,
+    )
+    .expect("should publish the invalid app-config value");
     let port = free_loopback_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
         .env_clear()
-        .env(AXUM_CONFIG_ENV, "not-a-trusted-server-config-envelope")
+        .env("EDGEZERO__ADAPTER__CONFIG_DIR", workspace.path())
+        .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
         .env("EDGEZERO__ADAPTER__PORT", port.to_string())
         .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
@@ -309,6 +319,14 @@ fn axum_main_serves_the_failure_router_when_settings_fail() {
     assert!(
         output.contains("failed to parse Trusted Server app-config blob envelope"),
         "should log the settings failure report; output:\n{output}"
+    );
+    assert!(
+        output.contains("Trusted Server initialization failed:"),
+        "should log the initialization failure; output:\n{output}"
+    );
+    assert!(
+        !output.contains("trusted-server-adapter-axum failed:"),
+        "should not report a startup failure exit; output:\n{output}"
     );
 }
 

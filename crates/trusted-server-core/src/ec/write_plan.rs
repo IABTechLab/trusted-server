@@ -17,6 +17,7 @@ use super::kv::PartnerIdUpdate;
 use super::kv_types::{KvEntry, KvPartnerId, MAX_ENTRY_BYTES};
 use super::page_load::{Generation, RowChange};
 use super::registry::PartnerRegistry;
+use super::sharedid::refile_legacy_sharedid;
 
 /// Inputs to [`plan_write`].
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +28,7 @@ pub struct WritePlanInput<'a> {
     pub snapshot: &'a EcKvSnapshot,
     /// The new row when this navigation creates one (new EC or recovery).
     pub new_entry: Option<&'a KvEntry>,
-    /// Browser updates from `ts-eids` and `sharedId`, already reduced by the
+    /// Browser updates from `ts-eids` and the `SharedID` cookie, already reduced by the
     /// ingest rules and consent-gated.
     pub browser_ingest: &'a [PartnerIdUpdate],
     /// Validated provider results.
@@ -70,6 +71,8 @@ pub fn plan_write(input: &WritePlanInput<'_>) -> Option<RowChange> {
     }
     entry.prune_opt_outs(input.now);
     entry.ids.retain(|_, record| !record.uid.is_empty());
+    // Re-filing a legacy `SharedID` rides along with a real change too.
+    refile_legacy_sharedid(&mut entry, input.registry);
     let pruned = entry.clone();
 
     let lookups_apply = input.lookups.is_for(input.ec_id);
@@ -203,13 +206,14 @@ fn apply_lookups(
     written
 }
 
-fn serialized_len(entry: &KvEntry) -> usize {
+/// Serialized bytes of `entry`, or `usize::MAX` when it cannot serialize.
+pub(crate) fn serialized_len(entry: &KvEntry) -> usize {
     serde_json::to_vec(entry).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// Serialized bytes one `ids` member adds to the row: its record, its
 /// escaped key, the colon and a separating comma.
-fn member_len(source: &str, record: &KvPartnerId) -> usize {
+pub(crate) fn member_len(source: &str, record: &KvPartnerId) -> usize {
     let key = serde_json::to_vec(source).map_or(usize::MAX, |bytes| bytes.len());
     let value = serde_json::to_vec(record).map_or(usize::MAX, |bytes| bytes.len());
     key.saturating_add(value).saturating_add(2)
@@ -530,6 +534,84 @@ mod tests {
         assert!(
             plan_write(&input(&snapshot, None, &ingest, &lookups, &registry)).is_none(),
             "should not overwrite an existing browser uid"
+        );
+    }
+
+    fn sharedid_registry() -> PartnerRegistry {
+        PartnerRegistry::from_config(&[
+            partner("browser.example.com"),
+            partner("pubcid.org"),
+            partner("sharedid.org"),
+        ])
+        .expect("should build registry")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_sharedid_is_refiled_under_pubcid_on_the_next_write() {
+        let registry = sharedid_registry();
+        let mut entry = live_entry();
+        entry
+            .ids
+            .insert("sharedid.org".to_owned(), KvPartnerId::single("shared-1"));
+        let snapshot = present(&entry).await;
+        let ingest = [PartnerIdUpdate::new("browser.example.com", "b-1")];
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
+            .expect("should plan an update for the new browser uid");
+
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update the returning row")
+        };
+        assert!(
+            !entry.ids.contains_key("sharedid.org"),
+            "should drop the legacy SharedID source"
+        );
+        assert_eq!(
+            entry.ids["pubcid.org"].uid, "shared-1",
+            "should re-file the SharedID under pubcid.org"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refiling_alone_plans_no_write() {
+        let registry = sharedid_registry();
+        let mut entry = live_entry();
+        entry
+            .ids
+            .insert("sharedid.org".to_owned(), KvPartnerId::single("shared-1"));
+        let snapshot = present(&entry).await;
+        let lookups = LookupResults::default();
+
+        assert!(
+            plan_write(&input(&snapshot, None, &[], &lookups, &registry)).is_none(),
+            "should wait for a real change before re-filing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refiled_sharedid_keeps_the_stored_value_over_the_cookie() {
+        let registry = sharedid_registry();
+        let mut entry = live_entry();
+        entry
+            .ids
+            .insert("sharedid.org".to_owned(), KvPartnerId::single("stored"));
+        let snapshot = present(&entry).await;
+        let ingest = [
+            PartnerIdUpdate::new("pubcid.org", "cookie"),
+            PartnerIdUpdate::new("browser.example.com", "b-1"),
+        ];
+        let lookups = LookupResults::default();
+
+        let change = plan_write(&input(&snapshot, None, &ingest, &lookups, &registry))
+            .expect("should plan an update");
+
+        let RowChange::Update { entry, .. } = change else {
+            panic!("should update the returning row")
+        };
+        assert_eq!(
+            entry.ids["pubcid.org"].uid, "stored",
+            "should keep the stored SharedID over a different cookie value"
         );
     }
 

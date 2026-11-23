@@ -34,8 +34,8 @@ use trusted_server_core::ec::provider::{
     IdentityProvider, ProviderConfigError, ProviderKind as _, build_kind,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sharedid::SharedIdStorage;
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::prebid::{PrebidIntegrationConfig, PrebidUserIdStorageType};
 use trusted_server_core::settings::{
     CollectTiming, Ec, IdentityProviderConfig, ProviderSecrets, Settings,
 };
@@ -249,33 +249,16 @@ pub fn validate_providers(settings: &Settings) -> Result<(), Report<ProviderConf
     Ok(())
 }
 
-/// Prebid `userSync.userIds` names of the `SharedID` module.
-const PREBID_SHAREDID_NAMES: [&str; 2] = ["sharedId", "pubCommonId"];
-
 /// The cookie Prebid's `SharedID` module stores its ID in, as configured in
 /// `integrations.prebid.managed_user_ids[].storage.name`.
 ///
 /// `None` when Prebid is not configured, manages no `SharedID` module, or
-/// keeps it in local storage.
+/// keeps it in local storage only.
 fn prebid_sharedid_cookie(settings: &Settings) -> Option<String> {
-    let prebid = match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
-        Ok(prebid) => prebid?,
-        Err(report) => {
-            log::warn!("Identity providers: Prebid config unreadable: {report}");
-            return None;
-        }
-    };
-    prebid
-        .managed_user_ids
-        .into_iter()
-        .filter(|entry| {
-            PREBID_SHAREDID_NAMES
-                .iter()
-                .any(|name| entry.name.eq_ignore_ascii_case(name))
-        })
-        .find_map(|entry| entry.storage)
-        .filter(|storage| storage.storage_type == PrebidUserIdStorageType::Cookie)
-        .map(|storage| storage.name)
+    match settings.sharedid_storage() {
+        SharedIdStorage::Cookie(name) => Some(name),
+        SharedIdStorage::LocalStorageOnly | SharedIdStorage::Unconfigured => None,
+    }
 }
 
 /// Fills a `sharedid` provider's `cookie_names` with the cookie Prebid's
