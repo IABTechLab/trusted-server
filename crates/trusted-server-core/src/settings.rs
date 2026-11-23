@@ -795,6 +795,71 @@ pub struct ProviderSecrets {
     pub token: Option<Redacted<String>>,
 }
 
+/// Checked EC cookie refresh interval, from 1 through 364 days.
+///
+/// Serialized as an integer in the typed application configuration.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RefreshAfterDays(u16);
+
+impl TryFrom<u64> for RefreshAfterDays {
+    type Error = &'static str;
+
+    fn try_from(days: u64) -> Result<Self, Self::Error> {
+        if (1..=364).contains(&days) {
+            Ok(Self(days as u16))
+        } else {
+            Err("ec.refresh_after_days must be an integer between 1 and 364 days")
+        }
+    }
+}
+
+impl RefreshAfterDays {
+    pub(crate) fn seconds(self) -> u64 {
+        u64::from(self.0)
+            .checked_mul(86_400)
+            .expect("should fit checked refresh days in seconds")
+    }
+}
+
+impl<'de> Deserialize<'de> for RefreshAfterDays {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RefreshAfterDaysVisitor)
+    }
+}
+
+struct RefreshAfterDaysVisitor;
+
+impl serde::de::Visitor<'_> for RefreshAfterDaysVisitor {
+    type Value = RefreshAfterDays;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ec.refresh_after_days as an integer between 1 and 364 days")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        RefreshAfterDays::try_from(value).map_err(E::custom)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        u64::try_from(value)
+            .ok()
+            .and_then(|days| RefreshAfterDays::try_from(days).ok())
+            .ok_or_else(|| {
+                E::custom("ec.refresh_after_days must be an integer between 1 and 364 days")
+            })
+    }
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -813,6 +878,12 @@ pub struct Ec {
     /// Explicit persistence provider or the Fastly store-only shorthand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<crate::ec::storage::EcStorage>,
+
+    /// Refresh the same EC cookie after this many days on eligible documents.
+    ///
+    /// Omission disables threshold refresh and its issuance companion cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_after_days: Option<RefreshAfterDays>,
 
     /// Maximum number of pull-sync lookups dispatched per navigation; 0
     /// means no limit.
@@ -888,6 +959,7 @@ impl Default for Ec {
             passphrase: Redacted::default(),
             ec_store: None,
             storage: None,
+            refresh_after_days: None,
             pull_sync_concurrency: 0,
             cluster_trust_threshold: 0,
             cluster_recheck_secs: 0,
@@ -3736,6 +3808,16 @@ impl Settings {
         }
 
         let sharedid_storage = self.sharedid_storage();
+        if self.ec.refresh_after_days.is_some()
+            && sharedid_storage.cookie_name().is_some_and(|name| {
+                name == crate::constants::COOKIE_TS_EC_ISSUED_AT
+                    || format!("{name}_cst") == crate::constants::COOKIE_TS_EC_ISSUED_AT
+            })
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "ec.refresh_after_days requires the SharedID cookie and its _cst companion to differ from ts-ec-issued-at".to_owned(),
+            }));
+        }
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3749,6 +3831,14 @@ impl Settings {
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
             co.validate_runtime()
+                .and_then(|()| {
+                    if self.ec.refresh_after_days.is_some() {
+                        crate::cookies::template_cache_policy::validate_refresh_key_cookie(
+                            co.template_cache_key_cookies(),
+                        )?;
+                    }
+                    Ok(())
+                })
                 .and_then(|()| {
                     crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
                         co.template_cache_key_cookies(),

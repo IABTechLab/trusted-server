@@ -10,15 +10,17 @@
 use std::collections::BTreeSet;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::Response;
+use http::{HeaderValue, Response, header};
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
-use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
+use crate::constants::{COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{COOKIE_MAX_AGE, append_cookie, expire_ec_cookie, set_ec_cookie};
+use super::cookies::{
+    COOKIE_MAX_AGE, append_cookie, create_ec_cookie, expire_ec_cookie, set_ec_cookie,
+};
 use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
@@ -227,6 +229,12 @@ async fn finalize_response_inner(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
+        if settings.ec.refresh_after_days.is_some()
+            && consent_withdrawn
+            && ec_context.refresh_marker_present
+        {
+            expire_refresh_marker(settings, response);
+        }
         expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
         finalize_unusable_consent(
             settings,
@@ -285,6 +293,9 @@ async fn finalize_response_inner(
         if navigation {
             apply_sharedid_write_back(settings, ec_context, graph, registry, sharedid, response)
                 .await;
+        }
+        if page_write_ok {
+            refresh_returning_cookie(settings, ec_context, graph, response).await;
         }
     } else if ec_context.ec_generated() {
         // Do not emit a generated EC when there is no KV graph: that would
@@ -628,6 +639,90 @@ pub fn set_ec_cookie_on_response(
 ) {
     if let Some(ec_id) = ec_context.ec_value() {
         set_ec_cookie(settings, response, ec_id);
+        if settings.ec.refresh_after_days.is_some()
+            && let Some(now) = super::checked_current_timestamp()
+            && let Some(marker) = refresh_marker_header(settings, ec_id, now)
+        {
+            response.headers_mut().append(header::SET_COOKIE, marker);
+        }
+    }
+}
+
+fn refresh_marker_header(settings: &Settings, ec_id: &str, now: u64) -> Option<HeaderValue> {
+    let marker = super::refresh::encode_marker(
+        settings.ec.passphrase.expose(),
+        &settings.publisher.domain,
+        ec_id,
+        now,
+    )?;
+    HeaderValue::from_str(&format!(
+        "{COOKIE_TS_EC_ISSUED_AT}={marker}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}; HttpOnly",
+        settings.publisher.ec_cookie_domain(),
+    )).ok()
+}
+
+pub(crate) fn expire_refresh_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
+    append_cookie(
+        response,
+        &format!(
+            "{COOKIE_TS_EC_ISSUED_AT}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
+            settings.publisher.ec_cookie_domain(),
+        ),
+    );
+}
+
+async fn refresh_returning_cookie(
+    settings: &Settings,
+    context: &EcContext,
+    graph: &KvIdentityGraph,
+    response: &mut Response<EdgeBody>,
+) {
+    let Some(days) = settings.ec.refresh_after_days else {
+        return;
+    };
+    if !context.refresh_document || context.ec_generated() {
+        return;
+    }
+    let Some(ec_id) = context
+        .existing_cookie_ec_id()
+        .filter(|id| Some(*id) == context.ec_value() && is_valid_ec_id(id))
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(now) = super::checked_current_timestamp() else {
+        return;
+    };
+    if !super::refresh::should_refresh(
+        settings.ec.passphrase.expose(),
+        &settings.publisher.domain,
+        &ec_id,
+        context.refresh_marker.as_deref(),
+        now,
+        days.seconds(),
+    ) {
+        return;
+    }
+    // A refresh-only read must not change what mirror or after-response processing sees.
+    let loaded = if matches!(context.kv_snapshot(), EcKvSnapshot::NotRead) {
+        Some(graph.load_snapshot(&ec_id).await)
+    } else {
+        None
+    };
+    let snapshot = loaded.as_ref().unwrap_or(context.kv_snapshot());
+    if !snapshot
+        .entry_for(&ec_id)
+        .is_some_and(|entry| entry.consent.ok)
+    {
+        return;
+    }
+    // Construct both headers first: renewal without a new marker would repeat on every visit.
+    if let (Ok(cookie), Some(marker)) = (
+        HeaderValue::from_str(&create_ec_cookie(settings, &ec_id)),
+        refresh_marker_header(settings, &ec_id, now),
+    ) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+        response.headers_mut().append(header::SET_COOKIE, marker);
     }
 }
 

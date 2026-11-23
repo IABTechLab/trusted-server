@@ -879,18 +879,46 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                               | Type           | Required | Description                                                                           |
-| ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------------------- |
-| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                 |
-| `ec_store`                          | String or null | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
-| `storage`                           | Table          | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
-| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                                   |
-| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
-| `partners`                          | Array          | No       | Static partner registry entries                                                       |
-| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
-| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
-| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
+| Field                               | Type            | Required | Description                                                                           |
+| ----------------------------------- | --------------- | -------- | ------------------------------------------------------------------------------------- |
+| `passphrase`                        | String          | Yes      | Publisher passphrase used as HMAC key                                                 |
+| `ec_store`                          | String or null  | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
+| `storage`                           | Table           | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
+| `refresh_after_days`                | Integer or null | No       | DEC-13 proposal: omitted by default; 1–364 days; browser-cookie renewal only          |
+| `pull_sync_concurrency`             | Integer         | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
+| `cluster_trust_threshold`           | Integer         | No       | Cluster size threshold for identity trust decisions                                   |
+| `cluster_recheck_secs`              | Integer         | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
+| `partners`                          | Array           | No       | Static partner registry entries                                                       |
+| `identity_budget_ms`                | Integer         | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
+| `identity_after_response_budget_ms` | Integer         | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
+| `identity_providers`                | Array           | No       | Server-side identity providers (see below)                                            |
+
+### Threshold refresh proposal (DEC-13)
+
+**Proposal for DEC-13; off by default; do not merge until DEC-13 is decided.**
+The optional `ec.refresh_after_days` integer accepts 1 through 364 days.
+Publish it through the existing typed app-config and `ts config push` flow;
+no new serving-process environment setting is read. Axum must load its updated
+prepared snapshot on restart. Removing the field disables the feature and
+omits it from published configuration for older-binary compatibility.
+
+On an eligible consented publisher document with a matching live record,
+a due `ts-ec-issued-at` marker renews the same `ts-ec` value for one year and
+sets a fresh signed HttpOnly marker. A missing or invalid marker bootstraps
+by renewing both together. Assets, API requests, no-consent responses and
+withdrawal never renew returning cookies. Explicit withdrawal deletes a
+carried marker. When disabled, the marker is neither read nor cleaned up,
+and no refresh record read or new cache-key restriction is introduced.
+
+Renewal and bootstrap responses are private under the existing Set-Cookie
+cache policy. Other visits can still be private for independent reasons.
+**Renewal extends browser lifetime only: it does not extend backing-record
+retention.** Record expiry can still lead to legitimate orphan rotation.
+The extra signed cookie adds request bytes; lost, rejected or replayed cookies
+can cause additional renewals. This does not guarantee Safari/ITP persistence.
+See the [proposal design](../superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
+for protocol, rollout and qualification limits. If DEC-13 chooses never
+refresh, this proposal will be closed.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

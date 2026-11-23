@@ -62,6 +62,7 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod record_backend;
+mod refresh;
 pub mod registry;
 pub mod sharedid;
 pub mod storage;
@@ -90,7 +91,9 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
+use crate::constants::{
+    COOKIE_TS_EC, COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR,
+};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -219,6 +222,28 @@ fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<Strin
         .map(|cookie| cookie.value().to_owned())
 }
 
+/// Captures the marker without accepting duplicate names or allocating oversized values.
+fn capture_refresh_marker(req: &Request<EdgeBody>) -> (bool, Option<String>) {
+    let mut values = req
+        .headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(name, _)| name.trim() == COOKIE_TS_EC_ISSUED_AT)
+        .map(|(_, value)| value.trim());
+    let Some(first) = values.next() else {
+        return (false, None);
+    };
+    let marker = if first.len() <= refresh::MAX_MARKER_BYTES && values.next().is_none() {
+        Some(first.to_owned())
+    } else {
+        None
+    };
+    (true, marker)
+}
+
 /// Parses EC identity from request cookies in a single pass.
 ///
 /// # Errors
@@ -336,6 +361,14 @@ pub struct EcContext {
     pull_marker_present: bool,
     /// The mirror cookie's value, when the request carried it.
     mirror_cookie: Option<String>,
+    /// Unambiguous bounded issuance marker, read only when refresh is enabled.
+    refresh_marker: Option<String>,
+    /// Whether any issuance marker was carried, including malformed values.
+    refresh_marker_present: bool,
+    /// Publisher-only authorization, confirmed against the final document response.
+    refresh_document: bool,
+    /// Whether a carried identity header agrees with the cookie (enabled-only gate).
+    refresh_header_matches: bool,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
     /// Navigation permit issued by the router for page-load navigations.
@@ -388,7 +421,18 @@ impl EcContext {
         geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
+        let (refresh_marker_present, refresh_marker) = if settings.ec.refresh_after_days.is_some() {
+            capture_refresh_marker(req)
+        } else {
+            (false, None)
+        };
 
+        let refresh_header_matches = settings.ec.refresh_after_days.is_some()
+            && req
+                .headers()
+                .get_all(crate::constants::HEADER_X_TS_EC)
+                .iter()
+                .all(|header| header.to_str().ok() == parsed.cookie_ec.as_deref());
         let ec_value = parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v));
         let ec_was_present = ec_value.is_some();
 
@@ -432,6 +476,10 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: parsed.pull_marker_present,
             mirror_cookie: parsed.mirror_cookie,
+            refresh_marker,
+            refresh_marker_present,
+            refresh_document: false,
+            refresh_header_matches,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -787,6 +835,10 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
+            refresh_marker: None,
+            refresh_marker_present: false,
+            refresh_document: false,
+            refresh_header_matches: true,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -818,6 +870,10 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
+            refresh_marker: None,
+            refresh_marker_present: false,
+            refresh_document: false,
+            refresh_header_matches: true,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
@@ -852,6 +908,10 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
+            refresh_marker: None,
+            refresh_marker_present: false,
+            refresh_document: false,
+            refresh_header_matches: true,
             eid_sync_source: None,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),

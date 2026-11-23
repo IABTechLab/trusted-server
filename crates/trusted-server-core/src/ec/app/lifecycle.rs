@@ -7,7 +7,8 @@ use error_stack::Report;
 
 use super::IdentityApp;
 use crate::constants::{
-    COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
+    COOKIE_TS_EC, COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS,
+    COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use crate::ec::consent::ec_consent_withdrawn;
@@ -113,6 +114,9 @@ impl IdentityApp {
         {
             return;
         }
+        if self.settings.ec.refresh_after_days.is_some() {
+            context.refresh_document = context.refresh_header_matches;
+        }
         context.set_eid_sync_source(EidSyncSource::Navigation);
         if let Some(permit) = NavigationPermit::classify(request) {
             context.set_navigation_permit(permit);
@@ -163,6 +167,12 @@ impl IdentityApp {
                         })
                     }));
         let eligible = document || ec_route;
+        if self.settings.ec.refresh_after_days.is_some() {
+            context.refresh_document &= document && !ec_route;
+        }
+        let withdraw_marker = self.settings.ec.refresh_after_days.is_some()
+            && ec_consent_withdrawn(context.consent())
+            && context.refresh_marker_present;
         if !eligible {
             let _ = context.take_navigation_permit();
         }
@@ -200,6 +210,9 @@ impl IdentityApp {
             if withdrawal {
                 expire_ec_cookie(&self.settings, response);
             }
+            if withdraw_marker {
+                crate::ec::finalize::expire_refresh_marker(&self.settings, response);
+            }
         }
     }
 
@@ -211,6 +224,7 @@ impl IdentityApp {
             COOKIE_TS_EC_PULL_COMPLETE,
         ]
         .contains(&name)
+            || (self.settings.ec.refresh_after_days.is_some() && name == COOKIE_TS_EC_ISSUED_AT)
             || self
                 .sharedid_storage
                 .cookie_name()

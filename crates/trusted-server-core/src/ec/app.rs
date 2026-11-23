@@ -15,6 +15,8 @@ mod lookups;
 
 pub use lookups::{AfterResponseLookups, IdentityLookups, joined_cookie_header};
 mod lifecycle;
+#[cfg(test)]
+mod refresh_tests;
 mod route;
 #[cfg(test)]
 mod route_tests;

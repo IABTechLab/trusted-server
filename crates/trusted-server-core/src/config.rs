@@ -1290,6 +1290,159 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn refresh_after_days_accepts_only_bounded_integers_on_push() {
+        for days in [1, 364] {
+            let source = crate_test_settings_str()
+                .replace("[ec]", &format!("[ec]\nrefresh_after_days = {days}"));
+            let mut config: TrustedServerAppConfig = toml::from_str(&source)
+                .expect("should accept bounded refresh days in TOML app config");
+            config.settings.proxy.allowed_domains = valid_settings().proxy.allowed_domains;
+            TrustedServerAppConfig::new(config.settings().clone())
+                .expect("should accept bounded refresh days for push");
+            assert_eq!(
+                config
+                    .settings()
+                    .ec
+                    .refresh_after_days
+                    .expect("should retain refresh days")
+                    .seconds(),
+                days * 86_400,
+                "should convert bounded days to seconds"
+            );
+            let json = serde_json::to_value(&config).expect("should serialize config");
+            assert_eq!(
+                json["ec"]["refresh_after_days"], days,
+                "should serialize integer days"
+            );
+            serde_json::from_value::<TrustedServerAppConfig>(json)
+                .expect("should accept bounded refresh days in JSON app config");
+        }
+        for input in ["0", "-1", "365", "65536", "1.5", "true", "\"1\""] {
+            let source = crate_test_settings_str()
+                .replace("[ec]", &format!("[ec]\nrefresh_after_days = {input}"));
+            let error = toml::from_str::<TrustedServerAppConfig>(&source)
+                .expect_err("should reject invalid refresh days in TOML app config");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains("refresh_after_days")
+                    && diagnostic.contains("1")
+                    && diagnostic.contains("364"),
+                "should name refresh setting and range: {diagnostic}"
+            );
+            let mut json =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            json["ec"]["refresh_after_days"] =
+                serde_json::from_str(input).expect("should parse JSON fixture");
+            let diagnostic = serde_json::from_value::<TrustedServerAppConfig>(json)
+                .expect_err("should reject invalid refresh days in JSON app config")
+                .to_string();
+            assert!(
+                diagnostic.contains("ec.refresh_after_days")
+                    && diagnostic.contains("1")
+                    && diagnostic.contains("364"),
+                "should name refresh setting and range: {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_after_days_rejects_json_integer_overflow() {
+        for input in [
+            "18446744073709551615",
+            "18446744073709551616",
+            "-9223372036854775809",
+            "[]",
+            "{}",
+        ] {
+            let mut json =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            json["ec"]["refresh_after_days"] =
+                serde_json::from_str(input).expect("should parse JSON fixture");
+            let diagnostic = serde_json::from_value::<TrustedServerAppConfig>(json)
+                .expect_err("should reject overflowing or noninteger refresh days")
+                .to_string();
+            assert!(
+                diagnostic.contains("ec.refresh_after_days")
+                    && diagnostic.contains("1")
+                    && diagnostic.contains("364"),
+                "should name refresh setting and range: {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_after_days_omission_preserves_published_bytes() {
+        assert_eq!(
+            serde_json::to_string(&Ec::default()).expect("should serialize default EC config"),
+            r#"{"passphrase":"","ec_store":null,"pull_sync_concurrency":0,"cluster_trust_threshold":0,"cluster_recheck_secs":0,"partners":[]}"#,
+            "should preserve baseline EC serialization bytes"
+        );
+        let mut settings = valid_settings();
+        settings.integrations = IntegrationSettings::default();
+        let config = TrustedServerAppConfig::new(settings.clone()).expect("should build config");
+        let before = serde_json::to_vec(&settings).expect("should serialize settings");
+        let published = serde_json::to_vec(&config).expect("should serialize push config");
+        assert_eq!(published, before, "should retain published settings bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(&published).expect("should parse published config");
+        assert!(
+            json["ec"].get("refresh_after_days").is_none(),
+            "should omit disabled refresh setting"
+        );
+        let restored: TrustedServerAppConfig =
+            serde_json::from_slice(&published).expect("should restore config");
+        assert_eq!(
+            serde_json::to_vec(&restored).expect("should serialize restored config"),
+            published,
+            "should round trip published bytes"
+        );
+        let envelope = BlobEnvelope::new(json.clone(), "2026-01-01T00:00:00Z".to_owned());
+        let mut without = json;
+        without["ec"]
+            .as_object_mut()
+            .expect("should contain EC settings")
+            .remove("refresh_after_days");
+        assert_eq!(
+            envelope.sha256,
+            BlobEnvelope::new(without, "2026-01-01T00:00:00Z".to_owned()).sha256,
+            "should retain envelope digest"
+        );
+    }
+
+    #[test]
+    fn refresh_after_days_gates_cookie_validation() {
+        for enabled in [false, true] {
+            let mut config = app_config_with_creative_opportunities(None);
+            let mut json = serde_json::to_value(&config).expect("should serialize config");
+            json["creative_opportunities"]["template_cache_key_cookies"] =
+                serde_json::json!(["ts-ec-issued-at"]);
+            if enabled {
+                json["ec"]["refresh_after_days"] = serde_json::json!(1);
+            }
+            config = serde_json::from_value(json).expect("should deserialize structural config");
+            assert_eq!(
+                TrustedServerAppConfig::new(config.settings().clone()).is_err(),
+                enabled,
+                "should reserve marker cache key only when enabled"
+            );
+
+            let mut json =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            if enabled {
+                json["ec"]["refresh_after_days"] = serde_json::json!(1);
+            }
+            json["integrations"]["prebid"]["managed_user_ids"] = serde_json::json!([{ "name": "sharedId", "storage": {"type": "cookie", "name": "ts-ec-issued-at", "expires": 365}}]);
+            let config: TrustedServerAppConfig =
+                serde_json::from_value(json).expect("should deserialize configured SharedID");
+            assert_eq!(
+                TrustedServerAppConfig::new(config.settings().clone()).is_err(),
+                enabled,
+                "should reserve marker against SharedID only when enabled"
+            );
+        }
+    }
+
+    #[test]
     fn wrapper_serializes_as_settings_shape() {
         let settings = valid_settings();
         let app_config =

@@ -13,6 +13,7 @@ use serde_json::json;
 
 use super::IdentityApp;
 use super::lifecycle::EcRouteResponse;
+use crate::ec::consent::ec_consent_withdrawn;
 use crate::ec::eid_types::UnixSeconds;
 use crate::ec::mirror::{MirrorCookie, build_mirror};
 use crate::ec::page_load::NavigationPermit;
@@ -111,12 +112,25 @@ impl IdentityApp {
                 .insert(header::ALLOW, header::HeaderValue::from_static("GET, POST"));
             return response;
         }
-        if self.identity_graph().is_none() {
+        let has_graph = self.identity_graph().is_some();
+        let refresh_get =
+            self.settings.ec.refresh_after_days.is_some() && request.method() == Method::GET;
+        if !has_graph && !refresh_get {
             return response(StatusCode::NOT_IMPLEMENTED);
         }
         if request.method() == Method::GET {
-            let mut response = response(StatusCode::NO_CONTENT);
+            let mut response = response(if has_graph {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            });
             if let Ok(mut identity) = self.read_request(services, &request) {
+                if self.settings.ec.refresh_after_days.is_some()
+                    && ec_consent_withdrawn(identity.context.consent())
+                    && identity.context.refresh_marker_present
+                {
+                    crate::ec::finalize::expire_refresh_marker(&self.settings, &mut response);
+                }
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
                 if identity.context.ec_allowed()
                     && let Some(graph) = identity.graph.as_ref()
