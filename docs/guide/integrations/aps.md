@@ -130,7 +130,8 @@ inventory, CSP, iframe/script creative behavior, impression reporting, and
 click-through behavior with the APS account team before production rollout.
 
 The common provider `endpoint` is required and must be an absolute HTTPS URL
-with a host and no credentials or fragment. The legacy `/e/dtb/bid` path is
+with a host and no credentials or fragment; plain HTTP is accepted only for
+`127.0.0.1` and `[::1]`, which local test bidders use. The legacy `/e/dtb/bid` path is
 rejected. `timeout_ms` belongs beside `endpoint`; when omitted, the `aps`
 profile default is 800 ms. Runtime caps it by the remaining auction budget.
 
@@ -185,7 +186,7 @@ Trusted Server builds the APS request independently from its Prebid Server reque
 - `ext.sdk = { "source": "prebid", "version": "2.2.0" }`;
 - secure banner impressions and configured floors;
 - page, site, device, and consent fields allowed by the existing privacy gates; and
-- eligible EIDs only when consent policy permits them.
+- eligible EIDs only when consent policy permits them, in both `user.eids` and `user.ext.eids` (the field the Prebid.js APS adapter uses).
 
 Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. The page URL is a validated publisher-owned URL with query and fragment removed; the raw browser `Referer` is not forwarded as `site.ref`. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
 
@@ -218,7 +219,7 @@ exchange in that provider's summary returned by `POST /auction`:
 }
 ```
 
-This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. A response body over the 2 MiB upstream limit fails the provider with `error_type` `transport` and carries no debug metadata. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
 
 The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
 

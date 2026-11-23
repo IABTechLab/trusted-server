@@ -279,7 +279,6 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -311,6 +310,9 @@ jobs:
 
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+
+      - name: Guard adapter identity wiring
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test adapter_identity_guard
 
       - name: Clippy (parity test crate)
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings

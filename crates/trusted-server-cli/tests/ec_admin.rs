@@ -3,15 +3,22 @@
 //!
 //! Run with `./scripts/test-cli.sh`.
 
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
 mod support_origin;
+
+use std::sync::Arc;
 
 use base64::Engine as _;
 use edgezero_core::body::Body as EdgeBody;
-use http::Request;
+use edgezero_core::router::RouterService;
+use futures::executor::block_on;
+use http::{Request, StatusCode};
 use support_origin::{FixtureRequest, FixtureResponse, FixtureServer};
 use trusted_server_cli::commands::ec::{EcCommand, EidsArgs, ShowArgs, run};
-use trusted_server_core::ec::admin::handle_admin_eids_lookup;
-use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::settings::Settings;
 
 /// Serializes the environment across this binary's tests; see `tests/cache_purge.rs`.
 static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -416,9 +423,16 @@ fn eids_escapes_cookie_controls_through_the_real_admin_handler() {
             )
             .body(EdgeBody::empty())
             .expect("should build the admin request");
-        let registry = PartnerRegistry::from_config(&[]).expect("should build an empty registry");
-        let response = handle_admin_eids_lookup(&registry, &request)
-            .expect("should decode the browser cookie");
+        let app = IdentityApp::build(Arc::new(Settings::default()), IdentityPlatform::default())
+            .expect("should build the identity app");
+        let router = app.mount(RouterService::builder()).build();
+        let response =
+            block_on(router.oneshot(request)).expect("should dispatch the admin EIDs request");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should decode the browser cookie"
+        );
         FixtureResponse::html(
             response
                 .into_body()
