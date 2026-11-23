@@ -2,10 +2,12 @@
 
 The Axum binary loads its config and secrets once, before it listens, from
 stores that EdgeZero prepares: local files for development, or AWS AppConfig
-and Secrets Manager in production. A missing or invalid input stops the process
-with a non-zero exit before the port opens. On SIGTERM the server stops
-accepting connections and finishes in-flight requests within a configured
-grace.
+and Secrets Manager in production. A store the selected provider cannot prepare
+stops the process with a non-zero exit before the port opens. A missing or
+invalid config value or secret leaves the process listening with the failure
+router: `/health` stays `200`, and `/ready` and every route answer `503`. On
+SIGTERM the server stops accepting connections and finishes in-flight requests
+within a configured grace.
 
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
@@ -24,9 +26,10 @@ EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
   cargo run -p trusted-server-adapter-axum
 ```
 
-Leave one secret variable out to see startup fail before listening; the error
-names the config field of the missing secret. [Getting started](./getting-started)
-covers the development overlay and port settings.
+Leave one secret variable out to see startup fail: the process listens with the
+failure router, `/ready` answers `503`, and the error log names the config field
+of the missing secret. [Getting started](./getting-started) covers the
+development overlay and port settings.
 
 ## Startup sequence
 
@@ -43,14 +46,22 @@ flowchart TD
     D --> E[Install immutable snapshots and application router]
     E --> F[Listen]
     B --> X[Fail before listening]
-    C --> X
-    D --> X
+    C --> Y[Install the failure router]
+    D --> Y
+    E --> Y
+    Y --> F
     F --> G[Stop admission and drain on shutdown]
 ```
 
 The declared identities are `trusted_server_config` and
 `trusted_server_secrets`. The configuration key is `trusted_server_config`.
-Required-provider and required-value failures prevent readiness. Startup bounds
+Required-provider and required-value failures prevent readiness. A provider
+preparation failure stops the process before it listens. A failure to read or
+verify the envelope, load a required secret, validate the runtime settings or
+build the application router installs the failure router instead: the process
+listens, `/health` stays `200`, and `/ready` and every supported route answer
+`503` under the
+[operational probe contract](./api-reference#operational-probe-contract). Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running
 snapshots are immutable. Restart to adopt changed configuration or secrets.
@@ -63,8 +74,9 @@ TS's runtime validation policy, not operator publication validation.
 Request-time store management writes, persistent signing-key management and
 automatic key rotation are unavailable. Unsupported configured consumers, such
 as enabled request signing, fail at startup. Axum has no Edge Cookie record
-store or visitor geo yet. An AWS region is not a visitor's geography, and
-missing geo keeps the existing consent behavior.
+store yet. Reader Geo defaults Off; the optional protected CloudFront selection
+below supplies country/subdivision facts without granting consent. An AWS
+region is not a visitor's geography.
 
 ## Inputs
 
@@ -102,6 +114,59 @@ Native features `aws-appconfig-agent` and `aws-secrets-manager` independently
 enable EdgeZero providers and default off. CLI features do not enable server
 providers. The server creates no AWS resources; provision the AppConfig
 profile and secrets before starting it.
+
+## Optional protected native Geo
+
+Compile `geo-cloudfront` explicitly and set `TS_NATIVE_GEO_PROFILE_FILE` to a
+separately delivered boot profile. Compiling the feature does not select it.
+EdgeZero does not read this TS selection from publisher AppConfig, store bindings
+or an `EDGEZERO__GEO__*` environment variable.
+
+```toml
+version = 1
+
+[geo]
+provider = "cloudfront"
+alb_peer_cidrs = ["10.42.1.0/24", "10.42.2.0/24"]
+origin_credential_header_name = "x-origin-example-removal"
+```
+
+An absent profile keeps Geo Off. An unreadable/invalid selected profile or a
+compiled-out provider fails before readiness. The profile contains admitted
+immediate ALB peer ranges and the credential header's removal name, never its
+expected value. Diagnostics do not retain profile bytes or policy inputs.
+
+This selection requires CloudFront-generated country/subdivision assertions,
+HTTPS to an exact-credential-gated ALB, CloudFront-only ALB ingress and an ALB-only
+private application port. EdgeZero does not authenticate an expected credential
+value itself. The deployment must enforce that boundary. Disable shared caching,
+including cacheable errors. Ordinary forwarding trust and protected Geo source
+admission are independent. Provisioning and staged live-input changes are not
+part of this feature.
+
+TS reads the immutable `RequestContext::geo()` result, not raw Geo headers. A
+located country/subdivision supplies one request-local snapshot to Core and
+response finalization. Missing detail is absent rather than empty text or zero
+coordinates. Complete populated Geo fields retain their existing flat wire
+names. Unselected, untrusted and unavailable outcomes supply no location.
+Country-only US geography retains Core's existing non-regulated fallback; missing
+geography remains Unknown. Configured GDPR countries and US privacy states keep
+their existing consent rules. This extraction does not change TCF/GPC/identity
+policy.
+
+A handler error, such as an oversized request body, passes through the finalize
+middleware, which retains Geo/TS headers without replacing the framework status.
+The pinned EdgeZero has no admitted-error finalizer, so an error EdgeZero
+renders outside the router carries no Geo/TS headers. Pre-admission failures
+have no managed outcome. The selected serving
+provider is protected CloudFront, not the standalone EdgeZero KV Geo prototype. No
+Geo database, remote lookup or licensed data is imported.
+
+The TS boot profile is temporary on this RC baseline. Completing issue #1529
+requires the production startup from #1573 and EdgeZero's manifest Geo binding
+and approved integration tag from EdgeZero #482/#491. That forward-port removes
+this profile loader rather than introducing another selection path. Live
+CloudFront/AWS deployment qualification remains outside this extraction.
 
 ## Request handling
 
