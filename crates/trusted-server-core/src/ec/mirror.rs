@@ -14,6 +14,14 @@ use crate::ec::registry::PartnerRegistry;
 /// Largest encoded mirror value.
 pub const MAX_MIRROR_BYTES: usize = 3584;
 
+/// Seconds in a day; the mirror's `exp` for a UID without a stated expiry
+/// counts from the start of the current UTC day.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Longest a mirrored UID without a stated expiry stays valid on the page,
+/// counted from the start of the current UTC day: 30 days.
+const MIRROR_NO_EXPIRY_SECS: u64 = 30 * SECONDS_PER_DAY;
+
 /// What to do with the mirror cookie on this response.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MirrorCookie {
@@ -42,8 +50,12 @@ impl MirrorValue {
 /// source is denied consent, no provider excludes it where GDPR applies for
 /// this visitor and no provider's cookies on this request record an opt-out
 /// for it, in partner config order, as unpadded base64url JSON
-/// `{"v":1,"eids":[...]}`. UIDs that would push the value past
-/// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
+/// `{"v":1,"eids":[...]}`. A UID with a stated expiry carries it as `exp`
+/// (already at most 30 days ahead, clamped when written); a UID without one
+/// carries `exp` = the start of the current UTC day plus 30 days, so the
+/// value stays the same all day and changes at most once per UTC day. UIDs
+/// that would push the value past [`MAX_MIRROR_BYTES`] are skipped, as are
+/// UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
 /// persistence, the row is missing or withdrawn, or nothing qualifies.
 ///
@@ -63,6 +75,7 @@ pub fn build_mirror(
     let Some(row) = row.filter(|row| row.consent.ok && mirror_consent(consent)) else {
         return MirrorCookie::Expire;
     };
+    let default_exp = no_expiry_exp(now);
     let mut mirror = MirrorBuilder::default();
     // A partner opts in with `mirror_enabled`, and a UID never reaches the
     // page while a TCF vendor gating its source (that of any configured
@@ -89,7 +102,7 @@ pub fn build_mirror(
                 .uids()
                 .iter()
                 .filter(|uid| uid.owner().is_some() && uid.is_live(now))
-                .map(|uid| serde_json::to_string(&uid_json(uid)));
+                .map(|uid| serde_json::to_string(&uid_json(uid, default_exp)));
             mirror.push_eid(source, eid_header(source, eid), uids);
         }
     }
@@ -241,16 +254,26 @@ fn eid_json(source: &str, eid: &KvEid) -> Value {
     Value::Object(object)
 }
 
-fn uid_json(uid: &KvUid) -> Value {
+/// The mirror `exp` for a UID without a stated expiry: the start of `now`'s
+/// UTC day plus [`MIRROR_NO_EXPIRY_SECS`], so at most 30 days ahead and
+/// stable within the day.
+fn no_expiry_exp(now: UnixSeconds) -> UnixSeconds {
+    let day_start = now.get() - now.get() % SECONDS_PER_DAY;
+    UnixSeconds::new(day_start).saturating_add_secs(MIRROR_NO_EXPIRY_SECS)
+}
+
+fn uid_json(uid: &KvUid, default_exp: UnixSeconds) -> Value {
     let mut object = Map::new();
     object.insert("id".to_owned(), Value::from(uid.id().as_str()));
     object.insert("atype".to_owned(), Value::from(uid.atype().get()));
     if let Some(ext) = uid.ext() {
         object.insert("ext".to_owned(), ext.to_value());
     }
-    if let Expiry::At(at) = uid.expiry() {
-        object.insert("exp".to_owned(), Value::from(at.get()));
-    }
+    let exp = match uid.expiry() {
+        Expiry::At(at) => at,
+        Expiry::Never => default_exp,
+    };
+    object.insert("exp".to_owned(), Value::from(exp.get()));
     Value::Object(object)
 }
 
@@ -336,6 +359,65 @@ mod tests {
             decode(&value),
             json!({ "v": 1, "eids": [{ "source": "ids.example.com", "uids": [{ "id": "live", "atype": 1, "exp": 2000 }] }] }),
             "should hold only the live UID with its exp"
+        );
+    }
+
+    #[test]
+    fn caps_a_uid_without_stated_expiry_at_thirty_days_from_the_utc_day_start() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let now = UnixSeconds::new(day_start + 13 * 60 * 60);
+        let entry = row(vec![uid("never", Expiry::Never)]);
+
+        // Act
+        let MirrorCookie::Set(value) =
+            build_mirror(Some(&entry), &context(granting()), &partners(true), now)
+        else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        let exp = decode(&value)["eids"][0]["uids"][0]["exp"]
+            .as_u64()
+            .expect("should carry a numeric exp");
+        assert_eq!(
+            exp,
+            day_start + MIRROR_NO_EXPIRY_SECS,
+            "should expire 30 days after the start of the current UTC day"
+        );
+        assert!(
+            exp > now.get() && exp <= now.get() + MIRROR_NO_EXPIRY_SECS,
+            "should expire within 30 days of now"
+        );
+    }
+
+    #[test]
+    fn uid_without_stated_expiry_keeps_its_exp_within_a_utc_day_and_moves_on_the_next() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let build = |now: u64| {
+            build_mirror(
+                Some(&entry),
+                &context(granting()),
+                &partners(true),
+                UnixSeconds::new(now),
+            )
+        };
+
+        // Act
+        let morning = build(day_start + 60);
+        let evening = build(day_start + SECONDS_PER_DAY - 1);
+        let next_day = build(day_start + SECONDS_PER_DAY);
+
+        // Assert
+        assert_eq!(
+            morning, evening,
+            "should build the same mirror throughout one UTC day"
+        );
+        assert_ne!(
+            evening, next_day,
+            "should move the exp forward on the next UTC day"
         );
     }
 
@@ -628,8 +710,8 @@ mod tests {
         assert_eq!(
             decode(&value),
             json!({ "v": 1, "eids": [
-                { "source": "ids.example.com", "uids": [{ "id": "a", "atype": 1 }] },
-                { "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1 }] }
+                { "source": "ids.example.com", "uids": [{ "id": "a", "atype": 1, "exp": 2_592_000 }] },
+                { "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1, "exp": 2_592_000 }] }
             ] }),
             "should join EIDs into valid JSON"
         );

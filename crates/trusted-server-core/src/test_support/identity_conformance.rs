@@ -764,7 +764,8 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
         {"name":"Disabled body fixture","source_domain":"disabled-body.example.com","bidstream_enabled":true},
         {"name":"Mirror fixture","source_domain":"mirror.example.com","bidstream_enabled":true,"mirror_enabled":true},
         {"name":"Expired fixture","source_domain":"expired.example.com","bidstream_enabled":true,"mirror_enabled":true},
-        {"name":"Denied fixture","source_domain":"denied.example.com","bidstream_enabled":true,"mirror_enabled":true}
+        {"name":"Denied fixture","source_domain":"denied.example.com","bidstream_enabled":true,"mirror_enabled":true},
+        {"name":"Unmirrored fixture","source_domain":"unmirrored.example.com","bidstream_enabled":true}
     ]))
     .expect("should configure conformance partner and SharedID");
 }
@@ -1024,6 +1025,21 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     );
     let graph = KvIdentityGraph::new(store.clone());
     let key = normalize_ec_id_for_kv(&identity);
+    let sharedid = assert_sharedid_cookies(&created.response);
+    assert!(
+        uuid::Uuid::parse_str(&sharedid).is_ok_and(|id| id.get_version_num() == 4),
+        "should create a UUID v4 SharedID as Prebid writes: {sharedid}"
+    );
+    assert_eq!(
+        block_on(graph.get(&key))
+            .expect("should read created SharedID record")
+            .expect("should retain created record")
+            .0
+            .ids["pubcid.org"]
+            .uid,
+        sharedid,
+        "should store the created SharedID in the record it sets"
+    );
     let cookies = format!("{tcf_cookie}; ts-ec={identity}");
     let browser_cookies = created
         .response
@@ -1052,6 +1068,33 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should accept unchanged consent"
     );
     assert_no_identity_cookies(&unchanged.response);
+    for companion in ["", "; _pubcid_cst=AAAAAA%3D%3D"] {
+        let mut stale = ApiRequest::new(http::Method::POST, ec_path);
+        stale.body = consent_body.clone();
+        stale.headers = vec![
+            (
+                "origin".to_owned(),
+                "https://publisher.example.com".to_owned(),
+            ),
+            (
+                "cookie".to_owned(),
+                format!("{tcf_cookie}; ts-ec={identity}; _pubcid={sharedid}{companion}"),
+            ),
+        ];
+        let stale = adapter.exchange(&stale);
+        assert_eq!(
+            stale.response.status,
+            StatusCode::OK,
+            "should accept a stale companion"
+        );
+        let set = identity_cookie_names(&stale.response);
+        assert_eq!(
+            set,
+            vec!["_pubcid_cst"],
+            "should re-set only the companion for {companion:?}: {:?}",
+            stale.response.cookies
+        );
+    }
 
     let mut batch = ApiRequest::new(http::Method::POST, "/_ts/api/v1/batch-sync");
     batch.headers.push((
@@ -1196,6 +1239,11 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             Expiry::At(UnixSeconds::new(1)),
         ),
         ("denied.example.com", "vendor-denied-id", Expiry::Never),
+        (
+            "unmirrored.example.com",
+            "unmirrored-provider-id",
+            Expiry::Never,
+        ),
     ] {
         seeded.ids.insert(
             source.to_owned(),
@@ -1242,12 +1290,9 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         restored.response.body.is_empty(),
         "should keep pixel response empty"
     );
-    assert!(
-        restored
-            .response
-            .cookies
-            .iter()
-            .any(|value| value.starts_with("_pubcid=")),
+    assert_eq!(
+        assert_sharedid_cookies(&restored.response),
+        sharedid,
         "should restore existing SharedID from its row"
     );
     assert!(
@@ -1325,14 +1370,26 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let mirrored = adapter.exchange(&post);
     let mirror: serde_json::Value =
         serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let mut eids = mirror["eids"].clone();
+    let exp = eids[0]["uids"][0]
+        .as_object_mut()
+        .and_then(|uid| uid.remove("exp"))
+        .and_then(|exp| exp.as_u64())
+        .expect("should give a UID without stated expiry a numeric exp");
+    let now = now_deciseconds() / 10;
+    assert!(
+        exp > now && exp <= now + 30 * 24 * 60 * 60,
+        "should mirror a UID without stated expiry with an expiry within 30 days: exp={exp}, now={now}"
+    );
     assert_eq!(
-        mirror["eids"],
+        eids,
         serde_json::json!([{"source":"mirror.example.com","uids":[{"id":"allowed-mirror-id","atype":1}]}]),
         "should expose only the live mirrored provider UID"
     );
     assert!(
         ![
             "body-fixture-id",
+            "unmirrored-provider-id",
             "batch-fixture-id",
             "expired-mirror-id",
             "vendor-denied-id"
@@ -1466,6 +1523,177 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             .ok,
         "should never revive the withdrawn row"
     );
+    verify_ec_route_sequence(adapter, store, tcf);
+}
+
+fn clear_store(store: &RecordingStore) {
+    for key in block_on(store.list_keys_with_prefix("", 100)).expect("should list fixture keys") {
+        block_on(store.delete(&key)).expect("should remove isolated fixture key");
+    }
+}
+
+fn ec_post(body: String, cookie: Option<String>) -> ApiRequest {
+    let mut post = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
+    post.body = body;
+    post.headers.push((
+        "origin".to_owned(),
+        "https://publisher.example.com".to_owned(),
+    ));
+    if let Some(cookie) = cookie {
+        post.headers.push(("cookie".to_owned(), cookie));
+    }
+    post
+}
+
+/// Server side of the browser's ordered consent queue, plus the `SharedID`
+/// opt-out on a first grant: grant A, withdrawal B, then grant C without EC.
+fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, granted_tcf: &str) {
+    let grant = serde_json::json!({"tcString": granted_tcf, "applicableSections": []}).to_string();
+    let denied_cookie = tcf_consent_cookie(false);
+    let denied_tcf = denied_cookie
+        .strip_prefix("euconsent-v2=")
+        .expect("should encode denied TCF");
+    let withdrawal =
+        serde_json::json!({"tcString": denied_tcf, "applicableSections": []}).to_string();
+    let graph = KvIdentityGraph::new(store.clone());
+
+    clear_store(store);
+    let opted_out = adapter.exchange(&ec_post(grant.clone(), Some("_pubcid_optout=1".to_owned())));
+    let identity = assert_created(&opted_out.response, store);
+    assert!(
+        !opted_out
+            .response
+            .cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0")),
+        "should set no SharedID for a reader with _pubcid_optout: {:?}",
+        opted_out.response.cookies
+    );
+    assert!(
+        !block_on(graph.get(&normalize_ec_id_for_kv(&identity)))
+            .expect("should read opted-out record")
+            .expect("should retain opted-out record")
+            .0
+            .ids
+            .contains_key("pubcid.org"),
+        "should store no SharedID for a reader with _pubcid_optout"
+    );
+
+    clear_store(store);
+    let a = adapter.exchange(&ec_post(grant.clone(), None));
+    let identity_a = assert_created(&a.response, store);
+    let sharedid = assert_sharedid_cookies(&a.response);
+    let b = adapter.exchange(&ec_post(
+        withdrawal,
+        Some(format!(
+            "ts-ec={identity_a}; _pubcid={sharedid}; _pubcid_cst=AAAAAA%3D%3D; __Host-ts-eids-mirror=stale"
+        )),
+    ));
+    assert_eq!(
+        b.response.status,
+        StatusCode::OK,
+        "should accept withdrawal B"
+    );
+    for name in ["ts-ec", "_pubcid", "_pubcid_cst", "__Host-ts-eids-mirror"] {
+        assert!(
+            b.response
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{name}=;"))
+                    && cookie.contains("Max-Age=0")),
+            "withdrawal B should expire {name}: {:?}",
+            b.response.cookies
+        );
+    }
+    assert!(
+        !b.response
+            .cookies
+            .iter()
+            .any(|cookie| !cookie.contains("Max-Age=0")),
+        "withdrawal B should set no identity cookie: {:?}",
+        b.response.cookies
+    );
+    let tombstoned = |store_graph: &KvIdentityGraph| {
+        !block_on(store_graph.get(&normalize_ec_id_for_kv(&identity_a)))
+            .expect("should read A's record")
+            .expect("should retain A's tombstone")
+            .0
+            .consent
+            .ok
+    };
+    assert!(
+        tombstoned(&graph),
+        "withdrawal B should tombstone A's record"
+    );
+
+    let c = adapter.exchange(&ec_post(grant, None));
+    assert_eq!(c.response.status, StatusCode::OK, "should accept grant C");
+    let identity_c = c
+        .response
+        .cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("ts-ec="))
+        .and_then(|cookie| cookie.split(';').next())
+        .filter(|value| !value.is_empty())
+        .expect("grant C should mint a new EC as a first consent")
+        .to_owned();
+    assert_ne!(identity_c, identity_a, "grant C should not revive A");
+    assert!(
+        block_on(graph.get(&normalize_ec_id_for_kv(&identity_c)))
+            .expect("should read C's record")
+            .expect("grant C should create its own record")
+            .0
+            .consent
+            .ok,
+        "grant C should create a live record"
+    );
+    assert!(tombstoned(&graph), "grant C should leave A tombstoned");
+    clear_store(store);
+}
+
+/// Asserts the `SharedID` cookie and its companion carry Prebid's attributes
+/// and returns the `SharedID` value.
+fn assert_sharedid_cookies(response: &Observation) -> String {
+    let attributes =
+        "; Domain=.publisher.example.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000";
+    let find = |name: &str| {
+        response
+            .cookies
+            .iter()
+            .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")))
+            .expect("should set the SharedID cookie and its companion")
+    };
+    let mut values = Vec::new();
+    for name in ["_pubcid", "_pubcid_cst"] {
+        let cookie = find(name);
+        let (value, rest) = cookie.split_once(';').expect("should carry attributes");
+        assert_eq!(
+            format!(";{rest}"),
+            attributes,
+            "should set {name} readable by Prebid, Secure and Lax for one year"
+        );
+        assert!(!value.is_empty(), "should set a non-empty {name}");
+        values.push(value.to_owned());
+    }
+    values.swap_remove(0)
+}
+
+fn identity_cookie_names(response: &Observation) -> Vec<&str> {
+    response
+        .cookies
+        .iter()
+        .filter_map(|cookie| cookie.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            [
+                "ts-ec",
+                "_pubcid",
+                "_pubcid_cst",
+                "__Host-ts-eids-mirror",
+                "ts-ec-pull-complete",
+            ]
+            .contains(name)
+        })
+        .collect()
 }
 
 fn assert_no_identity_cookies(response: &Observation) {

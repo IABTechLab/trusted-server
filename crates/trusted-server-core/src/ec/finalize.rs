@@ -95,7 +95,10 @@ pub async fn ec_finalize_response(
 /// its value differs from the one the request carried, so responses that
 /// leave the mirror as it was stay free of `Set-Cookie` and keep their
 /// cacheability. An unchanged mirror is therefore not re-extended; once it
-/// lapses, the next navigation sets it again.
+/// lapses, the next navigation sets it again. A UID without a stated expiry
+/// is mirrored with an `exp` 30 days after the start of the current UTC day,
+/// so a returning reader whose mirror holds such UIDs gets at most one
+/// mirror `Set-Cookie` per UTC day.
 ///
 /// Where the mirror cannot be rebuilt (non-navigations, or a navigation
 /// without a readable row), a carried mirror is expired when the request
@@ -112,12 +115,7 @@ fn apply_mirror(
     let decision = if !mirror_consent(ec_context.consent()) {
         MirrorCookie::Expire
     } else if navigation && let Some(row) = mirror_row(ec_context) {
-        build_mirror(
-            row,
-            ec_context,
-            registry,
-            UnixSeconds::new(current_timestamp()),
-        )
+        build_mirror(row, ec_context, registry, mirror_now())
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
         // provider whose TCF vendor consent is now denied, whose source is
@@ -146,6 +144,15 @@ fn apply_mirror(
         }
         MirrorCookie::Expire => {}
     }
+}
+
+/// The time the mirror is built at: the clock, or the time a test pins.
+fn mirror_now() -> UnixSeconds {
+    #[cfg(test)]
+    if let Some(now) = tests::MIRROR_NOW.get() {
+        return now;
+    }
+    UnixSeconds::new(current_timestamp())
 }
 
 /// Whether the request carries a mirror that holds UIDs of a mirrored partner
@@ -749,6 +756,7 @@ mod tests {
 
     use base64::Engine as _;
 
+    use std::cell::Cell;
     use std::num::NonZeroU16;
     use std::rc::Rc;
     use std::sync::Mutex;
@@ -778,6 +786,30 @@ mod tests {
     use crate::settings::EcPartner;
     use crate::test_support::tests::consent_granting_vendors;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
+
+    thread_local! {
+        /// The time [`mirror_now`] returns while a [`PinnedMirrorClock`] lives.
+        pub(super) static MIRROR_NOW: Cell<Option<UnixSeconds>> = const { Cell::new(None) };
+    }
+
+    /// Start of a UTC day, for tests that pin the mirror clock.
+    const MIRROR_DAY_START: u64 = 1_767_225_600;
+
+    /// Pins the mirror clock on this thread until dropped.
+    struct PinnedMirrorClock;
+
+    impl PinnedMirrorClock {
+        fn at(now: u64) -> Self {
+            MIRROR_NOW.set(Some(UnixSeconds::new(now)));
+            Self
+        }
+    }
+
+    impl Drop for PinnedMirrorClock {
+        fn drop(&mut self) {
+            MIRROR_NOW.set(None);
+        }
+    }
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()
@@ -2938,6 +2970,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn partial_vendor_denial_keeps_a_mirror_without_the_denied_vendor() {
         // Arrange
+        let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 60);
         let navigation = run_split_vendor_mirror_request(None, true).await;
         let set = mirror_cookies(&navigation);
         assert_eq!(set.len(), 1, "should set the mirror on navigation");
@@ -2961,6 +2994,48 @@ mod tests {
         assert!(
             mirror_cookies(&next_navigation).is_empty(),
             "should not re-set an unchanged mirror on the next navigation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_expiry_mirror_is_kept_within_a_utc_day_and_re_set_once_on_the_next() {
+        // Arrange
+        let first_clock = PinnedMirrorClock::at(MIRROR_DAY_START + 60);
+        let first = run_mirror_navigation(provider_found("ids.example.com"), None, false).await;
+        let set = mirror_cookies(&first);
+        assert_eq!(
+            set.len(),
+            1,
+            "should set the mirror on the first navigation"
+        );
+        let value = mirror_value(&set[0]).to_owned();
+        drop(first_clock);
+
+        // Act
+        let same_day = {
+            let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 86_399);
+            run_mirror_navigation(provider_found("ids.example.com"), Some(&value), false).await
+        };
+        let next_day = {
+            let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 86_400 + 60);
+            run_mirror_navigation(provider_found("ids.example.com"), Some(&value), false).await
+        };
+
+        // Assert
+        assert!(
+            mirror_cookies(&same_day).is_empty(),
+            "should not re-set an unchanged mirror later the same UTC day"
+        );
+        let next_day_cookies = mirror_cookies(&next_day);
+        assert_eq!(
+            next_day_cookies.len(),
+            1,
+            "should re-set the mirror once on the next UTC day"
+        );
+        assert_ne!(
+            mirror_value(&next_day_cookies[0]),
+            value,
+            "should carry the next day's exp"
         );
     }
 
