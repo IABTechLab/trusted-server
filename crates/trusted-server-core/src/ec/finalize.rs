@@ -229,10 +229,7 @@ async fn finalize_response_inner(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        if settings.ec.refresh_after_days.is_some()
-            && consent_withdrawn
-            && ec_context.refresh_marker_present
-        {
+        if consent_withdrawn && ec_context.refresh_marker_present {
             expire_refresh_marker(settings, response);
         }
         expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
@@ -693,14 +690,16 @@ async fn refresh_returning_cookie(
     let Some(now) = super::checked_current_timestamp() else {
         return;
     };
-    if !super::refresh::should_refresh(
-        settings.ec.passphrase.expose(),
-        &settings.publisher.domain,
-        &ec_id,
-        context.refresh_marker.as_deref(),
-        now,
-        days.seconds(),
-    ) {
+    if context.refresh_markers.iter().any(|marker| {
+        !super::refresh::should_refresh(
+            settings.ec.passphrase.expose(),
+            &settings.publisher.domain,
+            &ec_id,
+            Some(marker),
+            now,
+            days.seconds(),
+        )
+    }) {
         return;
     }
     // A refresh-only read must not change what mirror or after-response processing sees.

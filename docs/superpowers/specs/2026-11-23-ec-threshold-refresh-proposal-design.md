@@ -14,7 +14,8 @@ for comparison with retaining the existing never-refresh policy; it does
 not decide DEC-13.
 
 Add optional integer `ec.refresh_after_days`, accepting 1 through 364,
-inclusive. Omission disables the entire feature. A day is 86,400 seconds,
+inclusive. Omission disables renewal and marker processing except cleanup on
+explicit withdrawal of a carried marker. A day is 86,400 seconds,
 not a calendar boundary. Invalid configuration must identify the setting
 and supported range during config validation/push and application startup.
 The value comes from the typed app config, published with `ts config push`.
@@ -74,6 +75,15 @@ separator, publisher domain, full EC value, kind, and timestamp, with the
 existing EC passphrase. Verify using the MAC library's verification API.
 Never expose the passphrase or raw cookie values in logs.
 
+**Key-derivation follow-up:** v1 keeps the existing passphrase as its HMAC
+key and authenticates a purpose-separated message. Deriving a distinct marker
+key with audited HKDF-SHA256 and a fixed purpose label is deferred: the workspace
+currently has no HKDF dependency, and changing key derivation needs a versioned
+marker protocol and explicit migration policy. A follow-up should specify the
+salt/info bytes, add independent vectors, and decide between old-v1 verification
+and one-time bootstrap after the new version. No derivation or silent protocol
+change is included in this review fix.
+
 The authenticated bytes are the ASCII string
 `trusted-server/ec-cookie-issued-at/v1` followed by one zero byte, then four
 length-prefixed fields in order: scope, full EC, kind, timestamp. Each field
@@ -87,12 +97,20 @@ bytes. Do not change publisher normalization or outbound cookie-domain
 formatting. Include a fixed cross-language MAC test vector in implementation
 tests and use the same byte protocol for controlled browser seeding.
 
-Only enabled instances capture/parse this cookie, across all Cookie fields
-before routing consumes the request. Missing, malformed, oversized, duplicate,
-wrong-version, bad-MAC, wrong-EC/domain, or future markers have unknown age.
-They trigger bootstrap renewal: refresh the unchanged EC and issue a fresh
+Enabled instances capture bounded candidates across all Cookie fields before
+routing consumes the request. If any candidate authenticates for this EC and
+publisher and is recent, skip renewal, even when another copy is invalid,
+oversized or due. Duplicate names alone must not force cookie writes. If no
+candidate verifies as recent, missing, malformed, oversized, wrong-version,
+bad-MAC, wrong-EC/domain or future values have unknown age and cause bootstrap;
+valid due values cause renewal. Refresh the unchanged EC and issue a fresh
 signed marker together, subject to every document, consent and live-record
 gate below. Never infer age from record creation or update time.
+
+Disabled instances do not capture or verify marker values. Only on explicit
+withdrawal do they scan Cookie fields for the marker name, without authenticating
+its value, and expire a carried marker. Missing or unresolved consent does not
+trigger that cleanup.
 
 Use `checked_current_timestamp`, checked subtraction, and seconds arithmetic.
 With unavailable/pre-epoch time, emit no refresh or initialization. Future
@@ -134,12 +152,12 @@ for refresh or add a second navigation write.
 
 | State after the gates                                | Cookie output added by this feature                                                                                                                                    |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Setting absent                                       | None; do not parse, clean up, read records, change serialization, or add cache-key restrictions for this feature                                                       |
+| Setting absent                                       | No renewal, value parsing, record reads, serialization changes, or new cache-key restrictions; explicit withdrawal still deletes a carried marker                      |
 | Known age below N days                               | None                                                                                                                                                                   |
 | Known age equal to or above N days                   | Same `ts-ec`, full existing Max-Age, plus fresh `i` companion                                                                                                          |
 | Unknown age with usable clock                        | Same `ts-ec`, full existing Max-Age, plus a fresh `i` companion                                                                                                        |
 | Existing creation/rotation successfully issues an EC | Add an `i` companion alongside that EC; this also applies to genuine EC creation through the explicit EC endpoint, and is initialization, not returning-cookie refresh |
-| Explicit withdrawal                                  | No renewal; expire a carried companion even without an EC cookie or working storage                                                                                    |
+| Explicit withdrawal                                  | No renewal; expire a carried companion even with the setting absent, without an EC cookie or working storage                                                           |
 | Merely missing/unresolved consent                    | No renewal; preserve existing EC handling                                                                                                                              |
 
 Do not add `x-ts-ec` or new identity response headers during refresh. Append
@@ -152,8 +170,9 @@ metadata then follows the bootstrap renewal rule later.
 Include the companion in enabled identity-cookie filtering. Ineligible
 responses cannot leak positive origin-supplied companion cookies. Reconstruct
 only required withdrawal deletion after filtering, including marker-only
-withdrawal on a non-document. When disabled, this new classification and
-cleanup do not run.
+withdrawal on a non-document, the EC GET/POST routes and configured Fastly asset
+bypasses. When disabled, marker classification applies only to explicit
+withdrawal cleanup; every other disabled response retains its existing handling.
 
 ## Storage, concurrency, privacy and cache consequences
 
@@ -223,22 +242,30 @@ remain tooling behavior, not serving-time environment reads.
 Omission must serialize without a new null/default field, preserving old
 config payload bytes. An enabled blob is incompatible with older binaries
 that deny unknown EC settings: remove the field and republish before rolling
-back. Disabling leaves an existing companion untouched until browser expiry;
-actively cleaning it while disabled would violate the no-behavior-change
-requirement. Re-enabling may reuse a still-valid companion. The feature is
-not a new consent grant or a guarantee of identity continuity.
+back. Disabling stops renewal and leaves an existing companion until browser
+expiry or an explicit withdrawal; withdrawal deletes it even while disabled.
+Re-enabling may reuse a still-valid companion only when no intervening
+withdrawal removed it. Older binaries that predate the marker cannot perform
+this cleanup after rollback and may leave it until browser expiry. The feature
+is not a new consent grant or a guarantee of identity continuity.
+
+The opaque signed marker can still link requests while carried, even after the
+EC cookie itself disappears. Deleting it on withdrawal reduces that re-linking
+risk across disable/re-enable transitions; it does not erase previously logged
+requests or guarantee the browser accepts deletion. Missing or unresolved consent
+alone must not be interpreted as withdrawal.
 
 ## Acceptance and verification
 
 1. Absent-setting serialization, response headers/cookies and record I/O
-   match #1646. Existing returning-reader tests stay green; explicit absent
-   setting tests cover markers present and absent, creation, rotation,
+   match #1646 except explicit withdrawal deletes a carried marker. Existing
+   returning-reader tests stay green; explicit absent setting tests cover markers present and absent, creation, rotation,
    withdrawal, unknown consent and configured cache-cookie policies.
 2. Enabled setting rejects out-of-range values with an actionable field/range
    diagnostic through typed config validation and runtime startup. No serving
    environment read is added; the runtime environment guard passes.
 3. Pure clock-explicit tests cover exact threshold, below/above threshold,
-   missing/invalid/ambiguous markers, bindings, signature failures, future
+   missing/invalid markers and duplicate candidates, bindings, signature failures, future
    time, clock failure and input bounds. No time-based sleeps.
 4. Full lifecycle tests cover document HTML/XHTML/304 and allowed methods,
    304 with an explicit non-HTML Content-Type, redirects/error documents,

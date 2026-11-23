@@ -906,9 +906,19 @@ On an eligible consented publisher document with a matching live record,
 a due `ts-ec-issued-at` marker renews the same `ts-ec` value for one year and
 sets a fresh signed HttpOnly marker. A missing or invalid marker bootstraps
 by renewing both together. Assets, API requests, no-consent responses and
-withdrawal never renew returning cookies. Explicit withdrawal deletes a
-carried marker. When disabled, the marker is neither read nor cleaned up,
-and no refresh record read or new cache-key restriction is introduced.
+withdrawal never renew returning cookies. If duplicate markers are carried,
+any authenticated recent copy suppresses renewal. Explicit withdrawal deletes a
+carried marker even after the setting is removed. While disabled, only explicit
+withdrawal scans for its name to emit deletion; marker values are not captured
+or verified, and no refresh record read or new cache-key restriction is introduced.
+Every other disabled path keeps its existing behavior.
+
+Disabling stops renewal but leaves a carried marker until expiry or explicit
+withdrawal. Re-enabling can reuse it only if it still verifies for the current EC.
+The opaque marker can link requests while carried, even if the EC cookie is gone;
+withdrawal cleanup reduces this re-linking risk across disable/re-enable transitions.
+It does not erase logs or guarantee that the browser accepts cookie deletion.
+Older binaries that predate this marker cannot clean it up after rollback.
 
 Renewal and bootstrap responses are private under the existing Set-Cookie
 cache policy. Other visits can still be private for independent reasons.
@@ -916,7 +926,7 @@ cache policy. Other visits can still be private for independent reasons.
 retention.** Record expiry can still lead to legitimate orphan rotation.
 The extra signed cookie adds request bytes; lost, rejected or replayed cookies
 can cause additional renewals. This does not guarantee Safari/ITP persistence.
-See the [proposal design](https://github.com/IABTechLab/trusted-server/blob/c1ae51e5915f61db81982eb23b9418487fa616d7/docs/superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
+See the [proposal design](https://github.com/IABTechLab/trusted-server/blob/proposal/1595-ec-threshold-refresh/docs/superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
 for protocol, rollout and qualification limits. If DEC-13 chooses never
 refresh, this proposal will be closed.
 

@@ -4440,7 +4440,7 @@ mod tests {
                     .iter()
                     .map(|value| value.to_str().expect("should decode response cookie"))
                     .collect::<Vec<_>>();
-                if enabled && withdrawn {
+                if withdrawn {
                     if !cookies.iter().any(|value| {
                         value.starts_with("ts-ec-issued-at=;") && value.contains("Max-Age=0")
                     }) {

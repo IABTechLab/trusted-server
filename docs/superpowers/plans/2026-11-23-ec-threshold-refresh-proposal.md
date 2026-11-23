@@ -66,8 +66,10 @@ Modify: `ec/mod.rs`, `ec/cookies.rs`, and `constants.rs` as narrowly required.
       HMAC/SHA256/base64 crates and EC passphrase. Add no production clock
       override and no runtime environment read.
 - [ ] Capture optional incoming marker across Cookie fields before routing,
-      only with the setting enabled. Keep timestamp data out of records and
-      logs. Prove disabled input parsing and record calls remain unchanged.
+      only with the setting enabled; any verified recent duplicate suppresses
+      renewal. Keep timestamp data out of records and logs. While disabled,
+      scan only the marker name on explicit withdrawal for cleanup; otherwise
+      prove input parsing and record calls remain unchanged.
 - [ ] Run the new module tests green; format touched Rust files.
 
 ## 4. Integrate document-only renewal test-first
@@ -91,7 +93,8 @@ Files: `ec/app/lifecycle.rs`, `ec/finalize.rs`, `ec/mod.rs`, and existing
       Validate header preparation and failure behavior described in the spec.
 - [ ] Add withdrawal cleanup before early exits, including companion-only
       withdrawal and unavailable stores; reconstruct deletion after identity
-      filtering on ineligible responses. Keep disabled paths untouched.
+      filtering on ineligible responses. Delete carried markers even while
+      disabled on explicit withdrawal; keep every other disabled path untouched.
 - [ ] Test assets, API/EC POST with forged navigation headers, redirects,
       nonredirect errors, HEAD/POST documents, 304, no consent, unknown geo,
       304 with non-HTML Content-Type, header-only/mismatched EC, orphan

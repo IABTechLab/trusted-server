@@ -581,15 +581,15 @@ async fn signed_overdue_marker_renews_and_recent_marker_preserves_public_respons
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn marker_in_later_cookie_field_is_read_and_duplicate_markers_bootstrap() {
+async fn marker_in_later_cookie_field_and_duplicate_recent_markers_skip_renewal() {
     let fixture = Fixture::new(true).await;
     fixture.seed(true).await;
     let marker = marker_at(&fixture, current_timestamp());
     for (first, later, expected) in [
         (String::new(), vec![marker.clone()], 0),
-        (format!("{marker}; {marker}"), Vec::new(), 2),
-        (marker.clone(), vec![marker.clone()], 2),
-        ("ts-ec-issued-at=invalid".to_owned(), vec![marker], 2),
+        (format!("{marker}; {marker}"), Vec::new(), 0),
+        (marker.clone(), vec![marker.clone()], 0),
+        ("ts-ec-issued-at=invalid".to_owned(), vec![marker], 0),
     ] {
         let response = fixture
             .visit(Case {
@@ -601,13 +601,13 @@ async fn marker_in_later_cookie_field_is_read_and_duplicate_markers_bootstrap() 
         assert_eq!(
             cookies(&response).len(),
             expected,
-            "should suppress only one unambiguous authenticated marker"
+            "should suppress renewal when any candidate is authenticated and recent"
         );
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn disabled_refresh_withdrawal_preserves_companion_cookie() {
+async fn disabled_refresh_withdrawal_expires_companion_cookie() {
     let fixture = Fixture::new(false).await;
     fixture.seed(true).await;
     let response = fixture
@@ -624,9 +624,9 @@ async fn disabled_refresh_withdrawal_preserves_companion_cookie() {
         "should retain existing EC withdrawal"
     );
     assert!(
-        !set.iter()
-            .any(|value| value.starts_with("ts-ec-issued-at=")),
-        "should ignore companion cookies entirely while refresh is disabled"
+        set.iter()
+            .any(|value| value.starts_with("ts-ec-issued-at=;") && value.contains("Max-Age=0")),
+        "should delete a carried companion on explicit withdrawal even when disabled"
     );
 }
 
@@ -891,5 +891,157 @@ async fn refresh_record_read_preserves_unrelated_carried_mirror_cookie() {
         !set.iter()
             .any(|value| value.starts_with("__Host-ts-eids-mirror=")),
         "should preserve pre-existing unread-snapshot mirror behavior"
+    );
+}
+
+async fn assert_record_consent(fixture: &Fixture, expected: bool) {
+    let (entry, _) = fixture
+        .app
+        .identity_graph()
+        .expect("should have identity graph")
+        .get(EC)
+        .await
+        .expect("should read identity record")
+        .expect("should retain backed identity record");
+    assert_eq!(
+        entry.consent.ok, expected,
+        "should preserve the live row until withdrawal and then store a tombstone"
+    );
+}
+
+fn assert_identity_and_marker_expired(response: &Response) {
+    let set = cookies(response);
+    for name in ["ts-ec", "ts-ec-issued-at"] {
+        let prefix = format!("{name}=");
+        let matching = set
+            .iter()
+            .filter(|value| value.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "should expire carried {name} on the eligible withdrawal response: {set:?}"
+        );
+        assert!(
+            matching.iter().all(|value| {
+                value.starts_with(&format!("{name}=;")) && value.contains("Max-Age=0")
+            }),
+            "should emit only deletion cookies for {name}, without positive issuance: {set:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publisher_document_withdrawal_expires_backed_ec_and_valid_marker() {
+    let fixture = Fixture::new(true).await;
+    fixture.seed(true).await;
+    assert_record_consent(&fixture, true).await;
+
+    let response = fixture
+        .visit(Case {
+            consent: false,
+            marker: marker_at(&fixture, current_timestamp()),
+            ..Case::default()
+        })
+        .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should finalize the successful publisher document navigation"
+    );
+    assert_identity_and_marker_expired(&response);
+    assert_record_consent(&fixture, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ec_post_withdrawal_expires_backed_ec_and_valid_marker() {
+    let fixture = Fixture::new(true).await;
+    fixture.seed(true).await;
+    assert_record_consent(&fixture, true).await;
+    let marker = marker_at(&fixture, current_timestamp());
+    let mut request = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://publisher.example.com/_ts/api/v1/ec")
+        .header(header::ORIGIN, "https://publisher.example.com")
+        .header(
+            header::COOKIE,
+            format!("ts-ec={EC}; us_privacy=1YYN; {marker}"),
+        )
+        .body(Body::from(json!({}).to_string()))
+        .expect("should create same-origin EC POST withdrawal");
+    request.extensions_mut().insert(RuntimeRequestOrigin::new(
+        InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+            .expect("should provide trusted publisher ingress"),
+    ));
+
+    let response = fixture.app.ec_route(&fixture.services, request).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should admit the EC POST and reach shared identity finalization"
+    );
+    assert_identity_and_marker_expired(&response);
+    assert_record_consent(&fixture, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_markers_keep_a_recent_copy_in_either_cookie_field() {
+    let fixture = Fixture::new(true).await;
+    fixture.seed(true).await;
+    let now = current_timestamp();
+    let recent = marker_at(&fixture, now);
+    let due = marker_at(&fixture, now - 86_401);
+    let oversized = format!("ts-ec-issued-at={}", "a".repeat(81));
+    for (first, later, expected) in [
+        (due.clone(), vec![recent.clone()], 0),
+        (recent.clone(), vec![due.clone()], 0),
+        (format!("{due}; {recent}"), Vec::new(), 0),
+        (format!("{recent}; {due}"), Vec::new(), 0),
+        (oversized, vec![recent], 0),
+        (due.clone(), vec![due], 2),
+    ] {
+        let response = fixture
+            .visit(Case {
+                marker: first,
+                extra_cookie_fields: later,
+                ..Case::default()
+            })
+            .await;
+        assert_eq!(
+            cookies(&response).len(),
+            expected,
+            "should skip all cookie writes when any duplicate verifies as recent"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_refresh_withdrawal_expires_marker_without_ec_in_later_cookie_field() {
+    let fixture = Fixture::new(false).await;
+    let request = http::Request::builder()
+        .uri("/asset")
+        .header(header::COOKIE, "us_privacy=1YYN")
+        .header(header::COOKIE, "ts-ec-issued-at=carried")
+        .header("sec-fetch-dest", "empty")
+        .body(Body::empty())
+        .expect("should create marker-only disabled withdrawal");
+    let response = fixture
+        .respond(request, StatusCode::OK, "application/json")
+        .await;
+    let set = cookies(&response);
+    assert_eq!(
+        set.len(),
+        1,
+        "should only delete the carried marker: {set:?}"
+    );
+    assert!(
+        set[0].starts_with("ts-ec-issued-at=;") && set[0].contains("Max-Age=0"),
+        "should expire marker on disabled withdrawal without EC or a live record"
+    );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=0",
+        "should keep cleanup response out of shared caches"
     );
 }

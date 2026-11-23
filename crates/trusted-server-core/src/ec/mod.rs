@@ -222,26 +222,27 @@ fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<Strin
         .map(|cookie| cookie.value().to_owned())
 }
 
-/// Captures the marker without accepting duplicate names or allocating oversized values.
-fn capture_refresh_marker(req: &Request<EdgeBody>) -> (bool, Option<String>) {
-    let mut values = req
-        .headers()
+/// Visits marker candidates across all Cookie fields without allocating their values.
+fn refresh_marker_values(req: &Request<EdgeBody>) -> impl Iterator<Item = &str> {
+    req.headers()
         .get_all(http::header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
         .filter(|(name, _)| name.trim() == COOKIE_TS_EC_ISSUED_AT)
-        .map(|(_, value)| value.trim());
-    let Some(first) = values.next() else {
-        return (false, None);
-    };
-    let marker = if first.len() <= refresh::MAX_MARKER_BYTES && values.next().is_none() {
-        Some(first.to_owned())
-    } else {
-        None
-    };
-    (true, marker)
+        .map(|(_, value)| value.trim())
+}
+
+/// Captures bounded candidates so any authenticated recent marker can suppress renewal.
+fn capture_refresh_marker(req: &Request<EdgeBody>) -> (bool, Vec<String>) {
+    let mut present = false;
+    let markers = refresh_marker_values(req)
+        .inspect(|_| present = true)
+        .filter(|value| value.len() <= refresh::MAX_MARKER_BYTES)
+        .map(str::to_owned)
+        .collect();
+    (present, markers)
 }
 
 /// Parses EC identity from request cookies in a single pass.
@@ -361,8 +362,8 @@ pub struct EcContext {
     pull_marker_present: bool,
     /// The mirror cookie's value, when the request carried it.
     mirror_cookie: Option<String>,
-    /// Unambiguous bounded issuance marker, read only when refresh is enabled.
-    refresh_marker: Option<String>,
+    /// Bounded issuance candidates, captured only when refresh is enabled.
+    refresh_markers: Vec<String>,
     /// Whether any issuance marker was carried, including malformed values.
     refresh_marker_present: bool,
     /// Publisher-only authorization, confirmed against the final document response.
@@ -421,12 +422,6 @@ impl EcContext {
         geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
-        let (refresh_marker_present, refresh_marker) = if settings.ec.refresh_after_days.is_some() {
-            capture_refresh_marker(req)
-        } else {
-            (false, None)
-        };
-
         let refresh_header_matches = settings.ec.refresh_after_days.is_some()
             && req
                 .headers()
@@ -454,6 +449,19 @@ impl EcContext {
             geo: geo_info,
         });
 
+        let (refresh_marker_present, refresh_markers) = if settings.ec.refresh_after_days.is_some()
+        {
+            capture_refresh_marker(req)
+        } else {
+            // Disabling renewal must still honor explicit withdrawal of a carried marker.
+            // Do not capture or authenticate marker values on this cleanup-only path.
+            (
+                consent::ec_consent_withdrawn(&consent)
+                    && refresh_marker_values(req).next().is_some(),
+                Vec::new(),
+            )
+        };
+
         log::info!(
             "EC context: present={}, cookie_present={}, consent_allowed={}, jurisdiction={}",
             ec_was_present,
@@ -476,7 +484,7 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: parsed.pull_marker_present,
             mirror_cookie: parsed.mirror_cookie,
-            refresh_marker,
+            refresh_markers,
             refresh_marker_present,
             refresh_document: false,
             refresh_header_matches,
@@ -835,7 +843,7 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_marker: None,
+            refresh_markers: Vec::new(),
             refresh_marker_present: false,
             refresh_document: false,
             refresh_header_matches: true,
@@ -870,7 +878,7 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_marker: None,
+            refresh_markers: Vec::new(),
             refresh_marker_present: false,
             refresh_document: false,
             refresh_header_matches: true,
@@ -908,7 +916,7 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_marker: None,
+            refresh_markers: Vec::new(),
             refresh_marker_present: false,
             refresh_document: false,
             refresh_header_matches: true,
