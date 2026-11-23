@@ -1,7 +1,8 @@
 //! `ts ec eids` — preview cookie EID ingestion through `GET /_ts/admin/eids`.
 
 use serde::Deserialize;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::constants::COOKIE_TS_EIDS;
+use trusted_server_core::ec::sharedid::LEGACY_SHAREDID_COOKIE;
 
 use crate::admin_client::{AdminClient, AdminRequest, UNAUTHORIZED_HINT};
 use crate::commands::ec::show::{EidView, render_eids};
@@ -90,7 +91,7 @@ fn cookie_header(ts_eids: Option<&str>, shared_id: Option<&str>) -> CliResult<St
     let mut pairs = Vec::new();
     for (flag, name, value) in [
         ("--ts-eids", COOKIE_TS_EIDS, ts_eids),
-        ("--shared-id", COOKIE_SHAREDID, shared_id),
+        ("--shared-id", LEGACY_SHAREDID_COOKIE, shared_id),
     ] {
         let Some(value) = value else { continue };
         if value.is_empty() {
