@@ -62,7 +62,6 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod record_backend;
-mod refresh;
 pub mod registry;
 pub mod sharedid;
 pub mod storage;
@@ -91,9 +90,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{
-    COOKIE_TS_EC, COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR,
-};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -222,30 +219,6 @@ fn find_cookie_in_any_field(req: &Request<EdgeBody>, name: &str) -> Option<Strin
         .map(|cookie| cookie.value().to_owned())
 }
 
-/// Visits marker candidates across all Cookie fields without allocating their values.
-pub(crate) fn refresh_marker_values(req: &Request<EdgeBody>) -> impl Iterator<Item = &str> {
-    req.headers()
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(name, _)| name.trim() == COOKIE_TS_EC_ISSUED_AT)
-        .map(|(_, value)| value.trim())
-}
-
-/// Captures bounded candidates so any authenticated recent marker can suppress renewal.
-fn capture_refresh_marker(req: &Request<EdgeBody>) -> (bool, Vec<String>) {
-    let mut present = false;
-    let markers = refresh_marker_values(req)
-        .take(refresh::MAX_MARKER_CANDIDATES)
-        .inspect(|_| present = true)
-        .filter(|value| value.len() <= refresh::MAX_MARKER_BYTES)
-        .map(str::to_owned)
-        .collect();
-    (present, markers)
-}
-
 /// Parses EC identity from request cookies in a single pass.
 ///
 /// # Errors
@@ -363,16 +336,10 @@ pub struct EcContext {
     pull_marker_present: bool,
     /// The mirror cookie's value, when the request carried it.
     mirror_cookie: Option<String>,
-    /// Bounded issuance candidates, captured only when refresh is enabled.
-    refresh_markers: Vec<String>,
-    /// Whether any issuance marker was carried, including malformed values.
-    refresh_marker_present: bool,
-    /// Publisher-only authorization, confirmed against the final document response.
-    refresh_document: bool,
-    /// Whether a carried identity header agrees with the cookie (enabled-only gate).
-    refresh_header_matches: bool,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Existing publisher document authorization, confirmed before finalization.
+    sliding_document: bool,
     /// Navigation permit issued by the router for page-load navigations.
     navigation_permit: PermitSlot,
     /// Permit for the navigation's follow-up write after its response, set
@@ -423,12 +390,7 @@ impl EcContext {
         geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
-        let refresh_header_matches = settings.ec.refresh_after_days.is_some()
-            && req
-                .headers()
-                .get_all(crate::constants::HEADER_X_TS_EC)
-                .iter()
-                .all(|header| header.to_str().ok() == parsed.cookie_ec.as_deref());
+
         let ec_value = parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v));
         let ec_was_present = ec_value.is_some();
 
@@ -449,19 +411,6 @@ impl EcContext {
             config: &settings.consent,
             geo: geo_info,
         });
-
-        let (refresh_marker_present, refresh_markers) = if settings.ec.refresh_after_days.is_some()
-        {
-            capture_refresh_marker(req)
-        } else {
-            // Disabling renewal must still honor explicit withdrawal of a carried marker.
-            // Do not capture or authenticate marker values on this cleanup-only path.
-            (
-                consent::ec_consent_withdrawn(&consent)
-                    && refresh_marker_values(req).next().is_some(),
-                Vec::new(),
-            )
-        };
 
         log::info!(
             "EC context: present={}, cookie_present={}, consent_allowed={}, jurisdiction={}",
@@ -485,11 +434,8 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: parsed.pull_marker_present,
             mirror_cookie: parsed.mirror_cookie,
-            refresh_markers,
-            refresh_marker_present,
-            refresh_document: false,
-            refresh_header_matches,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -844,11 +790,8 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_markers: Vec::new(),
-            refresh_marker_present: false,
-            refresh_document: false,
-            refresh_header_matches: true,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -879,11 +822,8 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_markers: Vec::new(),
-            refresh_marker_present: false,
-            refresh_document: false,
-            refresh_header_matches: true,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -917,11 +857,8 @@ impl EcContext {
             client_eids: None,
             pull_marker_present: false,
             mirror_cookie: None,
-            refresh_markers: Vec::new(),
-            refresh_marker_present: false,
-            refresh_document: false,
-            refresh_header_matches: true,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),

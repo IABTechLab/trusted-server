@@ -1,8 +1,6 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
-/// Authenticated issuance marker for enabled EC threshold refresh.
-pub const COOKIE_TS_EC_ISSUED_AT: &str = "ts-ec-issued-at";
 /// Retired pull-sync completeness marker; leftover cookies are expired.
 pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded

@@ -7,8 +7,7 @@ use error_stack::Report;
 
 use super::IdentityApp;
 use crate::constants::{
-    COOKIE_TS_EC, COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS,
-    COOKIE_TS_EIDS_MIRROR,
+    COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use crate::ec::consent::ec_consent_withdrawn;
@@ -114,9 +113,6 @@ impl IdentityApp {
         {
             return;
         }
-        if self.settings.ec.refresh_after_days.is_some() {
-            context.refresh_document = context.refresh_header_matches;
-        }
         context.set_eid_sync_source(EidSyncSource::Navigation);
         if let Some(permit) = NavigationPermit::classify(request) {
             context.set_navigation_permit(permit);
@@ -149,9 +145,7 @@ impl IdentityApp {
         use_store: bool,
         response: &mut Response,
     ) {
-        let explicit_withdrawal = ec_consent_withdrawn(context.consent());
-        let withdrawal = explicit_withdrawal && context.cookie_was_present();
-        let withdraw_marker = explicit_withdrawal && context.refresh_marker_present;
+        let withdrawal = ec_consent_withdrawn(context.consent()) && context.cookie_was_present();
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
         // A document revalidation inherits the cached representation: 304
         // commonly omits Content-Type, and keeps the navigation permission.
@@ -169,8 +163,8 @@ impl IdentityApp {
                         })
                     }));
         let eligible = document || ec_route;
-        if self.settings.ec.refresh_after_days.is_some() {
-            context.refresh_document &= document && !ec_route;
+        if self.settings.ec.sliding_refresh {
+            context.sliding_document = document && !ec_route;
         }
         if !eligible {
             let _ = context.take_navigation_permit();
@@ -196,7 +190,7 @@ impl IdentityApp {
                         .to_str()
                         .ok()
                         .and_then(|value| value.split_once('='))
-                        .is_none_or(|(name, _)| !self.identity_cookie(name.trim(), withdraw_marker))
+                        .is_none_or(|(name, _)| !self.identity_cookie(name.trim()))
                 })
                 .cloned()
                 .collect();
@@ -209,28 +203,10 @@ impl IdentityApp {
             if withdrawal {
                 expire_ec_cookie(&self.settings, response);
             }
-            self.finalize_refresh_withdrawal(context, response);
         }
     }
 
-    /// Expires a carried issuance marker on explicit withdrawal without record access.
-    ///
-    /// Use this on response paths that deliberately bypass full identity finalization,
-    /// such as configured asset proxies. It never renews cookies. Explicit
-    /// withdrawal also removes a carried marker after threshold refresh is disabled.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// identity_app.finalize_refresh_withdrawal(&identity.context, &mut response);
-    /// ```
-    pub fn finalize_refresh_withdrawal(&self, context: &EcContext, response: &mut Response) {
-        if ec_consent_withdrawn(context.consent()) && context.refresh_marker_present {
-            crate::ec::finalize::expire_refresh_marker(&self.settings, response);
-        }
-    }
-
-    fn identity_cookie(&self, name: &str, withdraw_marker: bool) -> bool {
+    fn identity_cookie(&self, name: &str) -> bool {
         [
             COOKIE_TS_EC,
             COOKIE_TS_EIDS,
@@ -238,8 +214,6 @@ impl IdentityApp {
             COOKIE_TS_EC_PULL_COMPLETE,
         ]
         .contains(&name)
-            || ((self.settings.ec.refresh_after_days.is_some() || withdraw_marker)
-                && name == COOKIE_TS_EC_ISSUED_AT)
             || self
                 .sharedid_storage
                 .cookie_name()

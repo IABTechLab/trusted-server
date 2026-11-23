@@ -48,24 +48,6 @@ pub(crate) fn validate_cookie_names(
     Ok(())
 }
 
-/// Rejects the issuance marker as a template-cache key when refresh is enabled.
-///
-/// # Errors
-///
-/// Returns an error naming the key policy and reserved cookie.
-pub(crate) fn validate_refresh_key_cookie(key_names: &[String]) -> Result<(), String> {
-    if key_names
-        .iter()
-        .any(|name| name == crate::constants::COOKIE_TS_EC_ISSUED_AT)
-    {
-        return Err(format!(
-            "template_cache_key_cookies must not key on Trusted Server identity cookie `{}` when ec.refresh_after_days is enabled",
-            crate::constants::COOKIE_TS_EC_ISSUED_AT
-        ));
-    }
-    Ok(())
-}
-
 /// Rejects a template-cache key cookie that names the `SharedID` cookie.
 ///
 /// The `SharedID` cookie name comes from the publisher's Prebid

@@ -10,17 +10,15 @@
 use std::collections::BTreeSet;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{HeaderValue, Response, header};
+use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
-use crate::constants::{COOKIE_TS_EC_ISSUED_AT, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
+use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{
-    COOKIE_MAX_AGE, append_cookie, create_ec_cookie, expire_ec_cookie, set_ec_cookie,
-};
+use super::cookies::{append_cookie, expire_ec_cookie, set_ec_cookie};
 use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
@@ -35,6 +33,9 @@ use super::sharedid::{
 };
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
+
+// The EID mirror keeps its independent one-year lifetime.
+const MIRROR_COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 /// TS-managed response headers tied to EC identity output.
 const EC_RESPONSE_HEADERS: &[&str] = &[
@@ -136,7 +137,7 @@ fn apply_mirror(
         MirrorCookie::Set(value) => append_cookie(
             response,
             &format!(
-                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={MIRROR_COOKIE_MAX_AGE}",
                 value.as_str()
             ),
         ),
@@ -229,9 +230,6 @@ async fn finalize_response_inner(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        if consent_withdrawn && ec_context.refresh_marker_present {
-            expire_refresh_marker(settings, response);
-        }
         expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
         finalize_unusable_consent(
             settings,
@@ -245,6 +243,7 @@ async fn finalize_response_inner(
         return navigation;
     }
 
+    let mut page_write_allows_renewal = true;
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
         let collected = if ec_context.eid_sync_source().is_some() || ec_context.ec_generated() {
             drop_opted_out_sharedid_updates(
@@ -281,6 +280,7 @@ async fn finalize_response_inner(
         } else {
             false
         };
+        page_write_allows_renewal = page_write_ok;
         // The follow-up write is allowed only once consent allows the EC and
         // the page-load write succeeded or had nothing to change.
         if page_write_ok && let Some(after_response) = after_response {
@@ -291,15 +291,47 @@ async fn finalize_response_inner(
             apply_sharedid_write_back(settings, ec_context, graph, registry, sharedid, response)
                 .await;
         }
-        if page_write_ok {
-            refresh_returning_cookie(settings, ec_context, graph, response).await;
-        }
     } else if ec_context.ec_generated() {
         // Do not emit a generated EC when there is no KV graph: that would
         // mint a browser cookie with no backing identity-graph row.
         log::info!("Skipping generated EC response write because KV graph is unavailable");
     }
+    if settings.ec.sliding_refresh && page_write_allows_renewal {
+        renew_returning_cookie(settings, ec_context, response);
+    }
     navigation
+}
+
+/// Reissues a held cookie without record I/O after the existing document/write gates.
+fn renew_returning_cookie(
+    settings: &Settings,
+    context: &EcContext,
+    response: &mut Response<EdgeBody>,
+) {
+    if !context.sliding_document
+        || context.ec_generated()
+        || ec_consent_withdrawn(context.consent())
+    {
+        return;
+    }
+    let Some(ec_id) = context
+        .existing_cookie_ec_id()
+        .filter(|id| Some(*id) == context.ec_value() && is_valid_ec_id(id))
+    else {
+        return;
+    };
+    let state_allows_renewal = match context.kv_snapshot() {
+        EcKvSnapshot::NotRead => true,
+        EcKvSnapshot::Present {
+            ec_id: stored_id,
+            entry,
+            ..
+        } => stored_id == ec_id && entry.consent.ok,
+        EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => false,
+    };
+    if state_allows_renewal {
+        set_ec_cookie(settings, response, ec_id);
+    }
 }
 
 /// Shared inputs for the navigation's single write.
@@ -636,92 +668,6 @@ pub fn set_ec_cookie_on_response(
 ) {
     if let Some(ec_id) = ec_context.ec_value() {
         set_ec_cookie(settings, response, ec_id);
-        if settings.ec.refresh_after_days.is_some()
-            && let Some(now) = super::checked_current_timestamp()
-            && let Some(marker) = refresh_marker_header(settings, ec_id, now)
-        {
-            response.headers_mut().append(header::SET_COOKIE, marker);
-        }
-    }
-}
-
-fn refresh_marker_header(settings: &Settings, ec_id: &str, now: u64) -> Option<HeaderValue> {
-    let marker = super::refresh::encode_marker(
-        settings.ec.passphrase.expose(),
-        &settings.publisher.domain,
-        ec_id,
-        now,
-    )?;
-    HeaderValue::from_str(&format!(
-        "{COOKIE_TS_EC_ISSUED_AT}={marker}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}; HttpOnly",
-        settings.publisher.ec_cookie_domain(),
-    )).ok()
-}
-
-pub(crate) fn expire_refresh_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
-    append_cookie(
-        response,
-        &format!(
-            "{COOKIE_TS_EC_ISSUED_AT}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
-            settings.publisher.ec_cookie_domain(),
-        ),
-    );
-}
-
-async fn refresh_returning_cookie(
-    settings: &Settings,
-    context: &EcContext,
-    graph: &KvIdentityGraph,
-    response: &mut Response<EdgeBody>,
-) {
-    let Some(days) = settings.ec.refresh_after_days else {
-        return;
-    };
-    if !context.refresh_document || context.ec_generated() {
-        return;
-    }
-    let Some(ec_id) = context
-        .existing_cookie_ec_id()
-        .filter(|id| Some(*id) == context.ec_value() && is_valid_ec_id(id))
-        .map(str::to_owned)
-    else {
-        return;
-    };
-    let Some(now) = super::checked_current_timestamp() else {
-        return;
-    };
-    if context.refresh_markers.iter().any(|marker| {
-        !super::refresh::should_refresh(
-            settings.ec.passphrase.expose(),
-            &settings.publisher.domain,
-            &ec_id,
-            Some(marker),
-            now,
-            days.seconds(),
-        )
-    }) {
-        return;
-    }
-    // A refresh-only read must not change what mirror or after-response processing sees.
-    let loaded = if matches!(context.kv_snapshot(), EcKvSnapshot::NotRead) {
-        Some(graph.load_snapshot(&ec_id).await)
-    } else {
-        None
-    };
-    let snapshot = loaded.as_ref().unwrap_or(context.kv_snapshot());
-    if !snapshot
-        .entry_for(&ec_id)
-        .is_some_and(|entry| entry.consent.ok)
-    {
-        return;
-    }
-    // Construct both headers first: renewal without a new marker would repeat on every visit.
-    if let (Ok(cookie), Some(marker)) = (
-        HeaderValue::from_str(&create_ec_cookie(settings, &ec_id)),
-        refresh_marker_header(settings, &ec_id, now),
-    ) {
-        response.headers_mut().append(header::SET_COOKIE, cookie);
-        response.headers_mut().append(header::SET_COOKIE, marker);
     }
 }
 

@@ -86,11 +86,13 @@ proxy_secret = "publisher_proxy_secret"
 # REQUIRED — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
+# Proposal: configurable EC lifetime (1-400 days); default remains one year.
+# max_age_days = 365
+# Proposal for DEC-13: same-value renewal per eligible visit, OFF by default.
+# Do not enable before the decision and returning-reader acceptance rule change.
+# sliding_refresh = false
 # Secret Store key for the secret used to derive EC identifiers.
 passphrase = "ec_passphrase"
-# DEC-13 proposal only: off by default; do not enable before the decision.
-# Browser lifetime only; does not extend backing record retention.
-# refresh_after_days = 30
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
 # Optional identity-provider budgets (see [[ec.identity_providers]] below).

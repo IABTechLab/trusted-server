@@ -3,7 +3,10 @@ use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use glob::{MatchOptions, Pattern};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeOwned, Visitor},
+};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -795,68 +798,82 @@ pub struct ProviderSecrets {
     pub token: Option<Redacted<String>>,
 }
 
-/// Checked EC cookie refresh interval, from 1 through 364 days.
+/// Validated EC cookie lifetime in days, from 1 through 400 inclusive.
 ///
-/// Serialized as an integer in the typed application configuration.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+/// Defaults to 365 days. The private value ensures typed configuration cannot
+/// bypass the same bounds enforced during TOML and JSON deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct RefreshAfterDays(u16);
+pub struct MaxAgeDays(u16);
 
-impl TryFrom<u64> for RefreshAfterDays {
-    type Error = &'static str;
-
-    fn try_from(days: u64) -> Result<Self, Self::Error> {
-        if (1..=364).contains(&days) {
-            Ok(Self(days as u16))
-        } else {
-            Err("ec.refresh_after_days must be an integer between 1 and 364 days")
-        }
+impl Default for MaxAgeDays {
+    fn default() -> Self {
+        Self(365)
     }
 }
 
-impl RefreshAfterDays {
-    pub(crate) fn seconds(self) -> u64 {
-        u64::from(self.0)
-            .checked_mul(86_400)
-            .expect("should fit checked refresh days in seconds")
+impl TryFrom<u16> for MaxAgeDays {
+    type Error = Report<TrustedServerError>;
+
+    fn try_from(days: u16) -> Result<Self, Self::Error> {
+        error_stack::ensure!(
+            (1..=400).contains(&days),
+            TrustedServerError::Configuration {
+                message: "ec.max_age_days must be an integer between 1 and 400".to_owned(),
+            }
+        );
+        Ok(Self(days))
     }
 }
 
-impl<'de> Deserialize<'de> for RefreshAfterDays {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(RefreshAfterDaysVisitor)
+impl MaxAgeDays {
+    /// Returns the cookie lifetime in seconds.
+    ///
+    /// The validated 400-day upper bound fits within an [`i32`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::settings::MaxAgeDays;
+    ///
+    /// let lifetime = MaxAgeDays::try_from(30).expect("should accept 30 days");
+    /// assert_eq!(lifetime.as_seconds(), 2_592_000);
+    /// ```
+    #[must_use]
+    pub fn as_seconds(self) -> i32 {
+        i32::from(self.0) * 24 * 60 * 60
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
-struct RefreshAfterDaysVisitor;
+struct MaxAgeDaysVisitor;
 
-impl serde::de::Visitor<'_> for RefreshAfterDaysVisitor {
-    type Value = RefreshAfterDays;
+impl Visitor<'_> for MaxAgeDaysVisitor {
+    type Value = MaxAgeDays;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ec.refresh_after_days as an integer between 1 and 364 days")
+        formatter.write_str("ec.max_age_days as an integer between 1 and 400")
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        RefreshAfterDays::try_from(value).map_err(E::custom)
+    fn visit_u64<E: de::Error>(self, days: u64) -> Result<Self::Value, E> {
+        let days = u16::try_from(days)
+            .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(days), &self))?;
+        MaxAgeDays::try_from(days).map_err(E::custom)
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        u64::try_from(value)
-            .ok()
-            .and_then(|days| RefreshAfterDays::try_from(days).ok())
-            .ok_or_else(|| {
-                E::custom("ec.refresh_after_days must be an integer between 1 and 364 days")
-            })
+    fn visit_i64<E: de::Error>(self, days: i64) -> Result<Self::Value, E> {
+        let days = u16::try_from(days)
+            .map_err(|_| E::invalid_value(de::Unexpected::Signed(days), &self))?;
+        MaxAgeDays::try_from(days).map_err(E::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxAgeDays {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(MaxAgeDaysVisitor)
     }
 }
 
@@ -867,6 +884,16 @@ impl serde::de::Visitor<'_> for RefreshAfterDaysVisitor {
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
+    /// EC cookie lifetime in days, from 1 through 400. Defaults to 365.
+    #[serde(default, skip_serializing_if = "MaxAgeDays::is_default")]
+    pub max_age_days: MaxAgeDays,
+
+    /// Renew a held EC on eligible, consented publisher documents without extra reads.
+    ///
+    /// Defaults to disabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sliding_refresh: bool,
+
     /// Publisher passphrase used as HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
@@ -878,12 +905,6 @@ pub struct Ec {
     /// Explicit persistence provider or the Fastly store-only shorthand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<crate::ec::storage::EcStorage>,
-
-    /// Refresh the same EC cookie after this many days on eligible documents.
-    ///
-    /// Omission disables threshold refresh and its issuance companion cookie.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_after_days: Option<RefreshAfterDays>,
 
     /// Maximum number of pull-sync lookups dispatched per navigation; 0
     /// means no limit.
@@ -956,10 +977,11 @@ pub struct Ec {
 impl Default for Ec {
     fn default() -> Self {
         Self {
+            max_age_days: MaxAgeDays::default(),
+            sliding_refresh: false,
             passphrase: Redacted::default(),
             ec_store: None,
             storage: None,
-            refresh_after_days: None,
             pull_sync_concurrency: 0,
             cluster_trust_threshold: 0,
             cluster_recheck_secs: 0,
@@ -3808,16 +3830,6 @@ impl Settings {
         }
 
         let sharedid_storage = self.sharedid_storage();
-        if self.ec.refresh_after_days.is_some()
-            && sharedid_storage.cookie_name().is_some_and(|name| {
-                name == crate::constants::COOKIE_TS_EC_ISSUED_AT
-                    || format!("{name}_cst") == crate::constants::COOKIE_TS_EC_ISSUED_AT
-            })
-        {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "ec.refresh_after_days requires the SharedID cookie and its _cst companion to differ from ts-ec-issued-at".to_owned(),
-            }));
-        }
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3831,14 +3843,6 @@ impl Settings {
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
             co.validate_runtime()
-                .and_then(|()| {
-                    if self.ec.refresh_after_days.is_some() {
-                        crate::cookies::template_cache_policy::validate_refresh_key_cookie(
-                            co.template_cache_key_cookies(),
-                        )?;
-                    }
-                    Ok(())
-                })
                 .and_then(|()| {
                     crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
                         co.template_cache_key_cookies(),
@@ -4869,6 +4873,79 @@ mod tests {
             assert!(
                 serialized.get(field).is_none(),
                 "should omit default {field} for older binaries: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_defaults_preserve_serialized_shape() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without lifetime fields");
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize EC settings");
+        assert!(
+            serialized.get("max_age_days").is_none(),
+            "should omit default lifetime"
+        );
+        assert!(
+            serialized.get("sliding_refresh").is_none(),
+            "should omit disabled refresh"
+        );
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_accepts_bounds_and_refresh() {
+        for days in [1, 30, 365, 400] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]",
+                &format!("[ec]\nmax_age_days = {days}\nsliding_refresh = true"),
+            );
+            let settings = Settings::from_toml(&toml).expect("should accept valid lifetime");
+            let serialized =
+                serde_json::to_value(settings.ec).expect("should serialize EC settings");
+            assert_eq!(
+                serialized["sliding_refresh"],
+                json!(true),
+                "should retain enabled refresh"
+            );
+            if days != 365 {
+                assert_eq!(
+                    serialized["max_age_days"],
+                    json!(days),
+                    "should retain custom lifetime"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_rejects_invalid_toml_and_json() {
+        for invalid in ["0", "401", "-1", "1.5", "true", "\"30\""] {
+            let toml = crate_test_settings_str()
+                .replace("[ec]", &format!("[ec]\nmax_age_days = {invalid}"));
+            let error = Settings::from_toml(&toml).expect_err("should reject invalid lifetime");
+            assert!(
+                format!("{error:?}").contains("ec.max_age_days"),
+                "should identify lifetime field: {error:?}"
+            );
+        }
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse settings");
+        for invalid in [
+            json!(0),
+            json!(401),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("30"),
+            json!(null),
+        ] {
+            let mut value = serde_json::to_value(&settings).expect("should serialize settings");
+            value["ec"]["max_age_days"] = invalid;
+            let error =
+                Settings::from_json_value(value).expect_err("should reject invalid JSON lifetime");
+            assert!(
+                format!("{error:?}").contains("ec.max_age_days"),
+                "should identify lifetime field: {error:?}"
             );
         }
     }

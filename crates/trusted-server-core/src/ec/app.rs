@@ -15,11 +15,11 @@ mod lookups;
 
 pub use lookups::{AfterResponseLookups, IdentityLookups, joined_cookie_header};
 mod lifecycle;
-#[cfg(test)]
-mod refresh_tests;
 mod route;
 #[cfg(test)]
 mod route_tests;
+#[cfg(test)]
+mod sliding_tests;
 pub use lifecycle::IdentityRequest;
 pub use route::EC_PATH;
 

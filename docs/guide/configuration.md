@@ -879,59 +879,55 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                               | Type            | Required | Description                                                                           |
-| ----------------------------------- | --------------- | -------- | ------------------------------------------------------------------------------------- |
-| `passphrase`                        | String          | Yes      | Publisher passphrase used as HMAC key                                                 |
-| `ec_store`                          | String or null  | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
-| `storage`                           | Table           | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
-| `refresh_after_days`                | Integer or null | No       | DEC-13 proposal: omitted by default; 1–364 days; browser-cookie renewal only          |
-| `pull_sync_concurrency`             | Integer         | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
-| `cluster_trust_threshold`           | Integer         | No       | Cluster size threshold for identity trust decisions                                   |
-| `cluster_recheck_secs`              | Integer         | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
-| `partners`                          | Array           | No       | Static partner registry entries                                                       |
-| `identity_budget_ms`                | Integer         | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
-| `identity_after_response_budget_ms` | Integer         | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
-| `identity_providers`                | Array           | No       | Server-side identity providers (see below)                                            |
+| Field                               | Type           | Required | Description                                                                           |
+| ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                 |
+| `max_age_days`                      | Integer        | No       | Positive EC cookie lifetime, 1–400 days; default 365                                  |
+| `sliding_refresh`                   | Boolean        | No       | Same-value renewal on every eligible visit; default false                             |
+| `ec_store`                          | String or null | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
+| `storage`                           | Table          | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                                   |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
+| `partners`                          | Array          | No       | Static partner registry entries                                                       |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
 
-### Threshold refresh proposal (DEC-13)
+### Configurable EC lifetime and sliding expiration proposal
 
-**Proposal for DEC-13; off by default; do not merge until DEC-13 is decided.**
-The optional `ec.refresh_after_days` integer accepts 1 through 364 days.
-Publish it through the existing typed app-config and `ts config push` flow;
-no new serving-process environment setting is read. Axum must load its updated
-prepared snapshot on restart. Removing the field disables the feature and
-omits it from published configuration for older-binary compatibility.
+**Proposal for DEC-13; off by default. Do not merge until DEC-13 is formally
+recorded as decided and #1595's returning-reader no-Set-Cookie rule is adjusted.**
 
-On an eligible consented publisher document with a matching live record,
-a due `ts-ec-issued-at` marker renews the same `ts-ec` value for one year and
-sets a fresh signed HttpOnly marker. A missing or invalid marker bootstraps
-by renewing both together. Assets, API requests, no-consent responses and
-withdrawal never renew returning cookies. If duplicate markers are carried,
-any authenticated recent copy among the first eight candidates suppresses
-renewal; malformed and oversized copies also count toward that limit. Explicit withdrawal deletes a
-carried marker even after the setting is removed. While disabled, unsupported
-EC routes probe for marker-name presence and return the bare 501 without reading
-the request body or identity/consent state when none is present. Only explicit
-withdrawal emits deletion; marker values are not captured or verified, and no
-refresh record read or new cache-key restriction is introduced.
-Every other disabled path keeps its existing behavior.
+`ec.max_age_days` defaults to 365 and accepts only integers from 1 through 400.
+It controls positive `ts-ec` issuance on creation, rotation and optional renewal;
+withdrawal remains Max-Age=0. Omitted defaults produce the existing one-year
+cookie attributes and configuration payload. Publish settings through app config
+and `ts config push`; no new serving environment read is added.
 
-Disabling stops renewal but leaves a carried marker until expiry or explicit
-withdrawal. Re-enabling can reuse it only if it still verifies for the current EC.
-The opaque marker can link requests while carried, even if the EC cookie is gone;
-withdrawal cleanup reduces this re-linking risk across disable/re-enable transitions.
-It does not erase logs or guarantee that the browser accepts cookie deletion.
-Older binaries that predate this marker cannot clean it up after rollback.
+`ec.sliding_refresh = true` renews the same held EC with its full configured
+lifetime on each eligible, consented Fastly/Axum publisher document. Existing
+method/status/304 and asset/API eligibility rules are retained. Renewal adds no
+record reads or writes; unread/unavailable state permits it, while known missing,
+revoked, failed or write-failed state suppresses it. **An out-of-band revocation
+of an unread record is not observed until a later request reads that record.**
 
-Renewal and bootstrap responses are private under the existing Set-Cookie
-cache policy. Other visits can still be private for independent reasons.
-**Renewal extends browser lifetime only: it does not extend backing-record
-retention.** Record expiry can still lead to legitimate orphan rotation.
-The extra signed cookie adds request bytes; lost, rejected or replayed cookies
-can cause additional renewals. This does not guarantee Safari/ITP persistence.
-See the [proposal design](https://github.com/IABTechLab/trusted-server/blob/proposal/1595-ec-threshold-refresh/docs/superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
-for protocol, rollout and qualification limits. If DEC-13 chooses never
-refresh, this proposal will be closed.
+Every renewing final response is private and non-storable by shared caches.
+Some returning pages are already private because of assembly or ad synthesis;
+other otherwise-shareable pages lose that cacheability when renewed. A neutral,
+cookie-free raw template may still be cached independently. EC renewal does not
+extend backing-record retention. SharedID, its consent companion and the EID
+mirror keep their independent lifetimes and unchanged-value suppression.
+
+Cloudflare and Spin do not issue EC cookies today and remain unchanged for both
+switch values; enabling renewal there is follow-up work. With no new setting,
+responses remain identical to #1646. Explicitly changing the lifetime affects
+positive issuance even when renewal is disabled. Browser retention can still be
+shorter than requested; local tests do not qualify Safari/ITP behavior.
+
+The repository proposal is
+`docs/superpowers/specs/2026-11-23-ec-sliding-expiration-proposal-design.md`.
+It is intentionally outside the published documentation site.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

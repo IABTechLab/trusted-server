@@ -17,7 +17,7 @@ use crate::ec::eid_types::UnixSeconds;
 use crate::ec::mirror::{MirrorCookie, build_mirror};
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::apply_sharedid_write_back;
-use crate::ec::{EidSyncSource, current_timestamp, refresh_marker_values};
+use crate::ec::{EidSyncSource, current_timestamp};
 use crate::error::{IntoHttpResponse as _, http_error};
 use crate::http_util::read_request_body;
 use crate::platform::RuntimeServices;
@@ -112,31 +112,11 @@ impl IdentityApp {
             return response;
         }
         if self.identity_graph().is_none() {
-            let mut result = response(StatusCode::NOT_IMPLEMENTED);
-            if self.settings.ec.refresh_after_days.is_none()
-                && refresh_marker_values(&request).next().is_none()
-            {
-                return result;
-            }
-            // Preserve the unsupported response while still honoring accepted withdrawal.
-            // Validate posted consent before cleanup; rejected events keep the original 501.
-            let request = if request.method() == Method::POST {
-                match prepare_snapshot(services, request).await {
-                    Ok(request) => request,
-                    Err(_) => return result,
-                }
-            } else {
-                request
-            };
-            if let Ok(identity) = self.read_request(services, &request) {
-                self.finalize_refresh_withdrawal(&identity.context, &mut result);
-            }
-            return result;
+            return response(StatusCode::NOT_IMPLEMENTED);
         }
         if request.method() == Method::GET {
             let mut response = response(StatusCode::NO_CONTENT);
             if let Ok(mut identity) = self.read_request(services, &request) {
-                self.finalize_refresh_withdrawal(&identity.context, &mut response);
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
                 if identity.context.ec_allowed()
                     && let Some(graph) = identity.graph.as_ref()

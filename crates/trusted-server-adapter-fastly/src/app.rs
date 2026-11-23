@@ -881,14 +881,7 @@ async fn dispatch_fallback(
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            let mut response =
-                dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
-            // Keep assets outside record finalization; marker withdrawal also applies
-            // when threshold refresh is unset.
-            state
-                .identity
-                .finalize_refresh_withdrawal(&ec.ec_context, &mut response);
-            return response;
+            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
         }
 
         state
@@ -4355,119 +4348,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_asset_route_withdrawal_cleans_marker_without_identity_finalization() {
-        let mut missing_cleanup = Vec::new();
-        for method in [Method::GET, Method::HEAD] {
-            for (enabled, withdrawn) in [(true, true), (false, true), (true, false), (false, false)]
-            {
-                let mut settings = test_settings();
-                settings.proxy.asset_routes.push(
-                    trusted_server_core::settings::ProxyAssetRoute::new(
-                        "/assets/",
-                        "https://assets.example.com",
-                    ),
-                );
-                if enabled {
-                    let mut ec =
-                        serde_json::to_value(&settings.ec).expect("should serialize EC settings");
-                    ec["refresh_after_days"] = serde_json::json!(1);
-                    settings.ec =
-                        serde_json::from_value(ec).expect("should enable issuance marker cleanup");
-                }
-                let mut state = build_state_from_settings(settings)
-                    .expect("should build asset dispatch fixture");
-                Arc::get_mut(&mut state)
-                    .expect("should own isolated test state")
-                    .identity = trusted_server_core::ec::app::IdentityApp::build(
-                    Arc::clone(&state.settings),
-                    trusted_server_core::ec::app::IdentityPlatform::default(),
-                )
-                .expect("should build identity app without record storage");
-                assert!(
-                    state.identity.identity_graph().is_none(),
-                    "should exercise cleanup without identity KV access"
-                );
-                let router = TrustedServerApp::routes_for_state(&state);
-                let clock = TestClock::new();
-                let upstream = ScriptedHttpClient::new(&clock);
-                upstream.respond_to(
-                    method.clone(),
-                    "https://assets.example.com/assets/banner.png",
-                    ScriptedReply::status(StatusCode::OK)
-                        .header("content-type", "image/png")
-                        .body("example-asset"),
-                );
-                let mut request = empty_request(method.clone(), "/assets/banner.png");
-                request.headers_mut().insert(
-                    header::COOKIE,
-                    HeaderValue::from_static(if withdrawn {
-                        "us_privacy=1YYN; ts-ec-issued-at=carried"
-                    } else {
-                        "us_privacy=1YNN; ts-ec-issued-at=carried"
-                    }),
-                );
-                insert_outbound_client(&mut request, upstream.http_client());
-                let client_ip = Some("192.0.2.7".parse().expect("should parse example client IP"));
-                request.extensions_mut().insert(ClientInfo {
-                    client_ip,
-                    ..ClientInfo::default()
-                });
-                request.extensions_mut().insert(RequestGeo::new(
-                    client_ip,
-                    Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
-                ));
-                let response = block_on(router.oneshot(request))
-                    .expect("should route configured asset request");
-                assert_eq!(
-                    response.status(),
-                    StatusCode::OK,
-                    "should preserve successful asset dispatch"
-                );
-                assert_eq!(
-                    upstream.requests().len(),
-                    1,
-                    "should fetch only the configured asset origin"
-                );
-                assert!(
-                    response
-                        .extensions()
-                        .get::<super::EcFinalizeState>()
-                        .is_none(),
-                    "should keep asset dispatch outside identity finalization"
-                );
-                let cookies = response
-                    .headers()
-                    .get_all(header::SET_COOKIE)
-                    .iter()
-                    .map(|value| value.to_str().expect("should decode response cookie"))
-                    .collect::<Vec<_>>();
-                if withdrawn {
-                    if !cookies.iter().any(|value| {
-                        value.starts_with("ts-ec-issued-at=;") && value.contains("Max-Age=0")
-                    }) {
-                        missing_cleanup.push(method.clone());
-                    }
-                    assert!(
-                        cookies
-                            .iter()
-                            .all(|value| value.starts_with("ts-ec-issued-at=")),
-                        "should only expire the issuance marker without an EC cookie"
-                    );
-                } else {
-                    assert!(
-                        cookies.is_empty(),
-                        "should preserve asset cookies enabled={enabled} withdrawn={withdrawn}"
-                    );
-                }
-            }
-        }
-        assert!(
-            missing_cleanup.is_empty(),
-            "should clean marker-only withdrawal on configured assets: {missing_cleanup:?}"
-        );
-    }
-
     /// Streaming runtime services whose `EdgeZero` outbound requests go to `upstream`.
     fn runtime_services_with_upstream(
         upstream: &ScriptedHttpClient,
@@ -5030,6 +4910,121 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
         req
+    }
+
+    #[test]
+    fn sliding_ec_renews_held_publisher_identity_before_terminal_privacy() {
+        let identity = format!("{}.test01", "a".repeat(64));
+        for sliding in [false, true] {
+            let mut settings = test_settings();
+            settings.auction.enabled = false;
+            settings.auction.providers.clear();
+            settings.creative_opportunities = None;
+            let mut configured =
+                serde_json::to_value(settings).expect("should serialize Fastly route settings");
+            configured["ec"]["sliding_refresh"] = serde_json::json!(sliding);
+            configured["ec"]["max_age_days"] = serde_json::json!(30);
+            configured["ec"]["ec_store"] = serde_json::Value::Null;
+            configured["ec"]["storage"] = serde_json::Value::Null;
+            let settings: Settings = serde_json::from_value(configured)
+                .expect("should configure sliding EC without storage");
+            let state = app_state_for_settings(settings);
+            let router = TrustedServerApp::routes_for_state(&state);
+            let clock = TestClock::new();
+            let origin = ScriptedHttpClient::new(&clock);
+            for (path, mime) in [("/article", "text/html"), ("/asset.css", "text/css")] {
+                origin.respond_to(
+                    Method::GET,
+                    &format!("{}{path}", state.settings.publisher.origin_url),
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", mime)
+                        .header("cache-control", "public, max-age=600")
+                        .header("surrogate-control", "max-age=600")
+                        .body("<html><head></head><body>Example article</body></html>"),
+                );
+            }
+            for (method, path, document) in [
+                (Method::GET, "/article", true),
+                (Method::GET, "/asset.css", false),
+                (Method::GET, "/_ts/api/v1/ec", true),
+                (Method::POST, "/_ts/api/v1/ec", true),
+                (Method::GET, "/health", false),
+                (Method::POST, "/_ts/api/v1/identify", false),
+            ] {
+                let mut request =
+                    browser_request(method, path, if document { "document" } else { "empty" });
+                request.extensions_mut().insert(ClientInfo {
+                    client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    ..ClientInfo::default()
+                });
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("us_privacy=1YNN; ts-ec={identity}"))
+                        .expect("should encode held identity"),
+                );
+                super::take_navigation_lookups();
+                let mut response = route_with_host_geo(&router, request, &origin);
+                let navigation = super::take_navigation_lookups();
+                if let Some(mut ec_state) =
+                    response.extensions_mut().remove::<super::EcFinalizeState>()
+                {
+                    clock.drive(crate::apply_edgezero_ec_finalize(
+                        &state,
+                        &mut ec_state,
+                        navigation.page,
+                        &mut response,
+                    ));
+                } else {
+                    assert_eq!(
+                        path, "/_ts/api/v1/ec",
+                        "should skip finalization only for the unsupported EC route"
+                    );
+                }
+                // The entry point runs this after identity finalization and late filter effects.
+                crate::apply_terminal_response_effects(&mut response, None);
+                if path == "/_ts/api/v1/ec" {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NOT_IMPLEMENTED,
+                        "should preserve unsupported EC route"
+                    );
+                }
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .collect();
+                if path == "/article" && sliding {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "should serve actual publisher HTML"
+                    );
+                    assert_eq!(cookies.len(), 1, "should issue exactly one renewal");
+                    assert_eq!(
+                        cookies[0].to_str().expect("should encode EC renewal"),
+                        format!(
+                            "ts-ec={identity}; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000; HttpOnly"
+                        ),
+                        "should preserve identity and attributes with full configured age"
+                    );
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "private, max-age=0",
+                        "should enforce privacy after the late cookie is added"
+                    );
+                    assert!(
+                        !response.headers().contains_key("surrogate-control"),
+                        "should remove the origin shared cache policy"
+                    );
+                } else {
+                    assert!(
+                        cookies.is_empty(),
+                        "should not renew this response: {path}, enabled={sliding}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

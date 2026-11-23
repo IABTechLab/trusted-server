@@ -1413,3 +1413,103 @@ async fn identify_and_batch_sync_answer_other_methods_405_locally() {
     );
     origin.assert_no_requests();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sliding_ec_configuration_preserves_unsupported_platform_responses() {
+    let mut baseline = Vec::new();
+    for configuration in [None, Some(false), Some(true)] {
+        let mut configured =
+            serde_json::to_value(test_settings()).expect("should serialize route settings");
+        if let Some(sliding) = configuration {
+            configured["ec"]["sliding_refresh"] = serde_json::json!(sliding);
+            configured["ec"]["max_age_days"] = serde_json::json!(30);
+        }
+        let settings: Settings =
+            serde_json::from_value(configured).expect("should configure EC sliding refresh");
+        let cases = [
+            (Method::GET, "/article", StatusCode::OK),
+            (Method::HEAD, "/article", StatusCode::OK),
+            (Method::GET, "/asset.css", StatusCode::OK),
+            (Method::GET, "/_ts/api/v1/ec", StatusCode::NOT_IMPLEMENTED),
+            (Method::POST, "/_ts/api/v1/ec", StatusCode::NOT_IMPLEMENTED),
+            (
+                Method::GET,
+                "/_ts/api/v1/identify",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                Method::POST,
+                "/_ts/api/v1/batch-sync",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                Method::POST,
+                "/_ts/api/v1/identify",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+        ];
+        for (index, (method, path, status)) in cases.into_iter().enumerate() {
+            let origin = ScriptedHttpClient::new(&TestClock::new());
+            if !path.starts_with("/_ts/") {
+                origin.respond_to(
+                    method.clone(),
+                    &format!("{ORIGIN}{path}"),
+                    ScriptedReply::status(StatusCode::OK)
+                        .header(
+                            "content-type",
+                            if path.ends_with(".css") {
+                                "text/css"
+                            } else {
+                                "text/html"
+                            },
+                        )
+                        .header("cache-control", "public, max-age=60")
+                        .body("<html><head></head><body>Example article</body></html>"),
+                );
+            }
+            let request = request_builder()
+                .method(method)
+                .uri(format!("https://test-publisher.example.com{path}"))
+                .header(header::HOST, "test-publisher.example.com")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header(header::USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36")
+                .header(header::ACCEPT, "text/html")
+                .header(
+                    header::COOKIE,
+                    format!("us_privacy=1YNN; ts-ec={}.test01", "a".repeat(64)),
+                )
+                .body(Body::empty())
+                .expect("should build returning reader request");
+            let router = TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build configured platform router");
+            let response = route_to_origin(router, request, &origin).await;
+            assert_eq!(
+                response.status(),
+                status,
+                "should preserve routed status for {path}"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not issue identity cookies on this platform for {path}"
+            );
+            let head = (response.status(), response.headers().clone());
+            let body = response
+                .into_body()
+                .into_bytes()
+                .expect("should collect routed response");
+            if configuration.is_some() {
+                assert_eq!(
+                    (head, body),
+                    baseline[index],
+                    "should preserve complete HTTP response for {path}"
+                );
+            } else {
+                baseline.push((head, body));
+            }
+            if path.starts_with("/_ts/") {
+                origin.assert_no_requests();
+            }
+        }
+    }
+}
