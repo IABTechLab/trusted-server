@@ -22,8 +22,9 @@ second configuration conversion or changing provider behavior.
       from `docs/guide/cli.md` and `docs/guide/axum-dev.md`, including dotenv,
       restart, and explicit environment responsibilities.
 - [x] Extend `scripts/smoke-axum.sh` with malformed-envelope rejection before
-      listen. For the positive case, point `CONFIG_DIR` at the original push
-      directory, rather than extract and reconstruct the envelope with jq.
+      listen. Run the positive case through `ts serve --adapter axum` from the
+      isolated project, with `CONFIG_DIR` pointing at the original push directory.
+      Do not extract and reconstruct the positive envelope with jq.
 - [x] Run `cargo test -p trusted-server-adapter-axum --test startup`,
       `scripts/smoke-axum.sh`, `cargo fmt --all -- --check`,
       `cargo clippy-cli`, shellcheck for the changed smoke, the runtime env
@@ -32,8 +33,8 @@ second configuration conversion or changing provider behavior.
       documented Option B setup verbatim in the disposable worktree with an
       owned config copy; a local origin serves the tracked overlay's port. Verify
       health, configured-origin response and public URL rewrite through serve.
-- [ ] Explain final changes, sign and locally verify commits, push without
+- [x] Explain final changes, sign and locally verify commits, push without
       rewriting history, confirm GitHub Verified, create a draft PR against
       #1646 using the repository template and watch every hosted check finish.
-- [ ] Independently self-review the complete PR, resolve findings and update
+- [x] Independently self-review the complete PR, resolve findings and update
       its description. Clean up owned processes, scratch files and worktrees.

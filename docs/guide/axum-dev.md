@@ -34,6 +34,11 @@ local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
 envelope and active secret references, and installs immutable snapshots and
 the actual router before listening.
 
+The positive case runs `ts serve --adapter axum` from the isolated project, so
+the CLI must discover its `edgezero.toml` and pass the prepared-store inputs to
+the server. The copied manifest launches the already-built Axum binary instead
+of rebuilding through Cargo. Teardown stops both the CLI and its server.
+
 The smoke also supplies a writable `EDGEZERO__ADAPTER__DATA_DIR`. The record
 store is always declared and EdgeZero prepares its local provider before TS
 loads application config, even when `ec.storage` is absent. Every local-provider
