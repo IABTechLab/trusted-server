@@ -222,6 +222,7 @@ const proof = {
   events: [],
   artifacts: {},
   limitations: [
+    'grace expiry not tested',
     'synthetic geography and local consent policy only',
     'no live AWS IAM or browser acceptance',
     'direct app executable, not deployment wrapper',

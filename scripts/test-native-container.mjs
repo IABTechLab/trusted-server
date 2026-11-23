@@ -262,6 +262,12 @@ http.createServer((req, res) => {
       /Trusted Server initialization failed/,
       'must reject application inputs, not fail the launcher'
     )
+    if (label === 'missing-secret')
+      assert.match(
+        logs,
+        /is missing in trusted_server_secrets/,
+        'must reject a missing secret from the prepared secret store'
+      )
     assert.doesNotMatch(
       logs,
       /\bevent=lifecycle\b[^\n]*\bphase=ready\b/,

@@ -5,7 +5,7 @@ and after-response record-write shutdown, plus missing-secret startup rejection.
 
 **Architecture:** Extend the existing image scripts and their retained JSON
 proof. Use the current drained scheduler and DynamoDB Local; change no production
-Rust code, Dockerfile or dependency. Base the draft on #1646.
+Rust code, Dockerfile or dependency. Base the change on #1646.
 
 **Tools:** Pinned Node 24.20.0, Rust 1.98.1, production Docker image, Docker,
 DynamoDB Local and the existing prepared-store fixtures.
@@ -29,10 +29,9 @@ DynamoDB Local and the existing prepared-store fixtures.
       Demonstrate that delayed exit and post-exit row corruption fail.
 - [x] Add optional fixture configuration for a cookie-only after-response
       SharedID provider: generation off, dedicated cookie, registered fictional
-      source and five-second task budget. First verify that this normal consumer
-      produces the distinctive UID in a follow-up conditional write. Use a separate
-      fresh record/UID for the subsequent shutdown scenario so setup cannot make
-      the target update a no-op.
+      source and five-second task budget. In the shutdown scenario, mint a record
+      without the provider cookie and assert its source is absent before the
+      returning navigation supplies a distinctive UID for the follow-up write.
 - [x] Add a separate returning-navigation shutdown case. Pause only that UID's
       conditional write, await the entire response while still paused, verify
       the seed has no UID, send SIGTERM, observe draining while the selected write is still pending and the process is
@@ -52,15 +51,12 @@ DynamoDB Local and the existing prepared-store fixtures.
 - [x] Run both targeted scripts on the unchanged production image with the new
       harnesses. Run meaningful disposable controls, restore exact sources and
       fixtures, and re-run affected positive cases. Check changed JS syntax and
-      format only the two added Markdown documents.
-- [ ] Review the combined diff independently and reconcile runtime evidence.
-      Create signed commits, verify signatures locally, push without force and
-      confirm GitHub Verified. Create a draft PR on
-      `feat/1574-axum-shared-identity`, with `Closes #1579`, source/runtime evidence
-      and the relevant-PR-only CI limit. Do not change other PRs or the board.
-- [ ] Watch every hosted check to completion, perform independent self-review,
-      resolve findings and update this PR as needed. Remove owned containers,
-      servers, worktree and scratch after preserving the outcome in the handoff.
+      format the changed Markdown documents.
+
+Implementation, independent review and initial publication are complete in #1654,
+stacked on `feat/1574-axum-shared-identity` with `Closes #1579`. Follow-up commits
+run targeted local checks and wait for their own hosted results before handoff.
+Commits are signed and GitHub Verified; cleanup removes only owned resources.
 
 ## Targeted commands
 
