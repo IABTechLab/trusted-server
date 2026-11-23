@@ -1586,7 +1586,9 @@ PR A changes behaviour that operators and integrators can observe:
   Metadata get no EC, and integration proxies no longer mint one.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
-  until a later navigation finds its row.
+  until a later navigation finds its row. With an EC KV store, an EC goes to
+  bidders as `user.id` only when the request read a consented row for it
+  (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
 - **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
   `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
   ingests those cookies.
@@ -1597,7 +1599,9 @@ PR A changes behaviour that operators and integrators can observe:
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
-  reports `row_full`. A row written before the cap is trimmed only when a
+  reports `row_full`, and pull sync does not call a partner whose empty source
+  has no room left for its longest UID, so a full row is not pulled for on
+  every navigation; either resumes once pruning frees room. A row written before the cap is trimmed only when a
   write also carries a real change: its largest stored records are dropped
   first, so the change that triggered the write still lands. A provider
   refresh that no longer fits keeps the record it would replace.

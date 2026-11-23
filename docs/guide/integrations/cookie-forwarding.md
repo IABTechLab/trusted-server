@@ -33,7 +33,7 @@ produces this PBS header:
 Cookie: euconsent-v2=example-consent
 ```
 
-Cookie forwarding and identity forwarding are separate decisions. Excluding identity cookies from the raw header does not remove the server's identity-resolution path. Trusted Server can read the relevant first-party cookies, resolve identity, and populate `user.id` and `user.ext.eids` under the applicable consent rules. Forwarding a consent cookie also does not authorize identity forwarding by itself.
+Cookie forwarding and identity forwarding are separate decisions. Excluding identity cookies from the raw header does not remove the server's identity-resolution path. Trusted Server can read the relevant first-party cookies, resolve identity, and populate `user.id` and `user.eids` under the applicable consent rules. Forwarding a consent cookie also does not authorize identity forwarding by itself.
 
 See [Prebid integration](./prebid) and [GDPR compliance](/guide/gdpr-compliance) for configuration and consent behavior.
 

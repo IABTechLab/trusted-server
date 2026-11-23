@@ -964,7 +964,7 @@ certificate, whatever `proxy.certificate_check` says.
 
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them. Browser-resolved IDs
-(`ts-eids`, `sharedId`) are never stored for an owned source, so a source a
+(`ts-eids` and the SharedID cookie) are never stored for an owned source, so a source a
 provider cleared on an opt-out is not refilled from the browser.
 
 When a provider reports an opt-out, its sources are cleared. An opt-out the
@@ -3115,7 +3115,8 @@ Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
 within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`__Host-ts-eids-mirror`, `sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+`__Host-ts-eids-mirror` and the SharedID cookie, which is Prebid's configured
+`storage.name` or `sharedId` without one) in the key list. Identity cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,

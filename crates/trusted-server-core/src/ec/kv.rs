@@ -131,6 +131,15 @@ impl KvIdentityGraph {
         }
     }
 
+    /// Creates an identity graph over a store that other graphs share.
+    ///
+    /// The core identity app holds one store for its lifetime and hands each
+    /// request a graph over it.
+    #[must_use]
+    pub fn from_shared(store: Arc<dyn EcKvStore>) -> Self {
+        Self { store }
+    }
+
     /// Returns the configured store name.
     #[must_use]
     pub fn store_name(&self) -> &str {
