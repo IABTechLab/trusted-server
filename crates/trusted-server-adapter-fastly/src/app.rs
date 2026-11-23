@@ -881,7 +881,13 @@ async fn dispatch_fallback(
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+            let mut response =
+                dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+            // Keep assets outside record finalization while honoring enabled marker withdrawal.
+            state
+                .identity
+                .finalize_refresh_withdrawal(&ec.ec_context, &mut response);
+            return response;
         }
 
         state
@@ -4345,6 +4351,118 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_none(),
             "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
+    #[test]
+    fn dispatch_asset_route_withdrawal_cleans_marker_without_identity_finalization() {
+        let mut missing_cleanup = Vec::new();
+        for method in [Method::GET, Method::HEAD] {
+            for (enabled, withdrawn) in [(true, true), (false, true), (true, false)] {
+                let mut settings = test_settings();
+                settings.proxy.asset_routes.push(
+                    trusted_server_core::settings::ProxyAssetRoute::new(
+                        "/assets/",
+                        "https://assets.example.com",
+                    ),
+                );
+                if enabled {
+                    let mut ec =
+                        serde_json::to_value(&settings.ec).expect("should serialize EC settings");
+                    ec["refresh_after_days"] = serde_json::json!(1);
+                    settings.ec =
+                        serde_json::from_value(ec).expect("should enable issuance marker cleanup");
+                }
+                let mut state = build_state_from_settings(settings)
+                    .expect("should build asset dispatch fixture");
+                Arc::get_mut(&mut state)
+                    .expect("should own isolated test state")
+                    .identity = trusted_server_core::ec::app::IdentityApp::build(
+                    Arc::clone(&state.settings),
+                    trusted_server_core::ec::app::IdentityPlatform::default(),
+                )
+                .expect("should build identity app without record storage");
+                assert!(
+                    state.identity.identity_graph().is_none(),
+                    "should exercise cleanup without identity KV access"
+                );
+                let router = TrustedServerApp::routes_for_state(&state);
+                let clock = TestClock::new();
+                let upstream = ScriptedHttpClient::new(&clock);
+                upstream.respond_to(
+                    method.clone(),
+                    "https://assets.example.com/assets/banner.png",
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", "image/png")
+                        .body("example-asset"),
+                );
+                let mut request = empty_request(method.clone(), "/assets/banner.png");
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_static(if withdrawn {
+                        "us_privacy=1YYN; ts-ec-issued-at=carried"
+                    } else {
+                        "us_privacy=1YNN; ts-ec-issued-at=carried"
+                    }),
+                );
+                insert_outbound_client(&mut request, upstream.http_client());
+                let client_ip = Some("192.0.2.7".parse().expect("should parse example client IP"));
+                request.extensions_mut().insert(ClientInfo {
+                    client_ip,
+                    ..ClientInfo::default()
+                });
+                request.extensions_mut().insert(RequestGeo::new(
+                    client_ip,
+                    Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
+                ));
+                let response = block_on(router.oneshot(request))
+                    .expect("should route configured asset request");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "should preserve successful asset dispatch"
+                );
+                assert_eq!(
+                    upstream.requests().len(),
+                    1,
+                    "should fetch only the configured asset origin"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<super::EcFinalizeState>()
+                        .is_none(),
+                    "should keep asset dispatch outside identity finalization"
+                );
+                let cookies = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .map(|value| value.to_str().expect("should decode response cookie"))
+                    .collect::<Vec<_>>();
+                if enabled && withdrawn {
+                    if !cookies.iter().any(|value| {
+                        value.starts_with("ts-ec-issued-at=;") && value.contains("Max-Age=0")
+                    }) {
+                        missing_cleanup.push(method.clone());
+                    }
+                    assert!(
+                        cookies
+                            .iter()
+                            .all(|value| value.starts_with("ts-ec-issued-at=")),
+                        "should only expire the issuance marker without an EC cookie"
+                    );
+                } else {
+                    assert!(
+                        cookies.is_empty(),
+                        "should preserve asset cookies enabled={enabled} withdrawn={withdrawn}"
+                    );
+                }
+            }
+        }
+        assert!(
+            missing_cleanup.is_empty(),
+            "should clean marker-only withdrawal on configured assets: {missing_cleanup:?}"
         );
     }
 

@@ -916,7 +916,7 @@ cache policy. Other visits can still be private for independent reasons.
 retention.** Record expiry can still lead to legitimate orphan rotation.
 The extra signed cookie adds request bytes; lost, rejected or replayed cookies
 can cause additional renewals. This does not guarantee Safari/ITP persistence.
-See the [proposal design](../superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
+See the [proposal design](https://github.com/IABTechLab/trusted-server/blob/c1ae51e5915f61db81982eb23b9418487fa616d7/docs/superpowers/specs/2026-11-23-ec-threshold-refresh-proposal-design.md)
 for protocol, rollout and qualification limits. If DEC-13 chooses never
 refresh, this proposal will be closed.
 

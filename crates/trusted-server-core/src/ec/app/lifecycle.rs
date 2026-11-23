@@ -170,9 +170,6 @@ impl IdentityApp {
         if self.settings.ec.refresh_after_days.is_some() {
             context.refresh_document &= document && !ec_route;
         }
-        let withdraw_marker = self.settings.ec.refresh_after_days.is_some()
-            && ec_consent_withdrawn(context.consent())
-            && context.refresh_marker_present;
         if !eligible {
             let _ = context.take_navigation_permit();
         }
@@ -210,9 +207,27 @@ impl IdentityApp {
             if withdrawal {
                 expire_ec_cookie(&self.settings, response);
             }
-            if withdraw_marker {
-                crate::ec::finalize::expire_refresh_marker(&self.settings, response);
-            }
+            self.finalize_refresh_withdrawal(context, response);
+        }
+    }
+
+    /// Expires a carried issuance marker on explicit withdrawal without record access.
+    ///
+    /// Use this on response paths that deliberately bypass full identity finalization,
+    /// such as configured asset proxies. It never renews cookies, and does nothing
+    /// unless threshold refresh is enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// identity_app.finalize_refresh_withdrawal(&identity.context, &mut response);
+    /// ```
+    pub fn finalize_refresh_withdrawal(&self, context: &EcContext, response: &mut Response) {
+        if self.settings.ec.refresh_after_days.is_some()
+            && ec_consent_withdrawn(context.consent())
+            && context.refresh_marker_present
+        {
+            crate::ec::finalize::expire_refresh_marker(&self.settings, response);
         }
     }
 
