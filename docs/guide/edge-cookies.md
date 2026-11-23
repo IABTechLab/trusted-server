@@ -42,7 +42,7 @@ maps to a stable base.
 
 ### Request Lifecycle
 
-The shared application creates a new EC record before issuing its cookie on an eligible publisher document navigation of any method, or an admitted same-origin `POST /_ts/api/v1/ec`. Document classification uses `Sec-Fetch-Dest: document` or, without Fetch Metadata, an `Accept` header naming `text/html`. Fastly and Axum retain navigation eligibility on HTML error documents and exclude redirect statuses 301, 302, 303, 307 and 308. A navigation returning `304 Not Modified` retains its lifecycle permission even without Content-Type, because it validates the cached document. Other non-HTML responses do not issue identity cookies, except the EC deletion required for explicit withdrawal. An EC ID collision on create retries with a fresh ID, up to five attempts, inside that request's one creation write. Integration proxies and `/auction` use an existing EC but never mint one. Partner identify and batch-sync routes also skip generation. `/auction` may conditionally save explicit body EIDs into an existing live record without emitting identity cookies. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store. The document-navigation flow is shown below.
+The shared application creates a new EC record before issuing its cookie on an eligible publisher document navigation of any method, or an admitted same-origin `POST /_ts/api/v1/ec`. Document classification uses `Sec-Fetch-Dest: document` or, without Fetch Metadata, an `Accept` header naming `text/html`. Fastly and Axum retain navigation eligibility on HTML error documents and exclude redirect statuses 301, 302, 303, 307 and 308. A navigation returning `304 Not Modified` retains its lifecycle permission even without Content-Type, because it validates the cached document. Other non-HTML responses do not issue identity cookies, except the EC deletion required for explicit withdrawal. An EC ID collision on create retries with a fresh ID, up to five attempts, inside that request's one creation write. Integration proxies and `/auction` use an existing EC but never mint one. Partner identify and batch-sync routes also skip generation. `/auction` may conditionally save explicit body EIDs into an existing live record without emitting identity cookies. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store. The document-navigation flow below shows the default with `ec.sliding_refresh = false`. When enabled on Fastly or Axum, eligible consented returning document visits renew the same EC with the configured `ec.max_age_days` lifetime; record retention does not change. See [Configuration Reference](/guide/configuration#configurable-ec-lifetime-and-sliding-expiration-proposal) for the proposal restrictions and record-state limits.
 
 ```mermaid
 sequenceDiagram
@@ -70,7 +70,7 @@ sequenceDiagram
 
 ### Response Finalization
 
-After routing, the shared identity app evaluates consent and cookie presence. HTML document navigations of any method and nonredirect status, cached-document `304` responses, and EC route responses retain identity cookies. Explicit consent withdrawal is the privacy exception: every participating lifecycle response expires the browser EC cookie, regardless of method, status or content type, while persisting its tombstone. The diagram shows the eligible-response branches; creation must persist before cookie issuance.
+After routing, the shared identity app evaluates consent and cookie presence. HTML document navigations of any method and nonredirect status, cached-document `304` responses, and EC route responses retain identity cookies. Explicit consent withdrawal is the privacy exception: every participating lifecycle response expires the browser EC cookie, regardless of method, status or content type, while persisting its tombstone. The diagram shows the default eligible-response branches with sliding renewal disabled; creation must persist before cookie issuance.
 
 ```mermaid
 flowchart TD
@@ -282,7 +282,7 @@ On every participating lifecycle response, explicit withdrawal expires `ts-ec` i
 Trusted Server can mirror provider-written UIDs into a JavaScript-readable cookie so client-side code can use them. The mirror is off by default: a partner's UIDs are mirrored only when it sets both `bidstream_enabled = true` and `mirror_enabled = true`. Setting `mirror_enabled` without `bidstream_enabled` is rejected at startup and by `ts config push`.
 
 - **Name**: `__Host-ts-eids-mirror`
-- **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=<EC cookie max age>`, host-only (no `Domain`) and not `HttpOnly`
+- **Attributes**: `Path=/; Secure; SameSite=Lax; Max-Age=31536000` (an independent 365-day lifetime), host-only (no `Domain`) and not `HttpOnly`
 - **Contents**: unpadded base64url JSON `{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"...","atype":1,"exp":1767225600}]}]}`, partners in `[[ec.partners]]` order, at most 3584 bytes; UIDs that do not fit are left out
 - **Contents source**: live UIDs written by an identity provider. Ownerless UIDs, from browser ingest, batch sync or legacy pull sync, are never mirrored.
 - **Pull-sync UIDs**: pull sync writes provider-owned UIDs, so a pull-sync partner with `mirror_enabled = true` has its UIDs mirrored. Any script on the page can read them, and the cookie is sent on every same-origin request, including to the publisher origin. Leave `mirror_enabled` off for a partner whose UIDs must not reach the page; its UIDs still reach the bidstream when `bidstream_enabled` is set.
@@ -324,7 +324,7 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 
 ## Runtime Behavior Notes
 
-- Returning requests with consent and an existing `ts-ec` do not refresh the EC cookie or KV TTL.
+- By default, returning requests with consent and an existing `ts-ec` do not refresh the EC cookie or KV TTL. With `ec.sliding_refresh = true`, eligible consented Fastly/Axum document visits renew the same EC with `ec.max_age_days`; record retention remains unchanged.
 - Newly generated ECs receive `Set-Cookie: ts-ec=...`.
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
