@@ -227,8 +227,12 @@ browser             TS (navigation)                          providers   KV
   phase skips the read and the write and logs `unchanged`. A remembered
   opt-out clears only sources the row still stores.
 - The write is a compare-and-swap on the generation read just before it. On
-  conflict the results are dropped; the source stays due and is retried on the
-  next navigation.
+  conflict the row is read again and the update re-planned against it once,
+  never resending the stale plan, so an opt-out or withdrawal recorded since
+  dispatch still applies. A conflicting attempt writes nothing and hands the
+  `AfterResponseWrite` permit back, so at most one follow-up update lands. If
+  the retry also conflicts, the results are dropped; the source stays due and
+  is retried on the next navigation.
 - Results are not mirrored in the already-sent response. They are served from
   KV from the next page load. A browser fallback UID for an owned source is
   replaced by the provider's UID, as in §8.3.
@@ -1383,6 +1387,7 @@ pub struct PageLoadWrite(());
 //     -> Option<(PageLoadWrite, AfterResponseWrite)>;
 
 /// Proof for the one follow-up update; consumed by `commit_after_response_lookups`.
+/// A write that loses its CAS lands nothing and hands it back for one retry.
 #[derive(Debug)]
 pub struct AfterResponseWrite(());
 
@@ -1445,7 +1450,7 @@ PR5 removes it.
 | All providers fail                                  | The write proceeds if browser ingest changed anything; otherwise no write.                                                 |
 | Coordinator budget exceeded                         | Late responses dropped; the response is never held past the budget.                                                        |
 | After-response row missing, withdrawn or EC changed | Nothing written (`no_row`); results dropped.                                                                               |
-| After-response write conflict                       | Results dropped; the source stays due and is retried on the next navigation. The sent response is unaffected.              |
+| After-response write conflict                       | One re-read and re-plan; if that conflicts too, results dropped and the source stays due. The sent response is unaffected. |
 
 Failed lookups are retried only by a later navigation where the source is
 still due.
@@ -1581,7 +1586,8 @@ outcome label in PR A: a skipped write is logged with its error (a conflict,
 an existing row or a store error), and an update without a generation is
 logged as `no_generation`. A navigation that runs the after-response phase
 (§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`
-or `failed`. The outcome log holds the provider ID, the outcome and the kept
+or `failed`, with `conflicts`, the number of its attempts (0–2) that lost
+their CAS. The outcome log holds the provider ID, the outcome and the kept
 and dropped totals; other logs hold the EC ID only in its existing truncated
 form. Raw UIDs, EID values and encrypted envelopes are never logged.
 

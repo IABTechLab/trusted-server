@@ -21,7 +21,9 @@ use crate::error::TrustedServerError;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
-use super::page_load::{AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange};
+use super::page_load::{
+    AfterResponseRejection, AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange,
+};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -462,28 +464,47 @@ impl KvIdentityGraph {
     /// Applies a navigation's follow-up update after its response was sent.
     ///
     /// The row is replaced only while it is still at `expected`, so a
-    /// concurrent write is never overwritten. The `permit` is consumed.
+    /// concurrent write is never overwritten. The `permit` is consumed unless
+    /// the row changed since it was read: that attempt writes nothing, so the
+    /// permit is handed back for a re-planned attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`KvWriteError::Conflict`] when the row changed since it was
-    /// read, or [`KvWriteError::Store`] on a serialization or store failure,
-    /// including a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
+    /// Returns [`KvWriteError::Conflict`], with the permit, when the row
+    /// changed since it was read, or [`KvWriteError::Store`] on a
+    /// serialization or store failure, including a row over
+    /// [`MAX_ENTRY_BYTES`]. A retry must re-read the row and re-plan against
+    /// it, never resend `entry`.
     pub async fn commit_after_response(
         &self,
         permit: AfterResponseWrite,
         ec_id: &str,
         entry: &KvEntry,
         expected: Generation,
-    ) -> Result<(), Report<KvWriteError>> {
-        permit.spend();
-        self.write_row(
-            ec_id,
-            entry,
-            ENTRY_TTL,
-            EcKvWriteMode::IfGenerationMatch(expected.get()),
-        )
-        .await
+    ) -> Result<(), AfterResponseRejection> {
+        let result = self
+            .write_row(
+                ec_id,
+                entry,
+                ENTRY_TTL,
+                EcKvWriteMode::IfGenerationMatch(expected.get()),
+            )
+            .await;
+        match result {
+            Err(report) if matches!(report.current_context(), KvWriteError::Conflict) => {
+                Err(AfterResponseRejection {
+                    report,
+                    permit: Some(permit),
+                })
+            }
+            other => {
+                permit.spend();
+                other.map_err(|report| AfterResponseRejection {
+                    report,
+                    permit: None,
+                })
+            }
+        }
     }
 
     /// Serializes `entry` and writes it with `mode`, mapping a failed

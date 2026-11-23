@@ -165,7 +165,7 @@ pub(crate) async fn run_after_response_lookups(
         return;
     }
     let results = lookups.coordinator.collect(&transport, pending).await;
-    let outcome = commit_after_response_lookups(
+    commit_after_response_lookups(
         &graph,
         permit,
         identity.partners(),
@@ -173,7 +173,6 @@ pub(crate) async fn run_after_response_lookups(
         &results,
     )
     .await;
-    log::info!("After-response lookups: write outcome={outcome}");
 }
 
 #[cfg(test)]
