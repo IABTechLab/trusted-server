@@ -104,7 +104,9 @@ smoke_wait_http() {
     fi
     SMOKE_HTTP_STATUS="000"
     while [ "$attempt" -lt 60 ]; do
-        SMOKE_HTTP_STATUS=$(curl --silent --show-error --max-time 5 "${credentials[@]}" \
+        # Bash 3.2 treats an empty array expansion as unbound under `set -u`,
+        # so expand the credentials only when there are any.
+        SMOKE_HTTP_STATUS=$(curl --silent --show-error --max-time 5 ${credentials[@]+"${credentials[@]}"} \
             --output "$body_path" \
             --dump-header "$headers_path" \
             --write-out '%{http_code}' \
