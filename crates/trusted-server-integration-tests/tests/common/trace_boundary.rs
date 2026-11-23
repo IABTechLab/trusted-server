@@ -420,10 +420,10 @@ fn wait_for_trace_fixture_ready(base_url: &str) -> crate::common::runtime::TestR
     let client = reqwest::blocking::Client::new();
     for _ in 0..60 {
         if client
-            .get(format!("{base_url}/_ts/trace/state"))
+            .get(format!("{base_url}/ready"))
             .timeout(Duration::from_millis(500))
             .send()
-            .is_ok_and(|response| matches!(response.status().as_u16(), 200 | 401 | 404))
+            .is_ok_and(|response| response.status().as_u16() == 200)
         {
             return Ok(());
         }
@@ -780,24 +780,14 @@ fn check_boundary(base_url: &str, runtime: &TraceRuntime) {
             "should reject dot ambiguity still visible to Spin"
         );
         assert_private(&normalized_out);
-    } else if matches!(runtime, TraceRuntime::Fastly) {
+    } else {
         assert_eq!(
             normalized_out.status, 200,
-            "should preserve ordinary health when runtime normalization removes the namespace"
+            "should serve local health when runtime normalization removes the namespace"
         );
         assert_eq!(
             normalized_out.body, b"ok",
-            "should keep normalized-out requests on the ordinary health surface"
-        );
-    } else {
-        let ordinary = raw_request(&authority, b"GET", "/health", b"");
-        assert_eq!(
-            normalized_out.status, ordinary.status,
-            "should preserve Cloudflare's ordinary publisher fallback for normalized-out health"
-        );
-        assert!(
-            !String::from_utf8_lossy(&normalized_out.body).contains("trace-request-context"),
-            "should not capture context after the runtime removes the namespace"
+            "should keep normalized-out requests on the fixed liveness surface"
         );
     }
 }

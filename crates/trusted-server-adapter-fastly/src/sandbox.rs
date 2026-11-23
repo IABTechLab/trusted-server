@@ -725,6 +725,72 @@ mod tests {
     }
 
     #[test]
+    fn probes_preserve_lazy_initialization_retry_and_reuse() {
+        let mut sandbox = Sandbox::default();
+        let request = fastly::Request::get("https://example.com/health");
+        assert!(
+            crate::health_response(&request).is_some(),
+            "should answer liveness before initialization"
+        );
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            0,
+            "should leave liveness independent of initialization"
+        );
+
+        let result = crate::initialize_dispatch(
+            &mut sandbox,
+            &edgezero_core::http::Method::GET,
+            "/ready",
+            || {
+                Err(edgezero_core::error::EdgeError::service_unavailable(
+                    "fictional startup failure",
+                ))
+            },
+        );
+        let crate::ApplicationDispatch::Operational(response) = result else {
+            panic!("should return failed readiness");
+        };
+        assert_eq!(
+            response.status().as_u16(),
+            503,
+            "should reflect initialization failure"
+        );
+        assert!(
+            sandbox.state().is_none(),
+            "should discard failed construction"
+        );
+
+        for attempt in 0..2 {
+            let result = crate::initialize_dispatch(
+                &mut sandbox,
+                &edgezero_core::http::Method::GET,
+                "/ready",
+                || {
+                    assert_eq!(
+                        attempt, 0,
+                        "should reuse successful application on later readiness"
+                    );
+                    Ok(test_retained())
+                },
+            );
+            let crate::ApplicationDispatch::Operational(response) = result else {
+                panic!("should return readiness");
+            };
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "should report recovered readiness"
+            );
+        }
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            2,
+            "should attempt one failure and one success, then reuse"
+        );
+    }
+
+    #[test]
     fn a_sandbox_starts_with_no_retained_application() {
         let sandbox = Sandbox::default();
 

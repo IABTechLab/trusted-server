@@ -109,8 +109,9 @@ set `EDGEZERO__ADAPTER__PORT=<port>` before `cargo run` and set
 Each secret variable is `EDGEZERO__SECRETS__` followed by the uppercased secret
 reference name from `trusted-server.toml`: `handler_password`,
 `publisher_proxy_secret` and `ec_passphrase` in the starter config. Startup
-reads only the references the config uses. If one is missing, the process exits
-before it listens and names the config field of the missing secret. Restart the process to pick
+reads only the references the config uses. If one is missing, the process
+listens with the failure router, answers `/ready` and every route with `503`,
+and logs the config field of the missing secret. Restart the process to pick
 up a changed config or secret.
 
 `TRUSTED_SERVER__*` variables are applied by `ts config push` when it builds
