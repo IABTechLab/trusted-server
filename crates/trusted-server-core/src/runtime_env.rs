@@ -3,7 +3,8 @@
 /// Reads a process-environment variable with a statically approved name.
 ///
 /// Accepts a constant `&str` beginning with `TRUSTED_SERVER__`, or one of the
-/// explicitly justified Fastly platform names. Runtime-built names and scans
+/// explicitly justified platform names: Fastly metadata and `EdgeZero`'s native
+/// Geo provider override. Runtime-built names and scans
 /// are intentionally unsupported. Build scripts and tests are outside this
 /// runtime policy; platform bindings and `EdgeZero` configuration are separate.
 ///
@@ -37,6 +38,10 @@ macro_rules! runtime_env {
                 b"FASTLY_HOSTNAME" => true,
                 // Fastly server metadata supplies the platform's region.
                 b"FASTLY_REGION" => true,
+                // EdgeZero's own native Geo provider override. Axum reads it
+                // only to decide whether the app declares the Geo KV store,
+                // because EdgeZero exposes no API for that selection.
+                b"EDGEZERO__ADAPTER__GEO__PROVIDER" => true,
                 _ => {
                     let prefix = b"TRUSTED_SERVER__";
                     let bytes = name.as_bytes();

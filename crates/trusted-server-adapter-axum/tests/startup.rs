@@ -119,7 +119,7 @@ impl ServerFixture {
         if let Some(profile) = profile {
             let path = self.root.join("native-geo.toml");
             fs::write(&path, profile).expect("should write synthetic Geo profile");
-            command.env("TS_NATIVE_GEO_PROFILE_FILE", path);
+            command.env("TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE", path);
         }
         if !missing_secret {
             command.env(
