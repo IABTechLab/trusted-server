@@ -38,6 +38,7 @@ The positive case runs `ts serve --adapter axum` from the isolated project, so
 the CLI must discover its `edgezero.toml` and pass the prepared-store inputs to
 the server. The copied manifest launches the already-built Axum binary instead
 of rebuilding through Cargo. Teardown stops both the CLI and its server.
+This exercises EdgeZero's shell-command serve branch; the repository manifest uses `cargo run`.
 
 The smoke also supplies a writable `EDGEZERO__ADAPTER__DATA_DIR`. The record
 store is always declared and EdgeZero prepares its local provider before TS

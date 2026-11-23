@@ -164,7 +164,7 @@ run_case() {
         (
             cd "$WORKSPACE"
             # Own the launcher and its server descendants as one process group.
-            exec "${env_args[@]}" python3 -c \
+            exec "${env_args[@]}" "HOME=$HOME" python3 -c \
                 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
                 "$serve_binary" serve --adapter axum
         ) >"$log_path" 2>&1 &
