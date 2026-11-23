@@ -185,10 +185,30 @@ const output = resolve(
   opt.output ?? join(tmpdir(), `ts-native-ec-smoke-${id}.json`)
 )
 const exec = promisify(execFile)
-const docker = async (...args) =>
+const shutdownGraceSeconds = 3
+// Docker signal delivery and exit observation are outside the runner's grace.
+const shutdownObservationAllowanceMs = 500
+const shutdownBoundMs =
+  shutdownGraceSeconds * 1000 + shutdownObservationAllowanceMs
+const afterResponseSource = 'sharedid.example.com'
+const afterResponseCookie = '_fixture_sharedid'
+const afterResponseUid = 'fixture-after-response-uid'
+function remaining(deadline, message) {
+  const milliseconds = Math.ceil(deadline - performance.now())
+  assert(milliseconds > 0, message)
+  return milliseconds
+}
+const dockerWithin = async (deadline, ...args) =>
   (
-    await exec('docker', args, { timeout: 20000, maxBuffer: 1024 * 1024 })
+    await exec('docker', args, {
+      timeout:
+        deadline === undefined
+          ? 20000
+          : Math.min(20000, remaining(deadline, 'SIGTERM observation deadline')),
+      maxBuffer: 1024 * 1024,
+    })
   ).stdout.trim()
+const docker = (...args) => dockerWithin(undefined, ...args)
 const proof = {
   outcome: 'running',
   startedAt: new Date().toISOString(),
@@ -226,8 +246,8 @@ const event = (name, extra = {}) => {
   return entry.sequence
 }
 async function bounded(operation, milliseconds, message) {
-  const deadline = Date.now() + milliseconds
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + milliseconds
+  while (performance.now() < deadline) {
     assert(!interrupted, 'interrupted')
     if (await operation()) return
     await delay(25)
@@ -289,6 +309,7 @@ const logicalKeyMatches = (nativeSortKey, logicalKey) =>
 const decode = (item) =>
   JSON.parse(Buffer.from(item.v.B, 'base64').toString('utf8'))
 let fault = 'normal'
+let pauseAfterResponse = false
 const pending = new Set()
 const verifiedPuts = []
 const ownedApps = []
@@ -340,9 +361,15 @@ async function proxyRequest(req, res) {
       )
       return
     }
+    const selectedAfterResponse =
+      write &&
+      pauseAfterResponse &&
+      payload.ConditionExpression?.includes(':expected') &&
+      decode(payload.Item).ids?.[afterResponseSource]?.uid === afterResponseUid
     if (
       write &&
       (selectedFault === 'pause' ||
+        selectedAfterResponse ||
         (selectedFault === 'pause-cas' &&
           payload.ConditionExpression?.includes(':expected')))
     ) {
@@ -353,6 +380,8 @@ async function proxyRequest(req, res) {
           condition: payload.ConditionExpression,
           expectedGeneration:
             payload.ExpressionAttributeValues?.[':expected']?.N,
+          item: structuredClone(payload.Item),
+          afterResponse: selectedAfterResponse,
         }
         pending.add(entry)
         res.once('close', () => {
@@ -383,6 +412,7 @@ async function proxyRequest(req, res) {
       )
       verifiedPuts.push({
         key: sk,
+        item: structuredClone(row),
         sequence: event('put-verified-before-ack', {
           key: sk,
           generation: row.generation.N,
@@ -404,7 +434,7 @@ async function proxyRequest(req, res) {
     res.end('synthetic fixture proxy failure')
   }
 }
-async function state(app) {
+async function state(app, deadline) {
   if (app.child)
     return {
       Running: app.child.exitCode === null && app.child.signalCode === null,
@@ -412,20 +442,89 @@ async function state(app) {
       Signal: app.child.signalCode,
     }
   return JSON.parse(
-    await docker('inspect', '--format={{json .State}}', app.name)
+    await dockerWithin(deadline, 'inspect', '--format={{json .State}}', app.name)
   )
 }
-async function logs(app) {
+async function logs(app, deadline) {
   if (app.child) return app.log
   const result = await exec('docker', ['logs', app.name], {
-    timeout: 5000,
+    timeout:
+      deadline === undefined
+        ? 5000
+        : Math.min(5000, remaining(deadline, 'SIGTERM log deadline')),
     maxBuffer: 1024 * 1024,
   })
   return result.stdout + result.stderr
 }
-async function signal(app, value) {
+async function signal(app, value, deadline) {
   if (app.child) app.child.kill(value)
-  else await docker('kill', `--signal=${value}`, app.name)
+  else await dockerWithin(deadline, 'kill', `--signal=${value}`, app.name)
+}
+async function beforeDeadline(operation, deadline, message) {
+  let timer
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(message)),
+          remaining(deadline, message)
+        )
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+async function drain(app, held, completeResponse = async () => {}) {
+  const started = performance.now()
+  const deadline = started + shutdownBoundMs
+  const message = `SIGTERM must complete within ${shutdownBoundMs}ms`
+  event('shutdown-signal', { label: app.label, boundMs: shutdownBoundMs })
+  await signal(app, 'SIGTERM', deadline)
+  await bounded(
+    async () => /phase=draining/.test(await logs(app, deadline)),
+    remaining(deadline, message),
+    'runner must begin drain while real storage is paused'
+  )
+  assert(
+    (await state(app, deadline)).Running,
+    'runner must stay alive while the write is pending'
+  )
+  assert(
+    pending.has(held),
+    'selected record write must remain pending during drain'
+  )
+  event('shutdown-draining', { label: app.label, key: held.key })
+  held.resolve()
+  event('shutdown-write-released', { label: app.label, key: held.key })
+  await beforeDeadline(completeResponse(), deadline, message)
+  await bounded(
+    async () => !(await state(app, deadline)).Running,
+    remaining(deadline, message),
+    message
+  )
+  const elapsed = performance.now() - started
+  assert(elapsed <= shutdownBoundMs, message)
+  event('shutdown-exited', { label: app.label, elapsedMs: elapsed })
+  assert.equal((await state(app)).ExitCode, 0, 'runner must exit normally')
+  assert.match(await logs(app), /phase=stopped/)
+  return elapsed
+}
+async function verifyAfterExit(app, put) {
+  assert(!(await state(app)).Running, 'record proof must follow process exit')
+  const row = await getNative(nativeKey(put.item))
+  assert.deepEqual(
+    row,
+    put.item,
+    'post-exit record must match the acknowledged write and generation'
+  )
+  event('record-verified-after-exit', {
+    label: app.label,
+    key: put.key,
+    generation: row.generation.N,
+  })
+  return row
 }
 async function stop(app, graceful = true) {
   if (!(await state(app)).Running) return
@@ -438,7 +537,7 @@ async function stop(app, graceful = true) {
   if (graceful)
     assert.equal((await state(app)).ExitCode, 0, 'runner must exit normally')
 }
-async function launch(label, originEndpoint, proxyEndpoint) {
+async function launch(label, originEndpoint, proxyEndpoint, afterResponse = false) {
   const port = await freePort()
   const dir = join(work, label)
   await mkdir(dir, { mode: 0o755 })
@@ -454,7 +553,34 @@ async function launch(label, originEndpoint, proxyEndpoint) {
           bidstream_enabled: true,
           pull_sync_enabled: false,
         },
+        ...(afterResponse
+          ? [
+              {
+                name: 'fixture shared identity',
+                source_domain: afterResponseSource,
+                bidstream_enabled: true,
+                pull_sync_enabled: false,
+              },
+            ]
+          : []),
       ],
+      ...(afterResponse
+        ? {
+            identity_after_response_budget_ms: 5000,
+            identity_providers: [
+              {
+                id: 'fixture-sharedid',
+                kind: 'sharedid',
+                collect: 'after_response',
+                sources: [afterResponseSource],
+                settings: {
+                  cookie_names: [afterResponseCookie],
+                  generate: false,
+                },
+              },
+            ],
+          }
+        : {}),
     },
     handlers: [
       { path: '^/_ts/admin', username: 'admin', password: 'admin_key' },
@@ -504,7 +630,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     EDGEZERO__ADAPTER__DATA_DIR: opt.binary ? dir : '/data',
     EDGEZERO__ADAPTER__HOST: '127.0.0.1',
     EDGEZERO__ADAPTER__PORT: String(port),
-    EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS: '3',
+    EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS: String(shutdownGraceSeconds),
     EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS: '127.0.0.1/32',
     EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY: 'x-forwarded',
     EDGEZERO__SECRETS__EC_KEY: 'synthetic-ec-passphrase-32-bytes-minimum',
@@ -607,6 +733,11 @@ async function document(
       })
     },
   })
+  const completionSequence = event('document-response-complete', {
+    label: app.label,
+    country,
+    status: result.status,
+  })
   if (allowStorageError)
     assert(
       result.status === 200 || result.status >= 500,
@@ -626,7 +757,7 @@ async function document(
     )
   if (opt['expected-version'])
     assert.equal(result.headers['x-ts-version'], opt['expected-version'])
-  return { ...result, responseSequence }
+  return { ...result, responseSequence, completionSequence }
 }
 try {
   await chmod(work, 0o755)
@@ -920,44 +1051,115 @@ try {
     (error) => ({ error })
   )
   await bounded(() => pending.size > 0, 3000, 'pending real DynamoDB PutItem')
+  const heldRequest = [...pending][0]
   const healthStarted = Date.now()
   const health = await request(app.endpoint, '/health', { timeout: 750 })
   assert.equal(health.status, 200)
   assert.equal(minted(health).length, 0)
   proof.healthWhileStoragePausedMs = Date.now() - healthStarted
-  const shutdownStarted = Date.now()
-  await signal(app, 'SIGTERM')
-  await bounded(
-    async () => /phase=draining/.test(await logs(app)),
-    1000,
-    'runner must begin drain while real storage is paused'
-  )
-  for (const entry of [...pending]) entry.resolve()
-  const completed = await article
-  assert(
-    !completed.error,
-    `in-flight request failed during drain: ${completed.error?.message}`
-  )
+  let completed
+  proof.shutdownMs = await drain(app, heldRequest, async () => {
+    completed = await article
+    assert(
+      !completed.error,
+      `in-flight request failed during drain: ${completed.error?.message}`
+    )
+  })
   assert.equal(minted(completed.value).length, 1)
   const delayedEc = minted(completed.value)[0]
-  assert(
-    verifiedPuts.some(
-      (put) =>
-        logicalKeyMatches(put.key, delayedEc) &&
-        put.sequence < completed.value.responseSequence
-    )
+  const delayedPut = verifiedPuts.find(
+    (put) =>
+      logicalKeyMatches(put.key, delayedEc) &&
+      put.sequence < completed.value.responseSequence
   )
-  await bounded(
-    async () => !(await state(app)).Running,
-    7000,
-    'current-thread runner drain deadline'
+  assert(delayedPut, 'response cookie must follow the acknowledged request write')
+  assert.deepEqual(
+    delayedPut.item,
+    heldRequest.item,
+    'drain must commit the selected request write'
   )
-  assert.equal((await state(app)).ExitCode, 0)
-  proof.shutdownMs = Date.now() - shutdownStarted
-  const finalLogs = await logs(app)
-  assert.match(finalLogs, /phase=stopped/)
+  await verifyAfterExit(app, delayedPut)
   record(
     'actual runner serves health and starts shutdown while storage waits, then drains normally'
+  )
+
+  fault = 'normal'
+  app = await launch('after-response', originEndpoint, proxyEndpoint, true)
+  const seed = await document(app)
+  assert.equal(minted(seed).length, 1, 'after-response setup must mint one EC')
+  const afterEc = minted(seed)[0]
+  const seedRow = await get(afterEc)
+  assert.equal(
+    decode(seedRow).ids?.[afterResponseSource],
+    undefined,
+    'after-response source must start absent'
+  )
+  pauseAfterResponse = true
+  const response = await beforeDeadline(
+    document(app, 'AU', {
+      cookie: `ts-ec=${afterEc}; ${afterResponseCookie}=${afterResponseUid}`,
+    }),
+    performance.now() + 2500,
+    'full response must complete while the after-response write is paused'
+  )
+  assert.equal(
+    minted(response).length,
+    0,
+    'returning navigation must retain its EC'
+  )
+  assert.match(response.body.toString('utf8'), /fixture article/)
+  await bounded(
+    () =>
+      [...pending].some(
+        (entry) => entry.afterResponse && logicalKeyMatches(entry.key, afterEc)
+      ),
+    2500,
+    'after-response SharedID must reach the real conditional PutItem'
+  )
+  const heldAfter = [...pending].find(
+    (entry) => entry.afterResponse && logicalKeyMatches(entry.key, afterEc)
+  )
+  assert.equal(
+    heldAfter.expectedGeneration,
+    seedRow.generation.N,
+    'follow-up must condition on the seed generation'
+  )
+  assert.deepEqual(
+    await get(afterEc),
+    seedRow,
+    'full response must complete while the follow-up write remains uncommitted'
+  )
+  proof.afterResponseWrite = {
+    key: heldAfter.key,
+    uid: afterResponseUid,
+    condition: heldAfter.condition,
+    expectedGeneration: heldAfter.expectedGeneration,
+    responseCompletionSequence: response.completionSequence,
+  }
+  proof.afterResponseShutdownMs = await drain(app, heldAfter)
+  const followup = verifiedPuts.find(
+    (put) =>
+      logicalKeyMatches(put.key, afterEc) &&
+      decode(put.item).ids?.[afterResponseSource]?.uid === afterResponseUid
+  )
+  assert(followup, 'after-response UID must reach an acknowledged write')
+  assert.deepEqual(
+    followup.item,
+    heldAfter.item,
+    'drain must commit the selected follow-up write'
+  )
+  const afterRow = await verifyAfterExit(app, followup)
+  assert.equal(
+    decode(afterRow).ids[afterResponseSource].uid,
+    afterResponseUid,
+    'after-response UID must survive process exit'
+  )
+  assert(
+    Number(afterRow.generation.N) > Number(seedRow.generation.N),
+    'follow-up write must advance the record generation'
+  )
+  record(
+    'full response precedes SIGTERM with a pending after-response SharedID write, then durable drain within grace'
   )
   assert(!proof.proxyFailure, `fixture proxy error: ${proof.proxyFailure}`)
   assert(!proof.originFailure, proof.originFailure)
@@ -969,6 +1171,7 @@ try {
   console.error(`FAIL ${error.message}`)
 } finally {
   fault = 'normal'
+  pauseAfterResponse = false
   for (const entry of [...pending]) entry.resolve()
   proof.logs = {}
   for (const app of [...ownedApps].reverse()) {

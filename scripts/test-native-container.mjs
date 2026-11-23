@@ -246,8 +246,8 @@ http.createServer((req, res) => {
     )
     assert.doesNotMatch(
       logs,
-      /phase=ready/,
-      'invalid inputs must never reach readiness'
+      /\bevent=lifecycle\b[^\n]*\bphase=(?:ready|listening)\b/,
+      'invalid inputs must never report a ready or listening lifecycle event'
     )
     console.log(`PASS ${label} fails before listen`)
     console.log(logs)
