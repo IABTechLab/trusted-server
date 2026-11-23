@@ -108,7 +108,7 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
+use trusted_server_core::constants::{COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
 use trusted_server_core::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
@@ -124,6 +124,7 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
+use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -428,7 +429,7 @@ pub(crate) struct EcFinalizeState {
     /// entry point takes from the identity app built once per sandbox.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
-    pub(crate) sharedid_cookie: Option<String>,
+    pub(crate) sharedid: SharedIdRequest,
 }
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
@@ -594,6 +595,38 @@ async fn dispatch_identity_lookups(
     })
 }
 
+/// Records on the EC context the sources whose identity providers' own
+/// cookies on this request record an opt-out.
+///
+/// Runs on every route before any identity egress, so the publisher auction,
+/// page-bids, `/auction` and identify withhold those sources on the request
+/// the opt-out cookie arrives on. Only cookies are read: no lookup is made.
+fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestState) {
+    let coordinators = [
+        state.identity.page_identity(),
+        state.identity.after_response_identity(),
+    ];
+    if coordinators.iter().all(Option::is_none) {
+        return;
+    }
+    let cookie_header = joined_cookie_header(req);
+    let cookies = RequestCookies::new(&cookie_header)
+        .at(UnixSeconds::new(
+            trusted_server_core::ec::current_timestamp(),
+        ))
+        .where_gdpr_applies(ec.ec_context.consent().gdpr_applies);
+    let sources: Vec<String> = coordinators
+        .into_iter()
+        .flatten()
+        .flat_map(|coordinator| coordinator.cookie_opted_out_sources(cookies))
+        .map(|source| source.as_str().to_owned())
+        .collect();
+    if !sources.is_empty() {
+        log::debug!("Identity egress: withholding sources opted out in cookies: {sources:?}");
+    }
+    ec.ec_context.set_cookie_opted_out_sources(sources);
+}
+
 /// Per-request EC identity state built before dispatch, mirroring the
 /// pre-routing prelude of the legacy `route_request` (device signals, bot
 /// gate, cookie capture, consent/geo-aware [`EcContext`], and KV graph
@@ -603,7 +636,7 @@ struct EcRequestState {
     kv_graph: Option<KvIdentityGraph>,
     use_finalize_kv: bool,
     eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
+    sharedid: SharedIdRequest,
     is_real_browser: bool,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
@@ -622,7 +655,7 @@ impl EcRequestState {
             ec_context: self.ec_context,
             use_finalize_kv: self.use_finalize_kv,
             eids_cookie: self.eids_cookie,
-            sharedid_cookie: self.sharedid_cookie,
+            sharedid: self.sharedid,
         }
     }
 }
@@ -679,7 +712,7 @@ fn build_ec_request_state(
     }
 
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(identity.sharedid_storage().cookie_name(), req);
 
     let geo_info = services
         .geo()
@@ -723,7 +756,7 @@ fn build_ec_request_state(
         kv_graph,
         use_finalize_kv,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
         is_real_browser,
         geo_info,
         setup_error,
@@ -835,6 +868,7 @@ async fn execute_named(
     }
 
     let mut ec = build_ec_request_state(&state.identity, &services, &req);
+    apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -973,7 +1007,8 @@ async fn run_named_route(
 /// response finalization.
 async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    let sharedid =
+        SharedIdRequest::from_request(state.identity.sharedid_storage().cookie_name(), &req);
 
     let identity = &state.identity;
     let identity_graph = identity
@@ -991,7 +1026,7 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
         ec_context: EcContext::default(),
         use_finalize_kv: false,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
     });
     response
 }
@@ -1025,6 +1060,7 @@ async fn dispatch_fallback(
     }
 
     let mut ec = build_ec_request_state(&state.identity, services, &req);
+    apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -1639,7 +1675,7 @@ mod tests {
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::ec::eid_types::SourceDomain;
     use trusted_server_core::ec::provider::{
-        EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+        CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
         ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
     };
@@ -3531,6 +3567,52 @@ mod tests {
                 }],
             }]))
         }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            if cookies.get("vendor_id") == Some("optout") {
+                CookieRead::OptedOut
+            } else {
+                CookieRead::Absent
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cookie_opt_outs_reach_the_ec_context_of_every_route() {
+        for after_response in [false, true] {
+            for (cookie, opted_out) in [("vendor_id=optout", true), ("vendor_id=c-1", false)] {
+                // Arrange
+                let fixture = identity_fixture(after_response);
+                let mut request = browser_request(Method::POST, "/auction", "empty");
+                request
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static(cookie));
+                let mut ec = super::EcRequestState {
+                    ec_context: EcContext::default(),
+                    kv_graph: None,
+                    use_finalize_kv: false,
+                    eids_cookie: None,
+                    sharedid: super::SharedIdRequest::default(),
+                    is_real_browser: true,
+                    geo_info: None,
+                    setup_error: None,
+                };
+
+                // Act
+                super::apply_cookie_opt_outs(&fixture.state, &request, &mut ec);
+
+                // Assert
+                assert_eq!(
+                    ec.ec_context.source_opted_out_in_cookies("ids.example.com"),
+                    opted_out,
+                    "should withhold the source only when the provider's cookies opt out \
+                     (after_response={after_response}, cookie={cookie})"
+                );
+            }
+        }
     }
 
     /// The echo provider's lookup endpoint.
@@ -4007,6 +4089,46 @@ mod tests {
                 .device_signals()
                 .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn ec_request_state_reads_the_configured_sharedid_cookie() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } },
+                    "managed_user_ids": [
+                        { "name": "sharedId", "storage": { "type": "cookie", "name": "_pubcid" } }
+                    ],
+                }),
+            )
+            .expect("should configure Prebid");
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "sharedId=legacy-id; _pubcid=configured-id")
+            .body(Body::empty())
+            .expect("should build request");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+
+        let ec = super::build_ec_request_state(&state.identity, &services, &req);
+
+        assert_eq!(
+            ec.sharedid.readable_value(),
+            Some("configured-id"),
+            "should read the cookie named by Prebid's storage.name, not `sharedId`"
         );
     }
 
