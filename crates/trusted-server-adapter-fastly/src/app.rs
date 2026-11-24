@@ -1611,7 +1611,7 @@ mod tests {
             .client_ip;
         request
             .extensions_mut()
-            .insert(RequestGeo::lookup_once(client_ip, &test_settings().consent));
+            .insert(RequestGeo::lookup_once(client_ip));
         block_on(router.oneshot(request)).expect("should route request")
     }
 
@@ -3743,7 +3743,7 @@ mod tests {
             .client_ip;
         request
             .extensions_mut()
-            .insert(RequestGeo::lookup_once(client_ip, &test_settings().consent));
+            .insert(RequestGeo::lookup_once(client_ip));
         fixture
             .clock
             .drive(router.oneshot(request))

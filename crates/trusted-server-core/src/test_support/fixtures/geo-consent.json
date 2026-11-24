@@ -158,14 +158,18 @@
     "country": "US",
     "region": "",
     "source": "Located",
-    "policy": "Unknown"
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
   },
   {
     "name": "us-invalid-subdivision",
     "country": "US",
     "region": "US-CA",
     "source": "Located",
-    "policy": "Unknown"
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
   },
   {
     "name": "us-unrecognized-subdivision",
@@ -206,6 +210,17 @@
     "country": "US",
     "region": "?",
     "source": "Located",
-    "policy": "Unknown"
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-no-region-subdivision",
+    "country": "US",
+    "region": "NO REGION",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
   }
 ]

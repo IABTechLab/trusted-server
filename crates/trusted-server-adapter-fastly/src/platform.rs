@@ -209,34 +209,16 @@ fn write_client(
 /// Returns `None` unless the country belongs to the ISO-assigned catalogue in
 /// the pinned `EdgeZero` revision. This includes rejecting unassigned codes
 /// such as `XK`, aggregate codes such as `EU`/`AP`, and `A1`/`A2`/`O1`.
-/// A present subdivision must pass the pinned `EdgeZero` `SubdivisionCode`
-/// syntax check. Invalid subdivisions are dropped while retaining the country,
-/// unless configured rules require the subdivision: US with a nonempty state
-/// list and no overriding GDPR country rule returns `None` (Unknown).
-/// Unlike `EdgeZero` `GeoOutcome::platform`, this avoids turning malformed state
-/// input into `NonRegulated`. Absent subdivisions remain valid, as do syntactically
-/// valid but unrecognized subdivisions such as `ZZ`.
+/// Unknown-subdivision sentinels (`?`, `NO REGION`, and empty) and other values
+/// failing the pinned `EdgeZero` `SubdivisionCode` syntax check become an absent
+/// region. The valid country is retained, matching `GeoOutcome::platform`.
+/// This conversion does not consult consent configuration or choose jurisdiction.
 /// Valid SDK country and subdivision representations are preserved verbatim.
-fn geo_from_fastly(
-    geo: &Geo,
-    consent: &trusted_server_core::consent_config::ConsentConfig,
-) -> Option<GeoInfo> {
+fn geo_from_fastly(geo: &Geo) -> Option<GeoInfo> {
     edgezero_core::geo::CountryCode::new(geo.country_code()).ok()?;
     let region = geo
         .region()
         .filter(|region| edgezero_core::geo::SubdivisionCode::new(region).is_ok());
-    if geo.region().is_some()
-        && region.is_none()
-        && geo.country_code().eq_ignore_ascii_case("US")
-        && !consent.us_states.privacy_states.is_empty()
-        && !consent
-            .gdpr
-            .applies_in
-            .iter()
-            .any(|country| country.eq_ignore_ascii_case(geo.country_code()))
-    {
-        return None;
-    }
     Some(GeoInfo {
         city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),
@@ -286,17 +268,14 @@ impl RequestGeo {
     }
 
     /// Looks up `client_ip` once with Fastly's geo database.
-    pub(crate) fn lookup_once(
-        client_ip: Option<IpAddr>,
-        consent: &trusted_server_core::consent_config::ConsentConfig,
-    ) -> Self {
+    pub(crate) fn lookup_once(client_ip: Option<IpAddr>) -> Self {
         Self {
             #[cfg(test)]
             fail_lookup: false,
             client_ip,
             geo: client_ip
                 .and_then(geo_lookup)
-                .and_then(|geo| geo_from_fastly(&geo, consent)),
+                .and_then(|geo| geo_from_fastly(&geo)),
         }
     }
 

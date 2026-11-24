@@ -446,7 +446,7 @@ impl ClientRequestValues {
         // The request's one geo lookup, for the resolved client IP. The
         // synthesized headers, `finalize`, the finalize middleware, the trace
         // metadata and the per-request services all read it.
-        let request_geo = RequestGeo::lookup_once(client_info.client_ip, &settings.consent);
+        let request_geo = RequestGeo::lookup_once(client_info.client_ip);
         Self {
             forwarder,
             client_info,

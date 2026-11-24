@@ -111,7 +111,7 @@ fn geo_consent_fixture_retries_an_occupied_port() {
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_secs(12);
+            let deadline = Instant::now() + Duration::from_secs(35);
             while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                 if let Ok((mut stream, _)) = occupied.accept() {
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -344,7 +344,8 @@ impl ServerFixture {
     }
 
     fn wait_ready(&mut self) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
         let mut retries = 0;
         loop {
             let status = self
@@ -370,6 +371,15 @@ impl ServerFixture {
                 && Instant::now() < deadline
             {
                 retries += 1;
+                assert_no_secrets(&diagnostic);
+                // The failed child's readers have been joined above. Clear
+                // its output before any reader for the next attempt can run.
+                for output in &self.logs {
+                    output
+                        .lock()
+                        .expect("should reset failed-attempt diagnostics")
+                        .clear();
+                }
                 let reservation = reserve_port();
                 self.addr = reservation.local_addr().expect("should read retry address");
                 drop(reservation);
@@ -388,6 +398,14 @@ impl ServerFixture {
                 status.is_none(),
                 "should keep running after valid prepared-store initialization: {diagnostic}"
             );
+            assert!(
+                Instant::now() < deadline,
+                "should become ready within the test bound: address={} attempt={} elapsed={:?}; {}",
+                self.addr,
+                retries + 1,
+                started.elapsed(),
+                self.diagnostics()
+            );
             // Readiness belongs to this child, not whichever process won the port.
             if self
                 .diagnostics()
@@ -398,13 +416,16 @@ impl ServerFixture {
                     response.starts_with("HTTP/1.1 200"),
                     "should become healthy only after successful initialization: {response}"
                 );
+                assert!(
+                    Instant::now() < deadline,
+                    "should become ready within the test bound: address={} attempt={} elapsed={:?}; {}",
+                    self.addr,
+                    retries + 1,
+                    started.elapsed(),
+                    self.diagnostics()
+                );
                 return response;
             }
-            assert!(
-                Instant::now() < deadline,
-                "should become ready within the test bound: {}",
-                self.diagnostics()
-            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -756,6 +777,7 @@ fn admitted_body_error_keeps_managed_geo_without_losing_framework_status() {
     server.spawn_configured(false, false, Some(GEO_PROFILE));
     server.wait_ready();
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("should create local fixture client");

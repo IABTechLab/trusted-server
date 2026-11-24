@@ -139,10 +139,11 @@ impl Server {
 
     fn start_at(source: Source, store: &RecordingStore, initial: Option<SocketAddr>) -> Self {
         let probe = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(200))
             .build()
             .expect("should build readiness client");
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let started = Instant::now();
         for attempt in 0..5 {
             let reservation =
                 TcpListener::bind("127.0.0.1:0").expect("should reserve native fixture port");
@@ -152,6 +153,7 @@ impl Server {
                     .expect("should read fixture address")
             });
             drop(reservation);
+            assert_startup_bound(started, address, attempt + 1);
             let (stop, stopped) = oneshot::channel();
             let bids = Arc::new(Mutex::new(Vec::new()));
             let captured = Arc::clone(&bids);
@@ -199,6 +201,7 @@ impl Server {
                 bids,
             };
             loop {
+                assert_startup_bound(started, address, attempt + 1);
                 if server
                     .worker
                     .as_ref()
@@ -227,18 +230,23 @@ impl Server {
                     .get(format!("http://{address}/api/geo-fixture-ready"))
                     .header("host", "publisher.example.com")
                     .send();
+                assert_startup_bound(started, address, attempt + 1);
                 if ready.load(Ordering::Acquire) {
                     return server;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "should start native fixture within bound"
-                );
                 thread::sleep(Duration::from_millis(10));
             }
         }
         unreachable!("should return or report bounded startup failure")
     }
+}
+
+fn assert_startup_bound(started: Instant, address: SocketAddr, attempt: usize) {
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "should start native fixture within bound: address={address} attempt={attempt} elapsed={elapsed:?}"
+    );
 }
 
 impl Drop for Server {

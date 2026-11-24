@@ -539,12 +539,12 @@ fn geo_consent_fastly() {
     let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
     geo_consent::verify(&mut adapter, false, false);
     verify_deferred_stale_origin_headers(&mut adapter);
-    verify_configured_subdivision_rules();
+    verify_country_only_consent_rules();
 }
 
-// Exercise configuration precedence through the same authenticated host lookup
+// Exercise ordinary consent configuration with country-only geography through the host lookup
 // and application finalizer, rather than unit-calling jurisdiction detection.
-fn verify_configured_subdivision_rules() {
+fn verify_country_only_consent_rules() {
     for gdpr_override in [false, true] {
         let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
         adapter.settings.consent.us_states.privacy_states.clear();
@@ -608,7 +608,7 @@ fn verify_configured_subdivision_rules() {
                 .get("x-geo-country")
                 .and_then(|value| value.to_str().ok()),
             Some("US"),
-            "should retain country when configured rules do not need a subdivision"
+            "should retain valid country after dropping invalid subdivision"
         );
         assert!(
             !result.headers.contains_key("x-geo-region"),

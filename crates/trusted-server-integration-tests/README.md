@@ -143,23 +143,21 @@ Axum normalizes valid lowercase country/subdivision input before consumers see
 it. Fastly preserves the SDK's representation for valid values, as
 `geo_from_fastly` does; both select the same jurisdiction for lowercase US/CA.
 Fastly rejects every country outside the pinned EdgeZero ISO-assigned catalogue
-at that conversion boundary, including XK, EU, AP, A1, A2 and O1. A present
-empty or malformed subdivision fails the pinned EdgeZero `SubdivisionCode`
-syntax check. Fastly then keeps the valid country and drops the subdivision,
-except when configured jurisdiction rules depend on the lost subdivision: US is
-Unknown when the configured privacy-state list is nonempty and no configured
-GDPR country rule takes precedence. Thus DE with `?`, `NO REGION` or an empty
-subdivision stays GDPR and TCF denial withdraws a returning EC; malformed US
-subdivisions become Unknown and keep an existing EC. Absent subdivisions and
-syntax-valid `US/ZZ` remain NonRegulated under the fixture configuration.
+at that conversion boundary, including XK, EU, AP, A1, A2 and O1.
+Fastly's unknown-subdivision sentinels (`?`, `NO REGION`, and empty) are treated
+as an absent region. Other malformed subdivisions also fail the pinned EdgeZero
+`SubdivisionCode` syntax check and are dropped while the valid country survives.
+The producer does not read consent configuration or choose a jurisdiction.
+Country-only US therefore remains NonRegulated under the existing configured
+rules, including when the SDK supplied a sentinel or malformed subdivision;
+TCF denial retains a returning EC there. A retained GDPR country such as DE
+still applies GDPR withdrawal. Absent subdivisions, syntax-valid `US/ZZ`, and
+valid SDK representations retain their existing behavior.
 
-EdgeZero's `GeoOutcome::platform` always keeps a valid country and drops an
-invalid subdivision. Fastly deliberately differs for subdivision-dependent
-jurisdictions to avoid treating a malformed state as NonRegulated. Axum's
+This country-only projection matches EdgeZero's `GeoOutcome::platform`. Axum's
 protected CloudFront provider instead rejects the whole malformed assertion, so
-these DE cases remain Unknown there. The shared table explicitly records that
-producer difference. Fastly preserves valid SDK representations and uses its
-local lookup.
+these DE and US cases remain Unknown on that path. The shared table records
+this producer difference explicitly. Fastly continues to use its local lookup.
 
 The mapped Fastly test also explicitly pins a known deferred exception: a
 no-location document whose origin supplies `x-geo-country: DE` and
