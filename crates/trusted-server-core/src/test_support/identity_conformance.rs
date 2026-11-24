@@ -1538,6 +1538,45 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         serde_json::json!([{"source":"mirror.example.com","uids":[{"id":"allowed-mirror-id","atype":1}]}]),
         "should expose only the live mirrored provider UID"
     );
+    // ID-9 and WB-4: a returning reader whose mirror was set yesterday, so
+    // its `exp` is one day short of today's cap, is unchanged: no identity
+    // cookie is re-set and the route answers with the mirror it carries.
+    let mut yesterday = cookie_mirror.clone();
+    for eid in yesterday["eids"]
+        .as_array_mut()
+        .expect("should hold an EID array")
+    {
+        for uid in eid["uids"].as_array_mut().expect("should hold a UID array") {
+            let exp = uid["exp"].as_u64().expect("should carry a numeric exp");
+            uid["exp"] = serde_json::Value::from(exp - 24 * 60 * 60);
+        }
+    }
+    let carried = URL_SAFE_NO_PAD.encode(yesterday.to_string());
+    let mut returning = ApiRequest::new(http::Method::POST, ec_path);
+    returning.body = consent_body.clone();
+    returning.headers = vec![
+        (
+            "origin".to_owned(),
+            "https://publisher.example.com".to_owned(),
+        ),
+        (
+            "cookie".to_owned(),
+            format!("{tcf_cookie}; {browser_cookies}; __Host-ts-eids-mirror={carried}"),
+        ),
+    ];
+    let returning = adapter.exchange(&returning);
+    assert_eq!(
+        returning.response.status,
+        StatusCode::OK,
+        "should accept an unchanged returning reader"
+    );
+    assert_no_identity_cookies(&returning.response);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&returning.response.body)
+            .expect("should decode the returning reader's EC JSON"),
+        yesterday,
+        "should answer with the mirror the reader keeps"
+    );
     assert!(
         ![
             "body-fixture-id",

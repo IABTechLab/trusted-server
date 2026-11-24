@@ -25,7 +25,9 @@ use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
-use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
+use super::mirror::{
+    MirrorCookie, build_mirror, current_carried_mirror, mirror_consent, mirror_sources,
+};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::{PartnerConfig, PartnerRegistry};
@@ -107,11 +109,12 @@ pub struct FinalizeRequest<'a> {
 /// The cookie is only expired when the request carried it, and only set when
 /// its value differs from the one the request carried, so responses that
 /// leave the mirror as it was stay free of `Set-Cookie` and keep their
-/// cacheability. An unchanged mirror is therefore not re-extended; once it
-/// lapses, the next navigation sets it again. Every UID's `exp` is capped at
-/// the start of the current UTC day plus 30 days, so a returning reader whose
-/// mirror holds UIDs at that cap gets at most one mirror `Set-Cookie` per UTC
-/// day.
+/// cacheability. Every UID's `exp` is capped at the start of the current UTC
+/// day plus 30 days, so a rebuilt mirror's `exp` moves daily; a carried
+/// mirror that differs only by such an earlier `exp`, at least 7 days away,
+/// is kept instead ([`current_carried_mirror`]). An unchanged returning
+/// reader therefore gets a mirror `Set-Cookie` only when a UID nears its
+/// `exp`, about once every 23 days for UIDs at the cap.
 ///
 /// A navigation whose clock read failed (`now` is `None`) cannot build a
 /// mirror from a live row, since UID liveness and `exp` depend on the time,
@@ -141,7 +144,14 @@ fn apply_mirror(
         && let Some(row) = mirror_row(ec_context)
         && let Some(decision) = rebuild_mirror(row, ec_context, registry, now)
     {
-        decision
+        // Keep a carried mirror whose only difference is an earlier `exp`
+        // that is not yet near.
+        match (decision, ec_context.mirror_cookie(), now) {
+            (MirrorCookie::Set(rebuilt), Some(carried), Some(now)) => {
+                MirrorCookie::Set(current_carried_mirror(carried, &rebuilt, now).unwrap_or(rebuilt))
+            }
+            (decision, _, _) => decision,
+        }
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
         // provider whose TCF vendor consent is now denied, whose source is
@@ -3155,8 +3165,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn no_expiry_mirror_is_kept_within_a_utc_day_and_re_set_once_on_the_next() {
-        // Arrange
+    async fn no_expiry_mirror_is_kept_until_its_exp_is_within_seven_days() {
+        // Arrange: the first navigation sets `exp` to day 0 plus 30 days.
+        const DAY: u64 = 86_400;
         let at = |seconds: u64| Some(UnixSeconds::new(MIRROR_DAY_START + seconds));
         let (first, _) =
             run_mirror_navigation_at(provider_found("ids.example.com"), None, at(60)).await;
@@ -3167,33 +3178,53 @@ mod tests {
             "should set the mirror on the first navigation"
         );
         let value = mirror_value(&set[0]).to_owned();
+        let returning = |seconds: u64| {
+            let value = value.clone();
+            async move {
+                run_mirror_navigation_at(
+                    provider_found("ids.example.com"),
+                    Some(&value),
+                    at(seconds),
+                )
+                .await
+            }
+        };
 
         // Act
-        let (same_day, _) =
-            run_mirror_navigation_at(provider_found("ids.example.com"), Some(&value), at(86_399))
-                .await;
-        let (next_day, _) = run_mirror_navigation_at(
-            provider_found("ids.example.com"),
-            Some(&value),
-            at(86_400 + 60),
-        )
-        .await;
+        let (same_day, _) = returning(DAY - 1).await;
+        let (next_day, next_day_decision) = returning(DAY + 60).await;
+        let (day_22, _) = returning(22 * DAY + 60).await;
+        let (day_23, _) = returning(23 * DAY + 60).await;
 
         // Assert
-        assert!(
-            mirror_cookies(&same_day).is_empty(),
-            "should not re-set an unchanged mirror later the same UTC day"
-        );
-        let next_day_cookies = mirror_cookies(&next_day);
+        for (response, when) in [
+            (&same_day, "later the same UTC day"),
+            (&next_day, "on the next UTC day"),
+            (&day_22, "while its exp is more than 7 days away"),
+        ] {
+            assert!(
+                mirror_cookies(response).is_empty(),
+                "should keep an unchanged mirror {when}"
+            );
+        }
+        match next_day_decision {
+            Some(MirrorCookie::Set(kept)) => assert_eq!(
+                kept.as_str(),
+                value,
+                "should report the kept mirror, so the EC route answers with it"
+            ),
+            other => panic!("should decide to keep the mirror, got {other:?}"),
+        }
+        let refreshed = mirror_cookies(&day_23);
         assert_eq!(
-            next_day_cookies.len(),
+            refreshed.len(),
             1,
-            "should re-set the mirror once on the next UTC day"
+            "should re-set the mirror once its exp is within 7 days"
         );
         assert_ne!(
-            mirror_value(&next_day_cookies[0]),
+            mirror_value(&refreshed[0]),
             value,
-            "should carry the next day's exp"
+            "should carry the current exp"
         );
     }
 

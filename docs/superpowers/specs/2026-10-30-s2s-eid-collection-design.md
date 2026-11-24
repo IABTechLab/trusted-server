@@ -1525,10 +1525,13 @@ still due.
   The cap is the start of the current UTC day plus 30 days. A UID with a
   stated expiry is mirrored with the earlier of that expiry and the cap; a
   UID with no stated expiry (D7) is mirrored with the cap, and KV still
-  serves it until replaced or removed. A mirror whose UIDs reach the cap is
-  therefore stable within a UTC day, and an unchanged returning reader gets
-  a mirror `Set-Cookie` at most once per UTC day; a changed row or a stated
-  expiry falling during the day can change it again. The `exp` counts toward the
+  serves it until replaced or removed. The cap moves each UTC day, so the
+  server keeps a carried mirror that holds the same UIDs and differs only by
+  an earlier `exp` that is still at least 7 days away and no later than the
+  rebuilt one. An unchanged returning reader therefore gets no mirror
+  `Set-Cookie` until a UID nears its `exp`: about once every 23 days for UIDs
+  at the cap. A changed row or a shortened stated expiry re-sets it at once,
+  and the EC route answers with the mirror the reader keeps. The `exp` counts toward the
   3,584-byte budget, so UIDs that no longer fit are skipped as before.
 - **Clock:** the page-load write and the mirror build share one request
   time, read only for a navigation with an eligible, non-redirect response;
