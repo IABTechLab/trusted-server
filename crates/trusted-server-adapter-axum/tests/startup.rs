@@ -950,6 +950,18 @@ mod managed_geo_consumers {
         upstream.assert_no_dispatch();
     }
 
+    fn drain_runtime_log(
+        mut reader: impl std::io::Read + Send + 'static,
+    ) -> thread::JoinHandle<String> {
+        thread::spawn(move || {
+            let mut output = String::new();
+            reader
+                .read_to_string(&mut output)
+                .expect("should drain native runtime log");
+            output
+        })
+    }
+
     #[test]
     fn geo_consent_runtime_axum() {
         let upstream = LocalUpstream::start();
@@ -966,6 +978,18 @@ mod managed_geo_consumers {
         let mut unselected = ServerFixture::new(Some(&envelope(&upstream)));
         unselected.spawn_configured(false, false, Some("version = 1\n[geo]\nprovider = 'off'"));
         unselected.wait_ready();
+        // Drain both pipes while the expanded matrix runs: unread informational
+        // logs can otherwise block the child before it answers a request.
+        let mut logs = Vec::new();
+        for server in [&mut trusted, &mut untrusted, &mut unselected] {
+            let child = server.child.as_mut().expect("should own native child");
+            logs.push(drain_runtime_log(
+                child.stdout.take().expect("should own child stdout"),
+            ));
+            logs.push(drain_runtime_log(
+                child.stderr.take().expect("should own child stderr"),
+            ));
+        }
         let client = client();
         for &location in geo_consent::LOCATIONS.iter() {
             // A synchronous provider cannot time out. ProviderFailure is an
@@ -994,9 +1018,12 @@ mod managed_geo_consumers {
                 if let Some(region) = location.region {
                     request = request.header("cloudfront-viewer-country-region", region);
                 }
-                let response = request
-                    .send()
-                    .expect("should send real process auction request");
+                let response = request.send().unwrap_or_else(|error| {
+                    panic!(
+                        "should send real process auction request for {} {signal:?}: {error}",
+                        location.name
+                    )
+                });
                 assert_eq!(
                     response.status(),
                     reqwest::StatusCode::OK,
@@ -1068,6 +1095,10 @@ mod managed_geo_consumers {
                     assert_denied(&body, &upstream);
                 }
             }
+        }
+        drop((trusted, untrusted, unselected));
+        for log in logs {
+            assert_no_secrets(&log.join().expect("should collect drained child log"));
         }
     }
 

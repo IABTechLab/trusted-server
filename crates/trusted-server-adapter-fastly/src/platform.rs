@@ -205,10 +205,19 @@ fn write_client(
 // ---------------------------------------------------------------------------
 
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
+///
+/// Returns `None` unless the country belongs to the ISO-assigned catalogue in
+/// the pinned `EdgeZero` revision. This includes rejecting unassigned codes
+/// such as `XK`, aggregate codes such as `EU`/`AP`, and `A1`/`A2`/`O1`.
+/// A present subdivision must contain one to three ASCII alphanumerics;
+/// empty or malformed subdivisions also reject the entire location, matching
+/// Axum's protected `CloudFront` provider. Absent subdivisions remain valid.
+/// Valid SDK country and subdivision representations are preserved verbatim.
 fn geo_from_fastly(geo: &Geo) -> Option<GeoInfo> {
-    // Reject missing/sentinel countries before any consumer sees a location.
-    // Preserve the SDK's representation for valid country and region values.
     edgezero_core::geo::CountryCode::new(geo.country_code()).ok()?;
+    if let Some(region) = geo.region() {
+        edgezero_core::geo::SubdivisionCode::new(region).ok()?;
+    }
     Some(GeoInfo {
         city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),

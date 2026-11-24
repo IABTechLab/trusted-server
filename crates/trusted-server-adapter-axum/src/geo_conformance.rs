@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use edgezero_adapter_axum::dev_server::{AxumRunOptions, run_app_with_options_and_initializer};
+use edgezero_adapter_axum::dev_server::{
+    AxumRunOptions, LocalStartupFuture, run_app_with_options_and_initializer,
+};
 use edgezero_adapter_axum::geo::{NativeGeoSelection, ProtectedCloudFrontAlb};
 use edgezero_core::app::{App, Hooks};
 use edgezero_core::error::EdgeError;
@@ -52,6 +54,67 @@ impl GeoProvider for FailedProvider {
     }
 }
 
+fn initialize_fixture(
+    app: &mut App,
+    store: RecordingStore,
+    captured: Arc<Mutex<Vec<Value>>>,
+) -> LocalStartupFuture<'_> {
+    Box::pin(async move {
+        let clock = TestClock::new();
+        let transport = ScriptedHttpClient::new(&clock).with_request_observer(move |request| {
+            if request.uri == geo_consent::BIDDER {
+                captured
+                    .lock()
+                    .expect("should lock captured bidder requests")
+                    .push(
+                        serde_json::from_slice(&request.body)
+                            .expect("should record actual OpenRTB"),
+                    );
+            }
+        });
+        // All exchanges are sequential. Preload bounded immediate replies
+        // so both positive dispatch and absence are externally visible.
+        for _ in 0..4096 {
+            for path in ["/article", "/image.png", "/api/example"] {
+                let mime = if path == "/article" {
+                    "text/html"
+                } else {
+                    "application/json"
+                };
+                let reply = ScriptedReply::status(StatusCode::OK)
+                    .header("content-type", mime)
+                    .body("<html><head></head><body><div id=\"example-slot\"></div></body></html>");
+                transport.respond_to(
+                    Method::GET,
+                    &format!("https://origin.example.com{path}"),
+                    reply,
+                );
+            }
+            transport.respond_to(
+                Method::POST,
+                geo_consent::BIDDER,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
+        }
+        let mut configured = settings();
+        geo_consent::configure(&mut configured);
+        // No RuntimeServices override: production build_runtime_services
+        // must read this request's private managed GeoOutcome.
+        let mut state =
+            build_state_with_settings(configured).expect("should build actual TS state");
+        Arc::get_mut(&mut state)
+            .expect("should own initializing state")
+            .set_ec_store(store);
+        app.set_monotonic_clock(clock.monotonic_clock());
+        app.set_router(
+            router_builder(&state)
+                .with_state(transport.http_client())
+                .build(),
+        );
+        Ok(())
+    })
+}
+
 struct Server {
     address: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
@@ -93,31 +156,14 @@ impl Server {
             let options = AxumRunOptions::new(address)
                 .expect("should build explicit native options")
                 .with_geo(selection);
-            run_app_with_options_and_initializer::<FixtureHooks, _, _>(options, async move { let _ = stopped.await; }, move |app, _| Box::pin(async move {
-                let clock = TestClock::new();
-                let transport = ScriptedHttpClient::new(&clock).with_request_observer(move |request| {
-                    if request.uri == geo_consent::BIDDER {
-                        captured.lock().expect("should lock captured bidder requests").push(serde_json::from_slice(&request.body).expect("should record actual OpenRTB"));
-                    }
-                });
-                // All exchanges are sequential. Preload bounded immediate replies
-                // so both positive dispatch and absence are externally visible.
-                for _ in 0..4096 {
-                    for path in ["/article", "/image.png", "/api/example"] {
-                        transport.respond_to(Method::GET, &format!("https://origin.example.com{path}"), ScriptedReply::status(StatusCode::OK).header("content-type", if path == "/article" { "text/html" } else { "application/json" }).body("<html><head></head><body><div id=\"example-slot\"></div></body></html>"));
-                    }
-                    transport.respond_to(Method::POST, geo_consent::BIDDER, ScriptedReply::status(StatusCode::NO_CONTENT));
-                }
-                let mut configured = settings();
-                geo_consent::configure(&mut configured);
-                // No RuntimeServices override: production build_runtime_services
-                // must read this request's private managed GeoOutcome.
-                let mut state = build_state_with_settings(configured).expect("should build actual TS state");
-                Arc::get_mut(&mut state).expect("should own initializing state").set_ec_store(store);
-                app.set_monotonic_clock(clock.monotonic_clock());
-                app.set_router(router_builder(&state).with_state(transport.http_client()).build());
-                Ok(())
-            })).expect("should run managed native fixture");
+            run_app_with_options_and_initializer::<FixtureHooks, _, _>(
+                options,
+                async move {
+                    let _ = stopped.await;
+                },
+                move |app, _| initialize_fixture(app, store, captured),
+            )
+            .expect("should run managed native fixture");
         });
         let deadline = Instant::now() + Duration::from_secs(15);
         while TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_err() {

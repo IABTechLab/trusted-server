@@ -282,223 +282,257 @@ pub fn verify(adapter: &mut impl Adapter, canonical: bool, unselected: bool) {
                 Kind::Api,
             ] {
                 for returning in [false, true] {
-                    let identity = returning.then(|| {
-                        let seed = adapter.exchange(&Exchange {
-                            location: *LOCATIONS
-                                .iter()
-                                .find(|location| location.name == "jp")
-                                .expect("should have non-regulated seed case"),
-                            signal: Signal::None,
-                            kind: Kind::EcPost,
-                            ec: None,
-                        });
-                        cookies(&seed)
-                            .first()
-                            .expect("should issue seed EC")
-                            .split(';')
-                            .next()
-                            .expect("should have cookie pair")
-                            .trim_start_matches("ts-ec=")
-                            .to_owned()
-                    });
-                    if let Some(identity) = &identity {
-                        assert!(
-                            adapter.record_is_live(identity),
-                            "should persist live seed before replay"
-                        );
-                    }
-                    let observed = adapter.exchange(&Exchange {
-                        location,
-                        signal,
-                        kind,
-                        ec: identity.as_deref(),
-                    });
-                    let context = format!(
-                        "{} {signal:?} {kind:?} returning={returning}",
-                        location.name
+                    let identity = returning.then(|| seed_identity(adapter));
+                    verify_exchange(
+                        adapter,
+                        &Exchange {
+                            location,
+                            signal,
+                            kind,
+                            ec: identity.as_deref(),
+                        },
+                        canonical,
                     );
-                    assert!(
-                        !observed.status.is_server_error(),
-                        "should not fail request: {context}"
-                    );
-                    assert!(
-                        observed.status.is_success(),
-                        "should accept request: {context}, status={}",
-                        observed.status
-                    );
-                    let withdrawal = returning
-                        && match location.policy {
-                            Policy::Gdpr => signal == Signal::Denied,
-                            Policy::UsState => {
-                                matches!(signal, Signal::Denied | Signal::Gpc | Signal::GppOptOut)
-                            }
-                            Policy::NonRegulated | Policy::Unknown => false,
-                        };
-                    // EC GET is read-only and does not run identity finalization.
-                    let withdrawal = withdrawal && kind != Kind::EcGet;
-                    let allowed = match location.policy {
-                        Policy::Gdpr => signal.grants_storage(),
-                        Policy::UsState => {
-                            signal.grants_storage()
-                                || matches!(signal, Signal::GppUs | Signal::UsPrivacy)
-                        }
-                        Policy::NonRegulated => true,
-                        Policy::Unknown => false,
-                    };
-                    let ec = cookies(&observed);
-                    let expired = ec.iter().any(|cookie| cookie.contains("Max-Age=0"));
-                    assert_eq!(
-                        expired, withdrawal,
-                        "should apply jurisdiction-specific withdrawal: {context}; cookies={ec:?}"
-                    );
-                    if !returning {
-                        assert_eq!(
-                            ec.iter().any(|cookie| !cookie.contains("Max-Age=0")),
-                            allowed && matches!(kind, Kind::Document | Kind::EcPost),
-                            "should gate EC creation: {context}; cookies={ec:?}"
-                        );
-                    } else if !withdrawal {
-                        assert!(
-                            ec.iter().all(|cookie| cookie.split(';').next()
-                                == Some(
-                                    format!(
-                                        "ts-ec={}",
-                                        identity.as_deref().expect("should replay seed")
-                                    )
-                                    .as_str()
-                                )),
-                            "should retain existing EC: {context}; cookies={ec:?}"
-                        );
-                    }
-                    if let Some(identity) = &identity {
-                        assert_eq!(
-                            adapter.record_is_live(identity),
-                            !withdrawal,
-                            "should preserve or withdraw authoritative record: {context}"
-                        );
-                    }
-                    let auction = signal != Signal::Denied
-                        && (signal.grants_storage()
-                            || !matches!(location.policy, Policy::Gdpr | Policy::Unknown));
-                    assert_eq!(
-                        observed.bids.len(),
-                        usize::from(auction && matches!(kind, Kind::Auction | Kind::Document)),
-                        "should gate actual bidder dispatch: {context}"
-                    );
-                    let located = location.policy != Policy::Unknown;
-                    let expected_country = location.country.map(|value| {
-                        if canonical {
-                            value.to_ascii_uppercase()
-                        } else {
-                            value.to_owned()
-                        }
-                    });
-                    let expected_region = location.region.map(|value| {
-                        if canonical {
-                            value.to_ascii_uppercase()
-                        } else {
-                            value.to_owned()
-                        }
-                    });
-                    assert_eq!(
-                        observed
-                            .headers
-                            .get("x-geo-info-available")
-                            .and_then(|value| value.to_str().ok()),
-                        Some(if located { "true" } else { "false" }),
-                        "should report managed availability: {context}"
-                    );
-                    for name in ["country", "region"] {
-                        let expected = if !located {
-                            None
-                        } else if name == "country" {
-                            expected_country.as_deref()
-                        } else {
-                            expected_region.as_deref()
-                        };
-                        assert_eq!(
-                            observed
-                                .headers
-                                .get(format!("x-geo-{name}"))
-                                .and_then(|value| value.to_str().ok()),
-                            expected,
-                            "should report same producer {name}: {context}"
-                        );
-                    }
-                    for bid in &observed.bids {
-                        assert_eq!(
-                            bid["device"]["geo"]["country"].as_str(),
-                            located.then_some(expected_country.as_deref()).flatten(),
-                            "should export same country: {context}"
-                        );
-                        assert_eq!(
-                            bid["device"]["geo"]["region"].as_str(),
-                            located.then_some(expected_region.as_deref()).flatten(),
-                            "should export same subdivision: {context}"
-                        );
-                        if signal.grants_storage() {
-                            assert_eq!(
-                                bid["regs"]["gdpr"],
-                                json!(1),
-                                "should forward effective EU consent: {context}"
-                            );
-                        }
-                        if matches!(signal, Signal::GppUs | Signal::GppOptOut | Signal::GppTcf) {
-                            let raw = signal.cookie();
-                            let gpp = raw
-                                .trim_start_matches("__gpp=")
-                                .split(';')
-                                .next()
-                                .expect("should have GPP");
-                            assert_eq!(
-                                bid["regs"]["gpp"],
-                                json!(gpp),
-                                "should forward GPP: {context}"
-                            );
-                            assert_eq!(
-                                bid["regs"]["gpp_sid"],
-                                if signal == Signal::GppTcf {
-                                    json!([2, 6])
-                                } else if signal == Signal::GppUs {
-                                    json!([7])
-                                } else {
-                                    json!([9])
-                                },
-                                "should forward relevant GPP sections: {context}"
-                            );
-                        }
-                        if !signal.grants_storage() {
-                            let expected = if signal == Signal::None {
-                                Value::Null
-                            } else {
-                                json!(0)
-                            };
-                            assert_eq!(
-                                bid["regs"]["gdpr"], expected,
-                                "should forward current non-GDPR regs semantics: {context}"
-                            );
-                        }
-                        if signal == Signal::Gpc {
-                            assert_eq!(
-                                bid["regs"]["us_privacy"],
-                                if location.policy == Policy::UsState {
-                                    json!("1YYN")
-                                } else {
-                                    Value::Null
-                                },
-                                "should synthesize US Privacy only for applicable GPC jurisdiction: {context}"
-                            );
-                        }
-                        if signal == Signal::UsPrivacy {
-                            assert_eq!(
-                                bid["regs"]["us_privacy"],
-                                json!("1YNN"),
-                                "should forward US Privacy: {context}"
-                            );
-                        }
-                    }
                 }
             }
         }
+    }
+}
+
+fn seed_identity(adapter: &mut impl Adapter) -> String {
+    let seed = adapter.exchange(&Exchange {
+        location: *LOCATIONS
+            .iter()
+            .find(|location| location.name == "jp")
+            .expect("should have non-regulated seed case"),
+        signal: Signal::None,
+        kind: Kind::EcPost,
+        ec: None,
+    });
+    let identity = cookies(&seed)
+        .first()
+        .expect("should issue seed EC")
+        .split(';')
+        .next()
+        .expect("should have cookie pair")
+        .trim_start_matches("ts-ec=")
+        .to_owned();
+    assert!(
+        adapter.record_is_live(&identity),
+        "should persist live seed before replay"
+    );
+    identity
+}
+
+fn verify_exchange(adapter: &mut impl Adapter, request: &Exchange<'_>, canonical: bool) {
+    let observed = adapter.exchange(request);
+    let context = format!(
+        "{} {:?} {:?} returning={}",
+        request.location.name,
+        request.signal,
+        request.kind,
+        request.ec.is_some()
+    );
+    assert!(
+        !observed.status.is_server_error(),
+        "should not fail request: {context}"
+    );
+    assert!(
+        observed.status.is_success(),
+        "should accept request: {context}, status={}",
+        observed.status
+    );
+    verify_identity(adapter, request, &observed, &context);
+    verify_dispatch(request, &observed, &context);
+    verify_geo(request, &observed, canonical, &context);
+}
+
+fn verify_identity(
+    adapter: &impl Adapter,
+    request: &Exchange<'_>,
+    observed: &Observed,
+    context: &str,
+) {
+    let location = request.location;
+    let signal = request.signal;
+    let kind = request.kind;
+    let identity = request.ec;
+    let returning = identity.is_some();
+    let withdrawal = returning
+        && match location.policy {
+            Policy::Gdpr => signal == Signal::Denied,
+            Policy::UsState => {
+                matches!(signal, Signal::Denied | Signal::Gpc | Signal::GppOptOut)
+            }
+            Policy::NonRegulated | Policy::Unknown => false,
+        };
+    // EC GET is read-only and does not run identity finalization.
+    let withdrawal = withdrawal && kind != Kind::EcGet;
+    let allowed = match location.policy {
+        Policy::Gdpr => signal.grants_storage(),
+        Policy::UsState => {
+            signal.grants_storage() || matches!(signal, Signal::GppUs | Signal::UsPrivacy)
+        }
+        Policy::NonRegulated => true,
+        Policy::Unknown => false,
+    };
+    let ec = cookies(observed);
+    let expired = ec.iter().any(|cookie| cookie.contains("Max-Age=0"));
+    assert_eq!(
+        expired, withdrawal,
+        "should apply jurisdiction-specific withdrawal: {context}; cookies={ec:?}"
+    );
+    if !returning {
+        assert_eq!(
+            ec.iter().any(|cookie| !cookie.contains("Max-Age=0")),
+            allowed && matches!(kind, Kind::Document | Kind::EcPost),
+            "should gate EC creation: {context}; cookies={ec:?}"
+        );
+    } else if !withdrawal {
+        assert!(
+            ec.iter().all(|cookie| cookie.split(';').next()
+                == Some(format!("ts-ec={}", identity.expect("should replay seed")).as_str())),
+            "should retain existing EC: {context}; cookies={ec:?}"
+        );
+    }
+    if let Some(identity) = identity {
+        assert_eq!(
+            adapter.record_is_live(identity),
+            !withdrawal,
+            "should preserve or withdraw authoritative record: {context}"
+        );
+    }
+}
+
+fn verify_dispatch(request: &Exchange<'_>, observed: &Observed, context: &str) {
+    let location = request.location;
+    let signal = request.signal;
+    let kind = request.kind;
+    let auction = signal != Signal::Denied
+        && (signal.grants_storage() || !matches!(location.policy, Policy::Gdpr | Policy::Unknown));
+    assert_eq!(
+        observed.bids.len(),
+        usize::from(auction && matches!(kind, Kind::Auction | Kind::Document)),
+        "should gate actual bidder dispatch: {context}"
+    );
+}
+
+fn verify_geo(request: &Exchange<'_>, observed: &Observed, canonical: bool, context: &str) {
+    let location = request.location;
+    let located = location.policy != Policy::Unknown;
+    let expected_country = location.country.map(|value| {
+        if canonical {
+            value.to_ascii_uppercase()
+        } else {
+            value.to_owned()
+        }
+    });
+    let expected_region = location.region.map(|value| {
+        if canonical {
+            value.to_ascii_uppercase()
+        } else {
+            value.to_owned()
+        }
+    });
+    assert_eq!(
+        observed
+            .headers
+            .get("x-geo-info-available")
+            .and_then(|value| value.to_str().ok()),
+        Some(if located { "true" } else { "false" }),
+        "should report managed availability: {context}"
+    );
+    for name in ["country", "region"] {
+        let expected = if !located {
+            None
+        } else if name == "country" {
+            expected_country.as_deref()
+        } else {
+            expected_region.as_deref()
+        };
+        assert_eq!(
+            observed
+                .headers
+                .get(format!("x-geo-{name}"))
+                .and_then(|value| value.to_str().ok()),
+            expected,
+            "should report same producer {name}: {context}"
+        );
+    }
+    for bid in &observed.bids {
+        assert_eq!(
+            bid["device"]["geo"]["country"].as_str(),
+            located.then_some(expected_country.as_deref()).flatten(),
+            "should export same country: {context}"
+        );
+        assert_eq!(
+            bid["device"]["geo"]["region"].as_str(),
+            located.then_some(expected_region.as_deref()).flatten(),
+            "should export same subdivision: {context}"
+        );
+        verify_privacy_fields(bid, location, request.signal, context);
+    }
+}
+
+fn verify_privacy_fields(bid: &Value, location: Location, signal: Signal, context: &str) {
+    if signal.grants_storage() {
+        assert_eq!(
+            bid["regs"]["gdpr"],
+            json!(1),
+            "should forward effective EU consent: {context}"
+        );
+    }
+    if matches!(signal, Signal::GppUs | Signal::GppOptOut | Signal::GppTcf) {
+        let raw = signal.cookie();
+        let gpp = raw
+            .trim_start_matches("__gpp=")
+            .split(';')
+            .next()
+            .expect("should have GPP");
+        assert_eq!(
+            bid["regs"]["gpp"],
+            json!(gpp),
+            "should forward GPP: {context}"
+        );
+        assert_eq!(
+            bid["regs"]["gpp_sid"],
+            if signal == Signal::GppTcf {
+                json!([2, 6])
+            } else if signal == Signal::GppUs {
+                json!([7])
+            } else {
+                json!([9])
+            },
+            "should forward relevant GPP sections: {context}"
+        );
+    }
+    if !signal.grants_storage() {
+        let expected = if signal == Signal::None {
+            Value::Null
+        } else {
+            json!(0)
+        };
+        assert_eq!(
+            bid["regs"]["gdpr"], expected,
+            "should forward current non-GDPR regs semantics: {context}"
+        );
+    }
+    if signal == Signal::Gpc {
+        assert_eq!(
+            bid["regs"]["us_privacy"],
+            if location.policy == Policy::UsState {
+                json!("1YYN")
+            } else {
+                Value::Null
+            },
+            "should synthesize US Privacy only for applicable GPC jurisdiction: {context}"
+        );
+    }
+    if signal == Signal::UsPrivacy {
+        assert_eq!(
+            bid["regs"]["us_privacy"],
+            json!("1YNN"),
+            "should forward US Privacy: {context}"
+        );
     }
 }

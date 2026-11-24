@@ -610,7 +610,10 @@ fn geo_consent_fastly_forwarding() {
                 let result = geo_consent::Adapter::exchange(
                     &mut adapter,
                     &Exchange {
-                        location: geo_consent::LOCATIONS[2],
+                        location: *geo_consent::LOCATIONS
+                            .iter()
+                            .find(|location| location.name == "us-ca")
+                            .expect("should find US-CA forwarding case"),
                         signal,
                         kind,
                         ec: None,
@@ -622,7 +625,7 @@ fn geo_consent_fastly_forwarding() {
                 );
                 assert_eq!(
                     result.headers["x-geo-info-available"], "false",
-                    "should use unmapped peer rather than forged reader"
+                    "should have no location when rejected forwarding leaves no peer IP"
                 );
                 assert!(
                     !result.headers.contains_key("set-cookie"),
@@ -646,7 +649,10 @@ fn geo_consent_fastly_forwarding() {
     let result = geo_consent::Adapter::exchange(
         &mut adapter,
         &Exchange {
-            location: geo_consent::LOCATIONS[2],
+            location: *geo_consent::LOCATIONS
+                .iter()
+                .find(|location| location.name == "us-ca")
+                .expect("should find US-CA forwarding case"),
             signal: geo_consent::Signal::None,
             kind: geo_consent::Kind::Auction,
             ec: None,

@@ -110,5 +110,68 @@
     "region": "CA",
     "source": "Unselected",
     "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-xk",
+    "country": "XK",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-eu",
+    "country": "EU",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-ap",
+    "country": "AP",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-a1",
+    "country": "A1",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-a2",
+    "country": "A2",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-o1",
+    "country": "O1",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "us-empty-subdivision",
+    "country": "US",
+    "region": "",
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "us-invalid-subdivision",
+    "country": "US",
+    "region": "US-CA",
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "us-unrecognized-subdivision",
+    "country": "US",
+    "region": "ZZ",
+    "source": "Located",
+    "policy": "NonRegulated"
   }
 ]

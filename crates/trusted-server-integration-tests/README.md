@@ -87,21 +87,31 @@ product with eight consent signals, six entry points and new/returning readers
 runs through the application. It covers DE, GB, US-CA, US-WY, country-only US,
 JP, missing/invalid/partial geography, lowercase input, untrusted ingress,
 provider failure and native provider selection being off. The current configured
-country/state policy is preserved, including country-only US being non-regulated.
+country/state decision rules remain unchanged, including country-only US being
+non-regulated. Fastly now admits only countries in the pinned EdgeZero
+ISO-assigned catalogue: unsupported codes become Unknown and fail closed,
+matching Axum, instead of reaching NonRegulated.
 
 ```bash
 cargo test-axum --features geo-cloudfront geo_consent
 node scripts/test-geo-consent.mjs /path/to/isolated/viceroy
+node --test scripts/test-geo-consent.test.mjs
 ```
 
-The Fastly launcher requires Viceroy 0.21.0. It discovers the adapter test WASM
+The Fastly launcher requires Viceroy 0.21.0. It resolves the repository from its
+own file location, so it can be invoked from another working directory. Timed-out
+commands and handled interruptions kill the child process group, including
+descendants; launcher tests cover both living and exited parents. It discovers
+the adapter test WASM
 artifact from Cargo JSON, generates a temporary geolocation mapping from the
 shared table, disables default loopback geo, runs the real Fastly lookup and
 requires both exact test names to pass. These two runtime tests have an explicit
 `ignore` reason because an ordinary Cargo invocation has no mapping; the launcher
-runs them with `--ignored`, and the Fastly CI job runs the launcher. An unmapped
-peer makes rejected forwarding inputs distinguishable from authenticated reader
-IPs. Separate controls cover duplicate IP/auth headers, a malformed IP list,
+runs them with `--ignored`, and the Fastly CI job runs the launcher. These
+synthetic Fastly requests have no peer IP; rejected forwarding therefore
+leaves no client IP and no location. This distinguishes rejection from an
+authenticated reader IP. Separate controls cover duplicate IP/auth headers, a
+malformed IP list,
 missing authentication and authenticated IPv6 with a forged forwarding header.
 Production falls back to the actual peer, which can have its own valid geography.
 
@@ -131,8 +141,14 @@ row was silently tombstoned.
 Axum normalizes valid lowercase country/subdivision input before consumers see
 it. Fastly preserves the SDK's representation for valid values, as
 `geo_from_fastly` does; both select the same jurisdiction for lowercase US/CA.
-Unusable Fastly country codes are rejected at that conversion boundary, before
-any consumer receives a location. Fastly still uses its own local lookup rather
+Fastly rejects every country outside the pinned EdgeZero ISO-assigned catalogue
+at that conversion boundary, including XK, EU, AP, A1, A2 and O1. Present empty
+or malformed subdivisions also reject the entire location. Before the subdivision
+correction, US with an empty or `US-CA` subdivision reached NonRegulated on
+Fastly while Axum rejected the whole location as Unknown. That difference
+allowed an EC and auction without consent on Fastly, so it is corrected here.
+Absent subdivisions and the representation of valid SDK values remain unchanged.
+Fastly still uses its own local lookup rather
 than `ctx.geo()`.
 
 The mapped Fastly test also explicitly pins a known deferred exception: a
