@@ -161,6 +161,10 @@ pub const MAX_ENTRY_BYTES: usize = 16 * 1024;
 /// Deserialization is lenient (see [`ReadSkips`]): it never fails on the
 /// record's own content, and [`KvEntry::drop_unreadable_ids`] removes a
 /// record it could not read.
+///
+/// Equality also compares the read bookkeeping (what was unreadable or
+/// skipped), so a record fresh from a read equals another only after
+/// [`KvEntry::drop_unreadable_ids`] has taken that bookkeeping from both.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KvPartnerId {
     /// First live UID of `eids`, or the single UID for records written by
@@ -187,12 +191,16 @@ pub struct KvPartnerId {
 /// returns the totals so the caller can log them.
 ///
 /// The next write of the row persists it without the skipped values.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadSkips {
     /// Partner records removed: unreadable, or left without a UID this build
     /// can hold.
     pub records: usize,
-    /// Provider EID entries that could not be read.
+    /// Source domains of the removed partner records, in key order.
+    pub removed: Vec<String>,
+    /// Provider EID entries that could not be read. An entry left empty
+    /// because every UID in it was skipped is removed too, but counted only
+    /// in [`Self::uids`].
     pub eids: usize,
     /// UIDs that could not be read, including any over
     /// [`MAX_STORED_UID_LENGTH`].
@@ -799,15 +807,18 @@ impl KvEntry {
     /// instead of failing whole. Call it once after deserializing a row.
     pub fn drop_unreadable_ids(&mut self) -> ReadSkips {
         let mut skipped = ReadSkips::default();
-        let before = self.ids.len();
-        self.ids.retain(|_, record| {
+        self.ids.retain(|key, record| {
             let held = core::mem::take(&mut record.skipped);
             skipped.eids += held.eids;
             skipped.uids += held.uids;
             skipped.fields += held.fields;
-            record.retain_readable()
+            let kept = record.retain_readable();
+            if !kept {
+                skipped.removed.push(key.clone());
+            }
+            kept
         });
-        skipped.records = before - self.ids.len();
+        skipped.records = skipped.removed.len();
         skipped
     }
 
@@ -2055,6 +2066,7 @@ mod tests {
             skipped,
             ReadSkips {
                 records: 1,
+                removed: vec!["long.example.com".to_owned()],
                 ..ReadSkips::default()
             },
             "should count the dropped oversized record"
@@ -2095,6 +2107,7 @@ mod tests {
             skipped,
             ReadSkips {
                 records: 1,
+                removed: vec!["gone.example.com".to_owned()],
                 uids: 2,
                 ..ReadSkips::default()
             },
@@ -2328,6 +2341,7 @@ mod tests {
                 skipped,
                 ReadSkips {
                     records: 1,
+                    removed: vec!["bad.example.com".to_owned()],
                     eids,
                     ..ReadSkips::default()
                 },

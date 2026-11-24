@@ -284,10 +284,11 @@ impl KvIdentityGraph {
         let skipped = entry.drop_unreadable_ids();
         if !skipped.is_empty() {
             log::warn!(
-                "Skipped unreadable stored values loading key '{}': {} partner records, \
-                 {} EID entries, {} UIDs, {} fields",
+                "Skipped unreadable stored values loading key '{}': {} partner records \
+                 {:?}, {} EID entries, {} UIDs, {} fields",
                 log_id(ec_id),
                 skipped.records,
+                skipped.removed,
                 skipped.eids,
                 skipped.uids,
                 skipped.fields
