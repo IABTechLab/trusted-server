@@ -20,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::ja4_family;
 use super::kv_types::KvDevice;
-use crate::settings::BrowserGate;
+use crate::settings::{BrowserGate, Ja4ContradictionExempt};
 
 /// Device signals derived from a single request.
 ///
@@ -55,31 +55,29 @@ impl DeviceSignals {
     /// says.
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
-        Self::derive_with_tls_rule(ua, ja4, h2_fp, false)
+        Self::derive_with_tls_rule(ua, ja4, h2_fp, Ja4ContradictionExempt::Off)
     }
 
-    /// Derives device signals as [`Self::derive`] does, with
-    /// `allow_non_browser_tls` from `[ec].allow_non_browser_tls`: when set, a
-    /// non-browser TLS stack behind a browser User-Agent is not a
-    /// contradiction, while a browser-engine mismatch still is.
+    /// Derives device signals as [`Self::derive`] does, except that a
+    /// contradiction `exempt` (`[ec].ja4_contradiction_exempt`) covers does
+    /// not mark the client a known non-browser.
     #[must_use]
     pub fn derive_with_tls_rule(
         ua: &str,
         ja4: Option<&str>,
         h2_fp: Option<&str>,
-        allow_non_browser_tls: bool,
+        exempt: Ja4ContradictionExempt,
     ) -> Self {
         let is_mobile = parse_is_mobile(ua);
         let ja4_class = ja4.and_then(extract_ja4_section1);
         let platform_class = parse_platform_class(ua);
         let h2_fp_hash = h2_fp.map(compute_h2_fp_hash);
-        let known_browser = if ja4
-            .is_some_and(|ja4| ja4_family::contradicts_user_agent(ua, ja4, allow_non_browser_tls))
-        {
-            Some(false)
-        } else {
-            evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref())
-        };
+        let known_browser =
+            if ja4.is_some_and(|ja4| ja4_family::contradicts_user_agent(ua, ja4, exempt)) {
+                Some(false)
+            } else {
+                evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref())
+            };
 
         Self {
             is_mobile,
@@ -249,12 +247,11 @@ fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
 
 /// Evaluates whether a request comes from a known browser.
 ///
-/// Feeds analytics only; it never yields `Some(false)`. The family rule in
+/// Returns the `known_browser` flag of the [`KNOWN_BROWSERS`] entry that
+/// `ja4_class` + `h2_fp_hash` match, or `None` for an unrecognized
+/// combination. Every entry lists a browser, so in practice this yields
+/// `Some(true)` or `None` and feeds analytics only; the family rule in
 /// [`ja4_family`] is what marks a known non-browser.
-///
-/// Returns `Some(true)` if `ja4_class` + `h2_fp_hash` match a known
-/// legitimate browser pattern. Returns `Some(false)` for known
-/// bot/scraper patterns. Returns `None` for unrecognized combinations.
 ///
 /// Both signals must be present for a match — if either is `None`,
 /// returns `None`.
@@ -276,6 +273,9 @@ fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ja4::{
+        CHROMIUM_JA4, FIREFOX_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4, SAFARI_JA4, UNLISTED_JA4,
+    };
 
     // Chrome Mac UA
     const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -666,17 +666,11 @@ mod tests {
         }
     }
 
-    // Public fingerprints from FoxIO's ja4plus-mapping.csv; see `ja4_family`.
-    const PUBLIC_CHROMIUM_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
-    const PUBLIC_FIREFOX_JA4: &str = "t13d1715h2_5b57614c22b0_7121afd63204";
-    const PUBLIC_SAFARI_JA4: &str = "t13d2014h2_a09f3c656075_14788d8d241b";
-    const PUBLIC_PYTHON_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
-
     #[test]
     fn both_gates_refuse_a_browser_user_agent_with_a_non_browser_ja4() {
         let signals = DeviceSignals::derive(
             CHROME_MAC_UA,
-            Some(PUBLIC_PYTHON_JA4),
+            Some(PYTHON_JA4),
             Some("1:65536;2:0;4:6291456;6:262144"),
         );
 
@@ -688,7 +682,7 @@ mod tests {
         assert_eq!(
             signals.to_kv_device().known_browser,
             Some(false),
-            "should store the same classification for analytics"
+            "should carry the same classification into a device record"
         );
         for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
             assert!(
@@ -699,11 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn exemptions_clear_only_the_contradictions_they_cover() {
+        for (exempt, non_browser_refused, engine_mismatch_refused) in [
+            (Ja4ContradictionExempt::Off, true, true),
+            (Ja4ContradictionExempt::NonBrowser, false, true),
+            (Ja4ContradictionExempt::All, false, false),
+        ] {
+            for (ja4, refused) in [
+                (PYTHON_JA4, non_browser_refused),
+                (FIREFOX_JA4, engine_mismatch_refused),
+            ] {
+                let signals =
+                    DeviceSignals::derive_with_tls_rule(CHROME_MAC_UA, Some(ja4), None, exempt);
+                assert_eq!(
+                    signals.known_browser == Some(false),
+                    refused,
+                    "should mark a Chrome User-Agent with {ja4:?} a non-browser only when {exempt:?} leaves it"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn both_gates_refuse_a_browser_family_mismatch() {
         for (ua, ja4) in [
-            (FIREFOX_MAC_UA, PUBLIC_CHROMIUM_JA4),
-            (SAFARI_MAC_UA, PUBLIC_CHROMIUM_JA4),
-            (CHROME_WINDOWS_UA, PUBLIC_FIREFOX_JA4),
+            (FIREFOX_MAC_UA, CHROMIUM_JA4),
+            (SAFARI_MAC_UA, CHROMIUM_JA4),
+            (CHROME_WINDOWS_UA, FIREFOX_JA4),
         ] {
             let signals = DeviceSignals::derive(ua, Some(ja4), None);
             for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
@@ -718,14 +734,12 @@ mod tests {
     #[test]
     fn current_browser_ja4s_still_create() {
         for (ua, ja4) in [
-            (CHROME_MAC_UA, PUBLIC_CHROMIUM_JA4),
-            (FIREFOX_MAC_UA, PUBLIC_FIREFOX_JA4),
-            (SAFARI_MAC_UA, PUBLIC_SAFARI_JA4),
-            (SAFARI_IOS_UA, PUBLIC_SAFARI_JA4),
-            // Test-only: a later release's extension hash that no list names.
-            (CHROME_MAC_UA, "t13d1517h2_8daaf6152771_0123456789ab"),
-            // Test-only: a fictional cipher hash that no list names.
-            (CHROME_MAC_UA, "t13d1516h2_000000000000_000000000000"),
+            (CHROME_MAC_UA, CHROMIUM_JA4),
+            (FIREFOX_MAC_UA, FIREFOX_JA4),
+            (SAFARI_MAC_UA, SAFARI_JA4),
+            (SAFARI_IOS_UA, SAFARI_JA4),
+            (CHROME_MAC_UA, NEWER_CHROMIUM_JA4),
+            (CHROME_MAC_UA, UNLISTED_JA4),
         ] {
             let signals = DeviceSignals::derive(ua, Some(ja4), None);
             assert_ne!(

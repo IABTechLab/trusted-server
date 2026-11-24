@@ -20,6 +20,10 @@ use crate::ec::kv_backend::test_support::InMemoryEcKv;
 use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 use crate::error::TrustedServerError;
+use crate::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
+    SAFARI_USER_AGENT,
+};
 
 /// An observed persistence or response-release boundary in a conformance run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,17 +205,6 @@ pub enum Geo {
     Failed,
 }
 
-/// A public Chromium JA4 matching the runners' Chrome User-Agent.
-///
-/// From `FoxIO`'s `ja4plus-mapping.csv` (Chromium Browser); see
-/// `ec::ja4_family`.
-pub const BROWSER_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
-
-/// A public Python JA4, a non-browser TLS stack.
-///
-/// From `FoxIO`'s `ja4plus-mapping.csv` (Python); see `ec::ja4_family`.
-pub const NON_BROWSER_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
-
 /// A request to execute through an adapter's complete application lifecycle.
 pub struct Navigation {
     /// Consent cookie representation to encode.
@@ -220,6 +213,8 @@ pub struct Navigation {
     pub ec_cookie: Option<String>,
     /// The platform's location result.
     pub geo: Geo,
+    /// The `User-Agent` header.
+    pub user_agent: &'static str,
     /// The trusted JA4 the runner supplies, or `None` for no trusted JA4.
     pub ja4: Option<&'static str>,
     /// Fetch destination; a script is deliberately ineligible for creation.
@@ -232,7 +227,8 @@ impl Default for Navigation {
             consent: Consent::Granted,
             ec_cookie: None,
             geo: Geo::Gdpr,
-            ja4: Some(BROWSER_JA4),
+            user_agent: CHROME_USER_AGENT,
+            ja4: Some(CHROMIUM_JA4),
             destination: "document",
         }
     }
@@ -289,11 +285,18 @@ pub enum Scenario {
     MissingTrustedJa4,
     /// A browser User-Agent with a non-browser trusted JA4 prevents creation.
     ContradictingJa4,
+    /// A browser User-Agent with another browser engine's trusted JA4
+    /// prevents creation.
+    BrowserEngineMismatch,
+    /// A current Firefox with its own trusted JA4 creates an identity.
+    CurrentFirefox,
+    /// A current Safari with its own trusted JA4 creates an identity.
+    CurrentSafari,
 }
 
 impl Scenario {
     /// Navigation scenarios shared by all supported identity adapters.
-    pub const NAVIGATION_SCENARIOS: [Self; 10] = [
+    pub const NAVIGATION_SCENARIOS: [Self; 13] = [
         Self::Fresh,
         Self::WriteFailure,
         Self::UnknownGeo,
@@ -304,6 +307,9 @@ impl Scenario {
         Self::Returning,
         Self::MissingTrustedJa4,
         Self::ContradictingJa4,
+        Self::BrowserEngineMismatch,
+        Self::CurrentFirefox,
+        Self::CurrentSafari,
     ];
 
     /// Executes the scenario and checks the response against authoritative storage.
@@ -335,7 +341,19 @@ impl Scenario {
             Self::MissingConsent => request.consent = Consent::Missing,
             Self::Subresource => request.destination = "script",
             Self::MissingTrustedJa4 => request.ja4 = None,
-            Self::ContradictingJa4 => request.ja4 = Some(NON_BROWSER_JA4),
+            Self::ContradictingJa4 => request.ja4 = Some(PYTHON_JA4),
+            Self::BrowserEngineMismatch => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(CHROMIUM_JA4);
+            }
+            Self::CurrentFirefox => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(FIREFOX_JA4);
+            }
+            Self::CurrentSafari => {
+                request.user_agent = SAFARI_USER_AGENT;
+                request.ja4 = Some(SAFARI_JA4);
+            }
             _ => {}
         }
         let response = adapter.navigate(&request);
@@ -345,7 +363,8 @@ impl Scenario {
             | Self::DeniedConsent
             | Self::MissingConsent
             | Self::Subresource
-            | Self::ContradictingJa4 => {
+            | Self::ContradictingJa4
+            | Self::BrowserEngineMismatch => {
                 assert!(
                     ec_cookies(&response).is_empty(),
                     "should not issue or delete an EC for a fresh denied request in {self:?}"
@@ -358,7 +377,7 @@ impl Scenario {
                 );
                 if self != Self::WriteFailure {
                     // These scenarios share Fresh's successful setup and change
-                    // one input, so its gate must refuse before any write; a
+                    // only request inputs, so its gate must refuse before any write; a
                     // creation attempt that merely failed would not satisfy it.
                     assert!(
                         !store

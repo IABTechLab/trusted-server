@@ -807,6 +807,35 @@ impl BrowserGate {
     }
 }
 
+/// Which trusted JA4 and User-Agent contradictions stop blocking Edge Cookie
+/// creation.
+///
+/// Mapped from `[ec].ja4_contradiction_exempt`. A contradiction is a trusted
+/// JA4 whose TLS client family differs from the browser family the
+/// User-Agent claims (ID-7). An exempted contradiction no longer marks the
+/// client a known non-browser, under either [`BrowserGate`] rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ja4ContradictionExempt {
+    /// Exempts nothing: every contradiction blocks creation.
+    #[default]
+    Off,
+    /// Exempts a non-browser TLS stack (Python, Go) behind a browser
+    /// User-Agent, as a TLS-intercepting proxy in front of readers produces.
+    /// A User-Agent of one browser engine over another engine's TLS stack
+    /// still blocks.
+    NonBrowser,
+    /// Exempts every contradiction, which turns the rule off.
+    All,
+}
+
+impl Ja4ContradictionExempt {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Secret values for one identity provider.
 ///
 /// `EdgeZero` secret paths address fixed field names, so V1 supports one
@@ -911,14 +940,12 @@ pub struct Ec {
     #[serde(default, skip_serializing_if = "BrowserGate::is_default")]
     pub browser_gate: BrowserGate,
 
-    /// Lets a trusted JA4 from a non-browser TLS stack (Python, Go) behind a
-    /// browser User-Agent create an Edge Cookie; `false` by default.
+    /// JA4 and User-Agent contradictions that do not block Edge Cookie
+    /// creation; `off` by default, so every contradiction blocks.
     ///
-    /// For readers behind a TLS-intercepting proxy, which replaces their JA4
-    /// with its own. A browser-engine mismatch is still refused. Skipped from
-    /// serialization at its default, like `browser_gate`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_non_browser_tls: bool,
+    /// Skipped from serialization at its default, like `browser_gate`.
+    #[serde(default, skip_serializing_if = "Ja4ContradictionExempt::is_default")]
+    pub ja4_contradiction_exempt: Ja4ContradictionExempt,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -937,7 +964,7 @@ impl Default for Ec {
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
             browser_gate: BrowserGate::default(),
-            allow_non_browser_tls: false,
+            ja4_contradiction_exempt: Ja4ContradictionExempt::default(),
         }
     }
 }
@@ -4719,32 +4746,73 @@ mod tests {
         );
     }
 
+    /// `Ec` denies unknown fields, so a binary built before
+    /// `ja4_contradiction_exempt` existed must still accept a default blob.
     #[test]
-    fn allow_non_browser_tls_defaults_off_and_loads_from_toml() {
+    fn default_ja4_contradiction_exempt_is_off_and_omitted_for_rollback() {
         let ec = Ec::default();
-        assert!(
-            !ec.allow_non_browser_tls,
-            "should refuse non-browser TLS by default"
+
+        assert_eq!(
+            ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should block every contradiction by default"
         );
         let serialized = serde_json::to_value(&ec).expect("should serialize");
         assert!(
-            serialized.get("allow_non_browser_tls").is_none(),
+            serialized.get("ja4_contradiction_exempt").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
         );
+    }
 
-        let toml =
-            crate_test_settings_str().replace("[ec]\n", "[ec]\nallow_non_browser_tls = true\n");
-        let settings = Settings::from_toml(&toml).expect("should parse allow_non_browser_tls");
-        assert!(
-            settings.ec.allow_non_browser_tls,
-            "should load the switch from [ec]"
-        );
-        let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+    #[test]
+    fn ja4_contradiction_exempt_loads_from_toml() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         assert_eq!(
-            serialized.get("allow_non_browser_tls"),
-            Some(&json!(true)),
-            "should serialize a non-default value"
+            settings.ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should exempt nothing when the key is omitted"
         );
+
+        for (value, expected) in [
+            ("off", Ja4ContradictionExempt::Off),
+            ("non_browser", Ja4ContradictionExempt::NonBrowser),
+            ("all", Ja4ContradictionExempt::All),
+        ] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = \"{value}\"\n"),
+            );
+            assert_ne!(
+                toml,
+                crate_test_settings_str(),
+                "should insert the key into the [ec] table"
+            );
+            let settings = Settings::from_toml(&toml).expect("should parse the exemption");
+            assert_eq!(
+                settings.ec.ja4_contradiction_exempt, expected,
+                "should load {value:?}"
+            );
+            let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+            assert_eq!(
+                serialized.get("ja4_contradiction_exempt"),
+                (expected != Ja4ContradictionExempt::Off)
+                    .then(|| json!(value))
+                    .as_ref(),
+                "should serialize only a non-default exemption"
+            );
+        }
+
+        for value in ["\"non-browser\"", "\"none\"", "true"] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = {value}\n"),
+            );
+            assert!(
+                Settings::from_toml(&toml).is_err(),
+                "should reject the unknown exemption {value}"
+            );
+        }
     }
 
     #[test]

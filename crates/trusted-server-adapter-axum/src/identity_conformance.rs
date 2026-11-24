@@ -6,10 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, StatusCode, header, request_builder};
-use edgezero_core::ingress::{
-    CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress, TargetUnavailable,
-};
-use edgezero_core::ja4::{CapturedJa4, Ja4Fingerprint, Ja4Source};
+use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ja4::Ja4Source;
 use error_stack::Report;
 use futures::executor::block_on;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
@@ -23,6 +21,7 @@ use trusted_server_core::test_support::identity_conformance::{
     Scenario, configure_http_fixture, tcf_consent_cookie, verify_failed_ec_creation,
     verify_http_contract,
 };
+use trusted_server_core::test_support::ja4::{captured_ja4, insert_ja4};
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
@@ -31,8 +30,6 @@ use crate::app::TrustedServerApp;
 
 const DOCUMENT: &str = "<html><head></head><body>Example article</body></html>";
 const ORIGIN: &str = "https://origin.example.com/article";
-const USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36";
 
 struct UnusedStores;
 #[async_trait(?Send)]
@@ -185,7 +182,7 @@ impl AxumAdapter {
                 if document { "navigate" } else { "no-cors" },
             )
             .header(header::ACCEPT, if document { "text/html" } else { "*/*" })
-            .header(header::USER_AGENT, USER_AGENT)
+            .header(header::USER_AGENT, navigation.user_agent)
             .header(header::COOKIE, cookies.join("; "))
             .body(Body::empty())
             .expect("should build conformance navigation");
@@ -193,7 +190,7 @@ impl AxumAdapter {
             let mut builder = request_builder()
                 .method(api.method.clone())
                 .uri(format!("https://publisher.example.com{}", api.path))
-                .header(header::USER_AGENT, USER_AGENT);
+                .header(header::USER_AGENT, navigation.user_agent);
             for (name, value) in &api.headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
@@ -211,16 +208,9 @@ impl AxumAdapter {
                 .expect("should validate fixture public origin"),
         ));
         if let Some(ja4) = navigation.ja4 {
-            request.extensions_mut().insert(
-                RequestIngress::new(
-                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                    None,
-                    HeaderFidelity::default(),
-                )
-                .with_ja4(CapturedJa4::Captured {
-                    fingerprint: Ja4Fingerprint::parse(ja4).expect("should parse fixture JA4"),
-                    source: Ja4Source::TrustedProxyHeader,
-                }),
+            insert_ja4(
+                request.extensions_mut(),
+                captured_ja4(ja4, Ja4Source::TrustedProxyHeader),
             );
         }
         let response = block_on(router.oneshot(request)).expect("should dispatch the real router");

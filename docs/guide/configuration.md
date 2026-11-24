@@ -892,7 +892,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
 | `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
 | `browser_gate`                      | String         | No       | Device-signal rule for EC creation: `lenient` (default) or `strict` (see below)       |
-| `allow_non_browser_tls`             | Boolean        | No       | Let a non-browser TLS stack behind a browser User-Agent create an EC (default false)  |
+| `ja4_contradiction_exempt`          | String         | No       | Contradictions that do not block EC creation: `off` (default), `non_browser` or `all` |
 
 `browser_gate` decides which clients may create an Edge Cookie from their trusted
 device signals. Consent and the navigation policy apply under both rules.
@@ -907,11 +907,17 @@ device signals. Consent and the navigation policy apply under both rules.
   client without trusted JA4 creates no EC. `strict` blocks everything
   `lenient` blocks.
 
-`allow_non_browser_tls = true` stops a non-browser TLS stack (Python, Go)
-behind a browser User-Agent from blocking creation under either rule. Use it
-when readers reach the site through a TLS-intercepting proxy, which replaces
-their JA4 with its own. A User-Agent of one browser engine over another
-engine's TLS stack is still refused.
+`ja4_contradiction_exempt` names the JA4 contradictions that stop blocking
+creation under either rule:
+
+- `off` (default) exempts nothing: every contradiction blocks.
+- `non_browser` exempts a non-browser TLS stack (Python, Go) behind a browser
+  User-Agent. Use it when readers reach the site through a TLS-intercepting
+  proxy, which replaces their JA4 with its own. A User-Agent of one browser
+  engine over another engine's TLS stack still blocks.
+- `all` exempts every contradiction, which turns the JA4 rule off.
+
+An unknown value fails config loading.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

@@ -16,6 +16,8 @@
 //! The rule reads the full JA4 in memory only; storage keeps JA4 section 1
 //! ([`super::kv_types::KvDevice::ja4_class`]).
 
+use crate::settings::Ja4ContradictionExempt;
+
 /// The TLS client family a `JA4_b` cipher hash identifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsFamily {
@@ -79,22 +81,26 @@ enum BrowserClaim {
 }
 
 /// Returns `true` when a trusted `ja4`'s TLS client family contradicts the
-/// browser family `user_agent` claims.
+/// browser family `user_agent` claims and `exempt`
+/// (`[ec].ja4_contradiction_exempt`) does not exempt that contradiction.
 ///
-/// With `allow_non_browser_tls` (`[ec].allow_non_browser_tls`), a
-/// non-browser TLS stack no longer contradicts; a browser-engine mismatch
-/// still does.
+/// [`Ja4ContradictionExempt::NonBrowser`] exempts a non-browser TLS stack but
+/// not a browser-engine mismatch; [`Ja4ContradictionExempt::All`] exempts
+/// both.
 #[must_use]
 pub(super) fn contradicts_user_agent(
     user_agent: &str,
     ja4: &str,
-    allow_non_browser_tls: bool,
+    exempt: Ja4ContradictionExempt,
 ) -> bool {
+    if exempt == Ja4ContradictionExempt::All {
+        return false;
+    }
     let (Some(claim), Some(family)) = (browser_claim(user_agent), tls_family(ja4)) else {
         return false;
     };
     match (claim, family) {
-        (_, TlsFamily::NonBrowser) => !allow_non_browser_tls,
+        (_, TlsFamily::NonBrowser) => exempt == Ja4ContradictionExempt::Off,
         (BrowserClaim::Engine(claimed), family) => claimed != family,
         (BrowserClaim::AnyEngine, _) => false,
     }
@@ -144,36 +150,32 @@ fn browser_claim(user_agent: &str) -> Option<BrowserClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ja4::{
+        CHROME_IOS_USER_AGENT, CHROME_USER_AGENT, CHROMIUM_JA4, EDGE_USER_AGENT, FIREFOX_JA4,
+        FIREFOX_USER_AGENT, GO_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4, SAFARI_JA4, SAFARI_USER_AGENT,
+        UNLISTED_JA4,
+    };
 
-    const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-    const EDGE_WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0";
-    const FIREFOX_MAC_UA: &str =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0";
-    const SAFARI_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-        AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
-    const CHROME_IOS_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) \
-        AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/146.0.0.0 Mobile/15E148 Safari/604.1";
-
-    // Public fingerprints from FoxIO's ja4plus-mapping.csv (see the table).
-    const CHROMIUM_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
-    const FIREFOX_JA4: &str = "t13d1715h2_5b57614c22b0_7121afd63204";
-    const SAFARI_JA4: &str = "t13d2014h2_a09f3c656075_14788d8d241b";
-    const PYTHON_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
-    const GO_JA4: &str = "t13d190900_9dc949149365_97f8aa674fd9";
-    // Test-only: a listed cipher hash with an extension hash no list names,
-    // as a later browser release would send.
-    const NEWER_CHROMIUM_JA4: &str = "t13d1517h2_8daaf6152771_0123456789ab";
-    // Test-only: a fictional fingerprint whose cipher hash no list names.
-    const UNLISTED_JA4: &str = "t13d1516h2_000000000000_000000000000";
+    const BROWSER_USER_AGENTS: [&str; 4] = [
+        CHROME_USER_AGENT,
+        FIREFOX_USER_AGENT,
+        SAFARI_USER_AGENT,
+        CHROME_IOS_USER_AGENT,
+    ];
+    const ENGINE_MISMATCHES: [(&str, &str); 5] = [
+        (CHROME_USER_AGENT, FIREFOX_JA4),
+        (CHROME_USER_AGENT, SAFARI_JA4),
+        (FIREFOX_USER_AGENT, CHROMIUM_JA4),
+        (SAFARI_USER_AGENT, CHROMIUM_JA4),
+        (EDGE_USER_AGENT, FIREFOX_JA4),
+    ];
 
     #[test]
     fn a_browser_user_agent_with_a_non_browser_ja4_contradicts() {
-        for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA, CHROME_IOS_UA] {
+        for ua in BROWSER_USER_AGENTS {
             for ja4 in [PYTHON_JA4, GO_JA4] {
                 assert!(
-                    contradicts_user_agent(ua, ja4, false),
+                    contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
                     "should refuse a non-browser TLS stack behind {ua:?}"
                 );
             }
@@ -182,49 +184,63 @@ mod tests {
 
     #[test]
     fn a_browser_engine_mismatch_contradicts() {
-        for (ua, ja4) in [
-            (CHROME_MAC_UA, FIREFOX_JA4),
-            (CHROME_MAC_UA, SAFARI_JA4),
-            (FIREFOX_MAC_UA, CHROMIUM_JA4),
-            (SAFARI_MAC_UA, CHROMIUM_JA4),
-            (EDGE_WINDOWS_UA, FIREFOX_JA4),
-        ] {
+        for (ua, ja4) in ENGINE_MISMATCHES {
             assert!(
-                contradicts_user_agent(ua, ja4, false),
+                contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
                 "should refuse {ua:?} with another engine's TLS stack"
             );
         }
     }
 
     #[test]
-    fn allowing_non_browser_tls_still_refuses_an_engine_mismatch() {
-        for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA, CHROME_IOS_UA] {
+    fn exempting_non_browser_tls_still_refuses_an_engine_mismatch() {
+        for ua in BROWSER_USER_AGENTS {
             for ja4 in [PYTHON_JA4, GO_JA4] {
                 assert!(
-                    !contradicts_user_agent(ua, ja4, true),
-                    "should allow a non-browser TLS stack behind {ua:?} when configured"
+                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::NonBrowser),
+                    "should allow a non-browser TLS stack behind {ua:?} when exempted"
                 );
             }
         }
-        assert!(
-            contradicts_user_agent(FIREFOX_MAC_UA, CHROMIUM_JA4, true),
-            "should still refuse another browser engine's TLS stack"
-        );
+        for (ua, ja4) in ENGINE_MISMATCHES {
+            assert!(
+                contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::NonBrowser),
+                "should still refuse {ua:?} with another engine's TLS stack"
+            );
+        }
+    }
+
+    #[test]
+    fn exempting_all_contradictions_refuses_none() {
+        for ua in BROWSER_USER_AGENTS {
+            for ja4 in [PYTHON_JA4, GO_JA4] {
+                assert!(
+                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::All),
+                    "should allow a non-browser TLS stack behind {ua:?}"
+                );
+            }
+        }
+        for (ua, ja4) in ENGINE_MISMATCHES {
+            assert!(
+                !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::All),
+                "should allow {ua:?} with another engine's TLS stack"
+            );
+        }
     }
 
     #[test]
     fn matching_browser_families_do_not_contradict() {
         for (ua, ja4) in [
-            (CHROME_MAC_UA, CHROMIUM_JA4),
-            (CHROME_MAC_UA, NEWER_CHROMIUM_JA4),
-            (EDGE_WINDOWS_UA, CHROMIUM_JA4),
-            (FIREFOX_MAC_UA, FIREFOX_JA4),
-            (SAFARI_MAC_UA, SAFARI_JA4),
-            (CHROME_IOS_UA, SAFARI_JA4),
-            (CHROME_IOS_UA, CHROMIUM_JA4),
+            (CHROME_USER_AGENT, CHROMIUM_JA4),
+            (CHROME_USER_AGENT, NEWER_CHROMIUM_JA4),
+            (EDGE_USER_AGENT, CHROMIUM_JA4),
+            (FIREFOX_USER_AGENT, FIREFOX_JA4),
+            (SAFARI_USER_AGENT, SAFARI_JA4),
+            (CHROME_IOS_USER_AGENT, SAFARI_JA4),
+            (CHROME_IOS_USER_AGENT, CHROMIUM_JA4),
         ] {
             assert!(
-                !contradicts_user_agent(ua, ja4, false),
+                !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
                 "should allow {ua:?} with its own family's TLS stack"
             );
         }
@@ -232,17 +248,17 @@ mod tests {
 
     #[test]
     fn an_unlisted_ja4_or_a_non_browser_user_agent_never_contradicts() {
-        for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA] {
+        for ua in [CHROME_USER_AGENT, FIREFOX_USER_AGENT, SAFARI_USER_AGENT] {
             for ja4 in [UNLISTED_JA4, "t13d1516h2", "", "not-a-ja4"] {
                 assert!(
-                    !contradicts_user_agent(ua, ja4, false),
+                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
                     "should not refuse {ua:?} for unrecognized JA4 {ja4:?}"
                 );
             }
         }
         for ua in ["curl/8.0.0", "python-requests/2.32.0", ""] {
             assert!(
-                !contradicts_user_agent(ua, PYTHON_JA4, false),
+                !contradicts_user_agent(ua, PYTHON_JA4, Ja4ContradictionExempt::Off),
                 "should leave a User-Agent that claims no browser to other gates"
             );
         }

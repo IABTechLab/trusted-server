@@ -319,7 +319,8 @@ pub struct EcContext {
     client_ip: Option<String>,
     /// Geo information captured pre-routing for downstream KV writes.
     geo_info: Option<GeoInfo>,
-    /// Device signals derived from TLS/H2/UA in the adapter layer.
+    /// Device signals the shared identity app derives from the User-Agent,
+    /// `EdgeZero`'s ingress JA4 and the HTTP/2 fingerprint.
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
@@ -550,11 +551,14 @@ impl EcContext {
         &mut self.consent
     }
 
-    /// Sets the device signals derived from the adapter layer.
+    /// Sets the request's device signals.
     ///
     /// Must be called before [`generate_if_needed`] so that new entries
-    /// include the [`KvDevice`] record. The adapter derives these from
-    /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
+    /// include the [`KvDevice`] record. [`IdentityApp::read_request`] derives
+    /// them from the User-Agent, the JA4 `EdgeZero`'s request ingress
+    /// captured (`ctx.ja4()`) and the platform's HTTP/2 fingerprint.
+    ///
+    /// [`IdentityApp::read_request`]: app::IdentityApp::read_request
     ///
     /// [`KvDevice`]: super::kv_types::KvDevice
     /// [`generate_if_needed`]: Self::generate_if_needed
