@@ -378,7 +378,7 @@ impl Prepared {
                 .env("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "forwarded");
         }
         if let Some(profile) = geo_profile {
-            command.env("TS_NATIVE_GEO_PROFILE_FILE", profile);
+            command.env("TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE", profile);
         }
         if cloudfront {
             command

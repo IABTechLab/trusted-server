@@ -16,11 +16,9 @@ output "ec_task_policy_json" {
   value       = jsonencode(local.ec_task_policy)
 }
 
-output "draft_status" {
-  description = "False means no AWS workload may be applied. The operator must destroy this workload manually."
+output "deployment_metadata" {
+  description = "Deployment identity and retained-resource lifetimes, not an assertion of runtime qualification."
   value = {
-    deployable                          = length(local.deployment_blockers) == 0
-    blockers                            = sort(tolist(local.deployment_blockers))
     run_id                              = var.run_id
     geo                                 = local.geo_enabled ? { phase = local.geo_phase } : null
     manual_shutdown_required            = true
