@@ -811,6 +811,32 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
 }
 
 // Static cross-language consent strings test transport and policy, not age.
+/// The EC route's JSON, split into the mirror and its `sharedId` field.
+fn route_json(observed: &ApiObservation) -> (serde_json::Value, Option<String>) {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&observed.response.body).expect("should decode EC route JSON");
+    let sharedid = json
+        .as_object_mut()
+        .and_then(|object| object.remove("sharedId"))
+        .map(|value| {
+            value
+                .as_str()
+                .expect("should send sharedId as a string")
+                .to_owned()
+        });
+    (json, sharedid)
+}
+
+/// The live `_pubcid` value the response sets, if any.
+fn set_sharedid(response: &Observation) -> Option<&str> {
+    response.cookies.iter().find_map(|cookie| {
+        cookie
+            .strip_prefix("_pubcid=")
+            .and_then(|rest| rest.split(';').next())
+            .filter(|_| !cookie.contains("Max-Age=0"))
+    })
+}
+
 fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../trusted-server-js/lib/test/fixtures/ec-route-contract.json"
@@ -864,11 +890,16 @@ fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
             observed.origin_requests, 0,
             "should answer contract POST locally"
         );
+        let (mirror, sharedid) = route_json(&observed);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&observed.response.body)
-                .expect("should decode mirror response"),
-            case["expected"]["json"],
+            mirror, case["expected"]["json"],
             "should return the expected mirror for {}",
+            case["name"]
+        );
+        assert_eq!(
+            sharedid.as_deref(),
+            set_sharedid(&observed.response),
+            "ID-9: should answer with the SharedID the response sets for {}",
             case["name"]
         );
         assert!(
@@ -1135,6 +1166,11 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             .iter()
             .any(|value| value.starts_with("_pubcid=")),
         "should issue the persisted SharedID on EC POST"
+    );
+    assert_eq!(
+        route_json(&created).1.as_deref(),
+        set_sharedid(&created.response),
+        "ID-9: should answer with the SharedID the EC POST sets"
     );
     let graph = KvIdentityGraph::new(store.clone());
     let key = normalize_ec_id_for_kv(&identity);
@@ -1507,8 +1543,7 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
 
     post.headers.push(("cookie".to_owned(), cookies.clone()));
     let mirrored = adapter.exchange(&post);
-    let mirror: serde_json::Value =
-        serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let (mirror, _) = route_json(&mirrored);
     let cookie_mirror: serde_json::Value = mirrored
         .response
         .cookies
@@ -1571,11 +1606,15 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should accept an unchanged returning reader"
     );
     assert_no_identity_cookies(&returning.response);
+    let (kept_mirror, kept_sharedid) = route_json(&returning);
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&returning.response.body)
-            .expect("should decode the returning reader's EC JSON"),
-        yesterday,
+        kept_mirror, yesterday,
         "should answer with the mirror the reader keeps"
+    );
+    assert_eq!(
+        kept_sharedid.as_deref(),
+        Some(sharedid.as_str()),
+        "ID-9: should answer with the SharedID the reader keeps"
     );
     assert!(
         ![
@@ -1775,6 +1814,11 @@ fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, 
         }),
         "should set neither _pubcid nor _pubcid_cst for a reader with _pubcid_optout: {:?}",
         opted_out.response.cookies
+    );
+    assert_eq!(
+        route_json(&opted_out).1,
+        None,
+        "SID-2: should answer a reader with _pubcid_optout without a SharedID"
     );
     assert!(
         !block_on(graph.get(&normalize_ec_id_for_kv(&identity)))

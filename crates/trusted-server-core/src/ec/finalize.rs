@@ -1850,6 +1850,17 @@ mod tests {
     /// Runs a returning reader's finalize and returns the `_pubcid` cookies
     /// the response sets and the `SharedID` the record holds afterwards.
     async fn run_write_back(case: WriteBackCase<'_>) -> (Vec<String>, Option<String>) {
+        let (cookies, stored, _) = run_write_back_outcome(case, false).await;
+        (cookies, stored)
+    }
+
+    /// As [`run_write_back`], also returning the `SharedID` the response
+    /// leaves the reader with (what the EC route reports). With `preload`,
+    /// the record is read before finalize, as the EC route does.
+    async fn run_write_back_outcome(
+        case: WriteBackCase<'_>,
+        preload: bool,
+    ) -> (Vec<String>, Option<String>, Option<String>) {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("wrback");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1879,6 +1890,9 @@ mod tests {
             ec_context.set_navigation_permit(NavigationPermit::for_test());
         }
         ec_context.set_lookup_results(case.lookups);
+        if preload {
+            ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
+        }
         let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
             .expect("should build registry");
         let mut response = empty_response();
@@ -1902,7 +1916,60 @@ mod tests {
             .await
             .expect("should read store")
             .and_then(|(entry, _)| entry.ids.get("pubcid.org").map(|id| id.uid.clone()));
-        (pubcid_set_cookies(&response), stored)
+        (
+            pubcid_set_cookies(&response),
+            stored,
+            ec_context.kept_sharedid().map(str::to_owned),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kept_sharedid_follows_the_opt_out_and_purpose_four() {
+        let cases = [
+            (
+                navigation_case(Some(STORED_SHAREDID), "other=1"),
+                Some(STORED_SHAREDID),
+                "a SharedID the response sets",
+            ),
+            (
+                navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={STORED_SHAREDID}")),
+                Some(STORED_SHAREDID),
+                "a SharedID the browser already holds",
+            ),
+            (
+                WriteBackCase {
+                    consent: purpose_one_only_consent(),
+                    ..navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={OTHER_SHAREDID}"))
+                },
+                None,
+                "Purpose 4 denied (SID-6)",
+            ),
+            (
+                navigation_case(
+                    Some(STORED_SHAREDID),
+                    &format!("_pubcid={STORED_SHAREDID}; _pubcid_optout=1"),
+                ),
+                None,
+                "_pubcid_optout (SID-2)",
+            ),
+        ];
+
+        for (case, expected, label) in cases {
+            let (_, _, kept) = run_write_back_outcome(case, true).await;
+            assert_eq!(
+                kept.as_deref(),
+                expected,
+                "should report the kept SharedID for {label}"
+            );
+        }
+        // WB-3: a record without SharedID gets one created on this navigation.
+        let (_, stored, kept) =
+            run_write_back_outcome(navigation_case(None, "other=1"), true).await;
+        assert!(stored.is_some(), "should create a SharedID");
+        assert_eq!(
+            kept, stored,
+            "should report the SharedID created on this navigation"
+        );
     }
 
     fn navigation_case<'a>(stored: Option<&'a str>, cookies: &str) -> WriteBackCase<'a> {

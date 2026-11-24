@@ -182,7 +182,9 @@ impl IdentityApp {
         // because it cannot rebuild it (no readable row, or a live row and no
         // clock to judge UID liveness and `exp` by), the body lists no EIDs. A
         // carried cookie the server could not verify is never echoed, so the
-        // body then need not match the cookie the browser keeps.
+        // body then need not match the cookie the browser keeps. ID-9 adds
+        // the SharedID the response leaves the reader with, only where SID-2
+        // and SID-6 allow it.
         let mirror = self
             .finalize(
                 &mut identity.context,
@@ -192,10 +194,14 @@ impl IdentityApp {
                 &mut result,
             )
             .await;
-        *result.body_mut() = edgezero_core::body::Body::from(match mirror {
-            Some(MirrorCookie::Set(value)) => value.json().to_owned(),
-            Some(MirrorCookie::Expire) | None => EMPTY_MIRROR_JSON.to_owned(),
-        });
+        let mirror_json = match &mirror {
+            Some(MirrorCookie::Set(value)) => value.json(),
+            Some(MirrorCookie::Expire) | None => EMPTY_MIRROR_JSON,
+        };
+        *result.body_mut() = edgezero_core::body::Body::from(route_json(
+            mirror_json,
+            identity.context.kept_sharedid(),
+        ));
         result.headers_mut().insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
@@ -292,6 +298,24 @@ async fn prepare_snapshot(
         parts,
         edgezero_core::body::Body::empty(),
     ))
+}
+
+/// The EC POST body: the mirror JSON, with the reader's `SharedID` under
+/// `sharedId` when the write-back kept one.
+fn route_json(mirror_json: &str, sharedid: Option<&str>) -> String {
+    let Some(sharedid) = sharedid else {
+        return mirror_json.to_owned();
+    };
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(mirror_json) {
+        Ok(mut object) => {
+            object.insert("sharedId".to_owned(), serde_json::Value::from(sharedid));
+            serde_json::Value::Object(object).to_string()
+        }
+        Err(_) => {
+            log::warn!("EC route: mirror JSON is not an object, answering without SharedID");
+            mirror_json.to_owned()
+        }
+    }
 }
 
 fn response(status: StatusCode) -> Response {
