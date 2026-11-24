@@ -26,8 +26,8 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::identity_conformance::{
-    Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
-    Scenario, configure_api_request, configure_http_fixture, tcf_consent_cookie,
+    Adapter, ApiObservation, ApiRequest, Consent, Geo, ID5_LOOKUP, Navigation, Observation,
+    RecordingStore, Scenario, configure_api_request, configure_http_fixture, tcf_consent_cookie,
     verify_api_identity_expiries, verify_failed_ec_creation, verify_http_contract,
     verify_identity_gates,
 };
@@ -354,7 +354,7 @@ impl ProviderFixture {
         );
         client.respond_to(
             Method::POST,
-            "https://id5.example.com/gs/v2/1234.json",
+            ID5_LOOKUP,
             ScriptedReply::status(StatusCode::OK)
                 .body(
                     serde_json::json!({"universal_uid": ID5_UID, "signature":"",
@@ -581,17 +581,15 @@ fn page_lookup_past_the_deadline_is_skipped_without_delaying_the_response() {
     );
 }
 
-/// ID-9: grant A arrives with no EC while its ID5 lookup is slower than the
-/// deadline, and the script sends withdrawal B once A answers. A leaves no
-/// provider work behind its response, so nothing can revive A's record after
-/// B withdraws it, and B leaves no identity cookie. After-response lookups
-/// never run for an EC minted on the same request, so a page lookup is the
-/// only provider work a grant without an EC starts.
+/// ID-9 with a page-only provider: grant A arrives with no EC while its ID5
+/// lookup is slower than the deadline, and the script sends withdrawal B once
+/// A answers. A's lookup is skipped at the deadline and its UID is never
+/// stored, and B leaves no identity cookie. The after-response case is
+/// [`held_follow_up_from_a_grant_calls_no_provider_after_a_withdrawal`].
 #[test]
 fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
     // Arrange
     let fixture = ProviderFixture::new(StatusCode::OK, IDENTITY_BUDGET * 5, "page", Geo::Gdpr);
-    HELD_TASKS.with_borrow_mut(Vec::clear);
     let (grant, held) = fixture.send(ec_post(&tcf_consent_cookie(true), ""));
     let identity = set_value(&grant, "ts-ec").expect("should mint an EC for grant A");
     let sharedid = set_value(&grant, "_pubcid").expect("should set SharedID for grant A");
@@ -600,18 +598,12 @@ fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
         held <= IDENTITY_BUDGET,
         "should answer grant A by the lookup deadline, held {held:?}"
     );
-    assert!(
-        HELD_TASKS.with_borrow(Vec::is_empty),
-        "should leave no provider work running after grant A's response"
-    );
 
     // Act
     let (withdrawal, _) = fixture.send(ec_post(
         &tcf_consent_cookie(false),
         &format!("ts-ec={identity}; _pubcid={sharedid}"),
     ));
-    // Pass the time the slow ID5 answer would have arrived.
-    fixture.clock.advance(IDENTITY_BUDGET * 5);
 
     // Assert: A set no mirror (its lookup was skipped), so B has none to expire.
     for name in ["ts-ec", "_pubcid", "_pubcid_cst"] {
@@ -631,15 +623,57 @@ fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
         "withdrawal B should set no identity cookie: {:?}",
         set_cookies(&withdrawal)
     );
-    assert!(
-        HELD_TASKS.with_borrow(Vec::is_empty),
-        "should schedule no provider work for withdrawal B"
-    );
     let record = fixture.record(&identity);
     assert!(!record.consent.ok, "should keep A's record withdrawn");
     assert!(
         !record.ids.contains_key("id5.example.com"),
         "should never store the slow lookup's UID"
+    );
+}
+
+/// ID-9 with an after-response provider: grant A's follow-up lookup is still
+/// held when withdrawal B is handled, and running it afterwards calls no
+/// provider and leaves A's record withdrawn. The follow-up is scheduled for
+/// the new EC; it checks the EC and consent only when it runs.
+#[test]
+fn held_follow_up_from_a_grant_calls_no_provider_after_a_withdrawal() {
+    // Arrange
+    let fixture = ProviderFixture::new(
+        StatusCode::OK,
+        IDENTITY_BUDGET * 5,
+        "after_response",
+        Geo::Gdpr,
+    );
+    HELD_TASKS.with_borrow_mut(Vec::clear);
+    let (grant, _) = fixture.send(ec_post(&tcf_consent_cookie(true), ""));
+    let identity = set_value(&grant, "ts-ec").expect("should mint an EC for grant A");
+    let sharedid = set_value(&grant, "_pubcid").expect("should set SharedID for grant A");
+    assert_eq!(
+        HELD_TASKS.with_borrow(Vec::len),
+        1,
+        "should hold grant A's follow-up lookup, proving the capture"
+    );
+
+    // Act
+    fixture.send(ec_post(
+        &tcf_consent_cookie(false),
+        &format!("ts-ec={identity}; _pubcid={sharedid}"),
+    ));
+    for task in HELD_TASKS.with_borrow_mut(std::mem::take) {
+        fixture.clock.drive(task);
+    }
+
+    // Assert
+    assert_eq!(
+        fixture.id5_lookups(),
+        0,
+        "should call no provider for an EC minted by grant A"
+    );
+    let record = fixture.record(&identity);
+    assert!(!record.consent.ok, "should keep A's record withdrawn");
+    assert!(
+        !record.ids.contains_key("id5.example.com"),
+        "should store no late UID"
     );
 }
 

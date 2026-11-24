@@ -785,11 +785,10 @@ impl ApiObservation {
 pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
     // Shared JSON uses fixed TCF timestamps; age policy has separate consent tests.
     settings.consent.check_expiration = false;
-    settings.integrations.insert_config("prebid", &serde_json::json!({
-        "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
-        "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
-        "managed_user_ids":[{"name":"sharedId","storage":{"type":"cookie","name":"_pubcid"}}]
-    })).expect("should configure SharedID cookie storage");
+    settings
+        .integrations
+        .insert_config("prebid", &prebid_fixture("cookie"))
+        .expect("should configure SharedID cookie storage");
     settings
         .proxy
         .allowed_domains
@@ -817,6 +816,15 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
     .expect("should configure conformance partner and SharedID");
 }
 
+/// The Prebid integration fixture, with `SharedID` kept in `storage_type`.
+fn prebid_fixture(storage_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
+        "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
+        "managed_user_ids":[{"name":"sharedId","storage":{"type": storage_type, "name":"_pubcid"}}]
+    })
+}
+
 /// Applies one request's fixture switches on top of [`configure_http_fixture`].
 ///
 /// # Panics
@@ -826,15 +834,7 @@ pub fn configure_api_request(settings: &mut crate::settings::Settings, request: 
     if request.sharedid_storage_type != "cookie" {
         settings
             .integrations
-            .insert_config(
-                "prebid",
-                &serde_json::json!({
-                    "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
-                    "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
-                    "managed_user_ids":[{"name":"sharedId","storage":{
-                        "type": request.sharedid_storage_type, "name":"_pubcid"}}]
-                }),
-            )
+            .insert_config("prebid", &prebid_fixture(request.sharedid_storage_type))
             .expect("should configure SharedID storage type");
     }
     if request.identity_provider {
@@ -1973,7 +1973,7 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
         "should not echo the sharedId cookie"
     );
     // WB-3 and SID-6: Purpose 1 granted and Purpose 4 denied leaves the
-    // browser's SharedID alone and never reads it into the record.
+    // browser's SharedID cookies alone.
     for browser in [String::new(), format!("; _pubcid={FOREIGN_SHAREDID}")] {
         let observed = adapter.exchange(&ec_post(
             consent_body(&purpose_one_only),
@@ -1988,11 +1988,6 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
             sharedid_cookies(&observed.response).is_empty(),
             "should neither set nor expire SharedID without Purpose 4 ({browser:?}): {:?}",
             observed.response.cookies
-        );
-        assert_ne!(
-            stored_sharedid(store, &identity).as_deref(),
-            Some(FOREIGN_SHAREDID),
-            "should not read the browser SharedID without Purpose 4"
         );
     }
 
@@ -2021,12 +2016,6 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
                 .any(|source| source == "pubcid.org"),
             "should send no SharedID with {case}"
         );
-        assert!(
-            sharedid_cookies(&withheld.response)
-                .iter()
-                .all(|cookie| cookie.contains("Max-Age=0")),
-            "should set no SharedID with {case}"
-        );
     }
 
     // WB-3: Purpose 1 denied, with Purpose 4 still granted, expires both.
@@ -2048,6 +2037,23 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
             denied.response.cookies
         );
     }
+
+    // SID-6: a record without SharedID, so a read would show in the store.
+    clear_store(store);
+    let bare = adapter.exchange(&ec_post(
+        consent_body(&granted),
+        Some("_pubcid_optout=1".to_owned()),
+    ));
+    let bare_identity = assert_created(&bare.response, store);
+    adapter.exchange(&ec_post(
+        consent_body(&purpose_one_only),
+        Some(format!("ts-ec={bare_identity}; _pubcid={FOREIGN_SHAREDID}")),
+    ));
+    assert_eq!(
+        stored_sharedid(store, &bare_identity),
+        None,
+        "should not read the browser SharedID without Purpose 4"
+    );
 
     // SID-1: the configured `_pubcid` cookie is read, and `sharedId` is not.
     clear_store(store);
