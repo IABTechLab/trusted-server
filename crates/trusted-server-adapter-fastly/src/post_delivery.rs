@@ -337,6 +337,7 @@ mod tests {
                 use_finalize_kv: false,
                 eids_cookie: None,
                 sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                after_response: None,
             },
             after_response: None,
         }

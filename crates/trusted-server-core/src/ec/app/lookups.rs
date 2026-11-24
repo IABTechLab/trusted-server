@@ -35,6 +35,7 @@ pub struct IdentityLookups {
 /// The router owns the request, so the request signals the providers read are
 /// copied here. The lookups are dispatched only after the response, so they
 /// never delay the page.
+#[derive(Clone)]
 pub struct AfterResponseLookups {
     /// Coordinator owning these provider lookups.
     pub coordinator: Arc<ProviderCoordinator>,
@@ -136,7 +137,8 @@ impl IdentityApp {
             context.set_kv_snapshot(snapshot);
         }
         // The request's own client: the batch it starts is bound to the serving
-        // callback, so it stays in flight until `finalize` collects it.
+        // callback, so it stays in flight until the handler collects it
+        // before finalization.
         let transport = OutboundLookupTransport::for_services(services);
         let signals = ProviderRequestSignals::read(req, services);
         let now = current_timestamp();
