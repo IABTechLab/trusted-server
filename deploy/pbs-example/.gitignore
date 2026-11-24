@@ -11,6 +11,10 @@
 /deployment.generated.yaml
 /runtime/secret-bindings.generated.json
 
+# Development mTLS certificates and their private keys
+/.dev-mtls/
+*.key
+
 # Local inputs and crash output
 *.auto.tfvars
 *.tfvars

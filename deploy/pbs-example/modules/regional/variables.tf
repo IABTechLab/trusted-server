@@ -23,6 +23,21 @@ variable "certificate_arn" {
   type        = string
 }
 
+variable "client_ca_bundle" {
+  description = "Optional S3 bucket and object key for the ALB client CA bundle. Null disables client certificate verification."
+  type = object({
+    bucket = string
+    key    = string
+  })
+  default = null
+}
+
+variable "connection_logs_bucket" {
+  description = "Optional existing regional S3 bucket for ALB connection logs. Null disables logging."
+  type        = string
+  default     = null
+}
+
 variable "instance_type" {
   description = "EC2 instance type for the regional PBS hosts."
   type        = string

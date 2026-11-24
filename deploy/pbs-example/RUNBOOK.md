@@ -6,7 +6,7 @@ This runbook describes local checks and the separately authorized operations tha
 
 - Work only in `deploy/pbs-example`.
 - Use Terraform `1.16.2` and the committed AWS provider lock files in both the root and regional module. Both lock AWS `6.64.0` for Linux and macOS on AMD64 and ARM64.
-- Local wiring checks require the Node.js version in `.tool-versions` and Docker with the Compose plugin. The check uses only built-in Node.js modules; no npm install is needed.
+- Local wiring checks require the Node.js version in `.tool-versions` and Docker with the Compose plugin. The development certificate test also needs OpenSSL. Both tests use only built-in Node.js modules; no npm install is needed.
 - Use fictional values from `terraform.tfvars.example`, `deployment.example.yaml`, and `runtime/secret-bindings.example.json` only for local validation.
 - Replace the fictional AWS account, profile, certificate, hosted-zone, AMI, and CIDR inputs before any authorized cloud plan. Terraform renders actual instance and secret identifiers after apply.
 - Confirm the approved Trusted Server egress CIDRs. Do not use the documentation CIDR as a real allowlist.
@@ -30,9 +30,9 @@ terraform -chdir=deploy/pbs-example/modules/regional test \
   -filter=tests/security_unit_test.tftest.hcl
 ```
 
-`init -backend=false` downloads the locked provider but does not access the configured local state or AWS. Both selected test files use mocked AWS providers and explicit plan commands. Confirm that the root file runs five tests and the module file runs eight tests. Root assertions require distinct instance IDs in each regional descriptor. Module tests also cover resource-name boundaries and partition-specific SSM policy ARNs. Regional assertions cover IMDSv2, encrypted root volumes, private subnet/AZ placement, the TLS policy, scoped ALB ingress/egress, alarms, and secret access. `validate` and mocked tests do not prove AWS permissions, quotas, AMI existence, certificates, subnet availability, or capacity.
+`init -backend=false` downloads the locked provider but does not access the configured local state or AWS. Both selected test files use mocked AWS providers. The regional suite applies the mTLS changes against the mock to test enabling and disabling verification. Confirm that the root file runs eight tests and the module file runs eleven. Root assertions require distinct instance IDs in each regional descriptor and verify the regional inputs reach the correct ALB. Module tests also cover resource-name boundaries and partition-specific SSM policy ARNs. Regional assertions cover IMDSv2, encrypted root volumes, private subnet/AZ placement, the TLS policy, scoped ALB ingress/egress, alarms, and secret access. `validate` and mocked tests do not prove AWS permissions, quotas, AMI existence, certificates, subnet availability, or capacity.
 
-The `PBS example checks` workflow runs these Terraform checks and the JSON, shell, and Compose wiring checks below. The CLI test suite separately validates the committed deployment descriptor and its referenced inputs on every PR. The example owner remains responsible for local validation of adapted inputs. Provider upgrades must refresh both locks with `terraform providers lock -platform=darwin_arm64 -platform=darwin_amd64 -platform=linux_amd64 -platform=linux_arm64` from each directory and rerun both suites.
+The `PBS example checks` workflow runs these Terraform checks and the JSON, shell, Compose wiring, and certificate checks below. The CLI test suite separately validates the committed deployment descriptor and its referenced inputs on every PR. The example owner remains responsible for local validation of adapted inputs. Provider upgrades must refresh both locks with `terraform providers lock -platform=darwin_arm64 -platform=darwin_amd64 -platform=linux_amd64 -platform=linux_arm64` from each directory and rerun both suites.
 
 Check the PBS descriptor without AWS access. On Apple Silicon macOS, use `cargo run_cli_macos` instead of `cargo run_cli_linux`. On another host, use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`:
 
@@ -55,11 +55,13 @@ docker compose \
 
 Expected result: Compose renders successfully without pulling or starting the image. The dummy environment file is not a credential.
 
-Validate the JSON input and smoke command wiring without starting containers:
+Validate the JSON input, smoke command wiring, and development certificates without starting containers:
 
 ```bash
 bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs
+bash -n deploy/pbs-example/scripts/make-dev-mtls-certs.sh
+env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-smoke-runtime.mjs
+env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-make-dev-mtls-certs.mjs
 ```
 
 The wiring command clears inherited Node.js preload options and module paths. The script passes only `PATH` and `HOME` plus explicit test inputs to subprocesses. It parses the binding JSON, renders production and smoke configurations, uses fake Docker lifecycle and curl commands, and checks that inherited selectors cannot replace the dummy inputs. It does not pull images, start PBS, or prove runtime health.
@@ -85,6 +87,53 @@ These steps remain deferred. They require an approved AWS account, role, region 
 7. Apply only the reviewed saved plan after a separate approval.
 
 Failure behavior: stop on wrong-account identity, an unexpected resource action, a certificate or zone mismatch, broad ingress, missing egress approval, or a secret policy broader than the declared bidder bindings. Reconcile the inputs and create a new plan. Never reuse a stale saved plan after source, state, credentials, or assumptions change.
+
+## Optional ALB mutual TLS
+
+These steps require separate approval for the AWS and Fastly changes. Use the [authorized Terraform workflow](#authorized-terraform-workflow) for each regional change.
+
+### Issue a certificate and prepare S3
+
+1. The PBS operator owns the private CA and keeps its certificate and key offline. The Trusted Server operator generates the client key locally and sends only the certificate signing request to the PBS operator. Issue an end-entity certificate with the `clientAuth` extended key usage and about a one-year lifetime.
+2. Upload the public CA bundle to S3. Use one or more PEM CA certificates with no blank lines, and grant the Terraform principal `s3:GetObject` on the bundle. Upload each revision under a new object key, such as `client-ca/bundle-v2.pem`. Changing the bytes at the same key does not change Terraform's inputs.
+3. If using connection logs, create a bucket in each ALB's region with SSE-S3 before setting `east_connection_logs_bucket` or `west_connection_logs_bucket`. Add a bucket policy that grants the log delivery service `s3:PutObject`. For example, with no log prefix:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "logdelivery.elasticloadbalancing.amazonaws.com"
+         },
+         "Action": "s3:PutObject",
+         "Resource": "arn:aws:s3:::pbs-example-east-connection-logs/AWSLogs/123456789012/*"
+       }
+     ]
+   }
+   ```
+
+   Replace the fictional bucket and account ID with the approved bucket and the ALB's account ID. Connection logging is independent of verification. To stop it, unset that region's log bucket input and apply before deleting the bucket.
+
+Keep both the CA key and the client key out of Terraform variables, plans, and state. The client key belongs in Fastly Secret Store, not in S3 or Secrets Manager.
+
+### Enable verification and check each region
+
+1. Provision `auction-providers.private-key` in Fastly Secret Store. Provision `auction-providers.certificate` as a PEM chain, leaf first, and `auction-providers.hosts` as one HTTPS origin per line in Fastly Config Store.
+2. Push the provider config with `mtls = true` only after every Trusted Server version serving traffic supports the setting. Older versions reject the config, which breaks all of their requests, not only auctions.
+3. Wait until every Fastly sandbox serves the new config. With `reusable-sandbox`, running sandboxes keep the old config until they are recycled. The ALB does not ask for a client certificate before verify mode, so this step cannot be observed at the ALB. Then set both the CA bundle bucket and key for just one region, for example `east_client_ca_bundle_s3_bucket` and `east_client_ca_bundle_s3_key`. Confirm the plan creates a trust store and switches that region's HTTPS listener to `verify` without replacing its ACM certificate or changing the ingress allowlist. Apply the reviewed plan.
+4. Confirm auctions routed to that region succeed. A `/status` request through the public HTTPS listener also needs a client certificate. Probe from an allowed network using an approved client identity. The target group's HTTP health check still reaches PBS without a client certificate. Use a regional endpoint covered by the ACM certificate or direct the probe to that region's ALB while preserving the shared hostname for TLS.
+5. If connection logs are enabled for that region, open them in the regional log bucket under `AWSLogs/<account-id>/`. Match the probe or auction by time and listener. Check `tls_verify_status` for `Success` with the expected leaf certificate serial. A probe without a certificate should fail, with a `Failed:<error_code>` result in the logs. Do not rely on target health alone to confirm the public TLS handshake.
+6. Repeat the plan, apply, and checks for the other region once the first is working.
+
+### Rotate or roll back
+
+For a leaf renewal under the same CA, issue a fresh key and certificate. Write the new `auction-providers.private-key` entry first, then the new `auction-providers.certificate` chain. Fastly propagates these writes over time, so check auctions and the new serial in the connection logs. The chain determines EdgeZero's backend name. Updating it first can leave a reused sandbox with a backend registered under the new name but using the old key until the sandbox is recycled. Updating only the key does not change already registered backends.
+
+For a CA rotation, first apply a bundle containing both CAs under a new S3 key and check both regions. Switch the client identity, key first, and verify auctions. Then apply a bundle containing only the new CA under another new key. This example has no certificate revocation list inputs. To revoke trust, replace the bundle to remove the affected issuing CA. If its other clients still need access, rotate them to a new CA first. Reissuing a leaf alone does not revoke its predecessor. Bundle changes update the trust store in place. If you need to force replacement with the same trust store name, turn verification off first. AWS cannot create another store with that name before deleting the old one.
+
+For rollback, unset both CA bundle inputs for each region and apply. Verify that the listeners return to `off`. Terraform detaches the trust store before deleting it. Confirm auctions still work before Trusted Server stops presenting the certificate. Remove `mtls` from provider config before deploying an older binary that rejects the field. With `reusable-sandbox`, existing sandboxes keep their loaded settings and backends until recycled.
 
 ## Generate operator inputs
 
