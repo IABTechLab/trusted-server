@@ -35,6 +35,7 @@ pub struct IdentityLookups {
 /// The router owns the request, so the request signals the providers read are
 /// copied here. The lookups are dispatched only after the response, so they
 /// never delay the page.
+#[derive(Clone)]
 pub struct AfterResponseLookups {
     /// Coordinator owning these provider lookups.
     pub coordinator: Arc<ProviderCoordinator>,
