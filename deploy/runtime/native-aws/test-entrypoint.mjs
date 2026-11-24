@@ -184,7 +184,12 @@ test("an explicitly empty or unpublishable Geo profile never launches the app", 
   }).closed;
   assert.notEqual(result.code, 0);
   assert.equal(result.stdout, "");
+  assert.match(
+    result.stderr,
+    /Native Geo profile path must not be a directory/,
+  );
   assert.doesNotMatch(result.stderr, /fictional profile sentinel/);
+  assert.deepEqual(await readdir(join(runtime, "native-geo.toml")), []);
   assert.deepEqual(await readdir(runtime), [
     "native-bindings.toml",
     "native-geo.toml",
@@ -260,8 +265,24 @@ test("failed publication does not launch the app or leave a temporary file", asy
   const result = await start("nonsecret sentinel").closed;
   assert.notEqual(result.code, 0);
   assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Native bindings path must not be a directory/);
   assert.doesNotMatch(result.stderr, /nonsecret sentinel/);
+  assert.deepEqual(await readdir(bindings), []);
   assert.deepEqual(await readdir(runtime), ["native-bindings.toml"]);
+});
+
+test("refuses a link to a directory without writing into the linked directory", async (t) => {
+  const { root, bindings, start } = await fixture(t);
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await symlink(outside, bindings);
+  const result = await start("nonsecret sentinel").closed;
+  assert.notEqual(result.code, 0);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Native bindings path must not be a directory/);
+  assert.doesNotMatch(result.stderr, /nonsecret sentinel/);
+  assert.deepEqual(await readdir(outside), []);
+  assert.equal((await lstat(bindings)).isSymbolicLink(), true);
 });
 
 test(
