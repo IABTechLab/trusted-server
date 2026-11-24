@@ -20,6 +20,7 @@ use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRE
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::integrations::{
@@ -342,13 +343,15 @@ async fn dispatch_ec_route(
             .await
         }
     };
-    if let Some(lookups) = page_lookups {
+    let mut response = result.unwrap_or_else(|error| http_error(&error));
+    if let Some(lookups) = page_lookups
+        && !NavigationPermit::is_redirect(response.status())
+    {
         state
             .identity
             .collect_identity_lookups(lookups, &mut ec.context)
             .await;
     }
-    let mut response = result.unwrap_or_else(|error| http_error(&error));
     state
         .identity
         .finalize(

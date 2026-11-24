@@ -767,6 +767,8 @@ pub struct ApiObservation {
     pub origin_requests: usize,
     /// Response cache policy.
     pub cache_control: Option<String>,
+    /// Whether a runtime shared-cache directive survived finalization.
+    pub edge_cache_headers_present: bool,
 }
 
 /// Applies identical partner and auction configuration to supported runners.
@@ -917,6 +919,79 @@ fn assert_ec_expired(response: &Observation) {
             .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
         "should expire browser EC in the withdrawal response"
     );
+}
+
+/// Verifies core-generated identity expiries and cache privacy on API responses.
+///
+/// # Panics
+///
+/// Panics if an adapter strips a required deletion or permits shared caching.
+pub fn verify_api_identity_expiries(adapter: &mut impl Adapter) {
+    for (consent, extra, expected) in [
+        (
+            false,
+            "__Host-ts-eids-mirror=stale".to_owned(),
+            vec!["__Host-ts-eids-mirror"],
+        ),
+        (
+            true,
+            "_pubcid=browser-id; _pubcid_cst=old; _pubcid_optout=1".to_owned(),
+            vec!["_pubcid", "_pubcid_cst"],
+        ),
+        (
+            false,
+            format!(
+                "ts-ec={}.abc123; __Host-ts-eids-mirror=stale; _pubcid=browser-id; _pubcid_cst=old",
+                "a".repeat(64)
+            ),
+            vec!["ts-ec", "__Host-ts-eids-mirror", "_pubcid", "_pubcid_cst"],
+        ),
+    ] {
+        let mut request = ApiRequest::new(http::Method::GET, "/publisher-api");
+        request.headers.push((
+            "cookie".to_owned(),
+            format!("{}; {extra}", tcf_consent_cookie(consent)),
+        ));
+        let observed = adapter.exchange(&request);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::OK,
+            "should finalize an ordinary API response"
+        );
+        for name in expected {
+            assert!(
+                observed.response.cookies.iter().any(|value| {
+                    let cookie =
+                        Cookie::parse(value.as_str()).expect("should parse generated expiry");
+                    cookie.name() == name
+                        && cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+                }),
+                "should expire {name} on a non-document API response"
+            );
+        }
+        assert!(
+            observed.response.cookies.iter().all(|value| {
+                let cookie = Cookie::parse(value.as_str()).expect("should parse response cookie");
+                cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+            }),
+            "should emit only expiry cookies on the API response"
+        );
+        assert!(
+            !observed.edge_cache_headers_present,
+            "should strip runtime shared-cache directives from expiry responses"
+        );
+        assert!(
+            observed.cache_control.as_deref().is_some_and(|value| value
+                .split(',')
+                .map(str::trim)
+                .any(|directive| directive == "private")
+                && !value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|directive| directive == "public" || directive.starts_with("s-maxage"))),
+            "should keep identity deletion responses private"
+        );
+    }
 }
 
 /// Executes the shared HTTP acceptance cases against a real adapter.
@@ -1220,7 +1295,33 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             response.response.status,
             String::from_utf8_lossy(&response.response.body)
         );
-        assert_no_identity_cookies(&response.response);
+        assert_eq!(
+            response.response.cookies.len(),
+            1,
+            "should emit only the required mirror revocation expiry, filtering the retired marker"
+        );
+        let cookie = Cookie::parse(response.response.cookies[0].as_str())
+            .expect("should parse mirror expiry");
+        assert_eq!(
+            cookie.name(),
+            "__Host-ts-eids-mirror",
+            "should revoke a stale mirror whose vendor is denied"
+        );
+        assert!(
+            cookie.max_age().is_some_and(|age| age.whole_seconds() == 0),
+            "should emit no positive identity cookie on publisher API responses"
+        );
+        assert!(
+            !response.edge_cache_headers_present,
+            "should strip shared cache directives from mirror revocation responses"
+        );
+        assert!(
+            response
+                .cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("private")),
+            "should keep mirror revocation responses private"
+        );
     }
 
     let (mut seeded, generation) = block_on(graph.get(&key))
