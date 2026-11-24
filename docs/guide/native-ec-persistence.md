@@ -78,7 +78,7 @@ Provider preparation and runtime operations use EdgeZero's bounded, single-attem
 
 ## Eligibility and route boundaries
 
-Persistence does not grant consent. Native eligibility uses trusted client metadata, consent and the shared navigation policy. Missing JA4 does not block creation; no User-Agent-only gate or fabricated TLS signal is used. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
+Persistence does not grant consent. Native eligibility uses trusted client metadata, consent and the shared navigation policy. Under the default `ec.browser_gate = "lenient"`, missing JA4 does not block creation; no User-Agent-only gate or fabricated TLS signal is used. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
 
 Identify does not create identities. A withdrawal on an identity lifecycle request remains writable for privacy-hardened clients and tombstones the record. Identity cookie writes are restricted to eligible HTML navigation or EC-route responses, including method-neutral HTML error documents and cached-document `304` responses without Content-Type. Explicit withdrawal is the privacy exception: the same response expires the browser EC cookie regardless of method, status or content type, including on API responses. Finalization is awaited before committing response headers.
 

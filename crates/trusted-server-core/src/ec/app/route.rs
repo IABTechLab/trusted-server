@@ -2,22 +2,18 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterBuilder;
 use serde::Deserialize;
-use serde_json::json;
 
 use super::IdentityApp;
 use super::lifecycle::EcRouteResponse;
-use crate::ec::eid_types::UnixSeconds;
-use crate::ec::mirror::{MirrorCookie, build_mirror};
+use crate::ec::EidSyncSource;
+use crate::ec::mirror::MirrorCookie;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::apply_sharedid_write_back;
-use crate::ec::{EidSyncSource, current_timestamp};
 use crate::error::{IntoHttpResponse as _, http_error};
 use crate::http_util::read_request_body;
 use crate::platform::RuntimeServices;
@@ -27,6 +23,8 @@ use crate::response_privacy::enforce_terminal_private_cache_privacy;
 pub const EC_PATH: &str = "/_ts/api/v1/ec";
 const MAX_BODY: usize = 16 * 1024;
 const MAX_SIGNAL: usize = 8 * 1024;
+/// The EC POST body when the response carries no mirror.
+const EMPTY_MIRROR_JSON: &str = r#"{"v":1,"eids":[]}"#;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -178,31 +176,32 @@ impl IdentityApp {
         let mut result = response(StatusCode::OK);
         result.extensions_mut().insert(EcRouteResponse);
         crate::ec::consent_update::require_reconciliation(&mut result);
-        self.finalize(
-            &mut identity.context,
-            identity.eids_cookie.as_deref(),
-            &identity.sharedid,
-            true,
-            &mut result,
-        )
-        .await;
-        let mirror = match build_mirror(
-            identity
-                .context
-                .ec_value()
-                .and_then(|id| identity.context.kv_snapshot().entry_for(id)),
-            &identity.context,
-            &self.partners,
-            UnixSeconds::new(current_timestamp()),
-        ) {
-            MirrorCookie::Set(value) => URL_SAFE_NO_PAD
-                .decode(value.as_str())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .unwrap_or_else(|| json!({"v":1,"eids":[]})),
-            MirrorCookie::Expire => json!({"v":1,"eids":[]}),
+        // The body holds what WB-4 puts in the mirror cookie on this
+        // response: the value set, or kept unchanged, when finalize builds
+        // one. When finalize expires the mirror, or leaves it untouched
+        // because it cannot rebuild it (no readable row, or a live row and no
+        // clock to judge UID liveness and `exp` by), the body lists no EIDs. A
+        // carried cookie the server could not verify is never echoed, so the
+        // body then need not match the cookie the browser keeps. ID-9 adds
+        // the SharedID the response leaves the reader with, only where SID-2
+        // and SID-6 allow it.
+        let mirror = self
+            .finalize(
+                &mut identity.context,
+                identity.eids_cookie.as_deref(),
+                &identity.sharedid,
+                true,
+                &mut result,
+            )
+            .await;
+        let mirror_json = match &mirror {
+            Some(MirrorCookie::Set(value)) => value.json(),
+            Some(MirrorCookie::Expire) | None => EMPTY_MIRROR_JSON,
         };
-        *result.body_mut() = edgezero_core::body::Body::from(mirror.to_string());
+        *result.body_mut() = edgezero_core::body::Body::from(route_json(
+            mirror_json,
+            identity.context.kept_sharedid(),
+        ));
         result.headers_mut().insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
@@ -301,6 +300,24 @@ async fn prepare_snapshot(
     ))
 }
 
+/// The EC POST body: the mirror JSON, with the reader's `SharedID` under
+/// `sharedId` when the write-back kept one.
+fn route_json(mirror_json: &str, sharedid: Option<&str>) -> String {
+    let Some(sharedid) = sharedid else {
+        return mirror_json.to_owned();
+    };
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(mirror_json) {
+        Ok(mut object) => {
+            object.insert("sharedId".to_owned(), serde_json::Value::from(sharedid));
+            serde_json::Value::Object(object).to_string()
+        }
+        Err(_) => {
+            log::warn!("EC route: mirror JSON is not an object, answering without SharedID");
+            mirror_json.to_owned()
+        }
+    }
+}
+
 fn response(status: StatusCode) -> Response {
     let mut response = Response::new(edgezero_core::body::Body::empty());
     *response.status_mut() = status;
@@ -318,6 +335,7 @@ mod tests {
     use crate::platform::test_support::noop_services;
     use edgezero_core::body::Body;
     use edgezero_core::ingress::{InboundOrigin, OriginSource};
+    use serde_json::json;
 
     async fn snapshot(body: serde_json::Value) -> Result<Request, Box<Response>> {
         let mut request = edgezero_core::http::request_builder()

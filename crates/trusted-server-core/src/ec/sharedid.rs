@@ -405,17 +405,13 @@ fn decide_write_back(input: &SharedIdDecision<'_>) -> SharedIdWriteBack {
     }
 }
 
-/// Expires the `SharedID` cookies on a navigation whose EC consent is
-/// unusable, when the request carried them and the server writes them.
+/// Expires managed `SharedID` cookies on any finalized response after denial
+/// or opt-out, when the request carried them (S2S design §10, WB-1).
 pub(crate) fn expire_sharedid_on_denied_consent(
     settings: &Settings,
     sharedid: &SharedIdRequest,
-    navigation: bool,
     response: &mut Response<EdgeBody>,
 ) {
-    if !navigation {
-        return;
-    }
     let decision = decide_write_back(&SharedIdDecision {
         request: sharedid,
         stored: None,
@@ -482,6 +478,19 @@ pub(crate) async fn apply_sharedid_write_back(
         return;
     }
 
+    // SID-2 and SID-6: the reader keeps the stored SharedID only when it is
+    // not opted out and Purpose 4 allows EIDs; it is then set or already
+    // matches the browser cookie.
+    let kept = match &decision {
+        SharedIdWriteBack::SetBoth(value) => Some(value.clone()),
+        SharedIdWriteBack::Unchanged | SharedIdWriteBack::SetConsentHash
+            if eid_allowed && !sharedid.opted_out =>
+        {
+            stored.clone()
+        }
+        _ => None,
+    };
+    ec_context.set_kept_sharedid(kept);
     match decision {
         SharedIdWriteBack::Unchanged => {}
         SharedIdWriteBack::ExpireBoth => expire_sharedid_cookies(settings, sharedid, response),

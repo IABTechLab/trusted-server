@@ -19,7 +19,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::device::DeviceSignals;
+#[cfg(test)]
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
@@ -50,8 +50,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
-    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+    load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
 use crate::middleware::{
@@ -354,10 +354,6 @@ fn serve(
         geo: request_geo.geo(),
         counters,
     };
-    // Identity lookups a navigation dispatches wait in a request-local slot
-    // until `finalize` collects them. Drop anything an earlier request on
-    // this sandbox left there, which cancels its requests.
-    drop(take_navigation_lookups());
     let delivery = with_finalization(&inputs, |finalize| {
         send_request_with_registries_and_hooks(
             &retained.app,
@@ -370,8 +366,6 @@ fn serve(
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
-    // A detached response never reaches `finalize`; release its lookups now.
-    drop(take_navigation_lookups());
 }
 
 /// Supplies the production finalization callback to a request lifecycle.
@@ -385,11 +379,11 @@ fn with_finalization<T>(
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
 ///
 /// Only the client request exposes the trusted forwarder, the resolved client
-/// IP, TLS metadata, and device signals.
+/// IP and TLS metadata. EC device signals read JA4 from `EdgeZero`'s request
+/// ingress instead.
 struct ClientRequestValues {
     forwarder: ForwarderPreparation,
     client_info: ClientInfo,
-    device_signals: Option<DeviceSignals>,
     /// The geo lookup for `client_info`'s client IP.
     request_geo: RequestGeo,
 }
@@ -397,8 +391,7 @@ struct ClientRequestValues {
 impl ClientRequestValues {
     /// Reads the client request's values and sanitizes `req` for dispatch.
     ///
-    /// A trace path keeps its forwarded and TLS headers, and reads no device
-    /// signals.
+    /// A trace path keeps its forwarded and TLS headers.
     fn read(req: &mut FastlyRequest, settings: &Settings, trace_path: bool) -> Self {
         let trusted_client_ip = settings.trusted_client_ip.as_ref();
 
@@ -445,9 +438,8 @@ impl ClientRequestValues {
 
         // These accessors only return real values on the client request, so they
         // are read here and carried in the request extensions for
-        // build_per_request_services and EC bot classification.
+        // build_per_request_services.
         let client_info = client_info_from_request(req, resolved_client_ip);
-        let device_signals = (!trace_path).then(|| derive_device_signals(req));
         // The request's one geo lookup, for the resolved client IP. The
         // synthesized headers, `finalize`, the finalize middleware, the trace
         // metadata and the per-request services all read it.
@@ -455,7 +447,6 @@ impl ClientRequestValues {
         Self {
             forwarder,
             client_info,
-            device_signals,
             request_geo,
         }
     }
@@ -463,9 +454,6 @@ impl ClientRequestValues {
     /// Moves the values into `extensions`, with `queue` and the request's synthesized headers.
     fn prepare(self, extensions: &mut Extensions, settings: &Settings, queue: &TelemetryQueue) {
         extensions.insert(self.forwarder);
-        if let Some(device_signals) = self.device_signals {
-            extensions.insert(device_signals);
-        }
         extensions.insert(self.client_info);
         extensions.insert(queue.clone());
         extensions.insert(per_request_synthesized_headers(
@@ -493,8 +481,8 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters. EC finalization first collects the identity lookups the
-/// navigation dispatched.
+/// sandbox counters. The handler has already collected the navigation's
+/// page-phase identity lookups into the EC context.
 ///
 /// Returns the inputs post-delivery work needs, pull sync and after-response
 /// lookups, or `None` when the response carries no EC state.
@@ -503,12 +491,6 @@ fn finalize_response(
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
     let settings = inputs.state.settings.as_ref();
-    // Identity lookups this request dispatched, taken whatever the response
-    // so none outlives it.
-    let NavigationLookups {
-        page: identity,
-        after_response,
-    } = take_navigation_lookups();
     // Trace responses keep their exact hardened headers; no finalizer touches them.
     if response
         .extensions()
@@ -535,14 +517,14 @@ fn finalize_response(
         // `EdgeZero` calls `finalize` synchronously after its dispatch executor
         // has returned, and Fastly's KV SDK completes I/O through blocking
         // hostcalls. Keep this bridge here, never in native or worker executors.
-        // Identity lookups are collected inside it, so their wait never nests
-        // in the router's executor.
+        // The navigation's page-phase identity lookups were already collected
+        // by the handler into the EC context.
         futures::executor::block_on(apply_edgezero_ec_finalize(
             inputs.state,
             &mut ec_state,
-            identity,
             response,
         ));
+        let after_response = ec_state.after_response.take();
         FinalizeState {
             identity: Arc::clone(&inputs.state.identity),
             ec_state,
@@ -669,29 +651,15 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// Runs EC finalization for a routed response with the identity app's partner
 /// registry and record store.
 ///
-/// Collects `identity` lookups first, unless the response is a redirect,
-/// whose navigation writes nothing. The caller drives this future with the
-/// one `block_on` outside the router's executor.
+/// The navigation's page-phase lookup results are already on the EC context.
+/// The caller drives this future with the one `block_on` outside the
+/// router's executor.
 async fn apply_edgezero_ec_finalize(
     state: &AppState,
     ec_state: &mut EcFinalizeState,
-    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) {
-    // A redirect skips the write, so do not wait for lookups it would discard.
-    let identity = identity.filter(|_| {
-        let redirect = NavigationPermit::is_redirect(response.status());
-        if redirect {
-            log::debug!("Identity lookups dropped: redirect response skips the write");
-        }
-        !redirect
-    });
     let identity_app = &state.identity;
-    if let Some(lookups) = identity {
-        identity_app
-            .collect_identity_lookups(lookups, &mut ec_state.ec_context)
-            .await;
-    }
     identity_app
         .finalize(
             &mut ec_state.ec_context,
@@ -792,18 +760,6 @@ pub(crate) fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })
-}
-
-/// Derives device signals from TLS, H2, and UA request data.
-///
-/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
-/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
-    let ua = req.get_header_str("user-agent").unwrap_or("");
-    let ja4 = req.get_tls_ja4();
-    let h2_fp = req.get_client_h2_fingerprint();
-
-    DeviceSignals::derive(ua, ja4, h2_fp)
 }
 
 #[cfg(test)]
@@ -1483,6 +1439,7 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            after_response: None,
         });
 
         let state = finalize_response(&mut page, &inputs);
@@ -1511,8 +1468,8 @@ mod tests {
         );
         assert_eq!(
             page_header("cache-control").as_deref(),
-            Some("private, max-age=0"),
-            "should keep a cookie-bearing response out of shared caches"
+            Some("no-store, private"),
+            "should preserve terminal privacy for a core-generated identity expiry"
         );
 
         // An asset response keeps its protected cache policy and, being

@@ -20,6 +20,10 @@ use crate::ec::kv_backend::test_support::InMemoryEcKv;
 use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 use crate::error::TrustedServerError;
+use crate::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
+    SAFARI_USER_AGENT,
+};
 
 /// An observed persistence or response-release boundary in a conformance run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +213,10 @@ pub struct Navigation {
     pub ec_cookie: Option<String>,
     /// The platform's location result.
     pub geo: Geo,
-    /// Whether to supply trusted JA4 metadata where the adapter exposes it.
-    pub browser: bool,
+    /// The `User-Agent` header.
+    pub user_agent: &'static str,
+    /// The trusted JA4 the runner supplies, or `None` for no trusted JA4.
+    pub ja4: Option<&'static str>,
     /// Fetch destination; a script is deliberately ineligible for creation.
     pub destination: &'static str,
 }
@@ -221,7 +227,8 @@ impl Default for Navigation {
             consent: Consent::Granted,
             ec_cookie: None,
             geo: Geo::Gdpr,
-            browser: true,
+            user_agent: CHROME_USER_AGENT,
+            ja4: Some(CHROMIUM_JA4),
             destination: "document",
         }
     }
@@ -276,11 +283,20 @@ pub enum Scenario {
     Returning,
     /// Missing trusted JA4 permits creation with consent and a trusted IP.
     MissingTrustedJa4,
+    /// A browser User-Agent with a non-browser trusted JA4 prevents creation.
+    ContradictingJa4,
+    /// A browser User-Agent with another browser engine's trusted JA4
+    /// prevents creation.
+    BrowserEngineMismatch,
+    /// A current Firefox with its own trusted JA4 creates an identity.
+    CurrentFirefox,
+    /// A current Safari with its own trusted JA4 creates an identity.
+    CurrentSafari,
 }
 
 impl Scenario {
     /// Navigation scenarios shared by all supported identity adapters.
-    pub const NAVIGATION_SCENARIOS: [Self; 9] = [
+    pub const NAVIGATION_SCENARIOS: [Self; 13] = [
         Self::Fresh,
         Self::WriteFailure,
         Self::UnknownGeo,
@@ -290,6 +306,10 @@ impl Scenario {
         Self::Subresource,
         Self::Returning,
         Self::MissingTrustedJa4,
+        Self::ContradictingJa4,
+        Self::BrowserEngineMismatch,
+        Self::CurrentFirefox,
+        Self::CurrentSafari,
     ];
 
     /// Executes the scenario and checks the response against authoritative storage.
@@ -320,13 +340,31 @@ impl Scenario {
             Self::DeniedConsent => request.consent = Consent::Denied,
             Self::MissingConsent => request.consent = Consent::Missing,
             Self::Subresource => request.destination = "script",
-            Self::MissingTrustedJa4 => request.browser = false,
+            Self::MissingTrustedJa4 => request.ja4 = None,
+            Self::ContradictingJa4 => request.ja4 = Some(PYTHON_JA4),
+            Self::BrowserEngineMismatch => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(CHROMIUM_JA4);
+            }
+            Self::CurrentFirefox => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(FIREFOX_JA4);
+            }
+            Self::CurrentSafari => {
+                request.user_agent = SAFARI_USER_AGENT;
+                request.ja4 = Some(SAFARI_JA4);
+            }
             _ => {}
         }
         let response = adapter.navigate(&request);
         assert_document(&response);
         match self {
-            Self::WriteFailure | Self::DeniedConsent | Self::MissingConsent | Self::Subresource => {
+            Self::WriteFailure
+            | Self::DeniedConsent
+            | Self::MissingConsent
+            | Self::Subresource
+            | Self::ContradictingJa4
+            | Self::BrowserEngineMismatch => {
                 assert!(
                     ec_cookies(&response).is_empty(),
                     "should not issue or delete an EC for a fresh denied request in {self:?}"
@@ -339,7 +377,7 @@ impl Scenario {
                 );
                 if self != Self::WriteFailure {
                     // These scenarios share Fresh's successful setup and change
-                    // one input, so its gate must refuse before any write; a
+                    // only request inputs, so its gate must refuse before any write; a
                     // creation attempt that merely failed would not satisfy it.
                     assert!(
                         !store
@@ -729,6 +767,8 @@ pub struct ApiObservation {
     pub origin_requests: usize,
     /// Response cache policy.
     pub cache_control: Option<String>,
+    /// Whether a runtime shared-cache directive survived finalization.
+    pub edge_cache_headers_present: bool,
 }
 
 /// Applies identical partner and auction configuration to supported runners.
@@ -764,12 +804,39 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
         {"name":"Disabled body fixture","source_domain":"disabled-body.example.com","bidstream_enabled":true},
         {"name":"Mirror fixture","source_domain":"mirror.example.com","bidstream_enabled":true,"mirror_enabled":true},
         {"name":"Expired fixture","source_domain":"expired.example.com","bidstream_enabled":true,"mirror_enabled":true},
-        {"name":"Denied fixture","source_domain":"denied.example.com","bidstream_enabled":true,"mirror_enabled":true}
+        {"name":"Denied fixture","source_domain":"denied.example.com","bidstream_enabled":true,"mirror_enabled":true},
+        {"name":"Unmirrored fixture","source_domain":"unmirrored.example.com","bidstream_enabled":true}
     ]))
     .expect("should configure conformance partner and SharedID");
 }
 
 // Static cross-language consent strings test transport and policy, not age.
+/// The EC route's JSON, split into the mirror and its `sharedId` field.
+fn route_json(observed: &ApiObservation) -> (serde_json::Value, Option<String>) {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&observed.response.body).expect("should decode EC route JSON");
+    let sharedid = json
+        .as_object_mut()
+        .and_then(|object| object.remove("sharedId"))
+        .map(|value| {
+            value
+                .as_str()
+                .expect("should send sharedId as a string")
+                .to_owned()
+        });
+    (json, sharedid)
+}
+
+/// The live `_pubcid` value the response sets, if any.
+fn set_sharedid(response: &Observation) -> Option<&str> {
+    response.cookies.iter().find_map(|cookie| {
+        cookie
+            .strip_prefix("_pubcid=")
+            .and_then(|rest| rest.split(';').next())
+            .filter(|_| !cookie.contains("Max-Age=0"))
+    })
+}
+
 fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../trusted-server-js/lib/test/fixtures/ec-route-contract.json"
@@ -823,11 +890,16 @@ fn verify_ec_route_fixture(adapter: &mut impl Adapter, store: &RecordingStore) {
             observed.origin_requests, 0,
             "should answer contract POST locally"
         );
+        let (mirror, sharedid) = route_json(&observed);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&observed.response.body)
-                .expect("should decode mirror response"),
-            case["expected"]["json"],
+            mirror, case["expected"]["json"],
             "should return the expected mirror for {}",
+            case["name"]
+        );
+        assert_eq!(
+            sharedid.as_deref(),
+            set_sharedid(&observed.response),
+            "ID-9: should answer with the SharedID the response sets for {}",
             case["name"]
         );
         assert!(
@@ -879,6 +951,79 @@ fn assert_ec_expired(response: &Observation) {
             .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
         "should expire browser EC in the withdrawal response"
     );
+}
+
+/// Verifies core-generated identity expiries and cache privacy on API responses.
+///
+/// # Panics
+///
+/// Panics if an adapter strips a required deletion or permits shared caching.
+pub fn verify_api_identity_expiries(adapter: &mut impl Adapter) {
+    for (consent, extra, expected) in [
+        (
+            false,
+            "__Host-ts-eids-mirror=stale".to_owned(),
+            vec!["__Host-ts-eids-mirror"],
+        ),
+        (
+            true,
+            "_pubcid=browser-id; _pubcid_cst=old; _pubcid_optout=1".to_owned(),
+            vec!["_pubcid", "_pubcid_cst"],
+        ),
+        (
+            false,
+            format!(
+                "ts-ec={}.abc123; __Host-ts-eids-mirror=stale; _pubcid=browser-id; _pubcid_cst=old",
+                "a".repeat(64)
+            ),
+            vec!["ts-ec", "__Host-ts-eids-mirror", "_pubcid", "_pubcid_cst"],
+        ),
+    ] {
+        let mut request = ApiRequest::new(http::Method::GET, "/publisher-api");
+        request.headers.push((
+            "cookie".to_owned(),
+            format!("{}; {extra}", tcf_consent_cookie(consent)),
+        ));
+        let observed = adapter.exchange(&request);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::OK,
+            "should finalize an ordinary API response"
+        );
+        for name in expected {
+            assert!(
+                observed.response.cookies.iter().any(|value| {
+                    let cookie =
+                        Cookie::parse(value.as_str()).expect("should parse generated expiry");
+                    cookie.name() == name
+                        && cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+                }),
+                "should expire {name} on a non-document API response"
+            );
+        }
+        assert!(
+            observed.response.cookies.iter().all(|value| {
+                let cookie = Cookie::parse(value.as_str()).expect("should parse response cookie");
+                cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+            }),
+            "should emit only expiry cookies on the API response"
+        );
+        assert!(
+            !observed.edge_cache_headers_present,
+            "should strip runtime shared-cache directives from expiry responses"
+        );
+        assert!(
+            observed.cache_control.as_deref().is_some_and(|value| value
+                .split(',')
+                .map(str::trim)
+                .any(|directive| directive == "private")
+                && !value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|directive| directive == "public" || directive.starts_with("s-maxage"))),
+            "should keep identity deletion responses private"
+        );
+    }
 }
 
 /// Executes the shared HTTP acceptance cases against a real adapter.
@@ -1022,8 +1167,28 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             .any(|value| value.starts_with("_pubcid=")),
         "should issue the persisted SharedID on EC POST"
     );
+    assert_eq!(
+        route_json(&created).1.as_deref(),
+        set_sharedid(&created.response),
+        "ID-9: should answer with the SharedID the EC POST sets"
+    );
     let graph = KvIdentityGraph::new(store.clone());
     let key = normalize_ec_id_for_kv(&identity);
+    let sharedid = assert_sharedid_cookies(&created.response);
+    assert!(
+        uuid::Uuid::parse_str(&sharedid).is_ok_and(|id| id.get_version_num() == 4),
+        "should create a UUID v4 SharedID as Prebid writes: {sharedid}"
+    );
+    assert_eq!(
+        block_on(graph.get(&key))
+            .expect("should read created SharedID record")
+            .expect("should retain created record")
+            .0
+            .ids["pubcid.org"]
+            .uid,
+        sharedid,
+        "should store the created SharedID in the record it sets"
+    );
     let cookies = format!("{tcf_cookie}; ts-ec={identity}");
     let browser_cookies = created
         .response
@@ -1052,6 +1217,33 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         "should accept unchanged consent"
     );
     assert_no_identity_cookies(&unchanged.response);
+    for companion in ["", "; _pubcid_cst=AAAAAA%3D%3D"] {
+        let mut stale = ApiRequest::new(http::Method::POST, ec_path);
+        stale.body = consent_body.clone();
+        stale.headers = vec![
+            (
+                "origin".to_owned(),
+                "https://publisher.example.com".to_owned(),
+            ),
+            (
+                "cookie".to_owned(),
+                format!("{tcf_cookie}; ts-ec={identity}; _pubcid={sharedid}{companion}"),
+            ),
+        ];
+        let stale = adapter.exchange(&stale);
+        assert_eq!(
+            stale.response.status,
+            StatusCode::OK,
+            "should accept a stale companion"
+        );
+        let set = identity_cookie_names(&stale.response);
+        assert_eq!(
+            set,
+            vec!["_pubcid_cst"],
+            "should re-set only the companion for {companion:?}: {:?}",
+            stale.response.cookies
+        );
+    }
 
     let mut batch = ApiRequest::new(http::Method::POST, "/_ts/api/v1/batch-sync");
     batch.headers.push((
@@ -1182,7 +1374,33 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             response.response.status,
             String::from_utf8_lossy(&response.response.body)
         );
-        assert_no_identity_cookies(&response.response);
+        assert_eq!(
+            response.response.cookies.len(),
+            1,
+            "should emit only the required mirror revocation expiry, filtering the retired marker"
+        );
+        let cookie = Cookie::parse(response.response.cookies[0].as_str())
+            .expect("should parse mirror expiry");
+        assert_eq!(
+            cookie.name(),
+            "__Host-ts-eids-mirror",
+            "should revoke a stale mirror whose vendor is denied"
+        );
+        assert!(
+            cookie.max_age().is_some_and(|age| age.whole_seconds() == 0),
+            "should emit no positive identity cookie on publisher API responses"
+        );
+        assert!(
+            !response.edge_cache_headers_present,
+            "should strip shared cache directives from mirror revocation responses"
+        );
+        assert!(
+            response
+                .cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("private")),
+            "should keep mirror revocation responses private"
+        );
     }
 
     let (mut seeded, generation) = block_on(graph.get(&key))
@@ -1196,6 +1414,11 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             Expiry::At(UnixSeconds::new(1)),
         ),
         ("denied.example.com", "vendor-denied-id", Expiry::Never),
+        (
+            "unmirrored.example.com",
+            "unmirrored-provider-id",
+            Expiry::Never,
+        ),
     ] {
         seeded.ids.insert(
             source.to_owned(),
@@ -1242,12 +1465,9 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
         restored.response.body.is_empty(),
         "should keep pixel response empty"
     );
-    assert!(
-        restored
-            .response
-            .cookies
-            .iter()
-            .any(|value| value.starts_with("_pubcid=")),
+    assert_eq!(
+        assert_sharedid_cookies(&restored.response),
+        sharedid,
         "should restore existing SharedID from its row"
     );
     assert!(
@@ -1323,16 +1543,83 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
 
     post.headers.push(("cookie".to_owned(), cookies.clone()));
     let mirrored = adapter.exchange(&post);
-    let mirror: serde_json::Value =
-        serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let (mirror, _) = route_json(&mirrored);
+    let cookie_mirror: serde_json::Value = mirrored
+        .response
+        .cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("__Host-ts-eids-mirror="))
+        .and_then(|cookie| cookie.split(';').next())
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .expect("should set a decodable mirror cookie on the EC POST");
     assert_eq!(
-        mirror["eids"],
+        mirror, cookie_mirror,
+        "should answer the EC POST with the mirror its cookie carries"
+    );
+    let mut eids = mirror["eids"].clone();
+    let exp = eids[0]["uids"][0]
+        .as_object_mut()
+        .and_then(|uid| uid.remove("exp"))
+        .and_then(|exp| exp.as_u64())
+        .expect("should give a UID without stated expiry a numeric exp");
+    let now = now_deciseconds() / 10;
+    assert!(
+        exp > now && exp <= now + 30 * 24 * 60 * 60,
+        "should mirror a UID without stated expiry with an expiry within 30 days: exp={exp}, now={now}"
+    );
+    assert_eq!(
+        eids,
         serde_json::json!([{"source":"mirror.example.com","uids":[{"id":"allowed-mirror-id","atype":1}]}]),
         "should expose only the live mirrored provider UID"
+    );
+    // ID-9 and WB-4: a returning reader whose mirror was set yesterday, so
+    // its `exp` is one day short of today's cap, is unchanged: no identity
+    // cookie is re-set and the route answers with the mirror it carries.
+    let mut yesterday = cookie_mirror.clone();
+    for eid in yesterday["eids"]
+        .as_array_mut()
+        .expect("should hold an EID array")
+    {
+        for uid in eid["uids"].as_array_mut().expect("should hold a UID array") {
+            let exp = uid["exp"].as_u64().expect("should carry a numeric exp");
+            uid["exp"] = serde_json::Value::from(exp - 24 * 60 * 60);
+        }
+    }
+    let carried = URL_SAFE_NO_PAD.encode(yesterday.to_string());
+    let mut returning = ApiRequest::new(http::Method::POST, ec_path);
+    returning.body = consent_body.clone();
+    returning.headers = vec![
+        (
+            "origin".to_owned(),
+            "https://publisher.example.com".to_owned(),
+        ),
+        (
+            "cookie".to_owned(),
+            format!("{tcf_cookie}; {browser_cookies}; __Host-ts-eids-mirror={carried}"),
+        ),
+    ];
+    let returning = adapter.exchange(&returning);
+    assert_eq!(
+        returning.response.status,
+        StatusCode::OK,
+        "should accept an unchanged returning reader"
+    );
+    assert_no_identity_cookies(&returning.response);
+    let (kept_mirror, kept_sharedid) = route_json(&returning);
+    assert_eq!(
+        kept_mirror, yesterday,
+        "should answer with the mirror the reader keeps"
+    );
+    assert_eq!(
+        kept_sharedid.as_deref(),
+        Some(sharedid.as_str()),
+        "ID-9: should answer with the SharedID the reader keeps"
     );
     assert!(
         ![
             "body-fixture-id",
+            "unmirrored-provider-id",
             "batch-fixture-id",
             "expired-mirror-id",
             "vendor-denied-id"
@@ -1466,6 +1753,196 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             .ok,
         "should never revive the withdrawn row"
     );
+    verify_ec_route_sequence(adapter, store, tcf);
+}
+
+/// Removes every key from the store, a listing page at a time.
+///
+/// # Panics
+///
+/// Panics if a listed key cannot be deleted or survives its deletion, so a
+/// store that does not shrink fails instead of looping.
+fn clear_store(store: &RecordingStore) {
+    loop {
+        let keys =
+            block_on(store.list_keys_with_prefix("", 100)).expect("should list fixture keys");
+        if keys.is_empty() {
+            return;
+        }
+        for key in keys {
+            block_on(store.delete(&key)).expect("should remove isolated fixture key");
+            assert!(
+                !block_on(store.key_exists(&key)).expect("should check the removed key"),
+                "should remove fixture key {key}"
+            );
+        }
+    }
+}
+
+fn ec_post(body: String, cookie: Option<String>) -> ApiRequest {
+    let mut post = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
+    post.body = body;
+    post.headers.push((
+        "origin".to_owned(),
+        "https://publisher.example.com".to_owned(),
+    ));
+    if let Some(cookie) = cookie {
+        post.headers.push(("cookie".to_owned(), cookie));
+    }
+    post
+}
+
+/// Server side of the browser's ordered consent queue, plus the `SharedID`
+/// opt-out on a first grant: grant A, withdrawal B, then grant C without EC.
+fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, granted_tcf: &str) {
+    let grant = serde_json::json!({"tcString": granted_tcf, "applicableSections": []}).to_string();
+    let denied_cookie = tcf_consent_cookie(false);
+    let denied_tcf = denied_cookie
+        .strip_prefix("euconsent-v2=")
+        .expect("should encode denied TCF");
+    let withdrawal =
+        serde_json::json!({"tcString": denied_tcf, "applicableSections": []}).to_string();
+    let graph = KvIdentityGraph::new(store.clone());
+
+    clear_store(store);
+    let opted_out = adapter.exchange(&ec_post(grant.clone(), Some("_pubcid_optout=1".to_owned())));
+    let identity = assert_created(&opted_out.response, store);
+    assert!(
+        !opted_out.response.cookies.iter().any(|cookie| {
+            (cookie.starts_with("_pubcid=") || cookie.starts_with("_pubcid_cst="))
+                && !cookie.contains("Max-Age=0")
+        }),
+        "should set neither _pubcid nor _pubcid_cst for a reader with _pubcid_optout: {:?}",
+        opted_out.response.cookies
+    );
+    assert_eq!(
+        route_json(&opted_out).1,
+        None,
+        "SID-2: should answer a reader with _pubcid_optout without a SharedID"
+    );
+    assert!(
+        !block_on(graph.get(&normalize_ec_id_for_kv(&identity)))
+            .expect("should read opted-out record")
+            .expect("should retain opted-out record")
+            .0
+            .ids
+            .contains_key("pubcid.org"),
+        "should store no SharedID for a reader with _pubcid_optout"
+    );
+
+    clear_store(store);
+    let a = adapter.exchange(&ec_post(grant.clone(), None));
+    let identity_a = assert_created(&a.response, store);
+    let sharedid = assert_sharedid_cookies(&a.response);
+    let b = adapter.exchange(&ec_post(
+        withdrawal,
+        Some(format!(
+            "ts-ec={identity_a}; _pubcid={sharedid}; _pubcid_cst=AAAAAA%3D%3D; __Host-ts-eids-mirror=stale"
+        )),
+    ));
+    assert_eq!(
+        b.response.status,
+        StatusCode::OK,
+        "should accept withdrawal B"
+    );
+    for name in ["ts-ec", "_pubcid", "_pubcid_cst", "__Host-ts-eids-mirror"] {
+        assert!(
+            b.response
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{name}=;"))
+                    && cookie.contains("Max-Age=0")),
+            "withdrawal B should expire {name}: {:?}",
+            b.response.cookies
+        );
+    }
+    assert!(
+        !b.response
+            .cookies
+            .iter()
+            .any(|cookie| !cookie.contains("Max-Age=0")),
+        "withdrawal B should set no identity cookie: {:?}",
+        b.response.cookies
+    );
+    let tombstoned = |store_graph: &KvIdentityGraph| {
+        !block_on(store_graph.get(&normalize_ec_id_for_kv(&identity_a)))
+            .expect("should read A's record")
+            .expect("should retain A's tombstone")
+            .0
+            .consent
+            .ok
+    };
+    assert!(
+        tombstoned(&graph),
+        "withdrawal B should tombstone A's record"
+    );
+
+    let c = adapter.exchange(&ec_post(grant, None));
+    assert_eq!(c.response.status, StatusCode::OK, "should accept grant C");
+    let identity_c = c
+        .response
+        .cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("ts-ec="))
+        .and_then(|cookie| cookie.split(';').next())
+        .filter(|value| !value.is_empty())
+        .expect("should mint a new EC for grant C as a first consent")
+        .to_owned();
+    assert_ne!(identity_c, identity_a, "grant C should not revive A");
+    assert!(
+        block_on(graph.get(&normalize_ec_id_for_kv(&identity_c)))
+            .expect("should read C's record")
+            .expect("should create a record of its own for grant C")
+            .0
+            .consent
+            .ok,
+        "grant C should create a live record"
+    );
+    assert!(tombstoned(&graph), "grant C should leave A tombstoned");
+    clear_store(store);
+}
+
+/// Asserts the `SharedID` cookie and its companion carry Prebid's attributes
+/// and returns the `SharedID` value.
+fn assert_sharedid_cookies(response: &Observation) -> String {
+    let attributes =
+        "; Domain=.publisher.example.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000";
+    let value = |name: &str| {
+        let (value, rest) = response
+            .cookies
+            .iter()
+            .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")))
+            .and_then(|cookie| cookie.split_once(';'))
+            .expect("should set the cookie with attributes");
+        assert_eq!(
+            format!(";{rest}"),
+            attributes,
+            "should set {name} readable by Prebid, Secure and Lax for one year"
+        );
+        assert!(!value.is_empty(), "should set a non-empty {name}");
+        value.to_owned()
+    };
+    let sharedid = value("_pubcid");
+    value("_pubcid_cst");
+    sharedid
+}
+
+fn identity_cookie_names(response: &Observation) -> Vec<&str> {
+    response
+        .cookies
+        .iter()
+        .filter_map(|cookie| cookie.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            [
+                "ts-ec",
+                "_pubcid",
+                "_pubcid_cst",
+                "__Host-ts-eids-mirror",
+                "ts-ec-pull-complete",
+            ]
+            .contains(name)
+        })
+        .collect()
 }
 
 fn assert_no_identity_cookies(response: &Observation) {

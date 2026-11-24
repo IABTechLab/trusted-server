@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use edgezero_core::http::{Method, Request, Response, StatusCode, header};
+use edgezero_core::ingress::RequestIngress;
+use edgezero_core::ja4::CapturedJa4;
 use error_stack::Report;
 
 use super::IdentityApp;
@@ -10,19 +12,22 @@ use crate::constants::{
     COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
-use crate::ec::consent::ec_consent_withdrawn;
-use crate::ec::cookies::expire_ec_cookie;
 use crate::ec::device::DeviceSignals;
-use crate::ec::finalize::ec_finalize_response;
+use crate::ec::eid_types::UnixSeconds;
+use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_backend::EcKvStore;
+use crate::ec::mirror::MirrorCookie;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::SharedIdRequest;
-use crate::ec::{EcContext, EidSyncSource};
+use crate::ec::{EcContext, EidSyncSource, checked_current_timestamp};
 use crate::error::{TrustedServerError, http_error};
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
+use crate::response_privacy::{
+    enforce_set_cookie_cache_privacy, enforce_terminal_private_cache_privacy,
+};
 
 /// The identity inputs and graph used throughout one request.
 pub struct IdentityRequest {
@@ -30,7 +35,8 @@ pub struct IdentityRequest {
     pub context: EcContext,
     /// The app's shared record service, if configured.
     pub graph: Option<KvIdentityGraph>,
-    /// Whether available trusted device signals allow creation.
+    /// Whether available trusted device signals allow creation under
+    /// `[ec].browser_gate`.
     pub creation_allowed: bool,
     /// Browser EIDs captured before routing consumes the request.
     pub eids_cookie: Option<String>,
@@ -48,8 +54,14 @@ impl IdentityApp {
 
     /// Reads consent, identity and trusted platform signals once for a request.
     ///
-    /// Missing JA4 never prevents creation. User-Agent is analytics metadata,
-    /// not an independent authorization gate.
+    /// Device signals are derived here for every request, with JA4 only from
+    /// `EdgeZero`'s request ingress, the source of `ctx.ja4()`.
+    /// `[ec].browser_gate` decides whether the signals allow creation. Both
+    /// rules refuse a trusted JA4 whose TLS client family contradicts the
+    /// User-Agent's browser family, unless `[ec].ja4_contradiction_exempt`
+    /// exempts that contradiction; a missing or unrecognized JA4 never does.
+    /// `strict` also requires a JA4 class and a recognized User-Agent
+    /// platform.
     ///
     /// # Errors
     ///
@@ -68,23 +80,28 @@ impl IdentityApp {
             });
         let mut context =
             EcContext::read_from_request_with_geo(&self.settings, request, services, geo.as_ref())?;
-        let signals = request
-            .extensions()
-            .get::<DeviceSignals>()
-            .cloned()
-            .unwrap_or_else(|| {
-                let user_agent = request
-                    .headers()
-                    .get(header::USER_AGENT)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                DeviceSignals::derive(
-                    user_agent,
-                    services.client_info().tls_ja4.as_deref(),
-                    services.client_info().h2_fingerprint.as_deref(),
-                )
-            });
-        let creation_allowed = signals.known_browser != Some(false);
+        let user_agent = request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let signals = DeviceSignals::derive_with_tls_rule(
+            user_agent,
+            trusted_ja4(request),
+            services.client_info().h2_fingerprint.as_deref(),
+            self.settings.ec.ja4_contradiction_exempt,
+        );
+        let creation_allowed = signals.allows_creation(self.settings.ec.browser_gate);
+        if !creation_allowed {
+            log::debug!(
+                "Browser gate {:?} blocks EC creation (ja4={:?}, platform={:?}, known_browser={:?}, ja4_contradiction={})",
+                self.settings.ec.browser_gate,
+                signals.ja4_class,
+                signals.platform_class,
+                signals.known_browser,
+                signals.ja4_contradiction,
+            );
+        }
         context.set_device_signals(signals);
         Ok(IdentityRequest {
             context,
@@ -135,8 +152,14 @@ impl IdentityApp {
     /// Finalizes one request before its response headers are released.
     ///
     /// Positive identity cookies are restricted to document and EC responses.
-    /// Withdrawal expires the EC cookie on every finalized response, including
-    /// when authoritative storage is unavailable.
+    /// Core-generated EC, configured `SharedID` and mirror expiries may accompany
+    /// every finalized response (S2S design §10, WB-1). Origin identity cookies
+    /// are filtered first on ineligible responses; every expiry remains private.
+    ///
+    /// Reads the clock at most once, and only for a navigation with an
+    /// eligible, non-redirect response. Returns the mirror decision the
+    /// response carries, or `None` when the mirror cookie is left untouched or
+    /// the response is not eligible for identity cookies.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -144,8 +167,7 @@ impl IdentityApp {
         sharedid: &SharedIdRequest,
         use_store: bool,
         response: &mut Response,
-    ) {
-        let withdrawal = ec_consent_withdrawn(context.consent()) && context.cookie_was_present();
+    ) -> Option<MirrorCookie> {
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
         // A document revalidation inherits the cached representation: 304
         // commonly omits Content-Type, and keeps the navigation permission.
@@ -165,42 +187,103 @@ impl IdentityApp {
         let eligible = document || ec_route;
         if !eligible {
             let _ = context.take_navigation_permit();
+            // Establish provenance before core finalization: neither positive
+            // nor expiring origin identity cookies may pass this boundary.
+            self.filter_ineligible_identity_cookies(response, false);
         }
         let graph = self.identity_graph().filter(|_| use_store);
-        ec_finalize_response(
+        // Only a navigation with an eligible response uses the request time,
+        // so other responses never read the clock or log its failure.
+        let now = (context.has_navigation_permit()
+            && !NavigationPermit::is_redirect(response.status()))
+        .then(checked_current_timestamp)
+        .flatten()
+        .map(UnixSeconds::new);
+        let mirror = ec_finalize_response(
             &self.settings,
             context,
             graph.as_ref(),
             &self.partners,
-            eids_cookie,
-            sharedid,
+            &FinalizeRequest {
+                eids_cookie,
+                sharedid,
+                now,
+            },
             response,
         )
         .await;
         if !eligible {
-            let cookies: Vec<_> = response
-                .headers()
-                .get_all(header::SET_COOKIE)
-                .iter()
-                .filter(|value| {
-                    value
-                        .to_str()
-                        .ok()
-                        .and_then(|value| value.split_once('='))
-                        .is_none_or(|(name, _)| !self.identity_cookie(name.trim()))
-                })
-                .cloned()
-                .collect();
-            response.headers_mut().remove(header::SET_COOKIE);
-            for cookie in cookies {
-                response.headers_mut().append(header::SET_COOKIE, cookie);
-            }
-            // Rebuild only our withdrawal deletion after filtering, so an
-            // origin-supplied positive identity cookie cannot escape the gate.
-            if withdrawal {
-                expire_ec_cookie(&self.settings, response);
-            }
+            // S2S EID collection design §10, WB-1 permits core-generated
+            // identity expiries on any already-finalized response.
+            self.filter_ineligible_identity_cookies(response, true);
         }
+        enforce_set_cookie_cache_privacy(response);
+        if response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .is_some_and(|value| self.identity_expiry(value))
+            })
+        {
+            enforce_terminal_private_cache_privacy(response);
+        }
+        mirror.filter(|_| eligible)
+    }
+
+    fn filter_ineligible_identity_cookies(&self, response: &mut Response, core_generated: bool) {
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter(|value| {
+                // Read the ASCII name independently of a possibly non-ASCII
+                // origin value, which must not bypass identity filtering.
+                let name = value
+                    .as_bytes()
+                    .split(|byte| *byte == b'=')
+                    .next()
+                    .unwrap_or_default();
+                let managed = core::str::from_utf8(name.trim_ascii())
+                    .is_ok_and(|name| self.identity_cookie(name));
+                !managed
+                    || (core_generated
+                        && value
+                            .to_str()
+                            .ok()
+                            .is_some_and(|value| self.identity_expiry(value)))
+            })
+            .cloned()
+            .collect();
+        response.headers_mut().remove(header::SET_COOKIE);
+        for cookie in cookies {
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+        }
+    }
+
+    fn identity_expiry(&self, value: &str) -> bool {
+        let Ok(cookie) = cookie::Cookie::parse(value) else {
+            return false;
+        };
+        let name = cookie.name();
+        let allowed = [COOKIE_TS_EC, COOKIE_TS_EIDS_MIRROR].contains(&name)
+            || self
+                .sharedid_storage
+                .write_back_cookie()
+                .is_some_and(|sharedid| name == sharedid || name == format!("{sharedid}_cst"));
+        allowed
+            && cookie.max_age().map_or_else(
+                || {
+                    cookie.expires_datetime().is_some_and(|expiry| {
+                        i128::from(expiry.unix_timestamp())
+                            <= i128::from(crate::ec::current_timestamp())
+                    })
+                },
+                |age| age.whole_seconds() <= 0,
+            )
     }
 
     fn identity_cookie(&self, name: &str) -> bool {
@@ -316,6 +399,16 @@ impl IdentityApp {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EcRouteResponse;
 
+/// The JA4 `EdgeZero` captured for this request, as `ctx.ja4()` reads it.
+///
+/// Absent, missing, malformed or unexposed JA4 reads as `None`.
+fn trusted_ja4(request: &Request) -> Option<&str> {
+    match request.extensions().get::<RequestIngress>()?.ja4()? {
+        CapturedJa4::Captured { fingerprint, .. } => Some(fingerprint.as_str()),
+        CapturedJa4::Unavailable(_) => None,
+    }
+}
+
 fn cookie_value(request: &Request, name: &str) -> Option<String> {
     request
         .headers()
@@ -378,11 +471,189 @@ mod tests {
     use super::cookie_value;
     use crate::ec::EcContext;
     use crate::ec::app::{IdentityApp, IdentityPlatform};
-    use crate::settings::ProxyAssetRoute;
+    use crate::ec::device::DeviceSignals;
+    use crate::platform::test_support::noop_services;
+    use crate::platform::{ClientInfo, RuntimeServices};
+    use crate::settings::{BrowserGate, Ja4ContradictionExempt, ProxyAssetRoute};
+    use crate::test_support::ja4::{
+        CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
+        SAFARI_USER_AGENT, UNLISTED_JA4, captured_ja4, insert_ja4,
+    };
     use crate::test_support::tests::create_test_settings;
-    use edgezero_core::http::{Request, header};
+    use edgezero_core::http::{HeaderValue, Request, header};
+    use edgezero_core::ja4::{CapturedJa4, Ja4Source, Ja4Unavailable};
     use futures::executor::block_on;
     use std::sync::Arc;
+
+    #[test]
+    fn identity_expiry_requires_an_allowed_name_and_effective_expiration() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build app");
+        for (cookie, expected) in [
+            ("ts-ec=; Max-Age=0", true),
+            ("_pubcid=; Max-Age=0", true),
+            ("_pubcid_cst=; Max-Age=0", true),
+            (
+                "__Host-ts-eids-mirror=; Expires=Wed, 01 Jan 2020 00:00:00 GMT",
+                true,
+            ),
+            (
+                "ts-ec=positive; Max-Age=60; Expires=Wed, 01 Jan 2020 00:00:00 GMT",
+                false,
+            ),
+            (
+                "ts-ec=positive; Expires=Wed, 01 Jan 2098 00:00:00 GMT",
+                false,
+            ),
+            ("ts-ec=positive", false),
+            ("ts-eids=; Max-Age=0", false),
+            ("ts-ec-pull-complete=; Max-Age=0", false),
+            ("sharedId=; Max-Age=0", false),
+        ] {
+            assert_eq!(
+                app.identity_expiry(cookie),
+                expected,
+                "should enforce the expiry allowlist and Max-Age precedence for {cookie}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_expiries_cannot_keep_shared_cache_headers() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::COOKIE,
+            "__Host-ts-eids-mirror=stale"
+                .parse()
+                .expect("should set cookie"),
+        );
+        let mut identity = app
+            .read_request(&crate::platform::test_support::noop_services(), &request)
+            .expect("should read request");
+        let mut response = edgezero_core::http::Response::default();
+        for (name, value) in [
+            ("cache-control", "public, max-age=600, s-maxage=600"),
+            ("surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
+            ("cloudflare-cdn-cache-control", "public, max-age=600"),
+        ] {
+            response
+                .headers_mut()
+                .insert(name, value.parse().expect("should set cache header"));
+        }
+        for (name, value) in [
+            ("etag", "example-tag"),
+            ("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT"),
+            ("expires", "Wed, 01 Jan 2030 00:00:00 GMT"),
+            ("age", "120"),
+        ] {
+            response.headers_mut().insert(
+                name,
+                value.parse().expect("should seed origin cache metadata"),
+            );
+        }
+        block_on(app.finalize(
+            &mut identity.context,
+            None,
+            &identity.sharedid,
+            false,
+            &mut response,
+        ));
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "should emit a core mirror expiry"
+        );
+        assert!(
+            response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .expect("should read cache policy")
+                .contains("private"),
+            "should make every expiry response private"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .is_some(),
+            "should preserve expiry privacy through late response hooks"
+        );
+        for name in ["etag", "last-modified", "expires", "age"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should remove origin cache metadata {name}"
+            );
+        }
+        for name in [
+            "surrogate-control",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+        ] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should remove shared cache directive {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ineligible_response_rejects_origin_identity_cookies_including_expiries() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        let mut response = edgezero_core::http::Response::default();
+        for name in [
+            "ts-ec",
+            "ts-eids",
+            "__Host-ts-eids-mirror",
+            "_pubcid",
+            "_pubcid_cst",
+            "ts-ec-pull-complete",
+        ] {
+            for age in [0, 3600] {
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    format!("{name}=origin-value; Path=/; Max-Age={age}")
+                        .parse()
+                        .expect("should build forged cookie"),
+                );
+            }
+        }
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            edgezero_core::http::HeaderValue::from_bytes(b"ts-ec=origin\x80; Max-Age=0")
+                .expect("should build an origin cookie containing non-ASCII bytes"),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            "unrelated=kept"
+                .parse()
+                .expect("should build unrelated cookie"),
+        );
+        block_on(app.finalize(
+            &mut EcContext::default(),
+            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
+            false,
+            &mut response,
+        ));
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["unrelated=kept"],
+            "should discard every origin identity cookie including deletions"
+        );
+    }
 
     #[test]
     fn post_to_asset_path_retains_publisher_navigation() {
@@ -412,6 +683,258 @@ mod tests {
                 "should exclude only actual GET/HEAD asset routes"
             );
         }
+    }
+
+    #[test]
+    fn read_request_applies_the_configured_browser_gate() {
+        for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+            assert_eq!(
+                creation_allowed(
+                    gate,
+                    Ja4ContradictionExempt::Off,
+                    &noop_services(),
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Example/1.0",
+                    None,
+                ),
+                allowed,
+                "should apply the {gate:?} rule to a browser without JA4"
+            );
+        }
+    }
+
+    /// Reads a request with `user_agent` and the ingress JA4 claim `ja4`
+    /// under `gate` and `exempt`, as the shared app does for every adapter.
+    fn creation_allowed(
+        gate: BrowserGate,
+        exempt: Ja4ContradictionExempt,
+        services: &RuntimeServices,
+        user_agent: &str,
+        ja4: Option<CapturedJa4>,
+    ) -> bool {
+        let mut settings = create_test_settings();
+        settings.ec.browser_gate = gate;
+        settings.ec.ja4_contradiction_exempt = exempt;
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(user_agent).expect("should encode User-Agent"),
+        );
+        if let Some(ja4) = ja4 {
+            insert_ja4(request.extensions_mut(), ja4);
+        }
+        app.read_request(services, &request)
+            .expect("should read identity request")
+            .creation_allowed
+    }
+
+    fn captured(ja4: &str) -> Option<CapturedJa4> {
+        Some(captured_ja4(ja4, Ja4Source::RuntimeTls))
+    }
+
+    #[test]
+    fn read_request_refuses_a_trusted_ja4_that_contradicts_the_user_agent() {
+        for (user_agent, ja4) in [
+            (CHROME_USER_AGENT, PYTHON_JA4),
+            (FIREFOX_USER_AGENT, PYTHON_JA4),
+            (SAFARI_USER_AGENT, PYTHON_JA4),
+            (FIREFOX_USER_AGENT, CHROMIUM_JA4),
+            (SAFARI_USER_AGENT, CHROMIUM_JA4),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    !creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    "should refuse {user_agent:?} with a contradicting JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_honours_ja4_contradiction_exempt() {
+        for (exempt, non_browser_allowed, engine_mismatch_allowed) in [
+            (Ja4ContradictionExempt::Off, false, false),
+            (Ja4ContradictionExempt::NonBrowser, true, false),
+            (Ja4ContradictionExempt::All, true, true),
+        ] {
+            for (user_agent, ja4, allowed) in [
+                (CHROME_USER_AGENT, PYTHON_JA4, non_browser_allowed),
+                (FIREFOX_USER_AGENT, CHROMIUM_JA4, engine_mismatch_allowed),
+            ] {
+                assert_eq!(
+                    creation_allowed(
+                        BrowserGate::Lenient,
+                        exempt,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    allowed,
+                    "should apply {exempt:?} to {user_agent:?} with {ja4:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_creates_for_current_browser_ja4s() {
+        for (user_agent, ja4) in [
+            (CHROME_USER_AGENT, CHROMIUM_JA4),
+            (FIREFOX_USER_AGENT, FIREFOX_JA4),
+            (SAFARI_USER_AGENT, SAFARI_JA4),
+            (CHROME_USER_AGENT, UNLISTED_JA4),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    "should allow {user_agent:?} with JA4 {ja4:?} under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_does_not_refuse_a_request_without_trusted_ja4() {
+        for ja4 in [
+            None,
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::NotExposed)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Missing)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Malformed)),
+        ] {
+            assert!(
+                creation_allowed(
+                    BrowserGate::Lenient,
+                    Ja4ContradictionExempt::Off,
+                    &noop_services(),
+                    CHROME_USER_AGENT,
+                    ja4,
+                ),
+                "should not refuse a browser for lacking trusted JA4"
+            );
+        }
+    }
+
+    #[test]
+    fn read_request_treats_a_ja4_edgezero_rejects_as_absent() {
+        // EdgeZero's strict parser discards these runtime values as
+        // `Malformed`: section 1 of the Chromium row alone, and that row's
+        // fingerprint in upper case.
+        for value in ["t13d1516h2", "T13D1516H2_8DAAF6152771_02713D6AF862"] {
+            let ja4 = CapturedJa4::from_runtime_tls(Some(value));
+            assert_eq!(
+                ja4,
+                CapturedJa4::Unavailable(Ja4Unavailable::Malformed),
+                "should be rejected by EdgeZero's parser: {value:?}"
+            );
+
+            let app = IdentityApp::build(
+                Arc::new(create_test_settings()),
+                IdentityPlatform::default(),
+            )
+            .expect("should build identity app");
+            let mut request = Request::default();
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(CHROME_USER_AGENT),
+            );
+            insert_ja4(request.extensions_mut(), ja4.clone());
+            let identity = app
+                .read_request(&noop_services(), &request)
+                .expect("should read identity request");
+            let signals = identity
+                .context
+                .device_signals()
+                .expect("should derive device signals");
+            assert_eq!(
+                signals.ja4_class, None,
+                "should keep no JA4 class from a rejected value {value:?}"
+            );
+            assert!(
+                !signals.ja4_contradiction,
+                "should not treat a rejected value {value:?} as a contradiction"
+            );
+
+            for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+                assert_eq!(
+                    creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        CHROME_USER_AGENT,
+                        Some(ja4.clone()),
+                    ),
+                    allowed,
+                    "should treat a rejected value {value:?} as no JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_takes_ja4_only_from_edgezero_ingress() {
+        let services = RuntimeServices {
+            client_info: ClientInfo {
+                tls_ja4: Some(PYTHON_JA4.to_owned()),
+                ..ClientInfo::default()
+            },
+            ..noop_services()
+        };
+
+        assert!(
+            creation_allowed(
+                BrowserGate::Lenient,
+                Ja4ContradictionExempt::Off,
+                &services,
+                CHROME_USER_AGENT,
+                None,
+            ),
+            "should ignore a JA4 that did not come through EdgeZero's ingress"
+        );
+    }
+
+    #[test]
+    fn read_request_derives_signals_despite_a_device_signals_extension() {
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build identity app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(CHROME_USER_AGENT),
+        );
+        insert_ja4(
+            request.extensions_mut(),
+            captured_ja4(PYTHON_JA4, Ja4Source::RuntimeTls),
+        );
+        request.extensions_mut().insert(DeviceSignals::derive(
+            CHROME_USER_AGENT,
+            Some(CHROMIUM_JA4),
+            None,
+        ));
+
+        let identity = app
+            .read_request(&noop_services(), &request)
+            .expect("should read identity request");
+
+        assert!(
+            !identity.creation_allowed,
+            "should derive from the ingress JA4, not trust signals a caller supplied"
+        );
     }
 
     #[test]

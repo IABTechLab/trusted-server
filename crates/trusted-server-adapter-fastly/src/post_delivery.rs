@@ -107,7 +107,9 @@ mod tests {
     use edgezero_core::http::{Method, StatusCode};
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
     use trusted_server_core::ec::EcContext;
-    use trusted_server_core::ec::finalize::ec_finalize_response;
+    use trusted_server_core::ec::current_timestamp;
+    use trusted_server_core::ec::eid_types::UnixSeconds;
+    use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
     use trusted_server_core::ec::page_load::NavigationPermit;
     use trusted_server_core::geo::GeoInfo;
     use trusted_server_core::redacted::Redacted;
@@ -337,6 +339,7 @@ mod tests {
                 use_finalize_kv: false,
                 eids_cookie: None,
                 sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                after_response: None,
             },
             after_response: None,
         }
@@ -369,8 +372,11 @@ mod tests {
             &mut state.ec_state.ec_context,
             Some(&kv),
             app.identity.partners(),
-            None,
-            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         ));
         state.identity = Arc::clone(&app.identity);

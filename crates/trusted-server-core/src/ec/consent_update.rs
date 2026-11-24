@@ -208,8 +208,10 @@ pub fn handle_consent_update(
 mod tests {
     use super::*;
     use crate::consent::{ConsentContext, jurisdiction::Jurisdiction};
+    use crate::ec::eid_types::UnixSeconds;
+    use crate::ec::finalize::FinalizeRequest;
     use crate::ec::{
-        EcContext, finalize::ec_finalize_response, registry::PartnerRegistry,
+        EcContext, current_timestamp, finalize::ec_finalize_response, registry::PartnerRegistry,
         sharedid::SharedIdRequest,
     };
     use crate::http_util::RuntimeRequestOrigin;
@@ -405,8 +407,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -441,8 +446,11 @@ mod tests {
             &mut original,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut Response::new(EdgeBody::empty()),
         )
         .await;
@@ -478,8 +486,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -517,8 +528,11 @@ mod tests {
             &mut late,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -601,8 +615,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;

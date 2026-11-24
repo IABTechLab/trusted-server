@@ -783,6 +783,68 @@ pub enum CollectTiming {
     AfterResponse,
 }
 
+/// Rule that decides whether a client's device signals allow Edge Cookie
+/// creation.
+///
+/// Mapped from `[ec].browser_gate`. Consent and the navigation policy still
+/// apply under either rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserGate {
+    /// Blocks only known non-browsers: a trusted JA4 whose TLS client family
+    /// contradicts the User-Agent's browser family (unless
+    /// `ja4_contradiction_exempt` exempts it), or JA4 and HTTP/2 fingerprints
+    /// matching a known non-browser pattern (the built-in table lists none
+    /// yet). Missing JA4 does not block.
+    #[default]
+    Lenient,
+    /// Also requires a JA4 class and a recognized User-Agent platform, so a
+    /// client without trusted JA4 does not create an identity. Only Fastly,
+    /// and Axum with `EdgeZero`'s trusted JA4 proxy header, supply trusted JA4
+    /// today; other adapters create no identity under this rule.
+    ///
+    /// This gates creation only: what an adapter does with an existing EC that
+    /// fails the rule differs (Axum drops its graph for the request; Fastly
+    /// keeps it).
+    Strict,
+}
+
+impl BrowserGate {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Which trusted JA4 and User-Agent contradictions stop blocking Edge Cookie
+/// creation.
+///
+/// Mapped from `[ec].ja4_contradiction_exempt`. A contradiction is a trusted
+/// JA4 whose TLS client family differs from the browser family the
+/// User-Agent claims (ID-7). An exempted contradiction no longer blocks
+/// creation under either [`BrowserGate`] rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ja4ContradictionExempt {
+    /// Exempts nothing: every contradiction blocks creation.
+    #[default]
+    Off,
+    /// Exempts a non-browser TLS stack (such as Python's) behind a browser
+    /// User-Agent, as a TLS-intercepting proxy in front of readers produces.
+    /// A User-Agent of one browser engine over another engine's TLS stack
+    /// still blocks.
+    NonBrowser,
+    /// Exempts every contradiction, which turns the rule off.
+    All,
+}
+
+impl Ja4ContradictionExempt {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Secret values for one identity provider.
 ///
 /// `EdgeZero` secret paths address fixed field names, so V1 supports one
@@ -878,6 +940,21 @@ pub struct Ec {
         deserialize_with = "vec_from_seq_or_map"
     )]
     pub identity_providers: Vec<IdentityProviderConfig>,
+
+    /// Device-signal rule for Edge Cookie creation; `lenient` by default.
+    ///
+    /// Skipped from serialization at its default, like the identity fields,
+    /// so a config blob that leaves it unset still loads in a runtime built
+    /// before it.
+    #[serde(default, skip_serializing_if = "BrowserGate::is_default")]
+    pub browser_gate: BrowserGate,
+
+    /// JA4 and User-Agent contradictions that do not block Edge Cookie
+    /// creation; `off` by default, so every contradiction blocks.
+    ///
+    /// Skipped from serialization at its default, like `browser_gate`.
+    #[serde(default, skip_serializing_if = "Ja4ContradictionExempt::is_default")]
+    pub ja4_contradiction_exempt: Ja4ContradictionExempt,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -895,6 +972,8 @@ impl Default for Ec {
             identity_budget_ms: Self::default_identity_budget_ms(),
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
+            browser_gate: BrowserGate::default(),
+            ja4_contradiction_exempt: Ja4ContradictionExempt::default(),
         }
     }
 }
@@ -4655,6 +4734,129 @@ mod tests {
                     .get("identity_after_response_budget_ms")
                     .is_none(),
             "should serialize no identity keys"
+        );
+    }
+
+    /// `Ec` denies unknown fields, so a binary built before `browser_gate`
+    /// existed must still accept a default blob.
+    #[test]
+    fn default_browser_gate_is_lenient_and_omitted_for_rollback() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            ec.browser_gate,
+            BrowserGate::Lenient,
+            "should default to the lenient rule"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("browser_gate").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    /// `Ec` denies unknown fields, so a binary built before
+    /// `ja4_contradiction_exempt` existed must still accept a default blob.
+    #[test]
+    fn default_ja4_contradiction_exempt_is_off_and_omitted_for_rollback() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should block every contradiction by default"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("ja4_contradiction_exempt").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn ja4_contradiction_exempt_loads_from_toml() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        assert_eq!(
+            settings.ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should exempt nothing when the key is omitted"
+        );
+
+        for (value, expected) in [
+            ("off", Ja4ContradictionExempt::Off),
+            ("non_browser", Ja4ContradictionExempt::NonBrowser),
+            ("all", Ja4ContradictionExempt::All),
+        ] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = \"{value}\"\n"),
+            );
+            assert_ne!(
+                toml,
+                crate_test_settings_str(),
+                "should insert the key into the [ec] table"
+            );
+            let settings = Settings::from_toml(&toml).expect("should parse the exemption");
+            assert_eq!(
+                settings.ec.ja4_contradiction_exempt, expected,
+                "should load {value:?}"
+            );
+            let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+            assert_eq!(
+                serialized.get("ja4_contradiction_exempt"),
+                (expected != Ja4ContradictionExempt::Off)
+                    .then(|| json!(value))
+                    .as_ref(),
+                "should serialize only a non-default exemption"
+            );
+        }
+
+        for value in ["\"non-browser\"", "\"none\"", "true"] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = {value}\n"),
+            );
+            assert!(
+                Settings::from_toml(&toml).is_err(),
+                "should reject the unknown exemption {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_gate_loads_from_toml() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        assert_eq!(
+            settings.ec.browser_gate,
+            BrowserGate::Lenient,
+            "should use the lenient rule when the key is omitted"
+        );
+
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\nbrowser_gate = \"strict\"\n");
+        assert_ne!(
+            toml,
+            crate_test_settings_str(),
+            "should insert the key into the [ec] table"
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse strict browser gate");
+        assert_eq!(
+            settings.ec.browser_gate,
+            BrowserGate::Strict,
+            "should load the strict rule"
+        );
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+        assert_eq!(
+            serialized.get("browser_gate"),
+            Some(&json!("strict")),
+            "should serialize a non-default rule"
+        );
+
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\nbrowser_gate = \"off\"\n");
+        assert!(
+            Settings::from_toml(&toml).is_err(),
+            "should reject an unknown browser gate rule"
         );
     }
 
