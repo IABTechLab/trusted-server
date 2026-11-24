@@ -80,7 +80,7 @@ Introduce an explicit existing-record body-EID commit path, separate from the
 navigation write permit. It preserves Purpose 1/4 and partner/vendor consent,
 source ownership, opt-outs, conditional writes and withdrawal tombstones. It
 never creates or recovers an EC from an auction and emits no identity cookie.
-Keep authoritative withdrawal handling on routes participating in the identity lifecycle. The same response expires the browser EC cookie independently of method, status and content type, including when the tombstone write fails. This EC deletion is the explicit privacy exception to the HTML document/EC route identity-cookie boundary; other identity cookie output remains suppressed on ineligible responses. Configured asset-only proxy routes retain
+Keep authoritative withdrawal handling on routes participating in the identity lifecycle. The same response expires the browser EC cookie independently of method, status and content type, including when the tombstone write fails. WB-1 (§10 of the S2S EID collection design) also permits core-generated expiry cookies for the configured SharedID cookie and its `_cst` companion, and `__Host-ts-eids-mirror`, on any finalized response. Origin-supplied identity cookies and positive identity cookies remain suppressed on ineligible responses. Every deletion response passes `enforce_set_cookie_cache_privacy` and remains private without shared-cache directives. Configured asset-only proxy routes retain
 Fastly's existing streaming path without identity ingestion or finalization;
 explicit reconciliation uses the EC/consent route. This preserves the asset
 contract while WB-1 keeps every such response free of identity cookies.
@@ -104,8 +104,9 @@ Store preparation precedes application config loading, so deciding declarations
 from `ec.storage` would require an EdgeZero config-first preparation API. Keep
 the declaration unconditional. Config and secrets continue to use A1's prepared
 immutable startup snapshots.
-The temporary `TS_NATIVE_GEO_PROFILE_FILE` exception is narrowly justified by
-#1529 / #1532; geo selection remains a separate AX-2 obligation.
+#1532 names the Geo profile variable `TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE`,
+which the prefix rule already allows, so it needs no exception; geo selection
+remains a separate AX-2 obligation.
 
 ## Alternatives and boundaries
 

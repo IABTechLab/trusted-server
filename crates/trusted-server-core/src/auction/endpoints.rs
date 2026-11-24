@@ -336,16 +336,17 @@ pub async fn handle_auction(
     // only strips on TCF/GDPR signals. This matches the publisher and
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
-    let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_ref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-        )
-    } else {
-        None
-    };
+    let client_eids = ec_id
+        .is_some()
+        .then(|| {
+            resolve_client_auction_eids(
+                body.eids.as_ref(),
+                extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
+            )
+        })
+        .flatten();
     // Retain the parsed request-local EIDs for downstream identity consumers.
-    // The body ingestion below persists explicit body data separately from cookies.
+    // The earlier body ingestion persists explicit body data separately from cookies.
     if let Some(eids) = &client_eids {
         ec_context.set_client_eids(eids.clone());
     }
@@ -847,6 +848,8 @@ mod tests {
     use crate::consent::types::ConsentContext;
     use crate::error::IntoHttpResponse as _;
 
+    use crate::ec::kv_backend::test_support::ConditionalWriteCountingEcKv;
+    use crate::ec::kv_types::{KvEntry, KvPartnerId};
     use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
     use crate::platform::ClientInfo;
@@ -866,6 +869,7 @@ mod tests {
     use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -1143,8 +1147,8 @@ mod tests {
     async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
         // Finalization runs afterwards on the same EC context. It must not pay
-        // for a second lookup, and it never writes KV: only the page load's
-        // navigation may write (spec D1).
+        // for a second lookup or write cookie EIDs. Explicit body ingestion belongs
+        // to the endpoint, not finalization (ID-8); this request has no body updates.
         let settings = create_test_settings();
         let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
@@ -1461,6 +1465,252 @@ mod tests {
             request,
         )
         .await;
+    }
+
+    async fn auction_then_finalize(
+        settings: &Settings,
+        graph: &KvIdentityGraph,
+        registry: &PartnerRegistry,
+        ec_id: &str,
+        body: Vec<Eid>,
+    ) {
+        let cookie = BASE64.encode(
+            json!([{"source":"cookie.example.com","uids":[{"id":"cookie-uid","atype":1}]}])
+                .to_string(),
+        );
+        let mut request = body_ingest_request(Some(
+            serde_json::to_value(body).expect("should encode body EIDs"),
+        ));
+        request.headers_mut().insert(
+            header::COOKIE,
+            format!("ts-eids={cookie}")
+                .parse()
+                .expect("should build cookie"),
+        );
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(ec_id));
+        context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+        ingest_body_for_test(graph, registry, &mut context, request).await;
+        let mut response = Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            settings,
+            &mut context,
+            Some(graph),
+            registry,
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
+            &mut response,
+        )
+        .await;
+    }
+
+    fn body_eid(source: &str, id: &str) -> Eid {
+        Eid::new(
+            source.to_owned(),
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auction_saves_body_eids_to_missing_partner_uids() {
+        // `/auction` body EIDs are saved to the live row (ID-8) under browser
+        // ingest rules: they fill missing partner UIDs only, and the request's
+        // `ts-eids` cookie is left to the next navigation.
+        let settings = create_test_settings();
+        let ec_id = format!("{}.cleids1", "a".repeat(64));
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &make_ec_context(Jurisdiction::NonRegulated, None)
+                .consent()
+                .clone(),
+            None,
+            crate::ec::current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed the live row this request updates");
+        let partners = vec![
+            counting_test_partner("first.example.com"),
+            counting_test_partner("second.example.com"),
+            counting_test_partner("cookie.example.com"),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+
+        auction_then_finalize(
+            &settings,
+            &graph,
+            &registry,
+            &ec_id,
+            vec![
+                body_eid("first.example.com", "first-body-uid"),
+                body_eid("second.example.com", "second-body-uid"),
+            ],
+        )
+        .await;
+        auction_then_finalize(
+            &settings,
+            &graph,
+            &registry,
+            &ec_id,
+            vec![body_eid("second.example.com", "later-body-uid")],
+        )
+        .await;
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .await
+            .expect("should read store")
+            .expect("should keep the row");
+        let uid = |source: &str| stored.ids.get(source).map(|id| id.uid.as_str());
+        assert_eq!(
+            uid("first.example.com"),
+            Some("first-body-uid"),
+            "should save the body EID"
+        );
+        assert_eq!(
+            uid("second.example.com"),
+            Some("second-body-uid"),
+            "should keep the stored UID over a later body value"
+        );
+        assert_eq!(
+            uid("cookie.example.com"),
+            None,
+            "should not save the auction request's cookie EIDs"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auction_body_eids_never_create_a_row() {
+        let settings = create_test_settings();
+        let ec_id = format!("{}.cleids2", "a".repeat(64));
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("first.example.com")])
+            .expect("should build registry");
+
+        auction_then_finalize(
+            &settings,
+            &graph,
+            &registry,
+            &ec_id,
+            vec![body_eid("first.example.com", "first-body-uid")],
+        )
+        .await;
+
+        assert!(
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read store")
+                .is_none(),
+            "should not create a row from an auction request"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_and_finalization_make_at_most_one_conditional_write() {
+        for (name, has_body, conflict_first, preseed_uid, expected) in [
+            ("new body UID", true, false, false, 1),
+            ("first CAS conflicts", true, true, false, 1),
+            ("cookie only", false, false, false, 0),
+            ("existing UID", true, false, true, 0),
+        ] {
+            let writes = Arc::new(AtomicUsize::new(0));
+            let graph = KvIdentityGraph::new(ConditionalWriteCountingEcKv::new(
+                Arc::clone(&writes),
+                conflict_first,
+            ));
+            let registry = partner_registry(&["ids.example.com", "cookie.example.com"]);
+            let ec_id = format!("{}.once01", "c".repeat(64));
+            let mut entry = KvEntry::tombstone(crate::ec::current_timestamp());
+            entry.consent.ok = true;
+            if preseed_uid {
+                entry.ids.insert(
+                    "ids.example.com".to_owned(),
+                    KvPartnerId::single("original-uid".to_owned()),
+                );
+            }
+            graph
+                .create(&ec_id, &entry)
+                .await
+                .expect("should seed live row");
+            let cookie = BASE64.encode(
+                json!([{"source":"cookie.example.com","uids":[{"id":"cookie-uid","atype":1}]}])
+                    .to_string(),
+            );
+            let mut request = body_ingest_request(has_body.then(|| {
+                json!([
+                    {"source":"ids.example.com","uids":[{"id":"body-uid","atype":1}]}
+                ])
+            }));
+            request.headers_mut().insert(
+                header::COOKIE,
+                format!("ts-eids={cookie}")
+                    .parse()
+                    .expect("should set cookie fallback"),
+            );
+            let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+            ingest_body_for_test(&graph, &registry, &mut context, request).await;
+            let mut response = Response::new(EdgeBody::empty());
+            crate::ec::finalize::ec_finalize_response(
+                &create_test_settings(),
+                &mut context,
+                Some(&graph),
+                &registry,
+                &crate::ec::finalize::FinalizeRequest {
+                    eids_cookie: Some(&cookie),
+                    sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                    now: Some(crate::ec::eid_types::UnixSeconds::new(
+                        crate::ec::current_timestamp(),
+                    )),
+                },
+                &mut response,
+            )
+            .await;
+            assert_eq!(
+                writes.load(Ordering::Relaxed),
+                expected,
+                "should count conditional attempts across handler AND finalization: {name}"
+            );
+            let row = graph
+                .get(&ec_id)
+                .await
+                .expect("should read record")
+                .expect("should retain record")
+                .0;
+            let expected_uid = if preseed_uid {
+                Some("original-uid")
+            } else if has_body && !conflict_first {
+                Some("body-uid")
+            } else {
+                None
+            };
+            assert_eq!(
+                row.ids
+                    .get("ids.example.com")
+                    .map(|record| record.uid.as_str()),
+                expected_uid,
+                "should preserve planned outcome: {name}"
+            );
+            assert!(
+                !row.ids.contains_key("cookie.example.com"),
+                "should never ingest cookie fallback: {name}"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should emit no auction identity cookies: {name}"
+            );
+        }
     }
 
     #[tokio::test]

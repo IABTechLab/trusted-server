@@ -4,8 +4,10 @@
 //! and KV semantics. Every browser-driven KV write goes through the
 //! navigation's single page-load write ([`KvIdentityGraph::commit_page_load`]),
 //! so a request without a navigation permit never writes. The exceptions are a
-//! consent withdrawal, whose tombstone is written on any request, and the
-//! navigation's after-response follow-up write.
+//! consent withdrawal, whose tombstone is written on any request, the
+//! navigation's after-response follow-up write, and the EIDs an `/auction`
+//! request body carries, which fill a live row in one conditional write of
+//! their own in the shared auction endpoint.
 
 use std::collections::BTreeSet;
 
@@ -273,8 +275,10 @@ async fn finalize_response_inner(
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
+    if !consent_allows_ec || sharedid.opted_out() {
+        expire_sharedid_on_denied_consent(settings, sharedid, response);
+    }
     if !consent_allows_ec {
-        expire_sharedid_on_denied_consent(settings, sharedid, navigation, response);
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -341,7 +345,7 @@ async fn finalize_response_inner(
             ec_context.set_after_response_permit(after_response);
         }
         // Write-back reads the row as the page-load write left it.
-        if navigation {
+        if navigation && !sharedid.opted_out() {
             apply_sharedid_write_back(settings, ec_context, graph, registry, sharedid, response)
                 .await;
         }
@@ -1595,8 +1599,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn finalize_auction_transient_miss_does_not_persist_eid_updates() {
-        // `/auction` never writes KV (spec D1): browser EIDs are persisted only
-        // by the page load's navigation write, whatever its snapshot says.
+        // `/auction` writes only its body EIDs, and only to a row it read
+        // live; its cookie EIDs are persisted only by the page load's
+        // navigation write, whatever its snapshot says.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("named1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1650,9 +1655,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn finalize_never_persists_auction_body_eids() {
-        // `/auction` body EIDs go to bidders on that request only and are
-        // never persisted (spec §5.1); neither is the `ts-eids` cookie on a
-        // non-navigation request.
+        // The shared endpoint persists explicit body EIDs. Finalization alone
+        // must not ingest body or cookie EIDs carried by an auction context.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("cleids1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1666,41 +1670,49 @@ mod tests {
             .create(&ec_id, &live)
             .await
             .expect("should seed the live row this request updates");
-        let mut ec_context = returning_user_context(
-            &ec_id,
-            EcKvSnapshot::Missing {
-                ec_id: ec_id.clone(),
-            },
-            false,
+        let snapshot = graph.load_snapshot(&ec_id).await;
+        assert!(
+            matches!(
+                &snapshot,
+                EcKvSnapshot::Present {
+                    generation: Some(_),
+                    ..
+                }
+            ),
+            "should exercise finalization with a live row and usable generation"
         );
+        let mut ec_context = returning_user_context(&ec_id, snapshot, false);
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
-        // `liveramp.com` was dropped by the browser's size cap.
+        // Only `first.example.com` "fit" in the (simulated) trimmed cookie;
+        // `second.example.com` was dropped by the browser's size cap.
         let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
             serde_json::to_vec(&serde_json::json!([
-                {"source": "id5-sync.com", "uids": [{"id": "ID5_from_cookie", "atype": 1}]}
+                {"source": "first.example.com", "uids": [{"id": "first-cookie-uid", "atype": 1}]}
             ]))
             .expect("should serialize test cookie payload"),
         );
         ec_context.set_client_eids(vec![
             Eid::new(
-                "id5-sync.com".to_owned(),
+                "first.example.com".to_owned(),
                 vec![Uid {
-                    id: "ID5_from_body".to_owned(),
+                    id: "first-body-uid".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
             ),
             Eid::new(
-                "liveramp.com".to_owned(),
+                "second.example.com".to_owned(),
                 vec![Uid {
-                    id: "LR_from_body".to_owned(),
+                    id: "second-body-uid".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
             ),
         ]);
-        let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
+        let partners = vec![
+            make_partner("first.example.com"),
+            make_partner("second.example.com"),
+        ];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();
 
@@ -3993,7 +4005,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn auction_request_never_writes_browser_eids() {
+    async fn auction_request_never_writes_cookie_eids() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("auc001");
         let graph = KvIdentityGraph::in_memory("finalize");
@@ -4028,7 +4040,7 @@ mod tests {
             .expect("should exist");
         assert!(
             entry.ids.is_empty(),
-            "should not write from a non-navigation request"
+            "should not write cookie EIDs from a non-navigation request"
         );
     }
 
