@@ -910,6 +910,15 @@ pub struct Ec {
     /// before it.
     #[serde(default, skip_serializing_if = "BrowserGate::is_default")]
     pub browser_gate: BrowserGate,
+
+    /// Lets a trusted JA4 from a non-browser TLS stack (Python, Go) behind a
+    /// browser User-Agent create an Edge Cookie; `false` by default.
+    ///
+    /// For readers behind a TLS-intercepting proxy, which replaces their JA4
+    /// with its own. A browser-engine mismatch is still refused. Skipped from
+    /// serialization at its default, like `browser_gate`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_non_browser_tls: bool,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -928,6 +937,7 @@ impl Default for Ec {
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
             browser_gate: BrowserGate::default(),
+            allow_non_browser_tls: false,
         }
     }
 }
@@ -4706,6 +4716,34 @@ mod tests {
         assert!(
             serialized.get("browser_gate").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn allow_non_browser_tls_defaults_off_and_loads_from_toml() {
+        let ec = Ec::default();
+        assert!(
+            !ec.allow_non_browser_tls,
+            "should refuse non-browser TLS by default"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("allow_non_browser_tls").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+
+        let toml =
+            crate_test_settings_str().replace("[ec]\n", "[ec]\nallow_non_browser_tls = true\n");
+        let settings = Settings::from_toml(&toml).expect("should parse allow_non_browser_tls");
+        assert!(
+            settings.ec.allow_non_browser_tls,
+            "should load the switch from [ec]"
+        );
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+        assert_eq!(
+            serialized.get("allow_non_browser_tls"),
+            Some(&json!(true)),
+            "should serialize a non-default value"
         );
     }
 

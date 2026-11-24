@@ -104,6 +104,10 @@ pull_sync_concurrency = 3
 # User-Agent's browser family; "strict" also requires trusted JA4 and a
 # recognized User-Agent platform, so clients without JA4 create no EC.
 # browser_gate = "lenient"
+# Set to true when readers reach this site through a TLS-intercepting proxy
+# whose JA4 is a non-browser stack (Python, Go): such a JA4 then no longer
+# blocks EC creation. A browser-engine mismatch is still refused.
+# allow_non_browser_tls = false
 
 # Fastly persistence uses this exact physical binding. Provider omission is
 # Fastly-only; native providers require explicit configuration. An ordinary

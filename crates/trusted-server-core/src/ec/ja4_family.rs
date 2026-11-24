@@ -80,13 +80,21 @@ enum BrowserClaim {
 
 /// Returns `true` when a trusted `ja4`'s TLS client family contradicts the
 /// browser family `user_agent` claims.
+///
+/// With `allow_non_browser_tls` (`[ec].allow_non_browser_tls`), a
+/// non-browser TLS stack no longer contradicts; a browser-engine mismatch
+/// still does.
 #[must_use]
-pub(super) fn contradicts_user_agent(user_agent: &str, ja4: &str) -> bool {
+pub(super) fn contradicts_user_agent(
+    user_agent: &str,
+    ja4: &str,
+    allow_non_browser_tls: bool,
+) -> bool {
     let (Some(claim), Some(family)) = (browser_claim(user_agent), tls_family(ja4)) else {
         return false;
     };
     match (claim, family) {
-        (_, TlsFamily::NonBrowser) => true,
+        (_, TlsFamily::NonBrowser) => !allow_non_browser_tls,
         (BrowserClaim::Engine(claimed), family) => claimed != family,
         (BrowserClaim::AnyEngine, _) => false,
     }
@@ -165,7 +173,7 @@ mod tests {
         for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA, CHROME_IOS_UA] {
             for ja4 in [PYTHON_JA4, GO_JA4] {
                 assert!(
-                    contradicts_user_agent(ua, ja4),
+                    contradicts_user_agent(ua, ja4, false),
                     "should refuse a non-browser TLS stack behind {ua:?}"
                 );
             }
@@ -182,10 +190,26 @@ mod tests {
             (EDGE_WINDOWS_UA, FIREFOX_JA4),
         ] {
             assert!(
-                contradicts_user_agent(ua, ja4),
+                contradicts_user_agent(ua, ja4, false),
                 "should refuse {ua:?} with another engine's TLS stack"
             );
         }
+    }
+
+    #[test]
+    fn allowing_non_browser_tls_still_refuses_an_engine_mismatch() {
+        for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA, CHROME_IOS_UA] {
+            for ja4 in [PYTHON_JA4, GO_JA4] {
+                assert!(
+                    !contradicts_user_agent(ua, ja4, true),
+                    "should allow a non-browser TLS stack behind {ua:?} when configured"
+                );
+            }
+        }
+        assert!(
+            contradicts_user_agent(FIREFOX_MAC_UA, CHROMIUM_JA4, true),
+            "should still refuse another browser engine's TLS stack"
+        );
     }
 
     #[test]
@@ -200,7 +224,7 @@ mod tests {
             (CHROME_IOS_UA, CHROMIUM_JA4),
         ] {
             assert!(
-                !contradicts_user_agent(ua, ja4),
+                !contradicts_user_agent(ua, ja4, false),
                 "should allow {ua:?} with its own family's TLS stack"
             );
         }
@@ -211,14 +235,14 @@ mod tests {
         for ua in [CHROME_MAC_UA, FIREFOX_MAC_UA, SAFARI_MAC_UA] {
             for ja4 in [UNLISTED_JA4, "t13d1516h2", "", "not-a-ja4"] {
                 assert!(
-                    !contradicts_user_agent(ua, ja4),
+                    !contradicts_user_agent(ua, ja4, false),
                     "should not refuse {ua:?} for unrecognized JA4 {ja4:?}"
                 );
             }
         }
         for ua in ["curl/8.0.0", "python-requests/2.32.0", ""] {
             assert!(
-                !contradicts_user_agent(ua, PYTHON_JA4),
+                !contradicts_user_agent(ua, PYTHON_JA4, false),
                 "should leave a User-Agent that claims no browser to other gates"
             );
         }

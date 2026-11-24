@@ -55,11 +55,27 @@ impl DeviceSignals {
     /// says.
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
+        Self::derive_with_tls_rule(ua, ja4, h2_fp, false)
+    }
+
+    /// Derives device signals as [`Self::derive`] does, with
+    /// `allow_non_browser_tls` from `[ec].allow_non_browser_tls`: when set, a
+    /// non-browser TLS stack behind a browser User-Agent is not a
+    /// contradiction, while a browser-engine mismatch still is.
+    #[must_use]
+    pub fn derive_with_tls_rule(
+        ua: &str,
+        ja4: Option<&str>,
+        h2_fp: Option<&str>,
+        allow_non_browser_tls: bool,
+    ) -> Self {
         let is_mobile = parse_is_mobile(ua);
         let ja4_class = ja4.and_then(extract_ja4_section1);
         let platform_class = parse_platform_class(ua);
         let h2_fp_hash = h2_fp.map(compute_h2_fp_hash);
-        let known_browser = if ja4.is_some_and(|ja4| ja4_family::contradicts_user_agent(ua, ja4)) {
+        let known_browser = if ja4
+            .is_some_and(|ja4| ja4_family::contradicts_user_agent(ua, ja4, allow_non_browser_tls))
+        {
             Some(false)
         } else {
             evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref())

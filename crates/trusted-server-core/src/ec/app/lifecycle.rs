@@ -55,7 +55,8 @@ impl IdentityApp {
     /// `ctx.ja4()`. `[ec].browser_gate` decides whether the signals allow
     /// creation. Both rules refuse a trusted JA4 whose TLS client family
     /// contradicts the User-Agent's browser family; a missing or unrecognized
-    /// JA4 never does. `strict` also requires a JA4 class and a recognized
+    /// JA4 never does. `[ec].allow_non_browser_tls` exempts a non-browser TLS
+    /// stack but not a browser-engine mismatch. `strict` also requires a JA4 class and a recognized
     /// User-Agent platform.
     ///
     /// # Errors
@@ -85,10 +86,11 @@ impl IdentityApp {
                     .get(header::USER_AGENT)
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default();
-                DeviceSignals::derive(
+                DeviceSignals::derive_with_tls_rule(
                     user_agent,
                     trusted_ja4(request),
                     services.client_info().h2_fingerprint.as_deref(),
+                    self.settings.ec.allow_non_browser_tls,
                 )
             });
         let creation_allowed = signals.allows_creation(self.settings.ec.browser_gate);
@@ -529,6 +531,39 @@ mod tests {
                     "should refuse {user_agent:?} with a contradicting JA4 under {gate:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn read_request_honours_allow_non_browser_tls() {
+        let mut settings = create_test_settings();
+        settings.ec.allow_non_browser_tls = true;
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        for (user_agent, ja4, allowed) in [
+            (CHROME_UA, PYTHON_JA4, true),
+            (FIREFOX_UA, CHROMIUM_JA4, false),
+        ] {
+            let mut request = Request::default();
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_str(user_agent).expect("should encode User-Agent"),
+            );
+            request.extensions_mut().insert(
+                RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                )
+                .with_ja4(captured(ja4).expect("should capture fixture JA4")),
+            );
+            let identity = app
+                .read_request(&noop_services(), &request)
+                .expect("should read identity request");
+            assert_eq!(
+                identity.creation_allowed, allowed,
+                "should apply allow_non_browser_tls to {user_agent:?} with {ja4:?}"
+            );
         }
     }
 
