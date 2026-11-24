@@ -227,12 +227,18 @@ browser             TS (navigation)                          providers   KV
   phase skips the read and the write and logs `unchanged`. A remembered
   opt-out clears only sources the row still stores.
 - The write is a compare-and-swap on the generation read just before it. On
-  conflict the row is read again and the update re-planned against it once,
-  never resending the stale plan, so an opt-out or withdrawal recorded since
-  dispatch still applies. A conflicting attempt writes nothing and hands the
-  `AfterResponseWrite` permit back, so at most one follow-up update lands. If
-  the retry also conflicts, the results are dropped; the source stays due and
-  is retried on the next navigation.
+  conflict `KvIdentityGraph` reads the row again and re-plans the update
+  against it once, never resending the stale plan: results superseded by a
+  provider opt-out recorded since dispatch are discarded, and a row missing or
+  withdrawn at the re-read is skipped. A row withdrawn and given consent again
+  before that read is not detected, on either attempt (#1664). The graph spends
+  the `AfterResponseWrite` permit once and makes both attempts under it; the
+  permit never leaves the graph, and a conflicting attempt writes nothing, so
+  at most one follow-up update lands. If the retry also conflicts, or the
+  re-read returns the generation that just lost the CAS (a stale read of an
+  eventually consistent store), no further write is made and the results are
+  dropped; the source stays due and is retried on the next navigation. A
+  failed read is reported as `failed`, not `no_row`.
 - Results are not mirrored in the already-sent response. They are served from
   KV from the next page load. A browser fallback UID for an owned source is
   replaced by the provider's UID, as in §8.3.
@@ -1387,7 +1393,7 @@ pub struct PageLoadWrite(());
 //     -> Option<(PageLoadWrite, AfterResponseWrite)>;
 
 /// Proof for the one follow-up update; consumed by `commit_after_response_lookups`.
-/// A write that loses its CAS lands nothing and hands it back for one retry.
+/// The graph spends it once and makes the retry after a conflict under it.
 #[derive(Debug)]
 pub struct AfterResponseWrite(());
 
@@ -1450,7 +1456,9 @@ PR5 removes it.
 | All providers fail                                  | The write proceeds if browser ingest changed anything; otherwise no write.                                                 |
 | Coordinator budget exceeded                         | Late responses dropped; the response is never held past the budget.                                                        |
 | After-response row missing, withdrawn or EC changed | Nothing written (`no_row`); results dropped.                                                                               |
+| After-response row read or write fails              | Nothing written (`failed`); results dropped. A store error is not retried.                                                 |
 | After-response write conflict                       | One re-read and re-plan; if that conflicts too, results dropped and the source stays due. The sent response is unaffected. |
+| After-response re-read returns the lost generation  | No second write (`conflict`); results dropped and the source stays due.                                                    |
 
 Failed lookups are retried only by a later navigation where the source is
 still due.
@@ -1747,8 +1755,10 @@ request the units are separate, ordered commits so they stay reviewable.
     them.
 23. **After-response on a withdrawn or changed row.** The row is tombstoned,
     or written by another request, between the page write and B's result. →
-    No row is created or revived; on a generation conflict B's results are
-    dropped and B is asked again on the next navigation.
+    No row is created or revived; on a generation conflict the row is read
+    again and B's results re-planned against it once, so a tombstoned row is
+    skipped; if the retry also conflicts, B's results are dropped and B is
+    asked again on the next navigation.
 24. **Provider refresh.** A provider-written UID is live until 5000 and holds
     refresh state with `from` 900; the navigation is at 1000 and the request carries no usable vendor
     cookie. → The source is

@@ -187,20 +187,30 @@ pub trait EcKvStore {
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::KvEntry;
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.
     pub(crate) struct WriteFailingEcKv {
         inner: InMemoryEcKv,
+        inserts: AtomicU32,
     }
 
     impl WriteFailingEcKv {
         pub(crate) fn new() -> Self {
             Self {
                 inner: InMemoryEcKv::new("write-failing-store"),
+                inserts: AtomicU32::new(0),
             }
+        }
+
+        /// The number of writes attempted, every one of which failed.
+        pub(crate) fn inserts(&self) -> u32 {
+            self.inserts.load(Ordering::Relaxed)
         }
 
         /// Stores a row directly, bypassing the failing write path.
@@ -242,10 +252,175 @@ pub(crate) mod test_support {
             _key: &str,
             _write: EcKvWrite<'_>,
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inserts.fetch_add(1, Ordering::Relaxed);
             Err(Report::new(TrustedServerError::KvStore {
                 store_name: self.inner.store_name().to_owned(),
                 message: "write failing test store".to_owned(),
             }))
+        }
+
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A change another writer makes to a stored row.
+    type Race = Box<dyn Fn(&mut KvEntry) + Send + Sync>;
+
+    /// [`EcKvStore`] wrapper that injects generation conflicts: the first
+    /// `conflicts` `IfGenerationMatch` inserts return
+    /// [`EcKvWriteOutcome::PreconditionFailed`] without writing.
+    ///
+    /// With a race, another writer changes the stored row with it just before
+    /// each of those inserts, written through
+    /// [`KvIdentityGraph::serialize_entry`] so its metadata is real, and the
+    /// row's generation moves on. Without one, the row and its generation stay
+    /// as they were, as when the conflicting read was stale.
+    pub(crate) struct ConflictInjectingEcKv {
+        inner: InMemoryEcKv,
+        conflicts_remaining: AtomicU32,
+        race: Option<Race>,
+        fail_reads_after_conflict: bool,
+        conflicted: AtomicBool,
+    }
+
+    impl ConflictInjectingEcKv {
+        /// A store whose first `conflicts` conditional writes conflict without
+        /// the row changing.
+        pub(crate) fn new(conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("conflict-store"),
+                conflicts_remaining: AtomicU32::new(conflicts),
+                race: None,
+                fail_reads_after_conflict: false,
+                conflicted: AtomicBool::new(false),
+            }
+        }
+
+        /// A store where `race` changes the row just before each of the first
+        /// `conflicts` conditional writes, so those writes conflict.
+        pub(crate) fn racing(
+            conflicts: u32,
+            race: impl Fn(&mut KvEntry) + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                race: Some(Box::new(race)),
+                ..Self::new(conflicts)
+            }
+        }
+
+        /// Makes every read fail once a conflict has been injected.
+        pub(crate) fn failing_reads_after_conflict(self) -> Self {
+            Self {
+                fail_reads_after_conflict: true,
+                ..self
+            }
+        }
+
+        /// The conflicts still to inject.
+        pub(crate) fn conflicts_remaining(&self) -> u32 {
+            self.conflicts_remaining.load(Ordering::Relaxed)
+        }
+
+        /// Stores `entry` under `key` directly, bypassing conflict injection.
+        pub(crate) async fn seed(&self, key: &str, entry: &KvEntry) {
+            let (body, metadata) = KvIdentityGraph::serialize_entry(entry, self.store_name())
+                .expect("should serialize the seeded row");
+            self.inner
+                .insert(
+                    key,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &metadata,
+                        ttl: Duration::from_secs(60),
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .await
+                .expect("should seed the in-memory store");
+        }
+
+        /// Takes one conflict to inject, if any remain.
+        fn take_conflict(&self) -> bool {
+            self.conflicts_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .inspect(|_| self.conflicted.store(true, Ordering::Relaxed))
+                .is_ok()
+        }
+
+        /// Applies the race to the stored row of `key`.
+        async fn race_row(&self, race: &Race, key: &str, ttl: Duration) {
+            let stored = self
+                .inner
+                .lookup(key)
+                .await
+                .expect("should read the row being raced")
+                .expect("should hold the row being raced");
+            let mut entry: KvEntry =
+                serde_json::from_slice(&stored.body).expect("should parse the stored row");
+            race(&mut entry);
+            let (body, metadata) = KvIdentityGraph::serialize_entry(&entry, self.store_name())
+                .expect("should serialize the raced row");
+            self.inner
+                .insert(
+                    key,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &metadata,
+                        ttl,
+                        mode: EcKvWriteMode::Overwrite,
+                    },
+                )
+                .await
+                .expect("should apply the concurrent write");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for ConflictInjectingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            if self.fail_reads_after_conflict && self.conflicted.load(Ordering::Relaxed) {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.inner.store_name().to_owned(),
+                    message: "read failing after a conflict".to_owned(),
+                }));
+            }
+            self.inner.lookup(key).await
+        }
+
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) && self.take_conflict() {
+                if let Some(race) = &self.race {
+                    self.race_row(race, key, write.ttl).await;
+                }
+                return Ok(EcKvWriteOutcome::PreconditionFailed);
+            }
+            self.inner.insert(key, write).await
         }
 
         async fn list_keys_with_prefix(

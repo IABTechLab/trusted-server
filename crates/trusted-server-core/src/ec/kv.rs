@@ -22,7 +22,8 @@ use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
 use super::page_load::{
-    AfterResponseRejection, AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange,
+    AfterResponseCommit, AfterResponseRejection, AfterResponseWrite, Generation, KvWriteError,
+    PageLoadWrite, RowChange,
 };
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
@@ -32,6 +33,10 @@ const MAX_CAS_RETRIES: u32 = 5;
 /// Maximum Add attempts, each with a fresh ID, when creating the row of a new
 /// EC ID collides with an existing row.
 pub const MAX_CREATE_ATTEMPTS: u32 = 5;
+
+/// Write attempts a navigation's follow-up update makes: the first, then one
+/// re-read and re-plan after a conflict.
+pub const MAX_AFTER_RESPONSE_ATTEMPTS: u8 = 2;
 
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
@@ -163,7 +168,7 @@ impl KvIdentityGraph {
     ///
     /// A body over [`MAX_ENTRY_BYTES`] is an error; callers that report a
     /// full row separately use [`Self::serialize_entry_unless_full`].
-    fn serialize_entry(
+    pub(super) fn serialize_entry(
         entry: &KvEntry,
         store_name: &str,
     ) -> Result<(String, String), Report<TrustedServerError>> {
@@ -251,25 +256,30 @@ impl KvIdentityGraph {
     /// Loads one request-scoped snapshot, preserving miss versus failure at the caller boundary.
     #[must_use]
     pub async fn load_snapshot(&self, ec_id: &str) -> EcKvSnapshot {
-        match self.get(ec_id).await {
-            Ok(Some((entry, generation))) => EcKvSnapshot::Present {
+        self.read_snapshot(ec_id).await.unwrap_or_else(|err| {
+            log::warn!(
+                "EC KV snapshot read failed for '{}': {err:?}",
+                log_id(ec_id)
+            );
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.to_owned(),
+            }
+        })
+    }
+
+    /// Reads the row of `ec_id` as a snapshot, returning a failed read as its
+    /// error.
+    async fn read_snapshot(&self, ec_id: &str) -> Result<EcKvSnapshot, Report<TrustedServerError>> {
+        Ok(match self.get(ec_id).await? {
+            Some((entry, generation)) => EcKvSnapshot::Present {
                 ec_id: ec_id.to_owned(),
                 entry: Box::new(entry),
                 generation: Some(generation),
             },
-            Ok(None) => EcKvSnapshot::Missing {
+            None => EcKvSnapshot::Missing {
                 ec_id: ec_id.to_owned(),
             },
-            Err(err) => {
-                log::warn!(
-                    "EC KV snapshot read failed for '{}': {err:?}",
-                    log_id(ec_id)
-                );
-                EcKvSnapshot::Failed {
-                    ec_id: ec_id.to_owned(),
-                }
-            }
-        }
+        })
     }
 
     fn deserialize_entry(
@@ -463,48 +473,81 @@ impl KvIdentityGraph {
 
     /// Applies a navigation's follow-up update after its response was sent.
     ///
-    /// The row is replaced only while it is still at `expected`, so a
-    /// concurrent write is never overwritten. The `permit` is consumed unless
-    /// the row changed since it was read: that attempt writes nothing, so the
-    /// permit is handed back for a re-planned attempt.
+    /// Reads the row, asks `plan` for the update to make to it, and writes
+    /// that update only while the row is still at the generation `plan`
+    /// returns, so a concurrent write is never overwritten. When the write
+    /// loses its CAS it wrote nothing, so the row is read again and `plan`
+    /// asked again, for at most [`MAX_AFTER_RESPONSE_ATTEMPTS`] attempts: a
+    /// retry plans against every write since and never resends a stale
+    /// update. A re-read that returns the generation that just lost its CAS
+    /// is stale, as an eventually consistent store can return, so no further
+    /// attempt is made. The `permit` is spent once and every attempt runs
+    /// under it, so at most one update lands; it never leaves the graph.
     ///
-    /// # Errors
+    /// `plan` returns `Err` with its reason when the row as read needs no
+    /// write, such as a missing or withdrawn row; that reason comes back in
+    /// [`AfterResponseRejection::Skipped`].
     ///
-    /// Returns [`KvWriteError::Conflict`], with the permit, when the row
-    /// changed since it was read, or [`KvWriteError::Store`] on a
-    /// serialization or store failure, including a row over
-    /// [`MAX_ENTRY_BYTES`]. A retry must re-read the row and re-plan against
-    /// it, never resend `entry`.
-    pub async fn commit_after_response(
+    /// # Performance
+    ///
+    /// One KV read and at most one conditional KV write per attempt; the
+    /// second attempt runs only after a conflict.
+    pub async fn commit_after_response<S>(
         &self,
         permit: AfterResponseWrite,
         ec_id: &str,
-        entry: &KvEntry,
-        expected: Generation,
-    ) -> Result<(), AfterResponseRejection> {
-        let result = self
-            .write_row(
-                ec_id,
-                entry,
-                ENTRY_TTL,
-                EcKvWriteMode::IfGenerationMatch(expected.get()),
-            )
-            .await;
-        match result {
-            Err(report) if matches!(report.current_context(), KvWriteError::Conflict) => {
-                Err(AfterResponseRejection {
-                    report,
-                    permit: Some(permit),
-                })
+        mut plan: impl FnMut(&EcKvSnapshot) -> Result<(KvEntry, Generation), S>,
+    ) -> AfterResponseCommit<S> {
+        permit.spend();
+        let mut conflicts = 0;
+        let mut lost = None;
+        let result = loop {
+            let snapshot = match self.read_snapshot(ec_id).await {
+                Ok(snapshot) => snapshot,
+                Err(report) => break Err(AfterResponseRejection::ReadFailed(report)),
+            };
+            if lost.is_some() && Generation::of(&snapshot, ec_id) == lost {
+                log::warn!(
+                    "After-response re-read for '{}' returns the generation that lost its CAS, \
+                     dropping results",
+                    log_id(ec_id)
+                );
+                break Err(AfterResponseRejection::Conflict);
             }
-            other => {
-                permit.spend();
-                other.map_err(|report| AfterResponseRejection {
-                    report,
-                    permit: None,
-                })
+            let (entry, expected) = match plan(&snapshot) {
+                Ok(planned) => planned,
+                Err(reason) => break Err(AfterResponseRejection::Skipped(reason)),
+            };
+            let written = self
+                .write_row(
+                    ec_id,
+                    &entry,
+                    ENTRY_TTL,
+                    EcKvWriteMode::IfGenerationMatch(expected.get()),
+                )
+                .await;
+            let report = match written {
+                Ok(()) => break Ok(()),
+                Err(report) => report,
+            };
+            if !matches!(report.current_context(), KvWriteError::Conflict) {
+                break Err(AfterResponseRejection::WriteFailed(report));
             }
-        }
+            conflicts += 1;
+            if conflicts >= MAX_AFTER_RESPONSE_ATTEMPTS {
+                log::warn!(
+                    "After-response write for '{}' conflicts again, dropping results",
+                    log_id(ec_id)
+                );
+                break Err(AfterResponseRejection::Conflict);
+            }
+            log::info!(
+                "After-response write for '{}' conflicts, re-reading the row",
+                log_id(ec_id)
+            );
+            lost = Some(expected);
+        };
+        AfterResponseCommit { result, conflicts }
     }
 
     /// Serializes `entry` and writes it with `mode`, mapping a failed
@@ -1450,7 +1493,9 @@ mod tests {
     use super::*;
     use crate::ec::checked_current_timestamp;
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
-    use crate::ec::kv_backend::test_support::{InMemoryEcKv, WriteFailingEcKv};
+    use crate::ec::kv_backend::test_support::{
+        ConflictInjectingEcKv, InMemoryEcKv, WriteFailingEcKv,
+    };
     use crate::ec::kv_types::{KvEid, KvUid};
 
     struct DelayedLocalEcKv {
@@ -1688,150 +1733,10 @@ mod tests {
     // CAS-conflict injection tests
     // -----------------------------------------------------------------------
 
-    /// [`EcKvStore`] wrapper that injects generation conflicts: the first
-    /// `conflicts_remaining` `IfGenerationMatch` inserts return
-    /// [`EcKvWriteOutcome::PreconditionFailed`] without writing, optionally
-    /// reviving the underlying entry to simulate a concurrent writer.
-    struct ConflictInjectingEcKv {
-        inner: InMemoryEcKv,
-        conflicts_remaining: std::sync::Mutex<u32>,
-        revive_on_conflict: bool,
-        partner_update_on_conflict: bool,
-    }
-
-    impl ConflictInjectingEcKv {
-        fn new(conflicts: u32, revive_on_conflict: bool) -> Self {
-            Self {
-                inner: InMemoryEcKv::new("conflict-store"),
-                conflicts_remaining: std::sync::Mutex::new(conflicts),
-                revive_on_conflict,
-                partner_update_on_conflict: false,
-            }
-        }
-
-        async fn seed_tombstone(&self, ec_id: &str) {
-            let (body, meta) = KvIdentityGraph::serialize_entry(
-                &KvEntry::tombstone(1000),
-                self.inner.store_name(),
-            )
-            .expect("should serialize tombstone");
-            self.inner
-                .insert(
-                    ec_id,
-                    EcKvWrite {
-                        body: &body,
-                        metadata: &meta,
-                        ttl: TOMBSTONE_TTL,
-                        mode: EcKvWriteMode::Add,
-                    },
-                )
-                .await
-                .expect("should seed tombstone");
-        }
-
-        async fn seed_live(&self, ec_id: &str) {
-            let (body, meta) =
-                KvIdentityGraph::serialize_entry(&live_entry(), self.inner.store_name())
-                    .expect("should serialize live entry");
-            self.inner
-                .insert(
-                    ec_id,
-                    EcKvWrite {
-                        body: &body,
-                        metadata: &meta,
-                        ttl: TOMBSTONE_TTL,
-                        mode: EcKvWriteMode::Add,
-                    },
-                )
-                .await
-                .expect("should seed live entry");
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl EcKvStore for ConflictInjectingEcKv {
-        fn store_name(&self) -> &str {
-            self.inner.store_name()
-        }
-
-        async fn lookup(
-            &self,
-            key: &str,
-        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key).await
-        }
-
-        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key).await
-        }
-
-        async fn insert(
-            &self,
-            key: &str,
-            write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
-                let inject_conflict = {
-                    let mut remaining = self
-                        .conflicts_remaining
-                        .lock()
-                        .expect("should lock conflict counter");
-                    let inject_conflict = *remaining > 0;
-                    if inject_conflict {
-                        *remaining -= 1;
-                    }
-                    inject_conflict
-                };
-                if inject_conflict {
-                    if self.revive_on_conflict {
-                        // Simulate a concurrent writer reviving the entry
-                        // between this writer's read and its CAS write.
-                        let concurrent_entry = if self.partner_update_on_conflict {
-                            concurrent_live_entry()
-                        } else {
-                            live_entry()
-                        };
-                        let (body, meta) = KvIdentityGraph::serialize_entry(
-                            &concurrent_entry,
-                            self.inner.store_name(),
-                        )
-                        .expect("should serialize concurrent live entry");
-                        self.inner
-                            .insert(
-                                key,
-                                EcKvWrite {
-                                    body: &body,
-                                    metadata: &meta,
-                                    ttl: ENTRY_TTL,
-                                    mode: EcKvWriteMode::Overwrite,
-                                },
-                            )
-                            .await
-                            .expect("should apply concurrent revive");
-                    }
-                    return Ok(EcKvWriteOutcome::PreconditionFailed);
-                }
-            }
-            self.inner.insert(key, write).await
-        }
-
-        async fn list_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key).await
-        }
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn create_or_revive_retries_cas_conflict_and_succeeds() {
-        let store = ConflictInjectingEcKv::new(2, false);
-        store.seed_tombstone("ec-1").await;
+        let store = ConflictInjectingEcKv::new(2);
+        store.seed("ec-1", &KvEntry::tombstone(1000)).await;
         let graph = KvIdentityGraph::new(store);
 
         graph
@@ -1854,8 +1759,9 @@ mod tests {
     async fn create_or_revive_short_circuits_on_concurrent_revive() {
         // Inject more conflicts than MAX_CAS_RETRIES so the only way the call
         // can succeed is the concurrent-revive short-circuit on re-read.
-        let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, true);
-        store.seed_tombstone("ec-2").await;
+        let store =
+            ConflictInjectingEcKv::racing(MAX_CAS_RETRIES + 1, |entry| *entry = live_entry());
+        store.seed("ec-2", &KvEntry::tombstone(1000)).await;
         let graph = KvIdentityGraph::new(store);
 
         graph
@@ -1866,8 +1772,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_or_revive_errors_after_cas_exhaustion() {
-        let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
-        store.seed_tombstone("ec-3").await;
+        let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1);
+        store.seed("ec-3", &KvEntry::tombstone(1000)).await;
         let graph = KvIdentityGraph::new(store);
 
         let err = graph
@@ -2286,7 +2192,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn upsert_partner_id_if_exists_retries_cas_conflict() {
-        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, false));
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         graph
             .create(&ec_id, &live_entry())
@@ -2746,24 +2652,24 @@ mod tests {
         // The remaining CAS-exhaustion paths build their message the same way,
         // and a store that never lets a write land is the only way to reach them.
         let cas_revive = {
-            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
-            store.seed_tombstone(&ec_id).await;
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1);
+            store.seed(&ec_id, &KvEntry::tombstone(1000)).await;
             KvIdentityGraph::new(store)
                 .create_or_revive(&ec_id, &live_entry())
                 .await
                 .expect_err("should exhaust CAS retries")
         };
         let cas_upsert = {
-            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
-            store.seed_live(&ec_id).await;
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1);
+            store.seed(&ec_id, &live_entry()).await;
             KvIdentityGraph::new(store)
                 .upsert_partner_id(&ec_id, "partner", "uid")
                 .await
                 .expect_err("should exhaust CAS retries")
         };
         let cas_if_exists = {
-            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
-            store.seed_live(&ec_id).await;
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1);
+            store.seed(&ec_id, &live_entry()).await;
             KvIdentityGraph::new(store)
                 .upsert_partner_id_if_exists(&ec_id, "partner", "uid")
                 .await
@@ -3410,7 +3316,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tombstone_existing_from_snapshot_retries_cas_conflict() {
-        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, false));
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1));
         let ec_id = snapshot_ec_id();
         graph
             .create(&ec_id, &live_entry())
@@ -3435,7 +3341,7 @@ mod tests {
         // A generation-unavailable snapshot refreshes once before its CAS. That
         // refresh must not spend a CAS attempt, so a withdrawal tombstone still
         // persists after four conflicts and a successful fifth write.
-        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(4, false));
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(4));
         let ec_id = snapshot_ec_id();
         graph
             .create(&ec_id, &live_entry())
@@ -3464,7 +3370,7 @@ mod tests {
         // Every CAS attempt loses its race, so the row stays live with consent
         // granted while the browser cookie is already cleared. The caller must
         // see a failure it can report rather than a silent no-op.
-        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(MAX_CAS_RETRIES, false));
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(MAX_CAS_RETRIES));
         let ec_id = snapshot_ec_id();
         graph
             .create(&ec_id, &live_entry())
@@ -3794,7 +3700,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tombstone_existing_from_snapshot_overrides_concurrent_live_update() {
-        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, true));
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::racing(1, |entry| {
+            *entry = live_entry()
+        }));
         let ec_id = snapshot_ec_id();
         graph
             .create(&ec_id, &live_entry())

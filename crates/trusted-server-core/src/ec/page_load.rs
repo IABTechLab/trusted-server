@@ -9,10 +9,10 @@
 //! Two writes fall outside this rule. [`AfterResponseWrite`], confirmed
 //! alongside the page load's permit, allows one follow-up update after the
 //! response has been sent, carrying only the results of after-response
-//! identity lookups. An attempt that loses its CAS lands nothing and hands
-//! the permit back, so at most one follow-up update lands. A consent
-//! withdrawal's tombstone is a privacy write on any request that carries the
-//! EC cookie, and takes no permit.
+//! identity lookups. The graph spends it once and makes every attempt under
+//! it, so at most one follow-up update lands. A consent withdrawal's
+//! tombstone is a privacy write on any request that carries the EC cookie,
+//! and takes no permit.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
@@ -22,6 +22,7 @@ use http::{Request, StatusCode};
 
 use super::EcKvSnapshot;
 use super::kv_types::KvEntry;
+use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
 
 /// Issued to a request classified as a page-load navigation.
@@ -103,10 +104,9 @@ impl PageLoadWrite {
 /// response has been sent.
 ///
 /// Issued only by [`NavigationPermit::confirm_with_after_response`] and
-/// consumed by [`KvIdentityGraph::commit_after_response`]. It is not `Clone`,
-/// so a navigation lands at most one follow-up write. A write that loses its
-/// CAS lands nothing and hands the permit back in
-/// [`AfterResponseRejection::permit`].
+/// consumed by [`KvIdentityGraph::commit_after_response`], which keeps it for
+/// the re-read and re-plan after a conflict. It is not `Clone`, so a
+/// navigation lands at most one follow-up write.
 ///
 /// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
 #[derive(Debug)]
@@ -124,15 +124,31 @@ impl AfterResponseWrite {
     }
 }
 
+/// What [`KvIdentityGraph::commit_after_response`] did.
+///
+/// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
+#[derive(Debug)]
+#[must_use]
+pub struct AfterResponseCommit<S> {
+    /// `Ok` when the update landed.
+    pub result: Result<(), AfterResponseRejection<S>>,
+    /// The number of attempts that lost their CAS.
+    pub conflicts: u8,
+}
+
 /// Why a follow-up update did not land.
 #[derive(Debug)]
-pub struct AfterResponseRejection {
-    /// The write's error.
-    pub report: Report<KvWriteError>,
-    /// The permit, handed back only on [`KvWriteError::Conflict`]: that
-    /// attempt wrote nothing, so the navigation may re-read the row and try
-    /// again.
-    pub permit: Option<AfterResponseWrite>,
+pub enum AfterResponseRejection<S> {
+    /// The plan for the row as read has nothing to write, for the reason the
+    /// planner gave.
+    Skipped(S),
+    /// The row changed since each read, or a re-read returned the generation
+    /// that had just lost its CAS, so the results are dropped.
+    Conflict,
+    /// Reading the row failed.
+    ReadFailed(Report<TrustedServerError>),
+    /// The store rejected the write, or it could not be serialized.
+    WriteFailed(Report<KvWriteError>),
 }
 
 /// KV generation a conditional write expects.
