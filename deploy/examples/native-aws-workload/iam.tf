@@ -56,9 +56,8 @@ locals {
 
 resource "aws_iam_role" "execution" {
   name                 = "${var.run_id}-execution"
-  permissions_boundary = var.runtime_boundaries.execution
+  permissions_boundary = var.runtime_boundaries == null ? null : var.runtime_boundaries.execution
   assume_role_policy   = local.task_assume_role
-  depends_on           = [terraform_data.draft_gate]
 }
 
 resource "aws_iam_role_policy" "execution" {
@@ -90,14 +89,12 @@ resource "aws_iam_role_policy" "execution" {
         }
     ] : statement if length(local.private_ecr_arns) > 0], local.kms_read_statement)
   })
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_iam_role" "task" {
   name                 = "${var.run_id}-task"
-  permissions_boundary = var.runtime_boundaries.task
+  permissions_boundary = var.runtime_boundaries == null ? null : var.runtime_boundaries.task
   assume_role_policy   = local.task_assume_role
-  depends_on           = [terraform_data.draft_gate]
 }
 
 resource "aws_iam_role_policy" "task" {
@@ -118,5 +115,4 @@ resource "aws_iam_role_policy" "task" {
       }
     ], local.kms_read_statement, local.ec_task_policy.Statement)
   })
-  depends_on = [terraform_data.draft_gate]
 }
