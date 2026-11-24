@@ -15330,8 +15330,13 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
-                        None,
+                        &crate::ec::finalize::FinalizeRequest {
+                            eids_cookie: None,
+                            sharedid_cookie: None,
+                            now: Some(crate::ec::eid_types::UnixSeconds::new(
+                                crate::ec::current_timestamp(),
+                            )),
+                        },
                         &mut response,
                     )
                     .await;

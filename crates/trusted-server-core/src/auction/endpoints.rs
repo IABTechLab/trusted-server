@@ -1105,8 +1105,13 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            Some("shared-cookie-id"),
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: None,
+                sharedid_cookie: Some("shared-cookie-id"),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;
@@ -1201,8 +1206,14 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None, // No `ts-eids` cookie on this request at all.
-            None,
+            &crate::ec::finalize::FinalizeRequest {
+                // No `ts-eids` cookie on this request at all.
+                eids_cookie: None,
+                sharedid_cookie: None,
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;

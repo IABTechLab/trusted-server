@@ -14,13 +14,13 @@ use crate::ec::registry::PartnerRegistry;
 /// Largest encoded mirror value.
 pub const MAX_MIRROR_BYTES: usize = 3584;
 
-/// Seconds in a day; the mirror's `exp` for a UID without a stated expiry
-/// counts from the start of the current UTC day.
+/// Seconds in a day; the cap on a mirrored UID's `exp` counts from the
+/// start of the current UTC day.
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// Longest a mirrored UID without a stated expiry stays valid on the page,
-/// counted from the start of the current UTC day: 30 days.
-const MIRROR_NO_EXPIRY_SECS: u64 = 30 * SECONDS_PER_DAY;
+/// Longest a mirrored UID stays valid on the page, counted from the start of
+/// the current UTC day: 30 days (WB-4).
+const MIRROR_MAX_EXPIRY_SECS: u64 = 30 * SECONDS_PER_DAY;
 
 /// What to do with the mirror cookie on this response.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,12 +50,12 @@ impl MirrorValue {
 /// source is denied consent, no provider excludes it where GDPR applies for
 /// this visitor and no provider's cookies on this request record an opt-out
 /// for it, in partner config order, as unpadded base64url JSON
-/// `{"v":1,"eids":[...]}`. A UID with a stated expiry carries it as `exp`
-/// (already at most 30 days ahead, clamped when written); a UID without one
-/// carries `exp` = the start of the current UTC day plus 30 days, so the
-/// value stays the same all day and changes at most once per UTC day. UIDs
-/// that would push the value past [`MAX_MIRROR_BYTES`] are skipped, as are
-/// UIDs that fail to serialize.
+/// `{"v":1,"eids":[...]}`. Every UID carries `exp`: its stated expiry,
+/// capped at the start of `now`'s UTC day plus 30 days, or that cap when it
+/// states none. Every mirrored UID therefore expires within 30 days (WB-4),
+/// and a value built from an unchanged row stays the same all day, changing
+/// at most once per UTC day. UIDs that would push the value past
+/// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
 /// persistence, the row is missing or withdrawn, or nothing qualifies.
 ///
@@ -75,7 +75,7 @@ pub fn build_mirror(
     let Some(row) = row.filter(|row| row.consent.ok && mirror_consent(consent)) else {
         return MirrorCookie::Expire;
     };
-    let default_exp = no_expiry_exp(now);
+    let max_exp = max_exp(now);
     let mut mirror = MirrorBuilder::default();
     // A partner opts in with `mirror_enabled`, and a UID never reaches the
     // page while a TCF vendor gating its source (that of any configured
@@ -102,7 +102,7 @@ pub fn build_mirror(
                 .uids()
                 .iter()
                 .filter(|uid| uid.owner().is_some() && uid.is_live(now))
-                .map(|uid| serde_json::to_string(&uid_json(uid, default_exp)));
+                .map(|uid| serde_json::to_string(&uid_json(uid, max_exp)));
             mirror.push_eid(source, eid_header(source, eid), uids);
         }
     }
@@ -254,15 +254,15 @@ fn eid_json(source: &str, eid: &KvEid) -> Value {
     Value::Object(object)
 }
 
-/// The mirror `exp` for a UID without a stated expiry: the start of `now`'s
-/// UTC day plus [`MIRROR_NO_EXPIRY_SECS`], so at most 30 days ahead and
-/// stable within the day.
-fn no_expiry_exp(now: UnixSeconds) -> UnixSeconds {
+/// The latest mirror `exp`: the start of `now`'s UTC day plus
+/// [`MIRROR_MAX_EXPIRY_SECS`], so at most 30 days ahead and stable within
+/// the day.
+fn max_exp(now: UnixSeconds) -> UnixSeconds {
     let day_start = now.get() - now.get() % SECONDS_PER_DAY;
-    UnixSeconds::new(day_start).saturating_add_secs(MIRROR_NO_EXPIRY_SECS)
+    UnixSeconds::new(day_start).saturating_add_secs(MIRROR_MAX_EXPIRY_SECS)
 }
 
-fn uid_json(uid: &KvUid, default_exp: UnixSeconds) -> Value {
+fn uid_json(uid: &KvUid, max_exp: UnixSeconds) -> Value {
     let mut object = Map::new();
     object.insert("id".to_owned(), Value::from(uid.id().as_str()));
     object.insert("atype".to_owned(), Value::from(uid.atype().get()));
@@ -270,8 +270,8 @@ fn uid_json(uid: &KvUid, default_exp: UnixSeconds) -> Value {
         object.insert("ext".to_owned(), ext.to_value());
     }
     let exp = match uid.expiry() {
-        Expiry::At(at) => at,
-        Expiry::Never => default_exp,
+        Expiry::At(at) => at.min(max_exp),
+        Expiry::Never => max_exp,
     };
     object.insert("exp".to_owned(), Value::from(exp.get()));
     Value::Object(object)
@@ -382,12 +382,91 @@ mod tests {
             .expect("should carry a numeric exp");
         assert_eq!(
             exp,
-            day_start + MIRROR_NO_EXPIRY_SECS,
+            day_start + MIRROR_MAX_EXPIRY_SECS,
             "should expire 30 days after the start of the current UTC day"
         );
         assert!(
-            exp > now.get() && exp <= now.get() + MIRROR_NO_EXPIRY_SECS,
+            exp > now.get() && exp <= now.get() + MIRROR_MAX_EXPIRY_SECS,
             "should expire within 30 days of now"
+        );
+    }
+
+    #[test]
+    fn caps_a_stated_expiry_at_thirty_days_from_the_utc_day_start() {
+        // Arrange: a provider-stated expiry 40 days out, past the 30-day cap,
+        // and one 10 days out, within it.
+        let day_start = 1_767_225_600;
+        let now = UnixSeconds::new(day_start + 13 * 60 * 60);
+        let far = now.saturating_add_secs(40 * SECONDS_PER_DAY);
+        let near = now.saturating_add_secs(10 * SECONDS_PER_DAY);
+        let entry = row(vec![
+            uid("far", Expiry::At(far)),
+            uid("near", Expiry::At(near)),
+        ]);
+
+        // Act
+        let MirrorCookie::Set(value) =
+            build_mirror(Some(&entry), &context(granting()), &partners(true), now)
+        else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        let mirror = decode(&value);
+        let uids = &mirror["eids"][0]["uids"];
+        assert_eq!(
+            uids[0]["exp"].as_u64(),
+            Some(day_start + MIRROR_MAX_EXPIRY_SECS),
+            "should cap a stated expiry past 30 days at the start of the UTC day plus 30 days"
+        );
+        assert_eq!(
+            uids[1]["exp"].as_u64(),
+            Some(near.get()),
+            "should keep a stated expiry within the cap"
+        );
+    }
+
+    #[test]
+    fn added_exp_drops_a_uid_that_fit_the_budget_without_it() {
+        // Arrange: four equal UIDs whose mirror JSON fits the budget without
+        // `exp`, but not with the 17 bytes `,"exp":<10 digits>` adds to each.
+        let ids: Vec<String> = (0..4).map(|i| format!("{i}{}", "x".repeat(629))).collect();
+        let without_exp = json!({ "v": 1, "eids": [{
+            "source": "ids.example.com",
+            "uids": ids.iter().map(|id| json!({ "id": id, "atype": 1 })).collect::<Vec<_>>()
+        }] })
+        .to_string();
+        assert!(
+            encoded_len(without_exp.len()) <= MAX_MIRROR_BYTES,
+            "should fit all four UIDs without exp"
+        );
+        let entry = row(ids.iter().map(|id| uid(id, Expiry::Never)).collect());
+
+        // Act
+        let MirrorCookie::Set(value) = build_mirror(
+            Some(&entry),
+            &context(granting()),
+            &partners(true),
+            UnixSeconds::new(1_767_225_600),
+        ) else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        assert!(
+            value.as_str().len() <= MAX_MIRROR_BYTES,
+            "should fit the size limit"
+        );
+        let kept: Vec<_> = decode(&value)["eids"][0]["uids"]
+            .as_array()
+            .expect("should hold uids")
+            .iter()
+            .map(|uid| uid["id"].as_str().expect("should carry an id").to_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            ids[..3],
+            "should drop the UID that no longer fits once each UID carries exp"
         );
     }
 
