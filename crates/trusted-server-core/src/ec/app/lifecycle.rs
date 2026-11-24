@@ -10,8 +10,6 @@ use crate::constants::{
     COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
-use crate::ec::consent::ec_consent_withdrawn;
-use crate::ec::cookies::expire_ec_cookie;
 use crate::ec::device::DeviceSignals;
 use crate::ec::finalize::ec_finalize_response;
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
@@ -23,6 +21,9 @@ use crate::ec::{EcContext, EidSyncSource};
 use crate::error::{TrustedServerError, http_error};
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
+use crate::response_privacy::{
+    enforce_set_cookie_cache_privacy, enforce_terminal_private_cache_privacy,
+};
 
 /// The identity inputs and graph used throughout one request.
 pub struct IdentityRequest {
@@ -148,8 +149,9 @@ impl IdentityApp {
     /// Finalizes one request before its response headers are released.
     ///
     /// Positive identity cookies are restricted to document and EC responses.
-    /// Withdrawal expires the EC cookie on every finalized response, including
-    /// when authoritative storage is unavailable.
+    /// Core-generated EC, configured `SharedID` and mirror expiries may accompany
+    /// every finalized response (S2S design §10, WB-1). Origin identity cookies
+    /// are filtered first on ineligible responses; every expiry remains private.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -158,7 +160,6 @@ impl IdentityApp {
         use_store: bool,
         response: &mut Response,
     ) {
-        let withdrawal = ec_consent_withdrawn(context.consent()) && context.cookie_was_present();
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
         // A document revalidation inherits the cached representation: 304
         // commonly omits Content-Type, and keeps the navigation permission.
@@ -178,6 +179,9 @@ impl IdentityApp {
         let eligible = document || ec_route;
         if !eligible {
             let _ = context.take_navigation_permit();
+            // Establish provenance before core finalization: neither positive
+            // nor expiring origin identity cookies may pass this boundary.
+            self.filter_ineligible_identity_cookies(response, false);
         }
         let graph = self.identity_graph().filter(|_| use_store);
         ec_finalize_response(
@@ -191,29 +195,76 @@ impl IdentityApp {
         )
         .await;
         if !eligible {
-            let cookies: Vec<_> = response
-                .headers()
-                .get_all(header::SET_COOKIE)
-                .iter()
-                .filter(|value| {
-                    value
-                        .to_str()
-                        .ok()
-                        .and_then(|value| value.split_once('='))
-                        .is_none_or(|(name, _)| !self.identity_cookie(name.trim()))
-                })
-                .cloned()
-                .collect();
-            response.headers_mut().remove(header::SET_COOKIE);
-            for cookie in cookies {
-                response.headers_mut().append(header::SET_COOKIE, cookie);
-            }
-            // Rebuild only our withdrawal deletion after filtering, so an
-            // origin-supplied positive identity cookie cannot escape the gate.
-            if withdrawal {
-                expire_ec_cookie(&self.settings, response);
-            }
+            // S2S EID collection design §10, WB-1 permits core-generated
+            // identity expiries on any already-finalized response.
+            self.filter_ineligible_identity_cookies(response, true);
         }
+        enforce_set_cookie_cache_privacy(response);
+        if response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .is_some_and(|value| self.identity_expiry(value))
+            })
+        {
+            enforce_terminal_private_cache_privacy(response);
+        }
+    }
+
+    fn filter_ineligible_identity_cookies(&self, response: &mut Response, core_generated: bool) {
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter(|value| {
+                // Read the ASCII name independently of a possibly non-ASCII
+                // origin value, which must not bypass identity filtering.
+                let name = value
+                    .as_bytes()
+                    .split(|byte| *byte == b'=')
+                    .next()
+                    .unwrap_or_default();
+                let managed = core::str::from_utf8(name.trim_ascii())
+                    .is_ok_and(|name| self.identity_cookie(name));
+                !managed
+                    || (core_generated
+                        && value
+                            .to_str()
+                            .ok()
+                            .is_some_and(|value| self.identity_expiry(value)))
+            })
+            .cloned()
+            .collect();
+        response.headers_mut().remove(header::SET_COOKIE);
+        for cookie in cookies {
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+        }
+    }
+
+    fn identity_expiry(&self, value: &str) -> bool {
+        let Ok(cookie) = cookie::Cookie::parse(value) else {
+            return false;
+        };
+        let name = cookie.name();
+        let allowed = [COOKIE_TS_EC, COOKIE_TS_EIDS_MIRROR].contains(&name)
+            || self
+                .sharedid_storage
+                .write_back_cookie()
+                .is_some_and(|sharedid| name == sharedid || name == format!("{sharedid}_cst"));
+        allowed
+            && cookie.max_age().map_or_else(
+                || {
+                    cookie.expires_datetime().is_some_and(|expiry| {
+                        i128::from(expiry.unix_timestamp())
+                            <= i128::from(crate::ec::current_timestamp())
+                    })
+                },
+                |age| age.whole_seconds() <= 0,
+            )
     }
 
     fn identity_cookie(&self, name: &str) -> bool {
@@ -398,6 +449,176 @@ mod tests {
     use edgezero_core::http::{Request, header};
     use futures::executor::block_on;
     use std::sync::Arc;
+
+    #[test]
+    fn identity_expiry_requires_an_allowed_name_and_effective_expiration() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build app");
+        for (cookie, expected) in [
+            ("ts-ec=; Max-Age=0", true),
+            ("_pubcid=; Max-Age=0", true),
+            ("_pubcid_cst=; Max-Age=0", true),
+            (
+                "__Host-ts-eids-mirror=; Expires=Wed, 01 Jan 2020 00:00:00 GMT",
+                true,
+            ),
+            (
+                "ts-ec=positive; Max-Age=60; Expires=Wed, 01 Jan 2020 00:00:00 GMT",
+                false,
+            ),
+            (
+                "ts-ec=positive; Expires=Wed, 01 Jan 2098 00:00:00 GMT",
+                false,
+            ),
+            ("ts-ec=positive", false),
+            ("ts-eids=; Max-Age=0", false),
+            ("ts-ec-pull-complete=; Max-Age=0", false),
+            ("sharedId=; Max-Age=0", false),
+        ] {
+            assert_eq!(
+                app.identity_expiry(cookie),
+                expected,
+                "should enforce the expiry allowlist and Max-Age precedence for {cookie}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_expiries_cannot_keep_shared_cache_headers() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::COOKIE,
+            "__Host-ts-eids-mirror=stale"
+                .parse()
+                .expect("should set cookie"),
+        );
+        let mut identity = app
+            .read_request(&crate::platform::test_support::noop_services(), &request)
+            .expect("should read request");
+        let mut response = edgezero_core::http::Response::default();
+        for (name, value) in [
+            ("cache-control", "public, max-age=600, s-maxage=600"),
+            ("surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
+            ("cloudflare-cdn-cache-control", "public, max-age=600"),
+        ] {
+            response
+                .headers_mut()
+                .insert(name, value.parse().expect("should set cache header"));
+        }
+        for (name, value) in [
+            ("etag", "example-tag"),
+            ("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT"),
+            ("expires", "Wed, 01 Jan 2030 00:00:00 GMT"),
+            ("age", "120"),
+        ] {
+            response.headers_mut().insert(
+                name,
+                value.parse().expect("should seed origin cache metadata"),
+            );
+        }
+        block_on(app.finalize(
+            &mut identity.context,
+            None,
+            &identity.sharedid,
+            false,
+            &mut response,
+        ));
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "should emit a core mirror expiry"
+        );
+        assert!(
+            response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .expect("should read cache policy")
+                .contains("private"),
+            "should make every expiry response private"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .is_some(),
+            "should preserve expiry privacy through late response hooks"
+        );
+        for name in ["etag", "last-modified", "expires", "age"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should remove origin cache metadata {name}"
+            );
+        }
+        for name in [
+            "surrogate-control",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+        ] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should remove shared cache directive {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ineligible_response_rejects_origin_identity_cookies_including_expiries() {
+        let mut settings = create_test_settings();
+        crate::test_support::identity_conformance::configure_http_fixture(&mut settings);
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        let mut response = edgezero_core::http::Response::default();
+        for name in [
+            "ts-ec",
+            "ts-eids",
+            "__Host-ts-eids-mirror",
+            "_pubcid",
+            "_pubcid_cst",
+            "ts-ec-pull-complete",
+        ] {
+            for age in [0, 3600] {
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    format!("{name}=origin-value; Path=/; Max-Age={age}")
+                        .parse()
+                        .expect("should build forged cookie"),
+                );
+            }
+        }
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            edgezero_core::http::HeaderValue::from_bytes(b"ts-ec=origin\x80; Max-Age=0")
+                .expect("should build an origin cookie containing non-ASCII bytes"),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            "unrelated=kept"
+                .parse()
+                .expect("should build unrelated cookie"),
+        );
+        block_on(app.finalize(
+            &mut EcContext::default(),
+            None,
+            &crate::ec::sharedid::SharedIdRequest::default(),
+            false,
+            &mut response,
+        ));
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["unrelated=kept"],
+            "should discard every origin identity cookie including deletions"
+        );
+    }
 
     #[test]
     fn post_to_asset_path_retains_publisher_navigation() {
