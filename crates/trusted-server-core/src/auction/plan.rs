@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
+use edgezero_core::outbound::ClientIdentityName;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +23,12 @@ const RESERVED_BROWSER_ENVELOPE_BIDDER_ID: &str = "trustedServer";
 const FASTLY_DYNAMIC_BACKEND_LIMIT: usize = 200;
 /// Fastly dynamic backends kept for the sites outside the auction.
 const FASTLY_NON_AUCTION_BACKEND_RESERVE: usize = 40;
+
+/// Client identity that every provider with `mtls = true` presents.
+///
+/// `edgezero.toml` declares it under `[capabilities.outbound.client-identities]`, bound to the
+/// default config and secret stores, so the name is fixed and operators select it per provider.
+pub const AUCTION_PROVIDERS_CLIENT_IDENTITY: &str = "auction-providers";
 
 /// Validated operator-defined provider identifier.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, derive_more::Display)]
@@ -143,6 +150,11 @@ pub struct ProviderConfig {
     /// explicitly approved demo/test endpoints.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_insecure_http: bool,
+    /// Present the [`AUCTION_PROVIDERS_CLIENT_IDENTITY`] client certificate on this provider's
+    /// requests. Defaults to false. Requires an `https` endpoint, and only the Fastly adapter
+    /// supports it; the other adapters refuse to start with it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mtls: bool,
     /// Optional profile-default timeout override.
     #[serde(default)]
     pub timeout_ms: Option<u32>,
@@ -257,6 +269,8 @@ pub struct ProviderPlan {
     pub protocol: ProtocolPlan,
     /// Compiled typed profile behavior.
     pub profile: CompiledOpenRtbProfile,
+    /// Client identity the provider's requests present, set when the provider enables `mtls`.
+    pub client_identity: Option<ClientIdentityName>,
 }
 
 /// Immutable target-independent auction plan.
@@ -338,6 +352,7 @@ impl AuctionPlan {
                     "provider `{id}` timeout_ms must be greater than zero"
                 )));
             }
+            let client_identity = compile_client_identity(&id, raw.mtls, &endpoint)?;
             let notifications = compile_notifications(&id, raw.notifications)?;
             let profile = registration.compile(&raw.profile_config)?;
             let index = providers.len();
@@ -350,6 +365,7 @@ impl AuctionPlan {
                 notifications,
                 protocol: ProtocolPlan::OpenRtb26,
                 profile,
+                client_identity,
             });
         }
         let mut bidder_routes = BTreeMap::new();
@@ -436,9 +452,12 @@ impl AuctionPlan {
 
 /// Rejects an enabled plan whose providers need more Fastly backends than the auction may use.
 ///
-/// Each distinct tuple of provider scheme, host, port, and configured timeout is at most one
-/// `EdgeZero` backend configuration on Fastly, because bidders set no host override and every
-/// request carries the same connect timeout. The count can only overstate: `EdgeZero` keys
+/// Each distinct tuple of provider scheme, host, port, configured timeout, and whether the
+/// provider presents the client identity is at most one `EdgeZero` backend configuration on
+/// Fastly, because bidders set no host override, every request carries the same connect timeout,
+/// and `EdgeZero` names a backend that presents a client certificate apart from one that does not.
+/// A certificate rotation adds backends under new names in a running sandbox; this static count
+/// does not cover those. The count can only overstate: `EdgeZero` keys
 /// identity on the rounded timer, so two timeouts that round alike share a configuration but
 /// count twice here. The auction may use 160 of Fastly's 200 dynamic backends, which keeps 40 for
 /// the other outbound sites. A disabled auction registers no provider backend and passes.
@@ -477,6 +496,7 @@ pub fn validate_fastly_backend_bound(plan: &AuctionPlan) -> Result<(), Report<Tr
                 endpoint.host_str(),
                 endpoint.port_or_known_default(),
                 provider.timeout_ms,
+                provider.client_identity.is_some(),
             )
         })
         .collect::<BTreeSet<_>>();
@@ -586,6 +606,61 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Selects the auction client identity for a provider that enables `mtls`.
+///
+/// A client certificate can only be presented over TLS, so an `mtls` provider whose endpoint is
+/// plain HTTP, through the loopback exception or `allow_insecure_http`, is a configuration error.
+fn compile_client_identity(
+    provider_id: &ProviderId,
+    mtls: bool,
+    endpoint: &CanonicalProviderEndpoint,
+) -> Result<Option<ClientIdentityName>, Report<TrustedServerError>> {
+    if !mtls {
+        return Ok(None);
+    }
+    if endpoint.url().scheme() != "https" {
+        return Err(configuration_error(format!(
+            "provider `{provider_id}` sets mtls but its endpoint is not https"
+        )));
+    }
+    ClientIdentityName::new(AUCTION_PROVIDERS_CLIENT_IDENTITY)
+        .map(Some)
+        .map_err(|error| {
+            configuration_error(format!(
+                "auction client identity `{AUCTION_PROVIDERS_CLIENT_IDENTITY}` is invalid: {error}"
+            ))
+        })
+}
+
+/// Rejects a plan in which any provider enables `mtls`, for an adapter that cannot present a
+/// client certificate.
+///
+/// Every compiled provider is checked, whether or not the auction is enabled, so enabling the
+/// auction later cannot turn an accepted config into a startup failure.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming each provider that enables `mtls`, in
+/// plan order, and `adapter`.
+pub fn reject_auction_mtls(
+    plan: &AuctionPlan,
+    adapter: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    let providers = plan
+        .providers
+        .iter()
+        .filter(|provider| provider.client_identity.is_some())
+        .map(|provider| format!("`{}`", provider.id))
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return Ok(());
+    }
+    Err(configuration_error(format!(
+        "auction providers {} set mtls, but the {adapter} adapter cannot present client certificates",
+        providers.join(", ")
+    )))
+}
+
 fn normalize_prebid_server_endpoint(endpoint: &mut Url) {
     match endpoint.path() {
         "" | "/" => endpoint.set_path("/openrtb2/auction"),
@@ -633,6 +708,7 @@ mod tests {
     fn provider(profile: &str) -> ProviderConfig {
         ProviderConfig {
             allow_insecure_http: false,
+            mtls: false,
             protocol: "openrtb-2.6".to_string(),
             profile: profile.to_string(),
             endpoint: "https://bid.example/openrtb2/auction".to_string(),
@@ -1114,6 +1190,162 @@ mod tests {
                 .allow_insecure_http,
             "should retain the explicit HTTP opt-in across serialization"
         );
+    }
+
+    fn mtls_provider(endpoint: &str) -> ProviderConfig {
+        let mut raw_provider = provider("standard");
+        raw_provider.endpoint = endpoint.to_string();
+        raw_provider.mtls = true;
+        raw_provider
+    }
+
+    #[test]
+    fn mtls_defaults_off_and_round_trips_only_when_set() {
+        let legacy = serde_json::to_value(provider("prebid-server"))
+            .expect("should serialize the default provider");
+        assert!(
+            legacy.get("mtls").is_none(),
+            "should omit mtls while it is false"
+        );
+        assert!(
+            !serde_json::from_value::<ProviderConfig>(legacy)
+                .expect("should deserialize the default provider")
+                .mtls,
+            "should keep mtls off when the field is absent"
+        );
+
+        let encoded = serde_json::to_value(mtls_provider("https://bid.example/openrtb2/auction"))
+            .expect("should serialize the mtls provider");
+        assert_eq!(encoded["mtls"], true, "should publish mtls = true");
+        assert!(
+            serde_json::from_value::<ProviderConfig>(encoded)
+                .expect("should deserialize the mtls provider")
+                .mtls,
+            "should keep mtls across serialization"
+        );
+
+        let parsed: ProviderConfig = toml::from_str(
+            "protocol = \"openrtb-2.6\"\nendpoint = \"https://bid.example/bid\"\nmtls = true\n",
+        )
+        .expect("should parse mtls from TOML");
+        assert!(parsed.mtls, "should read mtls = true from TOML");
+    }
+
+    #[test]
+    fn plan_selects_the_auction_identity_only_for_mtls_providers() {
+        let plan = AuctionPlan::compile(config(BTreeMap::from([
+            (
+                id("secured"),
+                mtls_provider("https://bid.example/openrtb2/auction"),
+            ),
+            (id("plain"), provider("standard")),
+        ])))
+        .expect("should compile an mtls provider beside a plain one");
+
+        let identities = plan
+            .providers()
+            .iter()
+            .map(|provider| {
+                (
+                    provider.id.as_str(),
+                    provider
+                        .client_identity
+                        .as_ref()
+                        .map(ClientIdentityName::as_str),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                ("plain", None),
+                ("secured", Some(AUCTION_PROVIDERS_CLIENT_IDENTITY)),
+            ],
+            "should select the auction identity only where mtls is set"
+        );
+    }
+
+    #[test]
+    fn mtls_requires_an_https_endpoint() {
+        for (endpoint, allow_insecure_http) in [
+            ("http://bids.example.com:8000/bid", true),
+            ("http://127.0.0.1:8080/bid", false),
+        ] {
+            let mut raw_provider = mtls_provider(endpoint);
+            raw_provider.allow_insecure_http = allow_insecure_http;
+            let error =
+                AuctionPlan::compile(config(BTreeMap::from([(id("secured"), raw_provider)])))
+                    .expect_err("should reject mtls over plain HTTP");
+            assert!(
+                error
+                    .to_string()
+                    .contains("provider `secured` sets mtls but its endpoint is not https"),
+                "should name the provider and the HTTPS rule for {endpoint}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fastly_backend_bound_counts_mtls_as_its_own_backend() {
+        // Port 9000 is left to the mtls provider and its plain twin.
+        let mut providers = plan_with_providers(distinct_tuples(160).skip(1))
+            .providers()
+            .iter()
+            .map(|compiled| {
+                let mut raw_provider = provider("standard");
+                raw_provider.endpoint = compiled.endpoint.as_str().to_string();
+                raw_provider.timeout_ms = Some(compiled.timeout_ms);
+                (compiled.id.clone(), raw_provider)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let shared = "https://bid.example:9000/openrtb";
+        let mut secured = mtls_provider(shared);
+        secured.timeout_ms = Some(1000);
+        providers.insert(id("secured"), secured);
+        let plan =
+            AuctionPlan::compile(config(providers.clone())).expect("should compile 160 providers");
+        validate_fastly_backend_bound(&plan)
+            .expect("should fit 159 plain tuples and one mtls tuple");
+
+        let mut plain_twin = provider("standard");
+        plain_twin.endpoint = "https://bid.example:9000/other-path".to_string();
+        plain_twin.timeout_ms = Some(1000);
+        providers.insert(id("twin"), plain_twin);
+        let error = validate_fastly_backend_bound(
+            &AuctionPlan::compile(config(providers)).expect("should compile 161 providers"),
+        )
+        .expect_err("should count mtls and plain providers on one origin as two backends");
+        assert!(
+            error.to_string().contains("161"),
+            "should count the mtls tuple apart from the plain one: {error}"
+        );
+    }
+
+    #[test]
+    fn reject_auction_mtls_names_every_mtls_provider_even_when_disabled() {
+        let plain = AuctionPlan::compile(config(BTreeMap::from([(
+            id("plain"),
+            provider("standard"),
+        )])))
+        .expect("should compile a plain provider");
+        reject_auction_mtls(&plain, "Example").expect("should accept a plan without mtls");
+
+        let secured = AuctionPlan::compile(config(BTreeMap::from([
+            (id("alpha"), mtls_provider("https://alpha.example/bid")),
+            (id("bravo"), mtls_provider("https://bravo.example/bid")),
+            (id("plain"), provider("standard")),
+        ])))
+        .expect("should compile mtls providers");
+        for plan in [secured.clone(), secured.with_enabled(false)] {
+            let error = reject_auction_mtls(&plan, "Example")
+                .expect_err("should reject mtls providers whether or not the auction is enabled");
+            assert!(
+                error.to_string().contains(
+                    "auction providers `alpha`, `bravo` set mtls, but the Example adapter cannot present client certificates"
+                ),
+                "should name every mtls provider and the adapter: {error}"
+            );
+        }
     }
 
     #[test]

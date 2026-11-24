@@ -192,6 +192,18 @@ struct OutboundFailure {
     kind: &'static str,
 }
 
+/// The client identity a request selected and why `EdgeZero` refused to present it.
+///
+/// The reason names the identity's material slot, such as `private key is missing`, or the
+/// request origin the identity's hosts list did not allow. It never carries certificate or key
+/// contents.
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
+#[display("outbound client identity {name}: {reason}")]
+struct OutboundClientIdentityFailure {
+    name: String,
+    reason: String,
+}
+
 /// Text-free provider evidence for a failed outbound request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 #[display("outbound provider failure detail: {_0:?}")]
@@ -210,11 +222,13 @@ struct OutboundFailureDetail(ProviderFailureDetail);
 ///   502 for every outbound site.
 ///
 /// The report carries `error` as an opaque attachment, the error's status and
-/// kind, the budget source of a timeout, and the error's provider failure
-/// detail. It logs nothing: the caller logs the report once, naming its site
-/// or partner, and the report's `{:?}` rendering prints the status and kind,
-/// the budget source and the detail. That rendering never carries the error's
-/// message, which can hold provider text or a URL.
+/// kind, the budget source of a timeout, the error's provider failure detail,
+/// and, for a client-identity refusal, the identity name and reason. It logs
+/// nothing: the caller logs the report once, naming its site or partner, and
+/// the report's `{:?}` rendering prints those attachments. That rendering never
+/// carries the error's message, which can hold provider text or a URL. A
+/// client-identity reason can name the request's origin, which is the scheme,
+/// host and port the operator configured, without a path or query.
 /// Callers that need the error downcast the report to [`EdgeError`].
 ///
 /// # Examples
@@ -251,6 +265,13 @@ pub fn outbound_error(
         _ => None,
     };
     let detail = error.provider_failure_detail().copied();
+    let identity_failure = match &error {
+        EdgeError::ClientIdentity { name, reason } => Some(OutboundClientIdentityFailure {
+            name: name.clone(),
+            reason: reason.to_string(),
+        }),
+        _ => None,
+    };
 
     let mapped = match (status, source) {
         (StatusCode::PAYLOAD_TOO_LARGE, _) => Some(TrustedServerError::RequestTooLarge {
@@ -278,6 +299,9 @@ pub fn outbound_error(
     }
     if let Some(detail) = detail {
         report = report.attach(OutboundFailureDetail(detail));
+    }
+    if let Some(identity_failure) = identity_failure {
+        report = report.attach(identity_failure);
     }
     report
 }
@@ -603,6 +627,56 @@ mod tests {
         assert!(
             report.downcast_ref::<EdgeError>().is_some(),
             "should still attach the EdgeError for downcasts"
+        );
+    }
+
+    #[test]
+    fn outbound_error_names_the_client_identity_and_reason() {
+        let name = edgezero_core::outbound::ClientIdentityName::new("auction-providers")
+            .expect("should accept the identity name");
+        for (reason, expected) in [
+            (
+                edgezero_core::outbound::ClientIdentityError::MaterialMissing {
+                    which: edgezero_core::outbound::ClientIdentityMaterial::Key,
+                },
+                "outbound client identity auction-providers: private key is missing",
+            ),
+            (
+                edgezero_core::outbound::ClientIdentityError::HostNotAllowed {
+                    origin: "https://pbs.example.com:443".to_owned(),
+                    redirect: false,
+                },
+                "outbound client identity auction-providers: https://pbs.example.com:443 is not in the identity's hosts",
+            ),
+        ] {
+            let report = outbound_error(
+                EdgeError::client_identity(&name, reason),
+                site_error(),
+                OutboundRequestSource::Internal,
+            );
+
+            let rendered = format!("{report:?}");
+            assert!(
+                rendered.contains(expected),
+                "should log the identity name and reason `{expected}`, got `{rendered}`"
+            );
+            assert!(
+                !rendered.contains("BEGIN"),
+                "should carry no PEM, got `{rendered}`"
+            );
+        }
+
+        let unrelated = format!(
+            "{:?}",
+            outbound_error(
+                EdgeError::bad_gateway("example upstream failure"),
+                site_error(),
+                OutboundRequestSource::Internal,
+            )
+        );
+        assert!(
+            !unrelated.contains("outbound client identity"),
+            "should add no identity diagnostic to other failures, got `{unrelated}`"
         );
     }
 

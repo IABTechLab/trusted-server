@@ -208,6 +208,7 @@ impl AuctionConfig {
                     id,
                     ProviderConfig {
                         allow_insecure_http: false,
+                        mtls: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "standard".to_string(),
                         endpoint: format!("https://{name}.example/openrtb2/auction"),

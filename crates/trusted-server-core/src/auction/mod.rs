@@ -193,6 +193,7 @@ mod plan_sharing_tests {
             "aps-main".parse().expect("should parse APS provider ID"),
             ProviderConfig {
                 allow_insecure_http: false,
+                mtls: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

@@ -8,14 +8,17 @@
 //!
 //! `push` and `diff` name a target adapter, so for one that does not run
 //! identity providers they check [`ProviderlessAppConfig`], which also
-//! rejects enabled providers. `validate` names no adapter and stays
-//! adapter-agnostic: it accepts enabled providers.
+//! rejects enabled providers and auction providers that set `mtls`, since
+//! only the Fastly adapter presents client certificates. `validate` names no
+//! adapter and stays adapter-agnostic: it accepts both.
 
 use std::borrow::Cow;
 
 use edgezero_core::app_config::{AppConfigMeta, SecretField};
 use error_stack::{AttachmentKind, FrameKind, Report};
 use serde::{Deserialize, Serialize};
+use trusted_server_core::auction::compile_auction_plan;
+use trusted_server_core::auction::plan::reject_auction_mtls;
 use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::ec::provider::{ProviderConfigError, reject_enabled_providers};
 use trusted_server_identity_providers::validate_providers;
@@ -23,6 +26,9 @@ use validator::{Validate, ValidationError, ValidationErrors};
 
 /// Field that identity-provider build errors are reported under.
 const PROVIDER_VALIDATION_FIELD: &str = "identity_providers";
+
+/// Field that unsupported auction-provider `mtls` errors are reported under.
+const AUCTION_MTLS_VALIDATION_FIELD: &str = "auction_providers";
 
 /// [`TrustedServerAppConfig`] whose validation also builds every enabled
 /// identity provider.
@@ -55,14 +61,16 @@ impl AppConfigMeta for CheckedAppConfig {
 /// Whether the named target adapter runs identity providers.
 ///
 /// Only the Fastly adapter runs them; the Axum, Cloudflare and Spin adapters
-/// refuse to start with an enabled provider.
+/// refuse to start with an enabled provider. The same split holds for auction
+/// providers that set `mtls`.
 pub(crate) fn adapter_runs_identity_providers(adapter: &str) -> bool {
     adapter == "fastly"
 }
 
 /// [`CheckedAppConfig`] for a target adapter that does not run identity
-/// providers: validation also rejects every enabled provider, so `ts config
-/// push` and `diff` fail before deploying a config the adapter would refuse.
+/// providers: validation also rejects every enabled provider and every auction
+/// provider that sets `mtls`, so `ts config push` and `diff` fail before
+/// deploying a config the adapter would refuse.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ProviderlessAppConfig(CheckedAppConfig);
@@ -74,6 +82,14 @@ impl Validate for ProviderlessAppConfig {
             let mut error = ValidationError::new("trusted_server_adapter_providers");
             error.message = Some(Cow::Owned(report.current_context().to_string()));
             errors.add(PROVIDER_VALIDATION_FIELD, error);
+        }
+        // A plan that fails to compile is already reported by the core checks.
+        if let Ok(plan) = compile_auction_plan(self.0.0.settings())
+            && let Err(report) = reject_auction_mtls(&plan, "target")
+        {
+            let mut error = ValidationError::new("trusted_server_adapter_auction_mtls");
+            error.message = Some(Cow::Owned(report.current_context().to_string()));
+            errors.add(AUCTION_MTLS_VALIDATION_FIELD, error);
         }
         if errors.errors().is_empty() {
             Ok(())
@@ -191,6 +207,59 @@ mod tests {
         assert!(
             message.contains("liveramp") && message.contains("does not run identity providers"),
             "should name the enabled provider, got: {message}"
+        );
+    }
+
+    /// The example config with one auction provider that sets `mtls`.
+    fn with_mtls_auction_provider() -> String {
+        format!(
+            "{EXAMPLE_CONFIG}\n\
+             [auction.providers.example-mtls]\n\
+             protocol = \"openrtb-2.6\"\n\
+             endpoint = \"https://pbs.example.com/openrtb2/auction\"\n\
+             routing = \"all_eligible\"\n\
+             mtls = true\n"
+        )
+    }
+
+    fn auction_mtls_error(config: &impl Validate) -> Option<String> {
+        let errors = config.validate().err()?;
+        errors
+            .field_errors()
+            .get(AUCTION_MTLS_VALIDATION_FIELD)
+            .and_then(|errors| errors.first())
+            .and_then(|error| error.message.as_deref())
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn providerless_config_rejects_an_mtls_auction_provider() {
+        let config: ProviderlessAppConfig =
+            toml::from_str(&with_mtls_auction_provider()).expect("should parse app config");
+
+        let message = auction_mtls_error(&config).expect("should reject the mtls provider");
+
+        assert!(
+            message.contains("example-mtls")
+                && message.contains("target adapter cannot present client certificates"),
+            "should name the mtls provider, got: {message}"
+        );
+    }
+
+    #[test]
+    fn fastly_config_accepts_an_mtls_auction_provider() {
+        let config: CheckedAppConfig =
+            toml::from_str(&with_mtls_auction_provider()).expect("should parse app config");
+
+        assert_eq!(
+            auction_mtls_error(&config),
+            None,
+            "should leave mtls to the Fastly adapter"
+        );
+        assert_eq!(
+            provider_error(&config),
+            None,
+            "should report no identity-provider error"
         );
     }
 

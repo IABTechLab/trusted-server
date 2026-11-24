@@ -43,12 +43,13 @@ use edgezero_core::body::{Body, BodyPayload, BodyStream};
 use edgezero_core::error::{EdgeError, RequestBodyOverflowOrigin};
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use edgezero_core::outbound::{
-    ContentTypeProvenance, HttpClient, IndependentOutboundProgress, OutboundBatch,
-    OutboundBatchDriverEvent, OutboundCachePolicy, OutboundDispatchRequest, OutboundExchangeOwner,
-    OutboundFuture, OutboundHead, OutboundHeaderFidelity, OutboundHeaderInput, OutboundHttpClient,
-    OutboundImageOptimizerOptions, OutboundPending, OutboundPreparedBatch, OutboundProgressRuntime,
-    OutboundProxyMarker, OutboundRequest, OutboundRequestParts, OutboundResponse,
-    OutboundResponseContext, OutboundSendMode, OutboundTime, ResponseDecoding, ResponseMode,
+    ClientIdentityPolicy, ContentTypeProvenance, HttpClient, IndependentOutboundProgress,
+    OutboundBatch, OutboundBatchDriverEvent, OutboundCachePolicy, OutboundDispatchRequest,
+    OutboundExchangeOwner, OutboundFuture, OutboundHead, OutboundHeaderFidelity,
+    OutboundHeaderInput, OutboundHttpClient, OutboundImageOptimizerOptions, OutboundPending,
+    OutboundPreparedBatch, OutboundProgressRuntime, OutboundProxyMarker, OutboundRequest,
+    OutboundRequestParts, OutboundResponse, OutboundResponseContext, OutboundSendMode,
+    OutboundTime, ResponseDecoding, ResponseMode,
 };
 use edgezero_core::time::{Deadline, DispatchBudget, MonotonicClock, MonotonicInstant};
 use futures::FutureExt as _;
@@ -424,6 +425,8 @@ pub struct RecordedRequest {
     pub mode: OutboundSendMode,
     /// The effective budget the facade selected, a batch cutoff included.
     pub budget: DispatchBudget,
+    /// Name of the client identity the request selected, if any.
+    pub client_identity: Option<String>,
 }
 
 /// Transport settings a readback test expects one recorded request to carry.
@@ -725,6 +728,16 @@ impl ScriptedHttpClient {
         HttpClient::with_client(self.clone()).with_proxy_marker(false)
     }
 
+    /// Returns [`ScriptedHttpClient::http_client`] with the client identities the repository's
+    /// `edgezero.toml` declares, as `EdgeZero` attaches them to a production request's client.
+    #[must_use]
+    pub fn http_client_with_manifest_identities(&self) -> HttpClient {
+        self.http_client()
+            .with_client_identity_policy(Arc::new(ClientIdentityPolicy::from_baked(
+                crate::edgezero_manifest::baked_edgezero_manifest(),
+            )))
+    }
+
     /// Returns every request received so far, in arrival order.
     #[must_use]
     pub fn requests(&self) -> Vec<RecordedRequest> {
@@ -926,6 +939,7 @@ impl Dispatched {
         let OutboundRequestParts {
             body,
             cache_policy,
+            client_identity,
             connect_timeout,
             deadline,
             headers,
@@ -962,6 +976,7 @@ impl Dispatched {
                 has_host_authority_override,
                 mode,
                 budget,
+                client_identity: client_identity.map(|name| name.as_str().to_owned()),
             },
             body,
             context,

@@ -808,4 +808,23 @@ pub mod fixtures {
         )
         .expect("should parse identity provider")
     }
+
+    /// An HTTPS auction provider, `example-mtls`, that sets `mtls = true`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML or provider ID is invalid.
+    #[must_use]
+    pub fn mtls_auction_provider() -> (
+        crate::auction::plan::ProviderId,
+        crate::auction::plan::ProviderConfig,
+    ) {
+        (
+            "example-mtls".parse().expect("should parse provider ID"),
+            toml::from_str(
+                "protocol = \"openrtb-2.6\"\nendpoint = \"https://pbs.example.com/openrtb2/auction\"\nrouting = \"all_eligible\"\nmtls = true",
+            )
+            .expect("should parse auction provider"),
+        )
+    }
 }

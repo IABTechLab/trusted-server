@@ -14,11 +14,23 @@ kind = "http"
 version = "0.1.0"
 
 # -- Capabilities ------------------------------------------------------------
+# Client identities are optional: only the Fastly adapter presents them, and
+# the other adapters refuse a config whose auction providers set `mtls`.
+
+[capabilities]
+optional = ["outbound-client-identity"]
+
 # Publisher origins and integrations may use HTTP or HTTPS. An absent list means
 # HTTPS only, and `"*"` allows both, matching the Spin manifest's allowed hosts.
 
 [capabilities.outbound]
 hosts = ["*"]
+
+# The client certificate that auction providers with `mtls = true` present.
+# It binds to the [stores.config] and [stores.secrets] defaults, which hold
+# `auction-providers.certificate`, `auction-providers.hosts` and
+# `auction-providers.private-key`. See the auction orchestration guide.
+[capabilities.outbound.client-identities.auction-providers]
 
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the

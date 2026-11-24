@@ -335,6 +335,9 @@ impl GenericOpenRtbProvider {
         )
         .cache_policy(OutboundCachePolicy::Bypass)
         .body(body);
+        if let Some(identity) = &self.plan.client_identity {
+            outbound = outbound.client_identity(identity.clone());
+        }
         outbound.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),

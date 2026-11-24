@@ -146,6 +146,20 @@ fn main() {
 
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("should set the build output directory"));
+    // Bake the manifest the way EdgeZero's `app!` does, for adapters that implement
+    // `Hooks::manifest` by hand.
+    let manifest_json = match serde_json::to_string(manifest.manifest()) {
+        Ok(json) => json,
+        Err(error) => {
+            println!(
+                "cargo::error=should serialize EdgeZero manifest at {}: {error}",
+                manifest_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    fs::write(out_dir.join("edgezero-manifest.json"), manifest_json)
+        .expect("should write the baked EdgeZero manifest");
     let digest = template_build_digest(&crate_dir);
     fs::write(
         out_dir.join("template_build_digest.rs"),

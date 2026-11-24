@@ -1930,6 +1930,7 @@ pub fn register(
                 "aps".parse().expect("should parse APS provider ID"),
                 ProviderConfig {
                     allow_insecure_http: false,
+                    mtls: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "aps".to_string(),
                     endpoint: default_endpoint(),
@@ -3127,6 +3128,7 @@ mod tests {
                 "aps".parse().expect("should parse APS provider ID"),
                 ProviderConfig {
                     allow_insecure_http: false,
+                    mtls: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "aps".to_string(),
                     endpoint: default_endpoint(),

@@ -52,6 +52,7 @@ pub mod creative_opportunities;
 pub mod ec;
 pub mod edge_app;
 pub(crate) mod edge_cookie;
+pub mod edgezero_manifest;
 pub mod error;
 pub mod forwarder;
 pub mod geo;
