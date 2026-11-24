@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { runCommand, runSuite } from './test-geo-consent.mjs'
 
 const repoRoot = fileURLToPath(new URL('../', import.meta.url))
+const pinned = (
+  await readFile(new URL('../.tool-versions', import.meta.url), 'utf8')
+).match(/^viceroy\s+(\S+)\s*$/m)[1]
 const passing = ['geo_consent_fastly', 'geo_consent_fastly_forwarding']
   .map((name) => `test identity_conformance::${name} ... ok`)
   .join('\n')
@@ -19,7 +22,7 @@ function fixtureRunner(output = passing) {
     execute: async (command, args, options) => {
       calls.push({ command, args, options })
       if (args[0] === '--version')
-        return { stdout: 'viceroy 0.21.0\n', stderr: '' }
+        return { stdout: `viceroy ${pinned}\n`, stderr: '' }
       if (command === 'cargo')
         return {
           stdout: JSON.stringify({
@@ -62,7 +65,7 @@ test('a mismatched Viceroy version is rejected before building', async () => {
       stdout: 'viceroy 0.17.0',
       stderr: '',
     })),
-    /0.21.0/
+    (error) => error.message.includes(`pinned Viceroy ${pinned}`)
   )
 })
 
@@ -118,3 +121,22 @@ for (const parentLives of [true, false]) {
     }
   })
 }
+
+test('temporary runtime directory is removed after success and failure', async () => {
+  for (const fails of [false, true]) {
+    const fixture = fixtureRunner()
+    let manifest
+    const execute = async (command, args, options) => {
+      if (args[0] === 'run') {
+        manifest = args[2]
+        await access(manifest)
+        if (fails) throw new Error('fixture runtime failure')
+      }
+      return fixture.execute(command, args, options)
+    }
+    const run = runSuite('viceroy', '/example/test.wasm', execute)
+    if (fails) await assert.rejects(run, /fixture runtime failure/)
+    else await run
+    await assert.rejects(access(dirname(manifest)), { code: 'ENOENT' })
+  }
+})

@@ -96,10 +96,16 @@ export function runCommand(
 export async function runSuite(viceroy, suppliedBinary, execute = runCommand) {
   const runtime = viceroy.includes('/') ? resolve(viceroy) : viceroy
   const version = await execute(runtime, ['--version'], { cwd: repoRoot })
-  assert.match(
-    version.stdout,
-    /\b0\.21\.0\b/,
-    'should use pinned Viceroy 0.21.0'
+  const versions = await readFile(
+    new URL('../.tool-versions', import.meta.url),
+    'utf8'
+  )
+  const pinned = versions.match(/^viceroy\s+(\S+)\s*$/m)?.[1]
+  assert(pinned, 'should find the Viceroy pin in .tool-versions')
+  assert.equal(
+    version.stdout.trim().split(/\s+/)[1],
+    pinned,
+    `should use pinned Viceroy ${pinned}`
   )
   const directory = await mkdtemp(join(tmpdir(), 'ts-geo-consent-'))
   try {

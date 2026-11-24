@@ -530,6 +530,96 @@ fn geo_consent_fastly() {
     let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
     geo_consent::verify(&mut adapter, false, false);
     verify_deferred_stale_origin_headers(&mut adapter);
+    verify_configured_subdivision_rules();
+}
+
+// Exercise configuration precedence through the same authenticated host lookup
+// and application finalizer, rather than unit-calling jurisdiction detection.
+fn verify_configured_subdivision_rules() {
+    for gdpr_override in [false, true] {
+        let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
+        adapter.settings.consent.us_states.privacy_states.clear();
+        if gdpr_override {
+            adapter
+                .settings
+                .consent
+                .gdpr
+                .applies_in
+                .push("US".to_owned());
+            adapter
+                .settings
+                .consent
+                .us_states
+                .privacy_states
+                .push("CA".to_owned());
+        }
+        let seed = geo_consent::Adapter::exchange(
+            &mut adapter,
+            &Exchange {
+                location: *geo_consent::LOCATIONS
+                    .iter()
+                    .find(|row| row.name == "jp")
+                    .expect("should find seed location"),
+                signal: geo_consent::Signal::None,
+                kind: geo_consent::Kind::EcPost,
+                ec: None,
+            },
+        );
+        let identity = seed
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|cookie| {
+                cookie
+                    .strip_prefix("ts-ec=")
+                    .and_then(|value| value.split(';').next())
+            })
+            .expect("should issue seed identity")
+            .to_owned();
+        let result = geo_consent::Adapter::exchange(
+            &mut adapter,
+            &Exchange {
+                location: *geo_consent::LOCATIONS
+                    .iter()
+                    .find(|row| row.name == "us-question-subdivision")
+                    .expect("should find malformed US location"),
+                signal: geo_consent::Signal::Denied,
+                kind: geo_consent::Kind::Document,
+                ec: Some(&identity),
+            },
+        );
+        assert!(
+            result.status.is_success(),
+            "should finalize configured malformed-subdivision request"
+        );
+        assert_eq!(
+            result
+                .headers
+                .get("x-geo-country")
+                .and_then(|value| value.to_str().ok()),
+            Some("US"),
+            "should retain country when configured rules do not need a subdivision"
+        );
+        assert!(
+            !result.headers.contains_key("x-geo-region"),
+            "should drop invalid subdivision"
+        );
+        let expired = result.headers.get_all("set-cookie").iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|cookie| cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0"))
+        });
+        assert_eq!(
+            expired, gdpr_override,
+            "should honor configured GDPR precedence for withdrawal"
+        );
+        assert_eq!(
+            geo_consent::record_is_live(&adapter.store, &identity),
+            !gdpr_override,
+            "should honor configured withdrawal in authoritative storage"
+        );
+    }
 }
 
 fn verify_deferred_stale_origin_headers(adapter: &mut FastlyAdapter) {

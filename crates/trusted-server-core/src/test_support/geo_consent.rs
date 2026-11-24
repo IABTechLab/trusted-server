@@ -56,6 +56,12 @@ pub struct Location {
     pub source: Source,
     /// Independently specified policy expectation.
     pub policy: Policy,
+    /// Fastly expectation when its local producer differs from protected `CloudFront`.
+    #[serde(default)]
+    pub fastly_policy: Option<Policy>,
+    /// Fastly retains the country but drops this malformed subdivision.
+    #[serde(default)]
+    pub fastly_drop_region: bool,
 }
 
 /// Shared locations. US without subdivision deliberately preserves current policy.
@@ -252,8 +258,9 @@ fn cookies(response: &Observed) -> Vec<String> {
 
 /// Executes the shared matrix with independent policy expectations.
 ///
-/// `canonical` describes the producer's established output representation;
-/// Axum canonicalizes, while Fastly historically copies SDK values verbatim.
+/// `canonical` selects the current protected Axum profile (`true`) or Fastly
+/// profile (`false`), including casing and table-specified producer projections.
+/// Expectations are applied after exchange; the adapter always receives raw input.
 /// `unselected` is false on Fastly, whose local lookup has no provider selector.
 ///
 /// # Panics
@@ -326,6 +333,19 @@ fn seed_identity(adapter: &mut impl Adapter) -> String {
 
 fn verify_exchange(adapter: &mut impl Adapter, request: &Exchange<'_>, canonical: bool) {
     let observed = adapter.exchange(request);
+    // Expected producer projection is applied only after the real exchange.
+    // Never pass these expectations into ingress or application services.
+    let mut expected = Exchange { ..*request };
+    if !canonical {
+        expected.location.policy = request
+            .location
+            .fastly_policy
+            .unwrap_or(request.location.policy);
+        if request.location.fastly_drop_region {
+            expected.location.region = None;
+        }
+    }
+    let request = &expected;
     let context = format!(
         "{} {:?} {:?} returning={}",
         request.location.name,

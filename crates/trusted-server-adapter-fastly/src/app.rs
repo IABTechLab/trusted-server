@@ -1624,7 +1624,7 @@ mod tests {
             .client_ip;
         request
             .extensions_mut()
-            .insert(RequestGeo::lookup_once(client_ip));
+            .insert(RequestGeo::lookup_once(client_ip, &test_settings().consent));
         block_on(router.oneshot(request)).expect("should route request")
     }
 

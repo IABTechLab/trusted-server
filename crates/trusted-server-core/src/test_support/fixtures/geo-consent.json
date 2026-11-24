@@ -173,5 +173,39 @@
     "region": "ZZ",
     "source": "Located",
     "policy": "NonRegulated"
+  },
+  {
+    "name": "de-question-subdivision",
+    "country": "DE",
+    "region": "?",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "de-malformed-subdivision",
+    "country": "DE",
+    "region": "NO REGION",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "de-empty-subdivision",
+    "country": "DE",
+    "region": "",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-question-subdivision",
+    "country": "US",
+    "region": "?",
+    "source": "Located",
+    "policy": "Unknown"
   }
 ]

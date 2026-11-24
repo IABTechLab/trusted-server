@@ -62,7 +62,7 @@ jobs:
 
       - name: Verify geo consent with real Fastly lookup
         run: |
-          node --test scripts/test-geo-consent.test.mjs
+          node --test --test-timeout=60000 scripts/test-geo-consent.test.mjs
           node scripts/test-geo-consent.mjs "$(command -v viceroy)"
 
       - name: Run Fastly absolute deadline slow-network tests

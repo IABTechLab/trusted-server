@@ -5,7 +5,8 @@ use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,9 @@ struct ServerFixture {
     root: PathBuf,
     addr: SocketAddr,
     child: Option<Child>,
+    command: Option<Command>,
+    logs: [Arc<Mutex<Vec<u8>>>; 2],
+    log_readers: Vec<thread::JoinHandle<std::io::Result<()>>>,
 }
 
 fn reserve_port() -> tokio::net::TcpSocket {
@@ -95,6 +99,43 @@ fn fixture_port_reservation_does_not_create_a_listener() {
         TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_err(),
         "port allocation itself must not create a listener observed by concurrent startup probes"
     );
+}
+
+#[test]
+fn geo_consent_fixture_retries_an_occupied_port() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("should occupy fixture port");
+    let occupied_address = occupied.local_addr().expect("should read occupied address");
+    occupied
+        .set_nonblocking(true)
+        .expect("should poll competing listener");
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                if let Ok((mut stream, _)) = occupied.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let mut request = [0; 1024];
+                    let _ = stream.read(&mut request);
+                    // A foreign healthy response must never establish this child's readiness.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut server = ServerFixture::new(Some(ENVELOPE));
+        server.addr = occupied_address;
+        server.spawn(false, false);
+        server.wait_ready();
+        stop.store(true, Ordering::Relaxed);
+        assert_ne!(
+            server.addr, occupied_address,
+            "should retry instead of accepting a foreign healthy listener"
+        );
+        server.assert_logs_hold_no_secrets();
+    });
 }
 
 impl ServerFixture {
@@ -123,6 +164,12 @@ impl ServerFixture {
             root,
             addr,
             child: None,
+            command: None,
+            logs: [
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ],
+            log_readers: Vec::new(),
         }
     }
 
@@ -156,6 +203,12 @@ impl ServerFixture {
         profile: Option<&str>,
         legacy: Option<&str>,
     ) {
+        for output in &self.logs {
+            output
+                .lock()
+                .expect("should reset previous child diagnostics")
+                .clear();
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
@@ -205,6 +258,40 @@ impl ServerFixture {
                 .spawn()
                 .expect("should spawn production native binary"),
         );
+        self.command = Some(command);
+        self.capture_child_logs();
+    }
+
+    fn capture_child_logs(&mut self) {
+        let child = self.child.as_mut().expect("should own child log pipes");
+        let stdout = child.stdout.take().expect("should own child stdout");
+        let stderr = child.stderr.take().expect("should own child stderr");
+        self.log_readers
+            .push(capture_log(stdout, Arc::clone(&self.logs[0])));
+        self.log_readers
+            .push(capture_log(stderr, Arc::clone(&self.logs[1])));
+    }
+
+    fn diagnostics(&self) -> String {
+        self.logs
+            .iter()
+            .map(|output| {
+                String::from_utf8_lossy(&output.lock().expect("should read captured child logs"))
+                    .into_owned()
+            })
+            .collect::<String>()
+    }
+
+    fn finish_logs(&mut self) {
+        for reader in self.log_readers.drain(..) {
+            let result = reader.join();
+            if !thread::panicking() {
+                assert!(
+                    matches!(result, Ok(Ok(()))),
+                    "should finish draining owned child logs: {result:?}"
+                );
+            }
+        }
     }
 
     fn assert_failed_before_listen(&mut self, expected: &str) -> String {
@@ -234,17 +321,13 @@ impl ServerFixture {
                     !status.success(),
                     "should exit nonzero on initialization failure"
                 );
-                let output = self
-                    .child
+                self.child
                     .take()
                     .expect("should own child output")
-                    .wait_with_output()
-                    .expect("should collect startup diagnostics");
-                let diagnostic = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                    .wait()
+                    .expect("should reap failed child");
+                self.finish_logs();
+                let diagnostic = self.diagnostics();
                 assert!(
                     diagnostic.contains(expected),
                     "should explain startup failure: {diagnostic}"
@@ -262,14 +345,8 @@ impl ServerFixture {
 
     fn wait_ready(&mut self) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut retries = 0;
         loop {
-            if let Ok(response) = self.get("/health") {
-                assert!(
-                    response.starts_with("HTTP/1.1 200"),
-                    "should become healthy only after successful initialization: {response}"
-                );
-                return response;
-            }
             let status = self
                 .child
                 .as_mut()
@@ -277,27 +354,56 @@ impl ServerFixture {
                 .try_wait()
                 .expect("should poll child");
             let diagnostic = if status.is_some() {
-                let output = self
-                    .child
+                self.child
                     .take()
                     .expect("should own failed child")
-                    .wait_with_output()
-                    .expect("should collect startup diagnostics");
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                )
+                    .wait()
+                    .expect("should reap failed child");
+                self.finish_logs();
+                self.diagnostics()
             } else {
                 String::new()
             };
+            if status.is_some()
+                && diagnostic.contains("startup bind: listener: address unavailable")
+                && retries < 4
+                && Instant::now() < deadline
+            {
+                retries += 1;
+                let reservation = reserve_port();
+                self.addr = reservation.local_addr().expect("should read retry address");
+                drop(reservation);
+                self.child = Some(
+                    self.command
+                        .as_mut()
+                        .expect("should retain startup command")
+                        .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
+                        .spawn()
+                        .expect("should retry port collision"),
+                );
+                self.capture_child_logs();
+                continue;
+            }
             assert!(
                 status.is_none(),
                 "should keep running after valid prepared-store initialization: {diagnostic}"
             );
+            // Readiness belongs to this child, not whichever process won the port.
+            if self
+                .diagnostics()
+                .contains("event=lifecycle phase=ready reason=ready")
+                && let Ok(response) = self.get("/health")
+            {
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "should become healthy only after successful initialization: {response}"
+                );
+                return response;
+            }
             assert!(
                 Instant::now() < deadline,
-                "should become ready within the test bound"
+                "should become ready within the test bound: {}",
+                self.diagnostics()
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -307,14 +413,9 @@ impl ServerFixture {
     fn assert_logs_hold_no_secrets(&mut self) {
         let mut child = self.child.take().expect("should own running child");
         child.kill().expect("should stop the running server");
-        let output = child
-            .wait_with_output()
-            .expect("should collect running server output");
-        assert_no_secrets(&format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        child.wait().expect("should reap running server");
+        self.finish_logs();
+        assert_no_secrets(&self.diagnostics());
     }
 
     fn get(&self, path: &str) -> std::io::Result<String> {
@@ -354,8 +455,28 @@ impl Drop for ServerFixture {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.finish_logs();
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn capture_log(
+    mut reader: impl std::io::Read + Send + 'static,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<std::io::Result<()>> {
+    thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        loop {
+            let length = reader.read(&mut buffer)?;
+            if length == 0 {
+                return Ok(());
+            }
+            output
+                .lock()
+                .expect("should append captured child log")
+                .extend_from_slice(&buffer[..length]);
+        }
+    })
 }
 
 fn storage_envelope(storage: serde_json::Value) -> String {
@@ -439,6 +560,7 @@ fn local_records_require_data_dir_even_without_identity_storage() {
             .spawn()
             .expect("should spawn native startup without a data directory"),
     );
+    server.capture_child_logs();
     server.assert_failed_before_listen("DATA_DIR: required for declared stores");
 
     // The same no-identity config starts once its local provider has a writable root.
@@ -828,7 +950,10 @@ mod managed_geo_consumers {
                 let _ = stop.send(());
             }
             if let Some(worker) = self.worker.take() {
-                worker.join().expect("should stop local capture runtime");
+                let result = worker.join();
+                if !thread::panicking() {
+                    assert!(result.is_ok(), "should stop local capture runtime");
+                }
             }
         }
     }
@@ -950,18 +1075,6 @@ mod managed_geo_consumers {
         upstream.assert_no_dispatch();
     }
 
-    fn drain_runtime_log(
-        mut reader: impl std::io::Read + Send + 'static,
-    ) -> thread::JoinHandle<String> {
-        thread::spawn(move || {
-            let mut output = String::new();
-            reader
-                .read_to_string(&mut output)
-                .expect("should drain native runtime log");
-            output
-        })
-    }
-
     #[test]
     fn geo_consent_runtime_axum() {
         let upstream = LocalUpstream::start();
@@ -978,18 +1091,6 @@ mod managed_geo_consumers {
         let mut unselected = ServerFixture::new(Some(&envelope(&upstream)));
         unselected.spawn_configured(false, false, Some("version = 1\n[geo]\nprovider = 'off'"));
         unselected.wait_ready();
-        // Drain both pipes while the expanded matrix runs: unread informational
-        // logs can otherwise block the child before it answers a request.
-        let mut logs = Vec::new();
-        for server in [&mut trusted, &mut untrusted, &mut unselected] {
-            let child = server.child.as_mut().expect("should own native child");
-            logs.push(drain_runtime_log(
-                child.stdout.take().expect("should own child stdout"),
-            ));
-            logs.push(drain_runtime_log(
-                child.stderr.take().expect("should own child stderr"),
-            ));
-        }
         let client = client();
         for &location in geo_consent::LOCATIONS.iter() {
             // A synchronous provider cannot time out. ProviderFailure is an
@@ -1096,9 +1197,8 @@ mod managed_geo_consumers {
                 }
             }
         }
-        drop((trusted, untrusted, unselected));
-        for log in logs {
-            assert_no_secrets(&log.join().expect("should collect drained child log"));
+        for server in [&mut trusted, &mut untrusted, &mut unselected] {
+            server.assert_logs_hold_no_secrets();
         }
     }
 
