@@ -42,9 +42,9 @@ console.log(JSON.stringify({
   bindingsEnv: process.env.TS_NATIVE_BINDINGS_TOML ?? null,
   recordsEnabled: process.env.TS_EC_RECORDS_ENABLED ?? null,
   geoEnv: process.env.TS_NATIVE_GEO_PROFILE_TOML ?? null,
-  geoFile: process.env.TS_NATIVE_GEO_PROFILE_FILE ?? null,
-  geoContents: process.env.TS_NATIVE_GEO_PROFILE_FILE ? readFileSync(process.env.TS_NATIVE_GEO_PROFILE_FILE, 'utf8') : null,
-  geoMode: process.env.TS_NATIVE_GEO_PROFILE_FILE ? statSync(process.env.TS_NATIVE_GEO_PROFILE_FILE).mode & 0o777 : null,
+  geoFile: process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE ?? null,
+  geoContents: process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE ? readFileSync(process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE, 'utf8') : null,
+  geoMode: process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE ? statSync(process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE).mode & 0o777 : null,
 }))
 if (process.env.WAIT_FOR_SIGNAL === 'true') {
   process.on('SIGTERM', () => process.exit(23))
@@ -140,7 +140,7 @@ test("Geo is Off without a profile, ignoring stale pointers and volume files", a
   const { runtime, start } = await fixture(t);
   await writeFile(join(runtime, "native-geo.toml"), "stale");
   const result = await start("version = 1", {
-    TS_NATIVE_GEO_PROFILE_FILE: "/missing",
+    TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE: "/missing",
   }).closed;
   assert.equal(result.code, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).geoFile, null);
