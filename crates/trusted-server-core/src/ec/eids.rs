@@ -107,8 +107,10 @@ impl KvEntry {
     ///
     /// A source whose owning provider has a TCF vendor ID is skipped while
     /// `consent` withholds that vendor's consent, and a source a provider
-    /// excludes where GDPR applies is skipped for a GDPR visitor. A stored
-    /// `SharedID` is viewed under `pubcid.org` with agent type 1.
+    /// excludes where GDPR applies is skipped for a GDPR visitor. Active owner
+    /// opt-outs also withhold the source. Legacy single-UID records expire as
+    /// soon as an enabled provider owns their source.
+    /// A stored `SharedID` is viewed under `pubcid.org` with agent type 1.
     pub fn live_eids<'row>(
         &'row self,
         registry: &'row PartnerRegistry,
@@ -120,6 +122,9 @@ impl KvEntry {
                 partner.bidstream_enabled
                     && !partner.owner_vendor_consent_denied(consent)
                     && !partner.excluded_for(consent)
+                    && !registry.source_owner_opted_out(source, self, now)
+                    && (!registry.source_has_enabled_provider_owner(source)
+                        || record.is_provider_written())
             });
             partner.into_iter().flat_map(move |partner| {
                 // A stored SharedID is sent as `pubcid.org` with atype 1,
@@ -373,6 +378,126 @@ mod tests {
             "should withhold the excluded source with TCF Purposes 1 and 4 granted"
         );
         assert_eq!(elsewhere, 1, "should serve the source outside GDPR");
+    }
+
+    #[test]
+    fn live_eids_expire_legacy_records_only_in_provider_owned_sources() {
+        // Arrange
+        let mut registry = registry_with("ids.example.com", true);
+        let entry = KvEntry::minimal("ids.example.com", "browser-uid", 1);
+        let consent = ConsentContext::default();
+        assert_eq!(
+            entry
+                .live_eids(&registry, &consent, UnixSeconds::new(20))
+                .count(),
+            1,
+            "should retain legacy IDs without providers"
+        );
+        assert!(
+            registry.mark_provider_owned("ids.example.com", None),
+            "should mark source"
+        );
+
+        // Act and assert
+        assert_eq!(
+            entry
+                .live_eids(&registry, &consent, UnixSeconds::new(20))
+                .count(),
+            0,
+            "should expire legacy browser records when a provider owns the source"
+        );
+    }
+
+    #[test]
+    fn live_eids_honor_owner_opt_out_until_its_deadline() {
+        // Arrange
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![make_test_partner("ids.example.com")];
+        ec.identity_providers = vec![
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse provider"),
+        ];
+        let registry =
+            PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+        let mut entry = KvEntry::minimal("ids.example.com", "placeholder", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            provider_record(&[("provider-uid", Expiry::Never)]),
+        );
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), 20);
+        let consent = ConsentContext::default();
+
+        // Act and assert
+        assert_eq!(
+            entry
+                .live_eids(&registry, &consent, UnixSeconds::new(19))
+                .count(),
+            0,
+            "should withhold stored IDs during an owner opt-out"
+        );
+        assert_eq!(
+            entry
+                .live_eids(&registry, &consent, UnixSeconds::new(20))
+                .count(),
+            1,
+            "should allow live provider IDs at the opt-out expiry boundary"
+        );
+    }
+
+    #[test]
+    fn live_eids_apply_owned_expiry_and_opt_outs_across_sharedid_aliases() {
+        for (owner, stored) in [
+            ("pubcid.org", "sharedid.org"),
+            ("sharedid.org", "pubcid.org"),
+        ] {
+            let mut ec = crate::test_support::tests::create_test_settings().ec;
+            ec.partners = vec![
+                make_test_partner("pubcid.org"),
+                make_test_partner("sharedid.org"),
+            ];
+            ec.identity_providers = vec![
+                toml::from_str(&format!(
+                    "id = \"example-provider\"\nkind = \"test\"\nsources = [\"{owner}\"]"
+                ))
+                .expect("should parse provider"),
+            ];
+            let registry =
+                PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+            let consent = ConsentContext::default();
+            let mut entry = KvEntry::minimal(stored, "legacy-browser-uid", 1);
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(19))
+                    .count(),
+                0,
+                "should expire legacy alias records when either emitted-source owner is enabled"
+            );
+            entry.ids.insert(
+                stored.to_owned(),
+                provider_record(&[("provider-uid", Expiry::Never)]),
+            );
+            entry
+                .opt_outs
+                .insert(ProviderId::new("example-provider"), 20);
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(19))
+                    .count(),
+                0,
+                "should withhold an alias during remembered opt-out"
+            );
+            assert_eq!(
+                entry
+                    .live_eids(&registry, &consent, UnixSeconds::new(20))
+                    .count(),
+                1,
+                "should restore live provider alias at expiry"
+            );
+        }
     }
 
     #[test]
