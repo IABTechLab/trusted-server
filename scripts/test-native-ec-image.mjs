@@ -640,7 +640,7 @@ async function launch(
     AWS_ACCOUNT_ID_ENDPOINT_MODE: 'disabled',
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
-    TS_NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
+    TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
     EDGEZERO__STORE_BINDINGS_FILE: `${root}/native-bindings.toml`,
     TMPDIR: opt.binary ? tmpdir() : '/tmp',
     EDGEZERO__ADAPTER__CONFIG_DIR: root,

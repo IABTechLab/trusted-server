@@ -84,7 +84,6 @@ resource "aws_ecs_cluster" "review" {
     name  = "containerInsights"
     value = "disabled"
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_ecs_task_definition" "review" {
@@ -103,7 +102,6 @@ resource "aws_ecs_task_definition" "review" {
     name = "runtime-bindings"
   }
   container_definitions = jsonencode(local.containers)
-  depends_on            = [terraform_data.draft_gate]
 }
 
 // Retire the old service before its final listener association is removed.
@@ -142,7 +140,6 @@ resource "aws_ecs_service" "review" {
     delete = "15m"
   }
   depends_on = [
-    terraform_data.draft_gate,
     aws_appconfig_deployment.review,
     aws_lb_listener_rule.publisher,
     aws_vpc_security_group_egress_rule.auction,
@@ -187,7 +184,6 @@ resource "aws_ecs_service" "geo" {
     delete = "15m"
   }
   depends_on = [
-    terraform_data.draft_gate,
     aws_appconfig_deployment.review,
     aws_lb_listener_rule.geo,
     aws_lb_listener_rule.publisher,
