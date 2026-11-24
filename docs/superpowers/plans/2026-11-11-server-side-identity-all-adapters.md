@@ -544,7 +544,8 @@ posted them on 2026-11-13, and Part A's State records what changed since.
   its GPP capture in the injected script, in place of a separate `/_ts/consent`
   route wired into each adapter (DEC-16). #1532 takes its geo provider from
   EdgeZero's manifest once IABTechLab/edgezero#439 binds it, dropping
-  `TS_NATIVE_GEO_PROFILE_FILE`. The notes below were checked at the RC tag
+  `TS_NATIVE_GEO_PROFILE_FILE` (renamed `TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE` in
+  #1532 on 2026-11-23). The notes below were checked at the RC tag
   `v0.1.1-rc-axum.202611.2` (`7c6e68d94`), which contains every unit. They are
   forward-port notes: each applies to the PR that ports its unit to main, and
   Task 6 posts it there once that PR exists, checked at its head. On the RC unit

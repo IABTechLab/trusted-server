@@ -197,7 +197,9 @@ marks the record contract and geo as supported.
   name. State: main reads `TRUSTED_SERVER_CONFIG_*` and
   `TRUSTED_SERVER_SECRET_*`, which #1528 removes; the RC adds
   `TS_NATIVE_GEO_PROFILE_FILE`, `TS_NATIVE_BINDINGS_TOML` and
-  `TS_APPCONFIG_TOKEN`.
+  `TS_APPCONFIG_TOKEN`. On 2026-11-23 #1532 renamed the first to
+  `TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE`, which #1637 reads through
+  `runtime_env!`.
 - **AX-3 Trusted IP and geo.** The client IP comes only from trusted CloudFront
   and load balancer hops, IPv4 and IPv6. Country and US region come from
   CloudFront headers only from a trusted hop. The reference deployment enables
