@@ -35,6 +35,7 @@ const EXISTING_EC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 struct CountingProvider {
     capabilities: ProviderCapabilities,
     calls: Arc<AtomicUsize>,
+    sends_ec_id: bool,
 }
 
 impl IdentityProvider for CountingProvider {
@@ -58,10 +59,10 @@ impl IdentityProvider for CountingProvider {
         Ok(LookupOutcome::NoMatch)
     }
 
-    // Eligible on the request that mints the EC, so a fresh grant is a
-    // positive control for the refused requests.
+    // Without the EC ID the provider is eligible on the request that mints
+    // the EC, so a fresh grant is a positive control for the refused requests.
     fn sends_ec_id(&self) -> bool {
-        false
+        self.sends_ec_id
     }
 }
 
@@ -74,7 +75,10 @@ impl PlatformGeo for KnownGeo {
 }
 
 /// A complete identity app with one counting page provider and its record store.
-fn counting_app(calls: &Arc<AtomicUsize>) -> (Arc<IdentityApp>, Arc<InMemoryEcKv>) {
+fn counting_app(
+    calls: &Arc<AtomicUsize>,
+    sends_ec_id: bool,
+) -> (Arc<IdentityApp>, Arc<InMemoryEcKv>) {
     let mut settings = create_test_settings();
     settings.publisher.domain = "publisher.example.com".to_owned();
     settings.ec.partners = serde_json::from_value(json!([{
@@ -102,6 +106,7 @@ fn counting_app(calls: &Arc<AtomicUsize>) -> (Arc<IdentityApp>, Arc<InMemoryEcKv
             },
         },
         calls: Arc::clone(calls),
+        sends_ec_id,
     });
     let page = Arc::new(
         ProviderCoordinator::new(
@@ -205,7 +210,7 @@ async fn ec_route_refused_requests_without_identity_mint_nothing_and_call_no_pro
         ),
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (app, store) = counting_app(&calls);
+        let (app, store) = counting_app(&calls, false);
 
         let response = app
             .ec_route(
@@ -235,9 +240,11 @@ async fn ec_route_refused_requests_without_identity_mint_nothing_and_call_no_pro
 
 #[tokio::test(flavor = "current_thread")]
 async fn ec_route_refused_client_with_existing_identity_never_calls_page_provider() {
-    for allowed in [true, false] {
+    // A returning identity makes both a provider that sends the EC ID and one
+    // that does not eligible, so the refusal must hold for each.
+    for (allowed, sends_ec_id) in [(true, false), (false, false), (true, true), (false, true)] {
         let calls = Arc::new(AtomicUsize::new(0));
-        let (app, store) = counting_app(&calls);
+        let (app, store) = counting_app(&calls, sends_ec_id);
         let graph = app.identity_graph().expect("should have shared graph");
         let mut row = KvEntry::tombstone(crate::ec::current_timestamp());
         row.consent.ok = true;
@@ -263,7 +270,8 @@ async fn ec_route_refused_client_with_existing_identity_never_calls_page_provide
         assert_eq!(
             calls.load(Ordering::SeqCst),
             usize::from(allowed),
-            "should call the provider only for accepted trusted signals"
+            "should call the provider only for accepted trusted signals \
+             (sends_ec_id = {sends_ec_id})"
         );
         assert!(
             !response.headers().contains_key(header::SET_COOKIE),

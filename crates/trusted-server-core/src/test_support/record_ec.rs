@@ -6,13 +6,14 @@ use edgezero_core::body::Body;
 use edgezero_core::http::{Response, request_builder};
 
 use super::nextjs_auction::{self, NextJsAuctionOrigin};
-use crate::ec::EcContext;
-use crate::ec::finalize::ec_finalize_response;
+use crate::ec::eid_types::UnixSeconds;
+use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::kv::{KvIdentityGraph, UpsertResult};
 use crate::ec::kv_backend::{EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::KvEntry;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::sharedid::SharedIdRequest;
+use crate::ec::{EcContext, current_timestamp};
 use crate::platform::GeoInfo;
 
 /// Exercise concurrent identity updates, withdrawal and stale-token rejection.
@@ -77,14 +78,18 @@ pub async fn assert_record_ec_lifecycle<Store: EcKvStore + Clone + 'static>(p: &
     let registry = PartnerRegistry::from_config(&[]).expect("should create empty fixture registry");
     let mut response = Response::new(Body::empty());
     let sharedid = SharedIdRequest::default();
+    let finalize_request = FinalizeRequest {
+        eids_cookie: None,
+        sharedid: &sharedid,
+        now: Some(UnixSeconds::new(current_timestamp())),
+    };
     let (_, raced) = futures::join!(
         ec_finalize_response(
             &settings,
             &mut context,
             Some(&graph),
             &registry,
-            None,
-            &sharedid,
+            &finalize_request,
             &mut response
         ),
         graph.upsert_partner_id_if_exists(ec, "late.example", "late-uid"),

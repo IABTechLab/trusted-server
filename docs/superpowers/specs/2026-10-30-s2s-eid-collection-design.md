@@ -1491,13 +1491,19 @@ still due.
 - **The server reads it only to decide whether to set or expire it**, and
   never trusts it over KV. Readers on the page must drop UIDs whose `exp`
   has passed and strip `exp` before use.
-- **Expiry:** every mirrored UID carries `exp`, at most 30 days ahead. A UID
-  with a stated expiry keeps it (already clamped to 30 days when written). A
-  UID with no stated expiry (D7) is mirrored with `exp` = the start of the
-  current UTC day plus 30 days; KV still serves it until replaced or removed.
-  The value is therefore stable within a UTC day, and a returning reader
-  whose mirror holds such UIDs gets at most one mirror `Set-Cookie` per UTC
-  day.
+- **Expiry:** every mirrored UID carries `exp`, at most 30 days ahead (WB-4).
+  The cap is the start of the current UTC day plus 30 days. A UID with a
+  stated expiry is mirrored with the earlier of that expiry and the cap; a
+  UID with no stated expiry (D7) is mirrored with the cap, and KV still
+  serves it until replaced or removed. A mirror whose UIDs reach the cap is
+  therefore stable within a UTC day, and such a returning reader gets at
+  most one mirror `Set-Cookie` per UTC day. The `exp` counts toward the
+  3,584-byte budget, so UIDs that no longer fit are skipped as before.
+- **Clock:** the request time is read once per request and passed to the
+  mirror build. If the clock cannot be read, a navigation neither sets nor
+  re-sets the mirror, since UID liveness and `exp` depend on it; the consent
+  and vendor rules above can still expire it. The EC route's JSON is the
+  mirror decision of that same response, so it lists no EIDs then.
 
 ## 11. Consumers
 

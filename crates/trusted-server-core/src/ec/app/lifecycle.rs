@@ -13,13 +13,15 @@ use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use crate::ec::consent::ec_consent_withdrawn;
 use crate::ec::cookies::expire_ec_cookie;
 use crate::ec::device::DeviceSignals;
-use crate::ec::finalize::ec_finalize_response;
+use crate::ec::eid_types::UnixSeconds;
+use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_backend::EcKvStore;
+use crate::ec::mirror::MirrorCookie;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::SharedIdRequest;
-use crate::ec::{EcContext, EidSyncSource};
+use crate::ec::{EcContext, EidSyncSource, checked_current_timestamp};
 use crate::error::{TrustedServerError, http_error};
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
@@ -137,6 +139,10 @@ impl IdentityApp {
     /// Positive identity cookies are restricted to document and EC responses.
     /// Withdrawal expires the EC cookie on every finalized response, including
     /// when authoritative storage is unavailable.
+    ///
+    /// Reads the clock once for the request. Returns the mirror decision the
+    /// response carries, or `None` when the mirror cookie is left untouched or
+    /// the response is not eligible for identity cookies.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -144,7 +150,7 @@ impl IdentityApp {
         sharedid: &SharedIdRequest,
         use_store: bool,
         response: &mut Response,
-    ) {
+    ) -> Option<MirrorCookie> {
         let withdrawal = ec_consent_withdrawn(context.consent()) && context.cookie_was_present();
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
         // A document revalidation inherits the cached representation: 304
@@ -167,13 +173,16 @@ impl IdentityApp {
             let _ = context.take_navigation_permit();
         }
         let graph = self.identity_graph().filter(|_| use_store);
-        ec_finalize_response(
+        let mirror = ec_finalize_response(
             &self.settings,
             context,
             graph.as_ref(),
             &self.partners,
-            eids_cookie,
-            sharedid,
+            &FinalizeRequest {
+                eids_cookie,
+                sharedid,
+                now: checked_current_timestamp().map(UnixSeconds::new),
+            },
             response,
         )
         .await;
@@ -201,6 +210,7 @@ impl IdentityApp {
                 expire_ec_cookie(&self.settings, response);
             }
         }
+        mirror.filter(|_| eligible)
     }
 
     fn identity_cookie(&self, name: &str) -> bool {

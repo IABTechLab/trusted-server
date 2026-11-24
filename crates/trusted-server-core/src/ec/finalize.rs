@@ -56,31 +56,47 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// cookie, the browser response clears the EC cookie immediately and the KV
 /// tombstone is the authoritative revocation marker.
 ///
-/// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
-/// from the request *before* routing consumes it. `sharedid` carries the
-/// request's `SharedID` cookies; on a navigation the response writes them
-/// back from the EC record under the `SharedID` consent rules.
+/// `request` carries the inputs read from the request before routing (see
+/// [`FinalizeRequest`]).
+///
+/// Returns the mirror decision applied to the response, or `None` when the
+/// mirror cookie is left untouched. A [`MirrorCookie::Set`] is returned even
+/// when the request already carried that value and no `Set-Cookie` is sent.
 pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
-    eids_cookie: Option<&str>,
-    sharedid: &SharedIdRequest,
+    request: &FinalizeRequest<'_>,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<MirrorCookie> {
     let navigation = finalize_response_inner(
         settings,
         ec_context,
         kv,
         registry,
-        eids_cookie,
-        sharedid,
+        request.eids_cookie,
+        request.sharedid,
         response,
     )
     .await;
-    apply_mirror(ec_context, registry, navigation, response);
+    let mirror = apply_mirror(ec_context, registry, navigation, request.now, response);
     expire_retired_pull_marker(ec_context, response);
+    mirror
+}
+
+/// Request inputs [`ec_finalize_response`] reads besides the [`EcContext`].
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeRequest<'a> {
+    /// The raw value of the `ts-eids` cookie, extracted from the request
+    /// *before* routing consumes it.
+    pub eids_cookie: Option<&'a str>,
+    /// The request's `SharedID` cookies; on a navigation the response writes
+    /// them back from the EC record under the `SharedID` consent rules.
+    pub sharedid: &'a SharedIdRequest,
+    /// The time the mirror is built at, read once per request; `None` when
+    /// the clock could not be read.
+    pub now: Option<UnixSeconds>,
 }
 
 /// Sets or expires the mirror cookie (spec §10). Best effort.
@@ -95,27 +111,39 @@ pub async fn ec_finalize_response(
 /// its value differs from the one the request carried, so responses that
 /// leave the mirror as it was stay free of `Set-Cookie` and keep their
 /// cacheability. An unchanged mirror is therefore not re-extended; once it
-/// lapses, the next navigation sets it again. A UID without a stated expiry
-/// is mirrored with an `exp` 30 days after the start of the current UTC day,
-/// so a returning reader whose mirror holds such UIDs gets at most one
-/// mirror `Set-Cookie` per UTC day.
+/// lapses, the next navigation sets it again. Every UID's `exp` is capped at
+/// the start of the current UTC day plus 30 days, so a returning reader whose
+/// mirror holds UIDs at that cap gets at most one mirror `Set-Cookie` per UTC
+/// day.
+///
+/// A navigation whose clock read failed (`now` is `None`) cannot rebuild the
+/// mirror, since UID liveness and `exp` depend on the time, so it is never
+/// set or re-set then.
 ///
 /// Where the mirror cannot be rebuilt (non-navigations, or a navigation
-/// without a readable row), a carried mirror is expired when the request
+/// without a readable row or a clock), a carried mirror is expired when the request
 /// denies TCF vendor consent to a vendor gating any mirrored partner it holds,
 /// when a provider excludes such a partner's source on this GDPR visit, or
 /// when a provider's cookies on this request record an opt-out for it;
 /// otherwise it is left untouched.
+///
+/// Returns the decision, or `None` when the cookie is left untouched. A
+/// [`MirrorCookie::Set`] is returned even when the carried value already
+/// matches and no `Set-Cookie` is emitted.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
     navigation: bool,
+    now: Option<UnixSeconds>,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<MirrorCookie> {
     let decision = if !mirror_consent(ec_context.consent()) {
         MirrorCookie::Expire
-    } else if navigation && let Some(row) = mirror_row(ec_context) {
-        build_mirror(row, ec_context, registry, mirror_now())
+    } else if navigation
+        && let Some(row) = mirror_row(ec_context)
+        && let Some(now) = now
+    {
+        build_mirror(row, ec_context, registry, now)
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
         // provider whose TCF vendor consent is now denied, whose source is
@@ -123,11 +151,13 @@ fn apply_mirror(
         MirrorCookie::Expire
     } else {
         if navigation {
-            log::debug!("Leaving the mirror cookie untouched: identity row is unavailable");
+            log::debug!(
+                "Leaving the mirror cookie untouched: identity row or clock is unavailable"
+            );
         }
-        return;
+        return None;
     };
-    match decision {
+    match &decision {
         MirrorCookie::Set(value) if ec_context.mirror_cookie() == Some(value.as_str()) => {}
         MirrorCookie::Set(value) => append_cookie(
             response,
@@ -144,15 +174,7 @@ fn apply_mirror(
         }
         MirrorCookie::Expire => {}
     }
-}
-
-/// The time the mirror is built at: the clock, or the time a test pins.
-fn mirror_now() -> UnixSeconds {
-    #[cfg(test)]
-    if let Some(now) = tests::MIRROR_NOW.get() {
-        return now;
-    }
-    UnixSeconds::new(current_timestamp())
+    Some(decision)
 }
 
 /// Whether the request carries a mirror that holds UIDs of a mirrored partner
@@ -756,7 +778,6 @@ mod tests {
 
     use base64::Engine as _;
 
-    use std::cell::Cell;
     use std::num::NonZeroU16;
     use std::rc::Rc;
     use std::sync::Mutex;
@@ -787,29 +808,11 @@ mod tests {
     use crate::test_support::tests::consent_granting_vendors;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
 
-    thread_local! {
-        /// The time [`mirror_now`] returns while a [`PinnedMirrorClock`] lives.
-        pub(super) static MIRROR_NOW: Cell<Option<UnixSeconds>> = const { Cell::new(None) };
-    }
-
-    /// Start of a UTC day, for tests that pin the mirror clock.
+    /// Start of a UTC day, for tests that fix the request time.
     const MIRROR_DAY_START: u64 = 1_767_225_600;
 
-    /// Pins the mirror clock on this thread until dropped.
-    struct PinnedMirrorClock;
-
-    impl PinnedMirrorClock {
-        fn at(now: u64) -> Self {
-            MIRROR_NOW.set(Some(UnixSeconds::new(now)));
-            Self
-        }
-    }
-
-    impl Drop for PinnedMirrorClock {
-        fn drop(&mut self) {
-            MIRROR_NOW.set(None);
-        }
-    }
+    /// The request time tests finalize at: a minute into [`MIRROR_DAY_START`].
+    const NOW: Option<UnixSeconds> = Some(UnixSeconds::new(MIRROR_DAY_START + 60));
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()
@@ -956,8 +959,11 @@ mod tests {
             &mut ec_context,
             Some(&kv),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1011,8 +1017,11 @@ mod tests {
             &mut ec_context,
             Some(&kv),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1068,8 +1077,11 @@ mod tests {
             &mut ec_context,
             Some(&kv),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1115,8 +1127,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1168,8 +1183,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1203,8 +1221,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1238,8 +1259,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1281,8 +1305,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1345,8 +1372,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1396,8 +1426,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1457,8 +1490,11 @@ mod tests {
                 &mut ec_context,
                 Some(&graph),
                 &registry,
-                None,
-                &SharedIdRequest::with_value_for_test(cookie_id),
+                &FinalizeRequest {
+                    eids_cookie: None,
+                    sharedid: &SharedIdRequest::with_value_for_test(cookie_id),
+                    now: NOW,
+                },
                 &mut response,
             )
             .await;
@@ -1500,8 +1536,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::with_value_for_test("generated-cookie-id"),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::with_value_for_test("generated-cookie-id"),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1552,8 +1591,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1631,8 +1673,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            Some(&eids_cookie),
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: Some(&eids_cookie),
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1688,8 +1733,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            sharedid,
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid,
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -1787,8 +1835,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &case.sharedid,
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &case.sharedid,
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2183,8 +2234,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2250,8 +2304,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2298,8 +2355,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::with_value_for_test("fallback-cookie-id"),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::with_value_for_test("fallback-cookie-id"),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2340,8 +2400,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::with_value_for_test("shared-cookie-id"),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2390,8 +2453,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2439,8 +2505,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2500,8 +2569,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2550,8 +2622,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2582,8 +2657,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2606,8 +2684,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2643,8 +2724,11 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2717,6 +2801,16 @@ mod tests {
         run_mirror_request(lookups, mirror, kv_read_failed, true).await
     }
 
+    /// Runs a mirror navigation at request time `now`, returning the response
+    /// and the mirror decision finalize reports.
+    async fn run_mirror_navigation_at(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        now: Option<UnixSeconds>,
+    ) -> (Response<EdgeBody>, Option<MirrorCookie>) {
+        run_mirror_request_at(lookups, mirror, false, true, MirrorGate::Open, now).await
+    }
+
     async fn run_mirror_request(
         lookups: LookupResults,
         mirror: Option<&str>,
@@ -2756,6 +2850,21 @@ mod tests {
         navigation: bool,
         gate: MirrorGate,
     ) -> Response<EdgeBody> {
+        run_mirror_request_at(lookups, mirror, kv_read_failed, navigation, gate, NOW)
+            .await
+            .0
+    }
+
+    /// Runs a mirror request at request time `now` with the source withheld
+    /// as `gate` says, returning the response and the mirror decision.
+    async fn run_mirror_request_at(
+        lookups: LookupResults,
+        mirror: Option<&str>,
+        kv_read_failed: bool,
+        navigation: bool,
+        gate: MirrorGate,
+        now: Option<UnixSeconds>,
+    ) -> (Response<EdgeBody>, Option<MirrorCookie>) {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mirr01");
         let graph = KvIdentityGraph::in_memory("mirror_store");
@@ -2804,17 +2913,20 @@ mod tests {
         registry.mark_provider_owned("ids.example.com", owner_vendor);
         let mut response = empty_response();
 
-        ec_finalize_response(
+        let decision = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now,
+            },
             &mut response,
         )
         .await;
-        response
+        (response, decision)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2952,8 +3064,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -2970,7 +3085,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn partial_vendor_denial_keeps_a_mirror_without_the_denied_vendor() {
         // Arrange
-        let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 60);
         let navigation = run_split_vendor_mirror_request(None, true).await;
         let set = mirror_cookies(&navigation);
         assert_eq!(set.len(), 1, "should set the mirror on navigation");
@@ -3000,8 +3114,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_expiry_mirror_is_kept_within_a_utc_day_and_re_set_once_on_the_next() {
         // Arrange
-        let first_clock = PinnedMirrorClock::at(MIRROR_DAY_START + 60);
-        let first = run_mirror_navigation(provider_found("ids.example.com"), None, false).await;
+        let at = |seconds: u64| Some(UnixSeconds::new(MIRROR_DAY_START + seconds));
+        let (first, _) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), None, at(60)).await;
         let set = mirror_cookies(&first);
         assert_eq!(
             set.len(),
@@ -3009,17 +3124,17 @@ mod tests {
             "should set the mirror on the first navigation"
         );
         let value = mirror_value(&set[0]).to_owned();
-        drop(first_clock);
 
         // Act
-        let same_day = {
-            let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 86_399);
-            run_mirror_navigation(provider_found("ids.example.com"), Some(&value), false).await
-        };
-        let next_day = {
-            let _clock = PinnedMirrorClock::at(MIRROR_DAY_START + 86_400 + 60);
-            run_mirror_navigation(provider_found("ids.example.com"), Some(&value), false).await
-        };
+        let (same_day, _) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), Some(&value), at(86_399))
+                .await;
+        let (next_day, _) = run_mirror_navigation_at(
+            provider_found("ids.example.com"),
+            Some(&value),
+            at(86_400 + 60),
+        )
+        .await;
 
         // Assert
         assert!(
@@ -3136,17 +3251,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_with_an_unchanged_mirror_emits_no_cookie() {
-        // Arrange
+        // Arrange: every navigation runs at the fixed request time `NOW`, so
+        // the mirror's `exp` cannot move between them.
         let first = run_mirror_navigation(provider_found("ids.example.com"), None, false).await;
         let set = mirror_cookies(&first);
-        let value = set[0]
-            .strip_prefix("__Host-ts-eids-mirror=")
-            .and_then(|rest| rest.split(';').next())
-            .expect("should set a mirror value");
+        let value = mirror_value(&set[0]);
 
         // Act
-        let unchanged =
-            run_mirror_navigation(provider_found("ids.example.com"), Some(value), false).await;
+        let (unchanged, decision) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), Some(value), NOW).await;
         let changed =
             run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), false).await;
 
@@ -3155,10 +3268,49 @@ mod tests {
             mirror_cookies(&unchanged).is_empty(),
             "should not re-set a mirror whose value is unchanged"
         );
+        assert!(
+            matches!(&decision, Some(MirrorCookie::Set(kept)) if kept.as_str() == value),
+            "should still report the unchanged mirror as the response's mirror"
+        );
         assert_eq!(
             mirror_cookies(&changed).len(),
             1,
             "should set the mirror when its value changed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clock_failure_leaves_the_mirror_untouched_on_a_navigation() {
+        // Act
+        let (fresh, fresh_decision) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), None, None).await;
+        let (carried, carried_decision) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), Some("stale"), None).await;
+        let (denied, denied_decision) = run_mirror_request_at(
+            provider_found("ids.example.com"),
+            Some("stale"),
+            false,
+            true,
+            MirrorGate::VendorDenied,
+            None,
+        )
+        .await;
+
+        // Assert
+        assert!(
+            mirror_cookies(&fresh).is_empty() && fresh_decision.is_none(),
+            "should not set the mirror without a clock"
+        );
+        assert!(
+            mirror_cookies(&carried).is_empty() && carried_decision.is_none(),
+            "should not re-set a carried mirror without a clock"
+        );
+        let denied_cookies = mirror_cookies(&denied);
+        assert!(
+            denied_cookies.len() == 1
+                && denied_cookies[0].contains("Max-Age=0")
+                && denied_decision == Some(MirrorCookie::Expire),
+            "should still expire a mirror holding a denied vendor's UIDs without a clock"
         );
     }
 
@@ -3212,8 +3364,11 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3242,8 +3397,11 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3321,8 +3479,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3349,8 +3510,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3376,8 +3540,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3405,8 +3572,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3451,8 +3621,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3513,8 +3686,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3549,8 +3725,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut repeated_response,
         )
         .await;
@@ -3599,8 +3778,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3647,8 +3829,11 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3677,8 +3862,11 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3732,8 +3920,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("partner.example.com"),
-            Some(&cookie),
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3770,8 +3961,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("partner.example.com"),
-            Some(&cookie),
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3813,8 +4007,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("partner.example.com"),
-            Some(&cookie),
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3848,8 +4045,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3886,8 +4086,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -3928,8 +4131,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4046,8 +4252,11 @@ mod tests {
             &mut ec_context,
             Some(graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4119,8 +4328,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4202,8 +4414,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("provider.example.com"),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4242,8 +4457,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("provider.example.com"),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4313,8 +4531,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4346,8 +4567,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4377,8 +4601,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4419,8 +4646,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("partner.example.com"),
-            Some(&cookie),
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4452,8 +4682,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4483,8 +4716,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4515,8 +4751,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;
@@ -4581,8 +4820,11 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry_for("provider.example.com"),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: NOW,
+            },
             &mut response,
         )
         .await;

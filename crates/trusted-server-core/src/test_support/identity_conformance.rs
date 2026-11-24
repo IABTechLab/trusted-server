@@ -1370,6 +1370,19 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let mirrored = adapter.exchange(&post);
     let mirror: serde_json::Value =
         serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let cookie_mirror: serde_json::Value = mirrored
+        .response
+        .cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("__Host-ts-eids-mirror="))
+        .and_then(|cookie| cookie.split(';').next())
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .expect("should set a decodable mirror cookie on the EC POST");
+    assert_eq!(
+        mirror, cookie_mirror,
+        "should answer the EC POST with the mirror its cookie carries"
+    );
     let mut eids = mirror["eids"].clone();
     let exp = eids[0]["uids"][0]
         .as_object_mut()
@@ -1526,9 +1539,26 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     verify_ec_route_sequence(adapter, store, tcf);
 }
 
+/// Removes every key from the store, a listing page at a time.
+///
+/// # Panics
+///
+/// Panics if a listed key cannot be deleted or survives its deletion, so a
+/// store that does not shrink fails instead of looping.
 fn clear_store(store: &RecordingStore) {
-    for key in block_on(store.list_keys_with_prefix("", 100)).expect("should list fixture keys") {
-        block_on(store.delete(&key)).expect("should remove isolated fixture key");
+    loop {
+        let keys =
+            block_on(store.list_keys_with_prefix("", 100)).expect("should list fixture keys");
+        if keys.is_empty() {
+            return;
+        }
+        for key in keys {
+            block_on(store.delete(&key)).expect("should remove isolated fixture key");
+            assert!(
+                !block_on(store.key_exists(&key)).expect("should check the removed key"),
+                "should remove fixture key {key}"
+            );
+        }
     }
 }
 
@@ -1561,12 +1591,11 @@ fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, 
     let opted_out = adapter.exchange(&ec_post(grant.clone(), Some("_pubcid_optout=1".to_owned())));
     let identity = assert_created(&opted_out.response, store);
     assert!(
-        !opted_out
-            .response
-            .cookies
-            .iter()
-            .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0")),
-        "should set no SharedID for a reader with _pubcid_optout: {:?}",
+        !opted_out.response.cookies.iter().any(|cookie| {
+            (cookie.starts_with("_pubcid=") || cookie.starts_with("_pubcid_cst="))
+                && !cookie.contains("Max-Age=0")
+        }),
+        "should set neither _pubcid nor _pubcid_cst for a reader with _pubcid_optout: {:?}",
         opted_out.response.cookies
     );
     assert!(
@@ -1656,26 +1685,24 @@ fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, 
 fn assert_sharedid_cookies(response: &Observation) -> String {
     let attributes =
         "; Domain=.publisher.example.com; Path=/; Secure; SameSite=Lax; Max-Age=31536000";
-    let find = |name: &str| {
-        response
+    let value = |name: &str| {
+        let (value, rest) = response
             .cookies
             .iter()
             .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")))
-            .expect("should set the SharedID cookie and its companion")
-    };
-    let mut values = Vec::new();
-    for name in ["_pubcid", "_pubcid_cst"] {
-        let cookie = find(name);
-        let (value, rest) = cookie.split_once(';').expect("should carry attributes");
+            .and_then(|cookie| cookie.split_once(';'))
+            .expect("should set the cookie with attributes");
         assert_eq!(
             format!(";{rest}"),
             attributes,
             "should set {name} readable by Prebid, Secure and Lax for one year"
         );
         assert!(!value.is_empty(), "should set a non-empty {name}");
-        values.push(value.to_owned());
-    }
-    values.swap_remove(0)
+        value.to_owned()
+    };
+    let sharedid = value("_pubcid");
+    value("_pubcid_cst");
+    sharedid
 }
 
 fn identity_cookie_names(response: &Observation) -> Vec<&str> {

@@ -360,7 +360,11 @@ tombstones the existing record and expires identity cookies on this response.
 If authoritative withdrawal cannot be persisted, it returns `503` while still
 clearing the browser identity, so the caller can retry reconciliation.
 The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
-excluding expired, non-mirrored and vendor-denied IDs.
+excluding expired, non-mirrored and vendor-denied IDs. It is the mirror this
+response leaves the browser with, the same value as the
+`__Host-ts-eids-mirror` cookie set or kept on it. It lists no EIDs when the
+response expires the mirror or leaves it untouched because the record or the
+clock could not be read.
 
 `GET` returns an empty `204` and can restore an existing SharedID cookie from
 its record only when current EC and EID permission both allow. It never
