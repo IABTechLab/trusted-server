@@ -114,6 +114,7 @@ struct FastlyAdapter {
     store: RecordingStore,
     forwarding: Forwarding,
     geo_configured: bool,
+    stale_origin_geo: bool,
 }
 
 impl FastlyAdapter {
@@ -135,6 +136,7 @@ impl FastlyAdapter {
             store,
             forwarding: Forwarding::Trusted,
             geo_configured: false,
+            stale_origin_geo: false,
         }
     }
 }
@@ -204,6 +206,13 @@ impl FastlyAdapter {
                 } else {
                     reply.header("content-type", mime)
                 };
+                let reply = if self.stale_origin_geo {
+                    reply
+                        .header("x-geo-country", "DE")
+                        .header("x-geo-region", "BE")
+                } else {
+                    reply
+                };
                 if geo_request.is_some_and(|request| request.kind == geo_consent::Kind::Document) {
                     reply.body(
                         "<html><head></head><body><div id=\"example-slot\"></div></body></html>",
@@ -267,7 +276,13 @@ impl FastlyAdapter {
                 api.method.as_str(),
                 format!("https://publisher.example.com{}", api.path),
             );
-            request.set_header("user-agent", USER_AGENT);
+            if !api
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            {
+                request.set_header("user-agent", USER_AGENT);
+            }
             for (name, value) in &api.headers {
                 request.append_header(name.as_str(), value.as_str());
             }
@@ -514,6 +529,69 @@ impl geo_consent::Adapter for FastlyAdapter {
 fn geo_consent_fastly() {
     let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
     geo_consent::verify(&mut adapter, false, false);
+    verify_deferred_stale_origin_headers(&mut adapter);
+}
+
+fn verify_deferred_stale_origin_headers(adapter: &mut FastlyAdapter) {
+    // Pin today's deferred response-header behavior, while proving that neither
+    // consent decision consumes these stale origin facts. A future clearing
+    // fix must update this assertion deliberately. Deferral:
+    // https://github.com/IABTechLab/trusted-server/pull/1532#discussion_r4569600903
+    adapter.stale_origin_geo = true;
+    for signal in [geo_consent::Signal::None, geo_consent::Signal::Purpose1] {
+        let result = geo_consent::Adapter::exchange(
+            adapter,
+            &Exchange {
+                location: *geo_consent::LOCATIONS
+                    .iter()
+                    .find(|location| location.name == "missing")
+                    .expect("should find no-location row"),
+                signal,
+                kind: geo_consent::Kind::Document,
+                ec: None,
+            },
+        );
+        assert_eq!(
+            result.status,
+            StatusCode::OK,
+            "should preserve publisher response"
+        );
+        assert_eq!(
+            result.headers["x-geo-info-available"], "false",
+            "should report no trusted location"
+        );
+        assert_eq!(
+            result
+                .headers
+                .get("x-geo-country")
+                .and_then(|value| value.to_str().ok()),
+            Some("DE"),
+            "should explicitly preserve deferred origin country behavior"
+        );
+        assert_eq!(
+            result
+                .headers
+                .get("x-geo-region")
+                .and_then(|value| value.to_str().ok()),
+            Some("BE"),
+            "should explicitly preserve deferred origin region behavior"
+        );
+        assert!(
+            !result.headers.contains_key("set-cookie"),
+            "should refuse EC creation despite stale origin country"
+        );
+        assert_eq!(
+            result.bids.len(),
+            usize::from(signal == geo_consent::Signal::Purpose1),
+            "should apply Unknown auction policy despite stale origin country"
+        );
+        for bid in result.bids {
+            assert!(
+                bid["device"]["geo"].is_null(),
+                "should not export stale origin geography"
+            );
+        }
+    }
 }
 
 #[test]

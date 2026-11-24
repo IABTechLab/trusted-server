@@ -135,6 +135,16 @@ Unusable Fastly country codes are rejected at that conversion boundary, before
 any consumer receives a location. Fastly still uses its own local lookup rather
 than `ctx.geo()`.
 
+The mapped Fastly test also explicitly pins a known deferred exception: a
+no-location document whose origin supplies `x-geo-country: DE` and
+`x-geo-region: BE` currently retains those headers alongside
+`x-geo-info-available: false`. EC/auction assertions still require Unknown and
+no outbound device geo. This is the [#1532 deferral](https://github.com/IABTechLab/trusted-server/pull/1532#discussion_r4569600903),
+not an ignored failing test; a future header-clearing fix must update the
+passing current-behavior assertion deliberately. Repository browser/CMP/auction
+sources contain no consumer of these response geo headers; Didomi constructs
+outbound geo from the trusted service instead.
+
 To add an adapter, implement
 `trusted_server_core::test_support::geo_consent::Adapter`: send the raw request
 through real routing, ingress trust and finalization; consume the body; return
