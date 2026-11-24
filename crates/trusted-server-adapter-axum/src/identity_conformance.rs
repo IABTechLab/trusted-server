@@ -1,14 +1,24 @@
 //! Portable identity scenarios through the real Axum router and finalizer.
 
+use std::cell::RefCell;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use edgezero_core::after_response::{AfterResponseHandle, AfterResponseScheduler};
 use edgezero_core::body::Body;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method, Request, StatusCode, header, request_builder};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::router::RouterService;
 use error_stack::Report;
 use futures::executor::block_on;
+use futures::future::LocalBoxFuture;
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::normalize_ec_id_for_kv;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
@@ -17,8 +27,9 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
-    Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
-    verify_failed_ec_creation, verify_http_contract,
+    Scenario, configure_api_request, configure_http_fixture, tcf_consent_cookie,
+    verify_api_identity_expiries, verify_failed_ec_creation, verify_http_contract,
+    verify_identity_gates,
 };
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
@@ -156,7 +167,7 @@ impl AxumAdapter {
             .build();
         let mut configured = settings();
         if let Some(api) = api {
-            configured.auction.enabled = api.auction_enabled;
+            configure_api_request(&mut configured, api);
         }
         let router = if api.is_some_and(|request| !request.store_enabled) {
             TrustedServerApp::routes_with_settings_and_services(configured, services)
@@ -249,6 +260,7 @@ impl AxumAdapter {
                 body,
             },
             origin_requests: origin.requests().len(),
+            outbound: origin.requests(),
             cache_control,
             edge_cache_headers_present,
         }
@@ -278,79 +290,380 @@ fn identity_conformance_axum() {
 }
 
 #[test]
+fn identity_gates_axum() {
+    let store = RecordingStore::new(false);
+    verify_identity_gates(
+        &mut AxumAdapter {
+            store: store.clone(),
+        },
+        &store,
+    );
+}
+
+#[test]
 fn api_identity_expiries_axum() {
     verify_api_identity_expiries(&mut AxumAdapter {
         store: RecordingStore::new(false),
     });
 }
 
-#[test]
-fn redirect_cancels_page_lookups_without_waiting() {
-    let clock = TestClock::new();
-    let client = ScriptedHttpClient::new(&clock);
-    client.respond_to(
-        Method::GET,
-        ORIGIN,
-        ScriptedReply::status(StatusCode::FOUND).header("content-type", "text/html"),
-    );
-    client.respond_to(Method::POST, "https://id5.example.com/gs/v2/1234.json",
-        ScriptedReply::status(StatusCode::OK).body(serde_json::json!({"universal_uid":"example-id", "signature":"", "cache_control":{"max_age_sec":3600}}).to_string()).after(std::time::Duration::from_secs(1)));
-    let services = RuntimeServices::builder()
-        .config_store(Arc::new(UnusedStores))
-        .secret_store(Arc::new(UnusedStores))
-        .kv_store(Arc::new(UnavailableKvStore))
-        .outbound_client(client.http_client())
-        .clock(clock.monotonic_clock())
-        .geo(Arc::new(FixtureGeo(Geo::UsCalifornia)))
-        .client_info(ClientInfo {
-            client_ip: Some("192.0.2.7".parse().expect("should parse IP")),
-            ..ClientInfo::default()
-        })
-        .build();
-    let mut configured = settings();
-    configured.ec.identity_budget_ms = 200;
-    configured.ec.identity_providers = vec![serde_json::from_value(serde_json::json!({
-        "id":"id5", "kind":"id5", "endpoint":"https://id5.example.com/gs/v2",
-        "allowed_domains":["id5.example.com"], "sources":["id5.example.com"], "settings":{"partner_id":1234}
-    })).expect("should configure ID5")];
-    configured.ec.partners = serde_json::from_value(serde_json::json!([{"name":"Example identity", "source_domain":"id5.example.com", "bidstream_enabled":true}])).expect("should configure partner");
-    let store = RecordingStore::new(false);
-    let router = TrustedServerApp::routes_with_settings_services_and_ec_store(
-        configured,
-        services,
-        store.clone(),
-    )
-    .expect("should build router");
-    let mut request = request_builder()
+/// The page-lookup budget of the provider fixtures.
+const IDENTITY_BUDGET: Duration = Duration::from_millis(200);
+/// The UID the fixture's ID5 endpoint answers with.
+const ID5_UID: &str = "example-id5-uid";
+
+thread_local! {
+    /// After-response tasks the capturing scheduler holds, in schedule order.
+    static HELD_TASKS: RefCell<Vec<LocalBoxFuture<'static, ()>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Holds every after-response task on the test thread until the test runs it,
+/// so a later request can be handled while the earlier task is pending.
+struct HoldingScheduler;
+
+impl AfterResponseScheduler for HoldingScheduler {
+    fn schedule(
+        &self,
+        _budget: Duration,
+        task: LocalBoxFuture<'static, ()>,
+    ) -> Result<(), EdgeError> {
+        HELD_TASKS.with_borrow_mut(|tasks| tasks.push(task));
+        Ok(())
+    }
+}
+
+/// The real Axum router with an ID5 provider for a mirrored partner, whose
+/// lookups the scripted client answers after `id5_delay`.
+struct ProviderFixture {
+    clock: TestClock,
+    client: ScriptedHttpClient,
+    store: RecordingStore,
+    router: RouterService,
+}
+
+impl ProviderFixture {
+    fn new(origin_status: StatusCode, id5_delay: Duration, collect: &str, geo: Geo) -> Self {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::GET,
+            ORIGIN,
+            ScriptedReply::status(origin_status)
+                .header("content-type", "text/html")
+                .body(DOCUMENT),
+        );
+        client.respond_to(
+            Method::POST,
+            "https://id5.example.com/gs/v2/1234.json",
+            ScriptedReply::status(StatusCode::OK)
+                .body(
+                    serde_json::json!({"universal_uid": ID5_UID, "signature":"",
+                        "cache_control":{"max_age_sec":3600}})
+                    .to_string(),
+                )
+                .after(id5_delay),
+        );
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(UnusedStores))
+            .secret_store(Arc::new(UnusedStores))
+            .kv_store(Arc::new(UnavailableKvStore))
+            .outbound_client(client.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(FixtureGeo(geo)))
+            .client_info(ClientInfo {
+                client_ip: Some("192.0.2.7".parse().expect("should parse IP")),
+                ..ClientInfo::default()
+            })
+            .build();
+        let mut configured = settings();
+        configured.ec.identity_budget_ms =
+            u64::try_from(IDENTITY_BUDGET.as_millis()).expect("should fit the budget");
+        configured.ec.identity_providers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id":"id5", "kind":"id5", "endpoint":"https://id5.example.com/gs/v2",
+                "allowed_domains":["id5.example.com"], "sources":["id5.example.com"],
+                "collect": collect, "settings":{"partner_id":1234}
+            }))
+            .expect("should configure ID5"),
+        ];
+        configured.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"Example identity", "source_domain":"id5.example.com",
+                "bidstream_enabled":true, "mirror_enabled":true
+            }))
+            .expect("should configure partner"),
+        );
+        let store = RecordingStore::new(false);
+        let router = TrustedServerApp::routes_with_settings_services_and_ec_store(
+            configured,
+            services,
+            store.clone(),
+        )
+        .expect("should build router");
+        Self {
+            clock,
+            client,
+            store,
+            router,
+        }
+    }
+
+    /// Sends `request` through the router and returns the response with how
+    /// long the test clock advanced while it was handled.
+    fn send(&self, mut request: Request) -> (edgezero_core::http::Response, Duration) {
+        request.extensions_mut().insert(RuntimeRequestOrigin::new(
+            InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+                .expect("should validate origin"),
+        ));
+        request
+            .extensions_mut()
+            .insert(AfterResponseHandle::new(HoldingScheduler));
+        let timer = self.clock.monotonic_clock();
+        let started = timer.now();
+        let response = self
+            .clock
+            .drive(self.router.clone().oneshot(request))
+            .expect("should dispatch the request");
+        (response, timer.now().duration_since(started))
+    }
+
+    fn id5_lookups(&self) -> usize {
+        self.client
+            .requests()
+            .iter()
+            .filter(|request| request.uri.host() == Some("id5.example.com"))
+            .count()
+    }
+
+    fn record(&self, identity: &str) -> trusted_server_core::ec::kv_types::KvEntry {
+        block_on(KvIdentityGraph::new(self.store.clone()).get(&normalize_ec_id_for_kv(identity)))
+            .expect("should read the identity record")
+            .expect("should retain the identity record")
+            .0
+    }
+}
+
+fn navigation() -> Request {
+    request_builder()
         .method(Method::GET)
         .uri("https://publisher.example.com/article")
         .header("sec-fetch-dest", "document")
         .header("sec-fetch-mode", "navigate")
+        .header(header::ACCEPT, "text/html")
         .header(header::USER_AGENT, USER_AGENT)
         .header(header::COOKIE, "us_privacy=1YNN")
         .body(Body::empty())
-        .expect("should build navigation");
-    request.extensions_mut().insert(RuntimeRequestOrigin::new(
-        InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
-            .expect("should validate origin"),
+        .expect("should build navigation")
+}
+
+fn ec_post(tcf_cookie: &str, cookie: &str) -> Request {
+    let tc_string = tcf_cookie
+        .strip_prefix("euconsent-v2=")
+        .expect("should encode TCF");
+    request_builder()
+        .method(Method::POST)
+        .uri("https://publisher.example.com/_ts/api/v1/ec")
+        .header(header::ORIGIN, "https://publisher.example.com")
+        .header(header::USER_AGENT, USER_AGENT)
+        .header(header::COOKIE, cookie)
+        .body(Body::from(
+            serde_json::json!({"tcString": tc_string, "applicableSections": []}).to_string(),
+        ))
+        .expect("should build EC POST")
+}
+
+fn set_cookies(response: &edgezero_core::http::Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .expect("should decode response cookie")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The live value of cookie `name` the response sets, if any.
+fn set_value(response: &edgezero_core::http::Response, name: &str) -> Option<String> {
+    set_cookies(response).iter().find_map(|cookie| {
+        cookie
+            .strip_prefix(&format!("{name}="))
+            .and_then(|rest| rest.split(';').next())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn decoded_mirror(response: &edgezero_core::http::Response) -> Option<String> {
+    set_value(response, "__Host-ts-eids-mirror").map(|value| {
+        String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(value)
+                .expect("should encode the mirror as unpadded base64url"),
+        )
+        .expect("should encode the mirror as UTF-8 JSON")
+    })
+}
+
+#[test]
+fn page_lookup_within_the_deadline_reaches_the_record_and_the_mirror_cookie() {
+    // Arrange
+    let fixture = ProviderFixture::new(
+        StatusCode::OK,
+        IDENTITY_BUDGET / 4,
+        "page",
+        Geo::UsCalifornia,
+    );
+
+    // Act
+    let (response, held) = fixture.send(navigation());
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK, "should serve the page");
+    assert_eq!(fixture.id5_lookups(), 1, "should look up ID5 on navigation");
+    let identity = set_value(&response, "ts-ec").expect("should issue an EC");
+    assert_eq!(
+        fixture
+            .record(&identity)
+            .ids
+            .get("id5.example.com")
+            .map(|id| id.uid.as_str()),
+        Some(ID5_UID),
+        "should write the ID5 UID in the navigation's page-load write"
+    );
+    let mirror = decoded_mirror(&response)
+        .expect("should set the mirror cookie on the navigation's response");
+    assert!(
+        mirror.contains(ID5_UID) && mirror.contains("id5.example.com"),
+        "should mirror the ID5 UID found on this navigation, got {mirror}"
+    );
+    assert!(
+        held <= IDENTITY_BUDGET,
+        "should not hold the response past the lookup deadline, held {held:?}"
+    );
+}
+
+#[test]
+fn page_lookup_past_the_deadline_is_skipped_without_delaying_the_response() {
+    // Arrange
+    let fixture = ProviderFixture::new(
+        StatusCode::OK,
+        IDENTITY_BUDGET * 5,
+        "page",
+        Geo::UsCalifornia,
+    );
+
+    // Act
+    let (response, held) = fixture.send(navigation());
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK, "should serve the page");
+    assert_eq!(fixture.id5_lookups(), 1, "should look up ID5 on navigation");
+    let identity = set_value(&response, "ts-ec").expect("should issue an EC");
+    assert!(
+        !fixture
+            .record(&identity)
+            .ids
+            .contains_key("id5.example.com"),
+        "should skip a provider that misses the deadline"
+    );
+    assert_eq!(
+        decoded_mirror(&response),
+        None,
+        "should set no mirror cookie from a skipped lookup"
+    );
+    assert!(
+        held <= IDENTITY_BUDGET,
+        "should release the response at the deadline, held {held:?}"
+    );
+}
+
+/// ID-9: grant A arrives with no EC while its ID5 lookup is slower than the
+/// deadline, and the script sends withdrawal B once A answers. A leaves no
+/// provider work behind its response, so nothing can revive A's record after
+/// B withdraws it, and B leaves no identity cookie. After-response lookups
+/// never run for an EC minted on the same request, so a page lookup is the
+/// only provider work a grant without an EC starts.
+#[test]
+fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
+    // Arrange
+    let fixture = ProviderFixture::new(StatusCode::OK, IDENTITY_BUDGET * 5, "page", Geo::Gdpr);
+    HELD_TASKS.with_borrow_mut(Vec::clear);
+    let (grant, held) = fixture.send(ec_post(&tcf_consent_cookie(true), ""));
+    let identity = set_value(&grant, "ts-ec").expect("should mint an EC for grant A");
+    let sharedid = set_value(&grant, "_pubcid").expect("should set SharedID for grant A");
+    assert_eq!(fixture.id5_lookups(), 1, "should look up ID5 for grant A");
+    assert!(
+        held <= IDENTITY_BUDGET,
+        "should answer grant A by the lookup deadline, held {held:?}"
+    );
+    assert!(
+        HELD_TASKS.with_borrow(Vec::is_empty),
+        "should leave no provider work running after grant A's response"
+    );
+
+    // Act
+    let (withdrawal, _) = fixture.send(ec_post(
+        &tcf_consent_cookie(false),
+        &format!("ts-ec={identity}; _pubcid={sharedid}"),
     ));
-    let timer = clock.monotonic_clock();
-    let started = timer.now();
-    let response = clock
-        .drive(router.oneshot(request))
-        .expect("should dispatch redirect");
+    // Pass the time the slow ID5 answer would have arrived.
+    fixture.clock.advance(IDENTITY_BUDGET * 5);
+
+    // Assert: A set no mirror (its lookup was skipped), so B has none to expire.
+    for name in ["ts-ec", "_pubcid", "_pubcid_cst"] {
+        assert!(
+            set_cookies(&withdrawal)
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{name}=;"))
+                    && cookie.contains("Max-Age=0")),
+            "withdrawal B should expire {name}: {:?}",
+            set_cookies(&withdrawal)
+        );
+    }
+    assert!(
+        set_cookies(&withdrawal)
+            .iter()
+            .all(|cookie| cookie.contains("Max-Age=0")),
+        "withdrawal B should set no identity cookie: {:?}",
+        set_cookies(&withdrawal)
+    );
+    assert!(
+        HELD_TASKS.with_borrow(Vec::is_empty),
+        "should schedule no provider work for withdrawal B"
+    );
+    let record = fixture.record(&identity);
+    assert!(!record.consent.ok, "should keep A's record withdrawn");
+    assert!(
+        !record.ids.contains_key("id5.example.com"),
+        "should never store the slow lookup's UID"
+    );
+}
+
+#[test]
+fn redirect_cancels_page_lookups_without_waiting() {
+    let fixture = ProviderFixture::new(
+        StatusCode::FOUND,
+        Duration::from_secs(1),
+        "page",
+        Geo::UsCalifornia,
+    );
+    let (response, held) = fixture.send(navigation());
     assert_eq!(
         response.status(),
         StatusCode::FOUND,
         "should preserve redirect"
     );
     assert_eq!(
-        client.requests().len(),
+        fixture.client.requests().len(),
         2,
         "should start origin and page provider before cancellation"
     );
     assert!(
-        timer.now().duration_since(started) < std::time::Duration::from_millis(200),
+        held < IDENTITY_BUDGET,
         "should cancel redirect lookups without waiting for their deadline"
     );
     assert!(
@@ -358,7 +671,7 @@ fn redirect_cancels_page_lookups_without_waiting() {
         "should issue no identity cookies on redirect"
     );
     assert!(
-        store.events().is_empty(),
+        fixture.store.events().is_empty(),
         "should write no identity record on redirect"
     );
 }
