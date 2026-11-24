@@ -17,8 +17,8 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
-    Scenario, configure_http_fixture, tcf_consent_cookie, verify_failed_ec_creation,
-    verify_http_contract,
+    Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
+    verify_failed_ec_creation, verify_http_contract,
 };
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
@@ -134,7 +134,12 @@ impl AxumAdapter {
                 } else {
                     reply.header("content-type", mime)
                 };
-                reply.body(DOCUMENT)
+                reply
+                    .header("cache-control", "public, max-age=600, s-maxage=600")
+                    .header("surrogate-control", "max-age=600")
+                    .header("cdn-cache-control", "public, max-age=600")
+                    .header("cloudflare-cdn-cache-control", "public, max-age=600")
+                    .body(DOCUMENT)
             },
         );
         let services = RuntimeServices::builder()
@@ -215,6 +220,13 @@ impl AxumAdapter {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let headers = response.headers().clone();
+        let edge_cache_headers_present = [
+            "surrogate-control",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+        ]
+        .iter()
+        .any(|name| response.headers().contains_key(*name));
         self.store.response_released();
         let status = response.status();
         let cookies = response
@@ -241,6 +253,7 @@ impl AxumAdapter {
             },
             origin_requests: origin.requests().len(),
             cache_control,
+            edge_cache_headers_present,
         }
     }
 }
@@ -265,4 +278,90 @@ fn identity_conformance_axum() {
         store: store.clone(),
     };
     verify_failed_ec_creation(&mut adapter, &store);
+}
+
+#[test]
+fn api_identity_expiries_axum() {
+    verify_api_identity_expiries(&mut AxumAdapter {
+        store: RecordingStore::new(false),
+    });
+}
+
+#[test]
+fn redirect_cancels_page_lookups_without_waiting() {
+    let clock = TestClock::new();
+    let client = ScriptedHttpClient::new(&clock);
+    client.respond_to(
+        Method::GET,
+        ORIGIN,
+        ScriptedReply::status(StatusCode::FOUND).header("content-type", "text/html"),
+    );
+    client.respond_to(Method::POST, "https://id5.example.com/gs/v2/1234.json",
+        ScriptedReply::status(StatusCode::OK).body(serde_json::json!({"universal_uid":"example-id", "signature":"", "cache_control":{"max_age_sec":3600}}).to_string()).after(std::time::Duration::from_secs(1)));
+    let services = RuntimeServices::builder()
+        .config_store(Arc::new(UnusedStores))
+        .secret_store(Arc::new(UnusedStores))
+        .kv_store(Arc::new(UnavailableKvStore))
+        .outbound_client(client.http_client())
+        .clock(clock.monotonic_clock())
+        .geo(Arc::new(FixtureGeo(Geo::UsCalifornia)))
+        .client_info(ClientInfo {
+            client_ip: Some("192.0.2.7".parse().expect("should parse IP")),
+            ..ClientInfo::default()
+        })
+        .build();
+    let mut configured = settings();
+    configured.ec.identity_budget_ms = 200;
+    configured.ec.identity_providers = vec![serde_json::from_value(serde_json::json!({
+        "id":"id5", "kind":"id5", "endpoint":"https://id5.example.com/gs/v2",
+        "allowed_domains":["id5.example.com"], "sources":["id5.example.com"], "settings":{"partner_id":1234}
+    })).expect("should configure ID5")];
+    configured.ec.partners = serde_json::from_value(serde_json::json!([{"name":"Example identity", "source_domain":"id5.example.com", "bidstream_enabled":true}])).expect("should configure partner");
+    let store = RecordingStore::new(false);
+    let router = TrustedServerApp::routes_with_settings_services_and_ec_store(
+        configured,
+        services,
+        store.clone(),
+    )
+    .expect("should build router");
+    let mut request = request_builder()
+        .method(Method::GET)
+        .uri("https://publisher.example.com/article")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate")
+        .header(header::USER_AGENT, USER_AGENT)
+        .header(header::COOKIE, "us_privacy=1YNN")
+        .body(Body::empty())
+        .expect("should build navigation");
+    request.extensions_mut().insert(RuntimeRequestOrigin::new(
+        InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+            .expect("should validate origin"),
+    ));
+    let timer = clock.monotonic_clock();
+    let started = timer.now();
+    let response = clock
+        .drive(router.oneshot(request))
+        .expect("should dispatch redirect");
+    assert_eq!(
+        response.status(),
+        StatusCode::FOUND,
+        "should preserve redirect"
+    );
+    assert_eq!(
+        client.requests().len(),
+        2,
+        "should start origin and page provider before cancellation"
+    );
+    assert!(
+        timer.now().duration_since(started) < std::time::Duration::from_millis(200),
+        "should cancel redirect lookups without waiting for their deadline"
+    );
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "should issue no identity cookies on redirect"
+    );
+    assert!(
+        store.events().is_empty(),
+        "should write no identity record on redirect"
+    );
 }
