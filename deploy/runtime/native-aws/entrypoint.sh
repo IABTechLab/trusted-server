@@ -37,11 +37,11 @@ if [ "${TS_NATIVE_GEO_PROFILE_TOML+x}" = x ]; then
     chmod 0600 "$temporary"
     mv -fT -- "$temporary" "$runtime_dir/native-geo.toml"
     trap - 0 1 2 15
-    TS_NATIVE_GEO_PROFILE_FILE="$runtime_dir/native-geo.toml"
-    export TS_NATIVE_GEO_PROFILE_FILE
+    TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE="$runtime_dir/native-geo.toml"
+    export TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE
 else
     # Do not let an inherited pointer or a previous volume file select Geo.
-    unset TS_NATIVE_GEO_PROFILE_FILE
+    unset TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE
 fi
 
 # The base image's local roots need not exist when both stores are remote.
