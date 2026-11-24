@@ -1572,6 +1572,8 @@ fn loopback_bidder_fixtures(
                 endpoint: format!("http://127.0.0.1:{}/bid", bidder.port),
                 timeout_ms: u32::try_from(timeout.as_millis())
                     .expect("should fit the provider timeout in u32"),
+                prebid_server_bidder: None,
+                mtls: false,
             },
         )
         .collect()
@@ -1786,6 +1788,454 @@ fn wait_for_outbound_observations(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auction provider mTLS against a client-certificate origin
+// ---------------------------------------------------------------------------
+//
+// A `prebid-server` provider with `mtls = true` presents the `auction-providers`
+// client identity from the local config and secret stores. The mock PBS is a
+// loopback rustls origin that requires a certificate from its own client CA, and
+// Viceroy trusts its server CA through `SSL_CERT_FILE`. Viceroy reports a
+// rejected handshake only as an internal error, so the origin's own records
+// prove what happened on the wire.
+
+/// Bidder code the mock PBS bids for, routed to the PBS provider.
+const MTLS_PBS_BIDDER: &str = "examplePbsBidder";
+
+/// How one connection to [`MtlsPbsOrigin`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MtlsConnection {
+    /// The TLS handshake failed, such as for a client without an accepted certificate.
+    HandshakeFailed,
+    /// The client presented a certificate from the client CA and sent this request.
+    Request {
+        method: String,
+        target: String,
+        body: Vec<u8>,
+    },
+}
+
+/// A loopback mock PBS that requires a client certificate from its own client CA.
+///
+/// It answers each `POST` with one bid for [`MTLS_PBS_BIDDER`].
+struct MtlsPbsOrigin {
+    port: u16,
+    server_ca_file: tempfile::NamedTempFile,
+    client_certificate_pem: String,
+    client_key_pem: String,
+    connections: Arc<Mutex<Vec<MtlsConnection>>>,
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl MtlsPbsOrigin {
+    /// Starts the origin on an ephemeral loopback port, with fresh server and client CAs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test certificates or the listener cannot be set up.
+    fn start() -> Self {
+        let new_ca = |common_name: &str| {
+            let key = rcgen::KeyPair::generate().expect("should generate a test CA key");
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("should create test CA parameters");
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, common_name);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            let certificate = params
+                .self_signed(&key)
+                .expect("should self-sign a test CA");
+            (certificate, key)
+        };
+        let (server_ca, server_ca_key) = new_ca("Example PBS server CA");
+        let (client_ca, client_ca_key) = new_ca("Example PBS client CA");
+
+        let server_key = rcgen::KeyPair::generate().expect("should generate the server key");
+        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .expect("should create the server certificate parameters")
+            .signed_by(&server_key, &server_ca, &server_ca_key)
+            .expect("should sign the server certificate");
+        let client_key = rcgen::KeyPair::generate().expect("should generate the client key");
+        let mut client_params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("should create the client certificate parameters");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Example Trusted Server client");
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &client_ca, &client_ca_key)
+            .expect("should sign the client certificate");
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots
+            .add(client_ca.der().clone())
+            .expect("should trust the client CA");
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(client_roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .expect("should build the client certificate verifier");
+        let tls_config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("should select TLS versions")
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der())
+                        .expect("should encode the server key"),
+                )
+                .expect("should build the mock PBS TLS configuration"),
+        );
+        let mut server_ca_file =
+            tempfile::NamedTempFile::new().expect("should create the server CA file");
+        server_ca_file
+            .write_all(server_ca.pem().as_bytes())
+            .expect("should write the server CA certificate");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind the mock PBS");
+        let port = listener
+            .local_addr()
+            .expect("should read the mock PBS address")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("should set listener nonblocking");
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&connections);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            while matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let recorded = Arc::clone(&recorded);
+                        let tls_config = Arc::clone(&tls_config);
+                        thread::spawn(move || {
+                            serve_mtls_pbs_connection(stream, tls_config, &recorded);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            port,
+            server_ca_file,
+            client_certificate_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+            connections,
+            shutdown_tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// The provider endpoint on this origin.
+    fn endpoint(&self) -> String {
+        format!("https://127.0.0.1:{}/openrtb2/auction", self.port)
+    }
+
+    /// Every connection that ended so far, in the order they ended.
+    fn connections(&self) -> Vec<MtlsConnection> {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for MtlsPbsOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Completes the mutual TLS handshake, reads one request, and answers it with one bid.
+fn serve_mtls_pbs_connection(
+    mut stream: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    recorded: &Mutex<Vec<MtlsConnection>>,
+) {
+    let record = |connection: MtlsConnection| {
+        recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(connection);
+    };
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+    {
+        return;
+    }
+    let Ok(mut connection) = rustls::ServerConnection::new(tls_config) else {
+        return;
+    };
+    while connection.is_handshaking() {
+        if connection.complete_io(&mut stream).is_err() {
+            record(MtlsConnection::HandshakeFailed);
+            return;
+        }
+    }
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+    let mut received = Vec::new();
+    let head_end = loop {
+        if let Some(position) = find_subslice(&received, b"\r\n\r\n") {
+            break position;
+        }
+        let mut chunk = [0_u8; 4096];
+        match tls.read(&mut chunk) {
+            Ok(read) if read > 0 => received.extend_from_slice(&chunk[..read]),
+            _ => return,
+        }
+    };
+    let Ok(head) = std::str::from_utf8(&received[..head_end]) else {
+        return;
+    };
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or_default().split(' ');
+    let (Some(method), Some(target)) = (request_line.next(), request_line.next()) else {
+        return;
+    };
+    let (method, target) = (method.to_owned(), target.to_owned());
+    let content_length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = received[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0_u8; 4096];
+        match tls.read(&mut chunk) {
+            Ok(read) if read > 0 => body.extend_from_slice(&chunk[..read]),
+            _ => break,
+        }
+    }
+    record(MtlsConnection::Request {
+        method,
+        target,
+        body,
+    });
+
+    let response = serde_json::to_vec(&serde_json::json!({
+        "seatbid": [{"seat": MTLS_PBS_BIDDER, "bid": [{
+            "id": "mtls-pbs-bid",
+            "impid": AUCTION_SLOT,
+            "price": 3.5,
+            "adm": "<div>mtls pbs bid</div>",
+            "w": 300,
+            "h": 250
+        }]}]
+    }))
+    .expect("should serialize the mock PBS bid");
+    let response_head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.len()
+    );
+    let _ = tls.write_all(response_head.as_bytes());
+    let _ = tls.write_all(&response);
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+}
+
+/// Sends one `/auction` request for [`AUCTION_SLOT`] with demand for [`MTLS_PBS_BIDDER`].
+fn post_auction_with_pbs_demand(base_url: &str) -> serde_json::Value {
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{base_url}/auction"))
+        .header("cookie", tcf_purpose_one_cookie())
+        .header("cf-ipcountry", "US")
+        .json(&serde_json::json!({
+            "adUnits": [{
+                "code": AUCTION_SLOT,
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } },
+                "bids": [{ "bidder": MTLS_PBS_BIDDER, "params": { "placementId": 1 } }]
+            }]
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .expect("should send the auction request");
+    let status = response.status().as_u16();
+    let body = response.text().expect("should read the auction response");
+    assert_eq!(status, 200, "should complete the auction: {body}");
+    serde_json::from_str(&body).expect("should return an OpenRTB JSON response")
+}
+
+/// Which local identity material a Viceroy mTLS case provisions.
+#[derive(Clone, Copy, Debug)]
+enum IdentityMaterial {
+    /// Certificate, hosts list and private key.
+    Complete,
+    /// Certificate and hosts list, without the private key.
+    MissingKey,
+}
+
+/// Runs one auction on Viceroy with the mock PBS provider beside a plain loopback bidder,
+/// and returns the auction response and what the mock PBS recorded.
+fn run_mtls_auction(
+    mtls: bool,
+    material: IdentityMaterial,
+) -> (serde_json::Value, Vec<MtlsConnection>, Vec<String>) {
+    init_logger();
+    let pbs = MtlsPbsOrigin::start();
+    let plain = start_loopback_bidder("plain-seat", 1.25, Duration::ZERO);
+    let mut fixtures = loopback_bidder_fixtures(&[("plain", &plain, Duration::from_millis(1500))]);
+    fixtures.push(common::config::AuctionBidderFixture {
+        id: "pbs".to_owned(),
+        endpoint: pbs.endpoint(),
+        timeout_ms: 1500,
+        prebid_server_bidder: Some(MTLS_PBS_BIDDER.to_owned()),
+        mtls,
+    });
+    let envelope = common::config::auction_app_config_envelope(origin_port(), &fixtures, 2000)
+        .expect("should build the mTLS auction config");
+    let hosts = format!("https://127.0.0.1:{}", pbs.port);
+    let mut extras = common::trace_boundary::FastlyRuntimeExtras {
+        config_entries: vec![
+            (
+                "auction-providers.certificate",
+                pbs.client_certificate_pem.as_str(),
+            ),
+            ("auction-providers.hosts", hosts.as_str()),
+        ],
+        ssl_cert_file: Some(pbs.server_ca_file.path()),
+        ..common::trace_boundary::FastlyRuntimeExtras::default()
+    };
+    if matches!(material, IdentityMaterial::Complete) {
+        extras.secret_entries =
+            vec![("auction-providers.private-key", pbs.client_key_pem.as_str())];
+    }
+
+    let mut response = serde_json::Value::Null;
+    let mut guest_log = Vec::new();
+    common::trace_boundary::with_fastly_runtime_extras(&envelope, &extras, |base_url, stdout| {
+        response = post_auction_with_pbs_demand(base_url);
+        // The guest logs a provider failure before it answers, but Viceroy can print the
+        // line after the response arrives.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(material, IdentityMaterial::MissingKey)
+            && Instant::now() < deadline
+            && !stdout
+                .lines()
+                .iter()
+                .any(|line| line.contains("Planned provider 'pbs' request failed"))
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        guest_log = stdout.lines();
+    });
+    assert_bidders_received("Fastly", &[&plain], 1);
+    (response, pbs.connections(), guest_log)
+}
+
+/// Asserts the plain bidder's bid arrived, attributed to its own provider.
+fn assert_plain_bid(response: &serde_json::Value) {
+    let plain = provider_detail(response, "plain");
+    assert_eq!(
+        (&plain["bid_count"], &plain["bidders"]),
+        (&serde_json::json!(1), &serde_json::json!(["plain-seat"])),
+        "should keep the plain bidder's bid: {response}"
+    );
+}
+
+/// Asserts the PBS provider failed as a transport failure without bids.
+fn assert_pbs_transport_failure(response: &serde_json::Value) {
+    let pbs = provider_detail(response, "pbs");
+    assert_eq!(
+        (&pbs["bid_count"], &pbs["metadata"]["error_type"]),
+        (&serde_json::json!(0), &serde_json::json!("transport")),
+        "should fail the PBS provider as a transport failure: {response}"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn mtls_provider_presents_its_client_certificate_fastly() {
+    let (response, connections, _guest_log) = run_mtls_auction(true, IdentityMaterial::Complete);
+
+    let pbs = provider_detail(&response, "pbs");
+    assert_eq!(
+        (&pbs["bid_count"], &pbs["bidders"]),
+        (&serde_json::json!(1), &serde_json::json!([MTLS_PBS_BIDDER])),
+        "should attribute the mock PBS bid to the PBS provider: {response}"
+    );
+    assert_plain_bid(&response);
+    let [
+        MtlsConnection::Request {
+            method,
+            target,
+            body,
+        },
+    ] = connections.as_slice()
+    else {
+        panic!("should accept exactly one client-authenticated request, got {connections:?}");
+    };
+    assert_eq!(
+        (method.as_str(), target.as_str()),
+        ("POST", "/openrtb2/auction"),
+        "should POST the bid request to the PBS endpoint"
+    );
+    let bid_request: serde_json::Value =
+        serde_json::from_slice(body).expect("should deliver a JSON bid request");
+    assert!(
+        bid_request["imp"][0]["ext"]["prebid"]["bidder"][MTLS_PBS_BIDDER].is_object(),
+        "should route the PBS bidder's params to the PBS provider: {bid_request}"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn provider_without_mtls_is_rejected_by_the_client_certificate_origin_fastly() {
+    let (response, connections, _guest_log) = run_mtls_auction(false, IdentityMaterial::Complete);
+
+    assert_pbs_transport_failure(&response);
+    assert_plain_bid(&response);
+    assert!(
+        connections.contains(&MtlsConnection::HandshakeFailed)
+            && !connections
+                .iter()
+                .any(|connection| matches!(connection, MtlsConnection::Request { .. })),
+        "should fail the handshake and accept no request, got {connections:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
+fn missing_client_key_fails_before_connecting_fastly() {
+    let (response, connections, guest_log) = run_mtls_auction(true, IdentityMaterial::MissingKey);
+
+    assert_pbs_transport_failure(&response);
+    // Viceroy prints each line for the `tslog` endpoint and again as stdout, so count the
+    // endpoint copy.
+    assert_eq!(
+        guest_log
+            .iter()
+            .filter(|line| line.starts_with("tslog :: ")
+                && line.contains("Planned provider 'pbs' request failed")
+                && line
+                    .contains("outbound client identity auction-providers: private key is missing"))
+            .count(),
+        1,
+        "should log the identity name and reason once: {guest_log:#?}"
+    );
+    assert_plain_bid(&response);
+    assert_eq!(
+        connections,
+        Vec::new(),
+        "should not connect, or fall back to a request without the certificate"
+    );
 }
 
 #[test]

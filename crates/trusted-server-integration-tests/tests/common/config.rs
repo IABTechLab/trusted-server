@@ -181,7 +181,9 @@ pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
     cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
 }
 
-/// One standard `OpenRTB` provider an auction fixture routes every eligible slot to.
+/// One `OpenRTB` provider in an auction fixture.
+///
+/// Without `prebid_server_bidder` it is a standard provider that receives every eligible slot.
 pub struct AuctionBidderFixture {
     /// Provider ID.
     pub id: String,
@@ -189,6 +191,11 @@ pub struct AuctionBidderFixture {
     pub endpoint: String,
     /// Configured provider timeout.
     pub timeout_ms: u32,
+    /// Makes the provider a `prebid-server` provider with explicit routing, and routes this
+    /// bidder code to it.
+    pub prebid_server_bidder: Option<String>,
+    /// Sets the provider's `mtls`.
+    pub mtls: bool,
 }
 
 /// Builds the integration app-config envelope with the auction enabled over `bidders`.
@@ -215,10 +222,23 @@ fn enable_auction(
     auction_timeout_ms: u32,
 ) -> TestResult<()> {
     let mut providers = toml::Table::new();
+    let mut routes = toml::Table::new();
     for bidder in bidders {
+        let (profile, routing) = match &bidder.prebid_server_bidder {
+            Some(code) => {
+                let mut route = toml::Table::new();
+                route.insert(
+                    "provider".to_string(),
+                    toml::Value::String(bidder.id.clone()),
+                );
+                routes.insert(code.clone(), toml::Value::Table(route));
+                ("prebid-server", "explicit")
+            }
+            None => ("standard", "all_eligible"),
+        };
         let provider: toml::Table = toml::from_str(&format!(
-            "protocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"{}\"\ntimeout_ms = {}\nrouting = \"all_eligible\"\n",
-            bidder.endpoint, bidder.timeout_ms
+            "protocol = \"openrtb-2.6\"\nprofile = \"{profile}\"\nendpoint = \"{}\"\ntimeout_ms = {}\nrouting = \"{routing}\"\nmtls = {}\n",
+            bidder.endpoint, bidder.timeout_ms, bidder.mtls
         ))
         .map_err(|error| {
             Report::new(TestError::ConfigGeneration)
@@ -233,7 +253,11 @@ fn enable_auction(
         toml::Value::Integer(i64::from(auction_timeout_ms)),
     );
     auction.insert("providers".to_string(), toml::Value::Table(providers));
-    auction.remove("bidders");
+    if routes.is_empty() {
+        auction.remove("bidders");
+    } else {
+        auction.insert("bidders".to_string(), toml::Value::Table(routes));
+    }
     Ok(())
 }
 

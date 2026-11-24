@@ -304,12 +304,63 @@ pub(crate) fn with_trace_runtime(
 ///
 /// Panics when the Fastly artifact or Viceroy is missing or the runtime never becomes ready.
 pub(crate) fn with_fastly_runtime(envelope: &str, check: impl FnOnce(&str, &GuestStdout)) {
+    with_fastly_runtime_extras(envelope, &FastlyRuntimeExtras::default(), check);
+}
+
+/// Local store entries and trust that a Fastly runtime case adds to the isolated fixture.
+#[derive(Default)]
+pub(crate) struct FastlyRuntimeExtras<'a> {
+    /// Entries added to the manifest-default config store beside the app-config blob.
+    pub(crate) config_entries: Vec<(&'a str, &'a str)>,
+    /// Entries added to the `trusted_server_secrets` secret store.
+    pub(crate) secret_entries: Vec<(&'a str, &'a str)>,
+    /// CA bundle Viceroy trusts through `SSL_CERT_FILE`, for a loopback TLS origin.
+    pub(crate) ssl_cert_file: Option<&'a Path>,
+}
+
+/// [`with_fastly_runtime`] with `extras` added to the isolated fixture.
+///
+/// Entry values are written as TOML literal strings, so they may span lines, such as PEM, but
+/// must not contain `'''`.
+///
+/// # Panics
+///
+/// Panics when the Fastly artifact or Viceroy is missing or the runtime never becomes ready.
+pub(crate) fn with_fastly_runtime_extras(
+    envelope: &str,
+    extras: &FastlyRuntimeExtras<'_>,
+    check: impl FnOnce(&str, &GuestStdout),
+) {
     let fixture = IsolatedFixture::new();
     let template = include_str!("../../fixtures/configs/viceroy-template.toml");
-    let config=template.replace("        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",&format!("        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n            {CONFIG_BLOB_KEY} = '''{envelope}'''"));
+    let mut config_contents = format!("            {CONFIG_BLOB_KEY} = '''{envelope}'''");
+    for (key, value) in &extras.config_entries {
+        config_contents.push_str(&format!("\n            {key:?} = '''{value}'''"));
+    }
+    let mut secret_entries = String::new();
+    for (key, value) in &extras.secret_entries {
+        secret_entries.push_str(&format!(
+            "        [[local_server.secret_stores.trusted_server_secrets]]\n            key = {key:?}\n            data = '''{value}'''\n"
+        ));
+    }
+    let config = template
+        .replace(
+            "        # GENERATED_TRUSTED_SERVER_CONFIG_STORES",
+            &format!(
+                "        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}]\n            format = \"inline-toml\"\n        [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents]\n{config_contents}"
+            ),
+        )
+        .replace(
+            "\n    [local_server.config_stores]\n",
+            &format!("\n{secret_entries}\n    [local_server.config_stores]\n"),
+        );
     let path = fixture.0.join("viceroy.toml");
     fs::write(&path, config).expect("should write isolated Viceroy config");
-    temp_env::with_var("VICEROY_CONFIG_PATH", Some(path.as_os_str()), || {
+    let mut vars = vec![("VICEROY_CONFIG_PATH", Some(path.as_os_str()))];
+    if let Some(ca_file) = extras.ssl_cert_file {
+        vars.push(("SSL_CERT_FILE", Some(ca_file.as_os_str())));
+    }
+    temp_env::with_vars(vars, || {
         let (process, stdout) = FastlyViceroy
             .spawn_capturing_stdout(&wasm_binary_path())
             .expect("should spawn isolated Fastly trace runtime");
