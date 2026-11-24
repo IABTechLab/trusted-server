@@ -520,6 +520,15 @@ again. Stored values are built only by validation
 (§8.2) or by deserializing rows TS wrote, so `KvEid` and `KvUid` fields are
 private to the `ec` module and exposed through accessors.
 
+Reads are lenient below the row's top level (#1554), so a row written by a
+build with other limits loads instead of failing whole. An invalid optional
+`mm`, `ext`, `inserter` or `matcher` reads as absent; any other invalid UID is
+skipped; an EID entry or partner record that cannot be read, or that is left
+without a readable UID, is removed. The read logs how many records, EID
+entries, UIDs and fields it skipped, and the next write persists the row
+without them. Top-level fields, including consent and geo, still fail the
+row closed.
+
 ```rust
 /// A partner ID record within a KV entry, keyed by source domain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

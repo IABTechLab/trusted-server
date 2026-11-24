@@ -281,11 +281,17 @@ impl KvIdentityGraph {
                 message: format!("Failed to deserialize entry for key '{}'", log_id(ec_id)),
             })?;
 
-        let dropped = entry.drop_unreadable_ids();
-        if dropped > 0 {
+        let skipped = entry.drop_unreadable_ids();
+        if !skipped.is_empty() {
             log::warn!(
-                "Dropped {dropped} unreadable partner IDs loading key '{}'",
-                log_id(ec_id)
+                "Skipped unreadable stored values loading key '{}': {} partner records \
+                 {:?}, {} EID entries, {} UIDs, {} fields",
+                log_id(ec_id),
+                skipped.records,
+                skipped.removed,
+                skipped.eids,
+                skipped.uids,
+                skipped.fields
             );
         }
 
@@ -1564,6 +1570,46 @@ mod tests {
             loaded.ids.keys().collect::<Vec<_>>(),
             vec!["ssp_y"],
             "should drop only the oversized ID"
+        );
+    }
+
+    #[test]
+    fn deserialize_entry_keeps_a_row_with_one_invalid_stored_value() {
+        let body = serde_json::json!({
+            "v": crate::ec::kv_types::SCHEMA_VERSION,
+            "created": 1,
+            "consent": { "ok": true, "updated": 1 },
+            "geo": { "country": "US" },
+            "ids": {
+                "ids.example.com": { "uid": "u-1", "eids": [{ "mm": 6, "uids": [
+                    { "id": "u-1", "atype": 1, "owner": "example-provider" },
+                    { "id": "u-2", "atype": -1 }
+                ] }] },
+                "broken.example.com": { "uid": 5 },
+                "ssp_y": { "uid": "kept" }
+            }
+        })
+        .to_string();
+
+        let loaded = KvIdentityGraph::deserialize_entry("test-store", "ec-id", body.as_bytes())
+            .expect("should load a row holding one invalid value per record");
+
+        assert_eq!(
+            loaded.ids.keys().collect::<Vec<_>>(),
+            vec!["ids.example.com", "ssp_y"],
+            "should drop only the unreadable record"
+        );
+        let provider = &loaded.ids["ids.example.com"];
+        assert_eq!(provider.uid, "u-1", "should keep the valid UID");
+        assert_eq!(
+            provider.eids()[0].uids().len(),
+            1,
+            "should skip the invalid UID"
+        );
+        assert_eq!(
+            provider.eids()[0].fields().mm,
+            None,
+            "should read the unknown mm as absent"
         );
     }
 
