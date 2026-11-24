@@ -82,8 +82,9 @@ providers. This startup unit provisions nothing.
 
 ## Optional protected native Geo
 
-Compile `geo-cloudfront` explicitly and set `TS_NATIVE_GEO_PROFILE_FILE` to a
-separately delivered boot profile. Compiling the feature does not select it.
+Compile `geo-cloudfront` explicitly and set
+`TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE` to a separately delivered boot
+profile. Compiling the feature does not select it.
 EdgeZero does not read this TS selection from publisher AppConfig, store bindings
 or an `EDGEZERO__GEO__*` environment variable.
 
