@@ -471,7 +471,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     TS_EC_DYNAMODB_TABLE: table,
     TS_EC_DYNAMODB_NAMESPACE: namespace,
     TS_EC_DYNAMODB_LOCAL_ENDPOINT: proxyEndpoint,
-    TS_NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
+    TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
     EDGEZERO__ADAPTER__CONFIG_DIR: root,
     EDGEZERO__ADAPTER__DATA_DIR: opt.binary ? dir : '/data',
     EDGEZERO__ADAPTER__HOST: '127.0.0.1',
