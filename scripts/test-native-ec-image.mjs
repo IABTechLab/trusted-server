@@ -473,7 +473,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     AWS_EC2_METADATA_DISABLED: 'true',
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
-    TS_NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
+    TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
     EDGEZERO__ADAPTER__CONFIG_DIR: root,
     EDGEZERO__ADAPTER__DATA_DIR: opt.binary ? dir : '/data',
     EDGEZERO__ADAPTER__HOST: '127.0.0.1',
