@@ -105,7 +105,7 @@ pull_sync_concurrency = 3
 # recognized User-Agent platform, so clients without JA4 create no EC.
 # browser_gate = "lenient"
 # JA4 contradictions that do not block EC creation. "off" (default) exempts
-# none; "non_browser" exempts a non-browser TLS stack (Python, Go) behind a
+# none; "non_browser" exempts a non-browser TLS stack (Python's) behind a
 # browser User-Agent, for readers behind a TLS-intercepting proxy, while a
 # browser-engine mismatch still blocks; "all" exempts every contradiction.
 # ja4_contradiction_exempt = "off"

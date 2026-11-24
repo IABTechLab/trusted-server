@@ -9,7 +9,7 @@
 //!
 //! A request whose trusted JA4 names one family while its User-Agent claims a
 //! browser of another family contradicts itself. A non-browser TLS stack
-//! (Python, Go) behind a browser User-Agent is the common case. The rule is
+//! behind a browser User-Agent, such as Python's, is the common case. The rule is
 //! deliberately narrow: an unrecognized `JA4_b`, an absent JA4, or a
 //! User-Agent that claims no browser never contradicts.
 //!
@@ -36,16 +36,35 @@ enum TlsFamily {
 /// Source: `FoxIO`'s public JA4+ mapping, `ja4plus-mapping.csv` at commit
 /// `288d3c3d149697ad977f868651bcd42a7a1a82da` of
 /// <https://github.com/FoxIO-LLC/ja4>. Each entry quotes the row it comes
-/// from. Rows whose cipher hash is shared with a Windows system TLS stack
-/// (`WinINET`) are left out, so a Windows component never counts as a
+/// from.
+///
+/// A non-browser row is kept only when its cipher list is specific to one
+/// client library. A TLS library's generic default list is left out, because
+/// every program built on that library sends it, including scanning and
+/// corporate proxies that forward real readers. Rows left out on that ground:
+///
+/// - Python `t13d4312h1_c7886603b240_b26ce05bbdd6`: 43 cipher suites, a broad
+///   OpenSSL-style list, not the 17-suite list `CPython` sets for its default
+///   context (kept below as `85036bcba153`). Nothing ties it to Python
+///   rather than to other OpenSSL clients that send the same list.
+/// - Every `GoLang` row (`9dc949149365`, `e33ad33b3d25`, `8cdfa2d4673b`,
+///   `cbb2034c60b8`): Go programs use `crypto/tls`'s built-in default cipher
+///   list, so the hash names the Go version, not an application.
+///   `9dc949149365` appears for plain Go, Sliver Agent and Go's `net`
+///   package alike, and the `GoLang` row `t12d190800_d83cc789557e` shares
+///   `WinINET`'s hash, so a Go hash can match a system TLS stack.
+///
+/// Rows whose cipher hash is shared with a Windows system TLS stack
+/// (`WinINET`) are also left out, so a Windows component never counts as a
 /// non-browser.
 ///
 /// To refresh: read the current `ja4plus-mapping.csv` (or the JA4 database it
 /// links to), take the middle section of each `ja4` value whose Application or
-/// Library names a browser or a non-browser HTTP library, and add or remove
-/// rows here. Add only cipher hashes that a public source attributes; an
-/// unlisted hash never blocks, so a missing row costs coverage, not traffic.
-/// Then update the tests below and `docs/guide/edge-cookies.md`.
+/// Library names a browser or a non-browser HTTP client library, and add or
+/// remove rows here under the rules above. Add only cipher hashes that a
+/// public source attributes; an unlisted hash never blocks, so a missing row
+/// costs coverage, not traffic. Then update the tests below and
+/// `docs/guide/edge-cookies.md`.
 const CIPHER_HASH_FAMILIES: &[(&str, TlsFamily)] = &[
     // Chromium Browser: t13d1516h2_8daaf6152771_02713d6af862 and its
     // t13d1517h2 / t13i variants.
@@ -56,18 +75,11 @@ const CIPHER_HASH_FAMILIES: &[(&str, TlsFamily)] = &[
     ("5b57614c22b0", TlsFamily::Firefox),
     // Safari: t13d2014h2_a09f3c656075_14788d8d241b.
     ("a09f3c656075", TlsFamily::Safari),
-    // Python: t13d181000_85036bcba153_d41ae481755e.
+    // Python: t13d181000_85036bcba153_d41ae481755e and its t13i variant. Its
+    // 18 suites are the 17 of `CPython`'s own default-context cipher string
+    // (`ssl.create_default_context()`) plus the renegotiation SCSV, so the
+    // list is Python's choice, not OpenSSL's default.
     ("85036bcba153", TlsFamily::NonBrowser),
-    // Python: t13d4312h1_c7886603b240_b26ce05bbdd6.
-    ("c7886603b240", TlsFamily::NonBrowser),
-    // GoLang: t13d190900_9dc949149365_97f8aa674fd9.
-    ("9dc949149365", TlsFamily::NonBrowser),
-    // GoLang webhooks: t13d1412h2_e33ad33b3d25_6b314db333b6.
-    ("e33ad33b3d25", TlsFamily::NonBrowser),
-    // GoLang: t12d160700_8cdfa2d4673b_18dd7303c4a5.
-    ("8cdfa2d4673b", TlsFamily::NonBrowser),
-    // GoLang: t13d141000_cbb2034c60b8_e7c285222651.
-    ("cbb2034c60b8", TlsFamily::NonBrowser),
 ];
 
 /// What a User-Agent claims about the browser that sent it.
@@ -152,8 +164,8 @@ mod tests {
     use super::*;
     use crate::test_support::ja4::{
         CHROME_IOS_USER_AGENT, CHROME_USER_AGENT, CHROMIUM_JA4, EDGE_USER_AGENT, FIREFOX_JA4,
-        FIREFOX_USER_AGENT, GO_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4, SAFARI_JA4, SAFARI_USER_AGENT,
-        UNLISTED_JA4,
+        FIREFOX_USER_AGENT, GENERIC_PYTHON_JA4, GO_DEFAULT_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4,
+        SAFARI_JA4, SAFARI_USER_AGENT, UNLISTED_JA4,
     };
 
     const BROWSER_USER_AGENTS: [&str; 4] = [
@@ -173,12 +185,10 @@ mod tests {
     #[test]
     fn a_browser_user_agent_with_a_non_browser_ja4_contradicts() {
         for ua in BROWSER_USER_AGENTS {
-            for ja4 in [PYTHON_JA4, GO_JA4] {
-                assert!(
-                    contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
-                    "should refuse a non-browser TLS stack behind {ua:?}"
-                );
-            }
+            assert!(
+                contradicts_user_agent(ua, PYTHON_JA4, Ja4ContradictionExempt::Off),
+                "should refuse a non-browser TLS stack behind {ua:?}"
+            );
         }
     }
 
@@ -195,12 +205,10 @@ mod tests {
     #[test]
     fn exempting_non_browser_tls_still_refuses_an_engine_mismatch() {
         for ua in BROWSER_USER_AGENTS {
-            for ja4 in [PYTHON_JA4, GO_JA4] {
-                assert!(
-                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::NonBrowser),
-                    "should allow a non-browser TLS stack behind {ua:?} when exempted"
-                );
-            }
+            assert!(
+                !contradicts_user_agent(ua, PYTHON_JA4, Ja4ContradictionExempt::NonBrowser),
+                "should allow a non-browser TLS stack behind {ua:?} when exempted"
+            );
         }
         for (ua, ja4) in ENGINE_MISMATCHES {
             assert!(
@@ -213,12 +221,10 @@ mod tests {
     #[test]
     fn exempting_all_contradictions_refuses_none() {
         for ua in BROWSER_USER_AGENTS {
-            for ja4 in [PYTHON_JA4, GO_JA4] {
-                assert!(
-                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::All),
-                    "should allow a non-browser TLS stack behind {ua:?}"
-                );
-            }
+            assert!(
+                !contradicts_user_agent(ua, PYTHON_JA4, Ja4ContradictionExempt::All),
+                "should allow a non-browser TLS stack behind {ua:?}"
+            );
         }
         for (ua, ja4) in ENGINE_MISMATCHES {
             assert!(
@@ -243,6 +249,18 @@ mod tests {
                 !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
                 "should allow {ua:?} with its own family's TLS stack"
             );
+        }
+    }
+
+    #[test]
+    fn a_generic_tls_library_default_never_contradicts() {
+        for ua in BROWSER_USER_AGENTS {
+            for ja4 in [GO_DEFAULT_JA4, GENERIC_PYTHON_JA4] {
+                assert!(
+                    !contradicts_user_agent(ua, ja4, Ja4ContradictionExempt::Off),
+                    "should not refuse {ua:?} for a TLS library's default list {ja4:?}"
+                );
+            }
         }
     }
 

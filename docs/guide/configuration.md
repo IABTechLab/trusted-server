@@ -904,20 +904,24 @@ device signals. Consent and the navigation policy apply under both rules.
   trusted JA4, such as one behind a proxy or on a runtime that supplies none,
   or with a JA4 the rule does not recognize, stays eligible for EC creation.
 - `strict` also requires a JA4 class and a recognized User-Agent platform. A
-  client without trusted JA4 creates no EC. `strict` blocks everything
-  `lenient` blocks.
+  client without trusted JA4 creates no EC. That includes a JA4 the runtime
+  returns but EdgeZero rejects as malformed, such as section 1 alone, which
+  counts as no JA4 under both rules. `strict` blocks everything `lenient`
+  blocks.
 
 `ja4_contradiction_exempt` names the JA4 contradictions that stop blocking
 creation under either rule:
 
 - `off` (default) exempts nothing: every contradiction blocks.
-- `non_browser` exempts a non-browser TLS stack (Python, Go) behind a browser
-  User-Agent. Use it when readers reach the site through a TLS-intercepting
+- `non_browser` exempts a non-browser TLS stack (the rule lists only Python's
+  default TLS context) behind a browser User-Agent. Use it when readers reach the site through a TLS-intercepting
   proxy, which replaces their JA4 with its own. A User-Agent of one browser
   engine over another engine's TLS stack still blocks.
 - `all` exempts every contradiction, which turns the JA4 rule off.
 
-An unknown value fails config loading.
+An unknown value fails config loading. The rule runs on Fastly and on Axum
+with a trusted JA4 proxy header. Cloudflare creates no ECs yet, so both keys
+have no effect there.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

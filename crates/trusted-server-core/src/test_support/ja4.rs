@@ -32,8 +32,13 @@ pub const FIREFOX_JA4: &str = "t13d1715h2_5b57614c22b0_7121afd63204";
 pub const SAFARI_JA4: &str = "t13d2014h2_a09f3c656075_14788d8d241b";
 /// Python, a non-browser TLS stack.
 pub const PYTHON_JA4: &str = "t13d181000_85036bcba153_d41ae481755e";
-/// Go, a non-browser TLS stack.
-pub const GO_JA4: &str = "t13d190900_9dc949149365_97f8aa674fd9";
+/// Go's `crypto/tls` default list, which every Go program sends. The family
+/// table leaves it out as a generic TLS library default.
+pub const GO_DEFAULT_JA4: &str = "t13d190900_9dc949149365_97f8aa674fd9";
+/// A 43-suite list `FoxIO` attributes to Python but which is not `CPython`'s
+/// own default-context list. The family table leaves it out as a generic
+/// TLS library default.
+pub const GENERIC_PYTHON_JA4: &str = "t13d4312h1_c7886603b240_b26ce05bbdd6";
 /// Test-only: Chromium's listed cipher hash with an extension hash no list
 /// names, as a later browser release would send.
 pub const NEWER_CHROMIUM_JA4: &str = "t13d1517h2_8daaf6152771_0123456789ab";

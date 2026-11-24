@@ -579,6 +579,62 @@ mod tests {
     }
 
     #[test]
+    fn read_request_treats_a_ja4_edgezero_rejects_as_absent() {
+        // EdgeZero's strict parser discards these runtime values as
+        // `Malformed`: section 1 of the Chromium row alone, and that row's
+        // fingerprint in upper case.
+        for value in ["t13d1516h2", "T13D1516H2_8DAAF6152771_02713D6AF862"] {
+            let ja4 = CapturedJa4::from_runtime_tls(Some(value));
+            assert_eq!(
+                ja4,
+                CapturedJa4::Unavailable(Ja4Unavailable::Malformed),
+                "should be rejected by EdgeZero's parser: {value:?}"
+            );
+
+            let app = IdentityApp::build(
+                Arc::new(create_test_settings()),
+                IdentityPlatform::default(),
+            )
+            .expect("should build identity app");
+            let mut request = Request::default();
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(CHROME_USER_AGENT),
+            );
+            insert_ja4(request.extensions_mut(), ja4.clone());
+            let identity = app
+                .read_request(&noop_services(), &request)
+                .expect("should read identity request");
+            let signals = identity
+                .context
+                .device_signals()
+                .expect("should derive device signals");
+            assert_eq!(
+                signals.ja4_class, None,
+                "should keep no JA4 class from a rejected value {value:?}"
+            );
+            assert!(
+                !signals.ja4_contradiction,
+                "should not treat a rejected value {value:?} as a contradiction"
+            );
+
+            for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+                assert_eq!(
+                    creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        CHROME_USER_AGENT,
+                        Some(ja4.clone()),
+                    ),
+                    allowed,
+                    "should treat a rejected value {value:?} as no JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_request_takes_ja4_only_from_edgezero_ingress() {
         let services = RuntimeServices {
             client_info: ClientInfo {

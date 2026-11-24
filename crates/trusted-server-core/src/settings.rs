@@ -812,15 +812,15 @@ impl BrowserGate {
 ///
 /// Mapped from `[ec].ja4_contradiction_exempt`. A contradiction is a trusted
 /// JA4 whose TLS client family differs from the browser family the
-/// User-Agent claims (ID-7). An exempted contradiction no longer marks the
-/// client a known non-browser, under either [`BrowserGate`] rule.
+/// User-Agent claims (ID-7). An exempted contradiction no longer blocks
+/// creation under either [`BrowserGate`] rule.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ja4ContradictionExempt {
     /// Exempts nothing: every contradiction blocks creation.
     #[default]
     Off,
-    /// Exempts a non-browser TLS stack (Python, Go) behind a browser
+    /// Exempts a non-browser TLS stack (such as Python's) behind a browser
     /// User-Agent, as a TLS-intercepting proxy in front of readers produces.
     /// A User-Agent of one browser engine over another engine's TLS stack
     /// still blocks.
