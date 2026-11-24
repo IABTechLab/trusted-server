@@ -49,7 +49,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Check the offline workflow contract
-        run: node --test deploy/examples/native-aws-workload/test-workflow.mjs
+        run: node --test deploy/examples/native-aws-workload/test-workflow.mjs deploy/examples/native-aws-workload/test-operator-guide.mjs
 
       - name: Validate schema and credential-free mock plans
         run: |
@@ -58,5 +58,8 @@ jobs:
           terraform -chdir=deploy/examples/native-aws-workload validate
           terraform -chdir=deploy/examples/native-aws-workload/retained init -backend=false -input=false -lockfile=readonly
           terraform -chdir=deploy/examples/native-aws-workload/retained validate
+          terraform -chdir=deploy/examples/native-aws-workload/bootstrap init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/examples/native-aws-workload/bootstrap validate
+          node --test deploy/examples/native-aws-workload/bootstrap/test-bootstrap.mjs
           env -u NODE_OPTIONS -u NODE_PATH node deploy/examples/native-aws-workload/test-draft.mjs
-          git diff --exit-code -- deploy/examples/native-aws-workload/.terraform.lock.hcl deploy/examples/native-aws-workload/retained/.terraform.lock.hcl
+          git diff --exit-code -- deploy/examples/native-aws-workload/.terraform.lock.hcl deploy/examples/native-aws-workload/retained/.terraform.lock.hcl deploy/examples/native-aws-workload/bootstrap/.terraform.lock.hcl
