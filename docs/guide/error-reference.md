@@ -109,6 +109,42 @@ endpoint = "https://prebid.example.com/openrtb2/auction"
 
 ---
 
+### mTLS provider endpoint is not HTTPS
+
+**Error Message:**
+
+```
+provider `pbs-main` sets mtls but its endpoint is not https
+```
+
+**Cause:** A provider with `mtls = true` has a plain HTTP endpoint, through the
+loopback exception or `allow_insecure_http`. A client certificate can only be
+presented over TLS.
+
+**Solution:** Use the provider's `https` endpoint, or remove `mtls`. See
+[Provider mTLS](./auction-orchestration.md#provider-mtls).
+
+---
+
+### Adapter cannot present client certificates
+
+**Error Message:**
+
+```
+auction providers `pbs-main` set mtls, but the Axum adapter cannot present client certificates
+```
+
+**Cause:** A provider sets `mtls = true` and the target adapter is Axum,
+Cloudflare or Spin. Only the Fastly adapter presents client certificates. The
+adapter refuses to start with such a config, even with the auction disabled,
+and `ts config push` and `ts config diff` report it as `target` for those
+adapters.
+
+**Solution:** Remove `mtls` from those providers for this adapter, or deploy on
+Fastly.
+
+---
+
 ### Environment variable override failed
 
 **Error Message:**
@@ -187,12 +223,21 @@ failure records `launch_failed` for the provider, and other failures record
 such as `outbound failure: 502 Bad Gateway (response_too_large)`, never the
 error's message, and, when EdgeZero reports one, the provider
 failure detail (`outbound provider failure detail: ...`), which holds closed
-failure codes and no URL.
+failure codes and no URL. For a provider with `mtls = true`, a client identity
+that EdgeZero refuses before sending, because an entry is missing or invalid or
+the origin is not in its hosts list, records `transport` and adds
+`outbound client identity auction-providers: <reason>`, such as
+`private key is missing`; the reason names a store entry or the provider's
+origin, never certificate or key contents. A key that does not match the
+certificate fails later, as `launch_failed` if Fastly rejects the backend
+registration or `transport` if the handshake fails.
 
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
   valid certificate; origin TLS is always verified
+- For an `outbound client identity` reason, fix the entry it names; see
+  [Provider mTLS](./auction-orchestration.md#provider-mtls)
 - Read the outbound status and kind in the warning's report, and its
   `outbound provider failure detail` line when it has one
 - On Fastly, check the service's dynamic backend use. Fastly allows 200

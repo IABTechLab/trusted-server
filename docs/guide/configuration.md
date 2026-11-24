@@ -2770,18 +2770,20 @@ endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
 
-| Provider field   | Required | Default         | Description                                                   |
-| ---------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                         |
-| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                         |
-| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment   |
-| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap      |
-| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
-| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
-| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
+| Provider field   | Required | Default         | Description                                                      |
+| ---------------- | -------- | --------------- | ---------------------------------------------------------------- |
+| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                            |
+| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                            |
+| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment      |
+| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap         |
+| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles               |
+| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                       |
+| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization    |
+| `mtls`           | No       | `false`         | Present the `auction-providers` client certificate (Fastly only) |
 
 A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
-`[::1]`.
+`[::1]`. A provider with `mtls = true` needs an `https` endpoint; see
+[Provider mTLS](./auction-orchestration.md#provider-mtls).
 
 ### Profile configuration
 

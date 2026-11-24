@@ -565,6 +565,9 @@ profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 # `prebid-server` defaults to 1000 ms when omitted.
 routing = "explicit"
+# Present the `auction-providers` client certificate from the Fastly config and
+# secret stores, for a provider that requires mTLS. Fastly only; requires https.
+# mtls = true
 
 [auction.providers.pbs-main.profile_config]
 debug = false

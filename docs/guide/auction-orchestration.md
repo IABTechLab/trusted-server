@@ -775,22 +775,25 @@ registered integration selected by `[auction].mediator`.
 
 Common provider fields and defaults:
 
-| Field                 | Default         | Meaning                                                                            |
-| --------------------- | --------------- | ---------------------------------------------------------------------------------- |
-| `protocol`            | Required        | `openrtb-2.6`                                                                      |
-| `profile`             | `standard`      | Typed OpenRTB behavior                                                             |
-| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                      |
-| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
-| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                         |
-| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                 |
-| `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
-| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
+| Field                 | Default         | Meaning                                                                                 |
+| --------------------- | --------------- | --------------------------------------------------------------------------------------- |
+| `protocol`            | Required        | `openrtb-2.6`                                                                           |
+| `profile`             | `standard`      | Typed OpenRTB behavior                                                                  |
+| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                           |
+| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted      |
+| `mtls`                | `false`         | Present the `auction-providers` client certificate; see [Provider mTLS](#provider-mtls) |
+| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                              |
+| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                      |
+| `profile_config`      | `{}`            | Profile-owned typed settings                                                            |
+| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                          |
 
 HTTPS remains the default. The existing plain-HTTP exception for literal
 `127.0.0.1` and `[::1]` endpoints remains available without the opt-in.
 `localhost` and `127.0.0.2` do not qualify for that exception. Other HTTP endpoints
 require that provider's `allow_insecure_http = true`. Credentials, fragments and
-non-HTTP schemes remain invalid even with the opt-in.
+non-HTTP schemes remain invalid even with the opt-in. A provider with
+`mtls = true` needs an `https` endpoint; plain HTTP fails validation even
+through the loopback exception or `allow_insecure_http`.
 
 A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
 `[::1]`.
@@ -831,9 +834,152 @@ endpoints, bounds, signing structure, and mediator selection. Every adapter
 startup compiles the same plan, and every adapter runs multi-provider auctions.
 Fastly startup adds one check: an enabled plan may need at most 160 Fastly
 backend configurations, which leaves 40 of Fastly's 200 dynamic backends for
-other outbound traffic. Each distinct tuple of provider scheme, host, port, and
-timeout counts as one configuration. Config validation and push do not run this
-check, so Fastly startup is where it applies.
+other outbound traffic. Each distinct tuple of provider scheme, host, port,
+timeout, and `mtls` counts as one configuration, because a backend that presents
+a client certificate is separate from one that does not. Config validation and
+push do not run this check, so Fastly startup is where it applies.
+
+### Provider mTLS
+
+A provider can require Trusted Server to present a TLS client certificate, for
+example a self-hosted Prebid Server behind a load balancer that verifies
+clients. Set `mtls = true` on that provider:
+
+```toml
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://pbs.example.com/openrtb2/auction"
+mtls = true
+```
+
+Every provider with `mtls = true` presents the same client identity,
+`auction-providers`, which Trusted Server declares in `edgezero.toml`. Only the
+Fastly adapter presents client certificates. Axum, Cloudflare and Spin refuse to
+start when any provider sets `mtls`, even with the auction disabled, and
+`ts config push` and `ts config diff` refuse such a config for those adapters.
+
+#### Certificates
+
+The party that verifies the certificate owns the CA that issues it: the
+publisher for a self-hosted Prebid Server, or the host of a third-party one.
+Public CAs are ending client-authentication certificates, so use a private CA.
+The recommended flow uses an offline CA:
+
+1. The CA owner keeps the CA certificate and key offline.
+2. The Trusted Server operator generates a client key and a certificate signing
+   request locally.
+3. The CA signs a certificate with the `clientAuth` extended key usage and
+   about a one-year lifetime.
+4. The key goes into the Fastly Secret Store, as below, and nowhere else. The
+   certificate goes into the Fastly Config Store. It is not secret: Trusted
+   Server presents it to the provider on every connection.
+5. The CA certificate goes to the verifier, such as an AWS load balancer trust
+   store.
+
+The provider's server certificate is verified as usual, so it needs a publicly
+trusted certificate.
+
+The certificate identifies the Trusted Server deployment, not a user. Give it a
+service name as its subject, with no personal information. The verifier sees
+the certificate on each connection and may record it; an AWS load balancer in
+verify mode passes its details to the targets in `X-Amzn-Mtls-Clientcert-*`
+headers, and its connection logs record the subject, serial and source IP.
+Bid request bodies, consent and forwarded headers do not change. The
+[Prebid Server AWS example](https://github.com/IABTechLab/trusted-server/tree/main/deploy/pbs-example)
+can require client certificates at its load balancer.
+
+#### Fastly entries
+
+Provision three entries in the stores that `trusted_server_config` and
+`trusted_server_secrets` link to:
+
+| Store                                   | Key                             | Value                                                                              |
+| --------------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------- |
+| Config Store (`trusted_server_config`)  | `auction-providers.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                             |
+| Config Store (`trusted_server_config`)  | `auction-providers.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes |
+| Secret Store (`trusted_server_secrets`) | `auction-providers.private-key` | Unencrypted PEM private key                                                        |
+
+An origin is the endpoint's scheme, host and port, such as
+`https://pbs.example.com` or `https://pbs.example.com:8443`. A request to an
+origin missing from the list is refused before it is sent. The two Config Store
+entries count toward the store's entry limit, and `ts config push` leaves them
+alone.
+
+#### Secret Store reads
+
+Fastly allows 5 Secret Store reads per Compute request by default, and Trusted
+Server uses some for its own secrets, such as request signing keys. EdgeZero
+reads the private key each time a sandbox tries to register a backend for a new
+combination of origin, port, timeout and certificate; a failed registration
+reads again on the next try. Without the
+`reusable-sandbox` feature every request starts with no backends, so each
+auction spends one read per distinct mTLS origin and timeout (timeouts that
+round to the same backend timer share one). One Prebid Server
+endpoint costs one read per auction. A Secret Store read that fails, which
+likely includes one past the limit, fails that provider with
+`store is missing`. Measure the reads with your real provider set before
+relying on several mTLS origins.
+
+#### Rotation
+
+To renew the certificate, write the new key to `auction-providers.private-key`
+first, then the new chain to `auction-providers.certificate`. EdgeZero names a
+backend after the certificate chain and reads the key only when it registers
+the backend. A backend registered between the two writes pairs a new entry
+with an old one. If Fastly accepts that pair, the handshake fails and the
+backend stays in the sandbox. Writing the chain first gives that bad backend
+the new chain's name, which stays in use until the sandbox is recycled; writing
+the key first gives it the old name, which stops being used once the new chain
+is published. Store changes reach Fastly POPs over time, so confirm with
+auctions, and with the verifier's logs, that the new certificate is in use.
+
+#### Rollout and rollback
+
+Versions of Trusted Server without this setting reject a config that has
+`mtls`, so the order matters:
+
+1. Deploy a Trusted Server version that supports `mtls`, with no `mtls` in the
+   config, and confirm every version serving traffic is on it.
+2. Provision the three Fastly entries.
+3. Push the config with `mtls = true`. With `reusable-sandbox`, a running
+   sandbox keeps its old settings until it is recycled, so allow for that
+   before the next step.
+4. Turn on client verification at the provider, and confirm auctions succeed.
+   The PBS AWS example does this one region at a time.
+
+To roll back, reverse the order: turn client verification off at the provider,
+then push a config without `mtls`, and only then deploy an older Trusted Server
+version.
+
+#### Failures
+
+When Trusted Server refuses to send a request because the identity's material
+or hosts list is wrong, the provider returns no bids for that auction, with
+`error_type` `transport`; other providers are unaffected. The request is never
+retried without the certificate. Trusted Server logs one warning that names the
+identity and the reason:
+
+```text
+Planned provider 'pbs-main' request failed: ... outbound client identity auction-providers: private key is missing
+```
+
+| Reason in the log                                    | Fix                                                                                           |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `certificate is missing` or `certificate is invalid` | Provision a PEM chain, leaf first, in `auction-providers.certificate`                         |
+| `private key is missing`                             | Provision an unencrypted PEM key in `auction-providers.private-key`                           |
+| `hosts list is missing` or `hosts list is invalid`   | Provision `auction-providers.hosts`, one `https` origin per line                              |
+| `<origin> is not in the identity's hosts`            | Add the provider's origin; the logged origin includes the port, such as `:443`                |
+| `store is missing`                                   | Link both stores to the service; if they are linked, check the Secret Store read budget above |
+| `identity is not declared in the manifest`           | Deploy a Trusted Server build whose `edgezero.toml` declares it                               |
+
+Other failures follow the existing paths. Fastly reads the private key only as
+a handle, so a key that does not match the certificate is found later: either
+Fastly rejects the backend registration, which records `launch_failed`, or the
+handshake fails, which records `transport`. A certificate the provider rejects
+is also a `transport` failure; check the provider's TLS logs, such as AWS
+connection logs, for the reason. Reading the store entries is
+bounded by the auction deadline, and running out of it is a `timeout`.
 
 ### Timeout behavior
 

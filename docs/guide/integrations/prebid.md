@@ -22,6 +22,10 @@ Prebid configuration has two independent owners:
 - `[auction.providers.<id>]`, its `profile_config`, `notifications`, and
   `[auction.bidders]` own every Prebid Server request.
 
+A Prebid Server that requires a TLS client certificate, such as the AWS example
+with verification on, needs `mtls = true` on its provider. See
+[Provider mTLS](../auction-orchestration.md#provider-mtls).
+
 ```toml
 [integrations.prebid]
 enabled = true
