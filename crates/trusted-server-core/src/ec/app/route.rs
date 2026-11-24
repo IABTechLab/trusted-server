@@ -176,10 +176,13 @@ impl IdentityApp {
         let mut result = response(StatusCode::OK);
         result.extensions_mut().insert(EcRouteResponse);
         crate::ec::consent_update::require_reconciliation(&mut result);
-        // The body is the mirror this response leaves the browser with, so it
-        // matches the cookie. When finalize expires the mirror or leaves it
-        // untouched (no readable row, or no clock to judge UID liveness and
-        // `exp` by), the body lists no EIDs: a carried cookie is never echoed.
+        // The body holds what WB-4 puts in the mirror cookie on this
+        // response: the value set, or kept unchanged, when finalize builds
+        // one. When finalize expires the mirror, or leaves it untouched
+        // because it cannot rebuild it (no readable row, or a live row and no
+        // clock to judge UID liveness and `exp` by), the body lists no EIDs. A
+        // carried cookie the server could not verify is never echoed, so the
+        // body then need not match the cookie the browser keeps.
         let mirror = self
             .finalize(
                 &mut identity.context,

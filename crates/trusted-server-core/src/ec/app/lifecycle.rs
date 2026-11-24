@@ -140,7 +140,8 @@ impl IdentityApp {
     /// Withdrawal expires the EC cookie on every finalized response, including
     /// when authoritative storage is unavailable.
     ///
-    /// Reads the clock once for the request. Returns the mirror decision the
+    /// Reads the clock at most once, and only for a navigation with an
+    /// eligible, non-redirect response. Returns the mirror decision the
     /// response carries, or `None` when the mirror cookie is left untouched or
     /// the response is not eligible for identity cookies.
     pub async fn finalize(
@@ -173,6 +174,13 @@ impl IdentityApp {
             let _ = context.take_navigation_permit();
         }
         let graph = self.identity_graph().filter(|_| use_store);
+        // Only a navigation with an eligible response uses the request time,
+        // so other responses never read the clock or log its failure.
+        let now = (context.has_navigation_permit()
+            && !NavigationPermit::is_redirect(response.status()))
+        .then(checked_current_timestamp)
+        .flatten()
+        .map(UnixSeconds::new);
         let mirror = ec_finalize_response(
             &self.settings,
             context,
@@ -181,7 +189,7 @@ impl IdentityApp {
             &FinalizeRequest {
                 eids_cookie,
                 sharedid,
-                now: checked_current_timestamp().map(UnixSeconds::new),
+                now,
             },
             response,
         )

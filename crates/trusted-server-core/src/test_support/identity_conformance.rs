@@ -1664,13 +1664,13 @@ fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, 
         .find_map(|cookie| cookie.strip_prefix("ts-ec="))
         .and_then(|cookie| cookie.split(';').next())
         .filter(|value| !value.is_empty())
-        .expect("grant C should mint a new EC as a first consent")
+        .expect("should mint a new EC for grant C as a first consent")
         .to_owned();
     assert_ne!(identity_c, identity_a, "grant C should not revive A");
     assert!(
         block_on(graph.get(&normalize_ec_id_for_kv(&identity_c)))
             .expect("should read C's record")
-            .expect("grant C should create its own record")
+            .expect("should create a record of its own for grant C")
             .0
             .consent
             .ok,

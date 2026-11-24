@@ -1479,8 +1479,10 @@ still due.
   browser lost is restored on the next navigation.
 - **Expired** (`Max-Age=0`) only when the request carried it: on any response
   where EID consent is absent or withdrawn, whatever happened to the KV write;
-  on a navigation whose mirror would be empty; and, where the mirror cannot be
-  rebuilt (non-navigations, or a navigation whose row cannot be read), when it
+  on a navigation whose mirror would be empty, including one whose row is
+  missing or withdrawn, even when the clock cannot be read; and, where the mirror cannot be
+  rebuilt (non-navigations, or a navigation whose row cannot be read or whose
+  live row needs a clock that cannot be read), when it
   holds UIDs of a mirrored partner with a gating TCF vendor the request
   denies, a source excluded where GDPR applies on a GDPR visit, or one a
   provider's cookies on the request opt out of. A carried
@@ -1499,11 +1501,19 @@ still due.
   therefore stable within a UTC day, and such a returning reader gets at
   most one mirror `Set-Cookie` per UTC day. The `exp` counts toward the
   3,584-byte budget, so UIDs that no longer fit are skipped as before.
-- **Clock:** the request time is read once per request and passed to the
-  mirror build. If the clock cannot be read, a navigation neither sets nor
-  re-sets the mirror, since UID liveness and `exp` depend on it; the consent
-  and vendor rules above can still expire it. The EC route's JSON is the
-  mirror decision of that same response, so it lists no EIDs then.
+- **Clock:** the request time is read at most once per request, and only for
+  a navigation with an eligible, non-redirect response; the page-load write
+  and the mirror build both use it. If the clock cannot be read, the
+  navigation writes no row (no generated EC is issued and no orphan is
+  rotated) and neither sets nor re-sets the mirror from a live row, since UID
+  liveness and `exp` depend on it. A missing or withdrawn row still expires
+  it, and the consent and vendor rules above can too.
+- **EC route JSON:** the body holds what this response puts in the mirror
+  cookie (ID-9): the value set, or kept unchanged, when the mirror is built.
+  When the response expires the mirror or leaves it untouched because it
+  cannot be rebuilt, the body lists no EIDs. The server never echoes a
+  carried mirror it could not verify, so in the untouched case the body does
+  not match the cookie the browser keeps.
 
 ## 11. Consumers
 
