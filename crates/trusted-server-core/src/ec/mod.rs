@@ -670,7 +670,8 @@ impl EcContext {
     }
 
     /// Whether this request still holds its page-load write permit.
-    pub(crate) fn has_navigation_permit(&self) -> bool {
+    #[must_use]
+    pub fn has_navigation_permit(&self) -> bool {
         self.navigation_permit.0.is_some()
     }
 

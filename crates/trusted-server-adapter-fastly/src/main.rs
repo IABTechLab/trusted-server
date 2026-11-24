@@ -694,6 +694,13 @@ async fn apply_edgezero_ec_finalize(
     } else {
         None
     };
+    // Only a navigation with an eligible response uses the request time, so
+    // other responses never read the clock or log its failure.
+    let now = (ec_state.ec_context.has_navigation_permit()
+        && !NavigationPermit::is_redirect(response.status()))
+    .then(checked_current_timestamp)
+    .flatten()
+    .map(UnixSeconds::new);
     ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
@@ -702,7 +709,7 @@ async fn apply_edgezero_ec_finalize(
         &FinalizeRequest {
             eids_cookie: ec_state.eids_cookie.as_deref(),
             sharedid_cookie: ec_state.sharedid_cookie.as_deref(),
-            now: checked_current_timestamp().map(UnixSeconds::new),
+            now,
         },
         response,
     )
