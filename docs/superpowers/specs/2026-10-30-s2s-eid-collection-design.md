@@ -1498,12 +1498,13 @@ still due.
   stated expiry is mirrored with the earlier of that expiry and the cap; a
   UID with no stated expiry (D7) is mirrored with the cap, and KV still
   serves it until replaced or removed. A mirror whose UIDs reach the cap is
-  therefore stable within a UTC day, and such a returning reader gets at
-  most one mirror `Set-Cookie` per UTC day. The `exp` counts toward the
+  therefore stable within a UTC day, and an unchanged returning reader gets
+  a mirror `Set-Cookie` at most once per UTC day; a changed row or a stated
+  expiry falling during the day can change it again. The `exp` counts toward the
   3,584-byte budget, so UIDs that no longer fit are skipped as before.
-- **Clock:** the request time is read at most once per request, and only for
-  a navigation with an eligible, non-redirect response; the page-load write
-  and the mirror build both use it. If the clock cannot be read, the
+- **Clock:** the page-load write and the mirror build share one request
+  time, read only for a navigation with an eligible, non-redirect response;
+  other steps, such as provider lookups, read the clock separately. If the clock cannot be read, the
   navigation writes no row (no generated EC is issued and no orphan is
   rotated) and neither sets nor re-sets the mirror from a live row, since UID
   liveness and `exp` depend on it. A missing or withdrawn row still expires
