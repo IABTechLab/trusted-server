@@ -894,15 +894,17 @@ can require client certificates at its load balancer.
 Provision three entries in the stores that `trusted_server_config` and
 `trusted_server_secrets` link to:
 
-| Store                                   | Key                             | Value                                                                              |
-| --------------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------- |
-| Config Store (`trusted_server_config`)  | `auction-providers.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                             |
-| Config Store (`trusted_server_config`)  | `auction-providers.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes |
-| Secret Store (`trusted_server_secrets`) | `auction-providers.private-key` | Unencrypted PEM private key                                                        |
+| Store                                   | Key                             | Value                                                                                                    |
+| --------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Config Store (`trusted_server_config`)  | `auction-providers.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                                                   |
+| Config Store (`trusted_server_config`)  | `auction-providers.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes including line breaks |
+| Secret Store (`trusted_server_secrets`) | `auction-providers.private-key` | Unencrypted PEM private key                                                                              |
 
 An origin is the endpoint's scheme, host and port, such as
 `https://pbs.example.com` or `https://pbs.example.com:8443`. A request to an
-origin missing from the list is refused before it is sent. The two Config Store
+origin missing from the list is refused before it is sent. A list over the limit makes the
+whole identity invalid, so every `mtls` provider fails with
+`hosts list is invalid`. The two Config Store
 entries count toward the store's entry limit, and `ts config push` leaves them
 alone.
 
@@ -976,7 +978,9 @@ Planned provider 'pbs-main' request failed: ... outbound client identity auction
 Other failures follow the existing paths. Fastly reads the private key only as
 a handle, so a key that does not match the certificate is found later: either
 Fastly rejects the backend registration, which records `launch_failed`, or the
-handshake fails, which records `transport`. A certificate the provider rejects
+handshake fails, which records `transport`. If every routed provider fails to
+launch, direct `/auction` returns `502 Bad Gateway`, as described under
+[Error Handling](#error-handling). A certificate the provider rejects
 is also a `transport` failure; check the provider's TLS logs, such as AWS
 connection logs, for the reason. Reading the store entries is
 bounded by the auction deadline, and running out of it is a `timeout`.
