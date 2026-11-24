@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use edgezero_core::body::Body;
-use edgezero_core::http::{Method, StatusCode, header, request_builder};
+use edgezero_core::http::{HeaderValue, Method, StatusCode, header, request_builder};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ja4::Ja4Source;
 use error_stack::Report;
 use serde_json::json;
 
 use super::{EC_PATH, IdentityApp, IdentityPlatform, IdentityProviders};
 use crate::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
-use crate::ec::device::DeviceSignals;
 use crate::ec::eid_types::SourceDomain;
 use crate::ec::kv_backend::EcKvStore;
 use crate::ec::kv_backend::test_support::{FailingEcKv, InMemoryEcKv};
@@ -29,6 +29,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::http_util::RuntimeRequestOrigin;
 use crate::platform::test_support::{NoopConfigStore, NoopSecretStore, noop_services};
 use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
+use crate::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, PYTHON_JA4, captured_ja4, insert_ja4,
+};
 use crate::test_support::tests::create_test_settings;
 
 const EXISTING_EC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -168,7 +171,7 @@ fn route_request(
     method: Method,
     origin: Option<&str>,
     cookie: Option<&str>,
-    known_browser: Option<bool>,
+    ja4: &str,
 ) -> edgezero_core::http::Request {
     let mut builder = request_builder()
         .method(method)
@@ -186,9 +189,15 @@ fn route_request(
         InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
             .expect("should supply trusted fixture ingress"),
     ));
-    let mut signals = DeviceSignals::derive("Example browser", None, None);
-    signals.known_browser = known_browser;
-    request.extensions_mut().insert(signals);
+    // A trusted Python JA4 behind a Chrome User-Agent is one ID-7 refuses.
+    request.headers_mut().insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(CHROME_USER_AGENT),
+    );
+    insert_ja4(
+        request.extensions_mut(),
+        captured_ja4(ja4, Ja4Source::RuntimeTls),
+    );
     request
 }
 
@@ -197,28 +206,28 @@ async fn ec_route_refused_requests_without_identity_mint_nothing_and_call_no_pro
     let same_origin = Some("https://publisher.example.com");
     // Fixture TCF strings are age-checked elsewhere; a non-regulated location
     // lets the control mint without one.
-    for (label, method, origin, known_browser, mints) in [
+    for (label, method, origin, ja4, mints) in [
         (
             "same-origin control",
             Method::POST,
             same_origin,
-            Some(true),
+            CHROMIUM_JA4,
             true,
         ),
         (
             "cross-site Origin",
             Method::POST,
             Some("https://cross-site.example.com"),
-            Some(true),
+            CHROMIUM_JA4,
             false,
         ),
-        ("missing Origin", Method::POST, None, Some(true), false),
-        ("pixel GET", Method::GET, same_origin, Some(true), false),
+        ("missing Origin", Method::POST, None, CHROMIUM_JA4, false),
+        ("pixel GET", Method::GET, same_origin, CHROMIUM_JA4, false),
         (
             "ID-7 refused client",
             Method::POST,
             same_origin,
-            Some(false),
+            PYTHON_JA4,
             false,
         ),
     ] {
@@ -228,7 +237,7 @@ async fn ec_route_refused_requests_without_identity_mint_nothing_and_call_no_pro
         let response = app
             .ec_route(
                 &located_services(),
-                route_request(method, origin, None, known_browser),
+                route_request(method, origin, None, ja4),
             )
             .await;
 
@@ -270,7 +279,7 @@ async fn ec_route_refused_client_with_existing_identity_never_calls_page_provide
             Method::POST,
             Some("https://publisher.example.com"),
             Some(&cookie),
-            Some(allowed),
+            if allowed { CHROMIUM_JA4 } else { PYTHON_JA4 },
         );
 
         let response = app.ec_route(&located_services(), request).await;
@@ -330,7 +339,7 @@ async fn ec_route_lists_no_eids_when_it_leaves_a_carried_mirror_untouched() {
         Method::POST,
         Some("https://publisher.example.com"),
         Some(&cookie),
-        Some(true),
+        CHROMIUM_JA4,
     );
 
     // Act

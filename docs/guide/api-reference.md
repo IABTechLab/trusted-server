@@ -365,7 +365,10 @@ the mirror, the JSON is that value, the same as the `__Host-ts-eids-mirror`
 cookie it sets or keeps unchanged. It lists no EIDs when the response expires
 the mirror, or leaves it untouched because the record or the clock could not
 be read; the server never echoes a mirror it could not rebuild, so in that case
-the JSON does not match the cookie the browser keeps.
+the JSON does not match the cookie the browser keeps. When the SharedID storage
+type is `cookie`, the reader has not set `_pubcid_optout` and Purpose 4 allows
+EIDs, the JSON also carries `"sharedId"`: the SharedID this response sets or the
+browser already holds. Otherwise the field is absent.
 
 `GET` returns an empty `204` and can restore an existing SharedID cookie from
 its record only when current EC and EID permission both allow. It never

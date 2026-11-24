@@ -53,6 +53,7 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+mod ja4_family;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
@@ -320,7 +321,8 @@ pub struct EcContext {
     client_ip: Option<String>,
     /// Geo information captured pre-routing for downstream KV writes.
     geo_info: Option<GeoInfo>,
-    /// Device signals derived from TLS/H2/UA in the adapter layer.
+    /// Device signals the shared identity app derives from the User-Agent,
+    /// `EdgeZero`'s ingress JA4 and the HTTP/2 fingerprint.
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
@@ -352,6 +354,9 @@ pub struct EcContext {
     /// Sources of identity providers whose first-party cookies on this
     /// request record an opt-out; their IDs never leave the server for it.
     cookie_opted_out_sources: Vec<String>,
+    /// The `SharedID` this response leaves the reader with, when SID-2 and
+    /// SID-6 allow it, as decided by the `SharedID` write-back.
+    kept_sharedid: Option<String>,
 }
 
 impl EcContext {
@@ -440,6 +445,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         })
     }
 
@@ -551,11 +557,14 @@ impl EcContext {
         &mut self.consent
     }
 
-    /// Sets the device signals derived from the adapter layer.
+    /// Sets the request's device signals.
     ///
     /// Must be called before [`generate_if_needed`] so that new entries
-    /// include the [`KvDevice`] record. The adapter derives these from
-    /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
+    /// include the [`KvDevice`] record. [`IdentityApp::read_request`] derives
+    /// them from the User-Agent, the JA4 `EdgeZero`'s request ingress
+    /// captured (`ctx.ja4()`) and the platform's HTTP/2 fingerprint.
+    ///
+    /// [`IdentityApp::read_request`]: app::IdentityApp::read_request
     ///
     /// [`KvDevice`]: super::kv_types::KvDevice
     /// [`generate_if_needed`]: Self::generate_if_needed
@@ -661,6 +670,17 @@ impl EcContext {
     #[must_use]
     pub(crate) fn mirror_cookie(&self) -> Option<&str> {
         self.mirror_cookie.as_deref()
+    }
+
+    /// The `SharedID` this response leaves the reader with, when the
+    /// `SharedID` write-back ran and SID-2 and SID-6 allow it.
+    #[must_use]
+    pub(crate) fn kept_sharedid(&self) -> Option<&str> {
+        self.kept_sharedid.as_deref()
+    }
+
+    pub(crate) fn set_kept_sharedid(&mut self, sharedid: Option<String>) {
+        self.kept_sharedid = sharedid;
     }
 
     /// Sets the mirror cookie the request carried, for tests.
@@ -803,6 +823,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -834,6 +855,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -868,6 +890,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 }

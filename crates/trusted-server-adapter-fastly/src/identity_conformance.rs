@@ -2,12 +2,17 @@
 
 use crate::app::TrustedServerApp;
 use crate::sandbox::RetainedApp;
+use async_trait::async_trait;
 use edgezero_adapter_fastly::delivery::FastlyResponseCommitState;
 use edgezero_adapter_fastly::delivery::testing::response_delivery;
 use edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test;
 use edgezero_core::app::Hooks as _;
-use edgezero_core::http::StatusCode;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::{Response, StatusCode};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ja4::CapturedJa4;
+use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use futures::executor::block_on;
 use std::cell::RefCell;
@@ -20,28 +25,25 @@ use trusted_server_core::test_support::identity_conformance::{
     verify_api_identity_expiries, verify_failed_ec_creation, verify_http_contract,
     verify_identity_gates,
 };
+use trusted_server_core::test_support::ja4::insert_ja4;
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
 
 use edgezero_core::outbound::HttpClient;
 
-use super::{
-    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, with_finalization,
-};
+use super::{ClientRequestValues, FinalizeInputs, handle_delivery, with_finalization};
+use crate::app::assemble_app_with_middleware;
 use crate::platform::RequestGeo;
 use crate::sandbox::SandboxCounters;
 use crate::tinybird::TelemetryQueue;
 use fastly::Request as FastlyRequest;
-use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, GeoCoordinates};
 use trusted_server_core::settings::Settings;
 
 const DOCUMENT: &str = "<html><head></head><body>Example article</body></html>";
 const ORIGIN: &str = "https://origin.example.com/article";
-const USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36";
 
 thread_local! {
     static STORE: RefCell<Option<RecordingStore>> = const { RefCell::new(None) };
@@ -61,6 +63,34 @@ pub(crate) fn fixture_store(store_name: &str) -> Option<Arc<dyn EcKvStore + Send
         })
     } else {
         None
+    }
+}
+
+/// The runtime TLS JA4 of a scenario, which the prepare hook hands to
+/// [`RuntimeTlsJa4`].
+#[derive(Clone, Copy)]
+struct FixtureTlsJa4(&'static str);
+
+/// Records a scenario's JA4 in the [`RequestIngress`] `EdgeZero` captured.
+///
+/// `EdgeZero`'s Fastly ingress records `get_tls_ja4()` of the client
+/// request, which Viceroy cannot supply for a synthetic request, and drops any
+/// ingress a prepare hook supplies. This fills the claim that capture would
+/// make, so the app reads it through `ctx.ja4()`'s source as in production.
+///
+/// [`RequestIngress`]: edgezero_core::ingress::RequestIngress
+struct RuntimeTlsJa4;
+
+#[async_trait(?Send)]
+impl Middleware for RuntimeTlsJa4 {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        if let Some(FixtureTlsJa4(ja4)) = ctx.extensions_mut().remove::<FixtureTlsJa4>() {
+            insert_ja4(
+                ctx.extensions_mut(),
+                CapturedJa4::from_runtime_tls(Some(ja4)),
+            );
+        }
+        next.run(ctx).await
     }
 }
 
@@ -119,7 +149,7 @@ impl FastlyAdapter {
         let origin = ScriptedHttpClient::new(&clock);
         let mut retained = {
             let _guard = StoreGuard::install(&store);
-            assemble_app(Ok(settings.clone()), &"")
+            assemble_app_with_middleware(settings.clone(), RuntimeTlsJa4)
                 .expect("should assemble the conformance application")
         };
         retained.app.set_monotonic_clock(clock.monotonic_clock());
@@ -157,8 +187,8 @@ impl FastlyAdapter {
             configure_api_request(&mut configured, api);
             configured.ec.ec_store = api.store_enabled.then(|| "trusted_server_kv".to_owned());
             let _guard = StoreGuard::install(&self.store);
-            self.retained =
-                assemble_app(Ok(configured), &"").expect("should assemble HTTP conformance app");
+            self.retained = assemble_app_with_middleware(configured, RuntimeTlsJa4)
+                .expect("should assemble HTTP conformance app");
             // Rebuilt store/no-store applications keep the outbound double's
             // clock domain, including ingress and response deadlines.
             self.retained
@@ -236,14 +266,14 @@ impl FastlyAdapter {
                 if document { "navigate" } else { "no-cors" },
             )
             .with_header("accept", if document { "text/html" } else { "*/*" })
-            .with_header("user-agent", USER_AGENT)
+            .with_header("user-agent", navigation.user_agent)
             .with_header("cookie", cookies.join("; "));
         if let Some(api) = api {
             request = FastlyRequest::new(
                 api.method.as_str(),
                 format!("https://publisher.example.com{}", api.path),
             );
-            request.set_header("user-agent", USER_AGENT);
+            request.set_header("user-agent", navigation.user_agent);
             for (name, value) in &api.headers {
                 request.set_header(name.as_str(), value.as_str());
             }
@@ -251,7 +281,8 @@ impl FastlyAdapter {
         }
         // Production's native read and `prepare` run unchanged. The fixture
         // replaces only the values Viceroy cannot supply: a routable client IP,
-        // its geo result and, for browser scenarios, JA4-backed device signals.
+        // its geo result and, where the scenario has one, the runtime TLS JA4
+        // that `RuntimeTlsJa4` records in EdgeZero's ingress.
         let mut values = ClientRequestValues::read(&mut request, &self.settings, false);
         let ip = Some("192.0.2.7".parse().expect("should parse fixture IP"));
         values.client_info = ClientInfo {
@@ -263,13 +294,6 @@ impl FastlyAdapter {
         } else {
             RequestGeo::new(ip, geo.clone())
         };
-        if navigation.browser {
-            values.device_signals = Some(DeviceSignals::derive(
-                USER_AGENT,
-                Some("t13d1516h2_example_example"),
-                None,
-            ));
-        }
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let mut cache_control = None;
@@ -282,6 +306,9 @@ impl FastlyAdapter {
                 request,
                 |_request, extensions| {
                     values.prepare(extensions, &self.settings, &queue);
+                    if let Some(ja4) = navigation.ja4 {
+                        extensions.insert(FixtureTlsJa4(ja4));
+                    }
                     extensions.insert(HttpClient::with_client(origin));
                     // This synthetic request bypasses runtime URI capture.
                     extensions.insert(RuntimeRequestOrigin::new(

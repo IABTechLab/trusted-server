@@ -19,7 +19,6 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::device::DeviceSignals;
 #[cfg(test)]
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
@@ -380,11 +379,11 @@ fn with_finalization<T>(
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
 ///
 /// Only the client request exposes the trusted forwarder, the resolved client
-/// IP, TLS metadata, and device signals.
+/// IP and TLS metadata. EC device signals read JA4 from `EdgeZero`'s request
+/// ingress instead.
 struct ClientRequestValues {
     forwarder: ForwarderPreparation,
     client_info: ClientInfo,
-    device_signals: Option<DeviceSignals>,
     /// The geo lookup for `client_info`'s client IP.
     request_geo: RequestGeo,
 }
@@ -392,8 +391,7 @@ struct ClientRequestValues {
 impl ClientRequestValues {
     /// Reads the client request's values and sanitizes `req` for dispatch.
     ///
-    /// A trace path keeps its forwarded and TLS headers, and reads no device
-    /// signals.
+    /// A trace path keeps its forwarded and TLS headers.
     fn read(req: &mut FastlyRequest, settings: &Settings, trace_path: bool) -> Self {
         let trusted_client_ip = settings.trusted_client_ip.as_ref();
 
@@ -440,9 +438,8 @@ impl ClientRequestValues {
 
         // These accessors only return real values on the client request, so they
         // are read here and carried in the request extensions for
-        // build_per_request_services and EC bot classification.
+        // build_per_request_services.
         let client_info = client_info_from_request(req, resolved_client_ip);
-        let device_signals = (!trace_path).then(|| derive_device_signals(req));
         // The request's one geo lookup, for the resolved client IP. The
         // synthesized headers, `finalize`, the finalize middleware, the trace
         // metadata and the per-request services all read it.
@@ -450,7 +447,6 @@ impl ClientRequestValues {
         Self {
             forwarder,
             client_info,
-            device_signals,
             request_geo,
         }
     }
@@ -458,9 +454,6 @@ impl ClientRequestValues {
     /// Moves the values into `extensions`, with `queue` and the request's synthesized headers.
     fn prepare(self, extensions: &mut Extensions, settings: &Settings, queue: &TelemetryQueue) {
         extensions.insert(self.forwarder);
-        if let Some(device_signals) = self.device_signals {
-            extensions.insert(device_signals);
-        }
         extensions.insert(self.client_info);
         extensions.insert(queue.clone());
         extensions.insert(per_request_synthesized_headers(
@@ -767,18 +760,6 @@ pub(crate) fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })
-}
-
-/// Derives device signals from TLS, H2, and UA request data.
-///
-/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
-/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
-    let ua = req.get_header_str("user-agent").unwrap_or("");
-    let ja4 = req.get_tls_ja4();
-    let h2_fp = req.get_client_h2_fingerprint();
-
-    DeviceSignals::derive(ua, ja4, h2_fp)
 }
 
 #[cfg(test)]

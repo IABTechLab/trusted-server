@@ -891,6 +891,37 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
 | `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
 | `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
+| `browser_gate`                      | String         | No       | Device-signal rule for EC creation: `lenient` (default) or `strict` (see below)       |
+| `ja4_contradiction_exempt`          | String         | No       | Contradictions that do not block EC creation: `off` (default), `non_browser` or `all` |
+
+`browser_gate` decides which clients may create an Edge Cookie from their trusted
+device signals. Consent and the navigation policy apply under both rules.
+
+- `lenient` (default) blocks only known non-browsers: clients whose trusted
+  JA4 names a TLS client family that contradicts the User-Agent's browser
+  family, such as a Chrome User-Agent over Python's TLS stack (see
+  [Edge Cookies](/guide/edge-cookies#request-lifecycle)). A client without
+  trusted JA4, such as one behind a proxy or on a runtime that supplies none,
+  or with a JA4 the rule does not recognize, stays eligible for EC creation.
+- `strict` also requires a JA4 class and a recognized User-Agent platform. A
+  client without trusted JA4 creates no EC. That includes a JA4 the runtime
+  returns but EdgeZero rejects as malformed, such as section 1 alone, which
+  counts as no JA4 under both rules. `strict` blocks everything `lenient`
+  blocks.
+
+`ja4_contradiction_exempt` names the JA4 contradictions that stop blocking
+creation under either rule:
+
+- `off` (default) exempts nothing: every contradiction blocks.
+- `non_browser` exempts a non-browser TLS stack (the rule lists only Python's
+  default TLS context) behind a browser User-Agent. Use it when readers reach the site through a TLS-intercepting
+  proxy, which replaces their JA4 with its own. A User-Agent of one browser
+  engine over another engine's TLS stack still blocks.
+- `all` exempts every contradiction, which turns the JA4 rule off.
+
+An unknown value fails config loading. The rule runs on Fastly and on Axum
+with a trusted JA4 proxy header. Cloudflare creates no ECs yet, so both keys
+have no effect there.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -971,7 +1002,13 @@ certificate, whatever `proxy.certificate_check` says.
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them. Browser-resolved IDs
 (`ts-eids` and the SharedID cookie) are never stored for an owned source, so a source a
-provider cleared on an opt-out is not refilled from the browser.
+provider cleared on an opt-out is not refilled from the browser. Legacy single-UID
+records in provider-owned sources expire immediately on reads. Provider-written
+IDs retain their per-UID expiry, and unowned records retain their existing
+behavior. Active remembered provider opt-outs also suppress client copies from
+`ts-eids` and the `/auction` body in direct, initial-page and page-bids auctions.
+Client EIDs cannot clear that memory. A missing, failed or mismatched row snapshot
+retains existing degraded behavior because it establishes no active opt-out.
 
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the
