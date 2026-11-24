@@ -36,7 +36,9 @@ use fastly::Request as FastlyRequest;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, GeoCoordinates};
-use trusted_server_core::settings::Settings;
+use trusted_server_core::redacted::Redacted;
+use trusted_server_core::settings::{Settings, TrustedClientIpConfig};
+use trusted_server_core::test_support::geo_consent::{self, Exchange, Observed, Source};
 
 const DOCUMENT: &str = "<html><head></head><body>Example article</body></html>";
 const ORIGIN: &str = "https://origin.example.com/article";
@@ -110,6 +112,8 @@ struct FastlyAdapter {
     origin: ScriptedHttpClient,
     clock: TestClock,
     store: RecordingStore,
+    forwarding: Forwarding,
+    geo_configured: bool,
 }
 
 impl FastlyAdapter {
@@ -129,13 +133,15 @@ impl FastlyAdapter {
             origin,
             clock,
             store,
+            forwarding: Forwarding::Trusted,
+            geo_configured: false,
         }
     }
 }
 
 impl Adapter for FastlyAdapter {
     fn navigate(&mut self, navigation: &Navigation) -> Observation {
-        self.execute(navigation, None).response
+        self.execute(navigation, None, None).response
     }
 
     fn exchange(&mut self, request: &ApiRequest) -> ApiObservation {
@@ -145,20 +151,35 @@ impl Adapter for FastlyAdapter {
                 ..Navigation::default()
             },
             Some(request),
+            None,
         )
     }
 }
 
 impl FastlyAdapter {
-    fn execute(&mut self, navigation: &Navigation, api: Option<&ApiRequest>) -> ApiObservation {
+    fn execute(
+        &mut self,
+        navigation: &Navigation,
+        api: Option<&ApiRequest>,
+        geo_request: Option<&Exchange<'_>>,
+    ) -> ApiObservation {
         let before_requests = self.origin.requests().len();
-        if let Some(api) = api {
+        if let Some(api) = api.filter(|_| geo_request.is_none() || !self.geo_configured) {
             let mut configured = self.settings.clone();
             configured.auction.enabled = api.auction_enabled;
             configured.ec.ec_store = api.store_enabled.then(|| "trusted_server_kv".to_owned());
+            if geo_request.is_some() {
+                geo_consent::configure(&mut configured);
+                configured.trusted_client_ip = Some(TrustedClientIpConfig {
+                    ip_header: "x-example-reader-ip".to_owned(),
+                    auth_header: "x-example-reader-auth".to_owned(),
+                    shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+                });
+            }
             let _guard = StoreGuard::install(&self.store);
             self.retained =
                 assemble_app(Ok(configured), &"").expect("should assemble HTTP conformance app");
+            self.geo_configured = geo_request.is_some();
             // Rebuilt store/no-store applications keep the outbound double's
             // clock domain, including ingress and response deadlines.
             self.retained
@@ -183,9 +204,22 @@ impl FastlyAdapter {
                 } else {
                     reply.header("content-type", mime)
                 };
-                reply.body(DOCUMENT)
+                if geo_request.is_some_and(|request| request.kind == geo_consent::Kind::Document) {
+                    reply.body(
+                        "<html><head></head><body><div id=\"example-slot\"></div></body></html>",
+                    )
+                } else {
+                    reply.body(DOCUMENT)
+                }
             },
         );
+        if geo_request.is_some() {
+            self.origin.respond_to(
+                edgezero_core::http::Method::POST,
+                geo_consent::BIDDER,
+                ScriptedReply::status(StatusCode::NO_CONTENT),
+            );
+        }
         let geo = match navigation.geo {
             Geo::Gdpr => Some(GeoInfo {
                 country: "DE".to_owned(),
@@ -206,11 +240,6 @@ impl FastlyAdapter {
             ordinal: 1,
             builds: 1,
             request_id: "example-conformance-request".to_owned(),
-        };
-        let inputs = FinalizeInputs {
-            state: self.retained.state.as_ref(),
-            geo: geo.as_ref(),
-            counters: &counters,
         };
         let mut cookies = Vec::new();
         match navigation.consent {
@@ -240,25 +269,44 @@ impl FastlyAdapter {
             );
             request.set_header("user-agent", USER_AGENT);
             for (name, value) in &api.headers {
-                request.set_header(name.as_str(), value.as_str());
+                request.append_header(name.as_str(), value.as_str());
             }
             request.set_body(api.body.clone());
         }
         // Production's native read and `prepare` run unchanged. The fixture
         // replaces only the values Viceroy cannot supply: a routable client IP,
         // its geo result and, for browser scenarios, JA4-backed device signals.
-        let mut values = ClientRequestValues::read(&mut request, &self.settings, false);
+        let mut producer_settings = self.settings.clone();
+        if geo_request.is_some() {
+            producer_settings.trusted_client_ip = Some(TrustedClientIpConfig {
+                ip_header: "x-example-reader-ip".to_owned(),
+                auth_header: "x-example-reader-auth".to_owned(),
+                shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+            });
+        }
+        let mut values = ClientRequestValues::read(&mut request, &producer_settings, false);
         let ip = Some("192.0.2.7".parse().expect("should parse fixture IP"));
-        values.client_info = ClientInfo {
-            client_ip: ip,
-            ..ClientInfo::default()
+        if geo_request.is_none() {
+            values.client_info = ClientInfo {
+                client_ip: ip,
+                ..ClientInfo::default()
+            };
+            values.request_geo = if navigation.geo == Geo::Failed {
+                RequestGeo::failing(ip)
+            } else {
+                RequestGeo::new(ip, geo.clone())
+            };
+        }
+        if geo_request.is_some_and(|request| request.location.source == Source::Error) {
+            values.request_geo = RequestGeo::failing(values.client_info.client_ip);
+        }
+        let held_geo = values.request_geo.geo().cloned();
+        let inputs = FinalizeInputs {
+            state: self.retained.state.as_ref(),
+            geo: held_geo.as_ref(),
+            counters: &counters,
         };
-        values.request_geo = if navigation.geo == Geo::Failed {
-            RequestGeo::failing(ip)
-        } else {
-            RequestGeo::new(ip, geo.clone())
-        };
-        if navigation.browser {
+        if navigation.browser && geo_request.is_none() {
             values.device_signals = Some(DeviceSignals::derive(
                 USER_AGENT,
                 Some("t13d1516h2_example_example"),
@@ -268,6 +316,7 @@ impl FastlyAdapter {
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let mut cache_control = None;
+        let mut headers = None;
         let origin = self.origin.clone();
         // As in `serve`, drop identity lookups an earlier request on this
         // thread left in the request-local slot.
@@ -278,7 +327,7 @@ impl FastlyAdapter {
                 TrustedServerApp::stores(),
                 request,
                 |_request, extensions| {
-                    values.prepare(extensions, &self.settings, &queue);
+                    values.prepare(extensions, &producer_settings, &queue);
                     extensions.insert(HttpClient::with_client(origin));
                     // This synthetic request bypasses runtime URI capture.
                     extensions.insert(RuntimeRequestOrigin::new(
@@ -296,6 +345,7 @@ impl FastlyAdapter {
                         .begin(ResponseEgressFramingMode::HostAutomatic)
                         .unwrap_or_else(|_| panic!("should prepare the document response"));
                     let response = prepared.into_response();
+                    headers = Some(response.headers().clone());
                     self.store.response_released();
                     let status = response.status();
                     cache_control = response
@@ -344,6 +394,14 @@ impl FastlyAdapter {
         handle_delivery(delivery, &counters, |_| {});
         drop(take_navigation_lookups());
         ApiObservation {
+            headers: headers.expect("should capture finalized headers"),
+            bids: self.origin.requests()[before_requests..]
+                .iter()
+                .filter(|request| request.uri == geo_consent::BIDDER)
+                .map(|request| {
+                    serde_json::from_slice(&request.body).expect("should record OpenRTB")
+                })
+                .collect(),
             response: observation.expect("should deliver a finalized response"),
             origin_requests: self.origin.requests().len() - before_requests,
             cache_control,
@@ -365,4 +423,168 @@ fn identity_conformance_fastly() {
     let store = RecordingStore::new(true);
     let mut adapter = FastlyAdapter::new(store.clone());
     verify_failed_ec_creation(&mut adapter, &store);
+}
+
+#[derive(Clone, Copy)]
+enum Forwarding {
+    Trusted,
+    DuplicatedIp,
+    DuplicatedAuth,
+    MalformedIp,
+    MissingAuth,
+    Ipv6,
+}
+
+impl geo_consent::Adapter for FastlyAdapter {
+    fn record_is_live(&self, identity: &str) -> bool {
+        geo_consent::record_is_live(&self.store, identity)
+    }
+
+    fn exchange(&mut self, request: &Exchange<'_>) -> Observed {
+        let (method, path) = request.target();
+        let mut api = ApiRequest::new(method, path);
+        api.headers = request
+            .headers()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        let index = geo_consent::LOCATIONS
+            .iter()
+            .position(|location| location.name == request.location.name)
+            .expect("should find shared geo row");
+        api.headers.push((
+            "x-example-reader-ip".to_owned(),
+            format!("192.0.2.{}", index + 1),
+        ));
+        api.headers.push((
+            "x-example-reader-auth".to_owned(),
+            if request.location.source == Source::Untrusted {
+                "forged"
+            } else {
+                "fictional-shared-secret-0123456789"
+            }
+            .to_owned(),
+        ));
+        match self.forwarding {
+            Forwarding::Trusted => {}
+            Forwarding::DuplicatedIp => api
+                .headers
+                .push(("x-example-reader-ip".to_owned(), "198.51.100.7".to_owned())),
+            Forwarding::DuplicatedAuth => api.headers.push((
+                "x-example-reader-auth".to_owned(),
+                "fictional-shared-secret-0123456789".to_owned(),
+            )),
+            Forwarding::MalformedIp => {
+                api.headers
+                    .retain(|(name, _)| name != "x-example-reader-ip");
+                api.headers.push((
+                    "x-example-reader-ip".to_owned(),
+                    "192.0.2.3, 198.51.100.7".to_owned(),
+                ));
+            }
+            Forwarding::MissingAuth => api
+                .headers
+                .retain(|(name, _)| name != "x-example-reader-auth"),
+            Forwarding::Ipv6 => {
+                api.headers
+                    .retain(|(name, _)| name != "x-example-reader-ip");
+                api.headers
+                    .push(("x-example-reader-ip".to_owned(), "2001:db8::7".to_owned()));
+                api.headers
+                    .push(("x-forwarded-for".to_owned(), "192.0.2.1".to_owned()));
+            }
+        }
+        api.body = request.body();
+        api.origin_content_type = if request.kind == geo_consent::Kind::Document {
+            "text/html"
+        } else {
+            "application/json"
+        };
+        let result = self.execute(&Navigation::default(), Some(&api), Some(request));
+        Observed {
+            status: result.response.status,
+            headers: result.headers,
+            bids: result.bids,
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires test-only Viceroy geo mapping; run scripts/test-geo-consent.mjs"]
+fn geo_consent_fastly() {
+    let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
+    geo_consent::verify(&mut adapter, false, false);
+}
+
+#[test]
+#[ignore = "requires test-only Viceroy geo mapping; run scripts/test-geo-consent.mjs"]
+fn geo_consent_fastly_forwarding() {
+    let mut adapter = FastlyAdapter::new(RecordingStore::new(false));
+    for forwarding in [
+        Forwarding::DuplicatedIp,
+        Forwarding::DuplicatedAuth,
+        Forwarding::MalformedIp,
+        Forwarding::MissingAuth,
+    ] {
+        adapter.forwarding = forwarding;
+        for signal in [geo_consent::Signal::None, geo_consent::Signal::Purpose1] {
+            for kind in [geo_consent::Kind::Document, geo_consent::Kind::Auction] {
+                let result = geo_consent::Adapter::exchange(
+                    &mut adapter,
+                    &Exchange {
+                        location: geo_consent::LOCATIONS[2],
+                        signal,
+                        kind,
+                        ec: None,
+                    },
+                );
+                assert!(
+                    result.status.is_success(),
+                    "should accept rejected forwarding input without crashing"
+                );
+                assert_eq!(
+                    result.headers["x-geo-info-available"], "false",
+                    "should use unmapped peer rather than forged reader"
+                );
+                assert!(
+                    !result.headers.contains_key("set-cookie"),
+                    "should not create EC without trusted location"
+                );
+                assert_eq!(
+                    result.bids.len(),
+                    usize::from(signal == geo_consent::Signal::Purpose1),
+                    "should apply Unknown auction policy"
+                );
+                for bid in result.bids {
+                    assert!(
+                        bid["device"]["geo"].is_null(),
+                        "should not export forged location"
+                    );
+                }
+            }
+        }
+    }
+    adapter.forwarding = Forwarding::Ipv6;
+    let result = geo_consent::Adapter::exchange(
+        &mut adapter,
+        &Exchange {
+            location: geo_consent::LOCATIONS[2],
+            signal: geo_consent::Signal::None,
+            kind: geo_consent::Kind::Auction,
+            ec: None,
+        },
+    );
+    assert_eq!(
+        result.headers["x-geo-country"], "US",
+        "should use authenticated IPv6 reader instead of forged forwarding"
+    );
+    assert_eq!(
+        result.headers["x-geo-region"], "CA",
+        "should retain IPv6 reader subdivision"
+    );
+    assert_eq!(
+        result.bids[0]["device"]["geo"]["country"],
+        serde_json::json!("US"),
+        "should export trusted IPv6 location"
+    );
 }

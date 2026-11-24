@@ -752,6 +752,7 @@ mod managed_geo_consumers {
     use reqwest::blocking::Client;
     use serde_json::{Value, json};
     use tokio::sync::oneshot;
+    use trusted_server_core::test_support::geo_consent;
 
     struct CapturedRequest {
         path: String,
@@ -947,6 +948,127 @@ mod managed_geo_consumers {
             "should report no provider bids when consent denies dispatch: {response}"
         );
         upstream.assert_no_dispatch();
+    }
+
+    #[test]
+    fn geo_consent_runtime_axum() {
+        let upstream = LocalUpstream::start();
+        let mut trusted = ServerFixture::new(Some(&envelope(&upstream)));
+        trusted.spawn_configured(false, false, Some(GEO_PROFILE));
+        trusted.wait_ready();
+        let mut untrusted = ServerFixture::new(Some(&envelope(&upstream)));
+        untrusted.spawn_configured(
+            false,
+            false,
+            Some(&GEO_PROFILE.replace("127.0.0.1/32", "192.0.2.1/32")),
+        );
+        untrusted.wait_ready();
+        let mut unselected = ServerFixture::new(Some(&envelope(&upstream)));
+        unselected.spawn_configured(false, false, Some("version = 1\n[geo]\nprovider = 'off'"));
+        unselected.wait_ready();
+        let client = client();
+        for &location in geo_consent::LOCATIONS.iter() {
+            // A synchronous provider cannot time out. ProviderFailure is an
+            // injected managed-outcome case in geo_conformance, not a runtime
+            // failure a header-only CloudFront provider can produce.
+            if location.source == geo_consent::Source::Error {
+                continue;
+            }
+            let server = match location.source {
+                geo_consent::Source::Untrusted => &untrusted,
+                geo_consent::Source::Unselected => &unselected,
+                _ => &trusted,
+            };
+            for signal in [
+                geo_consent::Signal::None,
+                geo_consent::Signal::Purpose1,
+                geo_consent::Signal::Denied,
+            ] {
+                let mut request = client.post(format!("http://{}/auction", server.addr))
+                    .header("host", "publisher.example.com")
+                    .header("cookie", signal.cookie())
+                    .json(&json!({"adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}));
+                if let Some(country) = location.country {
+                    request = request.header("cloudfront-viewer-country", country);
+                }
+                if let Some(region) = location.region {
+                    request = request.header("cloudfront-viewer-country-region", region);
+                }
+                let response = request
+                    .send()
+                    .expect("should send real process auction request");
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::OK,
+                    "should accept {} {signal:?}",
+                    location.name
+                );
+                let headers = response.headers().clone();
+                let body: Value = response
+                    .json()
+                    .expect("should consume real process auction response");
+                let located = location.policy != geo_consent::Policy::Unknown;
+                assert_eq!(
+                    headers["x-geo-info-available"],
+                    if located { "true" } else { "false" },
+                    "should expose real managed outcome for {}",
+                    location.name
+                );
+                let allowed = signal != geo_consent::Signal::Denied
+                    && (signal == geo_consent::Signal::Purpose1
+                        || !matches!(
+                            location.policy,
+                            geo_consent::Policy::Gdpr | geo_consent::Policy::Unknown
+                        ));
+                if allowed {
+                    assert_bid(&body);
+                    let captured = upstream.receive();
+                    assert_eq!(
+                        captured.path, "/bid",
+                        "should capture actual bidder dispatch"
+                    );
+                    let outgoing: Value = serde_json::from_slice(&captured.body)
+                        .expect("should capture process OpenRTB");
+                    let country = located.then(|| {
+                        location
+                            .country
+                            .expect("should have located country")
+                            .to_ascii_uppercase()
+                    });
+                    let region = located
+                        .then(|| location.region.map(str::to_ascii_uppercase))
+                        .flatten();
+                    assert_eq!(
+                        outgoing["device"]["geo"]["country"].as_str(),
+                        country.as_deref(),
+                        "should export real process country for {}",
+                        location.name
+                    );
+                    assert_eq!(
+                        outgoing["device"]["geo"]["region"].as_str(),
+                        region.as_deref(),
+                        "should export real process region for {}",
+                        location.name
+                    );
+                    assert_eq!(
+                        headers
+                            .get("x-geo-country")
+                            .and_then(|value| value.to_str().ok()),
+                        country.as_deref(),
+                        "should expose same response country"
+                    );
+                    assert_eq!(
+                        headers
+                            .get("x-geo-region")
+                            .and_then(|value| value.to_str().ok()),
+                        region.as_deref(),
+                        "should expose same response region"
+                    );
+                } else {
+                    assert_denied(&body, &upstream);
+                }
+            }
+        }
     }
 
     #[test]

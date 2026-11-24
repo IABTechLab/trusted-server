@@ -56,7 +56,7 @@ impl PlatformSecretStore for UnusedStores {
         Err(Report::new(PlatformError::SecretStore))
     }
 }
-fn settings() -> Settings {
+pub(super) fn settings() -> Settings {
     let mut settings = Settings::from_toml(
         r#"
         [[handlers]]
@@ -214,6 +214,7 @@ impl AxumAdapter {
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let headers = response.headers().clone();
         self.store.response_released();
         let status = response.status();
         let cookies = response
@@ -231,6 +232,8 @@ impl AxumAdapter {
             .expect("should consume the complete publisher response")
             .to_vec();
         ApiObservation {
+            headers,
+            bids: Vec::new(),
             response: Observation {
                 status,
                 cookies,

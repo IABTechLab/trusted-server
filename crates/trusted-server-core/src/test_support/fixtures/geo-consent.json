@@ -1,0 +1,114 @@
+[
+  {
+    "name": "de",
+    "country": "DE",
+    "region": "BE",
+    "source": "Located",
+    "policy": "Gdpr"
+  },
+  {
+    "name": "gb",
+    "country": "GB",
+    "region": null,
+    "source": "Located",
+    "policy": "Gdpr"
+  },
+  {
+    "name": "us-ca",
+    "country": "US",
+    "region": "CA",
+    "source": "Located",
+    "policy": "UsState"
+  },
+  {
+    "name": "us-wy",
+    "country": "US",
+    "region": "WY",
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "us-country-only",
+    "country": "US",
+    "region": null,
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "jp",
+    "country": "JP",
+    "region": null,
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "missing",
+    "country": null,
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "empty",
+    "country": "",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "sentinel",
+    "country": "XX",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "lowercase",
+    "country": "us",
+    "region": "ca",
+    "source": "Located",
+    "policy": "UsState"
+  },
+  {
+    "name": "overlong",
+    "country": "USA",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "non-ascii",
+    "country": "DÉ",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "region-only",
+    "country": null,
+    "region": "CA",
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "untrusted",
+    "country": "US",
+    "region": "CA",
+    "source": "Untrusted",
+    "policy": "Unknown"
+  },
+  {
+    "name": "error",
+    "country": "US",
+    "region": "CA",
+    "source": "Error",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unselected",
+    "country": "US",
+    "region": "CA",
+    "source": "Unselected",
+    "policy": "Unknown"
+  }
+]

@@ -205,8 +205,11 @@ fn write_client(
 // ---------------------------------------------------------------------------
 
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
-fn geo_from_fastly(geo: &Geo) -> GeoInfo {
-    GeoInfo {
+fn geo_from_fastly(geo: &Geo) -> Option<GeoInfo> {
+    // Reject missing/sentinel countries before any consumer sees a location.
+    // Preserve the SDK's representation for valid country and region values.
+    edgezero_core::geo::CountryCode::new(geo.country_code()).ok()?;
+    Some(GeoInfo {
         city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),
         continent: Some(format!("{:?}", geo.continent())),
@@ -217,7 +220,7 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
         metro_code: Some(geo.metro_code()),
         region: geo.region().map(str::to_string),
         asn: None,
-    }
+    })
 }
 
 /// The geo result the entry point looks up once for a request's resolved client IP.
@@ -262,7 +265,7 @@ impl RequestGeo {
             client_ip,
             geo: client_ip
                 .and_then(geo_lookup)
-                .map(|geo| geo_from_fastly(&geo)),
+                .and_then(|geo| geo_from_fastly(&geo)),
         }
     }
 

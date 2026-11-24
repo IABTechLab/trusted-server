@@ -60,6 +60,9 @@ jobs:
           node --test scripts/test-identity-conformance.test.mjs
           node scripts/test-identity-conformance.mjs fastly
 
+      - name: Verify geo consent with real Fastly lookup
+        run: node scripts/test-geo-consent.mjs "$(command -v viceroy)"
+
       - name: Run Fastly absolute deadline slow-network tests
         run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 

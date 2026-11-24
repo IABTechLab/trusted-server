@@ -21,3 +21,6 @@ pub mod startup;
 
 #[cfg(test)]
 mod identity_conformance;
+
+#[cfg(all(test, feature = "geo-cloudfront"))]
+mod geo_conformance;

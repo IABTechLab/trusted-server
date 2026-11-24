@@ -723,6 +723,10 @@ impl ApiRequest {
 
 /// Final response and the capturing publisher's observed request count.
 pub struct ApiObservation {
+    /// Finalized response headers for geo conformance.
+    pub headers: http::HeaderMap,
+    /// Actual outbound bidder payloads for geo conformance.
+    pub bids: Vec<serde_json::Value>,
     /// Fully consumed response.
     pub response: Observation,
     /// Outbound requests received by the publisher origin.
