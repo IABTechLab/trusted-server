@@ -167,7 +167,7 @@ RS
     "$root/crates/trusted-server-core/src/runtime_env.rs" -o "$scratch/libchecked.rlib"
 # Make the checked macro available through the fixture helper's existing extern.
 cp "$scratch/libchecked.rlib" "$scratch/libhelper.rlib"
-for key in TRUSTED_SERVER__EXAMPLE FASTLY_IS_STAGING FASTLY_SERVICE_VERSION FASTLY_HOSTNAME FASTLY_REGION TS_NATIVE_GEO_PROFILE_FILE; do
+for key in TRUSTED_SERVER__EXAMPLE FASTLY_IS_STAGING FASTLY_SERVICE_VERSION FASTLY_HOSTNAME FASTLY_REGION TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE; do
     check "checked_$key" pass <<RS
 const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY); }
@@ -177,7 +177,7 @@ const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY, os); }
 RS
 done
-for key in TS_EXAMPLE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__; do
+for key in TS_EXAMPLE TS_NATIVE_GEO_PROFILE_FILE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__; do
     check "checked_$key" fail 'runtime environment name is not allowed' <<RS
 const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY); }

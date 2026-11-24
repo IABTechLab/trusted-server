@@ -791,12 +791,21 @@ pub enum CollectTiming {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserGate {
-    /// Blocks only clients whose JA4 and HTTP/2 fingerprints match a known
-    /// non-browser pattern. Missing JA4 does not block.
+    /// Blocks only known non-browsers: a trusted JA4 whose TLS client family
+    /// contradicts the User-Agent's browser family (unless
+    /// `ja4_contradiction_exempt` exempts it), or JA4 and HTTP/2 fingerprints
+    /// matching a known non-browser pattern (the built-in table lists none
+    /// yet). Missing JA4 does not block.
     #[default]
     Lenient,
     /// Also requires a JA4 class and a recognized User-Agent platform, so a
-    /// client without trusted JA4 does not create an identity.
+    /// client without trusted JA4 does not create an identity. Only Fastly,
+    /// and Axum with EdgeZero's trusted JA4 proxy header, supply trusted JA4
+    /// today; other adapters create no identity under this rule.
+    ///
+    /// This gates creation only: what an adapter does with an existing EC that
+    /// fails the rule differs (Axum drops its graph for the request; Fastly
+    /// keeps it).
     Strict,
 }
 

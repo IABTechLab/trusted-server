@@ -89,6 +89,16 @@ impl IdentityApp {
             self.settings.ec.ja4_contradiction_exempt,
         );
         let creation_allowed = signals.allows_creation(self.settings.ec.browser_gate);
+        if !creation_allowed {
+            log::debug!(
+                "Browser gate {:?} blocks EC creation (ja4={:?}, platform={:?}, known_browser={:?}, ja4_contradiction={})",
+                self.settings.ec.browser_gate,
+                signals.ja4_class,
+                signals.platform_class,
+                signals.known_browser,
+                signals.ja4_contradiction,
+            );
+        }
         context.set_device_signals(signals);
         Ok(IdentityRequest {
             context,

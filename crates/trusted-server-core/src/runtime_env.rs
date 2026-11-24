@@ -59,9 +59,6 @@ macro_rules! runtime_env {
                 b"FASTLY_HOSTNAME" => true,
                 // Fastly server metadata supplies the platform's region.
                 b"FASTLY_REGION" => true,
-                // Temporary Axum Geo profile migration exception. Issue #1529 /
-                // PR #1532 owns replacing this application-specific boot input.
-                b"TS_NATIVE_GEO_PROFILE_FILE" => true,
                 _ => {
                     let prefix = b"TRUSTED_SERVER__";
                     let bytes = name.as_bytes();
