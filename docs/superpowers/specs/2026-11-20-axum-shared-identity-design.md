@@ -104,8 +104,9 @@ Store preparation precedes application config loading, so deciding declarations
 from `ec.storage` would require an EdgeZero config-first preparation API. Keep
 the declaration unconditional. Config and secrets continue to use A1's prepared
 immutable startup snapshots.
-The temporary `TS_NATIVE_GEO_PROFILE_FILE` exception is narrowly justified by
-#1529 / #1532; geo selection remains a separate AX-2 obligation.
+#1532 names the Geo profile variable `TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE`,
+which the prefix rule already allows, so it needs no exception; geo selection
+remains a separate AX-2 obligation.
 
 ## Alternatives and boundaries
 
