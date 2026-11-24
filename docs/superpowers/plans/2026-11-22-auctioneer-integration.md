@@ -38,7 +38,7 @@ The selected SDK direction is Auctioneer repinning to cutover EdgeZero `9d02d7b3
 - One immutable source identity per shared EdgeZero package; no SDK type-disguising conversion or restored host transport.
 - Local runtime feature name: `auctioneer`. First production host: Fastly site/banner/display. Native harness access never authorizes an Axum local host.
 - Non-`Send`, request-owned execution; original admission/deadline through origin/body/EOF, completion and egress; no detached task, restarted preparation or automatic remote fallback.
-- One installed admission/stream capacity domain and one per-outer-auction accounting envelope. Gates are AppState-owned; remote waves enroll in the same stream gate. No increased ceiling or second funding pool.
+- Only plans containing a local Auctioneer provider install the AppState-owned admission/stream domain and per-outer-auction envelope. Remote-only plans on either binary keep one existing outbound batch and no new admissions; a Cargo feature alone never changes their scheduling. Local-containing plans enroll remote waves in the shared gate. No increased ceiling or second funding pool.
 - Planned TS types/signatures below are private unless a caller requires visibility. They are contracts to implement, not existing upstream exports. Upstream gaps are named prerequisites, never placeholder implementations.
 - Default remote configuration/output and privacy policy stay compatible. Local optional response fields and mixed opaque-demand refusal are explicit host deltas.
 - #1510 coordinates the host resource proof required by Auctioneer #76; #1511 supplies the artifact and #1512 the controlled observations. Their commits can land before final #1510 acceptance, avoiding a cycle on issue closure.
@@ -64,7 +64,7 @@ Task 0 additionally migrates `crates/trusted-server-core/src/openrtb.rs`, curren
 | `crates/trusted-server-core/src/platform/types.rs`; Fastly `src/app.rs`                                                                                                                         | Request SDK objects and actual Fastly binding                                                    |
 | `crates/trusted-server-core/src/auction/{mod,provider,routing,orchestrator,formats,telemetry}.rs`                                                                                               | Production driver construction, exact routing, competition, direct output and outcomes           |
 | `crates/trusted-server-core/src/publisher/html_finalization.rs`, `integrations/{aps,registry}.rs`                                                                                               | Streaming/EOF progress and existing typed renderer capability registration                       |
-| `crates/trusted-server-integration-tests/tests/html_eof_runtime{.rs,/config.rs,/process.rs,/origin.rs,/auctioneer.rs}`                                                                          | Actual artifact orchestration, deterministic bidder captures and equivalence controls            |
+| `crates/trusted-server-integration-tests/tests/html_eof_runtime{.rs,/config.rs,/process.rs,/origin.rs,/auctioneer.rs}`, planned `fixtures/auctioneer/` and browser auction-runtime config/spec  | Production fixture DNS/TLS, browser rendering, artifact orchestration and equivalence controls   |
 | `scripts/async-html-finalization-local-test.sh`, `.github/workflows/{test,format}.yml`                                                                                                          | Explicit feature-on runtime and lint/test execution; preserve existing lanes                     |
 | `crates/trusted-server-js/lib/src/core/{types,auction}.ts`, `src/integrations/{gpt,prebid}/index.ts` and adjacent Vitest files                                                                  | Optional finalized targeting carrier, parser/projection, GPT application and dynamic-key cleanup |
 | `fastly.toml`, `.github/workflows/{release-build,release}.yml`, `scripts/release/{phase1-build.sh,phase1.mjs,phase1.test.mjs,publish.mjs}`, CLI `src/run.rs` and `tests/release_build_facts.rs` | Non-test feature-on artifacts, build facts, feature-matched SBOM, signing and publication        |
@@ -125,7 +125,7 @@ cargo tree --locked -p trusted-server-core
 
 Expected before migration: baseline compatibility cases pass and the new shared-type contract exposes the intended missing implementation. Expected after migration: nonempty compatibility populations and all cross-adapter checks pass in default/feature-off builds; the resolved graph has the shared raw model and neither retired package. The `auctioneer` runtime feature must not be needed. Use source search and manifest/CI inspection to prove there are no live old-model/codegen references, while allowing historical documents to describe the old system.
 
-- [ ] Produce comparable default base/head release builds in isolated checkouts using the actual producer for shipping Fastly/CLI assets and target-matched release builds for Axum/Cloudflare/Spin. Record digests, sizes, source graph and initialization impact against the actual platform/installed limits, preserving profiles and feature flags. Exercise locked Git-source resolution, offline SBOM, source facts and attestation packaging through the existing release workflow; do not tag or publish from this planning task.
+- [ ] Produce comparable default base/head release builds in isolated checkouts using the actual producer for shipping Fastly/CLI assets and target-matched release builds for Axum/Cloudflare/Spin. Record digests, sizes, source graph and initialization impact against actual limits, preserving profiles/features. Pre-merge evidence covers locked Git-source resolution, feature-matched offline SBOM, source/build facts and packaging guards. Actual signing and digest/attestation-subject agreement are first proven by the authorized release workflow on a `v*` tag push with publication enabled; record that release evidence as pending and prohibit publication/deployment until it passes. This task creates no tag or deployment.
 - [ ] Run the full applicable runtime-change CI suite, replacing retired codegen gates with surviving compatibility-owner checks. Land a separate reviewed PR closing #1652 and record its merged commit/source/evidence. Task 1 waits for that evidence; migration alone does not establish #1510 handoff. Later raw-model repins rerun affected controls.
 
 ## Task 1 Add the reviewed engine dependency and feature boundary
@@ -160,9 +160,11 @@ Expected: default and feature-on checks compile; each shared EdgeZero package ha
 
 ## Task 2 Compile typed local provider declarations and policy
 
-**Files:** `auction_config_types.rs`, `auction/{config,plan}.rs`, `config.rs`, `config_payload.rs`, `settings_data.rs`, and CLI `tests/config_env_overlay.rs`.
+**Files:** core `auction_config_types.rs`, `auction/{config,plan}.rs`, `config.rs`, `config_payload.rs`, `settings_data.rs`; CLI `tests/config_env_overlay.rs`; all four `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs`; integration-tests `Cargo.toml` and `tests/parity.rs`.
 
 **Interfaces:** Consumes Task 1 features and shared selected-target discovery. Extend `deserialize_provider_map<'de, D>(D) -> Result<BTreeMap<ProviderId, ProviderConfig>, D::Error>` where `D: Deserializer<'de>`. Produce `ProviderConfig::{Remote(RemoteProviderConfig), Auctioneer(AuctioneerProviderConfig)}`, with the latter feature-gated; `LocalAccountSelection::{Default, Named { id: AccountId }}`; and `AuctioneerProviderConfig { auctioneer: AuctioneerAppConfig, account: LocalAccountSelection, artifact_identity: AuctioneerArtifactIdentity, timeout_ms: Option<u32>, routing: RoutingMode, notifications: NotificationConfig, debug_requested: bool }`. Local routing permits only `Explicit`; common notification semantics reuse the existing type.
+
+The compiled local execution branch retains `policy: Arc<AuctioneerProviderConfig>` from the accepted snapshot. Task 5 receives that same owner; it does not reconstruct policy from the typed request or ambient settings.
 
 Produce `validate_auction_execution(plan: &AuctionPlan, target: ExecutionTarget, support: &ExecutionSupport) -> Result<(), Report<TrustedServerError>>` for every adapter. `ExecutionTarget` names Fastly/Axum/Cloudflare/Spin; support carries compiled feature and optional accepted artifact facts. `AuctioneerArtifactFacts` holds selected target, canonical catalog/binding/schema/default identities, accepted resource facts and source/features. `artifact_identity(facts: &AuctioneerArtifactFacts) -> AuctioneerArtifactIdentity` is pure and canonical. The CLI and runtime contextual validators consume those facts explicitly.
 
@@ -189,7 +191,7 @@ Expected before implementation: a meaningful failure for the missing local contr
 - [ ] Extend `deserialize_provider_map` with discriminator-aware branch decoding and branch-local unknown-field validation. Use `ProviderConfig::{Remote,Auctioneer}`; omitted/explicit remote serializes to the unchanged old remote shape. Local requires the actual `AuctioneerAppConfig`, `LocalAccountSelection`, expected artifact identity and common `timeout_ms`/notification policy. Feature-off local input returns `AuctioneerUnavailable` before policy decoding, with no arbitrary JSON policy stand-in.
 - [ ] Extend plan compilation with common provider identity/timing/notification facts plus distinct remote and local execution data. Only the remote variant owns transport/profile fields. Resolve the local executor in composition code, not test-only registration.
 - [ ] Implement canonical `AuctioneerArtifactFacts`/identity from the selected Fastly discovery/bindings/schema/default/resource facts and reviewed source/features. Require the expected identity only on local declarations in the signed blob; compare during CLI/shared/runtime validation and report `AuctioneerArtifactMismatch` before credential/bidder I/O. Expose the planned `ts auctioneer facts --target fastly` command. If the shared selected-target view is unavailable, stop on #51's minimal export rather than substituting native catalog membership.
-- [ ] Call `validate_auction_execution` from every production adapter state builder after common compilation. Axum/Cloudflare/Spin refuse local execution even with unified core features. Fastly validates support/facts and remote-only backend bounds. Generic config push has no target argument and is not represented as target-aware. Preserve Settings/wrapper/blob, overlays, chunking and signatures.
+- [ ] Call `validate_auction_execution` from every production adapter state builder after common compilation. Axum/Cloudflare/Spin refuse local execution even with unified core features. Fastly validates support/facts and remote-only backend bounds. Config push's required `--adapter` selects destination/adapter checks, but typed `Validate` receives no adapter context: a structurally valid local blob may be pushed with `--adapter axum` and must then fail startup before bidder credentials/dispatch. Keep that operator outcome explicit; no new target-aware typed-validation API is introduced.
 - [ ] Add nonempty controls for omitted/explicit remote normalization, mixed/unknown fields, feature-off error, native-only identity, catalog/default/feature mismatch and all non-Fastly state builders. Assert zero secret/dispatch calls on refusal; run an Axum refusal control with integration-tests unifying the feature.
 - [ ] Preserve deferred bidder credential references. Do not attach them to the eager static-secret resolver. Test with a spy store that config validation/extraction does not turn deferred bidder credentials into unconditional reads; validate values at their shared permitted lookup boundary.
 
@@ -197,7 +199,17 @@ Expected before implementation: a meaningful failure for the missing local contr
 cargo test -p trusted-server-core --features auctioneer --lib auctioneer_config_
 cargo test -p trusted-server-cli --features auctioneer --test config_env_overlay
 cargo test -p trusted-server-cli --features auctioneer --lib auctioneer_
+validation_host_target="$(rustc -vV | sed -n 's/host: //p')"
+target_refusal_count="$(cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+  --target "$validation_host_target" --features auctioneer --test parity \
+  auctioneer_axum_refuses_local_with_unified_core_feature -- --exact --list | awk '/: test$/ { n += 1 } END { print n + 0 }')"
+test "$target_refusal_count" -gt 0 || exit 1
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+  --target "$validation_host_target" --features auctioneer --test parity \
+  auctioneer_axum_refuses_local_with_unified_core_feature -- --exact
 ```
+
+This task creates the top-level parity test `auctioneer_axum_refuses_local_with_unified_core_feature`. Feed valid local settings through the actual Axum state-construction seam; assert the target-support error and zero bidder-credential/transport calls. Task 1 already supplies the integration-tests feature forwarding.
 
 Expected: accepted policy changes affect the borrowed Auctioneer subtree, unrelated TS settings do not, and invalid policy fails without bidder I/O. Commit the configuration slice after target-matched lint/test checks.
 
@@ -207,7 +219,9 @@ Expected: accepted policy changes affect the borrowed Auctioneer subtree, unrela
 
 **Interfaces:** Consumes checked shared `AuctionResourceInputs`/schema qualification and #266's accepted partition/permit/timer contract. Produces `InstalledAuctionResources::try_new(install: HostResourceInstall) -> Result<Arc<InstalledAuctionResources>, Report<TrustedServerError>>` and `try_begin(self: &Arc<Self>, timing: OriginalAuctionTiming) -> Result<HostAuctionLease, Report<TrustedServerError>>`. `HostResourceInstall` contains complete profile inputs, schema qualification and accepted host storage; constructors accept no independent capacity numbers. `InstalledAuctionResources` holds the checked profile, one admission gate, one stream gate and that partition. `HostAuctionLease` retains the single original outer permit and per-auction ledger through all enrolled branches/egress, using the upstream-approved handoff.
 
-Produce request-owned `AuctioneerServiceBinding` with the actual client/clock/accepted wait adapter, credential loader, immutable registry/reference data, RNG and restrictions. Its `with_services` borrowing happens inside the owning Task 5 future. No public generic budget transfer is assumed.
+This task defines private `OriginalAuctionTiming { auction_start: edgezero_core::time::MonotonicInstant, auction_deadline: edgezero_core::time::Deadline }`. Populate it from the existing original dispatch values before conversion, preparation or queueing; retain it in `HostAuctionLease`. Later tasks only read those values. Fastly AppState stores `Option<Arc<InstalledAuctionResources>>`: `None` for a remote-only compiled plan, including on a feature-on binary; initialize profiles/gates only for a local-containing plan.
+
+Produce request-owned `AuctioneerServiceBinding` with the actual client/clock/accepted wait adapter, credential loader, immutable registry/reference data and RNG. Restrictions belong only to Task 4's `OwnedAuctioneerInput`; borrow them while constructing services inside Task 5's owning future. No public generic budget transfer is assumed.
 
 Test `auctioneer_services_mixed_capacity_and_egress` seeds nonempty local/remote bodies and host copies:
 
@@ -220,11 +234,11 @@ assert_eq!(case.slots_restored_after_drop, 1, "should release exactly one origin
 ```
 
 - [ ] Write failing `auctioneer_services_` tests using the real SDK object boundary plus spy transport/secret backends. Check the settings-first subtree argument, client/clock identity, original timing, required capabilities, and independent policies in a reused sandbox.
-- [ ] Wait for #266's reviewed original-permit/host-storage/fallible-timer contract. Install `InstalledAuctionResources` once in Fastly AppState from checked complete profile facts; capacities come only from the profile's accepted auction/active-stream limits. Clone it into request services and acquire one outer lease before conversion/credential/dispatch. Never reset gates per request.
+- [ ] Wait for #266's reviewed original-permit/host-storage/fallible-timer contract. For a compiled plan containing a local provider, install `InstalledAuctionResources` once in AppState from checked complete profile facts; capacities come only from accepted auction/active-stream limits. Clone it into request services and acquire one outer lease before conversion/credential/dispatch. Remote-only plans bypass profile initialization and admission. Never reset gates per request.
 - [ ] Bind `EdgeZeroFanout::with_wave_scheduler` to the actual client, paired clock and accepted timer/decode/strategy/limits/shared stream gate. Implement the host's fallible absolute wait from `HttpClient::time().wait_until` inside managed Fastly progress, according to #266's accepted trait/error mapping. Missing scope, timer failure or no-op timer refuses; standalone bootstrap and ambient fallback remain forbidden.
 - [ ] Construct the exported `CredentialLoader` from the host-bound secret store and matching clock. Exercise delayed lookup and resource/deadline refusal before any credential I/O. Preserve the actual upstream credential byte and lookup bounds.
 - [ ] Derive the checked profile from the accepted complete tuple. Create one per-outer-auction ledger and use the accepted original-permit handoff. Current canonical prepay consumes the whole peak, so #266's unchanged-envelope host partition/export must be accepted before any positive host-copy reservation. Do not invent spare capacity, transfer APIs, second ledgers or increased ceilings.
-- [ ] Enroll remote waves in the same stream gate, bounded by `min(capacity, pending_legs)`. Race acquisition with the original cutoff, recheck expiry before batch start, preserve global result indices, and hold wave permits through response body/decode/drop. Co-drive pending local and remote work so neither can wait for permits held by an unpolled sibling. Retain the outer lease through final egress, including a remote winner after local failure/loss.
+- [ ] Only for a local-containing compiled plan, enroll remote waves in the same stream gate, bounded by `min(capacity, pending_legs)`. Race acquisition with the original cutoff, recheck expiry before batch start, preserve global indices and hold permits through body/decode/drop. Co-drive local/remote work and retain the outer lease through final egress. Remote-only plans keep the existing one-batch dispatch without Auctioneer admission.
 - [ ] Cover prepayment rollback, zero remaining deadline, preparation delay, two isolated accepted policies/secret references, missing service, configuration recovery, and retained nonempty failures. Assert exact-once release and a nonempty denied dispatch/secret control population.
 
 ```bash
@@ -233,22 +247,27 @@ cargo test-fastly --features trusted-server-core/auctioneer,trusted-server-adapt
 cargo test-fastly-reuse --features auctioneer auctioneer_
 ```
 
-Expected: actual compatible SDK objects reach the shared API, expired/refused work performs no forbidden I/O, and accepted snapshots remain isolated. Complete #1510's handoff evidence with Auctioneer #51; portable fake-service results alone cannot close that boundary. Commit after checks.
+Expected: actual compatible SDK objects reach the shared API, expired/refused work performs no forbidden I/O, and accepted snapshots remain isolated. Commit the services/funding slice; #1510 handoff still needs Task 4's input/privacy evidence.
 
 ## Task 4 Preserve routed typed input and privacy evidence
 
 **Files:** new `auction/local/auctioneer/input.rs`; `consent/{types,extraction,mod}.rs`, `auction/{types,endpoints,routing}.rs`, and `publisher.rs`.
 
-**Interfaces:** Consumes `ProviderAuctionInput`, trusted `LocalAccountSelection`, Task 2 artifact facts, the original ingress snapshot and the Task 3 host lease. Produces owned `LocalIngressEvidence` and `OwnedAuctioneerInput` (shared raw request, owned header backing, host restrictions, original timing). `build_auctioneer_input(input: &ProviderAuctionInput, ingress: &LocalIngressEvidence, policy: &AuctioneerProviderConfig, lease: &HostAuctionLease) -> Result<OwnedAuctioneerInput, Report<TrustedServerError>>` allocates only under accepted host storage. Borrow `AuctionInput::Typed` and `RequestHeaders` from this owned input inside Task 5's future; never return references into temporary headers. Task 3's accepted lease implementation lands before this conversion.
+**Interfaces:** Consumes `ProviderAuctionInput`, trusted `LocalAccountSelection`, Task 2 artifact facts, the original ingress snapshot and Task 3's lease. Produces `LocalIngressEvidence` and `OwnedAuctioneerInput` (shared raw request, owned header backing and the sole host restriction owner). Original timing remains in the lease. `build_auctioneer_input(input: &ProviderAuctionInput, ingress: &LocalIngressEvidence, policy: &AuctioneerProviderConfig, lease: &HostAuctionLease) -> Result<OwnedAuctioneerInput, Report<TrustedServerError>>` allocates only under accepted host storage. Borrow `AuctionInput::Typed`, headers and restrictions from this owned input inside Task 5; no temporary-header references escape.
 
 Test `auctioneer_input_account_and_header_spoofing` repeats every ingress kind with conflicting client account/IP fields:
 
 ```rust
-let case = spoofed_ingress_fixture();
-assert_eq!(case.selected_account, case.configured_account, "should use trusted account selection");
-assert!(case.forwarded_ip_headers_are_absent(), "should drop spoofed forwarding addresses");
-assert_eq!(case.sent_denied_identifiers, 0, "should preserve the host denial");
-assert!(case.malformed_sid_refuses_before_io(), "should reject malformed typed privacy input");
+for ingress in [IngressKind::Direct, IngressKind::Navigation, IngressKind::PageBids] {
+    let case = spoofed_ingress_fixture(ingress).with_client_debug_and_test_flags(true);
+    assert_eq!(case.selected_account, case.configured_account, "should use trusted account selection");
+    assert!(case.forwarded_ip_headers_are_absent(), "should drop spoofed forwarding addresses");
+    assert_eq!(case.prepared_remote_addr, case.attested_client_ip, "should preserve the attested ingress address");
+    assert_eq!(case.entry_point, EntryPoint::Auction, "should use the display auction entry point");
+    assert!(!case.debug_requested, "should ignore client debug and test flags when trusted debug is false");
+    assert_eq!(case.sent_denied_identifiers, 0, "should preserve the host denial");
+    assert!(case.malformed_sid_refuses_before_io(), "should reject malformed typed privacy input");
+}
 ```
 
 - [ ] Add failing `auctioneer_input_` tests for exact routed bidder/slot membership, all admitted sizes, floors/currency, approved EC/EIDs, device/geo, and request/impression IDs. Include distinct aliases sharing an implementation.
@@ -265,13 +284,13 @@ cargo test -p trusted-server-core --features auctioneer --lib auctioneer_privacy
 cargo test-fastly --features trusted-server-core/auctioneer,trusted-server-adapter-fastly/auctioneer auctioneer_privacy_
 ```
 
-Expected: exact nonempty sent coverage, no resurrected identifiers, unchanged existing consent regressions, and preserved failure precedence. Commit the typed input/restriction slice.
+Expected: exact nonempty sent coverage, no resurrected identifiers, unchanged existing consent regressions and preserved failure precedence. Combine Tasks 3–4 evidence for #1510's handoff with Auctioneer #51; portable fakes alone cannot close that boundary. Commit the typed input/restriction slice, retaining the later combined-artifact acceptance gates.
 
 ## Task 5 Add an owned local operation and cutoff completion
 
 **Files:** new `auction/local/mod.rs`, concrete Auctioneer `mod.rs` and `result.rs`, and `auction/orchestrator.rs`.
 
-**Interfaces:** Consumes Task 4 `OwnedAuctioneerInput`, Task 3 `AuctioneerServiceBinding`/`HostAuctionLease`, accepted policy `Arc` and original timing. Produces neutral `LocalAuctionOperation` holding `Pin<Box<dyn Future<Output = Result<LocalAuctionCompletion, Report<TrustedServerError>>> + 'static>>` with no `Send` bound. Concrete composition implements `start_auctioneer(input: OwnedAuctioneerInput, binding: AuctioneerServiceBinding, lease: HostAuctionLease) -> LocalAuctionOperation`; scheduler code receives only the neutral operation and does not inspect Auctioneer policy.
+**Interfaces:** Consumes Task 2's accepted `Arc<AuctioneerProviderConfig>`, Task 4 `OwnedAuctioneerInput` and Task 3 `AuctioneerServiceBinding`/`HostAuctionLease`. Produces neutral `LocalAuctionOperation` holding `Pin<Box<dyn Future<Output = Result<LocalAuctionCompletion, Report<TrustedServerError>>> + 'static>>` without `Send`. Concrete composition implements `start_auctioneer(policy: Arc<AuctioneerProviderConfig>, input: OwnedAuctioneerInput, binding: AuctioneerServiceBinding, lease: HostAuctionLease) -> LocalAuctionOperation`. Inside that future borrow `&policy.auctioneer` for preparation, restrictions only from `input`, and original `request_start`/`outer_deadline` from `lease.timing.auction_start`/`Some(lease.timing.auction_deadline.instant())`. Scheduler code receives only the neutral operation.
 
 `LocalAuctionCompletion` owns a provider success/failure outcome, funded selected host candidates and `Box<dyn RetainedAuctionOwner>`. The private trait exposes `finish(&mut self, status: AuctionCompletionStatus)`; its concrete implementation retains the full engine completion/failure and host receipts. `selected(&self) -> &[SelectedLocalBid]` borrows admitted candidates; finishing observation never drops storage. Engine failures remain inside this retained completion until bounded diagnostics disappear; the future's outer `Report` is reserved for setup failures before a funded operation exists.
 
@@ -321,6 +340,7 @@ assert!(case.inline_override_dispatches_once(), "should inspect actual outgoing 
 ```
 
 - [ ] Add failing `auctioneer_plan_` and `auctioneer_routing_` tests through real Settings-to-plan-to-orchestrator construction. Cover local-only and mixed explicit routes, remote `all_eligible`, aliases, unknown/unavailable identities, opaque remote stored demand, direct/split parity and independent provider failure.
+- [ ] Add `auctioneer_plan_remote_only_keeps_single_batch` on the feature-on build. With multiple remote legs and no local provider in the compiled plan, assert `installed_resources.is_none()`, `new_admissions == 0`, `remote_batches_started == 1` and exact unchanged request/result membership. A separate local-containing-plan control proves common gate enrollment, including requests with no routed local demand.
 - [ ] Replace remote-only provider construction with execution-kind dispatch. Preserve the post-cutover remote `OutboundBatch` and indexed completion correlation. Keep Auctioneer-specific binding outside neutral routing/competition types.
 - [ ] Preflight actual outgoing demand after inline/profile overrides. Assign each requested identity once and strip others' parameters. Actual opaque stored overlap refuses the affected local and opaque remote invocations before either I/O; independent inspectable providers continue. Test Legacy/Explicit/Disabled, inline suppression, affected-provider errors and zero duplicate dispatch; remote-only stored behavior is unchanged.
 - [ ] Start eligible local execution before returning the dispatch token, without awaiting its entire result. Store pending remote and local state together; collection joins those same operations and preserves existing mediation, outcome categories and ordering. Fatal local policy failures remain failures; valid siblings and independent remote providers retain their established behavior.
@@ -361,7 +381,7 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 ./scripts/async-html-finalization-local-test.sh fastly --release --auction --auctioneer
 ```
 
-The final option and integration-tests `auctioneer` feature are **created by this task**, not existing command support. Expected: the actual feature-on Fastly artifact progresses local work across the suspended body/EOF boundaries, preserves prefix timing, and releases owners on each failure/drop path. Commit the streaming integration.
+The final `--auctioneer` harness option is **created by this task**; the integration-tests Cargo feature was created by Task 1. Expected: the instrumented feature-on Fastly artifact progresses local work across suspended body/EOF boundaries, preserves prefix timing and releases owners on each failure/drop path. Commit the streaming integration.
 
 ## Task 8 Preserve local selection targeting and delivery
 
@@ -405,7 +425,7 @@ Expected: shared local winners/targeting survive outer competition, valid render
 
 - [ ] Add failing producer inventory/feature-forwarding tests, including unsupported selection and `test-utils` contamination refusal. Extend clean-environment and container/non-container builds, locked metadata, offline CycloneDX feature selection, CLI `variant` reporting, smoke, signing/download/publication allowlists and tests together. Preserve source/canary/lock guards and existing privilege separation.
 - [ ] Add an explicit feature-on local Fastly build selection while preserving default behavior. Document which paired CLI/wasm bundle operators deploy and how its artifact identity enters local config.
-- [ ] Rehearse real non-test Fastly and all shipping native CLI variants through the producer in separate clean implementation checkouts, each with a fresh `RUNNER_TEMP` and empty release-assets path. Inspect feature/source identities in SBOM and binary facts; verify digest/attestation subject agreement through the existing authorized release workflow. Do not infer signing evidence from a plain cargo build.
+- [ ] Before PR handoff, run real non-test Fastly and shipping native CLI variants through the producer in separate clean checkouts, with fresh `RUNNER_TEMP` and empty release-assets paths. Verify digests, feature/source identities, SBOM, binary facts and packaging guards. Actual signing and digest/attestation-subject agreement wait for the first authorized `v*` tag release with publication enabled; record them as pending and block publication/deployment until verified. No branch-only signing rehearsal or workflow expansion is implied.
 
 ```bash
 shellcheck scripts/release/phase1-build.sh
@@ -420,11 +440,11 @@ RUNNER_TEMP="$(mktemp -d)" SOURCE_COMMIT="$(git rev-parse HEAD)" \
   wasm32-wasip1 trusted-server-fastly-auctioneer.wasm auctioneer
 ```
 
-Expected: non-test feature-on release assets, paired CLI facts, matching SBOM and exact published inventory; default assets remain compatible. Record producer and signing evidence separately; this plan creates no tag or deployment. Commit after checks.
+Expected before merge: non-test candidate assets, paired CLI facts, matching SBOM and tested release inventory/guards; default assets remain compatible. Expected at authorized release: successful signing, attestation-subject/digest verification and publication through existing gates. If the released binary identity differs from the qualified candidate, rerun affected artifact controls before deployment. This plan creates no tag or deployment. Commit after pre-merge checks; keep release evidence explicitly pending.
 
 ## Task 9 Produce controlled artifact equivalence evidence
 
-**Files:** new `tests/html_eof_runtime/auctioneer.rs`; existing HTML EOF runtime/config/process/origin modules; integration-tests manifest and auction testing guide.
+**Files:** new `tests/html_eof_runtime/auctioneer.rs` and `fixtures/auctioneer/{Dockerfile,network.mjs,tls-origin.mjs}` under `crates/trusted-server-integration-tests/`; existing HTML EOF runtime/config/process/origin modules and `tests/common/trace_boundary.rs`; browser `playwright.auction-runtime.config.ts` and `tests/shared/auction-runtime.spec.ts`; integration-tests/browser manifests and auction testing guide.
 
 **Interfaces:** Consumes Task 8a production artifact/CLI paths, Task 2 artifact identity and Task 8 delivery contracts. Produces a production-mode fixture runner plus an evidence manifest: host/Auctioneer/SDK commits, features/profile/patches, binary digests, accepted config identity, services/resources, discovery-derived case membership and captured outcomes. `run_production_auctioneer_case(artifacts: &ProductionAuctioneerArtifacts, case: &AuctioneerFixtureCase) -> Result<ArtifactObservation, Report<HarnessError>>` must execute the supplied binary; instrumented runner results carry a different artifact identity.
 
@@ -439,6 +459,9 @@ assert!(case.compatible_rollback_serves_without_duplicate_calls(), "should roll 
 
 - [ ] Consume Task 8a's producer-built non-test Fastly artifact and matching CLI. Record digests, revisions, feature graph, dependency/profile facts, accepted policy identity, services and owners; reuse that same binary across policy/bidder batches. Never rebuild it with `test-utils` for acceptance.
 - [ ] Add a production-artifact mode to the existing harness that accepts these explicit paths, executes the supplied wasm through Viceroy and drives existing public routes with isolated fixture origins/stores. Use the matching CLI's existing local config-push flow. Keep instrumented EOF timing/drop controls separate, recording their own digest/features and supplementary status; do not reconcile them into production execution evidence.
+- [ ] First prove production bidder routing in an owned Docker `--internal` network. Keep guest URLs/Host/SNI and endpoint validation unchanged. Map each compiled bidder hostname to the TLS fixture's network IP with Viceroy container `--add-host`; serve the original HTTPS port (normally 443) using transient certificates with matching SANs. Mount only the fixture CA read-only and set Viceroy `SSL_CERT_FILE` to it. Use ordinary dynamic backend registration; do not predeclare same-name backends, which the pinned SDK refuses. Record endpoint mappings, certificate fingerprints, network isolation, Viceroy version and unchanged wasm digest.
+- [ ] Add `auctioneer_artifact_https_fixture_route` before catalog/display cases. Require a real non-test bidder request to reach the fixture and its response to pass production parsing. Wrong CA and wrong SAN must fail; an unmapped bidder must have no path to live demand. Enumerate every required row's authority/port from shared captured-request fixtures and prove each is routable. A missing route blocks that row and #1512/#76/#91 acceptance; no public request or rebuilt insecure variant substitutes for it. This route is source-supported, not yet executed evidence.
+- [ ] Add the dedicated Playwright auction runtime config/spec using the existing Rust-owned trace-runtime launch pattern. From the integration-tests browser directory run `node node_modules/@playwright/test/cli.js test --config playwright.auction-runtime.config.ts`; the harness supplies `AUCTIONEER_BROWSER_ORIGIN` and `AUCTIONEER_EVIDENCE_MANIFEST` for its already-running production runtime. No setup starts a second server, and the spec must not intercept `/auction` or inject a fabricated bid. Extend the APS creative assertions while observing actual fixture-to-parser-to-GPT/Prebid-to-render flow.
 - [ ] Add deterministic fixture cases using shared effective policy, typed input, clock/RNG behavior, reference data, and captured bidder responses. Compare shared standalone and embedded candidates, selected winner/ties, targeting, attribution and permitted diagnostics. Reuse Auctioneer's actual shared/conformance entry points; do not create a second engine or pretend raw-only malformed JSON has a typed equivalent.
 - [ ] Run success, no-bid, privacy denial, invalid account/input, delayed credential, timeout, completed-plus-suspended/contended gate, partial failure, resource refusal, cancellation and recovery. Observe direct/page-bids/navigation delivery and browser-rendered creative/APS, dynamic targeting and notification ownership. Keep shared-engine comparison separate from host floor/mediation/creative decisions.
 - [ ] Derive required executable display identities/aliases from Auctioneer discovery and capabilities. Exercise every required implemented row in deterministic within-limit batches, retaining explicit verified unimplemented inventory without I/O. Include installed concurrency and one-over refusal; no handwritten bidder list or increased cap.
@@ -501,6 +524,11 @@ cargo bench -p trusted-server-core --bench html_processor_bench -- --test
 cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
 cargo clippy -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare,test-utils --lib -- -D warnings
 cargo clippy -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin,test-utils --lib -- -D warnings
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=http://127.0.0.1:8080 \
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=integration-test-proxy-secret \
+TRUSTED_SERVER__EC__PASSPHRASE=integration-test-ec-secret-padded-32 \
+TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
+  cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 ```
 
 ```bash
@@ -515,7 +543,6 @@ node --test scripts/check-ci-node-pin.test.mjs
 node scripts/check-ci-node-pin.mjs
 node --test scripts/release/phase1.test.mjs
 shellcheck scripts/release/phase1-build.sh
-node --test scripts/fastly-response-diff.test.mjs
 node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare
 cargo clippy -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare -- -D warnings
@@ -552,8 +579,8 @@ Preserve these additional existing CI lanes with their setup and nonempty assert
 | Lane                                       | Execution and feature policy                                                                                                                                                                                                                                    |
 | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TSJS source digest parity                  | In a temporary output directory run `node crates/trusted-server-js/lib/build-all.mjs --out-dir "$bundle_dir"`, then `TSJS_PREBUILT_DIR="$bundle_dir" cargo check-axum --locked`, as in `test.yml`; remove only the owned temporary output                       |
-| Native integration and Fastly EC lifecycle | Run `./scripts/integration-tests.sh` and `./scripts/integration-tests.sh test_wordpress_fastly` with the pinned Docker/Viceroy/runtime setup; retain default remote fixtures                                                                                    |
-| Browser integration                        | Run `./scripts/integration-tests-browser.sh`, including its built external Prebid/trace fixtures and Playwright run; keep existing default coverage                                                                                                             |
+| Native integration and Fastly EC lifecycle | Run `./scripts/integration-tests.sh` and `./scripts/integration-tests.sh test_ec_lifecycle_fastly` with pinned Docker/Viceroy/runtime setup; retain default remote fixtures                                                                                     |
+| Browser integration and initial render     | Run `./scripts/integration-tests-browser.sh` for its external Prebid/trace fixtures and Playwright run. It does not run initial-render checks: also execute both commands below with browser CI setup and the config generator build                            |
 | Prepared runtime/browser trace acceptance  | With the exact artifact paths, ports, fixture config, Spin build and browser setup from `.github/workflows/integration-tests.yml`, run the two ignored `--test integration` commands below; do not count the ordinary integration script's skipped trace probes |
 | Native CLI matrix                          | Preserve Linux/macOS tests, `release_build_facts`, rejected release branch-source check, macOS Chrome fixtures and Linux real-NSS ignored tests/count assertions from `test.yml`                                                                                |
 | New feature-on validation                  | Add explicit Fastly/reuse/core/CLI build-test-clippy lanes and nonempty local test populations, plus Task 9 production-artifact display/trace observations. Do not enable local Axum/Cloudflare/Spin hosts through parity                                       |
@@ -561,6 +588,15 @@ Preserve these additional existing CI lanes with their setup and nonempty assert
 ```bash
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target "$validation_host_target" --test integration trace_runtime_boundary -- --ignored --test-threads=1 --nocapture
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target "$validation_host_target" --test integration trace_browser_workflow -- --ignored --test-threads=1 --nocapture
+cargo build --package trusted-server-integration-tests --bin generate-viceroy-config
+(cd crates/trusted-server-integration-tests/browser && node --test initial-render/pages.test.cjs)
+(cd crates/trusted-server-integration-tests/browser && node initial-render/run.cjs --out "$RUNNER_TEMP/initial-render-evidence")
+```
+
+The cutover introduces the response-diff script; it is absent at the planning base. Run this post-cutover check for Tasks 1 onward, and for Task 0 only if its actual base already includes the cutover. Task 0 still runs every CI check present at its own base:
+
+```bash
+node --test scripts/fastly-response-diff.test.mjs
 ```
 
 For feature-on native CLI browser tests, the existing `scripts/test-cli.sh` accepts a host target, not `--features`. Add a deliberate feature-aware helper interface or run the four existing filter populations directly with the pinned Chrome setup. For each filter below, first list and require a positive test count, then run with `TS_AUDIT_BROWSER_TESTS=1`, `--features auctioneer` and one test thread:
@@ -579,7 +615,7 @@ for browser_filter in \
 done
 ```
 
-Keep default full CI and new feature-on tests as separate evidence. Real-NSS setup/permissions and release signing remain their existing job's responsibility; record externally executed results by runner. Task 8a's actual feature-matched producer/SBOM/signing rehearsal and Task 9's supplied-binary mode are required in addition to compilation. Refresh this job inventory against the actual implementation base before execution.
+Keep default full CI and new feature-on tests as separate evidence. Real-NSS setup/permissions remain their existing job's responsibility; record external results by runner. Task 8a's producer/SBOM/build-fact verification and Task 9's supplied-binary mode are required before their implementation handoff. Actual signing/attestation is pending until the gated tag workflow executes; publication/deployment waits on it. Refresh this inventory against the actual implementation base before execution.
 
 Task 0 retires `cargo clippy-codegen` and the old codegen package test together with the obsolete package/jobs; the commands above target surviving compatibility owners. This changes the reviewed future runtime migration, not the current planning PR's CI. Refresh any new feature-on CI/tooling commands introduced by Tasks 0–10 before implementation handoff. Record Fastly resource/serving and upstream acceptance separately from compile/test success. Preserve all actual GitHub-required checks and review/merge gates.
 
@@ -588,3 +624,4 @@ Task 0 retires `cargo clippy-codegen` and the old codegen package test together 
 - Round 1 (Codex plan-document reviewer, 2026-11-22): approved the full plan against the spec and inspected source boundaries, with no blocking gaps. Clarified that the controlled EOF artifact's digest and `test-utils` features are recorded separately from the plain release build; observations must identify the binary actually executed.
 - Round 2 (Codex plan-document reviewer, 2026-11-22): approved the user-directed Task 0 prerequisite and its source/compatibility/retirement checks, including unconditional raw types and the later optional engine feature. Found no blocking mismatch or validation-order gap; a separate spec reviewer also approved the revised design.
 - Round 3 (Codex advisory plan-document reviewer, 2026-11-22): approved the complete feedback revision, including task interfaces/assertions, service-before-input ordering, named upstream gates, production release producer and supplied-binary acceptance, browser propagation and the full future CI inventory. Command assumptions were checked against source; no product commands were executed by this document review.
+- Round 4 (Codex advisory plan-document reviewer, 2026-11-23): approved the seven remaining feedback corrections, consistent private interfaces, feature-on remote-only control, explicit target refusal test, CI/release staging and the production DNS/TLS plus Playwright proof gates. This is a document review; no product or fixture route was executed.
