@@ -53,6 +53,10 @@ enum TlsFamily {
 ///   `9dc949149365` appears for plain Go, Sliver Agent and Go's `net`
 ///   package alike, and the `GoLang` row `t12d190800_d83cc789557e` shares
 ///   `WinINET`'s hash, so a Go hash can match a system TLS stack.
+/// - Chromium over QUIC `q13d0312h3_55b375c5d22e_06cda9e17597`:
+///   `55b375c5d22e` hashes the three TLS 1.3 suites (`1301,1302,1303`) that
+///   QUIC requires, so every HTTP/3 client sends it, Firefox and Safari
+///   included.
 ///
 /// Rows whose cipher hash is shared with a Windows system TLS stack
 /// (`WinINET`) are also left out, so a Windows component never counts as a
@@ -69,8 +73,6 @@ const CIPHER_HASH_FAMILIES: &[(&str, TlsFamily)] = &[
     // Chromium Browser: t13d1516h2_8daaf6152771_02713d6af862 and its
     // t13d1517h2 / t13i variants.
     ("8daaf6152771", TlsFamily::Chromium),
-    // Chromium Browser over QUIC: q13d0312h3_55b375c5d22e_06cda9e17597.
-    ("55b375c5d22e", TlsFamily::Chromium),
     // Mozilla Firefox: t13d1715h2_5b57614c22b0_7121afd63204.
     ("5b57614c22b0", TlsFamily::Firefox),
     // Safari: t13d2014h2_a09f3c656075_14788d8d241b.
@@ -165,7 +167,7 @@ mod tests {
     use crate::test_support::ja4::{
         CHROME_IOS_USER_AGENT, CHROME_USER_AGENT, CHROMIUM_JA4, EDGE_USER_AGENT, FIREFOX_JA4,
         FIREFOX_USER_AGENT, GENERIC_PYTHON_JA4, GO_DEFAULT_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4,
-        SAFARI_JA4, SAFARI_USER_AGENT, UNLISTED_JA4,
+        QUIC_JA4, SAFARI_JA4, SAFARI_USER_AGENT, UNLISTED_JA4,
     };
 
     const BROWSER_USER_AGENTS: [&str; 4] = [
@@ -261,6 +263,16 @@ mod tests {
                     "should not refuse {ua:?} for a TLS library's default list {ja4:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_quic_cipher_list_never_contradicts() {
+        for ua in BROWSER_USER_AGENTS {
+            assert!(
+                !contradicts_user_agent(ua, QUIC_JA4, Ja4ContradictionExempt::Off),
+                "should not refuse {ua:?} over HTTP/3, where every client sends one cipher list"
+            );
         }
     }
 

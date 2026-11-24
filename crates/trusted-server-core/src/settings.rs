@@ -800,7 +800,7 @@ pub enum BrowserGate {
     Lenient,
     /// Also requires a JA4 class and a recognized User-Agent platform, so a
     /// client without trusted JA4 does not create an identity. Only Fastly,
-    /// and Axum with EdgeZero's trusted JA4 proxy header, supply trusted JA4
+    /// and Axum with `EdgeZero`'s trusted JA4 proxy header, supply trusted JA4
     /// today; other adapters create no identity under this rule.
     ///
     /// This gates creation only: what an adapter does with an existing EC that

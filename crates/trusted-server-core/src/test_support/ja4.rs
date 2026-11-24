@@ -86,3 +86,6 @@ pub fn insert_browser_signals(request: &mut Request) {
         captured_ja4(CHROMIUM_JA4, Ja4Source::RuntimeTls),
     );
 }
+/// Chromium over QUIC (`FoxIO` JA4+ mapping). Its cipher hash covers only the three
+/// TLS 1.3 suites QUIC requires, so every HTTP/3 client sends it.
+pub const QUIC_JA4: &str = "q13d0312h3_55b375c5d22e_06cda9e17597";
