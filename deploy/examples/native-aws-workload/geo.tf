@@ -3,10 +3,13 @@ locals {
   geo_enabled                = nonsensitive(var.geo_front_door != null)
   geo_phase                  = local.geo_enabled ? nonsensitive(var.geo_front_door.rollout_phase) : null
   geo_credential_header_name = local.geo_enabled ? var.geo_front_door.origin_credential_header_name : null
-  trusted_proxy_cidrs = concat(
-    local.alb_subnet_cidrs,
-    local.geo_enabled ? sort(tolist(var.geo_front_door.cloudfront_ipv4_cidrs)) : []
-  )
+  geo_credential_value       = local.geo_enabled ? random_password.origin_credential[0].result : null
+  publisher_forwarder_bindings = local.geo_enabled && var.preserve_publisher_hostname ? {
+    for name, binding in var.application_secrets : name => binding
+    if name == try(local.app_config.trusted_forwarder.shared_secret, null)
+  } : {}
+  cloudfront_ipv4_cidrs = local.geo_enabled ? sort([for entry in data.aws_ec2_managed_prefix_list.cloudfront[0].entries : entry.cidr]) : []
+  trusted_proxy_cidrs   = concat(local.alb_subnet_cidrs, local.cloudfront_ipv4_cidrs)
   native_geo_profile = local.geo_enabled ? join("\n", [
     "version = 1",
     "",
@@ -18,11 +21,29 @@ locals {
   ]) : null
 }
 
-# The managed prefix list owns network ingress. Supplied literal ranges above
-# own checked XFF trust, not Geo admission; keep them reviewed/versioned together.
+# Use the same AWS-managed origin-facing list for network ingress and checked
+# XFF trust. The prepared application adopts its current entries on task startup.
 data "aws_ec2_managed_prefix_list" "cloudfront" {
   count = local.geo_enabled ? 1 : 0
   name  = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
+# Publisher mode authenticates fixed browser-origin metadata at CloudFront, not
+# on reviewer machines. Read the same immutable version selected by the app.
+# This value is sensitive but is persisted in private workload state/plans.
+data "aws_secretsmanager_secret_version" "publisher_forwarder" {
+  for_each = local.publisher_forwarder_bindings
+
+  secret_id  = each.value.arn
+  version_id = each.value.version_id
+}
+
+# Persist one credential in workload state. Ordinary updates must not rotate it.
+# CloudFront and ALB are its only consumers; never publish it to the task.
+resource "random_password" "origin_credential" {
+  count   = local.geo_enabled ? 1 : 0
+  length  = 43
+  special = false
 }
 
 resource "aws_vpc_security_group_ingress_rule" "cloudfront" {
@@ -32,7 +53,6 @@ resource "aws_vpc_security_group_ingress_rule" "cloudfront" {
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
-  depends_on        = [terraform_data.draft_gate]
 }
 
 # Never share this target group with the old Off service or its rollback history.
@@ -54,7 +74,6 @@ resource "aws_lb_target_group" "geo" {
     healthy_threshold   = local.target_health.healthy_threshold
     unhealthy_threshold = local.target_health.unhealthy_threshold
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_lb_listener_rule" "geo" {
@@ -71,10 +90,9 @@ resource "aws_lb_listener_rule" "geo" {
   condition {
     http_header {
       http_header_name = local.geo_credential_header_name
-      values           = [var.geo_front_door.origin_credential_value]
+      values           = [local.geo_credential_value]
     }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 # Explicitly request generated assertions. Viewer-header forwarding alone does
@@ -89,7 +107,6 @@ resource "aws_cloudfront_origin_request_policy" "geo" {
   }
   cookies_config { cookie_behavior = "all" }
   query_strings_config { query_string_behavior = "all" }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_cloudfront_cache_policy" "geo" {
@@ -105,7 +122,6 @@ resource "aws_cloudfront_cache_policy" "geo" {
     cookies_config { cookie_behavior = "none" }
     query_strings_config { query_string_behavior = "none" }
   }
-  depends_on = [terraform_data.draft_gate]
 }
 
 resource "aws_cloudfront_distribution" "geo" {
@@ -123,14 +139,28 @@ resource "aws_cloudfront_distribution" "geo" {
     origin_id   = "protected-alb"
     custom_header {
       name  = local.geo_credential_header_name
-      value = var.geo_front_door.origin_credential_value
+      value = local.geo_credential_value
     }
-    # ALB preserves this field, and trusted proxy normalization consumes it.
-    # Fix browser identity at deployment time, never trust the viewer value.
-    # Publisher identity is opt-in; TLS and ALB admission still use demo Host.
+    # Fix browser identity at deployment time, never trust viewer values.
+    # Publisher mode also stamps scheme/authentication, so reviewers need no
+    # token file. Demo TLS and ALB admission still use the evaluation Host.
     custom_header {
       name  = "X-Forwarded-Host"
       value = var.preserve_publisher_hostname ? var.publisher_hostname : var.demo_hostname
+    }
+    dynamic "custom_header" {
+      for_each = local.publisher_forwarder_bindings
+      content {
+        name  = "X-Forwarded-Proto"
+        value = "https"
+      }
+    }
+    dynamic "custom_header" {
+      for_each = local.publisher_forwarder_bindings
+      content {
+        name  = local.app_config.trusted_forwarder.auth_header
+        value = data.aws_secretsmanager_secret_version.publisher_forwarder[custom_header.key].secret_string
+      }
     }
     custom_origin_config {
       http_port              = 80
@@ -158,10 +188,18 @@ resource "aws_cloudfront_distribution" "geo" {
   restrictions {
     geo_restriction { restriction_type = "none" }
   }
+  lifecycle {
+    precondition {
+      condition = !var.preserve_publisher_hostname || (
+        length(local.publisher_forwarder_bindings) == 1 &&
+        try(length(local.app_config.trusted_forwarder.auth_header) > 0 && lower(local.app_config.trusted_forwarder.auth_header) != lower(local.geo_credential_header_name), false)
+      )
+      error_message = "Publisher-preserving CloudFront needs a trusted_forwarder auth_header distinct from origin admission and a shared_secret reference bound to an immutable application_secrets version."
+    }
+  }
   viewer_certificate {
-    acm_certificate_arn      = var.geo_front_door.viewer_certificate_arn
+    acm_certificate_arn      = aws_acm_certificate_validation.viewer[0].certificate_arn
     ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
   }
-  depends_on = [terraform_data.draft_gate]
 }
