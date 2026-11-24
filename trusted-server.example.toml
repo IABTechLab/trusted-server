@@ -100,8 +100,9 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 # Device-signal rule for EC creation. "lenient" (default) blocks only known
-# non-browser fingerprints; "strict" also requires trusted JA4 and a
-# recognized User-Agent platform, so clients without JA4 create no EC.
+# non-browser fingerprints (none are listed yet, so it blocks no client today);
+# "strict" also requires trusted JA4 and a recognized User-Agent platform, so
+# clients without JA4 create no EC. Only Fastly supplies trusted JA4.
 # browser_gate = "lenient"
 
 # Fastly persistence uses this exact physical binding. Provider omission is

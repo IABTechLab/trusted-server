@@ -897,11 +897,13 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 device signals. Consent and the navigation policy apply under both rules.
 
 - `lenient` (default) blocks only clients whose JA4 and HTTP/2 fingerprints
-  match a known non-browser pattern. A client without trusted JA4, such as one
-  behind a proxy or on a runtime that supplies none, stays eligible for EC
-  creation.
+  match a known non-browser pattern. The built-in fingerprint table lists no
+  non-browser pattern yet, so `lenient` blocks no client today. A client
+  without trusted JA4, such as one behind a proxy or on a runtime that supplies
+  none, stays eligible for EC creation.
 - `strict` also requires a JA4 class and a recognized User-Agent platform. A
-  client without trusted JA4 creates no EC.
+  client without trusted JA4 creates no EC. Only Fastly supplies trusted JA4
+  today, so under `strict` the Axum, Cloudflare and Spin adapters create no EC.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

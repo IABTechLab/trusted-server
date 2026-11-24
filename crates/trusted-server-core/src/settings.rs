@@ -792,11 +792,18 @@ pub enum CollectTiming {
 #[serde(rename_all = "snake_case")]
 pub enum BrowserGate {
     /// Blocks only clients whose JA4 and HTTP/2 fingerprints match a known
-    /// non-browser pattern. Missing JA4 does not block.
+    /// non-browser pattern. Missing JA4 does not block. The built-in
+    /// fingerprint table lists no non-browser pattern yet, so this blocks no
+    /// client today.
     #[default]
     Lenient,
     /// Also requires a JA4 class and a recognized User-Agent platform, so a
-    /// client without trusted JA4 does not create an identity.
+    /// client without trusted JA4 does not create an identity. Only Fastly
+    /// supplies trusted JA4 today, so other adapters create no identity.
+    ///
+    /// This gates creation only: what an adapter does with an existing EC that
+    /// fails the rule differs (Axum drops its graph for the request; Fastly
+    /// keeps it).
     Strict,
 }
 

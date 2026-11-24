@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `[ec].browser_gate` to choose the device-signal rule for Edge Cookie creation (#1520). The default, `lenient`, blocks only known non-browser fingerprints, so a missing JA4 alone no longer stops EC creation. `strict` restores the earlier rule that requires trusted JA4 and a recognized User-Agent platform. A config that leaves it unset serializes without the key, so it still loads in older runtimes.
+- Add `[ec].browser_gate` to choose the device-signal rule for Edge Cookie creation (#1520). The default, `lenient`, blocks only known non-browser fingerprints, so a missing JA4 alone no longer stops EC creation; the built-in table lists no non-browser fingerprint yet, so it blocks no client today. `strict` restores the earlier creation rule that requires trusted JA4 and a recognized User-Agent platform; only Fastly supplies trusted JA4, so under `strict` the Axum, Cloudflare and Spin adapters create no EC. A config that leaves it unset serializes without the key, so it still loads in older runtimes.
 - Add Phase 1 attested release binaries: the Fastly wasm and the `ts` CLI for Linux x86-64 and macOS (ARM64 and x86-64), with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification and a GNU glibc 2.34 startup check. Reproducibility, other adapters and the custom verifier remain later work; production publication requires maintainer settings.
 
 ### Changed
