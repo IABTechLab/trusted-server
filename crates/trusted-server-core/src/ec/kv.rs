@@ -36,7 +36,7 @@ pub const MAX_CREATE_ATTEMPTS: u32 = 5;
 
 /// Write attempts a navigation's follow-up update makes: the first, then one
 /// re-read and re-plan after a conflict.
-pub const MAX_AFTER_RESPONSE_ATTEMPTS: u8 = 2;
+pub(super) const MAX_AFTER_RESPONSE_ATTEMPTS: u8 = 2;
 
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
@@ -168,7 +168,7 @@ impl KvIdentityGraph {
     ///
     /// A body over [`MAX_ENTRY_BYTES`] is an error; callers that report a
     /// full row separately use [`Self::serialize_entry_unless_full`].
-    pub(super) fn serialize_entry(
+    fn serialize_entry(
         entry: &KvEntry,
         store_name: &str,
     ) -> Result<(String, String), Report<TrustedServerError>> {
@@ -181,6 +181,16 @@ impl KvIdentityGraph {
                 ),
             })),
         }
+    }
+
+    /// Serializes an entry like [`Self::serialize_entry`], for test stores
+    /// outside this module that seed or race rows with real metadata.
+    #[cfg(test)]
+    pub(super) fn serialize_entry_for_test(
+        entry: &KvEntry,
+        store_name: &str,
+    ) -> Result<(String, String), Report<TrustedServerError>> {
+        Self::serialize_entry(entry, store_name)
     }
 
     /// Serializes an entry body and metadata, reporting an oversized body as
@@ -477,12 +487,18 @@ impl KvIdentityGraph {
     /// that update only while the row is still at the generation `plan`
     /// returns, so a concurrent write is never overwritten. When the write
     /// loses its CAS it wrote nothing, so the row is read again and `plan`
-    /// asked again, for at most [`MAX_AFTER_RESPONSE_ATTEMPTS`] attempts: a
-    /// retry plans against every write since and never resends a stale
-    /// update. A re-read that returns the generation that just lost its CAS
-    /// is stale, as an eventually consistent store can return, so no further
-    /// attempt is made. The `permit` is spent once and every attempt runs
-    /// under it, so at most one update lands; it never leaves the graph.
+    /// asked again, for at most two attempts: a retry plans against every
+    /// write since and never resends a stale update. The lost CAS proves the
+    /// row exists at a newer generation, so a re-read that returns the
+    /// generation that just lost or no row at all is stale, as an eventually
+    /// consistent store can return; no further attempt is made and
+    /// [`AfterResponseRejection::StaleRead`] comes back. Store generations are
+    /// unique but not ordered, so an older generation cannot be told from a
+    /// newer one: it is planned against, and a write planned on it loses its
+    /// CAS. The `permit` is spent before the first read and every attempt
+    /// runs under it; only a write that wins its CAS lands, and the loop stops
+    /// at the first one, so at most one update lands. The permit never leaves
+    /// the graph.
     ///
     /// `plan` returns `Err` with its reason when the row as read needs no
     /// write, such as a missing or withdrawn row; that reason comes back in
@@ -506,13 +522,21 @@ impl KvIdentityGraph {
                 Ok(snapshot) => snapshot,
                 Err(report) => break Err(AfterResponseRejection::ReadFailed(report)),
             };
-            if lost.is_some() && Generation::of(&snapshot, ec_id) == lost {
-                log::warn!(
-                    "After-response re-read for '{}' returns the generation that lost its CAS, \
-                     dropping results",
-                    log_id(ec_id)
-                );
-                break Err(AfterResponseRejection::Conflict);
+            if let Some(lost) = lost {
+                let read = Generation::of(&snapshot, ec_id);
+                if read.is_none_or(|read| read == lost) {
+                    let found = if read.is_none() {
+                        "no row"
+                    } else {
+                        "the generation that lost its CAS"
+                    };
+                    log::warn!(
+                        "After-response re-read for '{}' is stale, returning {found}; \
+                         dropping results",
+                        log_id(ec_id)
+                    );
+                    break Err(AfterResponseRejection::StaleRead);
+                }
             }
             let (entry, expected) = match plan(&snapshot) {
                 Ok(planned) => planned,

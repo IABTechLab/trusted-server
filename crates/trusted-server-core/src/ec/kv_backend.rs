@@ -281,7 +281,7 @@ pub(crate) mod test_support {
     ///
     /// With a race, another writer changes the stored row with it just before
     /// each of those inserts, written through
-    /// [`KvIdentityGraph::serialize_entry`] so its metadata is real, and the
+    /// [`KvIdentityGraph::serialize_entry_for_test`] so its metadata is real, and the
     /// row's generation moves on. Without one, the row and its generation stay
     /// as they were, as when the conflicting read was stale.
     pub(crate) struct ConflictInjectingEcKv {
@@ -289,6 +289,7 @@ pub(crate) mod test_support {
         conflicts_remaining: AtomicU32,
         race: Option<Race>,
         fail_reads_after_conflict: bool,
+        miss_reads_after_conflict: bool,
         conflicted: AtomicBool,
     }
 
@@ -301,6 +302,7 @@ pub(crate) mod test_support {
                 conflicts_remaining: AtomicU32::new(conflicts),
                 race: None,
                 fail_reads_after_conflict: false,
+                miss_reads_after_conflict: false,
                 conflicted: AtomicBool::new(false),
             }
         }
@@ -325,6 +327,15 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Makes every read find no row once a conflict has been injected, as
+        /// a stale replica of an eventually consistent store can.
+        pub(crate) fn missing_reads_after_conflict(self) -> Self {
+            Self {
+                miss_reads_after_conflict: true,
+                ..self
+            }
+        }
+
         /// The conflicts still to inject.
         pub(crate) fn conflicts_remaining(&self) -> u32 {
             self.conflicts_remaining.load(Ordering::Relaxed)
@@ -332,8 +343,9 @@ pub(crate) mod test_support {
 
         /// Stores `entry` under `key` directly, bypassing conflict injection.
         pub(crate) async fn seed(&self, key: &str, entry: &KvEntry) {
-            let (body, metadata) = KvIdentityGraph::serialize_entry(entry, self.store_name())
-                .expect("should serialize the seeded row");
+            let (body, metadata) =
+                KvIdentityGraph::serialize_entry_for_test(entry, self.store_name())
+                    .expect("should serialize the seeded row");
             self.inner
                 .insert(
                     key,
@@ -369,8 +381,9 @@ pub(crate) mod test_support {
             let mut entry: KvEntry =
                 serde_json::from_slice(&stored.body).expect("should parse the stored row");
             race(&mut entry);
-            let (body, metadata) = KvIdentityGraph::serialize_entry(&entry, self.store_name())
-                .expect("should serialize the raced row");
+            let (body, metadata) =
+                KvIdentityGraph::serialize_entry_for_test(&entry, self.store_name())
+                    .expect("should serialize the raced row");
             self.inner
                 .insert(
                     key,
@@ -401,6 +414,9 @@ pub(crate) mod test_support {
                     store_name: self.inner.store_name().to_owned(),
                     message: "read failing after a conflict".to_owned(),
                 }));
+            }
+            if self.miss_reads_after_conflict && self.conflicted.load(Ordering::Relaxed) {
+                return Ok(None);
             }
             self.inner.lookup(key).await
         }

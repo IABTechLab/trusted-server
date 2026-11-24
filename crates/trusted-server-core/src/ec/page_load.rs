@@ -104,9 +104,12 @@ impl PageLoadWrite {
 /// response has been sent.
 ///
 /// Issued only by [`NavigationPermit::confirm_with_after_response`] and
-/// consumed by [`KvIdentityGraph::commit_after_response`], which keeps it for
-/// the re-read and re-plan after a conflict. It is not `Clone`, so a
-/// navigation lands at most one follow-up write.
+/// consumed by [`KvIdentityGraph::commit_after_response`], which spends it
+/// before its first read, whether or not a write follows. That call's bounded
+/// loop re-reads and re-plans only after a write that lost its CAS and so
+/// wrote nothing, and stops at the first write that lands, so at most one
+/// follow-up write lands. It is not `Clone`, so a navigation makes that call
+/// at most once.
 ///
 /// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
 #[derive(Debug)]
@@ -142,9 +145,13 @@ pub enum AfterResponseRejection<S> {
     /// The plan for the row as read has nothing to write, for the reason the
     /// planner gave.
     Skipped(S),
-    /// The row changed since each read, or a re-read returned the generation
-    /// that had just lost its CAS, so the results are dropped.
+    /// The row changed since each read, the retry's included, so the results
+    /// are dropped.
     Conflict,
+    /// After a lost CAS, the re-read returned the generation that had just
+    /// lost or no row at all, though the lost CAS proves the row exists at a
+    /// newer generation, so the results are dropped without a second write.
+    StaleRead,
     /// Reading the row failed.
     ReadFailed(Report<TrustedServerError>),
     /// The store rejected the write, or it could not be serialized.
