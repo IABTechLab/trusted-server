@@ -719,7 +719,7 @@ async fn run_named_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                ec.kv_graph.as_ref(),
+                ec.kv_graph.as_ref().filter(|_| ec.is_real_browser),
                 registry_ref,
                 &mut ec.ec_context,
                 services,
@@ -1457,6 +1457,7 @@ mod tests {
         TemplateMetadata,
     };
     use trusted_server_core::settings::{EcPartner, IdentityProviderConfig, Settings};
+    use trusted_server_core::test_support::identity_conformance::RecordingStore;
     use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
@@ -3570,6 +3571,92 @@ mod tests {
         block_on(graph.create(ec_id, &entry)).expect("should seed the row");
     }
 
+    #[test]
+    fn auction_body_ingest_rejects_known_non_browsers() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings.ec.partners = serde_json::from_value(serde_json::json!([{
+            "name": "Example body partner",
+            "source_domain": "body.example.com",
+            "bidstream_enabled": true
+        }]))
+        .expect("should configure an unowned body source");
+        settings.auction.enabled = false;
+        let store = RecordingStore::new(false);
+        let mut state = app_state_for_settings(settings);
+        let mutable = Arc::get_mut(&mut state).expect("should own the app state");
+        Arc::get_mut(&mut mutable.identity)
+            .expect("should own the identity app")
+            .bind_record_store(Arc::new(store.clone()));
+        let graph = crate::require_identity_graph(&state.identity)
+            .expect("should open the recording identity graph");
+        let clock = TestClock::new();
+        let fixture = AfterResponseFixture {
+            state,
+            client: ScriptedHttpClient::new(&clock),
+            clock,
+            graph,
+        };
+
+        for (suffix, known_browser) in [("bot001", false), ("web001", true)] {
+            let ec_id = format!("{}.{suffix}", "b".repeat(64));
+            seed_live_row(&fixture.graph, &ec_id);
+            let before = block_on(fixture.graph.get(&ec_id))
+                .expect("should read the seeded row")
+                .expect("should retain the seeded row");
+            let writes_before = store.events().len();
+            let mut request =
+                consented_request(empty_request(Method::POST, "/auction"), Some(&ec_id));
+            *request.body_mut() = Body::from(serde_json::json!({
+                "adUnits": [{"code": "example-slot", "mediaTypes": {"banner": {"sizes": [[300, 250]]}}}],
+                "eids": [{"source": "body.example.com", "uids": [{"id": "body-uid", "atype": 1}]}]
+            }).to_string());
+            request.extensions_mut().insert(DeviceSignals {
+                known_browser: Some(known_browser),
+                ..DeviceSignals::derive("example-agent", None, None)
+            });
+
+            let router = TrustedServerApp::routes_for_state(&fixture.state);
+            let mut response = route_on_clock(&router, request, &fixture);
+            let mut identity = take_finalize_state(&mut response);
+            assert_eq!(
+                identity.ec_context.ec_value(),
+                Some(ec_id.as_str()),
+                "should reach the handler with a valid EC cookie"
+            );
+            fixture.clock.drive(crate::apply_edgezero_ec_finalize(
+                &fixture.state,
+                &mut identity,
+                &mut response,
+            ));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return the no-bid auction response"
+            );
+            assert_eq!(
+                store.events().len() - writes_before,
+                usize::from(known_browser),
+                "should persist body EIDs only for an allowed browser"
+            );
+            let after = block_on(fixture.graph.get(&ec_id))
+                .expect("should inspect the finalized row")
+                .expect("should retain the existing row");
+            if known_browser {
+                assert_eq!(
+                    after.0.ids["body.example.com"].uid, "body-uid",
+                    "should prove the body reaches ingestion for an allowed browser"
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "should leave the bot's record and generation unchanged"
+                );
+            }
+        }
+    }
+
     /// Runs the after-response phase on the fixture's post-delivery client.
     fn run_after_response(
         fixture: &AfterResponseFixture,
@@ -3828,6 +3915,57 @@ mod tests {
     }
 
     #[test]
+    fn redirect_cancels_page_lookups_without_waiting() {
+        let mut fixture = mirrored_page_identity_fixture(PAGE_LOOKUP_BUDGET * 5);
+        fixture.client = ScriptedHttpClient::new(&fixture.clock);
+        fixture.client.respond_to(
+            Method::GET,
+            &format!("{}/article", fixture.state.settings.publisher.origin_url),
+            ScriptedReply::status(StatusCode::FOUND).header("content-type", "text/html"),
+        );
+        fixture.client.respond_to(
+            Method::GET,
+            LOOKUP_URL,
+            ScriptedReply::status(StatusCode::OK)
+                .body("late-provider-uid")
+                .after(PAGE_LOOKUP_BUDGET * 5),
+        );
+        let ec_id = format!("{}.redir1", "c".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let before = block_on(fixture.graph.get(&ec_id)).expect("should read the seeded row");
+
+        let (response, collected, held) = finalized_response(
+            &fixture,
+            consented_request(navigation_request("/article"), Some(&ec_id)),
+        );
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should preserve the redirect"
+        );
+        assert_eq!(
+            fixture.sends(),
+            1,
+            "should dispatch a provider lookup before the redirect"
+        );
+        assert!(
+            held < PAGE_LOOKUP_BUDGET,
+            "should cancel redirect lookups without waiting for their deadline, held {held:?}"
+        );
+        assert!(!collected, "should not collect a canceled lookup");
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should issue no identity cookies on redirect"
+        );
+        assert_eq!(
+            block_on(fixture.graph.get(&ec_id)).expect("should read the finalized row"),
+            before,
+            "should leave the identity record unchanged on redirect"
+        );
+    }
+
+    #[test]
     fn page_lookup_within_the_deadline_reaches_the_record_and_the_mirror_cookie() {
         // Arrange
         let fixture = mirrored_page_identity_fixture(PAGE_LOOKUP_BUDGET / 4);
@@ -3954,6 +4092,22 @@ mod tests {
         })
         .collect();
 
+        let mut revocation =
+            consented_request(empty_request(Method::POST, "/auction"), Some(&ec_id));
+        revocation
+            .headers_mut()
+            .insert("sec-gpc", HeaderValue::from_static("1"));
+        revocation.headers_mut().insert(
+            header::COOKIE,
+            format!("us_privacy=1YNN; ts-ec={ec_id}; __Host-ts-eids-mirror=stale")
+                .parse()
+                .expect("should carry a mirror to revoke"),
+        );
+        *revocation.body_mut() = Body::from(serde_json::json!({
+            "adUnits": [{"code": "example-slot", "mediaTypes": {"banner": {"sizes": [[300, 250]]}}}]
+        }).to_string());
+        let (revoked, _, _) = finalized_response(&fixture, revocation);
+
         // Assert
         assert_eq!(
             new_visit.status(),
@@ -3991,6 +4145,23 @@ mod tests {
                 "should set no identity cookie on the {label} response, got {cookies:?}"
             );
         }
+        let expiry = mirror_set_cookie(&revoked)
+            .expect("should emit the mirror revocation expiry on the API response");
+        assert!(
+            expiry.contains("Max-Age=0"),
+            "should expire the carried mirror"
+        );
+        assert!(
+            !set_cookies(&revoked)
+                .iter()
+                .any(|cookie| sets_identity_cookie(cookie)),
+            "should emit no positive identity cookie during API revocation"
+        );
+        assert_eq!(
+            revoked.headers()[header::CACHE_CONTROL],
+            "no-store, private",
+            "should preserve terminal privacy for expiry cookies"
+        );
     }
 
     /// The ID5 fetch URL for partner 1234 at the example endpoint.

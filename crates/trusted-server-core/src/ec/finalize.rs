@@ -1560,13 +1560,18 @@ mod tests {
             .create(&ec_id, &live)
             .await
             .expect("should seed the live row this request updates");
-        let mut ec_context = returning_user_context(
-            &ec_id,
-            EcKvSnapshot::Missing {
-                ec_id: ec_id.clone(),
-            },
-            false,
+        let snapshot = graph.load_snapshot(&ec_id).await;
+        assert!(
+            matches!(
+                &snapshot,
+                EcKvSnapshot::Present {
+                    generation: Some(_),
+                    ..
+                }
+            ),
+            "should exercise finalization with a live row and usable generation"
         );
+        let mut ec_context = returning_user_context(&ec_id, snapshot, false);
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
         // Only `first.example.com` "fit" in the (simulated) trimmed cookie;
         // `second.example.com` was dropped by the browser's size cap.
