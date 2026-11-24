@@ -524,6 +524,12 @@ impl KvIdentityGraph {
             };
             if let Some(lost) = lost {
                 let read = Generation::of(&snapshot, ec_id);
+                // A missing row counts as stale only while nothing hard-deletes
+                // rows: withdrawal writes a tombstone and `delete` has no
+                // production caller yet. Once the deferred data-deletion
+                // framework calls it, a row deleted after the lost CAS is
+                // reported here as `stale_read`, not `no_row`; nothing is
+                // written either way.
                 if read.is_none_or(|read| read == lost) {
                     let found = if read.is_none() {
                         "no row"

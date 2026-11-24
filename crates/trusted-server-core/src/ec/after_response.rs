@@ -77,8 +77,8 @@ pub fn after_response_lookups_allowed(
 /// # Performance
 ///
 /// At most two KV reads, skipped when no lookup can change the row, and as
-/// many conditional KV writes; the second of each only after a conflict. Runs after the response has been sent, so it adds
-/// no page latency.
+/// many conditional KV writes; the second of each only after a conflict.
+/// Runs after the response has been sent, so it adds no page latency.
 pub async fn commit_after_response_lookups(
     graph: &KvIdentityGraph,
     permit: AfterResponseWrite,
