@@ -10,7 +10,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command jq
-smoke_require_command python3
+smoke_require_python
 smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace axum)
@@ -45,14 +45,15 @@ stop_app() {
 cleanup() {
     stop_app
     smoke_stop_process "$ORIGIN_PID"
+    smoke_preserve_artifacts "$WORKSPACE"
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 AXUM_BINARY=${AXUM_BINARY_PATH:-$REPO_ROOT/target/debug/trusted-server-axum}
-if [ ! -x "$AXUM_BINARY" ]; then
-    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p trusted-server-adapter-axum
+if [ -z "${AXUM_BINARY_PATH:-}" ]; then
+    cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" -p trusted-server-adapter-axum
 fi
 [ -x "$AXUM_BINARY" ] || smoke_die "Axum binary not executable: $AXUM_BINARY"
 
@@ -84,7 +85,7 @@ run_case() {
     local handler_value="$4"
     local proxy_value="$5"
     local ec_value="$6"
-    local expected_outcome="$7"
+    local expected_status="$7"
     local expected_diagnostic="${8:-}"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
@@ -122,59 +123,81 @@ run_case() {
 
     "${env_args[@]}" "$AXUM_BINARY" >"$log_path" 2>&1 &
     APP_PID=$!
-    local attempt=0
-    local status="000"
-    if [ "$expected_outcome" = "exit" ]; then
-        while kill -0 "$APP_PID" 2>/dev/null && [ "$attempt" -lt 100 ]; do
-            status=$(curl --silent --max-time 0.2 --output /dev/null \
-                --write-out '%{http_code}' "http://127.0.0.1:$port/health" || true)
-            [ "$status" = "000" ] || smoke_die "$case_name listened before rejecting startup"
-            attempt=$((attempt + 1))
-            sleep 0.05
-        done
-        if kill -0 "$APP_PID" 2>/dev/null; then
-            smoke_die "$case_name did not fail within the startup deadline"
-        fi
-        if wait "$APP_PID"; then
-            smoke_die "$case_name exited successfully instead of rejecting startup"
-        fi
-        APP_PID=""
-        smoke_wait_log "$log_path" "$expected_diagnostic"
-    else
-        while [ "$attempt" -lt 100 ]; do
-            smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
-            status=$(curl --silent --max-time 0.2 --output "$body_path" \
-                --write-out '%{http_code}' "http://127.0.0.1:$port/health" || true)
-            if [ "$status" = "200" ] && [ "$(<"$body_path")" = "ok" ] && \
-                [ "$(wc -c <"$body_path")" -eq 2 ]; then
-                break
-            fi
-            attempt=$((attempt + 1))
-            sleep 0.1
-        done
-        [ "$attempt" -lt 100 ] || smoke_die "Axum health did not become exactly 200/ok"
-        SMOKE_HTTP_STATUS=$(curl --silent --show-error --max-time 5 \
-            --output "$body_path" --dump-header "$headers_path" \
-            --write-out '%{http_code}' "http://127.0.0.1:$port/")
-        smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
-        smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
-        stop_app
+    local startup_state=ready
+    [ "$expected_status" != 503 ] || startup_state=unavailable
+    smoke_wait_http "http://127.0.0.1:$port/health" 200 \
+        "$WORKSPACE/$case_name-live.body" "$WORKSPACE/$case_name-live.headers"
+    if [ "$startup_state" = ready ]; then
+        smoke_wait_http "http://127.0.0.1:$port/ready" 200 \
+            "$WORKSPACE/$case_name-ready-wait.body" "$WORKSPACE/$case_name-ready-wait.headers"
     fi
+    smoke_assert_operational "http://127.0.0.1:$port" "$startup_state" "$WORKSPACE/$case_name"
+    local origin_before
+    origin_before=$(smoke_origin_count "$WORKSPACE")
+    local SMOKE_AUTHENTICATE=false
+    if [ "$case_name" = hostile ]; then
+        smoke_wait_http "http://127.0.0.1:$port/private" 401 \
+            "$WORKSPACE/$case_name-auth.body" "$WORKSPACE/$case_name-auth.headers"
+        SMOKE_AUTHENTICATE=true
+    fi
+    smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
+        "$body_path" "$headers_path"
+    smoke_assert_process_alive "$APP_PID" "Axum" "$log_path"
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
+    stop_app
+
+    if [ -n "$expected_diagnostic" ]; then
+        smoke_assert_unavailable_body "$body_path"
+        smoke_assert_failure "$expected_status" "$expected_diagnostic" "$log_path"
+        # Diagnostics name config paths, never reference keys: a key is an
+        # operator-supplied string that could hold a misplaced secret.
+        local reference
+        for reference in handler_password publisher_proxy_secret ec_passphrase; do
+            if grep -qF "$reference" "$log_path"; then
+                smoke_die "$case_name printed the reference key $reference"
+            fi
+        done
+        # A diagnostic that lists every path would hide which secret is absent.
+        local path
+        for path in 'handlers[0].password' publisher.proxy_secret ec.passphrase; do
+            case "$expected_diagnostic" in
+                *"\`$path\`"*) ;;
+                *)
+                    if grep -qF "\`$path\`" "$log_path"; then
+                        smoke_die "$case_name named the present secret path $path"
+                    fi
+                    ;;
+            esac
+        done
+    else
+        smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
+        [ "$(smoke_origin_count "$WORKSPACE")" -gt "$origin_before" ] || smoke_die "publisher control never reached origin"
+    fi
+    echo "axum startup case passed: $case_name"
 }
 
 run_case missing-config "$BASE_PORT" "" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" exit \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
     "Trusted Server config envelope is missing"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
-    "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
+    "required app-config secret at \`handlers[0].password\` is missing"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" exit \
-    "a required app-config secret is missing"
+    "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 503 \
+    "required app-config secret at \`publisher.proxy_secret\` is missing"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" exit \
-    "a required app-config secret is missing"
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 503 \
+    "required app-config secret at \`ec.passphrase\` is missing"
+INVALID_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" invalid)
+HOSTILE_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" hostile)
+run_case malformed-envelope "$((BASE_PORT + 5))" '{' \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
+    'failed to parse Trusted Server app-config blob envelope'
+run_case invalid-settings "$((BASE_PORT + 6))" "$INVALID_ENVELOPE" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
+    'invalid_publisher_domain'
+run_case hostile "$((BASE_PORT + 4))" "$HOSTILE_ENVELOPE" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

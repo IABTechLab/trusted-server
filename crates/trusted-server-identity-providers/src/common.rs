@@ -10,9 +10,9 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
-    EidLevelFields, EidShape, ProviderCapabilities, ProviderCommon, ProviderConfigError,
-    ProviderEid, ProviderExpiry, ProviderKind, ProviderUid, RequestCookies, SourceCapability,
-    SourceInput,
+    EidLevelFields, EidShape, HashedEmailPath, ProviderCapabilities, ProviderCommon,
+    ProviderConfigError, ProviderEid, ProviderExpiry, ProviderKind, ProviderUid, RequestCookies,
+    SourceCapability, SourceInput,
 };
 
 /// Returns whether `ip` is a public address worth sending to a vendor.
@@ -226,6 +226,49 @@ pub struct LockrSettings {
     /// Defaults to the vendor's known Lockr key.
     #[serde(default)]
     pub cookie_names: Option<Vec<String>>,
+}
+
+/// Settings for the hashed-email capability, under a provider's
+/// `[ec.identity_providers.settings.hashed_email]` (spec §8.7).
+///
+/// Only kinds implementing [`UsesHashedEmail`] accept this table; the
+/// settings of every other kind reject it as an unknown field.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HashedEmailSettings {
+    /// Whether the provider sends a hashed email. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where the hashed email sits in the publisher's status response, in
+    /// the jq path subset of [`HashedEmailPath`]. Required when enabled.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// The hashed-email capability: declared by provider kinds that can send a
+/// hashed email the publisher's status endpoint returns.
+pub(crate) trait UsesHashedEmail: ProviderKind {}
+
+/// The parsed path of an enabled hashed-email capability, or `None` when it
+/// is disabled.
+///
+/// # Errors
+///
+/// Returns [`ProviderConfigError::Invalid`] when the capability is enabled
+/// without a `path` or with one outside the supported jq subset.
+pub(crate) fn hashed_email_path<K: UsesHashedEmail>(
+    settings: HashedEmailSettings,
+) -> Result<Option<HashedEmailPath>, Report<ProviderConfigError>> {
+    if !settings.enabled {
+        return Ok(None);
+    }
+    let path = settings.path.ok_or_else(|| {
+        Report::new(ProviderConfigError::Invalid).attach(format!(
+            "hashed_email for a {} provider needs a path",
+            K::KIND
+        ))
+    })?;
+    HashedEmailPath::parse(&path).map(Some)
 }
 
 /// The Lockr capability: declared by provider kinds whose IDs Lockr AIM
