@@ -241,23 +241,25 @@ impl DataDomeIntegration {
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
-        let effective_info = if crate::forwarder::public_origin(req.extensions()).is_some()
+        let checked_origin_available = crate::forwarder::public_origin(req.extensions()).is_some()
             || req
                 .extensions()
                 .get::<edgezero_core::ingress::RequestIngress>()
-                .is_some()
-        {
-            RequestInfo::from_request(req, client_info).ok()
+                .is_some();
+        let (request_host, request_protocol) = if checked_origin_available {
+            // A failed check means the Host header is unusable. Falling back to
+            // the raw header or the URI target would report values that no
+            // checked source vouched for, so both fields are left out.
+            RequestInfo::from_request(req, client_info).map_or_else(
+                |_| (String::new(), String::new()),
+                |info| (info.host, info.scheme),
+            )
         } else {
-            None
+            (
+                request_host(req),
+                req.uri().scheme_str().unwrap_or_default().to_owned(),
+            )
         };
-        let request_host = effective_info
-            .as_ref()
-            .map_or_else(|| request_host(req), |info| info.host.clone());
-        let request_protocol = effective_info.as_ref().map_or_else(
-            || req.uri().scheme_str().unwrap_or_default(),
-            |info| info.scheme.as_str(),
-        );
         let mut fields = Vec::new();
         let header_client_id = header_value(req, HEADER_DATADOME_CLIENT_ID);
         let cookie_header = header_value(req, header::COOKIE.as_str());
@@ -1040,6 +1042,48 @@ mod tests {
             assert_eq!(
                 fields["Protocol"], "http",
                 "should not report a raw target scheme as runtime evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_datadome_payload_omits_host_and_protocol_when_request_info_fails() {
+        let integration = protection_integration();
+        let settings = Settings::default();
+        let services = crate::platform::test_support::noop_services();
+        for host in [
+            HeaderValue::from_bytes(b"listener-\xff.example.com")
+                .expect("should build a non-text host header"),
+            HeaderValue::from_static("not a host"),
+        ] {
+            let mut request = Request::builder()
+                .uri("https://target.example.com/page")
+                .body(EdgeBody::empty())
+                .expect("should construct an absolute request target");
+            request.headers_mut().insert(header::HOST, host);
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                None,
+                HeaderFidelity::default(),
+            ));
+            let payload = integration.build_protection_payload(
+                &RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+                &Redacted::new("fictional-server-side-key".to_owned()),
+            );
+            let fields: HashMap<_, _> = payload.fields.into_iter().collect();
+            assert!(
+                !fields.contains_key("Host"),
+                "should not report an unchecked host when request info fails: {fields:?}"
+            );
+            assert!(
+                !fields.contains_key("Protocol"),
+                "should not report an unchecked scheme when request info fails: {fields:?}"
             );
         }
     }
