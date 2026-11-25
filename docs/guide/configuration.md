@@ -882,6 +882,8 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | Field                               | Type           | Required | Description                                                                           |
 | ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------------------- |
 | `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                 |
+| `max_age_days`                      | Integer        | No       | Positive EC cookie lifetime, 1–400 days; default 365                                  |
+| `sliding_refresh`                   | Boolean        | No       | Same-value renewal on every eligible visit; default false                             |
 | `ec_store`                          | String or null | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
 | `storage`                           | Table          | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
 | `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
@@ -922,6 +924,41 @@ creation under either rule:
 An unknown value fails config loading. The rule runs on Fastly and on Axum
 with a trusted JA4 proxy header. Cloudflare creates no ECs yet, so both keys
 have no effect there.
+
+### Configurable EC lifetime and sliding expiration proposal
+
+**Proposal for DEC-13; off by default. Do not merge until DEC-13 is formally
+recorded as decided and #1595's returning-reader no-Set-Cookie rule is adjusted.**
+
+`ec.max_age_days` defaults to 365 and accepts only integers from 1 through 400.
+It controls positive `ts-ec` issuance on creation, rotation and optional renewal;
+withdrawal remains Max-Age=0. Omitted defaults produce the existing one-year
+cookie attributes and configuration payload. Publish settings through app config
+and `ts config push`; no new serving environment read is added.
+
+`ec.sliding_refresh = true` renews the same held EC with its full configured
+lifetime on each eligible, consented Fastly/Axum publisher document. Existing
+method/status/304 and asset/API eligibility rules are retained. Renewal adds no
+record reads or writes; unread/unavailable state permits it, while known missing,
+revoked, failed or write-failed state suppresses it. **An out-of-band revocation
+of an unread record is not observed until a later request reads that record.**
+
+Every renewing final response is private and non-storable by shared caches.
+Some returning pages are already private because of assembly or ad synthesis;
+other otherwise-shareable pages lose that cacheability when renewed. A neutral,
+cookie-free raw template may still be cached independently. EC renewal does not
+extend backing-record retention. SharedID, its consent companion and the EID
+mirror keep their independent lifetimes and unchanged-value suppression.
+
+Cloudflare and Spin do not issue EC cookies today and remain unchanged for both
+switch values; enabling renewal there is follow-up work. With no new setting,
+responses remain identical to #1646. Explicitly changing the lifetime affects
+positive issuance even when renewal is disabled. Browser retention can still be
+shorter than requested; local tests do not qualify Safari/ITP behavior.
+
+The repository proposal is
+`docs/superpowers/specs/2026-11-23-ec-sliding-expiration-proposal-design.md`.
+It is intentionally outside the published documentation site.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

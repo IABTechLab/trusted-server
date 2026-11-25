@@ -191,6 +191,9 @@ impl IdentityApp {
                         })
                     }));
         let eligible = document || ec_route;
+        if self.settings.ec.sliding_refresh {
+            context.sliding_document = document && !ec_route;
+        }
         if !eligible {
             let _ = context.take_navigation_permit();
             // Establish provenance before core finalization: neither positive

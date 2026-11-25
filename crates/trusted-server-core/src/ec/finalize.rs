@@ -20,7 +20,7 @@ use crate::constants::{COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_MIRROR};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{COOKIE_MAX_AGE, append_cookie, expire_ec_cookie, set_ec_cookie};
+use super::cookies::{append_cookie, expire_ec_cookie, set_ec_cookie};
 use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
@@ -37,6 +37,9 @@ use super::sharedid::{
 };
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, log_id};
+
+// The EID mirror keeps its independent one-year lifetime.
+const MIRROR_COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 /// TS-managed response headers tied to EC identity output.
 const EC_RESPONSE_HEADERS: &[&str] = &[
@@ -171,7 +174,7 @@ fn apply_mirror(
         MirrorCookie::Set(value) => append_cookie(
             response,
             &format!(
-                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+                "{COOKIE_TS_EIDS_MIRROR}={}; Path=/; Secure; SameSite=Lax; Max-Age={MIRROR_COOKIE_MAX_AGE}",
                 value.as_str()
             ),
         ),
@@ -302,6 +305,7 @@ async fn finalize_response_inner(
         return navigation;
     }
 
+    let mut page_write_allows_renewal = true;
     if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
         let collected = if ec_context.eid_sync_source().is_some() || ec_context.ec_generated() {
             drop_opted_out_sharedid_updates(
@@ -350,6 +354,7 @@ async fn finalize_response_inner(
             }
             false
         };
+        page_write_allows_renewal = page_write_ok;
         // The follow-up write is allowed only once consent allows the EC and
         // the page-load write succeeded or had nothing to change.
         if page_write_ok && let Some(after_response) = after_response {
@@ -365,7 +370,42 @@ async fn finalize_response_inner(
         // mint a browser cookie with no backing identity-graph row.
         log::info!("Skipping generated EC response write because KV graph is unavailable");
     }
+    if settings.ec.sliding_refresh && page_write_allows_renewal {
+        renew_returning_cookie(settings, ec_context, response);
+    }
     navigation
+}
+
+/// Reissues a held cookie without record I/O after the existing document/write gates.
+fn renew_returning_cookie(
+    settings: &Settings,
+    context: &EcContext,
+    response: &mut Response<EdgeBody>,
+) {
+    if !context.sliding_document
+        || context.ec_generated()
+        || ec_consent_withdrawn(context.consent())
+    {
+        return;
+    }
+    let Some(ec_id) = context
+        .existing_cookie_ec_id()
+        .filter(|id| Some(*id) == context.ec_value() && is_valid_ec_id(id))
+    else {
+        return;
+    };
+    let state_allows_renewal = match context.kv_snapshot() {
+        EcKvSnapshot::NotRead => true,
+        EcKvSnapshot::Present {
+            ec_id: stored_id,
+            entry,
+            ..
+        } => stored_id == ec_id && entry.consent.ok,
+        EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => false,
+    };
+    if state_allows_renewal {
+        set_ec_cookie(settings, response, ec_id);
+    }
 }
 
 /// Shared inputs for the navigation's single write.
