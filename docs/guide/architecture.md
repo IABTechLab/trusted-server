@@ -45,29 +45,31 @@ Fastly Compute adapter (WASM binary, `wasm32-wasip1` target):
 
 ### trusted-server-adapter-axum
 
-Native Axum dev/test adapter (native binary):
+Native Axum adapter (native binary):
 
-- Local development and integration-test adapter — not a production-equivalent runtime
-- Platform implementations backed by environment variables instead of Fastly stores
+- Production entry point and local development server. Edge Cookie record
+  storage is not available on Axum yet
+- Config and secrets are read once at startup from EdgeZero-prepared stores
+  (local files, or AWS AppConfig and Secrets Manager) into read-only snapshots
 - Listens on `http://localhost:8787` by default
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                                    | Axum dev server                                                                                                                                                                                  |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                                                                                 |
-| Geo lookup                                 | Always returns `None`                                                                                                                                                                            |
-| Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                                                                         |
-| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
-| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                              |
-| Startup failure                            | The process exits non-zero before it listens                                                                                                                                                     |
+| Feature                                    | Axum                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KV store                                   | Unsupported (`KvError::Unavailable`) until #1587 → #1574 wire EdgeZero-declared storage                                                                                                                                                                                                                                                                                                                                                                                       |
+| Geo lookup                                 | Always returns `None`                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback                                                                                                                                                                                                                                                                              |
+| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                                                                                                                                                                                                                                                                                                           |
+| Startup failure                            | A store-read, settings or application-state failure in the initializer keeps the process listening with the failure router: GET/HEAD `/health` answers `200`, and `/ready` and every supported route answer `503`. A failure before that router is installed still exits non-zero before listening, including EdgeZero provider preparation (such as a missing local config file), invalid config extraction limits, the hosting or Geo profile, ingress limits, and the bind |
 
 ### trusted-server-adapter-spin
 
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
+- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_runtime_kv` label
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning
@@ -140,16 +142,17 @@ Data collection operations are subject to available consent signals (TCF v2 form
 
 ### Fastly KV Store
 
-Used for:
-
-- Counter storage
-- Domain mappings
-- Configuration cache
-- EC ID state
+Edge Cookie records use the configured `ec.ec_store` KV Store
+(`ec_identity_store` by default). The separate `trusted_server_runtime_kv` store is
+wired for generic runtime KV, with no normal production consumer yet.
+Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
+and batch-sync counters use Edge Rate Limiting counters rather than KV.
 
 ### Data Persistence
 
-Page content and request bodies are processed in-flight and are not persisted. EC ID state and related metadata are stored in KV stores as configured.
+Request bodies are processed in-flight. EC state and related metadata use the
+configured identity KV Store. When shared-template caching is enabled, Fastly
+Core Cache can retain transformed HTML templates; this is separate from KV.
 
 ## Performance Characteristics
 
@@ -167,12 +170,12 @@ Page content and request bodies are processed in-flight and are not persisted. E
 
 ## Runtime Targets
 
-| Adapter                             | Target                    | Use case                                                          |
-| ----------------------------------- | ------------------------- | ----------------------------------------------------------------- |
-| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                      |
-| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                  |
-| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                        |
-| `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
+| Adapter                             | Target                    | Use case                                                         |
+| ----------------------------------- | ------------------------- | ---------------------------------------------------------------- |
+| `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                     |
+| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Cloudflare Workers (development support; see adapter guide)      |
+| `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                       |
+| `trusted-server-adapter-axum`       | native                    | Production startup and local development (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
 

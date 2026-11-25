@@ -15,6 +15,7 @@ use frameworks::{FRAMEWORKS, FrontendFramework};
 use reqwest::header::CONTENT_TYPE;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::panic::catch_unwind;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
@@ -2055,6 +2056,172 @@ fn with_spin_ingress(status: u16, check: impl FnOnce(&str, &RecordingOrigin)) {
     OriginRuntime::Spin.serve(&envelope, |base_url| check(base_url, &origin));
 }
 
+/// Spin serves request-time config, including request-signing metadata, from
+/// the `default` label startup reads. Before that wiring, discovery answered
+/// 500 because every request-time config read failed.
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_discovery_reads_signing_metadata_from_default() {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "example-kid-a",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw",
+    })
+    .to_string();
+    let default_entries = [
+        ("current-kid", "example-kid-a"),
+        ("active-kids", "example-kid-a"),
+        ("example-kid-a", jwk.as_str()),
+    ];
+
+    common::trace_boundary::with_spin_runtime(
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        &default_entries,
+        &[],
+        |base_url| {
+            let response =
+                reqwest::blocking::get(format!("{base_url}/.well-known/trusted-server.json"))
+                    .expect("should request the discovery document");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "Spin discovery should read signing metadata from `default`"
+            );
+            let document: serde_json::Value = response
+                .json()
+                .expect("should return a JSON discovery document");
+            assert_eq!(
+                document["jwks"]["keys"][0]["kid"],
+                serde_json::json!("example-kid-a"),
+                "discovery should publish the active key seeded in `default`: {document}"
+            );
+        },
+    );
+}
+
+/// Spin signs an outbound auction request at request time: the signing
+/// metadata comes from the `default` label and the private key from its
+/// encoded component variable. The key pair is the public development fixture
+/// that `fastly.toml` also uses.
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_signs_auction_requests_with_an_encoded_private_key() {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let bidder = start_loopback_bidder("signed-seat", 1.0, Duration::ZERO);
+    let envelope = common::config::auction_app_config_envelope(
+        origin_port(),
+        &loopback_bidder_fixtures(&[("signed-bidder", &bidder, Duration::from_millis(800))]),
+        1000,
+    )
+    .expect("should build the auction config");
+    let envelope = common::config::envelope_with_request_signing(&envelope)
+        .expect("should enable request signing");
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "ts-2025-10-A",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw",
+    })
+    .to_string();
+    let default_entries = [
+        ("current-kid", "ts-2025-10-A"),
+        ("active-kids", "ts-2025-10-A"),
+        ("ts-2025-10-A", jwk.as_str()),
+    ];
+    // Store `signing_keys` and key `ts-2025-10-A`, encoded as Spin requires.
+    let private_key = [(
+        "v_signing_x5fkeys_v_ts_x2d2025_x2d10_x2d_x41",
+        "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k=",
+    )];
+
+    common::trace_boundary::with_spin_runtime(
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        &default_entries,
+        &private_key,
+        |base_url| {
+            let response = post_auction(base_url);
+            let requests = bidder.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "the bidder should receive one auction request: {response}"
+            );
+            let request = requests.first().expect("should record the bidder request");
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("should send an OpenRTB JSON request");
+            let trusted_server = &body["ext"]["trusted_server"];
+            assert_eq!(
+                trusted_server["kid"],
+                serde_json::json!("ts-2025-10-A"),
+                "Spin should sign with the current kid from `default`: {body}"
+            );
+            assert!(
+                trusted_server["signature"]
+                    .as_str()
+                    .is_some_and(|signature| !signature.is_empty()),
+                "Spin should sign with the private key variable: {body}"
+            );
+            let params = trusted_server_core::request_signing::SigningParams {
+                request_id: body["id"]
+                    .as_str()
+                    .expect("should send request id")
+                    .to_owned(),
+                request_host: trusted_server["request_host"]
+                    .as_str()
+                    .expect("should bind request host")
+                    .to_owned(),
+                request_scheme: trusted_server["request_scheme"]
+                    .as_str()
+                    .expect("should bind request scheme")
+                    .to_owned(),
+                timestamp: trusted_server["ts"]
+                    .as_u64()
+                    .expect("should bind timestamp"),
+            };
+            let payload = params
+                .build_payload("ts-2025-10-A")
+                .expect("should reconstruct the signed payload");
+            let client = reqwest::blocking::Client::new();
+            for (payload, expected) in [(payload.as_str(), true), ("tampered-payload", false)] {
+                let response = client
+                    .post(format!("{base_url}/verify-signature"))
+                    .json(&serde_json::json!({
+                        "kid": "ts-2025-10-A",
+                        "payload": payload,
+                        "signature": trusted_server["signature"],
+                    }))
+                    .send()
+                    .expect("should verify the captured auction signature");
+                assert_eq!(
+                    response.status().as_u16(),
+                    200,
+                    "should answer verification"
+                );
+                let verified: serde_json::Value = response
+                    .json()
+                    .expect("should decode signature verification");
+                assert_eq!(
+                    verified["verified"],
+                    serde_json::json!(expected),
+                    "should verify only the authentic payload against the JWK in default"
+                );
+            }
+        },
+    );
+}
+
 #[test]
 #[ignore = "requires Spin and the current production Spin WASM artifact"]
 fn spin_runtime_post_auction_with_json_body() {
@@ -3300,12 +3467,39 @@ const SLOW_PAGE_STREAM: Duration = Duration::from_secs(35);
 /// Marker the slow publisher page ends with.
 const SLOW_PAGE_END: &str = "<p>example slow page end</p>";
 
+/// Owns the slow origin's listener and worker through successful or failed tests.
+struct SlowStreamingOrigin {
+    listener: TcpListener,
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for SlowStreamingOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        // Keep the listener alive until the wakeup has released a blocked accept.
+        if let Ok(address) = self.listener.local_addr() {
+            let _ = TcpStream::connect(address);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Serves one chunked HTML page on `listener` whose body takes [`SLOW_PAGE_STREAM`] to arrive.
-fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let Ok((mut stream, _addr)) = listener.accept() else {
+fn serve_slow_streaming_page(listener: TcpListener) -> SlowStreamingOrigin {
+    let worker_listener = listener
+        .try_clone()
+        .expect("should share the owned listener");
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        let Ok((mut stream, _addr)) = worker_listener.accept() else {
             return;
         };
+        if !matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            return;
+        }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let Some(_request) = read_origin_request(&mut stream) else {
             return;
@@ -3324,7 +3518,12 @@ fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
         }
         let started = std::time::Instant::now();
         while started.elapsed() < SLOW_PAGE_STREAM {
-            thread::sleep(Duration::from_secs(1));
+            if !matches!(
+                shutdown_rx.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                return;
+            }
             if write_chunk(&mut stream, "<p>example slow chunk</p>").is_err() {
                 return;
             }
@@ -3332,7 +3531,30 @@ fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
         let _ = write_chunk(&mut stream, &format!("{SLOW_PAGE_END}</body></html>"))
             .and_then(|()| stream.write_all(b"0\r\n\r\n"))
             .and_then(|()| stream.flush());
-    })
+    });
+    SlowStreamingOrigin {
+        listener,
+        shutdown_tx,
+        handle: Some(handle),
+    }
+}
+
+#[test]
+fn slow_streaming_origin_releases_port_when_test_unwinds_before_request() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind an isolated origin");
+    let address = listener
+        .local_addr()
+        .expect("should read the origin address");
+    let result = catch_unwind(|| {
+        let _origin = serve_slow_streaming_page(listener);
+        panic!("simulate a failed response assertion before origin receives a request");
+    });
+    assert!(
+        result.is_err(),
+        "should exercise the failed-test unwind path"
+    );
+    let _listener = TcpListener::bind(address)
+        .expect("should release the origin listener before the next test starts");
 }
 
 #[test]
@@ -3369,5 +3591,5 @@ fn publisher_page_streaming_35_seconds_completes() {
         "should deliver the page past EdgeZero's 30 s default write deadline"
     );
     drop(process);
-    let _ = origin.join();
+    drop(origin);
 }

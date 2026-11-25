@@ -1921,6 +1921,59 @@ mod trace_parity {
     }
 
     #[tokio::test]
+    async fn operational_probes_do_not_poll_runtime_services() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (adapters, outbound) = routers(true, None, Arc::clone(&calls));
+        for (adapter, router) in adapters {
+            let before = calls.load(Ordering::SeqCst);
+            for method in ["GET", "HEAD"] {
+                for path in ["/health", "/ready"] {
+                    let response = RouterService::oneshot(
+                        &router,
+                        request_builder()
+                            .method(method)
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build operational request"),
+                    )
+                    .await
+                    .expect("should serve operational request");
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{adapter} should stay ready with unusable request-time services"
+                    );
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "{adapter} probes should skip geo and other forbidden services"
+            );
+            outbound.assert_no_requests();
+            let response = RouterService::oneshot(
+                &router,
+                request_builder()
+                    .uri("/_ts/trace")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build service control"),
+            )
+            .await
+            .expect("should serve trace control");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should serve the positive wiring control"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before + 1,
+                "should prove injected services reached the adapter"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn trace_dispatch_parity_missing_client_ip_skips_geo() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (adapters, outbound) = routers_with_client(true, None, Arc::clone(&calls), None);
@@ -2750,5 +2803,474 @@ mod trace_parity {
 
     fn futures_trace_empty_stream() -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
         futures::stream::iter([Ok(Bytes::new()), Ok(Bytes::new())])
+    }
+}
+
+#[tokio::test]
+async fn operational_probes_bypass_auth_and_response_overrides() {
+    let mut value = serde_json::to_value(test_settings()).expect("should serialize settings");
+    value["handlers"][0]["path"] = serde_json::json!("^/");
+    let mut settings =
+        Settings::from_json_value(value).expect("should build catch-all auth settings");
+    for (name, value) in [
+        ("Cache-Control", "public, max-age=3600"),
+        ("Content-Type", "application/json"),
+        ("Set-Cookie", "fictional=value"),
+        ("WWW-Authenticate", "Basic realm=fictional"),
+    ] {
+        settings
+            .response_headers
+            .insert(name.to_string(), value.to_string());
+    }
+    for router in [
+        AxumApp::routes_with_settings(settings.clone()).expect("should build Axum router"),
+        CloudflareApp::routes_with_settings(settings.clone()).expect("should build Worker router"),
+        SpinApp::routes_with_settings(settings.clone()).expect("should build Spin router"),
+    ] {
+        for method in ["GET", "HEAD"] {
+            for (path, expected) in [("/health?probe=1", "ok"), ("/ready?probe=1", "ready")] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        request_builder()
+                            .method(method)
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build probe request"),
+                    )
+                    .await
+                    .expect("should serve probe");
+                assert_eq!(
+                    response.status().as_u16(),
+                    200,
+                    "should serve anonymous {method} {path}"
+                );
+                assert_eq!(
+                    response.headers()["cache-control"],
+                    "no-store",
+                    "should prevent probe caching"
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "text/plain",
+                    "should preserve probe content type"
+                );
+                for header in ["set-cookie", "www-authenticate"] {
+                    assert!(
+                        !response.headers().contains_key(header),
+                        "should omit {header}"
+                    );
+                }
+                let body = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read probe body");
+                assert_eq!(
+                    body.as_ref(),
+                    if method == "HEAD" {
+                        b""
+                    } else {
+                        expected.as_bytes()
+                    },
+                    "should serve exact probe bytes"
+                );
+            }
+        }
+        for path in ["/protected", "/health/", "/ready/", "/health/nested"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    request_builder()
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build protected request"),
+                )
+                .await
+                .expect("should serve protected route");
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "should preserve ordinary authentication on {path}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_disclosure_parity {
+    use edgezero_core::outbound::OutboundCachePolicy;
+    use http::{StatusCode, header};
+    use trusted_server_core::http_util::compute_encrypted_sha256_token;
+    use trusted_server_core::proxy_policy::ProxyIdentityEndpoint;
+    use trusted_server_core::test_support::scripted_client::RecordedRequest;
+
+    use super::*;
+
+    /// The creative origin's answer for each path, as a dynamic origin would give it.
+    fn policy_reply(path: &str) -> ScriptedReply {
+        if path == "/transport-error" {
+            return ScriptedReply::error(EdgeError::bad_gateway("example transport failure"));
+        }
+        let reply = |status| {
+            ScriptedReply::status(status)
+                .header("cache-control", "public, max-age=300")
+                .header("etag", "origin-validator")
+                .header("set-cookie", "origin_state=forbidden")
+                .header("access-control-allow-origin", "*")
+        };
+        let found = |location: &str| reply(StatusCode::FOUND).header("location", location);
+        match path {
+            "/events/error-chain" => found("https://cdn.example.com/transport-error"),
+            "/events/malformed" => reply(StatusCode::OK)
+                .header("content-type", "text/html")
+                .header("content-encoding", "gzip"),
+            "/events/first" => found("https://measurement.example.com/events/second?ts-ec=old"),
+            "/ambiguous" => {
+                found("https://measurement.example.com/%2e/events/impression.gif?ts-ec=old")
+            }
+            "/start" => found("https://measurement.example.com/events/impression.gif"),
+            "/loop" => found("https://cdn.example.com/loop?ts-ec=echoed"),
+            _ => reply(StatusCode::OK),
+        }
+        .body("origin-body")
+    }
+
+    /// A scripted creative origin that answers every request by its path.
+    ///
+    /// Each request queues its own reply as the script records it, so the
+    /// record holds every hop's URI, cache policy, and headers.
+    fn policy_origin() -> (ScriptedHttpClient, TestClock) {
+        let clock = TestClock::new();
+        let script = ScriptedHttpClient::new(&clock);
+        let rearm = script.clone();
+        let origin = script.with_request_observer(move |request| {
+            rearm.respond_to(
+                request.method.clone(),
+                &request.uri.to_string(),
+                policy_reply(request.uri.path()),
+            );
+        });
+        (origin, clock)
+    }
+
+    fn last_hop(origin: &ScriptedHttpClient) -> RecordedRequest {
+        origin
+            .requests()
+            .pop()
+            .expect("should reach actual origin transport")
+    }
+
+    fn settings() -> Settings {
+        let mut settings = test_settings();
+        settings.proxy.identity_endpoints = vec![ProxyIdentityEndpoint {
+            id: "impression".to_owned(),
+            origin: "https://measurement.example.com".to_owned(),
+            path_exact: Some("/events/impression.gif".to_owned()),
+            path_prefix: None,
+        }];
+        settings
+            .proxy
+            .identity_endpoints
+            .push(ProxyIdentityEndpoint {
+                id: "event-family".to_owned(),
+                origin: "https://measurement.example.com".to_owned(),
+                path_exact: None,
+                path_prefix: Some("/events/".to_owned()),
+            });
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        settings
+    }
+
+    fn signed(settings: &Settings, target: &str) -> String {
+        let token = compute_encrypted_sha256_token(settings, target);
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("tsurl", target)
+            .append_pair("tstoken", &token)
+            .finish();
+        format!("https://test-publisher.example.com/first-party/proxy?{query}")
+    }
+
+    fn routers(
+        settings: &Settings,
+        (origin, clock): &(ScriptedHttpClient, TestClock),
+    ) -> Vec<(&'static str, RouterService)> {
+        let services = nextjs_auction::services_with_outbound_client(origin, clock);
+        vec![
+            (
+                "Axum",
+                AxumApp::routes_with_settings_and_services(settings.clone(), services.clone())
+                    .expect("should build Axum policy routes"),
+            ),
+            (
+                "Cloudflare",
+                CloudflareApp::routes_with_settings_and_services(
+                    settings.clone(),
+                    services.clone(),
+                )
+                .expect("should build Cloudflare policy routes"),
+            ),
+            (
+                "Spin",
+                SpinApp::routes_with_settings_and_services(settings.clone(), services)
+                    .expect("should build Spin policy routes"),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_routes_deliver_authorized_identity_and_reassert_terminal_privacy() {
+        let settings = settings();
+        let origin = policy_origin();
+        let endpoint = "https://measurement.example.com/events/impression.gif";
+        for (adapter, router) in routers(&settings, &origin) {
+            for (prefix, gpc) in [("a", false), ("b", false), ("c", true)] {
+                let identity = format!("{}.Ab1234", prefix.repeat(64));
+                assert!(
+                    trusted_server_core::ec::is_valid_ec_id(&identity),
+                    "should use a canonical reader cookie"
+                );
+                let mut request = request_builder()
+                    .method("GET")
+                    .uri(signed(&settings, endpoint))
+                    .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                    .header(header::USER_AGENT, "ExampleBrowser/1.0")
+                    .header(header::REFERER, "https://publisher.example.com/private")
+                    .header("sec-gpc", if gpc { "1" } else { "0" })
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build actual policy request");
+                request.headers_mut().insert(
+                    "x-ts-ec",
+                    http::HeaderValue::from_static("untrusted-header"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should execute real named proxy route");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should deliver event even without authorized EC"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should set private cache policy"),
+                    "no-store, private",
+                    "{adapter} should retain privacy after operator headers"
+                );
+                for name in [
+                    header::ETAG,
+                    header::SET_COOKIE,
+                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                ] {
+                    assert!(
+                        !response.headers().contains_key(name),
+                        "{adapter} should strip origin authority and late validators"
+                    );
+                }
+                let hop = last_hop(&origin.0);
+                let expected = if gpc {
+                    endpoint.to_owned()
+                } else {
+                    format!("{endpoint}?ts-ec={identity}")
+                };
+                assert_eq!(
+                    hop.uri.to_string(),
+                    expected,
+                    "{adapter} should use canonical request-specific disclosure"
+                );
+                assert_eq!(
+                    hop.cache_policy,
+                    OutboundCachePolicy::Bypass,
+                    "{adapter} should bypass cache even without EC"
+                );
+                assert!(
+                    !hop.headers.contains_key(header::REFERER),
+                    "{adapter} should withhold page context"
+                );
+                assert_eq!(
+                    hop.headers
+                        .get(header::USER_AGENT)
+                        .expect("should set fixed UA"),
+                    "TrustedServer/1.0"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_routes_apply_later_hop_policy_and_private_errors() {
+        let settings = settings();
+        let origin = policy_origin();
+        for (adapter, router) in routers(&settings, &origin) {
+            let identity = format!("{}.Ab1234", "a".repeat(64));
+            let request = request_builder()
+                .uri(signed(&settings, "https://cdn.example.com/start"))
+                .header(header::COOKIE, format!("ts-ec={identity}; us_privacy=1YNN"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build redirect request");
+            let response = RouterService::oneshot(&router, request)
+                .await
+                .expect("should route redirected event");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{adapter} should follow authorized redirect"
+            );
+            {
+                let last = last_hop(&origin.0);
+                assert_eq!(
+                    last.uri.to_string(),
+                    format!(
+                        "https://measurement.example.com/events/impression.gif?ts-ec={identity}"
+                    ),
+                    "{adapter} should classify the later hop"
+                );
+            }
+            for href in [signed(&settings, "https://cdn.example.com/loop"), "https://test-publisher.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com&token=invalid".to_owned()] {
+                let request = request_builder().uri(href).body(edgezero_core::body::Body::empty()).expect("should build terminal request");
+                let response = RouterService::oneshot(&router, request).await.expect("should finalize proxy error");
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{adapter} should reject terminal redirects and bad signatures");
+                assert!(!response.headers().contains_key(header::LOCATION), "{adapter} should not expose terminal Location");
+                assert_eq!(response.headers().get(header::CACHE_CONTROL).expect("should mark error private"), "no-store, private", "{adapter} should protect error after middleware");
+                assert!(!response.headers().contains_key(header::ETAG), "{adapter} should not restore error validators");
+            }
+        }
+    }
+    fn reader_request(
+        settings: &Settings,
+        target: &str,
+    ) -> http::Request<edgezero_core::body::Body> {
+        request_builder()
+            .uri(signed(settings, target))
+            .header(
+                header::COOKIE,
+                format!("ts-ec={}.Ab1234; us_privacy=1YNN", "a".repeat(64)),
+            )
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build canonical reader request")
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_event_failures_remain_private_through_adapter_finalization() {
+        let settings = settings();
+        let origin = policy_origin();
+        for (adapter, router) in routers(&settings, &origin) {
+            for path in ["error-chain", "malformed"] {
+                let response = RouterService::oneshot(
+                    &router,
+                    reader_request(
+                        &settings,
+                        &format!("https://measurement.example.com/events/{path}"),
+                    ),
+                )
+                .await
+                .expect("should convert event failure at the real adapter boundary");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "{adapter} should preserve event failure status for {path}"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should retain event error privacy"),
+                    "no-store, private"
+                );
+                assert!(
+                    !response.headers().contains_key(header::ETAG),
+                    "{adapter} should remove late error validators"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_event_redirects_and_ambiguous_paths_keep_cache_safety() {
+        let settings = settings();
+        let origin = policy_origin();
+        for (adapter, router) in routers(&settings, &origin) {
+            for target in [
+                "https://measurement.example.com/events/first",
+                "https://cdn.example.com/ambiguous",
+            ] {
+                let response = RouterService::oneshot(&router, reader_request(&settings, target))
+                    .await
+                    .expect("should dispatch redirect chain");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should deliver the resolved event"
+                );
+                let last = last_hop(&origin.0);
+                if target.contains("ambiguous") {
+                    assert_eq!(
+                        last.uri.to_string(),
+                        "https://measurement.example.com/events/impression.gif",
+                        "{adapter} should withhold identity from ambiguous raw Location"
+                    );
+                } else {
+                    assert_eq!(
+                        last.uri.to_string(),
+                        format!(
+                            "https://measurement.example.com/events/second?ts-ec={}.Ab1234",
+                            "a".repeat(64)
+                        ),
+                        "{adapter} should replace echoed identity for the next allowed event"
+                    );
+                }
+                assert_eq!(
+                    last.cache_policy,
+                    OutboundCachePolicy::Bypass,
+                    "{adapter} should keep known event dispatch uncached even when identity is withheld"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .expect("should retain event privacy"),
+                    "no-store, private"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_old_signed_url_obeys_removed_identity_rule() {
+        let mut settings = settings();
+        settings
+            .proxy
+            .prepare_runtime()
+            .expect("should compile the original live grant");
+        let target = "https://measurement.example.com/events/impression.gif";
+        let href = signed(&settings, target);
+        let mut revoked = settings.clone();
+        revoked.proxy.identity_endpoints.clear();
+        let origin = policy_origin();
+        for (adapter, router) in routers(&revoked, &origin) {
+            let request = request_builder()
+                .uri(&href)
+                .header(
+                    header::COOKIE,
+                    format!("ts-ec={}.Ab1234; us_privacy=1YNN", "a".repeat(64)),
+                )
+                .body(edgezero_core::body::Body::empty())
+                .expect("should reuse the already signed URL");
+            let response = RouterService::oneshot(&router, request)
+                .await
+                .expect("should evaluate current policy for an old token");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                last_hop(&origin.0).uri.to_string(),
+                target,
+                "{adapter} should not retain a stale compiled grant"
+            );
+        }
     }
 }
