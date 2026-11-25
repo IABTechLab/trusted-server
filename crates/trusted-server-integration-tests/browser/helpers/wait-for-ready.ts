@@ -1,5 +1,5 @@
 /**
- * Poll a URL until it returns a successful response.
+ * Poll a URL until it returns HTTP 200 without a redirect.
  *
  * Uses the same timing as the Rust readiness polling: 30 attempts with
  * 500ms intervals.
@@ -16,8 +16,8 @@ export async function waitForReady(
 
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const resp = await fetch(url);
-      if (resp.ok) return;
+      const resp = await fetch(url, { redirect: "manual" });
+      if (resp.status === 200) return;
     } catch {
       // Connection refused — server not ready yet
     }

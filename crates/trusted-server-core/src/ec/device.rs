@@ -16,6 +16,11 @@
 //!   browser pattern; `None` for unknown. Analytics only.
 //! - **`ja4_contradiction`** — `true` when a trusted JA4's TLS client family
 //!   contradicts the User-Agent's browser family (ID-7); never stored
+//!
+//! Under the default `lenient` browser gate only a known non-browser or a
+//! trusted JA4 contradiction refuses identity creation and record writes;
+//! missing or unknown signals never do. The `strict` gate also refuses a
+//! request without both `ja4_class` and `platform_class`.
 
 use sha2::{Digest as _, Sha256};
 

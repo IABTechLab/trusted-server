@@ -76,9 +76,13 @@
 //!
 //! [`assemble_app`] and [`Hooks::routes`] return a settings or state failure
 //! as the [`EdgeError`] from [`startup_error`], and [`App::from_router`]
-//! returns a `configure` failure. The entry point answers either with
-//! `EdgeZero`'s assembly-error response, which carries no TS headers, and
-//! retains nothing, so the next request retries.
+//! returns a `configure` failure. The entry point retains nothing, so the next
+//! request retries. Whatever the error's status, it answers `GET` and `HEAD`
+//! `/ready` and every publisher fallback method with the fixed unavailable
+//! response from [`trusted_server_core::health`]; other methods get
+//! `EdgeZero`'s assembly-error response. Neither carries runtime or geo
+//! headers, and only the fixed response carries the compiled TS version.
+//! Liveness answers before assembly, so it stays `200`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -96,7 +100,7 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::plan::validate_fastly_backend_bound;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
@@ -105,10 +109,12 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::ENV_FASTLY_SERVICE_VERSION;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+pub(crate) use trusted_server_core::ec::app::AfterResponseLookups;
 #[cfg(test)]
 use trusted_server_core::ec::app::joined_cookie_header;
-pub(crate) use trusted_server_core::ec::app::{AfterResponseLookups, IdentityLookups};
-use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
+use trusted_server_core::ec::app::{
+    IdentityApp, IdentityPlatform, IdentityProviders, PageIdentityDispatch,
+};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
@@ -118,13 +124,14 @@ use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::health::{ProbePreDispatchHook, StartupState};
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, KvHandleStore, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -213,7 +220,7 @@ pub(crate) fn load_settings_from_config_store(
 }
 
 pub(crate) fn build_state_from_settings(
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     if let Some(selection) = settings
         .ec
@@ -230,6 +237,7 @@ pub(crate) fn build_state_from_settings(
             }));
         }
     }
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
     // Each request's synthesized set leaves these entries out at debug, so
@@ -384,7 +392,7 @@ fn build_per_request_services(
         .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
             outbound_client.clone(),
         )))
-        .kv_store(Arc::clone(&state.default_kv_store))
+        .kv_store(request_kv_store(state, ctx))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
@@ -397,7 +405,30 @@ fn build_per_request_services(
         .build())
 }
 
-fn publisher_fallback_methods() -> [Method; 7] {
+/// Logical ID of the generic runtime KV store.
+///
+/// It is distinct from `trusted_server_kv`, which is reserved for identity
+/// records, so generic KV writes never land in the identity store.
+pub(crate) const RUNTIME_KV_STORE_ID: &str = "trusted_server_runtime_kv";
+
+/// Returns the generic runtime KV store for one request.
+///
+/// `EdgeZero` registers the store [`TrustedServerApp::stores`] declares
+/// ([`RUNTIME_KV_STORE_ID`]) in every production request and opens the linked
+/// Fastly KV store on first use. The store is looked up by its ID, not as the
+/// registry default, so declaring another KV store cannot redirect it. A service without that store linked answers
+/// each KV operation with `KvError::OpenFailed`, and routes that do not use KV
+/// are unaffected. A request without a registry, which only test contexts
+/// build, uses [`AppState::default_kv_store`].
+fn request_kv_store(state: &AppState, ctx: &RequestContext) -> Arc<dyn PlatformKvStore> {
+    ctx.kv_store(RUNTIME_KV_STORE_ID).map_or_else(
+        || Arc::clone(&state.default_kv_store),
+        |handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>,
+    )
+}
+
+/// Returns the methods supported by publisher fallback and startup responses.
+pub(super) fn publisher_fallback_methods() -> [Method; 7] {
     [
         Method::GET,
         Method::POST,
@@ -451,15 +482,15 @@ fn prepare_after_response_lookups(
     )
 }
 
-async fn dispatch_identity_lookups(
+async fn prepare_identity_lookups(
     state: &AppState,
     services: &RuntimeServices,
     req: &Request,
     ec: &mut EcRequestState,
-) -> Option<IdentityLookups> {
+) -> Option<PageIdentityDispatch> {
     state
         .identity
-        .dispatch_identity_lookups(services, req, &mut ec.ec_context, ec.kv_graph.as_ref())
+        .prepare_identity_lookups(services, req, &mut ec.ec_context, ec.kv_graph.as_ref())
         .await
 }
 
@@ -515,10 +546,11 @@ fn build_ec_request_state(
     match identity.read_request(services, req) {
         Ok(request) => {
             let geo_info = request.context.geo_info().cloned();
+            let use_finalize_kv = request.store_writes_allowed();
             EcRequestState {
                 ec_context: request.context,
                 kv_graph: request.graph,
-                use_finalize_kv: true,
+                use_finalize_kv,
                 eids_cookie: request.eids_cookie,
                 sharedid: request.sharedid,
                 after_response: None,
@@ -716,11 +748,16 @@ async fn run_named_route(
             } else {
                 Some(partner_registry)
             };
+            // A refused client keeps the record service, so bidders still
+            // receive only an EC with a consented row, but never writes.
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                ec.kv_graph.as_ref().filter(|_| ec.is_real_browser),
-                registry_ref,
+                AuctionIdentity {
+                    graph: ec.kv_graph.as_ref(),
+                    registry: registry_ref,
+                    persist_body: ec.is_real_browser,
+                },
                 &mut ec.ec_context,
                 services,
                 req,
@@ -757,7 +794,7 @@ async fn run_named_route(
             .await
         }
         NamedRouteHandler::FirstPartyProxy => {
-            handle_first_party_proxy(&state.settings, services, req).await
+            handle_first_party_proxy(&state.settings, services, &ec.ec_context, req).await
         }
         NamedRouteHandler::FirstPartyClick => {
             handle_first_party_click(&state.settings, services, req).await
@@ -872,12 +909,15 @@ async fn dispatch_fallback(
             .await;
         let is_publisher_navigation = ec.is_real_browser && ec.ec_context.has_navigation_permit();
 
-        // Identity lookups start before the origin fetch so they overlap it;
+        // Identity lookups run beside the origin fetch, joined with it below;
         // they are collected once the response status is known, before EC
-        // finalization.
-        if is_publisher_navigation {
-            page_lookups = dispatch_identity_lookups(state, services, &req, &mut ec).await;
-        }
+        // finalization. A hashed-email status call (spec §8.7) precedes them
+        // inside that join, so it never delays the origin fetch.
+        let page_identity = if is_publisher_navigation {
+            prepare_identity_lookups(state, services, &req, &mut ec).await
+        } else {
+            None
+        };
         // After-response providers only capture request signals here; they
         // are built and dispatched once the response has been sent.
         if is_publisher_navigation {
@@ -897,7 +937,13 @@ async fn dispatch_fallback(
             slots,
             registry: Some(state.identity.partners().as_ref()),
         };
-        match handle_publisher_request(
+        let start_identity = async {
+            match page_identity {
+                Some(dispatch) => Some(dispatch.start(&state.identity, services).await),
+                None => None,
+            }
+        };
+        let origin = handle_publisher_request(
             &state.settings,
             services,
             ec.kv_graph.as_ref(),
@@ -909,9 +955,10 @@ async fn dispatch_fallback(
                 input_cap: None,
                 response_decoding: ResponseDecoding::Original,
             },
-        )
-        .await
-        {
+        );
+        let (dispatched, origin) = futures::future::join(start_identity, origin).await;
+        page_lookups = dispatched;
+        match origin {
             Ok((pub_response, owner)) => {
                 // Origin start succeeded on the sole publisher-page
                 // path. Authorize orphan recovery only for real-browser
@@ -1300,10 +1347,13 @@ impl TrustedServerApp {
 
     fn router_for_state(state: &Arc<AppState>) -> RouterBuilder {
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(trace_metadata),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(trace_metadata),
+                ))),
+            ))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1413,8 +1463,8 @@ impl Hooks for TrustedServerApp {
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
             kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
+                default: RUNTIME_KV_STORE_ID,
+                ids: &[RUNTIME_KV_STORE_ID, "trusted_server_kv"],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1468,6 +1518,7 @@ mod tests {
     #[cfg(test)]
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::ec::eid_types::SourceDomain;
+    use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::provider::{
         CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
         ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
@@ -1732,6 +1783,81 @@ mod tests {
         assert!(
             !services.outbound_client().proxy_marker_enabled(),
             "should turn the proxy marker off on the context client"
+        );
+    }
+
+    /// Builds a context whose `KvRegistry` holds the Fastly KV store linked
+    /// under the id [`TrustedServerApp::stores`] declares, as `EdgeZero`'s
+    /// dispatch registers it for a production request.
+    fn context_with_declared_kv_store(request: edgezero_core::http::Request) -> RequestContext {
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+        let store = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+            .expect("should open the KV store fastly.toml links under the declared id");
+        let registry = edgezero_core::store_registry::KvRegistry::new(
+            std::collections::BTreeMap::from([(
+                declared.default.to_owned(),
+                edgezero_core::key_value_store::KvHandle::new(Arc::new(store)),
+            )]),
+            declared.default.to_owned(),
+        );
+        let mut request = request;
+        request.extensions_mut().insert(registry);
+        context_with_client(
+            request,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        )
+    }
+
+    #[test]
+    fn per_request_services_write_through_to_the_declared_kv_store() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_declared_kv_store(empty_request(Method::GET, "/article"));
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.kv_store().put_bytes(
+            "per-request-services-write-through",
+            Bytes::from_static(b"example-value"),
+        ))
+        .expect("should write through the request's KV store");
+
+        let independent =
+            edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+                .expect("should reopen the linked KV store");
+        assert_eq!(
+            block_on(PlatformKvStore::get_bytes(
+                &independent,
+                "per-request-services-write-through"
+            ))
+            .expect("should read the linked KV store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should persist the write in the store linked under `trusted_server_runtime_kv`"
+        );
+    }
+
+    #[test]
+    fn per_request_services_without_a_kv_registry_report_kv_unavailable() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        let result = block_on(services.kv_store().get_bytes("example-key"));
+
+        assert!(
+            matches!(
+                result,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should fall back to the unavailable KV store, got {result:?}"
         );
     }
 
@@ -2273,27 +2399,55 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_blob_gets_500_then_recovers_in_same_sandbox() {
+    fn missing_config_blob_fails_startup_then_recovers_in_same_sandbox() {
         let mut sandbox = crate::sandbox::Sandbox::default();
+        let assemble = || {
+            assemble_app(
+                load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+                &"",
+            )
+        };
 
-        // Request 1: the linked store has no app config blob.
-        let error = sandbox
-            .initialize(|| {
-                assemble_app(
-                    load_settings_from_config_store(&RuntimeStoreConfig::logical()),
-                    &"",
-                )
-            })
-            .expect_err("should fail assembly without an app config blob");
+        // Request 1: the linked store has no app config blob, and a publisher
+        // fallback method gets the fixed unavailable response.
+        let crate::ApplicationDispatch::Operational(response) =
+            crate::initialize_dispatch(&mut sandbox, &Method::GET, "/", assemble)
+        else {
+            panic!("should answer the failed startup locally");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should answer the fixed startup-failure status"
+        );
+        let body = block_on(response.into_body().into_bytes_bounded(4096))
+            .expect("should read the startup failure body");
+        assert_eq!(
+            body.as_ref(),
+            b"Service Unavailable\n",
+            "should disclose nothing about the failure"
+        );
         assert!(
             sandbox.state().is_none(),
             "should retain nothing after a failed assembly"
         );
-        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 1, "request-1");
+
+        // Request 2: still no blob. A method outside the publisher fallback
+        // set keeps `EdgeZero`'s assembly-error response.
+        let crate::ApplicationDispatch::Ordinary(Err(error)) =
+            crate::initialize_dispatch(&mut sandbox, &Method::TRACE, "/", assemble)
+        else {
+            panic!("should fail assembly without an app config blob");
+        };
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after a failed assembly"
+        );
+        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
         let clock = edgezero_core::time::MonotonicClock::default();
         let response = delivered_response(App::assembly_error_egress(
             error,
-            Method::GET,
+            Method::TRACE,
             clock.now(),
             clock,
         ));
@@ -2318,11 +2472,11 @@ mod tests {
             "should render EdgeZero's error body: {json}"
         );
 
-        // Request 2: the blob is restored.
+        // Request 3: the blob is restored.
         sandbox
             .initialize(|| assemble_app(Ok(test_settings()), &""))
             .expect("should assemble once the blob is restored");
-        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
+        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 3, "request-3");
 
         assert!(
             sandbox.state().is_some(),
@@ -3604,7 +3758,6 @@ mod tests {
             "bidstream_enabled": true
         }]))
         .expect("should configure an unowned body source");
-        settings.auction.enabled = false;
         let store = RecordingStore::new(false);
         let mut state = app_state_for_settings(settings);
         let mutable = Arc::get_mut(&mut state).expect("should own the app state");
@@ -3621,12 +3774,27 @@ mod tests {
             graph,
         };
 
-        for (suffix, known_browser) in [("bot001", false), ("web001", true)] {
+        // (EC suffix, known browser, seeded row, whether bidders get the EC)
+        let cases = [
+            ("bot001", false, Some(true), true),
+            ("bot002", false, None, false),
+            ("bot003", false, Some(false), false),
+            ("web001", true, Some(true), true),
+        ];
+        for (suffix, known_browser, row, forwarded) in cases {
             let ec_id = format!("{}.{suffix}", "b".repeat(64));
-            seed_live_row(&fixture.graph, &ec_id);
-            let before = block_on(fixture.graph.get(&ec_id))
-                .expect("should read the seeded row")
-                .expect("should retain the seeded row");
+            match row {
+                Some(true) => seed_live_row(&fixture.graph, &ec_id),
+                Some(false) => block_on(fixture.graph.create(
+                    &ec_id,
+                    &trusted_server_core::ec::kv_types::KvEntry::tombstone(
+                        trusted_server_core::ec::current_timestamp(),
+                    ),
+                ))
+                .expect("should seed a withdrawn row"),
+                None => {}
+            }
+            let before = block_on(fixture.graph.get(&ec_id)).expect("should read the seeded row");
             let writes_before = store.events().len();
             let mut request =
                 consented_request(empty_request(Method::POST, "/auction"), Some(&ec_id));
@@ -3669,25 +3837,38 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
-                "should return the no-bid auction response"
+                "should return the auction response"
+            );
+            // The auction decides `user.id` from the row snapshot it read, so a
+            // refused client must still have its row read and validated.
+            let snapshot = identity.ec_context.kv_snapshot();
+            assert!(
+                !matches!(snapshot, trusted_server_core::ec::EcKvSnapshot::NotRead),
+                "should validate {suffix}'s EC against its row"
+            );
+            assert_eq!(
+                snapshot
+                    .entry_for(&ec_id)
+                    .is_some_and(|entry| entry.consent.ok),
+                forwarded,
+                "should allow {suffix}'s EC as user.id only with a consented row"
             );
             assert_eq!(
                 store.events().len() - writes_before,
                 usize::from(known_browser),
                 "should persist body EIDs only for an allowed browser"
             );
-            let after = block_on(fixture.graph.get(&ec_id))
-                .expect("should inspect the finalized row")
-                .expect("should retain the existing row");
+            let after = block_on(fixture.graph.get(&ec_id)).expect("should inspect the row");
             if known_browser {
                 assert_eq!(
-                    after.0.ids["body.example.com"].uid, "body-uid",
+                    after.expect("should retain the existing row").0.ids["body.example.com"].uid,
+                    "body-uid",
                     "should prove the body reaches ingestion for an allowed browser"
                 );
             } else {
                 assert_eq!(
                     after, before,
-                    "should leave the bot's record and generation unchanged"
+                    "should leave {suffix}'s record and generation unchanged"
                 );
             }
         }
@@ -3705,7 +3886,6 @@ mod tests {
                 ec_state,
                 lookups,
                 &fixture.state.identity,
-                &fixture.state.settings,
                 &fixture.client.http_client(),
             ));
     }
@@ -4520,6 +4700,10 @@ mod tests {
                 .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped User-Agent and ingress JA4 must mark the request as a real browser"
         );
+        assert!(
+            finalize.use_finalize_kv,
+            "a browser must keep the KV-backed finalize path"
+        );
     }
 
     #[test]
@@ -4583,6 +4767,8 @@ mod tests {
                 .method(Method::GET)
                 .uri("https://www.example.com/article")
                 .header(header::COOKIE, format!("ts-ec={}.test01", "a".repeat(64)))
+                .header(header::REFERER, "https://www.example.com/")
+                .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
                 .body(Body::empty())
                 .expect("should build request");
             insert_browser_signals(&mut req);
@@ -4606,12 +4792,19 @@ mod tests {
         let bot = super::prepare_after_response_lookups(&state, &services, &req, &ec);
 
         assert!(
-            browser.is_some(),
-            "should prepare pull sync for a real browser"
-        );
-        assert!(
             bot.is_none(),
             "should never prepare pull sync for a client that fails the browser check"
+        );
+        let browser = browser.expect("should prepare pull sync for a real browser");
+        assert_eq!(
+            browser.referer.as_deref(),
+            Some("https://www.example.com/"),
+            "should capture the Referer for after-response providers"
+        );
+        assert_eq!(
+            browser.accept_language.as_deref(),
+            Some("en-US,en;q=0.9"),
+            "should capture the Accept-Language for after-response providers"
         );
     }
 
@@ -4664,6 +4857,43 @@ mod tests {
                 .is_some_and(DeviceSignals::looks_like_browser),
             "a request without a User-Agent or ingress JA4 should not look like a real browser"
         );
+    }
+
+    #[test]
+    fn identity_writes_are_refused_only_for_known_non_browsers() {
+        // Missing signals must never refuse identity writes; only trusted
+        // signals classifying a known non-browser do. A trusted Python JA4
+        // behind a Chrome User-Agent is one (ID-7).
+        let router = test_router();
+        let mut known_non_browser = empty_request(Method::GET, "/some-page");
+        known_non_browser.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(CHROME_USER_AGENT),
+        );
+        insert_ja4(
+            known_non_browser.extensions_mut(),
+            captured_ja4(PYTHON_JA4, Ja4Source::RuntimeTls),
+        );
+
+        for (label, request, writes) in [
+            (
+                "missing signals",
+                empty_request(Method::GET, "/some-page"),
+                true,
+            ),
+            ("a known non-browser", known_non_browser, false),
+        ] {
+            let response = route(&router, request);
+
+            let finalize = response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .expect("fallback response should carry EcFinalizeState");
+            assert_eq!(
+                finalize.use_finalize_kv, writes,
+                "should decide finalize writes for {label}"
+            );
+        }
     }
 
     #[test]
@@ -4740,6 +4970,130 @@ mod tests {
             observed.server_region.as_deref(),
             Some("US-East"),
             "filter should see the captured server region"
+        );
+    }
+
+    #[test]
+    fn proxy_policy_named_route_preserves_withdrawal_and_terminal_privacy() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        let state = app_state_for_settings(settings.clone());
+        let graph =
+            crate::require_identity_graph(&state.identity).expect("should open identity graph");
+        let identity = format!("{}.Pd1234", "9".repeat(64));
+        let mut entry = KvEntry::tombstone(1_700_000_000);
+        entry.consent.ok = true;
+        block_on(graph.create(&identity, &entry)).expect("should seed a live test identity");
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut request = empty_request(
+            Method::GET,
+            "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=invalid",
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-ec={identity}; us_privacy=1YYN"))
+                .expect("should attach withdrawal cookies"),
+        );
+        request
+            .headers_mut()
+            .insert("sec-gpc", HeaderValue::from_static("1"));
+        // The geo the entry point's lookup would hold for a US privacy state.
+        let geo = GeoInfo {
+            country: "US".to_owned(),
+            region: Some("CA".to_owned()),
+            city: Some("Example City".to_owned()),
+            continent: Some("NA".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
+            asn: None,
+        };
+        let origin = ScriptedHttpClient::forbidding();
+        insert_outbound_client(&mut request, HttpClient::with_client(origin.clone()));
+        request
+            .extensions_mut()
+            .insert(RequestGeo::new(None, Some(geo)));
+        request.extensions_mut().insert(ClientInfo::default());
+        let mut response = block_on(router.oneshot(request)).expect("should route request");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should preserve the existing invalid-signature status"
+        );
+        {
+            let finalize = response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .expect("should retain normal named-route finalization state");
+            assert!(
+                finalize.use_finalize_kv,
+                "should keep authoritative withdrawal writes even without browser signals"
+            );
+            assert!(
+                !finalize.ec_context.ec_generated(),
+                "should not mint identity on an asset request"
+            );
+        }
+        response.extensions_mut().insert(RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, max-age=600"),
+                HeaderMutation::set("etag", "late-filter-validator"),
+            ],
+        });
+        let counters = crate::sandbox::SandboxCounters {
+            ordinal: 1,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        // The actual entry-point finalizer: EC finalization, then the late
+        // request-filter effects and the terminal privacy that must survive them.
+        crate::finalize_response(
+            &mut response,
+            &crate::FinalizeInputs {
+                state: &state,
+                geo: None,
+                counters: &counters,
+            },
+        );
+        origin.assert_no_requests();
+        let record = block_on(graph.get(&identity))
+            .expect("should read withdrawn record")
+            .expect("should retain a tombstone")
+            .0;
+        assert!(
+            !record.consent.ok,
+            "should tombstone the identity through normal route finalization"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0"))),
+            "should expire the withdrawn EC cookie"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("should set privacy"),
+            "no-store, private",
+            "should retain terminal privacy after late filters"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should remove late identity validators"
         );
     }
 

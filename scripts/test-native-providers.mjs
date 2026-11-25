@@ -393,8 +393,10 @@ export async function main(binary) {
     await stopChild(app.child)
     children.delete(app.child)
   }
-  const health = (app, password) =>
-    request(app.endpoint, '/health', {
+  // Probes bypass authentication and configured response headers, so the
+  // authenticated EIDs echo behind `^/_ts/admin` observes the snapshot.
+  const admin = (app, password) =>
+    request(app.endpoint, '/_ts/admin/eids', {
       headers: {
         Authorization: `Basic ${Buffer.from(`admin:${password}`).toString('base64')}`,
       },
@@ -411,17 +413,23 @@ export async function main(binary) {
       )
       let response
       try {
-        response = await health(app, secretValues(phase).admin_key)
+        response = await request(app.endpoint, '/ready')
       } catch {
         /* Retry connection refusal, not a wrong HTTP response. */
       }
       if (response) {
         requireCheck(
           response.status === 200 &&
-            response.body === 'ok' &&
-            response.headers['x-ts-version'] &&
-            response.headers['x-provider-snapshot'] === phase,
-          'health snapshot readiness'
+            response.body === 'ready' &&
+            response.headers['x-ts-version'],
+          'readiness'
+        )
+        const observed = await admin(app, secretValues(phase).admin_key)
+        requireCheck(
+          observed.status === 200 &&
+            observed.headers['x-ts-version'] &&
+            observed.headers['x-provider-snapshot'] === phase,
+          'admin snapshot readiness'
         )
         return
       }
@@ -430,19 +438,18 @@ export async function main(binary) {
     throw new Error('startup deadline')
   }
   const snapshot = async (app, configPhase, secretPhase, rejectedPhase) => {
-    const response = await health(app, secretValues(secretPhase).admin_key)
+    const response = await admin(app, secretValues(secretPhase).admin_key)
     requireCheck(
       response.status === 200 &&
-        response.body === 'ok' &&
         response.headers['x-provider-snapshot'] === configPhase,
       'snapshot observation'
     )
     requireCheck(
-      (await health(app, secretValues(rejectedPhase).admin_key)).status === 401,
+      (await admin(app, secretValues(rejectedPhase).admin_key)).status === 401,
       'old or future secret rejection'
     )
     requireCheck(
-      (await health(app, `synthetic-admin-${secretPhase}`)).status === 401,
+      (await admin(app, `synthetic-admin-${secretPhase}`)).status === 401,
       'whole secret semantics'
     )
     const js = await request(app.endpoint, '/static/tsjs=0000000000000000')
@@ -619,7 +626,7 @@ export async function main(binary) {
       await snapshot(restarted, 'B', 'B', 'A')
       await stop(restarted)
       console.log(
-        `PASS ${mode}: real TS health/auth/TSJS; immutable snapshots; restart adoption`
+        `PASS ${mode}: real TS readiness/auth/TSJS; immutable snapshots; restart adoption`
       )
       if (mode !== 'secrets') {
         stage = `${mode} config failure`
