@@ -41,6 +41,32 @@ pub(crate) fn require_credential_safe_transport(url: &reqwest::Url, flag: &str) 
     Ok(())
 }
 
+/// Join a service base URL and an endpoint path without doubling or dropping a slash.
+///
+/// The service must be a bare base URL: credentials, a path, a query, or a fragment would
+/// each let the typed value change which endpoint is reached.
+///
+/// # Errors
+///
+/// Returns an error when `service` is not an absolute URL, fails
+/// [`require_credential_safe_transport`], or carries more than a scheme, host, and port.
+pub(crate) fn service_endpoint(service: &str, path: &str) -> CliResult<String> {
+    let mut url =
+        reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
+    require_credential_safe_transport(&url, "--service")?;
+    if url.host().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().trim_matches('/').is_empty()
+    {
+        return cli_error(
+            "--service must be a base HTTPS URL without credentials, a path, query, or fragment",
+        );
+    }
+    url.set_path(path);
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +107,61 @@ mod tests {
             "credentials in the URL reach proxy logs and shell history"
         );
         assert!(check("https://user@example.com/").is_err());
+    }
+
+    #[test]
+    fn the_endpoint_url_survives_a_trailing_slash() {
+        for service in [
+            "https://edge.example.com",
+            "https://edge.example.com/",
+            "https://edge.example.com///",
+        ] {
+            assert_eq!(
+                service_endpoint(service, "/_ts/admin/cache/purge")
+                    .expect("should accept a secure base URL"),
+                "https://edge.example.com/_ts/admin/cache/purge",
+                "{service} must resolve to one well-formed endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn only_loopback_services_may_use_plaintext_http() {
+        for service in [
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+        ] {
+            assert!(
+                service_endpoint(service, "/_ts/admin/keys/rotate").is_ok(),
+                "should permit loopback development: {service}"
+            );
+        }
+        for service in [
+            "http://192.0.2.1",     // allow-domain: 192.0.2.1
+            "http://[2001:db8::1]", // allow-domain: 2001:db8::1
+            "http://localhost.example.com",
+        ] {
+            assert!(
+                service_endpoint(service, "/_ts/admin/keys/rotate").is_err(),
+                "should refuse remote plaintext transport: {service}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_urls_cannot_redirect_the_endpoint_path_or_embed_credentials() {
+        for service in [
+            "not a URL",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+            "https://user:example-password@example.com",
+        ] {
+            assert!(
+                service_endpoint(service, "/_ts/admin/keys/rotate").is_err(),
+                "should require an unambiguous service base URL: {service}"
+            );
+        }
     }
 }

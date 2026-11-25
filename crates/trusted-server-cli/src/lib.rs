@@ -1,6 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod ad_templates;
 #[cfg(not(target_arch = "wasm32"))]
+mod admin_client;
+#[cfg(not(target_arch = "wasm32"))]
 mod app_config;
 #[cfg(not(target_arch = "wasm32"))]
 mod error;

@@ -420,8 +420,8 @@ Signing key not found: ts-2025-01-A
 3. Run key rotation to generate new key:
 
 ```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password
+# TRUSTED_SERVER_ADMIN_PASSWORD holds the admin password
+ts keys rotate --service https://edge.example.com
 ```
 
 ---
@@ -443,8 +443,8 @@ curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
 1. Initialize keys using rotation endpoint:
 
 ```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password
+# TRUSTED_SERVER_ADMIN_PASSWORD holds the admin password
+ts keys rotate --service https://edge.example.com
 ```
 
 2. Verify Config Store has `active-kids` entry
