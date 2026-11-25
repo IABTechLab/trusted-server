@@ -93,15 +93,26 @@ export async function publish({
   for (const name of releaseAssets) {
     const build = path('build', name)
     const signed = path('signed', name)
-    const inputs = [name, `${name}.spdx.json`]
+    const inputs = [
+      name,
+      `${name}.spdx.json`,
+      ...(name === 'trusted-server-fastly.wasm'
+        ? ['trusted-server-fastly.tar.gz']
+        : []),
+    ]
     const bundles = [
       `${name}.provenance.sigstore.json`,
       `${name}.sbom.sigstore.json`,
     ]
+    const companions =
+      name === 'trusted-server-fastly.wasm'
+        ? [`${name}.rebuild-check.json`]
+        : []
     exact(build, inputs)
-    exact(signed, [...bundles, 'SHA256SUMS'])
+    exact(signed, [...companions, ...bundles, 'SHA256SUMS'])
     const receipt = [
       ...inputs.map((file) => [build, file]),
+      ...companions.map((file) => [signed, file]),
       ...bundles.map((file) => [signed, file]),
     ]
       .map(([dir, file]) => {
@@ -127,53 +138,76 @@ export async function publish({
   // Verify every signing bundle before anything is created: a defective bundle
   // would otherwise become a permanent part of the immutable release. Nothing
   // exists yet, so a failure here is safe to rerun.
-  for (const name of releaseAssets)
-    for (const [kind, predicate] of [
-      ['provenance', 'https://slsa.dev/provenance/v1'],
-      ['sbom', 'https://spdx.dev/Document/v2.3'],
-    ]) {
-      const verified = JSON.parse(
-        execFileSync(
-          'gh',
+  // The Fastly provenance also names the rebuild-check companion as a subject.
+  const checks = releaseAssets.flatMap((name) => [
+    [name, name, 'provenance', 'https://slsa.dev/provenance/v1'],
+    [name, name, 'sbom', 'https://spdx.dev/Document/v2.3'],
+    ...(name === 'trusted-server-fastly.wasm'
+      ? [
           [
-            'attestation',
-            'verify',
-            path('release-assets', name),
-            '--repo',
-            repo,
-            '--bundle',
-            path('release-assets', `${name}.${kind}.sigstore.json`),
-            '--source-ref',
-            `refs/tags/${tag}`,
-            '--source-digest',
-            source,
-            '--signer-digest',
-            source,
-            '--deny-self-hosted-runners',
-            '--predicate-type',
-            predicate,
-            '--signer-workflow',
-            `${repo}/.github/workflows/release-build.yml`,
-            '--format',
-            'json',
+            name,
+            `${name}.rebuild-check.json`,
+            'provenance',
+            'https://slsa.dev/provenance/v1',
           ],
-          // The SBOM result embeds the whole SPDX document, which exceeds
-          // Node's 1 MiB default output buffer.
-          { timeout: 60000, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 }
-        )
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'provenance',
+            'https://slsa.dev/provenance/v1',
+          ],
+          [
+            name,
+            'trusted-server-fastly.tar.gz',
+            'sbom',
+            'https://spdx.dev/Document/v2.3',
+          ],
+        ]
+      : []),
+  ])
+  for (const [name, subject, kind, predicate] of checks) {
+    const verified = JSON.parse(
+      execFileSync(
+        'gh',
+        [
+          'attestation',
+          'verify',
+          path('release-assets', subject),
+          '--repo',
+          repo,
+          '--bundle',
+          path('release-assets', `${name}.${kind}.sigstore.json`),
+          '--source-ref',
+          `refs/tags/${tag}`,
+          '--source-digest',
+          source,
+          '--signer-digest',
+          source,
+          '--deny-self-hosted-runners',
+          '--predicate-type',
+          predicate,
+          '--signer-workflow',
+          `${repo}/.github/workflows/release-build.yml`,
+          '--format',
+          'json',
+        ],
+        // The SBOM result embeds the whole SPDX document, which exceeds
+        // Node's 1 MiB default output buffer.
+        { timeout: 60000, stdio: 'pipe', maxBuffer: 256 * 1024 * 1024 }
       )
-      // The signed SBOM predicate must be the SPDX document shipped beside it.
-      if (
-        kind === 'sbom' &&
-        (!Array.isArray(verified) ||
-          verified.length !== 1 ||
-          !isDeepStrictEqual(
-            verified[0]?.verificationResult?.statement?.predicate,
-            JSON.parse(asset(`${name}.spdx.json`))
-          ))
-      )
-        throw Error(`Signed SBOM differs from the shipped SPDX: ${name}`)
-    }
+    )
+    // The signed SBOM predicate must be the SPDX document shipped beside it.
+    if (
+      kind === 'sbom' &&
+      (!Array.isArray(verified) ||
+        verified.length !== 1 ||
+        !isDeepStrictEqual(
+          verified[0]?.verificationResult?.statement?.predicate,
+          JSON.parse(asset(`${name}.spdx.json`))
+        ))
+    )
+      throw Error(`Signed SBOM differs from the shipped SPDX: ${name}`)
+  }
   // Close API connections before synchronous gh checks can leave pooled
   // sockets idle. Every read is time-bounded. Mutations are single-shot and
   // rely on the job timeout: a client-side abort cannot cancel a create,

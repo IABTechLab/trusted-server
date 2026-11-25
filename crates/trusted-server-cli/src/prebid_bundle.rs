@@ -627,6 +627,18 @@ fn ensure_file_exists(path: &Path, description: &str) -> CliResult<()> {
 }
 
 fn find_js_lib_dir(start: &Path) -> CliResult<PathBuf> {
+    #[cfg(not(trusted_server_release_build))]
+    let fallback = Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("crates/trusted-server-js/lib"),
+    );
+    #[cfg(trusted_server_release_build)]
+    let fallback: Option<PathBuf> = None;
+    find_js_lib_dir_with_fallback(start, fallback.as_deref())
+}
+
+fn find_js_lib_dir_with_fallback(start: &Path, fallback: Option<&Path>) -> CliResult<PathBuf> {
     for ancestor in start.ancestors() {
         let candidate = ancestor.join("crates/trusted-server-js/lib");
         if is_js_lib_dir(&candidate) {
@@ -634,11 +646,9 @@ fn find_js_lib_dir(start: &Path) -> CliResult<PathBuf> {
         }
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest_dir
-        .join("../..")
-        .join("crates/trusted-server-js/lib");
-    if is_js_lib_dir(&candidate) {
+    if let Some(candidate) = fallback
+        && is_js_lib_dir(candidate)
+    {
         return candidate.canonicalize().map_err(|error| {
             report_error(format!(
                 "failed to resolve JS library directory {}: {error}",
@@ -814,6 +824,71 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn resource_discovery_without_fallback_requires_runtime_checkout() {
+        let directory = tempfile::tempdir().expect("should create outside checkout fixture");
+        let error = find_js_lib_dir_with_fallback(directory.path(), None)
+            .expect_err("should require runtime checkout when fallback is absent");
+        assert!(
+            error
+                .to_string()
+                .contains("run `ts prebid client` from the Trusted Server repository"),
+            "should explain the missing source prerequisites"
+        );
+        let resources = directory.path().join("crates/trusted-server-js/lib");
+        fs::create_dir_all(&resources).expect("should create runtime resources");
+        fs::write(resources.join("package.json"), "{}").expect("should create package fixture");
+        fs::write(resources.join("build-prebid-external.mjs"), "")
+            .expect("should create builder fixture");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("should create nested current directory");
+        assert_eq!(
+            find_js_lib_dir_with_fallback(&nested, None)
+                .expect("should discover actual runtime checkout"),
+            resources,
+            "should discover runtime ancestor resources"
+        );
+    }
+
+    #[test]
+    fn resource_discovery_uses_explicit_development_fallback() {
+        let directory = tempfile::tempdir().expect("should create fixture");
+        let resources = directory.path().join("development-lib");
+        fs::create_dir(&resources).expect("should create development fallback");
+        fs::write(resources.join("package.json"), "{}").expect("should create package fixture");
+        fs::write(resources.join("build-prebid-external.mjs"), "")
+            .expect("should create builder fixture");
+        assert_eq!(
+            find_js_lib_dir_with_fallback(directory.path(), Some(&resources))
+                .expect("should use explicit development fallback"),
+            resources
+                .canonicalize()
+                .expect("should canonicalize fallback"),
+            "should preserve development fallback behavior"
+        );
+    }
+
+    #[test]
+    fn actual_resource_discovery_uses_owning_release_cfg() {
+        let directory = tempfile::tempdir().expect("should create outside checkout fixture");
+        let result = find_js_lib_dir(directory.path());
+        if cfg!(trusted_server_release_build) {
+            let error =
+                result.expect_err("should exclude the compiled developer checkout in release mode");
+            assert!(
+                error
+                    .to_string()
+                    .contains("run `ts prebid client` from the Trusted Server repository"),
+                "should identify release source prerequisites"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "should retain the compiled checkout fallback in development"
+            );
+        }
+    }
 
     fn managed_config(managed: &str, user_id: &str) -> String {
         format!(

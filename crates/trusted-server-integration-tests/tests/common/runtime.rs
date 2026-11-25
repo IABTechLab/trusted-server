@@ -81,10 +81,9 @@ pub trait RuntimeProcessHandle: Send + Sync {}
 
 /// Trait defining how to run the trusted-server on different platforms.
 ///
-/// The application configuration (origin URL, integrations, etc.) is baked
-/// into the WASM binary at build time via `build.rs`. The runtime environment
-/// only needs the WASM binary path and its own platform-specific config
-/// (e.g. Viceroy's `fastly.toml` for KV stores and secret stores).
+/// Runtime fixtures supply application configuration (origin URL, integrations,
+/// etc.) separately from the WASM binary, alongside platform-specific resources
+/// (e.g. Viceroy's `fastly.toml` config, KV and secret stores).
 pub trait RuntimeEnvironment: Send + Sync {
     /// Platform identifier (e.g., "fastly", "cloudflare")
     fn id(&self) -> &'static str;
@@ -122,8 +121,8 @@ pub fn wasm_binary_path() -> PathBuf {
 
 /// Get the fixed origin port used for Docker container port mapping.
 ///
-/// This must match the port baked into the WASM binary via
-/// `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL` at build time.
+/// This must match the origin port in the generated runtime application
+/// configuration and the container host-port mapping.
 pub fn origin_port() -> u16 {
     match std::env::var("INTEGRATION_ORIGIN_PORT") {
         Ok(value) => value

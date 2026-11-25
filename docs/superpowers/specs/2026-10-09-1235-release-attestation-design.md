@@ -74,7 +74,11 @@ which owns building and signing:
    accepts only two regular, non-symlink, non-empty files, records their digests,
    and runs two `actions/attest` calls: SLSA provenance over the binary and its
    SPDX file, then an SPDX SBOM attestation for the binary. It never checks out
-   or runs source.
+   or runs source. Phase 2 adds, for the Fastly leg only, the
+   `trusted-server-fastly.wasm.rebuild-check.json` companion as a third
+   provenance subject. Its inline validation runs on Node: the signing job
+   installs the pinned Node with `actions/setup-node`, and that runtime is
+   trusted as a hosted-runner tool while the job holds `id-token: write`.
 
 The caller's **release** job (same gate, `contents: write` only) checks out only
 `scripts/release/publish.mjs`, `scripts/release/release-notes.md` and
