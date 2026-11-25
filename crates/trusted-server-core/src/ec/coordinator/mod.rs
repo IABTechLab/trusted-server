@@ -1178,9 +1178,9 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .into_iter()
             .map(|Tagged { provider, value }| (self.providers[provider.get()].id.clone(), value))
             .collect();
-        LookupResults::new(&ec_id, lookups)
-            .dispatched_with(revocations)
-            .with_known_uids(known_uids)
+        let mut results = LookupResults::new(&ec_id, lookups).dispatched_with(revocations);
+        results.set_known_uids(known_uids);
+        results
     }
 }
 

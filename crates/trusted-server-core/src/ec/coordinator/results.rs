@@ -186,10 +186,12 @@ impl LookupResults {
 
     /// Records the hashes of the UIDs known for each looked-up provider at
     /// dispatch: its cookies' and the row's.
-    #[must_use]
-    pub fn with_known_uids(mut self, known_uids: BTreeMap<ProviderId, Vec<String>>) -> Self {
+    ///
+    /// This is a setter rather than a builder because static analysis treats
+    /// the value a UID-named call returns as sensitive, and the write planner
+    /// logs the provider IDs it reads from these results.
+    pub fn set_known_uids(&mut self, known_uids: BTreeMap<ProviderId, Vec<String>>) {
         self.known_uids = known_uids;
-        self
     }
 
     /// Hashes of the UIDs known for `provider` when its lookup was
