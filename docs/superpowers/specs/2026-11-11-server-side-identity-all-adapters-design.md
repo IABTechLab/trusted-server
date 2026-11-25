@@ -276,7 +276,10 @@ marks the record contract and geo as supported.
   document response. A page load writes the record once. Accept: a mock
   provider that answers within the deadline has its ID in the record and in
   the mirror cookie of that navigation's response; one that misses the
-  deadline is skipped and does not delay the response past it.
+  deadline is skipped and does not delay the response past it. The
+  hashed-email status call (ID-10) counts against the same deadline. State:
+  #1488 starts the status call and the lookups beside the origin fetch on
+  Fastly.
 - **ID-5 After-response work.** Only pull sync and guarded follow-up writes run
   after the response is sent: after send on Fastly, a task drained on SIGTERM
   on Axum, `waitUntil` on Cloudflare. On Spin the work runs before the response
@@ -300,7 +303,8 @@ marks the record contract and geo as supported.
   refuses at half the limit. State: Fastly Edge Rate Limiting is the only
   limiter; record creation is limited nowhere; #1487 keys lookups on the
   IP-derived EC prefix, so everyone behind one IPv4 address or IPv6 /64 shares
-  a budget.
+  a budget. #1488 makes the hashed-email status call (ID-10) before it checks
+  that limit, so a provider over its limit can still cause a status call.
 - **ID-7 Abuse resistance.** Where a trusted JA4 is available, record creation
   is refused when the JA4's TLS client family contradicts the User-Agent's
   browser family; a JA4 the rule does not recognize, or no trusted JA4 at all,
@@ -326,7 +330,9 @@ marks the record contract and geo as supported.
 - **ID-9 EC route.** A same-origin route, `/_ts/api/v1/ec` by default, lets the
   script Trusted Server injects into proxied pages report consent and receive
   identity, so a reader who consents after the page loads gets an EC on that
-  page view instead of the next navigation. A `POST` whose `Origin` matches the
+  page view instead of the next navigation. The script calls the route only for
+  consent, so a reader who signs in after the page loads gets hashed-email IDs
+  (ID-10) on the next navigation or route call. A `POST` whose `Origin` matches the
   page mints the EC when the reader has none and consent allows, creates the
   record, runs the providers as a navigation does, and sets `ts-ec`, the
   SharedID cookie and the mirror cookie on its own response. It carries the
@@ -365,6 +371,21 @@ marks the record contract and geo as supported.
   through the publisher proxy mints an EC, and no such route exists. #1535 (RC
   line) posts Sourcepoint's GPP string to a separate, non-minting `/_ts/consent`
   route, wired into each adapter's router.
+- **ID-10 Hashed email from the publisher (DEC-9).** A publisher status
+  endpoint, `[ec.hashed_email]`, returns the signed-in reader's hashed email.
+  Trusted Server calls it with the request's whole `Cookie` header, at most once
+  per collection phase (at navigation and after the response) and only when a
+  provider that takes a hashed email has a source due for a new lookup; a
+  refresh never calls it. Each such provider reads its
+  value with its own jq-style path and sends it on unchanged; the value is never
+  stored in the record or a cookie. LiveRamp looks up an envelope with it
+  (`it=4`) and refreshes a live envelope without it (`it=19`); ID5 sends it as
+  partner data (`pd`). Accept: on Fastly and Axum, a signed-in navigation makes
+  one status call and LiveRamp's and ID5's IDs from it are in the record and
+  the mirror cookie of that response; a signed-out reader, a refresh and a
+  provider without the capability make no status call; a status call that
+  misses the deadline skips only the providers that needed it. State: #1488
+  implements it on Fastly.
 
 ### SH: Shared state passed the right way
 
@@ -401,7 +422,9 @@ marks the record contract and geo as supported.
   otherwise through the adapter's existing platform bridge until the EdgeZero
   ask lands (today Fastly's limiter, ID-6, and Fastly's geo, EZI-4). A
   capability an adapter lacks is an EdgeZero ask, never new code in that
-  adapter (DEC-16). Accept: no adapter crate's non-test code calls EC
+  adapter (DEC-16). The app fills every provider signal from the request,
+  including the `Referer` and `Accept-Language` headers that ID5's fetch sends
+  (#1488). Accept: no adapter crate's non-test code calls EC
   generation, finalization or an identity handler directly, and the same
   conformance suite (T5) runs on each supported adapter. State: at #1506's head
   only the Fastly adapter wires identity (EC generation and finalization are
@@ -656,8 +679,8 @@ Decided:
 - **DEC-1 Cutover** (user, 2026-11-11). #1506 is the EdgeZero cutover. #1527
   closes once #1506 covers its tests.
 - **DEC-2 MVP** (user, 2026-11-12). Fastly and Axum are the MVP: plan waves 0 to 9.
-  The one open decision the MVP waits on is DEC-9, through T22. Cloudflare, Spin
-  and the decision-gated work follow it.
+  The MVP waits on no open decision since DEC-9. Cloudflare, Spin and the
+  decision-gated work follow it.
 - **DEC-3 Shared record store** (user, 2026-11-11). The EC record runs on one
   `EcKvStore` over EdgeZero's `KvStore`, with no per-adapter backends. The user
   reaffirmed it on 2026-11-12: Axum's record uses EdgeZero's pluggable `KvStore`
@@ -696,6 +719,11 @@ Decided:
   because a browser may block Prebid.js from loading at all (WB-3). Retention
   (proposed, assumed by the plan): the stored value wins and lives as long as
   the record (SID-5).
+- **DEC-9 LiveRamp identifier** (user, 2026-11-25). LiveRamp drops the Custom
+  ID, which was the IP-derived EC prefix shared by everyone behind one IP,
+  because LiveRamp confirmed that every ATS route needs a hashed email. It looks
+  up envelopes from the publisher's hashed email instead (ID-10), and ID5 takes
+  the same value as partner data. T22 enables LiveRamp on it.
 - **DEC-10 Mirror partners** (user, 2026-11-12). ID5 and LiveRamp, the
   important identity providers, get `mirror_enabled`, and the MVP's provider
   and mirror checks (T11, A10) use them.
@@ -743,10 +771,6 @@ Open:
   default for the record: the DynamoDB or celld adapter, or a native store that
   meets the contract, per [Platform support](#platform-support). Blocks EZI-2c,
   EZI-2s, R3, T8 and T9.
-- **DEC-9 LiveRamp Custom ID.** The current value is the IP-derived EC prefix,
-  shared by everyone behind one IP. Blocks T22, which sets the Custom ID,
-  enables LiveRamp and checks it before launch because LiveRamp is in the MVP
-  (DEC-10), and #1245. The user is getting a LiveRamp test setup to settle it.
 - **DEC-12 EC EID source.** Which source name the EC uses, and whether it keeps
   going out as `user.id`. Blocks #1549; no other ticket until decided.
 - **DEC-13 `ts-ec` refresh** for returning readers. Blocks T16.
@@ -950,3 +974,16 @@ that owns it. DEC-20 records that rule, and DEC-21 the merge order the user
 chose for it. [Integration branches](#integration-branches) lists the new
 heads and the provider stack's move onto EdgeZero's outbound client and #1526's
 async store.
+
+### Hashed email, 2026-11-25
+
+At the user's request this revision records the hashed-email intake #1488 now
+carries. The user decided DEC-9: LiveRamp drops the Custom ID for the
+publisher's hashed email, which ID5 also takes (ID-10), so the MVP waits on no
+open decision and T22 no longer waits on DEC-9. ID-4 adds the status call to
+the provider deadline; ID-6 records that the status call comes before the
+per-provider limit; ID-9 notes that a reader who signs in mid-page gets those
+IDs on the next navigation or route call; and SH-5 has the shared app fill the
+`Referer` and `Accept-Language` signals ID5 sends. T11's check needs a
+production ID5 partner number: ID5's test partner 173 answers 204 to every
+fetch, including the example in ID5's own documentation.
