@@ -22,6 +22,7 @@ mod html_finalization;
 
 use std::borrow::Cow;
 use std::io::Write;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -3495,6 +3496,33 @@ fn rewrite_origin_request(
     Ok(())
 }
 
+/// Writes the resolved client IP into the configured publisher-origin header.
+///
+/// Every client-supplied copy is removed first, so the origin only sees the
+/// address Trusted Server resolved. Without a resolved address the header is
+/// omitted rather than left holding a client-chosen value.
+fn set_origin_client_ip_header(
+    req: &mut Request<EdgeBody>,
+    header_name: Option<&str>,
+    client_ip: Option<IpAddr>,
+) {
+    let Some(header_name) = header_name else {
+        return;
+    };
+    // Settings validation rejects invalid names, so this only guards a blob
+    // that skipped validation.
+    let Ok(header_name) = header::HeaderName::from_bytes(header_name.as_bytes()) else {
+        log::warn!("Skips invalid publisher.origin_client_ip_header `{header_name}`");
+        return;
+    };
+    req.headers_mut().remove(&header_name);
+    if let Some(client_ip) = client_ip {
+        let value = HeaderValue::from_str(&client_ip.to_string())
+            .expect("should format an IP address as a header value");
+        req.headers_mut().insert(header_name, value);
+    }
+}
+
 /// Build a minimal [`AuctionContext`] for the collect phase.
 ///
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
@@ -5285,6 +5313,11 @@ pub async fn handle_publisher_request(
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+    set_origin_client_ip_header(
+        &mut req,
+        settings.publisher.origin_client_ip_header.as_deref(),
+        services.client_info().client_ip,
+    );
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
@@ -8051,6 +8084,7 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
 mod tests {
     use std::future::Future as _;
     use std::io::{self, Read as _};
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use brotli::Decompressor;
@@ -19351,6 +19385,137 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             .header("fastly-ssl", "1")
             .body(EdgeBody::empty())
             .expect("should build request")
+    }
+
+    fn header_values(req: &Request<EdgeBody>, name: &str) -> Vec<String> {
+        req.headers()
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("should read ASCII header value")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn origin_client_ip_header_is_left_alone_when_unconfigured() {
+        let mut req = publisher_page_request();
+        req.headers_mut().insert(
+            "fastly-client-ip",
+            HeaderValue::from_static("198.51.100.20"),
+        );
+
+        set_origin_client_ip_header(
+            &mut req,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        );
+
+        assert_eq!(
+            header_values(&req, "fastly-client-ip"),
+            vec!["198.51.100.20"],
+            "should not touch the request when no header is configured"
+        );
+    }
+
+    #[test]
+    fn origin_client_ip_header_replaces_every_client_supplied_copy() {
+        let mut req = publisher_page_request();
+        req.headers_mut().append(
+            "fastly-client-ip",
+            HeaderValue::from_static("198.51.100.20"),
+        );
+        req.headers_mut().append(
+            "fastly-client-ip",
+            HeaderValue::from_static("198.51.100.21"),
+        );
+
+        set_origin_client_ip_header(
+            &mut req,
+            Some("fastly-client-ip"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        );
+
+        assert_eq!(
+            header_values(&req, "fastly-client-ip"),
+            vec!["192.0.2.7"],
+            "should send exactly one value holding the resolved client IP"
+        );
+    }
+
+    #[test]
+    fn origin_client_ip_header_carries_ipv6_addresses() {
+        let mut req = publisher_page_request();
+
+        set_origin_client_ip_header(
+            &mut req,
+            Some("x-forwarded-for"),
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7))),
+        );
+
+        assert_eq!(
+            header_values(&req, "x-forwarded-for"),
+            vec!["2001:db8::7"],
+            "should write the bare IPv6 address"
+        );
+    }
+
+    #[test]
+    fn origin_client_ip_header_is_removed_without_a_resolved_ip() {
+        let mut req = publisher_page_request();
+        req.headers_mut().insert(
+            "fastly-client-ip",
+            HeaderValue::from_static("198.51.100.20"),
+        );
+
+        set_origin_client_ip_header(&mut req, Some("fastly-client-ip"), None);
+
+        assert!(
+            header_values(&req, "fastly-client-ip").is_empty(),
+            "should drop a client-supplied value when no client IP was resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_origin_request_carries_configured_client_ip_header() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_client_ip_header = Some("fastly-client-ip".to_owned());
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"png".to_vec(),
+            vec![(header::CONTENT_TYPE.as_str(), "image/png")],
+        );
+        let services = build_services_with_secret_http_client_and_client_ip(
+            NoopSecretStore,
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/assets/logo.png")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-client-ip", "198.51.100.20")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        run_publisher_proxy(&settings, &services, request).await;
+
+        let recorded = stub.recorded_request_headers();
+        let origin_headers = recorded.first().expect("should send one origin request");
+        let client_ip_values: Vec<&str> = origin_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("fastly-client-ip"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            client_ip_values,
+            vec!["192.0.2.7"],
+            "should forward the resolved client IP, not the client-supplied value"
+        );
     }
 
     #[tokio::test]

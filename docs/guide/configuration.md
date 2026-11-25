@@ -341,6 +341,7 @@ Core publisher settings for domain, origin, and proxy configuration.
 | `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
 | `public_origin`                | String  | No       | Browser-facing Trusted Server origin used in rewritten creative URLs                 |
 | `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
+| `origin_client_ip_header`      | String  | No       | Header that carries the resolved client IP to `origin_url`                           |
 | `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
 | `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
 | `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
@@ -524,6 +525,36 @@ connecting to the host in `origin_url`.
 - ❌ `www.publisher.com/path`
 
 **Default**: When omitted, Trusted Server sends the host from `origin_url`.
+
+#### `origin_client_ip_header`
+
+**Purpose**: Optional request header that carries the client IP to the publisher
+origin.
+
+Trusted Server strips client-spoofable forwarding headers such as
+`Fastly-Client-IP` before routing, so by default the publisher origin receives no
+client address and sees Trusted Server's own egress address as the peer. Set
+this when the origin's WAF rules, logging, rate limits, or geolocation read a
+client-IP header.
+
+**Usage**:
+
+- Writes the client IP Trusted Server resolved into this header on every
+  publisher-origin request
+- Removes any client-supplied copy first, so the origin receives exactly one
+  value that the client cannot choose
+- Omits the header when no client IP was resolved
+- Behind a fronting CDN, configure [`[trusted_client_ip]`](./fastly.md#cdn-fronted-client-ip) as well;
+  without it the resolved address is the CDN node, not the reader
+
+**Format**: `fastly-client-ip`, `true-client-ip`, `x-forwarded-for`, or another
+`x-` header that Trusted Server does not reserve. Names starting with `x-ts-`
+and internal headers such as `x-geo-country` are rejected.
+
+- Accepted: `fastly-client-ip`, `x-real-ip`
+- Rejected: `forwarded`, `x-ts-client-ip-auth`
+
+**Default**: When omitted, no client-IP header is sent to the origin.
 
 #### `proxy_secret`
 
@@ -769,10 +800,12 @@ least 32 ASCII graphic bytes (`!` through `~`) with no whitespace, controls, DEL
 or non-ASCII bytes.
 
 Independently of this section, the Fastly adapter treats `fastly-client-ip` as
-client-spoofable and strips it at request entry, so Trusted Server no longer
-forwards an inbound `Fastly-Client-IP` to the publisher origin. This applies
-even when `[trusted_client_ip]` is absent. Check whether the origin reads that
-header before deploying.
+client-spoofable and strips it at request entry, so Trusted Server does not
+forward an inbound `Fastly-Client-IP` to the publisher origin. This applies
+even when `[trusted_client_ip]` is absent. If the origin reads that header, set
+[`publisher.origin_client_ip_header`](#origin-client-ip-header) so Trusted
+Server sends the address it resolved instead. Enable it only after this section
+is verified; until then the resolved address is the fronting POP.
 
 Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
 resolves to an invalid shared-secret value. Every adapter removes the configured

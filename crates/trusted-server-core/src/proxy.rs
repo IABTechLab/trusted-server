@@ -2267,7 +2267,8 @@ mod tests {
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
         HashMapSecretStore, StubHttpClient, build_services_with_http_client,
-        build_services_with_secret_and_http_client, noop_services,
+        build_services_with_http_client_and_client_ip, build_services_with_secret_and_http_client,
+        noop_services,
     };
     use crate::platform::{
         PlatformCacheIntent, PlatformError, PlatformHttpClient, PlatformHttpRequest,
@@ -5388,6 +5389,36 @@ mod tests {
             assert!(
                 header_value("x-custom-test").is_none(),
                 "should not forward unrelated custom headers"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_omits_publisher_origin_client_ip_header() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client_and_client_ip(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7)),
+            );
+            let mut settings = create_test_settings();
+            settings.publisher.origin_client_ip_header = Some("fastly-client-ip".to_owned());
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+
+            let recorded = stub.recorded_request_headers();
+            let forwarded = recorded.first().expect("should send one asset request");
+            assert!(
+                !forwarded
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("fastly-client-ip")),
+                "should keep the publisher-origin client IP header off asset proxy requests"
             );
         });
     }
