@@ -1016,6 +1016,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            mirror_enabled: false,
             api_token: Some(crate::redacted::Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -1104,8 +1105,13 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            Some("shared-cookie-id"),
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: None,
+                sharedid_cookie: Some("shared-cookie-id"),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;
@@ -1200,8 +1206,14 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None, // No `ts-eids` cookie on this request at all.
-            None,
+            &crate::ec::finalize::FinalizeRequest {
+                // No `ts-eids` cookie on this request at all.
+                eids_cookie: None,
+                sharedid_cookie: None,
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;

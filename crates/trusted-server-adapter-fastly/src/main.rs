@@ -12,19 +12,19 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
-use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::checked_current_timestamp;
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -694,13 +694,23 @@ async fn apply_edgezero_ec_finalize(
     } else {
         None
     };
+    // Only a navigation with an eligible response uses the request time, so
+    // other responses never read the clock or log its failure.
+    let now = (ec_state.ec_context.has_navigation_permit()
+        && !NavigationPermit::is_redirect(response.status()))
+    .then(checked_current_timestamp)
+    .flatten()
+    .map(UnixSeconds::new);
     ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
-        ec_state.eids_cookie.as_deref(),
-        ec_state.sharedid_cookie.as_deref(),
+        &FinalizeRequest {
+            eids_cookie: ec_state.eids_cookie.as_deref(),
+            sharedid_cookie: ec_state.sharedid_cookie.as_deref(),
+            now,
+        },
         response,
     )
     .await;
@@ -788,11 +798,15 @@ pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGrap
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
+///
+/// Only tests open the graph this way; request paths use
+/// [`maybe_identity_graph`].
+#[cfg(test)]
 pub(crate) fn require_identity_graph(
     settings: &Settings,
-) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+) -> Result<KvIdentityGraph, error_stack::Report<trusted_server_core::error::TrustedServerError>> {
     let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
+        error_stack::Report::new(trusted_server_core::error::TrustedServerError::KvStore {
             store_name: "ec.ec_store".to_owned(),
             message: "ec.ec_store is not configured".to_owned(),
         })
@@ -1485,7 +1499,6 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid_cookie: None,
-            is_real_browser: true,
         });
 
         let state = finalize_response(&mut page, &inputs);
