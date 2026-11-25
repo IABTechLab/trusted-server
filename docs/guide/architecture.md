@@ -55,14 +55,14 @@ Native Axum adapter (native binary):
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                                    | Axum                                                                                                                                                                                             |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KV store                                   | Generic platform KV unavailable; EC records use the prepared record capability                                                                                                                   |
-| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                      |
-| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                    |
-| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback |
-| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                              |
-| Startup failure                            | The process exits non-zero before it listens                                                                                                                                                     |
+| Feature                                    | Axum                                                                                                                                                                                               |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KV store                                   | Generic platform KV unavailable; EC records use the prepared record capability                                                                                                                     |
+| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                        |
+| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                      |
+| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback   |
+| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                                |
+| Startup failure                            | Provider preparation failures exit before listening; application initialization failures, including EC record-store binding, serve the failure router (`/health` `200`, `/ready` and routes `503`) |
 
 ### trusted-server-adapter-spin
 

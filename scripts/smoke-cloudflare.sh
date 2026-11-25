@@ -11,7 +11,7 @@ smoke_require_command bash
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command jq
-smoke_require_command python3
+smoke_require_python
 smoke_require_command wrangler
 smoke_require_command pgrep
 
@@ -31,16 +31,18 @@ APP_PID=""
 cleanup() {
     smoke_stop_process "$APP_PID"
     smoke_stop_process "$ORIGIN_PID"
+    smoke_preserve_artifacts "$WORKSPACE"
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 CLOUDFLARE_ROOT="$REPO_ROOT/crates/trusted-server-adapter-cloudflare"
-if [ ! -f "$CLOUDFLARE_ROOT/build/index.js" ]; then
+if [ -z "${CLOUDFLARE_BUILD_PATH:-}" ]; then
     (cd "$CLOUDFLARE_ROOT" && bash build.sh)
 fi
-[ -f "$CLOUDFLARE_ROOT/build/index.js" ] ||
+CLOUDFLARE_BUILD_PATH=${CLOUDFLARE_BUILD_PATH:-$CLOUDFLARE_ROOT/build}
+[ -f "$CLOUDFLARE_BUILD_PATH/index.js" ] ||
     smoke_die "Cloudflare Worker bundle not found: $CLOUDFLARE_ROOT/build/index.js"
 
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
@@ -52,7 +54,7 @@ CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"
 cp "$CLOUDFLARE_ROOT/wrangler.toml" "$CLOUDFLARE_WORK/wrangler.toml"
 cp "$CLOUDFLARE_ROOT/wrangler.ci.toml" "$CLOUDFLARE_WORK/wrangler.ci.toml"
-ln -s "$CLOUDFLARE_ROOT/build" "$CLOUDFLARE_WORK/build"
+ln -s "$CLOUDFLARE_BUILD_PATH" "$CLOUDFLARE_WORK/build"
 sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
     -e "s|manifest = \"fastly.toml\"|manifest = \"$REPO_ROOT/fastly.toml\"|" \
@@ -148,6 +150,23 @@ run_case() {
             --ip 127.0.0.1
     ) >"$log_path" 2>&1 &
     APP_PID=$!
+    local startup_state=ready
+    [ "$expected_status" != 503 ] || startup_state=unavailable
+    smoke_wait_http "http://127.0.0.1:$port/health" 200 \
+        "$WORKSPACE/$case_name-live.body" "$WORKSPACE/$case_name-live.headers"
+    if [ "$startup_state" = ready ]; then
+        smoke_wait_http "http://127.0.0.1:$port/ready" 200 \
+            "$WORKSPACE/$case_name-ready-wait.body" "$WORKSPACE/$case_name-ready-wait.headers"
+    fi
+    smoke_assert_operational "http://127.0.0.1:$port" "$startup_state" "$WORKSPACE/$case_name"
+    local origin_before
+    origin_before=$(smoke_origin_count "$WORKSPACE")
+    local SMOKE_AUTHENTICATE=false
+    if [ "$case_name" = hostile ]; then
+        smoke_wait_http "http://127.0.0.1:$port/private" 401 \
+            "$WORKSPACE/$case_name-auth.body" "$WORKSPACE/$case_name-auth.headers"
+        SMOKE_AUTHENTICATE=true
+    fi
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Wrangler" "$log_path"
@@ -156,9 +175,10 @@ run_case() {
     APP_PID=""
 
     if [ -n "$expected_diagnostic" ]; then
+        smoke_assert_unavailable_body "$body_path"
         grep --fixed-strings --quiet 'Your Worker has access to the following bindings:' "$log_path" ||
             smoke_die "Wrangler did not report the runtime binding inventory"
-        if grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
+        if [ -n "$missing_binding" ] && grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
         if [ "$missing_binding" = "env.TRUSTED_SERVER_CONFIG" ]; then
@@ -174,21 +194,33 @@ run_case() {
             "$log_path"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
+        [ "$(smoke_origin_count "$WORKSPACE")" -gt "$origin_before" ] || smoke_die "publisher control never reached origin"
     fi
+    echo "cloudflare startup case passed: $case_name"
 }
 
-run_case missing-config "$BASE_PORT" "" "" 500 \
+run_case missing-config "$BASE_PORT" "" "" 503 \
     'env.TRUSTED_SERVER_CONFIG' \
     'Cloudflare TRUSTED_SERVER_CONFIG is required'
-run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 500 \
+run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 503 \
     'env.handler_password' \
     "failed to resolve secret reference at \`handlers[0].password\` from secret store \`trusted_server_secrets\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 500 \
+run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 503 \
     'env.publisher_proxy_secret' \
     "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
+run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 503 \
     'env.ec_passphrase' \
     "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
+INVALID_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" invalid)
+HOSTILE_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" hostile)
+MALFORMED_JSON=$(jq -cn --arg app_config '{' '{app_config: $app_config}')
+INVALID_JSON=$(jq -cn --arg app_config "$INVALID_ENVELOPE" '{app_config: $app_config}')
+HOSTILE_JSON=$(jq -cn --arg app_config "$HOSTILE_ENVELOPE" '{app_config: $app_config}')
+run_case malformed-envelope "$((BASE_PORT + 5))" "$MALFORMED_JSON" "" 503 "" \
+    'failed to parse Trusted Server app-config blob envelope'
+run_case invalid-settings "$((BASE_PORT + 6))" "$INVALID_JSON" "" 503 "" \
+    'invalid_publisher_domain'
+run_case hostile "$POSITIVE_PORT" "$HOSTILE_JSON" "" 200 "" ""
 run_case positive "$POSITIVE_PORT" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"

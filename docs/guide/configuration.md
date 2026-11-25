@@ -870,7 +870,7 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The shared r
 
 ### Migrating from `consent_store`
 
-The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return adapter-specific 5xx startup-error responses until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return the shared `503` startup-error response until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
@@ -1669,8 +1669,10 @@ Matches:
   wildcard IP address all match real URL hosts and are not flagged.
 - `include_domains` controls which asset URLs are newly rewritten or signed. It
   is not enforced when a proxy URL is fetched: a proxy URL issued before a host
-  was removed from the list (for example, in a cached creative) still forwards
-  the EC ID to that host, subject only to `proxy.allowed_domains`.
+  was removed from the list (for example, in a cached creative) can still fetch
+  that host, subject to `proxy.allowed_domains`. EC disclosure is independently
+  evaluated against the current `proxy.identity_endpoints` and request consent
+  on every fetch and redirect; old signatures do not preserve a removed grant.
 
 ::: tip
 When both `include_domains` and `proxy.allowed_domains` are set, keep every
@@ -1726,11 +1728,12 @@ Controls first-party proxy security settings and path-based asset routes.
 
 ### `[proxy]`
 
-| Field               | Type          | Required             | Description                                                 |
-| ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
-| `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
-| `certificate_check` | Boolean       | No (default: `true`) | Must be `true`; origin TLS is always verified               |
-| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
+| Field                | Type          | Required             | Description                                                           |
+| -------------------- | ------------- | -------------------- | --------------------------------------------------------------------- |
+| `allowed_domains`    | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects           |
+| `certificate_check`  | Boolean       | No (default: `true`) | Must be `true`; outbound TLS is always verified                       |
+| `identity_endpoints` | Array[Table]  | No (default: `[]`)   | Explicit creative-proxy HTTPS origin/path EC grants; empty denies all |
+| `asset_routes`       | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins                  |
 
 **Example**:
 
@@ -1787,16 +1790,111 @@ See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage deta
 
 #### `certificate_check`
 
-**Purpose**: None to configure. Every adapter always verifies origin TLS.
+**Purpose**: None to configure. Every adapter always verifies TLS on every
+outbound HTTPS request: the publisher origin, asset routes and redirects,
+integrations, auction providers, and identity providers, EC pull sync among
+them.
 
 **Default**: `true`
 
 `ts config validate` and `ts config push` reject `certificate_check = false`. A
 live config that still sets it keeps loading: settings load logs a warning,
-ignores the setting, and origin TLS stays verified. Remove the setting before
+ignores the setting, and TLS stays verified. Remove the setting before
 the next push. An origin whose certificate fails verification fails the
 request with the route's 502. For local development, serve the origin over
 plain HTTP instead of with a self-signed certificate.
+
+### `[[proxy.identity_endpoints]]`
+
+Explicitly authorize creative-proxy EC disclosure to selected HTTPS origin/path
+pairs. The default is empty and denies identity everywhere. This is independent
+of `allowed_domains`, whose empty list permits valid hosts: a grant never widens
+fetch permission, enables CORS, or enables identity on managed integration assets.
+
+```toml
+# DEFAULT OFF: leave absent until destinations are reviewed and approved.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
+```
+
+| Field         | Validation and matching                                                                             |
+| ------------- | --------------------------------------------------------------------------------------------------- |
+| `id`          | Unique, 1–64 ASCII letters, digits, underscore, or hyphen; used in diagnostics                      |
+| `origin`      | Absolute HTTPS DNS origin, optional nonzero port, no credentials, query, fragment, or non-root path |
+| `path_exact`  | Exact case-sensitive path; mutually exclusive with `path_prefix`                                    |
+| `path_prefix` | `/` or a path ending in `/`; mutually exclusive with `path_exact`                                   |
+
+Origins reject IP literals, wildcards, non-ASCII input, trailing dots, and empty
+labels; use punycode for internationalized names. Host case and explicit `:443`
+normalize to the same origin; another port differs. A root slash normalizes away.
+Paths begin with `/` and reject percent escapes, backslashes, whitespace/control
+characters, query/fragment delimiters, and literal `.`/`..` segments.
+`/events/` matches `/events/a`, but not `/events` or `/events-other/a`.
+Queries do not participate: paths serving both assets and query-selected events
+must be separated before granting identity.
+
+Duplicate normalized selectors are invalid, even with different IDs. Overlaps
+are allowed: exact wins, otherwise the longest prefix wins, independently of
+entry order. Invalid entries fail settings load and `ts config validate`.
+
+Matching uses the authenticated reconstructed target's serialized path; percent
+escapes remaining there withhold identity. Earlier signing may already have
+normalized encoded dot segments or backslashes. On redirects, the raw Location
+path is also checked for percent escapes/backslashes before resolution; query
+escapes alone do not disqualify a path. This policy describes the actual
+reconstructed destination, not unavailable original pre-sign text.
+
+Every hop removes reserved `ts-ec` query pairs, including carried signed values
+and redirect echoes, then appends one canonical existing cookie EC only when
+both the destination and request qualify. Raw `x-ts-ec` is ignored and missing
+identity is never generated. Consent must be unexpired, GPC absent, and both
+existing jurisdiction-based EC creation and EID persistence decisions affirmative;
+when TCF applies this includes effective Purpose 1 and Purpose 4 after signal
+conflict handling. Existing adapter withdrawal/marker finalization is preserved.
+A vendor signature covering a stripped EC value may break.
+
+Matching endpoints always use upstream cache bypass and make the entire response
+chain private/no-store, even without EC. Unmatched resources use platform-default
+caching and preserve origin policy and `Vary`; public caching is not guaranteed.
+Creative sends use fixed `TrustedServer/1.0` UA, valid client Accept/Language, and
+supported normalized encoding only, with no browser cookies, authorization,
+referrer, or client IP. Terminal 3xx responses carrying Location fail with 502.
+Click behavior is unchanged. See [First-Party Proxy](/guide/first-party-proxy)
+for execution, response protections, and the separate future #982 capability.
+
+Inspect inventory samples without fetching or changing config:
+
+```bash
+ts config proxy explain https://measurement.example.com/events/impression --json --app-config trusted-server.toml --manifest edgezero.toml --no-env
+```
+
+Explain uses the runtime evaluator and existing app-config selection/environment
+overlay semantics. Without `--app-config`, `<app.name>.toml` resolves beside the
+manifest; `--no-env` skips overlays. It takes no EC/consent input; conditional
+eligibility is not proof of reader consent. Allowed and blocked decisions exit
+0; invalid URL/configuration exits nonzero. Neither explain nor audit creates
+identity grants automatically.
+
+**Upgrade:** empty lists are omitted from stored JSON; older binaries reject
+nonempty endpoint configuration. Deploy compatible binaries first, then validate
+and publish rules. Old configs on new binaries immediately get default-off
+identity and new header/redirect behavior. The transition withholds identity;
+use a separately configured blue/green service if that gap is unacceptable.
+
+**Rollback:** publish an old-compatible config without this field before rolling
+back binaries. The old binary restores old forwarding/header behavior, a privacy
+regression requiring an operator decision. Existing signed URLs reaching TS use
+current rules, including after rule removal. Purge relevant shared-cache entries
+where stale responses could skip evaluation; already cached browser responses
+cannot be recalled. Bound rollout expectations by TTLs or use a separately
+reviewed signed-URL version/cache-busting transition.
 
 ### `[[proxy.asset_routes]]`
 

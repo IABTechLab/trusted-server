@@ -10,13 +10,19 @@ config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
 unavailable; live identity records use the separate prepared record capability.
 The logical record store is declared unconditionally, so its local provider
-requires a writable `EDGEZERO__ADAPTER__DATA_DIR`.
+requires a writable `EDGEZERO__ADAPTER__DATA_DIR`. The adapter's `/health`, `/ready`,
+and startup-failure responses follow the shared
+[operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
 
 Before listening, the native initializer reads the declared prepared stores,
 validates one bounded config envelope and its active secret references, and
-installs the real router. Missing or invalid inputs stop the process with a
-non-zero exit. Local development uses an isolated EdgeZero config-store map and
-`EDGEZERO__SECRETS__*` values. Legacy `TRUSTED_SERVER_CONFIG_*` and
+installs the real router. A missing or invalid config value or secret, or
+settings the application cannot start from, installs the failure router
+instead: the process listens, `/health` stays `200`, and `/ready` and every
+supported route answer `503`. A store the selected provider cannot prepare,
+such as a missing local config file, stops the process with a non-zero exit
+before it listens. Local development uses an isolated EdgeZero config-store
+map and `EDGEZERO__SECRETS__*` values. Legacy `TRUSTED_SERVER_CONFIG_*` and
 `TRUSTED_SERVER_SECRET_*` variables cannot rescue missing prepared inputs.
 See [Axum production startup](../../docs/guide/native-rc-demo.md) for the
 AWS providers and their checks.
@@ -26,9 +32,10 @@ The binary runs through EdgeZero's Axum production startup,
 listener; the adapter installs no logger of its own. The log level comes from
 `EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener address from
 `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default
-`127.0.0.1:8787`); an invalid value stops startup. The listener's ingress
-limits come from `EDGEZERO__ADAPTER__INGRESS__*` environment variables, and an
-invalid value also stops startup. The
+`127.0.0.1:8787`); an invalid value stops the process with a non-zero exit
+before it listens. The listener's ingress limits come from
+`EDGEZERO__ADAPTER__INGRESS__*` environment variables, and an invalid value
+also stops the process with a non-zero exit before it listens. The
 [Axum development guide](../../docs/guide/axum-dev.md#ingress-limits) lists
 them.
 

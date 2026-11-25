@@ -4,16 +4,19 @@ This guide covers setting up your Fastly account and Compute service for Trusted
 
 ## Support status
 
-| Adapter  | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization |
-| -------- | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | --------------------- |
-| `fastly` | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                  |
+| Adapter  | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization |
+| -------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | --------------------- |
+| `fastly` | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                  |
 
 The row above summarizes the
 [adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
-response does not prove that configuration loaded: Fastly serves `/health`
-before it constructs the application. If EdgeZero's managed logger fails to
-install, EdgeZero answers every route with its JSON `500`, `/health` included
-(see [When the logger fails to install](#when-the-logger-fails-to-install)).
+response does not prove that configuration loaded: Fastly serves GET/HEAD
+`/health` before it constructs the application. GET/HEAD `/ready` follows the
+ordinary initialization path, including required configuration-store access.
+If EdgeZero's managed logger fails to install, EdgeZero answers every route
+with its JSON `500`, `/health` and `/ready` included (see
+[When the logger fails to install](#when-the-logger-fails-to-install)). See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 ## Create a Fastly Account
 
@@ -335,7 +338,8 @@ Services deployed before this change link the physical store directly, such as
 opens `trusted_server_secrets` instead, and only a managed deployment creates
 that link. A plain `fastly compute publish` clones the active version's links,
 so it activates a version whose link is missing: app config fails to load and
-every publisher route returns 500 while `/health` keeps answering 200.
+every publisher route returns 503 while `/health` keeps answering 200 and
+`/ready` returns 503.
 
 When upgrading an existing service:
 
@@ -507,8 +511,9 @@ through Viceroy. The required keys are `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase`.
 
 The check deliberately proves both halves of startup. With no config entry, it
-requires `/health` to return 200 while the publisher route returns 500 and the
-log names the missing `trusted_server_config` entry. It then removes each required
+requires `/health` to return 200 while `/ready` and the publisher route return
+503 with the fixed unavailable body. Logs must identify the missing
+`trusted_server_config` input. It then removes each required
 secret independently and requires the corresponding setting path to fail.
 Finally, the publisher request must return 200, retain the stub-origin
 sentinel, rewrite an origin URL to the Fastly listener, and omit the original
@@ -520,6 +525,14 @@ tracked manifests remain untouched, including when smoke runs overlap. Its trap
 stops Viceroy and the stub origin and removes the temporary project. For a
 deployed service, provision and link the stores described above and write the
 three secrets through Fastly's secret-store interface.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Next Steps
 

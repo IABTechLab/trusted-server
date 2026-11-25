@@ -2,10 +2,12 @@
 
 The Axum binary loads its config and secrets once, before it listens, from
 stores that EdgeZero prepares: local files for development, or AWS AppConfig
-and Secrets Manager in production. A missing or invalid input stops the process
-with a non-zero exit before the port opens. On SIGTERM the server stops
-accepting connections and finishes in-flight requests within a configured
-grace.
+and Secrets Manager in production. A store the selected provider cannot prepare
+stops the process with a non-zero exit before the port opens. A missing or
+invalid config value or secret leaves the process listening with the failure
+router: `/health` stays `200`, and `/ready` and every route answer `503`. On
+SIGTERM the server stops accepting connections and finishes in-flight requests
+within a configured grace.
 
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
@@ -43,9 +45,10 @@ EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
   cargo run -p trusted-server-adapter-axum
 ```
 
-Leave one secret variable out to see startup fail before listening; the error
-names the config field of the missing secret. [Getting started](./getting-started)
-covers the development overlay and port settings.
+Leave one secret variable out to see startup fail: the process listens with the
+failure router, `/ready` answers `503`, and the error log names the config field
+of the missing secret. [Getting started](./getting-started) covers the
+development overlay and port settings.
 
 ## Startup sequence
 
@@ -62,15 +65,24 @@ flowchart TD
     D --> E[Install immutable snapshots and application router]
     E --> F[Listen]
     B --> X[Fail before listening]
-    C --> X
-    D --> X
+    C --> Y[Install the failure router]
+    D --> Y
+    E --> Y
+    Y --> F
     F --> G[Stop admission and drain on shutdown]
 ```
 
 The declared stores are `trusted_server_config`, `trusted_server_secrets` and
 `trusted_server_kv`. The record layout is declared before provider preparation;
-provider binding selection belongs to EdgeZero. The configuration key is `trusted_server_config`.
-Required-provider and required-value failures prevent readiness. Startup bounds
+provider binding selection belongs to EdgeZero. The configuration key is
+`trusted_server_config`. Required-provider and required-value failures prevent
+readiness. A provider preparation failure, including the selected record
+provider, stops the process before it listens. A failure to read or verify the
+envelope, load a required secret, validate the runtime settings, bind the
+configured EC record store or build the application router installs the failure
+router instead: the process listens, `/health` stays `200`, and `/ready` and
+every supported route answer `503` under the
+[operational probe contract](./api-reference#operational-probe-contract). Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running
 snapshots are immutable. Restart to adopt changed configuration or secrets.
@@ -85,7 +97,7 @@ automatic key rotation are unavailable. Unsupported configured consumers, such
 as enabled request signing, fail at startup. Native EC persistence uses the
 shared core record store. Reader Geo defaults Off; the optional protected
 CloudFront selection below supplies country/subdivision facts without granting
-consent. An AWS region is not visitor geography.
+consent. An AWS region is not a visitor's geography.
 
 ## Inputs
 

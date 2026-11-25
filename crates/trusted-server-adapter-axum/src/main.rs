@@ -15,9 +15,11 @@ use trusted_server_adapter_axum::startup::initialize_native;
 /// `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT`, and prepares the
 /// declared config and secret stores from the selected providers. The
 /// initializer then loads and validates the settings from those stores and
-/// installs the router. A hosting, Geo, settings, store, ingress or bind
+/// installs the router. A hosting, Geo, store preparation, ingress or bind
 /// failure returns before any request is served, and the process exits
-/// non-zero.
+/// non-zero. A store read, settings or state failure in the initializer
+/// installs the failure router instead, which keeps `/health` live and
+/// answers `/ready` and every supported route with `503`.
 fn main() {
     let options = match native_options() {
         Ok(options) => options,
