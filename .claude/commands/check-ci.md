@@ -10,4 +10,7 @@ Run all CI checks locally, in order. Stop and report if any step fails.
 8. `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- dev lint domains --changed-vs origin/main` (use the PR's base branch in place of `main` when it targets another branch)
 9. `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs`
 
+10. Publisher attestation fixtures (run `cd docs && npm ci` first): `node scripts/publisher-attestation/generate.mjs --check && node --test scripts/publisher-attestation/*.test.mjs`
+11. `docs/node_modules/.bin/eslint --config scripts/publisher-attestation/eslint.config.mjs "scripts/publisher-attestation/*.mjs"` and `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "scripts/publisher-attestation/*.mjs"`
+
 Report a summary of all results when done.

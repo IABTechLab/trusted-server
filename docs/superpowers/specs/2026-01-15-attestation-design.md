@@ -4,6 +4,8 @@
 > **Author:** Architecture Team
 > **Date:** January 2026
 
+> **Superseded for publisher/runtime attestation:** [Publisher attestation](2026-11-04-publisher-attestation-design.md) is the current contract. The proposal metadata above is historical; this document's full-configuration and embedded-checksum model is not a current requirement. Binary release evidence follows its separate release specification.
+
 ## Problem Statement
 
 The Trusted Server is a WASM-based edge computing system that handles ad serving with pluggable **integrations** (Prebid, Lockr, Didomi, etc.). Publishers configure these integrations via `trusted-server.toml`. The challenge:
