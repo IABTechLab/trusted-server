@@ -11,7 +11,7 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -241,7 +241,10 @@ async fn dispatch_ec_route(
     };
     // Borrows of the graph and context remain local to this request. Neither
     // the non-Send graph nor a response snapshot enters shared App extensions.
-    let graph = ec.graph.as_ref().filter(|_| ec.creation_allowed);
+    // A client refused creation keeps the graph so bidders receive only an EC
+    // with a consented row; its writes are gated separately below.
+    let graph = ec.graph.as_ref();
+    let use_store = ec.store_writes_allowed();
     let auction = AuctionDispatch {
         integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
@@ -256,8 +259,11 @@ async fn dispatch_ec_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                graph,
-                Some(state.identity.partners()),
+                AuctionIdentity {
+                    graph,
+                    registry: Some(state.identity.partners()),
+                    persist_body: ec.creation_allowed,
+                },
                 &mut ec.context,
                 services,
                 req,
@@ -358,7 +364,7 @@ async fn dispatch_ec_route(
             &mut ec.context,
             ec.eids_cookie.as_deref(),
             &ec.sharedid,
-            true,
+            use_store,
             &mut response,
         )
         .await;

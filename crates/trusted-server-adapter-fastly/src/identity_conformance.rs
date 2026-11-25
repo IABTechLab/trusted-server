@@ -17,7 +17,7 @@ use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
     Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
-    verify_failed_ec_creation, verify_http_contract,
+    verify_failed_ec_creation, verify_http_contract, verify_known_non_browser_navigation,
 };
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
@@ -331,6 +331,12 @@ impl FastlyAdapter {
                 Some("t13d1516h2_example_example"),
                 None,
             ));
+        }
+        if api.is_some_and(|request| request.known_non_browser) {
+            values.device_signals = Some(DeviceSignals {
+                known_browser: Some(false),
+                ..DeviceSignals::derive(USER_AGENT, None, None)
+            });
         }
         let queue = TelemetryQueue::default();
         let mut observation = None;
@@ -770,6 +776,12 @@ fn geo_consent_fastly_forwarding() {
         serde_json::json!("US"),
         "should export trusted IPv6 location"
     );
+}
+
+#[test]
+fn known_non_browser_navigation_fastly() {
+    let store = RecordingStore::new(false);
+    verify_known_non_browser_navigation(&mut FastlyAdapter::new(store.clone()), &store);
 }
 
 #[test]
