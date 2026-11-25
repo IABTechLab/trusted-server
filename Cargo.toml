@@ -65,7 +65,7 @@ edgezero-core = { git = "https://github.com/IABTechLab/edgezero", rev = "d063a8e
 env_logger = "0.11"
 error-stack = "0.6"
 esi = "0.7.2"
-fastly = "0.13"
+fastly = "0.13.3"
 flate2 = "1.1"
 futures = "0.3"
 # `ts dev lint domains` / `install-hooks` drive all git access through
@@ -117,7 +117,7 @@ tracing = "0.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
-url = "2.5.8"
+url = "2.5.9"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.21", features = ["derive"] }
