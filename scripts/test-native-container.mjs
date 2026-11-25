@@ -291,7 +291,9 @@ http.createServer((req, res) => {
       }
       assert.equal(result.status, 200)
       assert.equal(result.body, 'ok')
-      assert.equal(result.headers.get('x-container-snapshot'), 'synthetic')
+      // Operational probes skip finalization (#1142), so the envelope's
+      // configured response headers never reach /health.
+      assert.equal(result.headers.get('x-container-snapshot'), null)
       return true
     },
     15000,
@@ -301,6 +303,8 @@ http.createServer((req, res) => {
   const page = await request(app.endpoint, '/')
   assert.equal(page.status, 200)
   assert.match(page.body, /container-fixture/)
+  // The finalized page proves the envelope snapshot was loaded.
+  assert.equal(page.headers.get('x-container-snapshot'), 'synthetic')
   const jsPath = page.body.match(/\/static\/tsjs=[^"'\s<>]+/)?.[0]
   assert(jsPath, 'page must inject actual TSJS URL')
   const js = await request(app.endpoint, jsPath)
