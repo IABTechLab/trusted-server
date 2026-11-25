@@ -1076,6 +1076,9 @@ try {
   proof.healthWhileStoragePausedMs = Date.now() - healthStarted
   let completed
   proof.shutdownMs = await drain(app, heldRequest, async () => {
+    // The selected write is already released; release any other paused
+    // request write too so the response does not wait out the grace.
+    for (const entry of [...pending]) entry.resolve()
     completed = await article
     assert(
       !completed.error,
