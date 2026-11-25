@@ -11,7 +11,7 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -20,6 +20,7 @@ use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRE
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::integrations::{
@@ -240,7 +241,10 @@ async fn dispatch_ec_route(
     };
     // Borrows of the graph and context remain local to this request. Neither
     // the non-Send graph nor a response snapshot enters shared App extensions.
-    let graph = ec.graph.as_ref().filter(|_| ec.creation_allowed);
+    // A client refused creation keeps the graph so bidders receive only an EC
+    // with a consented row; its writes are gated separately below.
+    let graph = ec.graph.as_ref();
+    let use_store = ec.store_writes_allowed();
     let auction = AuctionDispatch {
         integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
@@ -255,8 +259,11 @@ async fn dispatch_ec_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                graph,
-                Some(state.identity.partners()),
+                AuctionIdentity {
+                    graph,
+                    registry: Some(state.identity.partners()),
+                    persist_body: ec.creation_allowed,
+                },
                 &mut ec.context,
                 services,
                 req,
@@ -342,20 +349,22 @@ async fn dispatch_ec_route(
             .await
         }
     };
-    if let Some(lookups) = page_lookups {
+    let mut response = result.unwrap_or_else(|error| http_error(&error));
+    if let Some(lookups) = page_lookups
+        && !NavigationPermit::is_redirect(response.status())
+    {
         state
             .identity
             .collect_identity_lookups(lookups, &mut ec.context)
             .await;
     }
-    let mut response = result.unwrap_or_else(|error| http_error(&error));
     state
         .identity
         .finalize(
             &mut ec.context,
             ec.eids_cookie.as_deref(),
             &ec.sharedid,
-            true,
+            use_store,
             &mut response,
         )
         .await;

@@ -16,8 +16,8 @@ use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
-    Scenario, configure_http_fixture, tcf_consent_cookie, verify_failed_ec_creation,
-    verify_http_contract,
+    Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
+    verify_failed_ec_creation, verify_http_contract, verify_known_non_browser_navigation,
 };
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
@@ -26,8 +26,7 @@ use trusted_server_core::test_support::scripted_client::{
 use edgezero_core::outbound::HttpClient;
 
 use super::{
-    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, take_navigation_lookups,
-    with_finalization,
+    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, with_finalization,
 };
 use crate::platform::RequestGeo;
 use crate::sandbox::SandboxCounters;
@@ -183,7 +182,12 @@ impl FastlyAdapter {
                 } else {
                     reply.header("content-type", mime)
                 };
-                reply.body(DOCUMENT)
+                reply
+                    .header("cache-control", "public, max-age=600, s-maxage=600")
+                    .header("surrogate-control", "max-age=600")
+                    .header("cdn-cache-control", "public, max-age=600")
+                    .header("cloudflare-cdn-cache-control", "public, max-age=600")
+                    .body(DOCUMENT)
             },
         );
         let geo = match navigation.geo {
@@ -265,13 +269,17 @@ impl FastlyAdapter {
                 None,
             ));
         }
+        if api.is_some_and(|request| request.known_non_browser) {
+            values.device_signals = Some(DeviceSignals {
+                known_browser: Some(false),
+                ..DeviceSignals::derive(USER_AGENT, None, None)
+            });
+        }
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let mut cache_control = None;
+        let mut edge_cache_headers_present = false;
         let origin = self.origin.clone();
-        // As in `serve`, drop identity lookups an earlier request on this
-        // thread left in the request-local slot.
-        drop(take_navigation_lookups());
         let delivery = with_finalization(&inputs, |finalize| {
             run_request_with_registries_and_hooks_for_test(
                 &self.retained.app,
@@ -303,6 +311,13 @@ impl FastlyAdapter {
                         .get("cache-control")
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned);
+                    edge_cache_headers_present = [
+                        "surrogate-control",
+                        "cdn-cache-control",
+                        "cloudflare-cdn-cache-control",
+                    ]
+                    .iter()
+                    .any(|name| response.headers().contains_key(*name));
                     let cookies = response
                         .headers()
                         .get_all("set-cookie")
@@ -342,11 +357,11 @@ impl FastlyAdapter {
             )
         });
         handle_delivery(delivery, &counters, |_| {});
-        drop(take_navigation_lookups());
         ApiObservation {
             response: observation.expect("should deliver a finalized response"),
             origin_requests: self.origin.requests().len() - before_requests,
             cache_control,
+            edge_cache_headers_present,
         }
     }
 }
@@ -365,4 +380,15 @@ fn identity_conformance_fastly() {
     let store = RecordingStore::new(true);
     let mut adapter = FastlyAdapter::new(store.clone());
     verify_failed_ec_creation(&mut adapter, &store);
+}
+
+#[test]
+fn known_non_browser_navigation_fastly() {
+    let store = RecordingStore::new(false);
+    verify_known_non_browser_navigation(&mut FastlyAdapter::new(store.clone()), &store);
+}
+
+#[test]
+fn api_identity_expiries_fastly() {
+    verify_api_identity_expiries(&mut FastlyAdapter::new(RecordingStore::new(false)));
 }

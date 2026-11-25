@@ -32,12 +32,18 @@ not promise that browsers retain cookies for the entire requested lifetime.
 
 Both defaults are omitted when serializing configuration. With no new settings,
 responses, storage operations and cookie attributes match #1646 at
-`6bc15305fdf340f0a38fd79423047f2ecfdf119f`. The switch defaults to false. Explicitly
+`aa315593fdf7b801ace5b5a12581995958eb74f2`, the base head merged into this
+proposal. That includes WB-1's core-generated identity expiries on any finalized
+response and their private, non-storable cache policy. The switch defaults to false. Explicitly
 configuring another lifetime changes positive issuance even with renewal disabled;
 it does not cause returning cookies to be reissued. No runtime environment reads,
 extra secret, storage schema, dependency or EdgeZero change is introduced.
-Older binaries reject unknown EC fields: remove the new settings and republish
-before rolling back. Disabling renewal does not shorten cookies already held by
+Older binaries reject unknown EC fields, so deploy the new binary to every
+service version that reads a config store before pushing config that sets either
+field, and remove the new settings and republish before rolling back. The pinned
+EdgeZero environment overlay overrides only keys already present in the TOML, so
+`TRUSTED_SERVER__EC__*` overrides for these fields take effect only once the key
+is written there. Disabling renewal does not shorten cookies already held by
 a browser; a changed lifetime applies on the next positive issuance or renewal.
 
 ## Supported platforms
@@ -50,8 +56,9 @@ switch values. Adding issuance or renewal to those platforms is a separate
 follow-up and may require platform storage work outside this repository.
 
 Their unsupported EC endpoint remains a private empty 501 for GET/POST and 405
-for unsupported methods, without additional request parsing or identity work.
-No new eligibility path is introduced there.
+for unsupported methods, with no identity work beyond #1646's existing request
+preparation, which can still return its private 400. No new eligibility path is
+introduced there.
 
 ## Eligibility and output
 
@@ -66,6 +73,9 @@ Reuse #1646's classification and final-response gate exactly:
   prefix uses the publisher fallback and follows its document rules.
 - Named API/local routes, including EC POST, never renew a returning cookie even
   when document-looking headers are supplied.
+- The client must be allowed identity creation. #1646 gives a client it refuses
+  (a known non-browser) no navigation permit, so its held EC is never renewed
+  and renewal adds no record I/O for it.
 - Request consent must allow EC and must not explicitly withdraw consent.
 - Require a valid incoming browser EC equal to the final active EC. Ignore the
   incoming `x-ts-ec` header, as #1646 does. Do not add a header-agreement rule.
@@ -89,6 +99,11 @@ The user-approved rule adds no reads or writes solely for renewal:
 | Known read failure                                         | Suppressed                                                   |
 | Navigation write failed                                    | Suppressed                                                   |
 | Matching consented record, successful or unnecessary write | Allowed                                                      |
+
+The asymmetry between the unavailable-store and read-failure rows is intended:
+with no bound or openable store nothing is observed, so the record stays unread,
+while a read that was attempted and failed is an observation that suppresses
+renewal.
 
 Existing record lookup, conditional-write, orphan recovery and after-response
 rules remain unchanged. Renewal does not extend record TTL or retention. Record
@@ -115,14 +130,17 @@ renewal after an explicit withdrawal carried on the current request.
 
 Every response that gains Set-Cookie is private and non-storable in shared caches
 under `enforce_set_cookie_cache_privacy`. Preserve stricter policies and remove
-edge-cache directives. Fastly must run its terminal guard after late identity
-finalization; the other adapters retain their existing shared privacy middleware.
+edge-cache directives. The shared core finalization applies this guard on every
+adapter; Fastly's terminal guard and the other adapters' privacy middleware
+reapply it after later header changes.
 
 Some returning-reader pages are already private today: assembled/ad-synthesized
 HTML uses `no-store, private`, and inactive ad-stack documents can retain a short
 private browser policy. Other responses can retain a shared policy when no cookie
 or personalization rule applies. Renewal makes those otherwise shareable final
-responses private too; it does not newly change every page's cacheability.
+responses private too, and on inactive ad-stack documents it replaces the
+generated `private, max-age=60` browser allowance with `private, max-age=0`. It
+does not newly change every page's cacheability.
 For example, the base inactive-ad-stack non-OK HTML path preserves a public
 origin policy when no other privacy rule applies. This is code-supported
 cacheability, not a measurement of any deployed shared cache.
@@ -133,6 +151,14 @@ independence/bypass rules. It is not a blanket prohibition on storing a neutral,
 cookie-free raw template. Final personalized or cookie-bearing responses must
 never become shared-cache entries.
 
+Because there is no method or success-status restriction, renewing HEAD, non-GET
+and HTML error documents also carry Set-Cookie and become private.
+
+**Limitation:** an origin `Set-Cookie: ts-ec=...` on an eligible document passes
+through, as it already does for creation in #1646, so renewal can append a second
+`ts-ec` header to it. Stripping origin identity cookies from eligible responses is
+a lifecycle change for #1646, not this proposal.
+
 This changes the meaning of #1595's returning-reader acceptance rule when enabled:
 returning readers now intentionally receive Set-Cookie on eligible visits. The
 issue and DEC-13 decision must explicitly acknowledge this before merge.
@@ -142,12 +168,33 @@ issue and DEC-13 decision must explicitly acknowledge this before merge.
 Test lifetime defaults, omission, custom values, invalid bounds and all positive
 issuance entry points. Test every observed record state separately, the exact
 method/status/document matrix, API/asset exclusions, withdrawal, no extra record
-operations and private renewal responses. Compare disabled/default response
-fixtures to the base and verify actual routed Fastly/Axum behavior, including
-late finalization. Verify Cloudflare/Spin unchanged for both switch values.
+operations and private renewal responses. With renewal disabled, check that
+origin headers and cookies match the expected #1646 matrix, and run #1646's own
+lifecycle and WB-1 tests unchanged against this branch. Verify routed Fastly
+behavior through the router plus the entry point's finalization and terminal
+helpers, and Axum through its native routes. Verify Cloudflare/Spin unchanged for
+both switch values on EC GET/POST.
 
 Run targeted core and adapter tests, pinned isolated Viceroy 0.21.0, touched-target
 clippy, Rust formatting, changed-document formatting and the runtime environment
 guard. Hosted CI and independent full-PR review precede handoff. Do not run the
 full CI matrix locally. Safari/ITP, deployed platform and real-CMP qualification
 are not established by local unit/runtime fixtures.
+
+## Review log
+
+- Round 1 (Claude Code, fresh session, after merging #1646 at `aa315593f`): no
+  blocking findings. Corrected the cookie-privacy section (core finalization
+  applies the guard on every adapter; renewal replaces the inactive ad-stack
+  `max-age=60` allowance), stated the unavailable-store versus read-failure
+  asymmetry, narrowed the Cloudflare/Spin EC route wording to #1646's existing
+  request preparation, and reworded the verification claims to match the actual
+  tests. Tightened the creation and rotation tests to assert exactly one EC
+  Set-Cookie.
+- Round 2 (Claude Code, Sonnet, fresh session): no blocking findings. Added the
+  forward-rollout order and the environment-overlay caveat, noted that renewing
+  HEAD, non-GET and error documents become private, and recorded origin `ts-ec`
+  pass-through on eligible documents as a limitation inherited from #1646. Its
+  claim of a missing Cloudflare parity test was wrong: the test is in the
+  Cloudflare `tests/routes.rs`. Did not restate #1646's consent-default
+  semantics, which this proposal does not change.

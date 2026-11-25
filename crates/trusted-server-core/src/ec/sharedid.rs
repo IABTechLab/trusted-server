@@ -405,17 +405,13 @@ fn decide_write_back(input: &SharedIdDecision<'_>) -> SharedIdWriteBack {
     }
 }
 
-/// Expires the `SharedID` cookies on a navigation whose EC consent is
-/// unusable, when the request carried them and the server writes them.
+/// Expires managed `SharedID` cookies on any finalized response after denial
+/// or opt-out, when the request carried them (S2S design §10, WB-1).
 pub(crate) fn expire_sharedid_on_denied_consent(
     settings: &Settings,
     sharedid: &SharedIdRequest,
-    navigation: bool,
     response: &mut Response<EdgeBody>,
 ) {
-    if !navigation {
-        return;
-    }
     let decision = decide_write_back(&SharedIdDecision {
         request: sharedid,
         stored: None,

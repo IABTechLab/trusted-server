@@ -189,10 +189,12 @@ impl Fixture {
             .app
             .read_request(&self.services, &request)
             .expect("should read identity request");
+        identity.creation_allowed = case.allow_creation;
         self.app
-            .prepare_navigation(&mut identity.context, &request, case.allow_creation)
+            .prepare_navigation(&mut identity.context, &request, identity.creation_allowed)
             .await;
         update(&mut identity.context);
+        let use_store = identity.store_writes_allowed();
         let mut response = http::Response::builder()
             .status(case.status)
             .header(header::CONTENT_TYPE, case.content_type)
@@ -205,7 +207,7 @@ impl Fixture {
                 &mut identity.context,
                 identity.eids_cookie.as_deref(),
                 &identity.sharedid,
-                true,
+                use_store,
                 &mut response,
             )
             .await;
@@ -235,7 +237,7 @@ impl Default for Case {
             document: true,
             consent: Some(true),
             ec: Some(EC),
-            allow_creation: false,
+            allow_creation: true,
             conflicting_header: false,
         }
     }
@@ -606,21 +608,30 @@ async fn ignored_identity_header_does_not_block_cookie_renewal() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_consent_and_invalid_cookie_never_renew() {
-    for case in [
-        Case {
-            consent: None,
-            ..Case::default()
-        },
-        Case {
-            ec: Some("invalid"),
-            ..Case::default()
-        },
+    // Without a bound store an admitted document visit cannot mint, so an
+    // invalid incoming cookie reaches the renewal gate itself.
+    for (case, store_available) in [
+        (
+            Case {
+                consent: None,
+                ..Case::default()
+            },
+            true,
+        ),
+        (
+            Case {
+                ec: Some("invalid"),
+                ..Case::default()
+            },
+            false,
+        ),
     ] {
-        let fixture = Fixture::new(true, true);
+        let fixture = Fixture::new(true, store_available);
         let (response, _) = fixture.visit(case, |_| {}).await;
         assert!(
             cookies(&response).is_empty(),
-            "should require a valid incoming EC and positive consent"
+            "should require a valid incoming EC and positive consent: {:?}",
+            cookies(&response)
         );
         fixture.assert_no_store_io();
     }
@@ -807,10 +818,16 @@ async fn withdrawal_preserves_zero_lifetime_with_sliding_on_or_off() {
 
 fn assert_new_ec_lifetime(response: &Response) {
     let set = cookies(response);
-    let ec = set
+    let issued: Vec<_> = set
         .iter()
-        .find(|value| value.starts_with("ts-ec="))
-        .expect("should issue EC cookie");
+        .filter(|value| value.starts_with("ts-ec="))
+        .collect();
+    assert_eq!(
+        issued.len(),
+        1,
+        "should issue exactly one EC cookie without a second renewal: {set:?}"
+    );
+    let ec = issued[0];
     assert!(
         !ec.starts_with(&format!("ts-ec={EC};")),
         "should issue a fresh identity"
@@ -845,6 +862,25 @@ async fn publisher_creation_and_ec_post_creation_use_configured_lifetime() {
         );
         assert_new_ec_lifetime(&response);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refused_client_gets_no_renewal_or_record_io() {
+    let fixture = Fixture::new(true, true);
+    let (response, _) = fixture
+        .visit(
+            Case {
+                allow_creation: false,
+                ..Case::default()
+            },
+            |_| {},
+        )
+        .await;
+    assert!(
+        cookies(&response).is_empty(),
+        "should not renew a client refused identity creation"
+    );
+    fixture.assert_no_store_io();
 }
 
 fn orphan(context: &mut EcContext) {
