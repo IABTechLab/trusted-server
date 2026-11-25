@@ -1351,7 +1351,13 @@ data. The publisher operates TS and already knows whether the visitor is
 signed in, so TS asks the publisher rather than the page.
 
 **Configuration.** `[ec.hashed_email]` names one publisher status endpoint
-(`endpoint`, `https` only) and a `timeout_ms` (1–1000, default 100). Both
+(`endpoint`, `https` only) and a `timeout_ms` (1–1000, default 100), and
+optionally how to call it: `method` (`GET`, the default, or `POST`), `body`
+(only with `POST`) and `headers`, a table of extra request headers whose
+values are fixed strings or `{ cookie = "name" }`. A body without `POST`, a
+header name that is not valid or that the call sets itself (`Cookie`, `Host`,
+`Content-Length`, `Transfer-Encoding`), a fixed value that is not a valid
+header value and an empty cookie name fail startup and deploy validation. Both
 coordinators (page and after-response) share it. Provider kinds that can send
 a hashed email declare the hashed-email capability (`liveramp`, `id5`); each
 such provider opts in under `[ec.identity_providers.settings.hashed_email]`
@@ -1378,8 +1384,16 @@ both phases makes one call per phase. The call is made before rate-limit and
 destination checks, so a provider those checks then skip may still have
 caused it.
 
-**The call.** A `GET` to `endpoint` carrying the visitor's whole `Cookie`
-header as received and `Accept: application/json`, sent through the
+**The call.** A request with `method` to `endpoint` carrying the visitor's
+whole `Cookie` header as received, `Accept: application/json`, the `body` with
+`Content-Type: application/json` when there is one, and the configured
+`headers`, which override those two. A header taken from a cookie carries that
+cookie's first non-empty value, unquoted; when the request has no such cookie
+the visitor cannot be signed in, so no call is made, as for a request without
+cookies. Header values are marked sensitive. Publishers whose session check
+needs a header rather than the `Cookie` header (for example a token from a
+cookie in `X-Session`), or a `POST`, can point TS at their existing endpoint
+this way. The call is sent through the
 coordinator's `LookupTransport` with `timeout_ms` as its cutoff and the same
 64 KiB body cap. The call and the lookups share one deadline, the phase's
 identity budget: lookups start when the call returns, with the budget less

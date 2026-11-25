@@ -35,7 +35,9 @@ use crate::ec::provider::{
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
 
-use crate::settings::{HashedEmailSource, IdentityProviderConfig};
+use crate::settings::{
+    HashedEmailHeader, HashedEmailMethod, HashedEmailSource, IdentityProviderConfig,
+};
 
 /// Coordinates server-side identity lookups for one navigation.
 ///
@@ -216,6 +218,15 @@ pub struct ProviderCoordinator<P = Box<dyn IdentityProvider>> {
 struct StatusEndpoint {
     url: url::Url,
     timeout: Duration,
+    method: http::Method,
+    body: bytes::Bytes,
+    headers: Box<[(http::HeaderName, StatusHeader)]>,
+}
+
+/// A validated extra header of the status call.
+enum StatusHeader {
+    Value(http::HeaderValue),
+    Cookie(Box<str>),
 }
 
 /// A provider that passed eligibility, consent, cookie and opt-out checks
@@ -303,6 +314,10 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             Report::new(ProviderConfigError::Invalid)
                 .attach("ec.hashed_email.endpoint must be an https URL with a host")
         })?;
+        if let Some(message) = source.request_error() {
+            return Err(Report::new(ProviderConfigError::Invalid)
+                .attach(format!("ec.hashed_email: {message}")));
+        }
         let timeout = Duration::from_millis(source.timeout_ms);
         if timeout >= self.budget
             && let Some(registered) = self
@@ -318,7 +333,46 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 registered.id
             )));
         }
-        self.hashed_email = Some(StatusEndpoint { url, timeout });
+        let invalid_header = |name: &str| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach(format!("ec.hashed_email: header `{name}` is invalid"))
+        };
+        let headers = source
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let header_name =
+                    http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+                        .map_err(|_| invalid_header(name))?;
+                let value = match value {
+                    HashedEmailHeader::Value(value) => {
+                        let mut value =
+                            http::HeaderValue::from_str(value).map_err(|_| invalid_header(name))?;
+                        value.set_sensitive(true);
+                        StatusHeader::Value(value)
+                    }
+                    HashedEmailHeader::Cookie { cookie } => {
+                        StatusHeader::Cookie(Box::from(cookie.trim()))
+                    }
+                };
+                Ok((header_name, value))
+            })
+            .collect::<Result<Box<[_]>, Report<ProviderConfigError>>>()?;
+        let body = source
+            .body
+            .as_ref()
+            .map_or_else(bytes::Bytes::new, |body| bytes::Bytes::from(body.clone()));
+        let method = match source.method {
+            HashedEmailMethod::Get => http::Method::GET,
+            HashedEmailMethod::Post => http::Method::POST,
+        };
+        self.hashed_email = Some(StatusEndpoint {
+            url,
+            timeout,
+            method,
+            body,
+            headers,
+        });
         Ok(self)
     }
 
@@ -460,9 +514,11 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     /// Calls the publisher's status endpoint once and returns its JSON body,
     /// or `None` when it gives no usable reply (spec §8.7).
     ///
-    /// The call carries the visitor's whole `Cookie` header; a request
-    /// without cookies cannot be signed in, so it makes no call. Neither the
-    /// body nor any hashed email is logged.
+    /// The call uses the configured method and body and carries the
+    /// visitor's whole `Cookie` header and the configured headers; a request
+    /// without cookies, or without a cookie a header is taken from, cannot be
+    /// signed in, so it makes no call. Neither the body nor any hashed email
+    /// is logged.
     async fn hashed_email_status<T: LookupTransport>(
         &self,
         transport: &T,
@@ -485,12 +541,41 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             http::header::ACCEPT,
             http::HeaderValue::from_static("application/json"),
         );
+        if !endpoint.body.is_empty() {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+        }
         headers.insert(http::header::COOKIE, cookie);
+        for (name, value) in &endpoint.headers {
+            let value = match value {
+                StatusHeader::Value(value) => value.clone(),
+                StatusHeader::Cookie(cookie_name) => {
+                    // Without the cookie the visitor cannot be signed in.
+                    let Some(found) = cookies.get(cookie_name) else {
+                        log::debug!(
+                            "Identity lookup: hashed email status skipped: no `{cookie_name}` cookie"
+                        );
+                        return None;
+                    };
+                    let Ok(mut found) = http::HeaderValue::from_str(found) else {
+                        log::debug!(
+                            "Identity lookup: hashed email status skipped: `{cookie_name}` cookie is not a valid header value"
+                        );
+                        return None;
+                    };
+                    found.set_sensitive(true);
+                    found
+                }
+            };
+            headers.insert(name.clone(), value);
+        }
         let request = ProviderRequest {
-            method: http::Method::GET,
+            method: endpoint.method.clone(),
             url: endpoint.url.clone(),
             headers,
-            body: bytes::Bytes::new(),
+            body: endpoint.body.clone(),
             context: None,
         };
         let in_flight = transport.start(
@@ -1438,6 +1523,8 @@ mod tests {
         sent: RefCell<Vec<String>>,
         /// The `Cookie` header and cutoff of each status call.
         status_calls: RefCell<Vec<(Option<String>, Duration)>>,
+        /// The method, headers and body of each status call.
+        status_requests: RefCell<Vec<(http::Method, http::HeaderMap, bytes::Bytes)>>,
         /// The cutoff of each lookup batch.
         lookup_budgets: RefCell<Vec<Duration>>,
         /// How long the status reply takes to arrive.
@@ -1455,6 +1542,7 @@ mod tests {
                 status,
                 sent: RefCell::default(),
                 status_calls: RefCell::default(),
+                status_requests: RefCell::default(),
                 lookup_budgets: RefCell::default(),
                 status_delay: Duration::ZERO,
             }
@@ -1486,6 +1574,11 @@ mod tests {
                             .and_then(|cookie| cookie.to_str().ok())
                             .map(str::to_owned);
                         self.status_calls.borrow_mut().push((cookie, budget));
+                        self.status_requests.borrow_mut().push((
+                            value.method.clone(),
+                            value.headers.clone(),
+                            value.body.clone(),
+                        ));
                     }
                     self.sent.borrow_mut().push(value.url.to_string());
                     (provider, is_status)
@@ -2255,6 +2348,31 @@ mod tests {
         HashedEmailSource {
             endpoint: STATUS_URL.to_owned(),
             timeout_ms: 150,
+            method: HashedEmailMethod::Get,
+            body: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// A `POST` status call whose `x-session` header comes from the
+    /// `session` cookie, as a publisher's profile endpoint may require.
+    fn post_status_source() -> HashedEmailSource {
+        HashedEmailSource {
+            method: HashedEmailMethod::Post,
+            body: Some("{}".to_owned()),
+            headers: BTreeMap::from([
+                (
+                    "X-Session".to_owned(),
+                    HashedEmailHeader::Cookie {
+                        cookie: "session".to_owned(),
+                    },
+                ),
+                (
+                    "x-requested-with".to_owned(),
+                    HashedEmailHeader::Value("XMLHttpRequest".to_owned()),
+                ),
+            ]),
+            ..status_source()
         }
     }
 
@@ -2326,6 +2444,129 @@ mod tests {
                 Duration::from_millis(150)
             )],
             "should forward the whole Cookie header with the status timeout"
+        );
+    }
+
+    fn post_hashed_email_coordinator() -> ProviderCoordinator<HashedEmailProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&post_status_source()))
+        .expect("should accept a POST status endpoint")
+    }
+
+    #[test]
+    fn a_post_status_call_sends_its_body_and_a_header_from_a_cookie() {
+        // Arrange
+        let coordinator = post_hashed_email_coordinator();
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=\"s-1|abc\"; other=o-1",
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up the source with the hashed email"
+        );
+        let requests = transport.status_requests.borrow();
+        let [(method, headers, body)] = requests.as_slice() else {
+            panic!("should make one status call, made {}", requests.len());
+        };
+        assert_eq!(*method, http::Method::POST, "should POST");
+        assert_eq!(body.as_ref(), b"{}", "should send the configured body");
+        let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        assert_eq!(
+            header("x-session"),
+            Some("s-1|abc"),
+            "should send the unquoted session cookie as x-session"
+        );
+        assert!(
+            headers
+                .get("x-session")
+                .is_some_and(http::HeaderValue::is_sensitive),
+            "should mark the cookie value sensitive"
+        );
+        assert_eq!(
+            header("x-requested-with"),
+            Some("XMLHttpRequest"),
+            "should send the fixed header"
+        );
+        assert_eq!(
+            header("content-type"),
+            Some("application/json"),
+            "should send the body as JSON"
+        );
+        assert_eq!(
+            header("cookie"),
+            Some("session=\"s-1|abc\"; other=o-1"),
+            "should still forward the whole Cookie header"
+        );
+    }
+
+    #[test]
+    fn a_status_call_needing_a_missing_cookie_is_not_made() {
+        // Arrange
+        let coordinator = post_hashed_email_coordinator();
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "other=o-1",
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source needing a hashed email"
+        );
+        assert!(
+            transport.status_requests.borrow().is_empty(),
+            "should make no status call without the session cookie"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_get_status_call_sends_no_body() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        let requests = transport.status_requests.borrow();
+        let [(method, headers, body)] = requests.as_slice() else {
+            panic!("should make one status call, made {}", requests.len());
+        };
+        assert_eq!(*method, http::Method::GET, "should GET by default");
+        assert!(body.is_empty(), "should send no body");
+        assert!(
+            headers.get(http::header::CONTENT_TYPE).is_none(),
+            "should send no content type without a body"
         );
     }
 
@@ -2575,7 +2816,7 @@ mod tests {
         let insecure = with_path()
             .with_hashed_email_source(Some(&HashedEmailSource {
                 endpoint: "http://status.example.com/user".to_owned(),
-                timeout_ms: 150,
+                ..status_source()
             }))
             .err()
             .expect("should reject a non-https status endpoint");
@@ -2588,6 +2829,17 @@ mod tests {
             matches!(insecure.current_context(), ProviderConfigError::Invalid),
             "should report invalid config"
         );
+        let get_with_body = with_path()
+            .with_hashed_email_source(Some(&HashedEmailSource {
+                body: Some("{}".to_owned()),
+                ..status_source()
+            }))
+            .err()
+            .expect("should reject a body without POST");
+        assert!(
+            format!("{get_with_body:?}").contains("body is only sent with method"),
+            "should explain the rejected body: {get_with_body:?}"
+        );
         coordinator("")
             .with_hashed_email_source(None)
             .expect("should accept no endpoint when no provider reads one");
@@ -2597,8 +2849,8 @@ mod tests {
     fn the_status_timeout_must_leave_room_in_the_budget() {
         // Arrange: the coordinators' budget is 200 ms.
         let at_budget = HashedEmailSource {
-            endpoint: STATUS_URL.to_owned(),
             timeout_ms: 200,
+            ..status_source()
         };
 
         // Act

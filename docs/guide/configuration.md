@@ -1113,11 +1113,26 @@ endpoint in `[ec.hashed_email]`:
 
 ```toml
 [ec.hashed_email]
-# Your endpoint; it receives a GET with the visitor's whole Cookie header.
+# Your endpoint; it receives the visitor's whole Cookie header.
 endpoint = "https://www.example.com/api/user/status"
 # Optional cutoff, 1–1000 ms (default 100); below the phase's identity budget.
 timeout_ms = 100
+# Optional: "GET" (default) or "POST".
+# method = "POST"
+# Optional, POST only: sent as is, as application/json unless a
+# content-type header below says otherwise.
+# body = "{}"
+# Optional extra headers: a fixed value, or the value of one of the
+# visitor's cookies (unquoted).
+# [ec.hashed_email.headers]
+# x-session = { cookie = "session" }
 ```
+
+An endpoint that authenticates with a header rather than the `Cookie` header
+can take that header from a cookie. When the named cookie is missing, the
+visitor cannot be signed in, so Trusted Server makes no call. `headers` cannot
+set `Cookie`, `Host`, `Content-Length` or `Transfer-Encoding`, and `body` is
+rejected without `method = "POST"`.
 
 Trusted Server calls it at most once per collection phase (`page` and
 `after_response` providers each make their own call), and only when an enabled
