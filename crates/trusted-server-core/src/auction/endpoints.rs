@@ -71,6 +71,23 @@ fn auction_body_too_large_response() -> Result<Response<EdgeBody>, Report<Truste
         })
 }
 
+/// The identity record service and partner registry one `/auction` call uses.
+///
+/// The default has no record service and writes nothing.
+#[derive(Clone, Copy, Default)]
+pub struct AuctionIdentity<'a> {
+    /// Record service that decides whether bidders receive the EC as `user.id`
+    /// and supplies the record's stored EIDs, read for every client.
+    pub graph: Option<&'a KvIdentityGraph>,
+    /// Partner registry that resolves stored and client EIDs.
+    pub registry: Option<&'a PartnerRegistry>,
+    /// Whether explicit body EIDs may be written to the EC's record.
+    ///
+    /// Clients refused identity creation keep `graph` for `user.id` validation
+    /// but never write.
+    pub persist_body: bool,
+}
+
 /// Handle auction request from `POST /auction`.
 ///
 /// Accepts a JSON body matching [`AdRequest`][`super::formats::AdRequest`].
@@ -149,12 +166,16 @@ fn auction_body_too_large_response() -> Result<Response<EdgeBody>, Report<Truste
 pub async fn handle_auction(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
-    kv: Option<&KvIdentityGraph>,
-    registry: Option<&PartnerRegistry>,
+    identity: AuctionIdentity<'_>,
     ec_context: &mut EcContext,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let AuctionIdentity {
+        graph: kv,
+        registry,
+        persist_body,
+    } = identity;
     // The bounded read rejects a declared overflow before polling the body and
     // stops a streamed body at the first chunk past the cap, so a client that
     // omits or understates `Content-Length` is still held to it.
@@ -206,8 +227,11 @@ pub async fn handle_auction(
     let consent_context = ec_context.consent().clone();
 
     // Identity ingestion is independent of whether this deployment runs bidders.
-    let body_snapshot =
-        persist_auction_body(kv, registry, ec_context, &http_req, body.eids.as_ref()).await;
+    let body_snapshot = if persist_body {
+        persist_auction_body(kv, registry, ec_context, &http_req, body.eids.as_ref()).await
+    } else {
+        None
+    };
 
     if !orchestrator.is_enabled() {
         log::info!("/auction: auction is disabled; returning no-bid response");
@@ -1193,8 +1217,11 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            Some(&graph),
-            Some(&registry),
+            AuctionIdentity {
+                graph: Some(&graph),
+                registry: Some(&registry),
+                persist_body: true,
+            },
             &mut ec_context,
             &noop_services(),
             req,
@@ -1289,8 +1316,11 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            Some(&graph),
-            Some(&registry),
+            AuctionIdentity {
+                graph: Some(&graph),
+                registry: Some(&registry),
+                persist_body: true,
+            },
             &mut ec_context,
             &noop_services(),
             req,
@@ -1375,8 +1405,11 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            Some(&graph),
-            Some(&registry),
+            AuctionIdentity {
+                graph: Some(&graph),
+                registry: Some(&registry),
+                persist_body: true,
+            },
             &mut context,
             &noop_services(),
             request,
@@ -1445,8 +1478,11 @@ mod tests {
         let _ = handle_auction(
             &create_test_settings(),
             &orchestrator,
-            Some(graph),
-            Some(registry),
+            AuctionIdentity {
+                graph: Some(graph),
+                registry: Some(registry),
+                persist_body: true,
+            },
             ec,
             &noop_services(),
             request,
@@ -1896,8 +1932,7 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             req,
@@ -1967,8 +2002,7 @@ mod tests {
             let error = handle_auction(
                 &settings,
                 &orchestrator,
-                None,
-                None,
+                AuctionIdentity::default(),
                 &mut ec_context,
                 &services,
                 request,
@@ -2037,8 +2071,7 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             request,
@@ -2131,8 +2164,7 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             request,
@@ -2235,8 +2267,7 @@ mod tests {
             let response = handle_auction(
                 &settings,
                 &orchestrator,
-                None,
-                None,
+                AuctionIdentity::default(),
                 &mut ec_context,
                 &services,
                 request,
@@ -2362,8 +2393,7 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             request,
@@ -2450,8 +2480,7 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             req,
@@ -2555,8 +2584,11 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            Some(&graph),
-            Some(&registry),
+            AuctionIdentity {
+                graph: Some(&graph),
+                registry: Some(&registry),
+                persist_body: true,
+            },
             &mut ec_context,
             &services,
             req,
@@ -2702,8 +2734,11 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            Some(&graph),
-            Some(&registry),
+            AuctionIdentity {
+                graph: Some(&graph),
+                registry: Some(&registry),
+                persist_body: true,
+            },
             &mut ec_context,
             &services,
             req,
@@ -2733,6 +2768,23 @@ mod tests {
     /// Runs `/auction` for a cookie EC against `graph` and returns the bid
     /// request the bidder received.
     async fn bid_request_for_cookie_ec(graph: &KvIdentityGraph, ec_id: &str) -> serde_json::Value {
+        bid_request_with(
+            AuctionIdentity {
+                graph: Some(graph),
+                registry: None,
+                persist_body: true,
+            },
+            ec_id,
+            JsonValue::Null,
+        )
+        .await
+    }
+
+    async fn bid_request_with(
+        identity: AuctionIdentity<'_>,
+        ec_id: &str,
+        body_eids: JsonValue,
+    ) -> serde_json::Value {
         let settings = create_test_settings();
         let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
@@ -2760,7 +2812,8 @@ mod tests {
                             "code": "div-gpt-ad-1",
                             "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
                         }
-                    ]
+                    ],
+                    "eids": body_eids
                 }))
                 .expect("should serialize body"),
             ))
@@ -2769,8 +2822,7 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            Some(graph),
-            None,
+            identity,
             &mut ec_context,
             &services,
             req,
@@ -2827,6 +2879,54 @@ mod tests {
             Some(ec_id.as_str()),
             "should send an EC with a consented row as user.id"
         );
+    }
+
+    #[tokio::test]
+    async fn refused_client_auction_validates_its_ec_without_writing() {
+        // Arrange
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let registry = partner_registry(&["ids.example.com"]);
+        let missing = format!("{}.refuse", "a".repeat(64));
+        let withdrawn = format!("{}.refuse", "b".repeat(64));
+        let consented = format!("{}.refuse", "c".repeat(64));
+        graph
+            .create(&withdrawn, &crate::ec::kv_types::KvEntry::tombstone(1000))
+            .await
+            .expect("should seed withdrawn row");
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph
+            .create(&consented, &live)
+            .await
+            .expect("should seed consented row");
+
+        for (ec_id, forwarded) in [(&missing, false), (&withdrawn, false), (&consented, true)] {
+            let before = graph.get(ec_id).await.expect("should read the row");
+
+            // Act
+            let body = bid_request_with(
+                AuctionIdentity {
+                    graph: Some(&graph),
+                    registry: Some(&registry),
+                    persist_body: false,
+                },
+                ec_id,
+                json!([{"source": "ids.example.com", "uids": [{"id": "body-uid", "atype": 1}]}]),
+            )
+            .await;
+
+            // Assert
+            assert_eq!(
+                body["user"]["id"].as_str(),
+                forwarded.then_some(ec_id.as_str()),
+                "should send a refused client's EC as user.id only with a consented row: {body}"
+            );
+            assert_eq!(
+                graph.get(ec_id).await.expect("should reread the row"),
+                before,
+                "should not write a refused client's body EIDs"
+            );
+        }
     }
 
     #[test]
@@ -2963,8 +3063,7 @@ mod tests {
         let _ = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            AuctionIdentity::default(),
             &mut ec_context,
             &services,
             req,
@@ -3633,8 +3732,7 @@ mod tests {
             let response = handle_auction(
                 &settings,
                 &orchestrator,
-                None,
-                None,
+                AuctionIdentity::default(),
                 &mut ec_context,
                 &services,
                 req,
@@ -3685,8 +3783,7 @@ mod tests {
             let response = handle_auction(
                 &settings,
                 &orchestrator,
-                None,
-                None,
+                AuctionIdentity::default(),
                 &mut ec_context,
                 &services,
                 request,
@@ -3721,8 +3818,7 @@ mod tests {
                 let outcome = handle_auction(
                     &settings,
                     &orchestrator,
-                    None,
-                    None,
+                    AuctionIdentity::default(),
                     &mut ec_context,
                     &services,
                     request,

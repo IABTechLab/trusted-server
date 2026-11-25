@@ -96,7 +96,7 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::plan::validate_fastly_backend_bound;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
@@ -515,10 +515,11 @@ fn build_ec_request_state(
     match identity.read_request(services, req) {
         Ok(request) => {
             let geo_info = request.context.geo_info().cloned();
+            let use_finalize_kv = request.store_writes_allowed();
             EcRequestState {
                 ec_context: request.context,
                 kv_graph: request.graph,
-                use_finalize_kv: true,
+                use_finalize_kv,
                 eids_cookie: request.eids_cookie,
                 sharedid: request.sharedid,
                 after_response: None,
@@ -716,11 +717,16 @@ async fn run_named_route(
             } else {
                 Some(partner_registry)
             };
+            // A refused client keeps the record service, so bidders still
+            // receive only an EC with a consented row, but never writes.
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                ec.kv_graph.as_ref().filter(|_| ec.is_real_browser),
-                registry_ref,
+                AuctionIdentity {
+                    graph: ec.kv_graph.as_ref(),
+                    registry: registry_ref,
+                    persist_body: ec.is_real_browser,
+                },
                 &mut ec.ec_context,
                 services,
                 req,
@@ -3581,7 +3587,6 @@ mod tests {
             "bidstream_enabled": true
         }]))
         .expect("should configure an unowned body source");
-        settings.auction.enabled = false;
         let store = RecordingStore::new(false);
         let mut state = app_state_for_settings(settings);
         let mutable = Arc::get_mut(&mut state).expect("should own the app state");
@@ -3598,12 +3603,27 @@ mod tests {
             graph,
         };
 
-        for (suffix, known_browser) in [("bot001", false), ("web001", true)] {
+        // (EC suffix, known browser, seeded row, whether bidders get the EC)
+        let cases = [
+            ("bot001", false, Some(true), true),
+            ("bot002", false, None, false),
+            ("bot003", false, Some(false), false),
+            ("web001", true, Some(true), true),
+        ];
+        for (suffix, known_browser, row, forwarded) in cases {
             let ec_id = format!("{}.{suffix}", "b".repeat(64));
-            seed_live_row(&fixture.graph, &ec_id);
-            let before = block_on(fixture.graph.get(&ec_id))
-                .expect("should read the seeded row")
-                .expect("should retain the seeded row");
+            match row {
+                Some(true) => seed_live_row(&fixture.graph, &ec_id),
+                Some(false) => block_on(fixture.graph.create(
+                    &ec_id,
+                    &trusted_server_core::ec::kv_types::KvEntry::tombstone(
+                        trusted_server_core::ec::current_timestamp(),
+                    ),
+                ))
+                .expect("should seed a withdrawn row"),
+                None => {}
+            }
+            let before = block_on(fixture.graph.get(&ec_id)).expect("should read the seeded row");
             let writes_before = store.events().len();
             let mut request =
                 consented_request(empty_request(Method::POST, "/auction"), Some(&ec_id));
@@ -3633,25 +3653,38 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
-                "should return the no-bid auction response"
+                "should return the auction response"
+            );
+            // The auction decides `user.id` from the row snapshot it read, so a
+            // refused client must still have its row read and validated.
+            let snapshot = identity.ec_context.kv_snapshot();
+            assert!(
+                !matches!(snapshot, trusted_server_core::ec::EcKvSnapshot::NotRead),
+                "should validate {suffix}'s EC against its row"
+            );
+            assert_eq!(
+                snapshot
+                    .entry_for(&ec_id)
+                    .is_some_and(|entry| entry.consent.ok),
+                forwarded,
+                "should allow {suffix}'s EC as user.id only with a consented row"
             );
             assert_eq!(
                 store.events().len() - writes_before,
                 usize::from(known_browser),
                 "should persist body EIDs only for an allowed browser"
             );
-            let after = block_on(fixture.graph.get(&ec_id))
-                .expect("should inspect the finalized row")
-                .expect("should retain the existing row");
+            let after = block_on(fixture.graph.get(&ec_id)).expect("should inspect the row");
             if known_browser {
                 assert_eq!(
-                    after.0.ids["body.example.com"].uid, "body-uid",
+                    after.expect("should retain the existing row").0.ids["body.example.com"].uid,
+                    "body-uid",
                     "should prove the body reaches ingestion for an allowed browser"
                 );
             } else {
                 assert_eq!(
                     after, before,
-                    "should leave the bot's record and generation unchanged"
+                    "should leave {suffix}'s record and generation unchanged"
                 );
             }
         }
@@ -4484,12 +4517,17 @@ mod tests {
             .extensions()
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
-        assert!(
+        assert_eq!(
             finalize
                 .ec_context
                 .device_signals()
-                .is_some_and(DeviceSignals::looks_like_browser),
-            "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+                .and_then(|signals| signals.ja4_class.as_deref()),
+            Some("t13d1516h2"),
+            "browser-shaped JA4/H2 signals from the request extension must reach EC finalization"
+        );
+        assert!(
+            finalize.use_finalize_kv,
+            "a browser must keep the KV-backed finalize path"
         );
     }
 
@@ -4592,25 +4630,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_device_signals_extension_classifies_as_non_browser() {
-        // Without the entry-point-captured signals, the reconstructed request
-        // cannot expose JA4/H2, so the bot gate falls back to non-browser. This
-        // documents the regression the extension threading fixes: the same
-        // request that looks like a browser above is treated as a bot here.
+    fn identity_writes_are_refused_only_for_known_non_browsers() {
+        // Without entry-point-captured signals the reconstructed request cannot
+        // expose JA4/H2. Missing signals must never refuse identity writes; only
+        // trusted signals classifying a known non-browser do.
         let router = test_router();
-        let response = route(&router, empty_request(Method::GET, "/some-page"));
+        let mut known_non_browser = empty_request(Method::GET, "/some-page");
+        known_non_browser.extensions_mut().insert(DeviceSignals {
+            known_browser: Some(false),
+            ..DeviceSignals::derive("example-agent", None, None)
+        });
 
-        let finalize = response
-            .extensions()
-            .get::<super::EcFinalizeState>()
-            .expect("fallback response should carry EcFinalizeState");
-        assert!(
-            !finalize
-                .ec_context
-                .device_signals()
-                .is_some_and(DeviceSignals::looks_like_browser),
-            "a request without captured device signals should not be classified as a real browser"
-        );
+        for (label, request, writes) in [
+            (
+                "missing signals",
+                empty_request(Method::GET, "/some-page"),
+                true,
+            ),
+            ("a known non-browser", known_non_browser, false),
+        ] {
+            let response = route(&router, request);
+
+            let finalize = response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .expect("fallback response should carry EcFinalizeState");
+            assert_eq!(
+                finalize.use_finalize_kv, writes,
+                "should decide finalize writes for {label}"
+            );
+        }
     }
 
     #[test]
