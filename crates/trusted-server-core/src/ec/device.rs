@@ -13,7 +13,11 @@
 //! - **`platform_class`** — coarse OS family from UA
 //! - **`h2_fp_hash`** — SHA256 prefix (12 hex chars) of raw H2 SETTINGS
 //! - **`known_browser`** — `true` if `ja4_class` + `h2_fp_hash` match a known
-//!   browser pattern; `false` for known bots; `None` for unknown
+//!   browser pattern; `false` for known bots; `None` for unknown. Under the
+//!   default `lenient` browser gate only `false` refuses identity creation
+//!   and record writes; missing or unknown signals never do. The `strict`
+//!   gate also refuses a request without both `ja4_class` and
+//!   `platform_class`.
 
 use sha2::{Digest as _, Sha256};
 

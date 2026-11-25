@@ -118,7 +118,9 @@ impl IdentityApp {
             let mut response = response(StatusCode::NO_CONTENT);
             if let Ok(mut identity) = self.read_request(services, &request) {
                 self.apply_cookie_opt_outs(&request, &mut identity.context);
-                if identity.context.ec_allowed()
+                // A client refused creation never receives a SharedID cookie.
+                if identity.creation_allowed
+                    && identity.context.ec_allowed()
                     && let Some(graph) = identity.graph.as_ref()
                 {
                     apply_sharedid_write_back(
@@ -143,14 +145,17 @@ impl IdentityApp {
             Err(error) => return private_error(http_error(&error)),
         };
         self.apply_cookie_opt_outs(&request, &mut identity.context);
-        identity
-            .context
-            .set_eid_sync_source(EidSyncSource::Navigation);
         // An EC POST has its own write authority; it is a same-origin document
         // consent event, not an auction or partner API masquerading as one.
-        identity
-            .context
-            .set_navigation_permit(NavigationPermit::for_ec_route());
+        // A client refused creation gets no write authority.
+        if identity.creation_allowed {
+            identity
+                .context
+                .set_eid_sync_source(EidSyncSource::Navigation);
+            identity
+                .context
+                .set_navigation_permit(NavigationPermit::for_ec_route());
+        }
         self.prepare_creation(&mut identity.context, identity.creation_allowed)
             .await;
         let after_response = self.prepare_after_response_lookups(
@@ -178,11 +183,12 @@ impl IdentityApp {
         let mut result = response(StatusCode::OK);
         result.extensions_mut().insert(EcRouteResponse);
         crate::ec::consent_update::require_reconciliation(&mut result);
+        let use_store = identity.store_writes_allowed();
         self.finalize(
             &mut identity.context,
             identity.eids_cookie.as_deref(),
             &identity.sharedid,
-            true,
+            use_store,
             &mut result,
         )
         .await;
@@ -207,7 +213,8 @@ impl IdentityApp {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        self.schedule_after_response(
+        // Registration failures are logged inside; the response is sent either way.
+        let _registered = self.schedule_after_response(
             identity.context,
             after_response,
             scheduler,

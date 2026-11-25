@@ -75,6 +75,8 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let creative_proxy = ctx.uri().path() == "/first-party/proxy"
+            && ctx.method() == edgezero_core::http::Method::GET;
         let geo_available = ctx
             .headers()
             .get("cf-ipcountry")
@@ -86,6 +88,13 @@ impl Middleware for FinalizeResponseMiddleware {
             Ok(response) => response,
             Err(error) => handler_error_response(error)?,
         };
+        if creative_proxy
+            && (response.status().is_client_error() || response.status().is_server_error())
+        {
+            trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
+                &mut response,
+            );
+        }
         apply_finalize_headers(&self.settings, geo_available, &mut response);
         Ok(response)
     }
