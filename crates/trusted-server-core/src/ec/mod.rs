@@ -64,6 +64,7 @@ pub mod rate_limiter;
 pub mod record_backend;
 pub mod registry;
 pub mod sharedid;
+pub mod storage;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.

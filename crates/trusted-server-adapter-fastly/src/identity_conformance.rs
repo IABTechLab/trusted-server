@@ -1,11 +1,13 @@
 //! EC conformance through the Fastly application and its production finalizer.
 
+use crate::app::TrustedServerApp;
 use crate::sandbox::RetainedApp;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use edgezero_adapter_fastly::delivery::FastlyResponseCommitState;
 use edgezero_adapter_fastly::delivery::testing::response_delivery;
-use edgezero_adapter_fastly::request::FastlyService;
+use edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::http::StatusCode;
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use futures::executor::block_on;
@@ -50,7 +52,7 @@ thread_local! {
 /// runner assembles the application, so the store it holds for every request
 /// is the fixture.
 pub(crate) fn fixture_store(store_name: &str) -> Option<Arc<dyn EcKvStore + Send + Sync>> {
-    if store_name == "identity-conformance" {
+    if store_name == "trusted_server_kv" {
         STORE.with_borrow(|store| {
             store
                 .clone()
@@ -89,7 +91,7 @@ fn settings() -> Settings {
         proxy_secret = "example-proxy-secret"
         [ec]
         passphrase = "example-secret-at-least-32-bytes-long"
-        ec_store = "identity-conformance"
+        ec_store = "trusted_server_kv"
         [request_signing]
         enabled = false
         config_store_id = "example-config"
@@ -227,7 +229,9 @@ impl Adapter for FastlyAdapter {
         // thread left in the request-local slot.
         drop(take_navigation_lookups());
         let delivery = with_finalization(&inputs, |finalize| {
-            FastlyService::new(&self.retained.app).run_request_with_hooks_for_test(
+            run_request_with_registries_and_hooks_for_test(
+                &self.retained.app,
+                TrustedServerApp::stores(),
                 request,
                 |_request, extensions| {
                     values.prepare(extensions, &self.settings, &queue);

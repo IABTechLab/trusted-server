@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use edgezero_core::app::{Hooks as _, StoreMetadata};
+use edgezero_core::blob_envelope::BlobEnvelope;
+use serde_json::json;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID};
 
@@ -27,6 +29,48 @@ const LEGACY_PREFIX: &str = "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_";
 /// Local route that runs the response middleware without reaching an origin:
 /// the TSJS handler answers an unknown bundle hash with `404`.
 const GEO_ROUTE: &str = "/static/tsjs=0000000000000000";
+
+#[cfg(feature = "celld-ec")]
+#[path = "support/celld.rs"]
+mod celld_fixture;
+
+#[cfg(feature = "celld-ec")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires official CELLD_EC_TEST_BINARY and matching EDGEZERO_CELLD_STORE_SERVICE"]
+async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_on_outage() {
+    let mut celld = celld_fixture::CelldFixture::new();
+    for _ in 0..2 {
+        let mut server = ServerFixture::new(Some(&storage_envelope(
+            json!({"provider":"records","store":"trusted_server_kv"}),
+        )));
+        let mut binding = serde_json::to_value(celld.settings()).expect("should serialize binding");
+        binding["provider"] = json!("celld-records");
+        server.record_binding(binding);
+        server.spawn(false, false);
+        server.wait_ready();
+        let store = celld.store().await;
+        assert!(
+            !trusted_server_core::ec::kv_backend::EcKvStore::key_exists(
+                &store,
+                &format!("{}.neverissued", "a".repeat(64))
+            )
+            .await
+            .expect("should strongly read the stock celld store service")
+        );
+        drop(server);
+        celld.restart();
+    }
+    let mut binding =
+        serde_json::to_value(celld.settings()).expect("should serialize final binding");
+    binding["provider"] = json!("celld-records");
+    celld.stop();
+    let mut server = ServerFixture::new(Some(&storage_envelope(
+        json!({"provider":"records","store":"trusted_server_kv"}),
+    )));
+    server.record_binding(binding);
+    server.spawn(false, false);
+    server.assert_failed_before_listen("startup kv: trusted_server_kv: provider unavailable");
+}
 
 struct ServerFixture {
     root: PathBuf,
@@ -86,6 +130,16 @@ impl ServerFixture {
         }
     }
 
+    fn record_binding(&self, binding: serde_json::Value) {
+        let mut document = json!({"version":1,"kv":{}});
+        document["kv"]["trusted_server_kv"] = binding;
+        fs::write(
+            self.root.join("record-bindings.toml"),
+            toml::to_string(&document).expect("should encode EdgeZero binding"),
+        )
+        .expect("should write isolated native record binding");
+    }
+
     fn spawn(&mut self, missing_secret: bool, short_passphrase: bool) {
         self.spawn_configured(missing_secret, short_passphrase, None);
     }
@@ -96,9 +150,20 @@ impl ServerFixture {
         short_passphrase: bool,
         profile: Option<&str>,
     ) {
+        self.spawn_inputs(missing_secret, short_passphrase, profile, None);
+    }
+
+    fn spawn_inputs(
+        &mut self,
+        missing_secret: bool,
+        short_passphrase: bool,
+        profile: Option<&str>,
+        legacy: Option<&str>,
+    ) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"));
         command
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
             .env("EDGEZERO__LOGGING__LEVEL", "info")
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
@@ -116,6 +181,12 @@ impl ServerFixture {
             .env(format!("{LEGACY_PREFIX}ADMIN_KEY"), ADMIN_PASSWORD)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let bindings = self.root.join("record-bindings.toml");
+        if bindings.is_file() {
+            command
+                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings)
+                .env("TRUSTED_SERVER__EC_RECORDS_ENABLED", "true");
+        }
         if let Some(profile) = profile {
             let path = self.root.join("native-geo.toml");
             fs::write(&path, profile).expect("should write synthetic Geo profile");
@@ -130,6 +201,9 @@ impl ServerFixture {
                     EC_PASSPHRASE
                 },
             );
+        }
+        if let Some(value) = legacy {
+            command.env("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", value);
         }
         self.child = Some(
             command
@@ -358,6 +432,60 @@ impl Drop for ServerFixture {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn storage_envelope(storage: serde_json::Value) -> String {
+    let mut envelope: serde_json::Value =
+        serde_json::from_str(ENVELOPE).expect("should decode fixture envelope");
+    let mut data = envelope["data"].take();
+    data["ec"]["storage"] = storage;
+    serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+        .expect("should encode existing envelope format")
+}
+
+#[test]
+fn active_legacy_ec_environment_cannot_disable_or_override_published_storage() {
+    let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
+    for envelope in [ENVELOPE, configured.as_str()] {
+        let mut server = ServerFixture::new(Some(envelope));
+        server.spawn_inputs(false, false, None, Some("true"));
+        server.assert_failed_before_listen("TRUSTED_SERVER__EC_DYNAMODB_ENABLED is obsolete");
+    }
+}
+
+#[test]
+fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
+    let mut server = ServerFixture::new(Some(&storage_envelope(
+        json!({"provider":"fastly","store":"exact-binding"}),
+    )));
+    server.spawn(false, false);
+    server.assert_serves_failure_router("unsupported by the selected serving runtime");
+
+    let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
+    let mut server = ServerFixture::new(Some(&configured));
+    server.spawn(false, false);
+    server.assert_serves_failure_router("configured EC record store is not prepared");
+
+    for binding in [
+        (!cfg!(feature="aws-dynamodb-ec")).then(|| json!({"provider":"aws-dynamodb-records","region":"us-east-1","table":"example-identity","namespace":"fixture"})),
+        (!cfg!(feature="celld-ec")).then(|| json!({"provider":"celld-records","endpoint":"http://127.0.0.1:7780","store":"identity","access":{"mode":"trusted-network"}})),
+    ].into_iter().flatten() {
+        let mut server = ServerFixture::new(Some(&configured));
+        server.record_binding(binding);
+        server.spawn(false, false);
+        server.assert_failed_before_listen("provider not compiled");
+    }
+}
+
+#[cfg(feature = "celld-ec")]
+#[test]
+fn selected_celld_captures_only_its_explicit_bootstrap_reference_before_network() {
+    let mut server = ServerFixture::new(Some(&storage_envelope(
+        json!({"provider":"records","store":"trusted_server_kv"}),
+    )));
+    server.record_binding(json!({"provider":"celld-records","endpoint":"https://127.0.0.1:7780","store":"identity","access":{"mode":"authenticated","token_env":"FIXTURE_MISSING_CELLD_TOKEN"}}));
+    server.spawn(false, false);
+    server.assert_failed_before_listen("celld token: configured value absent");
 }
 
 #[test]

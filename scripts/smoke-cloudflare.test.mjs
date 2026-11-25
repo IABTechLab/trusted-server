@@ -68,7 +68,14 @@ test "$(awk '$1 == "nodejs" {print $2}' "$candidate/.tool-versions")" = 24.20.0
 if [ "$1" = kv ]; then echo reached-pinned-kv >&2; exit 42; fi
 `
   )
-  executable('ts', 'if [ "$1 $2" = "config push" ]; then wrangler check; fi\n')
+  // `ts config init --app-config <path>` writes the template's Fastly storage
+  // block, which the smoke removes for non-Fastly adapters.
+  executable(
+    'ts',
+    `if [ "$1 $2" = "config init" ]; then printf '[ec.storage]\\nstore = "trusted_server_kv"\\n' > "$4"; fi
+if [ "$1 $2" = "config push" ]; then wrangler check; fi
+`
+  )
   return () =>
     spawnSync('bash', [join(repository, 'scripts/smoke-cloudflare.sh')], {
       cwd: directory,
