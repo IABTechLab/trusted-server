@@ -795,7 +795,8 @@ impl ApiRequest {
 pub struct ApiObservation {
     /// Fully consumed response.
     pub response: Observation,
-    /// Outbound requests received by the publisher origin.
+    /// Outbound requests the exchange made: those to the publisher origin,
+    /// plus any to an ID5 provider or bidder the request turned on.
     pub origin_requests: usize,
     /// Response cache policy.
     pub cache_control: Option<String>,
@@ -2171,10 +2172,15 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
         Some("_pubcid_optout=1".to_owned()),
     ));
     let bare_identity = assert_created(&bare.response, store);
-    adapter.exchange(&ec_post(
+    let purpose_one = adapter.exchange(&ec_post(
         consent_body(&purpose_one_only),
         Some(format!("ts-ec={bare_identity}; _pubcid={FOREIGN_SHAREDID}")),
     ));
+    assert_eq!(
+        purpose_one.response.status,
+        http::StatusCode::OK,
+        "should accept the Purpose 1 only POST, so the SharedID gate is what runs"
+    );
     assert_eq!(
         stored_sharedid(store, &bare_identity),
         None,
@@ -2244,21 +2250,30 @@ pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore)
         1,
         "should call the provider from a same-origin POST, proving the capture"
     );
-    let mut cross_site = ApiRequest::new(http::Method::POST, "/_ts/api/v1/ec");
+    // The control's request with only its `Origin` changed, so the origin
+    // check is the one thing that can refuse it.
+    let mut cross_site = ec_post(consent_body(&granted), None);
     cross_site.identity_provider = true;
-    cross_site.body = consent_body(&granted);
-    cross_site.headers.push((
-        "origin".to_owned(),
-        "https://cross-site.example.com".to_owned(),
-    ));
+    for (name, value) in &mut cross_site.headers {
+        if name == "origin" {
+            *value = "https://cross-site.example.com".to_owned();
+        }
+    }
     let mut get = ApiRequest::new(http::Method::GET, "/_ts/api/v1/ec");
     get.identity_provider = true;
     get.headers.push((
         "cookie".to_owned(),
         format!("{granted}; ts-ec={provider_identity}"),
     ));
-    for (request, case) in [(cross_site, "cross-site POST"), (get, "GET")] {
+    for (request, case, status) in [
+        (cross_site, "cross-site POST", http::StatusCode::FORBIDDEN),
+        (get, "GET", http::StatusCode::NO_CONTENT),
+    ] {
         let observed = adapter.exchange(&request);
+        assert_eq!(
+            observed.response.status, status,
+            "should answer a {case} with {status}"
+        );
         assert_eq!(
             observed.requests_to(ID5_LOOKUP),
             0,

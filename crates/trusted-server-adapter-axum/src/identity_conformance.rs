@@ -348,6 +348,7 @@ struct ProviderFixture {
 
 impl ProviderFixture {
     fn new(origin_status: StatusCode, id5_delay: Duration, collect: &str, geo: Geo) -> Self {
+        HELD_TASKS.with_borrow_mut(Vec::clear);
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client.respond_to(
@@ -432,6 +433,14 @@ impl ProviderFixture {
         (response, timer.now().duration_since(started))
     }
 
+    /// Runs every after-response task the requests so far scheduled, as the
+    /// runtime would once their responses were sent.
+    fn run_held_tasks(&self) {
+        for task in HELD_TASKS.with_borrow_mut(std::mem::take) {
+            self.clock.drive(task);
+        }
+    }
+
     fn id5_lookups(&self) -> usize {
         self.client
             .requests()
@@ -449,6 +458,10 @@ impl ProviderFixture {
 }
 
 fn navigation() -> Request {
+    navigation_with("us_privacy=1YNN")
+}
+
+fn navigation_with(cookie: &str) -> Request {
     request_builder()
         .method(Method::GET)
         .uri("https://publisher.example.com/article")
@@ -456,7 +469,7 @@ fn navigation() -> Request {
         .header("sec-fetch-mode", "navigate")
         .header(header::ACCEPT, "text/html")
         .header(header::USER_AGENT, CHROME_USER_AGENT)
-        .header(header::COOKIE, "us_privacy=1YNN")
+        .header(header::COOKIE, cookie)
         .body(Body::empty())
         .expect("should build navigation")
 }
@@ -525,6 +538,7 @@ fn page_lookup_within_the_deadline_reaches_the_record_and_the_mirror_cookie() {
 
     // Act
     let (response, held) = fixture.send(navigation());
+    fixture.run_held_tasks();
 
     // Assert
     assert_eq!(response.status(), StatusCode::OK, "should serve the page");
@@ -546,8 +560,8 @@ fn page_lookup_within_the_deadline_reaches_the_record_and_the_mirror_cookie() {
         "should mirror the ID5 UID found on this navigation, got {mirror}"
     );
     assert!(
-        held <= IDENTITY_BUDGET,
-        "should not hold the response past the lookup deadline, held {held:?}"
+        held < IDENTITY_BUDGET,
+        "should release the response once the lookup answers, before the deadline, held {held:?}"
     );
 }
 
@@ -563,6 +577,7 @@ fn page_lookup_past_the_deadline_is_skipped_without_delaying_the_response() {
 
     // Act
     let (response, held) = fixture.send(navigation());
+    fixture.run_held_tasks();
 
     // Assert
     assert_eq!(response.status(), StatusCode::OK, "should serve the page");
@@ -609,6 +624,7 @@ fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
         &tcf_consent_cookie(false),
         &format!("ts-ec={identity}; _pubcid={sharedid}"),
     ));
+    fixture.run_held_tasks();
 
     // Assert: A set no mirror (its lookup was skipped), so B has none to expire.
     for name in ["ts-ec", "_pubcid", "_pubcid_cst"] {
@@ -636,46 +652,116 @@ fn withdrawal_after_a_grant_with_a_slow_lookup_leaves_no_live_identity() {
     );
 }
 
-/// ID-9 with an after-response provider: grant A's follow-up lookup is still
-/// held when withdrawal B is handled, and running it afterwards calls no
-/// provider and leaves A's record withdrawn. The follow-up is scheduled for
-/// the new EC; it checks the EC and consent only when it runs.
+/// ID-9 with an after-response provider and a grant with no EC: the grant's
+/// follow-up lookup never calls a provider, because follow-ups run only for
+/// an EC that existed before the request. So no late UID can arrive after a
+/// withdrawal that follows the grant.
 #[test]
-fn held_follow_up_from_a_grant_calls_no_provider_after_a_withdrawal() {
+fn follow_up_from_a_grant_with_no_ec_calls_no_provider() {
     // Arrange
     let fixture = ProviderFixture::new(
         StatusCode::OK,
-        IDENTITY_BUDGET * 5,
+        IDENTITY_BUDGET / 4,
         "after_response",
         Geo::Gdpr,
     );
-    HELD_TASKS.with_borrow_mut(Vec::clear);
-    let (grant, _) = fixture.send(ec_post(&tcf_consent_cookie(true), ""));
-    let identity = set_value(&grant, "ts-ec").expect("should mint an EC for grant A");
-    let sharedid = set_value(&grant, "_pubcid").expect("should set SharedID for grant A");
-    assert_eq!(
-        HELD_TASKS.with_borrow(Vec::len),
-        1,
-        "should hold grant A's follow-up lookup, proving the capture"
-    );
 
     // Act
-    fixture.send(ec_post(
-        &tcf_consent_cookie(false),
-        &format!("ts-ec={identity}; _pubcid={sharedid}"),
-    ));
-    for task in HELD_TASKS.with_borrow_mut(std::mem::take) {
-        fixture.clock.drive(task);
-    }
+    let (grant, _) = fixture.send(ec_post(&tcf_consent_cookie(true), ""));
+    let identity = set_value(&grant, "ts-ec").expect("should mint an EC for grant A");
+    let held = HELD_TASKS.with_borrow(Vec::len);
+    fixture.run_held_tasks();
 
     // Assert
+    assert_eq!(held, 1, "should schedule grant A's follow-up");
     assert_eq!(
         fixture.id5_lookups(),
         0,
         "should call no provider for an EC minted by grant A"
     );
+    assert!(
+        !fixture
+            .record(&identity)
+            .ids
+            .contains_key("id5.example.com"),
+        "should store no UID from grant A's follow-up"
+    );
+}
+
+/// Mints an EC with a grant, then sends a returning navigation whose
+/// after-response lookup is held. With `withdraw`, a withdrawal is handled
+/// before the held lookup runs. Returns the fixture and the EC.
+fn held_follow_up_for_a_returning_reader(withdraw: bool) -> (ProviderFixture, String) {
+    let fixture = ProviderFixture::new(
+        StatusCode::OK,
+        IDENTITY_BUDGET / 4,
+        "after_response",
+        Geo::Gdpr,
+    );
+    let granted = tcf_consent_cookie(true);
+    let (grant, _) = fixture.send(ec_post(&granted, ""));
+    let identity = set_value(&grant, "ts-ec").expect("should mint an EC for the grant");
+    let sharedid = set_value(&grant, "_pubcid").expect("should set SharedID for the grant");
+    fixture.run_held_tasks();
+    let cookies = format!("ts-ec={identity}; _pubcid={sharedid}");
+    let (page, _) = fixture.send(navigation_with(&format!("{granted}; {cookies}")));
+    assert_eq!(
+        page.status(),
+        StatusCode::OK,
+        "should serve the returning page"
+    );
+    assert_eq!(
+        HELD_TASKS.with_borrow(Vec::len),
+        1,
+        "should hold the returning navigation's follow-up lookup"
+    );
+    if withdraw {
+        let (withdrawal, _) = fixture.send(ec_post(&tcf_consent_cookie(false), &cookies));
+        assert_eq!(
+            withdrawal.status(),
+            StatusCode::OK,
+            "should accept the withdrawal"
+        );
+    }
+    fixture.run_held_tasks();
+    (fixture, identity)
+}
+
+/// Control for [`held_follow_up_for_a_returning_reader_calls_no_provider_after_a_withdrawal`]:
+/// without the withdrawal, the same held lookup calls ID5 and stores its UID.
+#[test]
+fn held_follow_up_for_a_returning_reader_stores_the_uid() {
+    let (fixture, identity) = held_follow_up_for_a_returning_reader(false);
+
+    assert_eq!(
+        fixture.id5_lookups(),
+        1,
+        "should call ID5 from the follow-up, proving the capture"
+    );
+    assert_eq!(
+        fixture
+            .record(&identity)
+            .ids
+            .get("id5.example.com")
+            .map(|id| id.uid.as_str()),
+        Some(ID5_UID),
+        "should store the follow-up's UID"
+    );
+}
+
+/// ID-9: a follow-up lookup held across a withdrawal reads the withdrawn row
+/// when it runs, so it calls no provider and stores no UID.
+#[test]
+fn held_follow_up_for_a_returning_reader_calls_no_provider_after_a_withdrawal() {
+    let (fixture, identity) = held_follow_up_for_a_returning_reader(true);
+
+    assert_eq!(
+        fixture.id5_lookups(),
+        0,
+        "should call no provider once consent is withdrawn"
+    );
     let record = fixture.record(&identity);
-    assert!(!record.consent.ok, "should keep A's record withdrawn");
+    assert!(!record.consent.ok, "should keep the record withdrawn");
     assert!(
         !record.ids.contains_key("id5.example.com"),
         "should store no late UID"
