@@ -126,10 +126,10 @@ the [adapter matrix](./api-reference#adapter-and-startup-support).
 
 The generic runtime KV store is unsupported: reads and writes return
 `KvError::Unavailable`, a warning is logged once per process, and publisher
-pages continue to be served. `trusted_server_kv` remains declared in the
-application manifest because identity storage needs it. Axum support will come
-through EdgeZero's declared store in #1587 (shared record backend), then #1574
-(Axum identity); there is no adapter-local file store. Config and required
+pages continue to be served. Identity records are a separate concern: they
+will use the declared logical store `trusted_server_kv` through EdgeZero in
+#1587 (shared record backend), then #1574 (Axum identity); there is no
+adapter-local file store. Config and required
 secrets are loaded once at startup from prepared stores, independently of KV.
 See the [store inventory](./edgezero#store-inventory).
 

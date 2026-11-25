@@ -60,11 +60,11 @@ impl PlatformSecretStore for NoopSecretStore {
 /// Workers KV namespace binding that backs the generic runtime KV store.
 ///
 /// It is the binding `wrangler.toml` declares and the reference
-/// `cloudflare.toml` maps to the logical ID `trusted_server_kv`. The Worker
+/// `cloudflare.toml` maps to the logical ID `trusted_server_runtime_kv`. The Worker
 /// opens it directly rather than declaring the store to `EdgeZero`, which would
 /// look for a binding named after the logical ID unless every deployment set
-/// `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME`.
-pub const CLOUDFLARE_KV_BINDING: &str = "TRUSTED_SERVER_KV";
+/// `EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME`.
+pub const CLOUDFLARE_KV_BINDING: &str = "TRUSTED_SERVER_RUNTIME_KV";
 
 /// Opens the runtime KV store for one request from the Worker environment.
 ///

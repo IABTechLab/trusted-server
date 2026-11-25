@@ -69,7 +69,7 @@ Native Axum adapter (native binary):
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_kv` label
+- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_runtime_kv` label
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning
@@ -143,7 +143,7 @@ Data collection operations are subject to available consent signals (TCF v2 form
 ### Fastly KV Store
 
 Edge Cookie records use the configured `ec.ec_store` KV Store
-(`ec_identity_store` by default). The separate `trusted_server_kv` store is
+(`ec_identity_store` by default). The separate `trusted_server_runtime_kv` store is
 wired for generic runtime KV, with no normal production consumer yet.
 Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
 and batch-sync counters use Edge Rate Limiting counters rather than KV.

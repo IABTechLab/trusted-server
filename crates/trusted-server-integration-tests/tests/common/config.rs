@@ -592,7 +592,7 @@ mod tests {
             "fastly.toml should not declare the Edge Rate Limiting counter as a KV store"
         );
         assert!(
-            stores["trusted_server_kv"].is_array(),
+            stores["trusted_server_runtime_kv"].is_array(),
             "fastly.toml should link the generic runtime KV store under its logical ID"
         );
         let ec_entries = stores["ec_identity_store"]

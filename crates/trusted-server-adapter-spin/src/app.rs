@@ -72,7 +72,7 @@ use crate::platform::{
 ///
 /// It matches the KV store `edgezero.toml` declares. Its label must never be
 /// `default`, which holds the app config and request-signing metadata.
-pub const SPIN_KV_STORE_ID: &str = "trusted_server_kv";
+pub const SPIN_KV_STORE_ID: &str = "trusted_server_runtime_kv";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -502,7 +502,7 @@ impl Hooks for TrustedServerApp {
 
     /// Declares only the generic runtime KV store.
     ///
-    /// `EdgeZero` opens the `trusted_server_kv` label on first use, so a
+    /// `EdgeZero` opens the `trusted_server_runtime_kv` label on first use, so a
     /// component without that label still serves every route. Config and
     /// secrets are not declared: startup and request-time config read the
     /// `default` label directly, and secrets come from component variables.

@@ -60,3 +60,11 @@ Retaining the base's unavailable Axum store is the smallest compatible change.
   full-tree documentation reconciliation, and cryptographic signing controls.
 - Round 2: independent reviews confirmed all blocking and optional findings
   addressed; no unresolved findings before implementation.
+
+## Store ID split (2026-11-25)
+
+The generic runtime KV store's logical ID is `trusted_server_runtime_kv`
+(Cloudflare binding `TRUSTED_SERVER_RUNTIME_KV`). `trusted_server_kv` is kept
+for the identity record store that #1574 declares, so generic KV writes can
+never land in identity records. "Keep `trusted_server_kv`" above refers to that
+identity store.

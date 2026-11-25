@@ -215,7 +215,7 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
             .as_ref()
             .expect("should declare a KV store")
             .default_id(),
-        "trusted_server_kv",
+        "trusted_server_runtime_kv",
         "edgezero.toml should declare the generic runtime KV store"
     );
     assert!(
@@ -233,9 +233,9 @@ fn hooks_declare_only_the_runtime_kv_store() {
         (kv.default, kv.ids),
         (
             trusted_server_adapter_spin::app::SPIN_KV_STORE_ID,
-            &["trusted_server_kv"][..]
+            &["trusted_server_runtime_kv"][..]
         ),
-        "should declare `trusted_server_kv` as the only KV store"
+        "should declare `trusted_server_runtime_kv` as the only KV store"
     );
     assert!(
         !kv.ids.contains(&"default"),

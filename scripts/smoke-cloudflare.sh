@@ -63,7 +63,9 @@ sed \
 
 (
     cd "$WORKSPACE"
-    EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=TRUSTED_SERVER_KV \
+    # Smoke-only: the isolated local namespace stages the envelope. Deployments
+    # push config to a namespace other than the runtime KV binding.
+    EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=TRUSTED_SERVER_RUNTIME_KV \
         "$SMOKE_TS_BIN" config push \
         --adapter cloudflare \
         --local \
@@ -75,7 +77,7 @@ sed \
 ENVELOPE=$(
     cd "$CLOUDFLARE_WORK"
     wrangler kv key get trusted_server_config \
-        --binding TRUSTED_SERVER_KV \
+        --binding TRUSTED_SERVER_RUNTIME_KV \
         --local \
         --config wrangler.toml
 )

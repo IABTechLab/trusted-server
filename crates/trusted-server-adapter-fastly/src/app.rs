@@ -401,16 +401,23 @@ fn build_per_request_services(
         .build())
 }
 
+/// Logical ID of the generic runtime KV store.
+///
+/// It is distinct from `trusted_server_kv`, which is reserved for identity
+/// records, so generic KV writes never land in the identity store.
+pub(crate) const RUNTIME_KV_STORE_ID: &str = "trusted_server_runtime_kv";
+
 /// Returns the generic runtime KV store for one request.
 ///
 /// `EdgeZero` registers the store [`TrustedServerApp::stores`] declares
-/// (`trusted_server_kv`) in every production request and opens the linked
-/// Fastly KV store on first use. A service without that store linked answers
+/// ([`RUNTIME_KV_STORE_ID`]) in every production request and opens the linked
+/// Fastly KV store on first use. The store is looked up by its ID, not as the
+/// registry default, so declaring another KV store cannot redirect it. A service without that store linked answers
 /// each KV operation with `KvError::OpenFailed`, and routes that do not use KV
 /// are unaffected. A request without a registry, which only test contexts
 /// build, uses [`AppState::default_kv_store`].
 fn request_kv_store(state: &AppState, ctx: &RequestContext) -> Arc<dyn PlatformKvStore> {
-    ctx.kv_store_default().map_or_else(
+    ctx.kv_store(RUNTIME_KV_STORE_ID).map_or_else(
         || Arc::clone(&state.default_kv_store),
         |handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>,
     )
@@ -1647,8 +1654,8 @@ impl Hooks for TrustedServerApp {
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
             kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
+                default: RUNTIME_KV_STORE_ID,
+                ids: &[RUNTIME_KV_STORE_ID],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1998,7 +2005,7 @@ mod tests {
             ))
             .expect("should read the linked KV store"),
             Some(Bytes::from_static(b"example-value")),
-            "should persist the write in the store linked under `trusted_server_kv`"
+            "should persist the write in the store linked under `trusted_server_runtime_kv`"
         );
     }
 

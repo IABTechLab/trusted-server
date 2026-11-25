@@ -8,6 +8,8 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
+
+use crate::app::SPIN_KV_STORE_ID;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, KvHandleStore, PlatformConfigStore, PlatformError, PlatformGeo,
     PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
@@ -17,7 +19,7 @@ use trusted_server_core::platform::{
 /// config, including request-signing metadata.
 ///
 /// Spin grants this label to a component without runtime configuration. The
-/// adapter's generic runtime KV store uses its own `trusted_server_kv` label
+/// adapter's generic runtime KV store uses its own `trusted_server_runtime_kv` label
 /// and never this one.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub(crate) const SPIN_DEFAULT_CONFIG_LABEL: &str = "default";
@@ -225,7 +227,7 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 /// config key live there. The host build has no Spin runtime and answers every
 /// config read with an error.
 ///
-/// KV is the `trusted_server_kv` handle `EdgeZero` registers because
+/// KV is the `trusted_server_runtime_kv` handle `EdgeZero` registers because
 /// [`TrustedServerApp`](crate::app::TrustedServerApp) declares that store. It
 /// opens the label of the same name on first use; a component without that
 /// label answers each KV operation with `KvError::OpenFailed`.
@@ -255,7 +257,7 @@ pub fn build_runtime_services(
     let config_store: Arc<dyn PlatformConfigStore> = Arc::new(NoopConfigStore);
 
     let kv_store: Arc<dyn PlatformKvStore> = ctx
-        .kv_store_default()
+        .kv_store(SPIN_KV_STORE_ID)
         .map(|handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>)
         .unwrap_or_else(|| Arc::new(UnavailableKvStore));
 

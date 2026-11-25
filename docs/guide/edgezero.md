@@ -35,11 +35,11 @@ staging isolation comes from selecting a different physical store with
 
 The manifest declares portable logical IDs:
 
-| Kind          | Logical ID               |
-| ------------- | ------------------------ |
-| KV            | `trusted_server_kv`      |
-| Configuration | `trusted_server_config`  |
-| Secrets       | `trusted_server_secrets` |
+| Kind          | Logical ID                  |
+| ------------- | --------------------------- |
+| KV            | `trusted_server_runtime_kv` |
+| Configuration | `trusted_server_config`     |
+| Secrets       | `trusted_server_secrets`    |
 
 An adapter maps those IDs to platform resources. The runtime-facing
 `StoreName` used for reads and the management-facing `StoreId` used for
@@ -51,7 +51,7 @@ Fastly binds its stores in `fastly.toml` and through the managed deploy.
 Axum loads config and required secrets once at startup from EdgeZero-prepared
 stores and shares immutable snapshots with requests. Its generic KV is unsupported. Cloudflare reads Worker variables, secrets
 and one KV namespace binding. Spin reads its `default` key-value label,
-component variables and an optional `trusted_server_kv` label.
+component variables and an optional `trusted_server_runtime_kv` label.
 
 ## Store inventory
 
@@ -64,7 +64,7 @@ the feature that depends on it reports its own error.
 | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `trusted_server_config` (config)                                                       | `edgezero.toml`, Fastly and Axum `Hooks::stores()`, `fastly.toml`, `cloudflare.toml`                                                             | App-config blob that `ts config push` writes                  | Startup reads it from the linked Config Store                                                     | Not read; startup reads the `TRUSTED_SERVER_CONFIG` variable instead                                                | Startup reads the `trusted_server_config` key from the `default` label                              | Startup loads the prepared config envelope; requests read its immutable snapshot                                 |
 | `trusted_server_secrets` (secrets)                                                     | `edgezero.toml`, Fastly and Axum `Hooks::stores()`, `fastly.toml`, `cloudflare.toml`, `spin.toml` `[variables]`                                  | Secret values that the app config names                       | Startup and request read the linked Secret Store                                                  | Startup and request read Worker secrets (`wrangler secret put`) by key name; `wrangler.ci.toml` defines test values | Startup and request read encoded component variables (`v_<store>_v_<key>`)                          | Startup resolves active references from prepared secrets; requests read only those captured keys                 |
-| `trusted_server_kv` (KV)                                                               | `edgezero.toml`, Fastly `Hooks::stores()`, Spin `Hooks::stores()`, `fastly.toml` (local), `wrangler.toml`, `wrangler.ci.toml`, `cloudflare.toml` | Generic runtime KV that `RuntimeServices::kv_store()` returns | Request: the store linked under this ID. Unlinked: `KvError::OpenFailed`                          | Request: the `TRUSTED_SERVER_KV` namespace. Unbound: `KvError::Unavailable`                                         | Request: the `trusted_server_kv` label. Not granted: `KvError::OpenFailed`                          | Unsupported: `KvError::Unavailable`; pending #1587 → #1574                                                       |
+| `trusted_server_runtime_kv` (KV)                                                       | `edgezero.toml`, Fastly `Hooks::stores()`, Spin `Hooks::stores()`, `fastly.toml` (local), `wrangler.toml`, `wrangler.ci.toml`, `cloudflare.toml` | Generic runtime KV that `RuntimeServices::kv_store()` returns | Request: the store linked under this ID. Unlinked: `KvError::OpenFailed`                          | Request: the `TRUSTED_SERVER_RUNTIME_KV` namespace. Unbound: `KvError::Unavailable`                                 | Request: the `trusted_server_runtime_kv` label. Not granted: `KvError::OpenFailed`                  | Unsupported: `KvError::Unavailable`; pending #1587 → #1574                                                       |
 | `jwks_store` (config)                                                                  | `fastly.toml` (local)                                                                                                                            | Request-signing metadata: `current-kid`, `active-kids`, JWKs  | Request reads the Config Store of this name                                                       | Unsupported: discovery answers `500`, `/verify-signature` answers `verified: false`, and signing fails              | Request reads the `default` label (Spin ignores the store name)                                     | Unsupported: enabled signing fails startup; otherwise discovery answers `500` and verification `verified: false` |
 | `signing_keys` (secrets)                                                               | `fastly.toml` (local)                                                                                                                            | Request-signing private keys by `kid`                         | Request reads the Secret Store of this name                                                       | Unsupported (see `jwks_store`)                                                                                      | Request reads encoded variables `v_signing_x5fkeys_v_<encoded kid>`, which `spin.toml` must declare | Unsupported: no snapshot for this store; enabled signing fails startup                                           |
 | `request_signing.config_store_id`, `request_signing.secret_store_id`                   | App config                                                                                                                                       | Management targets for key rotation                           | Rotation writes through the Fastly API                                                            | Unsupported: rotation answers `501`                                                                                 | Unsupported: rotation answers `501`                                                                 | Unsupported: rotation answers `501`                                                                              |
@@ -78,9 +78,9 @@ the feature that depends on it reports its own error.
 
 Axum declares config and secrets in `Hooks::stores()`; it does not register
 runtime KV. Its `axum.toml` contains application and logging metadata, with no
-store declarations. `trusted_server_kv` is retained for identity storage,
-with Axum support deferred to #1587 (shared backend over EdgeZero `KvStore`)
-then #1574 (Axum identity). This generic KV wiring does not migrate the
+store declarations. Identity records will use a separate logical store,
+`trusted_server_kv`, with Axum support deferred to #1587 (shared backend over
+EdgeZero `KvStore`) then #1574 (Axum identity). This generic KV wiring does not migrate the
 existing Fastly identity record backend. Axum snapshot writes fail; publish
 prepared inputs and restart to change config or secrets.
 

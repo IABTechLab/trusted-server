@@ -30,12 +30,12 @@ pass before the next task starts.
   has no registry. Production always has one. Test contexts that inject
   `default_kv_store` (the trace tests) do not, so they keep observing the
   injected store, and the fallback's doc comment says so.
-- `fastly.toml`: add a local `[[local_server.kv_stores.trusted_server_kv]]`
+- `fastly.toml`: add a local `[[local_server.kv_stores.trusted_server_runtime_kv]]`
   placeholder and remove `creative_store`.
 - Viceroy template: remove `creative_store`, `opid_store` and
   `ec_partner_store`.
 - `integration-tests/tests/common/config.rs`: also assert that `fastly.toml`
-  defines `trusted_server_kv`.
+  defines `trusted_server_runtime_kv`.
 - Tests, all under Viceroy:
   1. Build a context whose `KvRegistry` is keyed by
      `TrustedServerApp::stores().kv` (default id and ids) and holds
@@ -45,10 +45,10 @@ pass before the next task starts.
   2. A context without a registry returns `KvError::Unavailable`.
 - Verify: `cargo test-fastly` and `cargo test-fastly-reuse`.
 
-## Task 3: Cloudflare opens `TRUSTED_SERVER_KV`
+## Task 3: Cloudflare opens `TRUSTED_SERVER_RUNTIME_KV`
 
 - `platform.rs`:
-  - Add `pub const CLOUDFLARE_KV_BINDING: &str = "TRUSTED_SERVER_KV"`. It is
+  - Add `pub const CLOUDFLARE_KV_BINDING: &str = "TRUSTED_SERVER_RUNTIME_KV"`. It is
     public (`platform` is a public module) because the wasm branch is the only
     production use, and `pub(crate)` would be `dead_code` on the host.
   - On wasm, open `CloudflareKvStore::from_env(env, CLOUDFLARE_KV_BINDING)` per
@@ -73,7 +73,7 @@ pass before the next task starts.
 
 - `app.rs`: `Hooks::stores()` declares only
   `kv: Some(StoreMetadata { default: SPIN_KV_STORE_ID, ids: &[SPIN_KV_STORE_ID] })`,
-  where `SPIN_KV_STORE_ID = "trusted_server_kv"`.
+  where `SPIN_KV_STORE_ID = "trusted_server_runtime_kv"`.
 - `platform.rs`:
   - Use `KvHandleStore` for `ctx.kv_store_default()`.
   - On wasm, the config store is a `ConfigStoreHandleAdapter` over
@@ -85,12 +85,12 @@ pass before the next task starts.
     that, each target's clippy reports dead code.
 - `spin.toml` comments:
   - Request-time config and signing metadata come from `default`.
-  - `trusted_server_kv` is an opt-in label, with an example.
+  - `trusted_server_runtime_kv` is an opt-in label, with an example.
   - The label override must never name `default`.
 - `tests/routes.rs`:
   - Reword the manifest test messages that claim config and secret injection.
   - Add a test that `TrustedServerApp::stores()` declares only KV, with the id
-    `trusted_server_kv`.
+    `trusted_server_runtime_kv`.
 - Integration: refactor the Spin branch of `with_trace_runtime` into a helper
   that accepts extra `default` key-value pairs. The existing branch passes
   none.
@@ -126,7 +126,7 @@ pass before the next task starts.
   - Request-time config comes from `default`, including the DataDome effect
     and key collisions (D2).
   - `ts provision` adds every `edgezero.toml` KV and config label, including
-    `trusted_server_kv`, to `key_value_stores`, after which `spin up` needs
+    `trusted_server_runtime_kv`, to `key_value_stores`, after which `spin up` needs
     runtime config for them.
   - Correct line 89: CI now installs Spin.
   - Signing private keys use encoded variables.
@@ -134,7 +134,7 @@ pass before the next task starts.
   - Correct lines 84-86.
 - `docs/guide/axum-dev.md`: document unsupported KV pending #1587 → #1574,
   prepared-store startup, and unsupported EC lookup and key rotation.
-- `docs/guide/fastly.md`: the purpose of `trusted_server_kv`, plus the
+- `docs/guide/fastly.md`: the purpose of `trusted_server_runtime_kv`, plus the
   dedicated-store requirement (D7).
 - `docs/guide/api-reference.md`: add a footnote for the Cloudflare discovery
   and `/verify-signature` cells that gives the actual results. The cells must
@@ -142,7 +142,7 @@ pass before the next task starts.
 - `docs/guide/architecture.md` (lines 57 and 70) and the crate READMEs for
   Axum, Cloudflare and Spin.
 - `trusted-server.example.toml`: fix the `ec_store` comment that links it to
-  `trusted_server_kv`.
+  `trusted_server_runtime_kv`.
 - Verify:
   - `cd docs && npm run format` and the Markdown prettier gate, both with
     docs' pinned prettier.

@@ -90,7 +90,7 @@ proxy_secret = "publisher_proxy_secret"
 passphrase = "ec_passphrase"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml). It is separate
-# from edgezero.toml's generic runtime KV store `trusted_server_kv`.
+# from edgezero.toml's generic runtime KV store `trusted_server_runtime_kv`.
 ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3

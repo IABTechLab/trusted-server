@@ -101,14 +101,14 @@ distinct from each other and from `trusted_server_config`. Request-signing
 private keys are encoded component variables, such as
 `v_signing_x5fkeys_v_<encoded kid>` for store `signing_keys`.
 
-The generic runtime KV store is the `trusted_server_kv` label, which the
+The generic runtime KV store is the `trusted_server_runtime_kv` label, which the
 component opens on first use. `spin.toml` does not grant it, so KV operations
 answer `KvError::OpenFailed` and every route is still served. To enable it,
 add the label to the component's `key_value_stores` and give it a backend in
 the runtime config. `ts provision --adapter spin` adds every KV and config
-label `edgezero.toml` declares, including `trusted_server_kv`, after which
+label `edgezero.toml` declares, including `trusted_server_runtime_kv`, after which
 `spin up` needs runtime config for each of them. Never point
-`EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` at `default`: generic KV
+`EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME` at `default`: generic KV
 writes would then share the label that holds the app config and signing
 metadata.
 

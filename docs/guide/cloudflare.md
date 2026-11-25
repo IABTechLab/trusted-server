@@ -34,7 +34,7 @@ Install the Wrangler version pinned in `.tool-versions`, then run:
 
 The smoke refuses an absent pin or a different Wrangler executable. It creates
 an isolated Worker manifest, maps the EdgeZero config store to
-`TRUSTED_SERVER_KV`, and runs `ts config push --adapter cloudflare --local`.
+`TRUSTED_SERVER_RUNTIME_KV`, and runs `ts config push --adapter cloudflare --local`.
 It reads `trusted_server_config` back with `wrangler kv key get` using both the
 explicit binding and local mode. The returned envelope becomes the string
 value of `app_config` in a JSON object; that outer JSON is assigned to the
@@ -73,13 +73,13 @@ only after all four bindings are present.
 
 A successful `ts config push` alone does not configure this runtime: startup
 reads only the `TRUSTED_SERVER_CONFIG` variable, never a KV namespace. Push
-deployment config to a namespace other than `TRUSTED_SERVER_KV`, which holds
+deployment config to a namespace other than `TRUSTED_SERVER_RUNTIME_KV`, which holds
 runtime KV data. The local smoke's isolated namespace is removed when it
 exits.
 
 ## Runtime stores
 
-- **Generic runtime KV.** The Worker opens the `TRUSTED_SERVER_KV` namespace
+- **Generic runtime KV.** The Worker opens the `TRUSTED_SERVER_RUNTIME_KV` namespace
   binding for each request and hands it to features through
   `RuntimeServices::kv_store()`. Without the binding, KV operations answer
   `KvError::Unavailable`, a warning is logged once per isolate, and every
