@@ -31,7 +31,7 @@ docker build \
   -t ts-native:aws .
 ```
 
-`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a connector does not select it. For EC, set `TS_EC_RECORDS_ENABLED=true` at boot to declare the layout before preparation, select the connector in `EDGEZERO__STORE_BINDINGS_FILE`, and reference logical `trusted_server_kv` with `ec.storage.provider="records"` in published application configuration. A separate boot profile selects protected CloudFront Geo. Credentials and provider settings are runtime inputs, never image build arguments. See [Native EC persistence](./native-ec-persistence.md). The local-provider smoke below does not validate AWS access.
+`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a connector does not select it. For EC, set `TRUSTED_SERVER__EC_RECORDS_ENABLED=true` at boot to declare the layout before preparation, select the connector in `EDGEZERO__STORE_BINDINGS_FILE`, and reference logical `trusted_server_kv` with `ec.storage.provider="records"` in published application configuration. A separate boot profile selects protected CloudFront Geo. Credentials and provider settings are runtime inputs, never image build arguments. See [Native EC persistence](./native-ec-persistence.md). The local-provider smoke below does not validate AWS access.
 
 ## Local smoke test
 

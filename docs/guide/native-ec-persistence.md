@@ -22,7 +22,7 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TS_EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TRUSTED_SERVER__EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
 
 Published application config selects the logical prepared store, not an endpoint or credentials:
 
@@ -32,7 +32,7 @@ provider = "records"
 store = "trusted_server_kv"
 ```
 
-A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TS_EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TRUSTED_SERVER__EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 
