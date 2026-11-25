@@ -23,11 +23,9 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
-        [[local_server.kv_stores.counter_store]]
-            key = "placeholder"
-            data = "placeholder"
-
-        [[local_server.kv_stores.creative_store]]
+        # Generic runtime KV, linked under the logical ID `trusted_server_runtime_kv`
+        # that `edgezero.toml` and the adapter's `Hooks::stores()` declare.
+        [[local_server.kv_stores.trusted_server_runtime_kv]]
             key = "placeholder"
             data = "placeholder"
 

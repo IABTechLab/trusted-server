@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
@@ -29,6 +29,7 @@ use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
 use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
+use crate::proxy_policy::{CompiledProxyPolicy, ProxyIdentityEndpoint};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -795,6 +796,141 @@ pub struct ProviderSecrets {
     pub token: Option<Redacted<String>>,
 }
 
+/// The publisher endpoint that returns a signed-in visitor's hashed email
+/// (`[ec.hashed_email]`, spec §8.7).
+///
+/// Identity providers with the hashed-email capability read their value
+/// from its JSON response at their own path.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_hashed_email_request, skip_on_field_errors = false))]
+pub struct HashedEmailSource {
+    /// Status endpoint; must be `https` with a host. Called with `method`,
+    /// the visitor's whole `Cookie` header and the configured `headers`.
+    #[validate(custom(function = HashedEmailSource::validate_endpoint))]
+    pub endpoint: String,
+    /// HTTP method of the status call, `GET` (default) or `POST`.
+    #[serde(default)]
+    pub method: HashedEmailMethod,
+    /// Request body, sent as is; only with `POST`. Without a configured
+    /// `content-type` header it is sent as `application/json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Extra request headers by name: a fixed value, or `{ cookie = "name" }`
+    /// for the value of the visitor's cookie `name` (unquoted). Without that
+    /// cookie the visitor cannot be signed in, so no call is made.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, HashedEmailHeader>,
+    /// Cutoff for the status call, in milliseconds. The call shares the
+    /// collection phase's identity budget with the lookups, so it must be
+    /// below `identity_budget_ms`, and below
+    /// `identity_after_response_budget_ms` when an after-response provider
+    /// reads a hashed email.
+    #[serde(
+        default = "HashedEmailSource::default_timeout_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub timeout_ms: u64,
+}
+
+/// HTTP method of the hashed-email status call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HashedEmailMethod {
+    /// `GET`, without a body.
+    #[default]
+    Get,
+    /// `POST`, with the configured `body`, if any.
+    Post,
+}
+
+/// Value of an extra header on the hashed-email status call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum HashedEmailHeader {
+    /// A fixed value.
+    Value(String),
+    /// The value of the visitor's cookie `cookie`, unquoted.
+    Cookie {
+        /// Cookie name.
+        cookie: String,
+    },
+}
+
+/// Headers the status call sets itself, which `headers` may not set.
+const HASHED_EMAIL_RESERVED_HEADERS: [&str; 4] =
+    ["cookie", "host", "content-length", "transfer-encoding"];
+
+fn validate_hashed_email_request(source: &HashedEmailSource) -> Result<(), ValidationError> {
+    source.request_error().map_or(Ok(()), |message| {
+        Err(ValidationError::new("hashed_email_request").with_message(message.into()))
+    })
+}
+
+impl HashedEmailSource {
+    /// Why the configured method, body and headers cannot form a request, if
+    /// they cannot: a body without `POST`, a header name that is not valid
+    /// or that the call sets itself, a fixed value that is not a valid header
+    /// value, or an empty cookie name.
+    #[must_use]
+    pub fn request_error(&self) -> Option<String> {
+        if self.body.is_some() && self.method != HashedEmailMethod::Post {
+            return Some("body is only sent with method = \"POST\"".to_owned());
+        }
+        for (name, value) in &self.headers {
+            let lower = name.to_ascii_lowercase();
+            if http::HeaderName::from_bytes(lower.as_bytes()).is_err() {
+                return Some(format!("header `{name}` is not a valid header name"));
+            }
+            if HASHED_EMAIL_RESERVED_HEADERS.contains(&lower.as_str()) {
+                return Some(format!("header `{name}` is set by Trusted Server"));
+            }
+            match value {
+                HashedEmailHeader::Value(value) if http::HeaderValue::from_str(value).is_err() => {
+                    return Some(format!("header `{name}` has an invalid value"));
+                }
+                HashedEmailHeader::Cookie { cookie } if cookie.trim().is_empty() => {
+                    return Some(format!("header `{name}` names an empty cookie"));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Default status call cutoff (100 ms), half the default page-phase
+    /// identity budget.
+    #[must_use]
+    pub const fn default_timeout_ms() -> u64 {
+        100
+    }
+
+    /// The parsed endpoint, when it is `https` with a host.
+    #[must_use]
+    pub fn endpoint_url(&self) -> Option<Url> {
+        Url::parse(&self.endpoint)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.host_str().is_some())
+    }
+
+    fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
+        let valid = Url::parse(endpoint)
+            .ok()
+            .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some());
+        if valid {
+            Ok(())
+        } else {
+            Err(ValidationError::new("hashed_email_endpoint")
+                .with_message("must be an https URL with a host".into()))
+        }
+    }
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -874,6 +1010,12 @@ pub struct Ec {
         deserialize_with = "vec_from_seq_or_map"
     )]
     pub identity_providers: Vec<IdentityProviderConfig>,
+
+    /// The publisher endpoint that returns a signed-in visitor's hashed
+    /// email, for providers with the hashed-email capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub hashed_email: Option<HashedEmailSource>,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -890,6 +1032,7 @@ impl Default for Ec {
             identity_budget_ms: Self::default_identity_budget_ms(),
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
+            hashed_email: None,
         }
     }
 }
@@ -2222,7 +2365,19 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Must be true. Origin TLS is always verified.
+    /// Explicit creative identity destination grants; empty denies disclosure.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
+    pub identity_endpoints: Vec<ProxyIdentityEndpoint>,
+    /// Prepared immutable identity policy. Rebuild through [`Self::prepare_runtime`]
+    /// after changing endpoint configuration and before routing requests.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub compiled_identity_policy: CompiledProxyPolicy,
+    /// Must be true. TLS is always verified on every outbound HTTPS request.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the
@@ -2258,6 +2413,8 @@ fn is_admin_placeholder_password(password: &str) -> bool {
 impl Default for Proxy {
     fn default() -> Self {
         Self {
+            identity_endpoints: Vec::new(),
+            compiled_identity_policy: CompiledProxyPolicy::default(),
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
@@ -2326,13 +2483,22 @@ impl Proxy {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any configured asset route is invalid.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if an asset route or identity endpoint is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.compiled_identity_policy = CompiledProxyPolicy::compile(&self.identity_endpoints)?;
         for route in &self.asset_routes {
             route.prepare_runtime()?;
         }
 
         Ok(())
+    }
+
+    /// Return the immutable identity policy prepared for this configuration.
+    ///
+    /// Call [`Self::prepare_runtime`] after any programmatic endpoint changes.
+    #[must_use]
+    pub fn identity_policy(&self) -> &CompiledProxyPolicy {
+        &self.compiled_identity_policy
     }
 
     /// Resolve the longest matching asset route for the given request path.
@@ -4769,6 +4935,7 @@ mod tests {
             "identity_budget_ms",
             "identity_after_response_budget_ms",
             "identity_providers",
+            "hashed_email",
         ] {
             assert!(
                 serialized.get(field).is_none(),
@@ -4800,6 +4967,166 @@ mod tests {
                 invalid,
                 "should enforce identity budget bounds for {page} and {after_response}"
             );
+        }
+    }
+
+    #[test]
+    fn hashed_email_source_is_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse the hashed email source");
+
+        assert_eq!(
+            source.timeout_ms,
+            HashedEmailSource::default_timeout_ms(),
+            "should default the timeout"
+        );
+        for (endpoint, timeout_ms, invalid) in [
+            ("https://www.example.com/api/user/status", 300, false),
+            ("https://www.example.com/api/user/status", 1000, false),
+            ("https://www.example.com/api/user/status", 0, true),
+            ("https://www.example.com/api/user/status", 1001, true),
+            ("http://www.example.com/api/user/status", 300, true),
+            ("not a url", 300, true),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: endpoint.to_owned(),
+                    timeout_ms,
+                    method: HashedEmailMethod::Get,
+                    body: None,
+                    headers: BTreeMap::new(),
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should check {endpoint} with {timeout_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_request_parts_are_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource = toml::from_str(
+            r#"
+            endpoint = "https://www.example.com/api/user/profile"
+            method = "POST"
+            body = "{}"
+            [headers]
+            x-session = { cookie = "session" }
+            x-requested-with = "XMLHttpRequest"
+            "#,
+        )
+        .expect("should parse a POST status call");
+
+        assert_eq!(source.method, HashedEmailMethod::Post, "should read POST");
+        assert_eq!(source.body.as_deref(), Some("{}"), "should read the body");
+        assert_eq!(
+            source.headers.get("x-session"),
+            Some(&HashedEmailHeader::Cookie {
+                cookie: "session".to_owned()
+            }),
+            "should read a header taken from a cookie"
+        );
+        assert_eq!(
+            source.headers.get("x-requested-with"),
+            Some(&HashedEmailHeader::Value("XMLHttpRequest".to_owned())),
+            "should read a fixed header"
+        );
+        let default: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse a GET status call");
+        assert_eq!(
+            default.method,
+            HashedEmailMethod::Get,
+            "should default to GET"
+        );
+
+        let header =
+            |name: &str, value: HashedEmailHeader| BTreeMap::from([(name.to_owned(), value)]);
+        let fixed = |value: &str| HashedEmailHeader::Value(value.to_owned());
+        for (method, body, headers, invalid, case) in [
+            (
+                HashedEmailMethod::Post,
+                Some("{}"),
+                BTreeMap::new(),
+                false,
+                "POST with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                Some("{}"),
+                BTreeMap::new(),
+                true,
+                "GET with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("1")),
+                false,
+                "a fixed header",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("Cookie", fixed("a=1")),
+                true,
+                "Cookie",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("host", fixed("example.com")),
+                true,
+                "Host",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("bad name", fixed("1")),
+                true,
+                "an invalid name",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("a\nb")),
+                true,
+                "an invalid value",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header(
+                    "x-ok",
+                    HashedEmailHeader::Cookie {
+                        cookie: " ".to_owned(),
+                    },
+                ),
+                true,
+                "an empty cookie name",
+            ),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: "https://www.example.com/api/user/status".to_owned(),
+                    timeout_ms: 100,
+                    method,
+                    body: body.map(str::to_owned),
+                    headers,
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(ec.validate().is_err(), invalid, "should check {case}");
         }
     }
 
@@ -8662,6 +8989,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8682,6 +9010,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8697,6 +9026,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8712,6 +9042,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -8726,6 +9057,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -8744,6 +9076,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8768,6 +9101,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
 
@@ -9492,6 +9826,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -9520,6 +9855,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -9736,6 +10072,87 @@ source_domain = "partner.example.com"
 
     /// Helper that returns a settings TOML string WITHOUT any admin handler,
     /// for tests that need to verify uncovered-admin-endpoint behaviour.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyProxyReader {
+        #[serde(rename = "certificate_check")]
+        _certificate_check: bool,
+        #[serde(rename = "allowed_domains")]
+        _allowed_domains: Vec<String>,
+        #[serde(rename = "asset_routes")]
+        _asset_routes: Vec<ProxyAssetRoute>,
+    }
+
+    #[test]
+    fn proxy_identity_policy_is_prepared_and_never_serialized() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"https://example.com:443/","path_exact":"/event"}]
+        })).expect("should deserialize endpoint config");
+        proxy
+            .prepare_runtime()
+            .expect("should prepare immutable identity policy");
+        let target = Url::parse("https://example.com/event").expect("should parse target");
+        assert_eq!(
+            proxy
+                .identity_policy()
+                .matching_endpoint(&target)
+                .map(|rule| rule.id.as_str()),
+            Some("event"),
+            "should compile endpoint during runtime preparation"
+        );
+        let serialized = serde_json::to_value(&proxy).expect("should serialize proxy");
+        assert!(
+            serialized.get("compiled_identity_policy").is_none(),
+            "should omit runtime policy from stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(serialized)
+            .expect_err("should reject recipient grants in the older deny-unknown-fields reader");
+        proxy.identity_endpoints.clear();
+        proxy
+            .prepare_runtime()
+            .expect("should recompile changed configuration");
+        assert!(
+            proxy.identity_policy().matching_endpoint(&target).is_none(),
+            "should replace previous compiled rules after mutation"
+        );
+        let empty = serde_json::to_value(&proxy).expect("should serialize empty policy");
+        assert!(
+            empty.get("identity_endpoints").is_none(),
+            "should omit default-empty rules for compatible stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(empty)
+            .expect("should preserve default configuration readability for the older reader");
+    }
+
+    #[test]
+    fn proxy_identity_policy_rejects_invalid_runtime_configuration() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"http://example.com","path_exact":"/event"}]
+        })).expect("should deserialize structurally valid endpoint");
+        assert!(
+            proxy.prepare_runtime().is_err(),
+            "should reject invalid origin during runtime preparation"
+        );
+    }
+
+    #[test]
+    fn proxy_identity_endpoints_accept_sequence_and_map_overlays() {
+        for endpoints in [
+            serde_json::json!([{"id":"event","origin":"https://example.com","path_exact":"/event"}]),
+            serde_json::json!({"0":{"id":"event","origin":"https://example.com","path_exact":"/event"}}),
+        ] {
+            let proxy: Proxy =
+                serde_json::from_value(serde_json::json!({"identity_endpoints":endpoints}))
+                    .expect("should accept typed identity endpoint configuration");
+            assert_eq!(
+                serde_json::to_value(proxy).expect("should serialize proxy")["identity_endpoints"]
+                    [0]["id"],
+                "event",
+                "should preserve endpoint rule"
+            );
+        }
+    }
+
     fn settings_str_without_admin_handler() -> String {
         r#"
             [[handlers]]

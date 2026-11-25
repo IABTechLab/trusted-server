@@ -3,10 +3,12 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { test } from 'node:test'
 import {
+  dockerEnvironment,
   envelope,
   fixtureEnvelope,
   images,
   isolatedEnvironment,
+  outputHolds,
   publishedEndpoint,
   sorted,
   stopChild,
@@ -119,3 +121,41 @@ test(
     }
   }
 )
+
+test('Docker commands get an isolated HOME and only an explicit daemon endpoint', () => {
+  const inherited = {
+    PATH: '/usr/bin',
+    HOME: '/home/operator',
+    DOCKER_CONTEXT: 'operator-context',
+    DOCKER_CONFIG: '/home/operator/.docker',
+    AWS_ACCESS_KEY_ID: 'operator-key',
+    HTTPS_PROXY: 'http://proxy.example.com',
+  }
+  assert.deepEqual(dockerEnvironment('/tmp/work', inherited), {
+    PATH: '/usr/bin',
+    HOME: '/tmp/work',
+  })
+  assert.deepEqual(
+    dockerEnvironment('/tmp/work', {
+      ...inherited,
+      DOCKER_HOST: 'unix:///tmp/example-docker.sock',
+    }),
+    {
+      PATH: '/usr/bin',
+      HOME: '/tmp/work',
+      DOCKER_HOST: 'unix:///tmp/example-docker.sock',
+    }
+  )
+})
+
+test('failure output must name the cause and hold no secret value', () => {
+  const cause = 'trusted_server_secrets: missing resource'
+  assert.equal(outputHolds(`startup secrets: ${cause} or version`, cause), null)
+  assert.equal(outputHolds('unrelated failure', cause), 'startup cause')
+  for (const phase of ['A', 'B']) {
+    const leaked = `${cause} synthetic-proxy-secret-32-bytes-minimum-${phase}`
+    assert.equal(outputHolds(leaked, cause), 'secret value in output')
+  }
+  const admin = `${cause} { "password": "synthetic-admin-A" }`
+  assert.equal(outputHolds(admin, cause), 'secret value in output')
+})
