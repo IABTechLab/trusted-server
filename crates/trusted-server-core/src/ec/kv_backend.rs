@@ -72,7 +72,9 @@ pub enum EcKvWriteOutcome {
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
 ///
 /// I/O returns local futures so native backends can yield without blocking the
-/// request runtime. Neither stores nor their futures need to be `Send` or `Sync`.
+/// request runtime. Neither stores nor their futures need to be `Send` or `Sync`;
+/// a store the shared identity app holds across requests must be both (see
+/// [`crate::ec::app::IdentityPlatform`]).
 #[async_trait::async_trait(?Send)]
 pub trait EcKvStore {
     /// Returns the platform store name, used in log and error messages.
