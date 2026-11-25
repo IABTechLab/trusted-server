@@ -82,3 +82,24 @@ close and reopen it, or push to its branch, before merging. To retry a run,
 dispatch it again with the same `since` and `sha`, both recorded in the
 proposal's body; publication refuses a retry whose range differs from an open
 proposal's.
+
+## Axum and Next.js transport measurements
+
+With the managed runner/client integration from #1506 present, run:
+
+```bash
+bash scripts/measure-axum-nextjs/run.sh /tmp/axum-nextjs-measurement
+```
+
+Use the repository-pinned Node and Rust. The output directory must be empty;
+ports 18980–18982 must be free. The runner builds the current checkout and
+installs locked Next.js and browser dependencies. It uses disposable configuration
+and synthetic cookies/secrets; no deployment or operator config is changed.
+
+The `Axum Next.js transport measurement` Actions workflow runs the same command,
+asserts body/cookie/navigation correctness and upstream reuse, and publishes
+connection counts and median/p95 timings in its summary. Raw synthetic receipts,
+source/tool/binary identity and failure logs are uploaded as artifacts. Timings
+are descriptive; there are no performance pass thresholds. See the
+[measurement report](../docs/internal/measurements/2026-11-19-1585-axum-nextjs.md)
+for the historical observations, origin prerequisite and scope limits.

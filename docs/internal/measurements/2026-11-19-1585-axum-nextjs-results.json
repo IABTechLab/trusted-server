@@ -1,0 +1,133 @@
+{
+  "measured_at": "2026-11-19",
+  "trusted_server_revision": "feaf3df5d1c9bb2dca64158480725cb555ab9c26",
+  "edgezero_revision": "9d02d7b3185b49e81d9ac972ca3feef932ed848a",
+  "environment": {
+    "rust": "1.98.1",
+    "node": "24.20.0",
+    "next": "14.2.35",
+    "chromium": "145.0.7632.6",
+    "target": "aarch64-apple-darwin",
+    "profile": "dev",
+    "protocol": "HTTP/1 on loopback"
+  },
+  "targets": {
+    "18980": "Direct Next.js",
+    "18982": "Managed Axum through a transparent TCP relay to Next.js"
+  },
+  "scope": "Captured local measurement; not a CI fixture or a pooled-versus-fresh comparison",
+  "success": true,
+  "upstream_requests": 204,
+  "used_connections": 18,
+  "requests_per_connection": {
+    "2": 78,
+    "3": 12,
+    "4": 11,
+    "6": 12,
+    "7": 11,
+    "5": 16,
+    "8": 5,
+    "9": 8,
+    "13": 15,
+    "10": 27,
+    "14": 1,
+    "12": 2,
+    "11": 1,
+    "15": 1,
+    "16": 1,
+    "17": 1,
+    "18": 1,
+    "19": 1
+  },
+  "historical_posts": 30,
+  "historical_connections": [2],
+  "valid_fetch_actions": 15,
+  "valid_fetch_action_connections": [3, 4, 5, 10, 13],
+  "timings": {
+    "18980": {
+      "historical_post": {
+        "n": 30,
+        "median_ms": 7.187,
+        "p95_ms": 8.975,
+        "max_ms": 45.223
+      },
+      "api_get": {
+        "n": 31,
+        "median_ms": 0.714,
+        "p95_ms": 1.183,
+        "max_ms": 5.834
+      },
+      "concurrent_echo": {
+        "n": 48,
+        "median_ms": 87.652,
+        "p95_ms": 98.67,
+        "max_ms": 98.808
+      },
+      "browser_cycles": {
+        "n": 18,
+        "median_ms": 133.41,
+        "p95_ms": 231.622,
+        "max_ms": 231.622
+      }
+    },
+    "18982": {
+      "historical_post": {
+        "n": 30,
+        "median_ms": 9.61,
+        "p95_ms": 12.088,
+        "max_ms": 18.095
+      },
+      "api_get": {
+        "n": 31,
+        "median_ms": 1.376,
+        "p95_ms": 2.568,
+        "max_ms": 4.433
+      },
+      "concurrent_echo": {
+        "n": 48,
+        "median_ms": 97.223,
+        "p95_ms": 113.936,
+        "max_ms": 113.985
+      },
+      "browser_cycles": {
+        "n": 18,
+        "median_ms": 133.796,
+        "p95_ms": 384.728,
+        "max_ms": 384.728
+      }
+    }
+  },
+  "browser_observations": {
+    "direct_action_cycles": 18,
+    "managed_action_cycles": 18,
+    "hydrated_cycles_per_target": 15,
+    "javascript_disabled_cycles_per_target": 3,
+    "concurrent_hydrated_contexts_per_target": 4,
+    "cycles_per_context": 3,
+    "all_action_statuses": 303,
+    "token_and_cookie_checks_passed": true,
+    "return_navigation_checks_passed": true
+  },
+  "api_observations": {
+    "historical_post_get_pairs_per_target": 30,
+    "historical_requests_use_fresh_incoming_connections": true,
+    "historical_chunked_incoming_posts_per_target": 15,
+    "historical_outgoing_post_body": "[]",
+    "historical_outgoing_post_content_length": 2,
+    "concurrent_unique_uploads_per_target": 48,
+    "node_client_max_sockets": 16,
+    "chunked_upload_pause_ms_per_4096_bytes": 2,
+    "empty_post_passed": true,
+    "paced_chunked_non_json_upload_bytes": 81920,
+    "max_concurrent_upload_bytes": 163840,
+    "explicit_redirect_statuses": [303, 307, 308]
+  },
+  "limitations": [
+    "Exact proxy origin explicitly allowed by the Next.js fixture",
+    "Historical root cause remains unknown",
+    "Sequential direct and managed workloads, not randomized",
+    "Browser-cycle timings combine serial, concurrent and JavaScript-disabled scenarios",
+    "No TLS, HTTP/2, other Next.js versions, long idle connections or sustained-load qualification",
+    "No allocation profile or fresh outbound transport comparison"
+  ]
+}
