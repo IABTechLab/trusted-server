@@ -25,6 +25,9 @@ The integration is off when the section is absent. When the section exists, `ena
 | `rewrite_sdk_host`  | Unset                                               | Deprecated and ignored, including when set to `true`                            |
 | `origin_override`   | Unset                                               | Override the `Origin` header sent to the upstream API                           |
 
+Unknown fields are rejected, including the `organization_id` and `project_id`
+fields that earlier versions of this guide listed. Remove them and set `app_id`.
+
 `cache_ttl_seconds` controls downstream HTTP caching. The integration does not maintain a KV cache of SDK contents or identity mappings.
 
 ## SDK and API routing

@@ -971,7 +971,7 @@ fn build_asset_platform_request(
     Ok(PlatformHttpRequest::new(edge_req, backend_name))
 }
 
-async fn send_asset_origin_request(
+async fn send_uncached_asset_origin_request(
     services: &RuntimeServices,
     backend_name: &str,
     method: &Method,
@@ -980,8 +980,12 @@ async fn send_asset_origin_request(
     stream_response: bool,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let stream_response = stream_response && services.http_client().supports_streaming_responses();
+    // Preflight HEADs and raw error-body GETs bypass the readthrough cache. On a
+    // miss it can forward a signed HEAD as GET, invalidating SigV4, and the error
+    // response must come from S3 rather than from a cached object.
     let mut platform_req =
-        build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
+        build_asset_platform_request(method, target_url, outbound_headers, backend_name)?
+            .with_cache_bypass();
     if stream_response {
         platform_req = platform_req.with_stream_response();
     }
@@ -1039,7 +1043,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
-    let head_response = send_asset_origin_request(
+    let head_response = send_uncached_asset_origin_request(
         services,
         backend_name,
         &Method::HEAD,
@@ -1062,7 +1066,7 @@ async fn preflight_s3_origin_for_image_optimizer(
 
     let mut get_headers = unsigned_headers.clone();
     apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
-    let mut response = send_asset_origin_request(
+    let mut response = send_uncached_asset_origin_request(
         services,
         backend_name,
         &Method::GET,
@@ -1172,6 +1176,12 @@ pub async fn handle_asset_proxy_request(
         build_asset_platform_request(req.method(), &target_url, &outbound_headers, &backend_name)?;
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
+    } else if req.method() == Method::HEAD
+        && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
+    {
+        // Preserve the signed HEAD method on the raw path. IO requests must not
+        // use pass because Fastly prioritizes it over Image Optimizer.
+        platform_req = platform_req.with_cache_bypass();
     }
     let stream_response = services.http_client().supports_streaming_responses();
     if stream_response {
@@ -2260,8 +2270,9 @@ mod tests {
         build_services_with_secret_and_http_client, noop_services,
     };
     use crate::platform::{
-        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+        PlatformCacheIntent, PlatformError, PlatformHttpClient, PlatformHttpRequest,
+        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+        StoreId, StoreName,
     };
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -6099,6 +6110,11 @@ mod tests {
                 vec![false, true],
                 "S3 HEAD preflight stays non-streaming, final asset GET stays streaming"
             );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Default],
+                "signed HEAD preflight must bypass cache without disabling IO GET caching"
+            );
             let options = stub.recorded_image_optimizer_options();
             assert_eq!(options.len(), 2, "should send two origin requests");
             assert!(
@@ -6185,12 +6201,353 @@ mod tests {
                 vec![false, true],
                 "S3 HEAD preflight stays non-streaming, error-body GET stays streaming"
             );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Bypass],
+                "preflight and raw error-body fetch must both reach the S3 origin"
+            );
             let options = stub.recorded_image_optimizer_options();
             assert_eq!(
                 options,
                 vec![None, None],
                 "should not invoke IO for S3 errors"
             );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_bypasses_cache_for_signed_raw_head() {
+        futures::executor::block_on(async {
+            for (case, uri) in [
+                (
+                    "svg",
+                    "https://www.example.com/.images/logo.svg?profile=medium",
+                ),
+                (
+                    "svgz",
+                    "https://www.example.com/.images/logo.svgz?profile=medium",
+                ),
+                (
+                    "rewritten_svg",
+                    "https://www.example.com/.images/logo.png?profile=medium",
+                ),
+                (
+                    "debug",
+                    "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+                ),
+                (
+                    "disabled_io",
+                    "https://www.example.com/.images/foo.jpg?profile=medium",
+                ),
+                ("absent_io", "https://www.example.com/.images/foo.jpg"),
+            ] {
+                for streaming in [false, true] {
+                    let stub = Arc::new(StubHttpClient::new());
+                    stub.set_streaming_responses_supported(streaming);
+                    stub.push_response_with_headers(
+                        200,
+                        Vec::new(),
+                        vec![
+                            (header::CONTENT_LENGTH.as_str(), "42"),
+                            (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                        ],
+                    );
+                    let services = build_services_with_secret_and_http_client(
+                        HashMapSecretStore::new(test_s3_secrets()),
+                        Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                    );
+                    let mut settings = create_test_settings();
+                    settings.image_optimizer = ImageOptimizerSettings {
+                        profile_sets: HashMap::from([(
+                            "default_images".to_string(),
+                            test_profile_set(),
+                        )]),
+                    };
+                    let mut route = test_s3_image_optimizer_route();
+                    match case {
+                        "rewritten_svg" => {
+                            route.path_pattern = Some("^/\\.images/(.*)\\.png$".to_string());
+                            route.target_path = Some("/.images/$1.svg".to_string());
+                        }
+                        "disabled_io" => {
+                            route
+                                .image_optimizer
+                                .as_mut()
+                                .expect("should configure IO")
+                                .enabled = false;
+                        }
+                        "absent_io" => route.image_optimizer = None,
+                        _ => {}
+                    }
+                    let response = handle_asset_proxy_request(
+                        &settings,
+                        &services,
+                        build_http_request(Method::HEAD, uri),
+                        &route,
+                    )
+                    .await
+                    .expect("should proxy the signed raw HEAD");
+                    assert_eq!(
+                        stub.recorded_request_methods(),
+                        vec!["HEAD"],
+                        "{case} should send one HEAD with streaming={streaming}"
+                    );
+                    assert_eq!(
+                        stub.recorded_image_optimizer_options(),
+                        vec![None],
+                        "{case} HEAD should not attach IO with streaming={streaming}"
+                    );
+                    assert_eq!(
+                        stub.recorded_cache_intents(),
+                        vec![PlatformCacheIntent::Bypass],
+                        "{case} signed raw HEAD must bypass readthrough with streaming={streaming}"
+                    );
+                    assert_eq!(
+                        stub.recorded_stream_response_flags(),
+                        vec![streaming],
+                        "{case} HEAD should preserve streaming selection"
+                    );
+                    assert_eq!(
+                        response.cache_policy(),
+                        AssetProxyCachePolicy::OriginControlled,
+                        "{case} HEAD should preserve the origin cache policy"
+                    );
+                    let (response, stream_body) = response.into_response_and_body();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{case} HEAD should retain the origin status"
+                    );
+                    assert_eq!(
+                        response_header(&response, header::CONTENT_LENGTH),
+                        Some("42"),
+                        "{case} HEAD should retain the origin content length"
+                    );
+                    assert_eq!(
+                        response_header(&response, header::CACHE_CONTROL),
+                        Some("public, max-age=60"),
+                        "{case} HEAD should retain origin cache headers"
+                    );
+                    let body = if let Some(stream_body) = stream_body {
+                        let mut body = Vec::new();
+                        stream_asset_body(stream_body, &mut body)
+                            .await
+                            .expect("should consume the HEAD stream");
+                        body
+                    } else {
+                        response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should buffer the HEAD response")
+                            .to_vec()
+                    };
+                    assert!(
+                        body.is_empty(),
+                        "{case} HEAD should remain bodyless with streaming={streaming}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_keeps_cache_for_raw_get_and_unsigned_head() {
+        futures::executor::block_on(async {
+            for (method, signed) in [
+                (Method::GET, true),
+                (Method::GET, false),
+                (Method::HEAD, false),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, Vec::new());
+                let services = build_services_with_secret_and_http_client(
+                    HashMapSecretStore::new(test_s3_secrets()),
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                );
+                let mut route = test_s3_image_optimizer_route();
+                if !signed {
+                    route.auth = None;
+                }
+                handle_asset_proxy_request(
+                    &create_test_settings(),
+                    &services,
+                    build_http_request(
+                        method.clone(),
+                        "https://www.example.com/.images/logo.svg?profile=medium",
+                    ),
+                    &route,
+                )
+                .await
+                .expect("should proxy the raw asset");
+                assert_eq!(
+                    stub.recorded_request_methods(),
+                    vec![method.as_str()],
+                    "{method} with signed={signed} should not add a preflight"
+                );
+                assert_eq!(
+                    stub.recorded_image_optimizer_options(),
+                    vec![None],
+                    "{method} with signed={signed} should not attach IO to SVG"
+                );
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Default],
+                    "{method} with signed={signed} should keep readthrough caching"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_keeps_io_for_signed_optimized_head() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            stub.push_response(200, Vec::new());
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                build_http_request(
+                    Method::HEAD,
+                    "https://www.example.com/.images/foo.jpg?profile=medium",
+                ),
+                &test_s3_image_optimizer_route(),
+            )
+            .await
+            .expect("should proxy the optimized HEAD");
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD", "HEAD"],
+                "optimized HEAD should preflight before the IO request"
+            );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Bypass, PlatformCacheIntent::Default],
+                "optimized HEAD must not use pass, which disables IO on Fastly"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            assert_eq!(
+                options.len(),
+                2,
+                "optimized HEAD should send the preflight and final IO request"
+            );
+            assert!(
+                options[0].is_none(),
+                "preflight should not attach IO metadata"
+            );
+            assert!(
+                options[1].is_some(),
+                "final optimized HEAD should attach IO metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_returns_s3_head_errors_without_cache_or_io() {
+        futures::executor::block_on(async {
+            for status in [403, 404] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.set_streaming_responses_supported(true);
+                stub.push_response_with_headers(
+                    status,
+                    Vec::new(),
+                    vec![
+                        (header::CONTENT_TYPE.as_str(), "application/xml"),
+                        (header::CONTENT_LENGTH.as_str(), "42"),
+                        (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
+                        (header::SET_COOKIE.as_str(), "asset=1; Path=/"),
+                    ],
+                );
+                let services = build_services_with_secret_and_http_client(
+                    HashMapSecretStore::new(test_s3_secrets()),
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                );
+                let mut settings = create_test_settings();
+                settings.image_optimizer = ImageOptimizerSettings {
+                    profile_sets: HashMap::from([(
+                        "default_images".to_string(),
+                        test_profile_set(),
+                    )]),
+                };
+                let req = build_http_request(
+                    Method::HEAD,
+                    "https://www.example.com/.images/missing.jpg?profile=medium",
+                );
+
+                let response = handle_asset_proxy_request(
+                    &settings,
+                    &services,
+                    req,
+                    &test_s3_image_optimizer_route(),
+                )
+                .await
+                .expect("should return the S3 HEAD error");
+                assert_eq!(
+                    response.cache_policy(),
+                    AssetProxyCachePolicy::NoStorePrivate,
+                    "S3 HEAD {status} should carry a typed no-store policy"
+                );
+                let response = response
+                    .into_response()
+                    .expect("should buffer HEAD headers");
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "S3 HEAD {status} should keep the origin status"
+                );
+                assert_eq!(
+                    response_header(&response, header::CACHE_CONTROL),
+                    Some("no-store, private"),
+                    "S3 HEAD {status} should not be cached"
+                );
+                assert_eq!(
+                    response_header(&response, header::CONTENT_LENGTH),
+                    Some("42"),
+                    "S3 HEAD {status} should keep the origin Content-Length"
+                );
+                assert!(
+                    response.headers().get(header::SET_COOKIE).is_none(),
+                    "S3 HEAD {status} should strip Set-Cookie"
+                );
+                assert!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer HEAD body")
+                        .is_empty(),
+                    "S3 HEAD {status} error response must not contain a body"
+                );
+                assert_eq!(
+                    stub.recorded_request_methods(),
+                    vec!["HEAD"],
+                    "S3 HEAD {status} should not fetch an error body"
+                );
+                assert_eq!(
+                    stub.recorded_cache_intents(),
+                    vec![PlatformCacheIntent::Bypass],
+                    "S3 HEAD {status} preflight must bypass the readthrough cache"
+                );
+                assert_eq!(
+                    stub.recorded_image_optimizer_options(),
+                    vec![None],
+                    "S3 HEAD {status} should not invoke IO"
+                );
+                assert_eq!(
+                    stub.recorded_stream_response_flags(),
+                    vec![false],
+                    "S3 HEAD {status} preflight should stay non-streaming"
+                );
+            }
         });
     }
 
@@ -6243,6 +6600,11 @@ mod tests {
                 stub.recorded_stream_response_flags(),
                 vec![true],
                 "debug asset responses should still stay streaming"
+            );
+            assert_eq!(
+                stub.recorded_cache_intents(),
+                vec![PlatformCacheIntent::Default],
+                "debug S3 GET should keep readthrough caching"
             );
         });
     }

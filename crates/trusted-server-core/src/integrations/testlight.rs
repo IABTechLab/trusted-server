@@ -24,6 +24,7 @@ use crate::tsjs;
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
 #[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct TestlightConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,

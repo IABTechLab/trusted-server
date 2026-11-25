@@ -178,9 +178,33 @@ openssl rand -base64 32
 
 ### Strict Key Validation
 
-Trusted Server rejects unknown TOML keys in runtime configuration. Before pushing
-or upgrading config, remove stale fields and typos; otherwise config loading can
-fail and the service will return its startup-error response.
+`ts config validate` and `ts config push` reject unknown integration IDs and list
+the supported IDs. Unknown fields in known integration tables are rejected,
+including when `enabled = false`. The error names the integration and offending
+field. `[tester_cookie]` and `[tinybird]` also reject unknown fields. Payload maps
+such as Prebid managed-user-ID `params` and Adserver Mock `context_query_params`
+remain open for application-defined keys.
+
+A disabled block may omit fields that are required only when the integration is
+enabled. One limit applies: if a disabled block contains an incomplete nested
+entry, such as a Prebid managed user ID without `name`, parsing stops at that
+entry and unknown keys that follow it are not reported until the entry is
+completed. Enabling the block reports the incomplete entry first.
+
+Runtime startup rejects unknown fields in known tables. For compatibility with
+previously stored configurations, an unknown integration ID only logs a warning
+and its table is ignored at runtime.
+
+This warning is emitted each time runtime settings are loaded. On Fastly without
+reusable sandboxes, that means every request; remove unknown IDs before the next
+config push to avoid repeated warnings.
+
+Before upgrading, use the new CLI to run `ts config validate` against the current
+config, correct the reported settings, and push the cleaned config while the old
+binary is still running. On Fastly, wait for the config-store propagation window
+to elapse before activating the new binary; a successful push does not mean every
+point of presence (POP) has the new config. Otherwise a stored unknown field can
+prevent startup and cause the service to return its startup-error response.
 
 ## Configuration Files
 

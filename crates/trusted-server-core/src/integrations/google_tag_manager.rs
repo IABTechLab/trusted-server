@@ -238,6 +238,7 @@ pub(crate) fn rewrite_gtm_rsc_span(content: &str, record_text: bool) -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleTagManagerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
