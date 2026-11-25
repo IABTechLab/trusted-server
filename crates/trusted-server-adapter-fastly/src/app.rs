@@ -112,6 +112,7 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
+use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::constants::{COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
@@ -126,8 +127,10 @@ use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
+use trusted_server_core::ec::rate_limiter::RateLimiter;
 use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
@@ -457,6 +460,8 @@ pub(crate) struct AfterResponseLookups {
     pub(crate) ec_id: String,
     pub(crate) client_ip: Option<IpAddr>,
     pub(crate) user_agent: Option<String>,
+    pub(crate) referer: Option<String>,
+    pub(crate) accept_language: Option<String>,
     pub(crate) cookie_header: String,
 }
 
@@ -488,26 +493,45 @@ pub(crate) fn take_navigation_lookups() -> NavigationLookups {
     NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
-/// Request signals lent to identity providers.
-struct ProviderRequestSignals<'a> {
+/// Request signals lent to identity providers, copied out of the request so
+/// lookups can run while the router hands the request to the origin fetch.
+struct ProviderRequestSignals {
     client_ip: Option<IpAddr>,
-    user_agent: Option<&'a str>,
+    user_agent: Option<String>,
+    referer: Option<String>,
+    accept_language: Option<String>,
     cookie_header: String,
 }
 
-impl<'a> ProviderRequestSignals<'a> {
-    fn read(req: &'a Request, services: &RuntimeServices) -> Self {
+impl ProviderRequestSignals {
+    fn read(req: &Request, services: &RuntimeServices) -> Self {
         Self {
             // The trusted raw address: `EcContext::client_ip` is the
             // normalized EC-hash input, which drops IPv6 separators.
             client_ip: services.client_info().client_ip,
-            user_agent: req
-                .headers()
-                .get(header::USER_AGENT)
-                .and_then(|value| value.to_str().ok()),
+            user_agent: header_string(req, &header::USER_AGENT),
+            referer: header_string(req, &header::REFERER),
+            accept_language: header_string(req, &header::ACCEPT_LANGUAGE),
             cookie_header: joined_cookie_header(req),
         }
     }
+
+    fn client(&self) -> ClientSignals<'_> {
+        ClientSignals {
+            ip: self.client_ip,
+            user_agent: self.user_agent.as_deref(),
+            referer: self.referer.as_deref(),
+            accept_language: self.accept_language.as_deref(),
+        }
+    }
+}
+
+/// The first `name` header on the request, when it is visible ASCII.
+fn header_string(req: &Request, name: &header::HeaderName) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// Joins every `Cookie` header on the request into one `; `-separated value.
@@ -547,59 +571,99 @@ fn prepare_after_response_lookups(
         coordinator,
         ec_id,
         client_ip: signals.client_ip,
-        user_agent: signals.user_agent.map(str::to_owned),
+        user_agent: signals.user_agent,
+        referer: signals.referer,
+        accept_language: signals.accept_language,
         cookie_header: signals.cookie_header,
     })
 }
 
-/// Starts identity-provider lookups for a permitted publisher navigation.
+/// What a navigation's page-phase identity lookups read, copied out of the
+/// request and its EC context.
 ///
-/// Returns `None` when no provider is enabled, the request has no EC, or the
-/// identity graph is unavailable. For an EC minted on this request only
-/// providers that do not send the EC ID are dispatched, against the row this
-/// navigation will create.
-async fn dispatch_identity_lookups(
-    state: &AppState,
-    services: &RuntimeServices,
-    req: &Request,
-    ec: &mut EcRequestState,
-) -> Option<IdentityLookups> {
-    let coordinator = Arc::clone(state.identity.page_identity()?);
-    let graph = ec.kv_graph.as_ref()?;
-    let ec_id = ec.ec_context.ec_value()?.to_owned();
-    if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
-        let snapshot = graph.load_snapshot(&ec_id).await;
-        ec.ec_context.set_kv_snapshot(snapshot);
+/// The lookups, and the hashed-email status call before them (spec §8.7),
+/// run beside the origin fetch, which takes the request and borrows the EC
+/// context mutably, so this owns its inputs.
+///
+/// # Performance
+///
+/// Clones the consent context and the stored and pending rows once per
+/// navigation that dispatches providers.
+struct PageIdentityDispatch {
+    coordinator: Arc<ProviderCoordinator>,
+    ec_id: String,
+    snapshot: EcKvSnapshot,
+    minted_entry: Option<KvEntry>,
+    consent: ConsentContext,
+    signals: ProviderRequestSignals,
+}
+
+impl PageIdentityDispatch {
+    /// Copies the inputs of a permitted publisher navigation's lookups,
+    /// reading the stored row first when the request has not read it.
+    ///
+    /// Returns `None` when no provider is enabled, the request has no EC, or
+    /// the identity graph is unavailable. For an EC minted on this request
+    /// only providers that do not send the EC ID are dispatched, against the
+    /// row this navigation will create.
+    async fn prepare(
+        state: &AppState,
+        services: &RuntimeServices,
+        req: &Request,
+        ec: &mut EcRequestState,
+    ) -> Option<Self> {
+        let coordinator = Arc::clone(state.identity.page_identity()?);
+        let graph = ec.kv_graph.as_ref()?;
+        let ec_id = ec.ec_context.ec_value()?.to_owned();
+        if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
+            let snapshot = graph.load_snapshot(&ec_id).await;
+            ec.ec_context.set_kv_snapshot(snapshot);
+        }
+        Some(Self {
+            coordinator,
+            ec_id,
+            snapshot: ec.ec_context.kv_snapshot().clone(),
+            minted_entry: ec.ec_context.pending_entry().cloned(),
+            consent: ec.ec_context.consent().clone(),
+            signals: ProviderRequestSignals::read(req, services),
+        })
     }
-    // The request's own client: the batch it starts is bound to the serving
-    // callback, so it stays in flight until `finalize` collects it.
-    let transport = OutboundLookupTransport::for_services(services);
-    let signals = ProviderRequestSignals::read(req, services);
-    let now = trusted_server_core::ec::current_timestamp();
-    let pending = coordinator
-        .dispatch(
-            &transport,
-            &LookupContext {
-                ec_id: &ec_id,
-                snapshot: ec.ec_context.kv_snapshot(),
-                minted_entry: ec.ec_context.pending_entry(),
-                consent: ec.ec_context.consent(),
-                client: ClientSignals {
-                    ip: signals.client_ip,
-                    user_agent: signals.user_agent,
+
+    /// Starts the lookups, after the status call when a provider needs it,
+    /// counting them against the identity app's `rate_limiter`.
+    async fn start(
+        self,
+        services: &RuntimeServices,
+        rate_limiter: &dyn RateLimiter,
+        publisher_domain: &str,
+    ) -> IdentityLookups {
+        // The request's own client: the batch it starts is bound to the
+        // serving callback, so it stays in flight until `finalize` collects it.
+        let transport = OutboundLookupTransport::for_services(services);
+        let now = trusted_server_core::ec::current_timestamp();
+        let pending = self
+            .coordinator
+            .dispatch(
+                &transport,
+                &LookupContext {
+                    ec_id: &self.ec_id,
+                    snapshot: &self.snapshot,
+                    minted_entry: self.minted_entry.as_ref(),
+                    consent: &self.consent,
+                    client: self.signals.client(),
+                    publisher_domain,
+                    cookies: RequestCookies::new(&self.signals.cookie_header),
+                    rate_limiter,
+                    now: UnixSeconds::new(now),
                 },
-                publisher_domain: &state.settings.publisher.domain,
-                cookies: RequestCookies::new(&signals.cookie_header),
-                rate_limiter: state.identity.rate_limiter(),
-                now: UnixSeconds::new(now),
-            },
-        )
-        .await;
-    Some(IdentityLookups {
-        coordinator,
-        transport,
-        pending,
-    })
+            )
+            .await;
+        IdentityLookups {
+            coordinator: self.coordinator,
+            transport,
+            pending,
+        }
+    }
 }
 
 /// Records on the EC context the sources whose identity providers' own
@@ -1144,14 +1208,15 @@ async fn dispatch_fallback(
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 
-        // Identity lookups start before the origin fetch so they overlap it;
-        // the entry point collects them before EC finalization.
-        if is_publisher_navigation
-            && has_permit
-            && let Some(lookups) = dispatch_identity_lookups(state, services, &req, &mut ec).await
-        {
-            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
-        }
+        // Identity lookups run beside the origin fetch, joined with it below;
+        // the entry point collects them before EC finalization. A hashed-email
+        // status call (spec §8.7) precedes them inside that join, so it never
+        // delays the origin fetch.
+        let page_identity = if is_publisher_navigation && has_permit {
+            PageIdentityDispatch::prepare(state, services, &req, &mut ec).await
+        } else {
+            None
+        };
         // After-response providers only capture request signals here; they
         // are built and dispatched once the response has been sent.
         if is_publisher_navigation
@@ -1174,7 +1239,21 @@ async fn dispatch_fallback(
             slots,
             registry: Some(state.identity.partners().as_ref()),
         };
-        match handle_publisher_request(
+        let start_identity = async {
+            match page_identity {
+                Some(dispatch) => Some(
+                    dispatch
+                        .start(
+                            services,
+                            state.identity.rate_limiter(),
+                            &state.settings.publisher.domain,
+                        )
+                        .await,
+                ),
+                None => None,
+            }
+        };
+        let origin = handle_publisher_request(
             &state.settings,
             services,
             ec.kv_graph.as_ref(),
@@ -1186,9 +1265,12 @@ async fn dispatch_fallback(
                 input_cap: None,
                 response_decoding: ResponseDecoding::Original,
             },
-        )
-        .await
-        {
+        );
+        let (page_lookups, origin) = futures::future::join(start_identity, origin).await;
+        if let Some(lookups) = page_lookups {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        }
+        match origin {
             Ok((pub_response, owner)) => {
                 // Origin start succeeded on the sole publisher-page
                 // path. Authorize orphan recovery only for real-browser
