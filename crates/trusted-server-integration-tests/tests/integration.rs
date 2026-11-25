@@ -1794,8 +1794,8 @@ fn wait_for_outbound_observations(
 // Auction provider mTLS against a client-certificate origin
 // ---------------------------------------------------------------------------
 //
-// A `prebid-server` provider with `mtls = true` presents the `auction-providers`
-// client identity from the local config and secret stores. The mock PBS is a
+// A `prebid-server` provider with `mtls = true` presents the active slot's
+// `auction-providers-<slot>` client identity from the local config and secret stores. The mock PBS is a
 // loopback rustls origin that requires a certificate from its own client CA, and
 // Viceroy trusts its server CA through `SSL_CERT_FILE`. Viceroy reports a
 // rejected handshake only as an internal error, so the origin's own records
@@ -2088,6 +2088,16 @@ fn run_mtls_auction(
     mtls: bool,
     material: IdentityMaterial,
 ) -> (serde_json::Value, Vec<MtlsConnection>, Vec<String>) {
+    run_mtls_auction_in_slot(mtls, material, "blue")
+}
+
+/// Runs [`run_mtls_auction`] with `auction.mtls_slot = slot`, provisioning only that slot's
+/// identity entries.
+fn run_mtls_auction_in_slot(
+    mtls: bool,
+    material: IdentityMaterial,
+    slot: &str,
+) -> (serde_json::Value, Vec<MtlsConnection>, Vec<String>) {
     init_logger();
     let pbs = MtlsPbsOrigin::start();
     let plain = start_loopback_bidder("plain-seat", 1.25, Duration::ZERO);
@@ -2099,23 +2109,37 @@ fn run_mtls_auction(
         prebid_server_bidder: Some(MTLS_PBS_BIDDER.to_owned()),
         mtls,
     });
-    let envelope = common::config::auction_app_config_envelope(origin_port(), &fixtures, 2000)
-        .expect("should build the mTLS auction config");
+    let envelope = if slot == "blue" {
+        common::config::auction_app_config_envelope(origin_port(), &fixtures, 2000)
+    } else {
+        common::config::auction_app_config_envelope_with_mtls_slot(
+            origin_port(),
+            &fixtures,
+            2000,
+            slot,
+        )
+    }
+    .expect("should build the mTLS auction config");
     let hosts = format!("https://127.0.0.1:{}", pbs.port);
+    let identity = format!("auction-providers-{slot}");
+    let (certificate_key, hosts_key, private_key_key) = (
+        format!("{identity}.certificate"),
+        format!("{identity}.hosts"),
+        format!("{identity}.private-key"),
+    );
     let mut extras = common::trace_boundary::FastlyRuntimeExtras {
         config_entries: vec![
             (
-                "auction-providers.certificate",
+                certificate_key.as_str(),
                 pbs.client_certificate_pem.as_str(),
             ),
-            ("auction-providers.hosts", hosts.as_str()),
+            (hosts_key.as_str(), hosts.as_str()),
         ],
         ssl_cert_file: Some(pbs.server_ca_file.path()),
         ..common::trace_boundary::FastlyRuntimeExtras::default()
     };
     if matches!(material, IdentityMaterial::Complete) {
-        extras.secret_entries =
-            vec![("auction-providers.private-key", pbs.client_key_pem.as_str())];
+        extras.secret_entries = vec![(private_key_key.as_str(), pbs.client_key_pem.as_str())];
     }
 
     let mut response = serde_json::Value::Null;
@@ -2197,6 +2221,26 @@ fn mtls_provider_presents_its_client_certificate_fastly() {
 
 #[test]
 #[ignore = "requires Viceroy and the release Fastly WASM"]
+fn green_mtls_slot_presents_the_green_identity_fastly() {
+    // Only the green slot holds material, so a bid proves the switch selected it.
+    let (response, connections, _guest_log) =
+        run_mtls_auction_in_slot(true, IdentityMaterial::Complete, "green");
+
+    let pbs = provider_detail(&response, "pbs");
+    assert_eq!(
+        (&pbs["bid_count"], &pbs["bidders"]),
+        (&serde_json::json!(1), &serde_json::json!([MTLS_PBS_BIDDER])),
+        "should bid through the green identity: {response}"
+    );
+    assert_plain_bid(&response);
+    assert!(
+        matches!(connections.as_slice(), [MtlsConnection::Request { .. }]),
+        "should accept exactly one client-authenticated request, got {connections:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Viceroy and the release Fastly WASM"]
 fn provider_without_mtls_is_rejected_by_the_client_certificate_origin_fastly() {
     let (response, connections, _guest_log) = run_mtls_auction(false, IdentityMaterial::Complete);
 
@@ -2224,8 +2268,9 @@ fn missing_client_key_fails_before_connecting_fastly() {
             .iter()
             .filter(|line| line.starts_with("tslog :: ")
                 && line.contains("Planned provider 'pbs' request failed")
-                && line
-                    .contains("outbound client identity auction-providers: private key is missing"))
+                && line.contains(
+                    "outbound client identity auction-providers-blue: private key is missing"
+                ))
             .count(),
         1,
         "should log the identity name and reason once: {guest_log:#?}"

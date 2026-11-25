@@ -633,6 +633,7 @@ mod tests {
             ]),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile plan")
     }
@@ -661,6 +662,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile explicit plan")
     }

@@ -775,17 +775,17 @@ registered integration selected by `[auction].mediator`.
 
 Common provider fields and defaults:
 
-| Field                 | Default         | Meaning                                                                                 |
-| --------------------- | --------------- | --------------------------------------------------------------------------------------- |
-| `protocol`            | Required        | `openrtb-2.6`                                                                           |
-| `profile`             | `standard`      | Typed OpenRTB behavior                                                                  |
-| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                           |
-| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted      |
-| `mtls`                | `false`         | Present the `auction-providers` client certificate; see [Provider mTLS](#provider-mtls) |
-| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                              |
-| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                      |
-| `profile_config`      | `{}`            | Profile-owned typed settings                                                            |
-| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                          |
+| Field                 | Default         | Meaning                                                                            |
+| --------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `protocol`            | Required        | `openrtb-2.6`                                                                      |
+| `profile`             | `standard`      | Typed OpenRTB behavior                                                             |
+| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                      |
+| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
+| `mtls`                | `false`         | Present the active slot's client certificate; see [Provider mTLS](#provider-mtls)  |
+| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                         |
+| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                 |
+| `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
+| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
 
 HTTPS remains the default. The existing plain-HTTP exception for literal
 `127.0.0.1` and `[::1]` endpoints remains available without the opt-in.
@@ -853,9 +853,11 @@ endpoint = "https://pbs.example.com/openrtb2/auction"
 mtls = true
 ```
 
-Every provider with `mtls = true` presents the same client identity,
-`auction-providers`, which Trusted Server declares in `edgezero.toml`. Only the
-Fastly adapter presents client certificates. Axum, Cloudflare and Spin refuse to
+Every provider with `mtls = true` presents the client identity of the active
+rotation slot. Trusted Server declares two in `edgezero.toml`,
+`auction-providers-blue` and `auction-providers-green`, and
+`[auction] mtls_slot` selects one, `blue` by default. See
+[Rotation](#rotation). Only the Fastly adapter presents client certificates. Axum, Cloudflare and Spin refuse to
 start when any provider sets `mtls`, even with the auction disabled, and
 `ts config push` and `ts config diff` refuse such a config for those adapters.
 
@@ -891,14 +893,15 @@ can require client certificates at its load balancer.
 
 #### Fastly entries
 
-Provision three entries in the stores that `trusted_server_config` and
-`trusted_server_secrets` link to:
+Each slot has three entries in the stores that `trusted_server_config` and
+`trusted_server_secrets` link to. `<identity>` is `auction-providers-blue` or
+`auction-providers-green`. Provision the active slot before you turn on `mtls`.
 
-| Store                                   | Key                             | Value                                                                                                    |
-| --------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Config Store (`trusted_server_config`)  | `auction-providers.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                                                   |
-| Config Store (`trusted_server_config`)  | `auction-providers.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes including line breaks |
-| Secret Store (`trusted_server_secrets`) | `auction-providers.private-key` | Unencrypted PEM private key                                                                              |
+| Store                                   | Key                      | Value                                                                                                    |
+| --------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Config Store (`trusted_server_config`)  | `<identity>.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                                                   |
+| Config Store (`trusted_server_config`)  | `<identity>.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes including line breaks |
+| Secret Store (`trusted_server_secrets`) | `<identity>.private-key` | Unencrypted PEM private key                                                                              |
 
 An origin is the endpoint's scheme, host and port, such as
 `https://pbs.example.com` or `https://pbs.example.com:8443`. A request to an
@@ -925,16 +928,38 @@ relying on several mTLS origins.
 
 #### Rotation
 
-To renew the certificate, write the new key to `auction-providers.private-key`
-first, then the new chain to `auction-providers.certificate`. EdgeZero names a
-backend after the certificate chain and reads the key only when it registers
-the backend. A backend registered between the two writes pairs a new entry
-with an old one. If Fastly accepts that pair, the handshake fails and the
-backend stays in the sandbox. Writing the chain first gives that bad backend
-the new chain's name, which stays in use until the sandbox is recycled; writing
-the key first gives it the old name, which stops being used once the new chain
-is published. Store changes reach Fastly POPs over time, so confirm with
-auctions, and with the verifier's logs, that the new certificate is in use.
+Rotate by switching slots. Never rewrite the active slot's entries in place.
+The key and the chain live in different stores, and each write reaches Fastly
+POPs on its own schedule, usually within a minute or two. Without
+`reusable-sandbox` every request registers its backend, reading the current key
+and the current chain, so an in-place rewrite fails every `mtls` auction until
+both writes have arrived. A staging test saw about three minutes of failures.
+
+To rotate from `blue` to `green`:
+
+1. Check the new pair before writing it: the key matches the certificate
+   (`openssl x509 -noout -pubkey` against `openssl pkey -pubout`), and the
+   verifier accepts the certificate, for example with
+   `curl --cert <certificate> --key <key> https://pbs.example.com/status`.
+2. Write `auction-providers-green.private-key`,
+   `auction-providers-green.certificate` and `auction-providers-green.hosts`.
+   Nothing reads the idle slot, so these writes cannot fail an auction.
+3. Wait for the entries to propagate. Five minutes is a safe margin.
+4. Push the config with `mtls_slot = "green"`. While the push propagates, each
+   request reads one slot or the other, and both hold a complete, matching
+   pair.
+5. Confirm with auctions, and with the verifier's logs, that the new
+   certificate is in use.
+6. Leave the `blue` entries in place as the rollback until you retire the old
+   certificate. Rolling back is another push of `mtls_slot`.
+
+Each slot names its own backends, because EdgeZero names a backend after the
+identity and its certificate chain. With `reusable-sandbox`, a sandbox keeps the
+old slot's backend until it loads the new config, and both certificates stay
+valid during that window. The verifier must trust both certificates until the
+switch is complete, which holds when one CA issues both. To change CAs, follow
+the verifier's own procedure, such as the PBS example's three-step bundle
+change.
 
 #### Rollout and rollback
 
@@ -947,8 +972,11 @@ Versions of Trusted Server without this setting reject a config that has
 3. Push the config with `mtls = true`. With `reusable-sandbox`, a running
    sandbox keeps its old settings until it is recycled, so allow for that
    before the next step.
-4. Turn on client verification at the provider, and confirm auctions succeed.
-   The PBS AWS example does this one region at a time.
+
+`mtls_slot = "green"` follows the same rule: versions without the field reject
+it, so deploy a version that supports it before the first push that sets it.
+The default `blue` is omitted from the stored config. 4. Turn on client verification at the provider, and confirm auctions succeed.
+The PBS AWS example does this one region at a time.
 
 To roll back, reverse the order: turn client verification off at the provider,
 then push a config without `mtls`, and only then deploy an older Trusted Server
@@ -963,14 +991,14 @@ retried without the certificate. Trusted Server logs one warning that names the
 identity and the reason:
 
 ```text
-Planned provider 'pbs-main' request failed: ... outbound client identity auction-providers: private key is missing
+Planned provider 'pbs-main' request failed: ... outbound client identity auction-providers-blue: private key is missing
 ```
 
 | Reason in the log                                    | Fix                                                                                           |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `certificate is missing` or `certificate is invalid` | Provision a PEM chain, leaf first, in `auction-providers.certificate`                         |
-| `private key is missing`                             | Provision an unencrypted PEM key in `auction-providers.private-key`                           |
-| `hosts list is missing` or `hosts list is invalid`   | Provision `auction-providers.hosts`, one `https` origin per line                              |
+| `certificate is missing` or `certificate is invalid` | Provision a PEM chain, leaf first, in the named identity's `.certificate` entry               |
+| `private key is missing`                             | Provision an unencrypted PEM key in the named identity's `.private-key` entry                 |
+| `hosts list is missing` or `hosts list is invalid`   | Provision the named identity's `.hosts` entry, one `https` origin per line                    |
 | `<origin> is not in the identity's hosts`            | Add the provider's origin; the logged origin includes the port, such as `:443`                |
 | `store is missing`                                   | Link both stores to the service; if they are linked, check the Secret Store read budget above |
 | `identity is not declared in the manifest`           | Deploy a Trusted Server build whose `edgezero.toml` declares it                               |

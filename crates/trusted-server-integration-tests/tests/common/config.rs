@@ -215,6 +215,27 @@ pub fn auction_app_config_envelope(
     })
 }
 
+/// Builds [`auction_app_config_envelope`] with `auction.mtls_slot` set to `mtls_slot`.
+///
+/// # Errors
+///
+/// Returns a fixture-generation error when configuration validation fails.
+pub fn auction_app_config_envelope_with_mtls_slot(
+    origin_port: u16,
+    bidders: &[AuctionBidderFixture],
+    auction_timeout_ms: u32,
+    mtls_slot: &str,
+) -> TestResult<String> {
+    app_config_envelope(origin_port, false, |table| {
+        enable_auction(table, bidders, auction_timeout_ms)?;
+        table_mut(table, "auction")?.insert(
+            "mtls_slot".to_string(),
+            toml::Value::String(mtls_slot.to_owned()),
+        );
+        Ok(())
+    })
+}
+
 /// Enables the auction in `table` over `bidders` alone, with `auction_timeout_ms`.
 fn enable_auction(
     table: &mut toml::Table,

@@ -26,11 +26,15 @@ optional = ["outbound-client-identity"]
 [capabilities.outbound]
 hosts = ["*"]
 
-# The client certificate that auction providers with `mtls = true` present.
-# It binds to the [stores.config] and [stores.secrets] defaults, which hold
-# `auction-providers.certificate`, `auction-providers.hosts` and
-# `auction-providers.private-key`. See the auction orchestration guide.
-[capabilities.outbound.client-identities.auction-providers]
+# The client certificates that auction providers with `mtls = true` present,
+# one identity per rotation slot. `auction.mtls_slot` selects the active slot
+# (`blue` by default). Each binds to the [stores.config] and [stores.secrets] defaults,
+# which hold `<identity>.certificate`, `<identity>.hosts` and
+# `<identity>.private-key`. Rotate by filling the idle slot, then switching
+# `auction.mtls_slot`. See the auction orchestration guide.
+[capabilities.outbound.client-identities.auction-providers-blue]
+
+[capabilities.outbound.client-identities.auction-providers-green]
 
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the

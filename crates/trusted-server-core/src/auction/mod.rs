@@ -64,6 +64,7 @@ pub fn compile_auction_plan(
         bidders: settings.auction.bidders.clone(),
         mediator: settings.auction.mediator.clone(),
         request_signing: settings.request_signing.clone(),
+        mtls_slot: settings.auction.mtls_slot,
     })
     .map(|plan| plan.with_enabled(settings.auction.enabled))
 }

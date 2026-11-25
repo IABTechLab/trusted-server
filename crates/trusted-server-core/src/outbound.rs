@@ -632,21 +632,21 @@ mod tests {
 
     #[test]
     fn outbound_error_names_the_client_identity_and_reason() {
-        let name = edgezero_core::outbound::ClientIdentityName::new("auction-providers")
+        let name = edgezero_core::outbound::ClientIdentityName::new("auction-providers-blue")
             .expect("should accept the identity name");
         for (reason, expected) in [
             (
                 edgezero_core::outbound::ClientIdentityError::MaterialMissing {
                     which: edgezero_core::outbound::ClientIdentityMaterial::Key,
                 },
-                "outbound client identity auction-providers: private key is missing",
+                "outbound client identity auction-providers-blue: private key is missing",
             ),
             (
                 edgezero_core::outbound::ClientIdentityError::HostNotAllowed {
                     origin: "https://pbs.example.com:443".to_owned(),
                     redirect: false,
                 },
-                "outbound client identity auction-providers: https://pbs.example.com:443 is not in the identity's hosts",
+                "outbound client identity auction-providers-blue: https://pbs.example.com:443 is not in the identity's hosts",
             ),
         ] {
             let report = outbound_error(

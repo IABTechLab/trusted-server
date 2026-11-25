@@ -81,8 +81,8 @@
     [local_server.config_stores]
         # Generated integration configs inject the manifest-default app-config blob
         # into the store required by the Fastly entry point.
-        # Auction provider mTLS cases also inject `auction-providers.certificate` and
-        # `auction-providers.hosts` here, and `auction-providers.private-key` into
+        # Auction provider mTLS cases also inject `auction-providers-<slot>.certificate`
+        # and `.hosts` here, and `auction-providers-<slot>.private-key` into
         # trusted_server_secrets above (see `with_fastly_runtime_extras`).
         # GENERATED_TRUSTED_SERVER_CONFIG_STORES
 

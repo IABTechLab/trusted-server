@@ -24,11 +24,43 @@ const FASTLY_DYNAMIC_BACKEND_LIMIT: usize = 200;
 /// Fastly dynamic backends kept for the sites outside the auction.
 const FASTLY_NON_AUCTION_BACKEND_RESERVE: usize = 40;
 
-/// Client identity that every provider with `mtls = true` presents.
+/// Client identity slot that every provider with `mtls = true` presents.
 ///
-/// `edgezero.toml` declares it under `[capabilities.outbound.client-identities]`, bound to the
-/// default config and secret stores, so the name is fixed and operators select it per provider.
-pub const AUCTION_PROVIDERS_CLIENT_IDENTITY: &str = "auction-providers";
+/// `edgezero.toml` declares one client identity per slot under
+/// `[capabilities.outbound.client-identities]`, bound to the default config and secret stores.
+/// Each slot has its own certificate, hosts and private-key entries, so an operator rotates by
+/// filling the idle slot and then switching `auction.mtls_slot`. Requests read either slot's
+/// complete material while the switch propagates, so no auction pairs a new key with an old
+/// certificate.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MtlsSlot {
+    /// The `auction-providers-blue` identity. The default.
+    #[default]
+    Blue,
+    /// The `auction-providers-green` identity.
+    Green,
+}
+
+impl MtlsSlot {
+    /// Every slot, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Blue, Self::Green];
+
+    /// Name of the client identity this slot presents.
+    #[must_use]
+    pub const fn identity_name(self) -> &'static str {
+        match self {
+            Self::Blue => "auction-providers-blue",
+            Self::Green => "auction-providers-green",
+        }
+    }
+
+    /// Whether this is the default slot, which serialized configs omit.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 /// Validated operator-defined provider identifier.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, derive_more::Display)]
@@ -150,7 +182,7 @@ pub struct ProviderConfig {
     /// explicitly approved demo/test endpoints.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_insecure_http: bool,
-    /// Present the [`AUCTION_PROVIDERS_CLIENT_IDENTITY`] client certificate on this provider's
+    /// Present the active [`MtlsSlot`] client certificate on this provider's
     /// requests. Defaults to false. Requires an `https` endpoint, and only the Fastly adapter
     /// supports it; the other adapters refuse to start with it.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -218,6 +250,9 @@ pub struct AuctionPlanConfig {
     /// Existing global Trusted Server signing configuration.
     #[serde(default)]
     pub request_signing: Option<RequestSigning>,
+    /// Client identity slot that `mtls` providers present.
+    #[serde(default, skip_serializing_if = "MtlsSlot::is_default")]
+    pub mtls_slot: MtlsSlot,
 }
 
 /// Canonical absolute provider endpoint.
@@ -310,6 +345,7 @@ impl AuctionPlan {
         }
         validate_mediator(config.mediator.as_deref())?;
         let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
+        let mtls_slot = config.mtls_slot;
         let mut providers = Vec::with_capacity(config.providers.len());
         let mut provider_indices = BTreeMap::new();
         for (id, raw) in config.providers {
@@ -352,7 +388,7 @@ impl AuctionPlan {
                     "provider `{id}` timeout_ms must be greater than zero"
                 )));
             }
-            let client_identity = compile_client_identity(&id, raw.mtls, &endpoint)?;
+            let client_identity = compile_client_identity(&id, raw.mtls, &endpoint, mtls_slot)?;
             let notifications = compile_notifications(&id, raw.notifications)?;
             let profile = registration.compile(&raw.profile_config)?;
             let index = providers.len();
@@ -606,7 +642,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Selects the auction client identity for a provider that enables `mtls`.
+/// Selects the active slot's client identity for a provider that enables `mtls`.
 ///
 /// A client certificate can only be presented over TLS, so an `mtls` provider whose endpoint is
 /// plain HTTP, through the loopback exception or `allow_insecure_http`, is a configuration error.
@@ -614,6 +650,7 @@ fn compile_client_identity(
     provider_id: &ProviderId,
     mtls: bool,
     endpoint: &CanonicalProviderEndpoint,
+    slot: MtlsSlot,
 ) -> Result<Option<ClientIdentityName>, Report<TrustedServerError>> {
     if !mtls {
         return Ok(None);
@@ -623,13 +660,12 @@ fn compile_client_identity(
             "provider `{provider_id}` sets mtls but its endpoint is not https"
         )));
     }
-    ClientIdentityName::new(AUCTION_PROVIDERS_CLIENT_IDENTITY)
-        .map(Some)
-        .map_err(|error| {
-            configuration_error(format!(
-                "auction client identity `{AUCTION_PROVIDERS_CLIENT_IDENTITY}` is invalid: {error}"
-            ))
-        })
+    let name = slot.identity_name();
+    ClientIdentityName::new(name).map(Some).map_err(|error| {
+        configuration_error(format!(
+            "auction client identity `{name}` is invalid: {error}"
+        ))
+    })
 }
 
 /// Rejects a plan in which any provider enables `mtls`, for an adapter that cannot present a
@@ -1232,36 +1268,78 @@ mod tests {
     }
 
     #[test]
-    fn plan_selects_the_auction_identity_only_for_mtls_providers() {
-        let plan = AuctionPlan::compile(config(BTreeMap::from([
-            (
-                id("secured"),
-                mtls_provider("https://bid.example/openrtb2/auction"),
-            ),
-            (id("plain"), provider("standard")),
-        ])))
-        .expect("should compile an mtls provider beside a plain one");
-
-        let identities = plan
-            .providers()
-            .iter()
-            .map(|provider| {
+    fn plan_selects_the_active_slot_identity_only_for_mtls_providers() {
+        for (slot, expected) in [
+            (None, "auction-providers-blue"),
+            (Some(MtlsSlot::Blue), "auction-providers-blue"),
+            (Some(MtlsSlot::Green), "auction-providers-green"),
+        ] {
+            let mut raw = config(BTreeMap::from([
                 (
-                    provider.id.as_str(),
-                    provider
-                        .client_identity
-                        .as_ref()
-                        .map(ClientIdentityName::as_str),
-                )
-            })
-            .collect::<Vec<_>>();
+                    id("secured"),
+                    mtls_provider("https://bid.example/openrtb2/auction"),
+                ),
+                (id("plain"), provider("standard")),
+            ]));
+            if let Some(slot) = slot {
+                raw.mtls_slot = slot;
+            }
+            let plan = AuctionPlan::compile(raw)
+                .expect("should compile an mtls provider beside a plain one");
+
+            let identities = plan
+                .providers()
+                .iter()
+                .map(|provider| {
+                    (
+                        provider.id.as_str(),
+                        provider
+                            .client_identity
+                            .as_ref()
+                            .map(ClientIdentityName::as_str),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                identities,
+                vec![("plain", None), ("secured", Some(expected))],
+                "should select the {slot:?} slot's identity only where mtls is set"
+            );
+        }
+    }
+
+    #[test]
+    fn mtls_slot_defaults_to_blue_and_serializes_only_when_green() {
+        let default: AuctionPlanConfig =
+            serde_json::from_value(serde_json::json!({ "timeout_ms": 1000 }))
+                .expect("should parse a config without mtls_slot");
+        assert_eq!(default.mtls_slot, MtlsSlot::Blue, "should default to blue");
+        assert!(
+            serde_json::to_value(&default)
+                .expect("should serialize")
+                .get("mtls_slot")
+                .is_none(),
+            "should omit the default slot so older binaries keep reading the blob"
+        );
+
+        let green: AuctionPlanConfig = serde_json::from_value(serde_json::json!({
+            "timeout_ms": 1000,
+            "mtls_slot": "green",
+        }))
+        .expect("should parse mtls_slot = green");
+        assert_eq!(green.mtls_slot, MtlsSlot::Green);
         assert_eq!(
-            identities,
-            vec![
-                ("plain", None),
-                ("secured", Some(AUCTION_PROVIDERS_CLIENT_IDENTITY)),
-            ],
-            "should select the auction identity only where mtls is set"
+            serde_json::to_value(&green).expect("should serialize")["mtls_slot"],
+            "green",
+            "should publish a non-default slot"
+        );
+        assert!(
+            serde_json::from_value::<AuctionPlanConfig>(serde_json::json!({
+                "timeout_ms": 1000,
+                "mtls_slot": "purple",
+            }))
+            .is_err(),
+            "should reject an unknown slot"
         );
     }
 

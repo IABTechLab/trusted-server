@@ -226,7 +226,7 @@ failure detail (`outbound provider failure detail: ...`), which holds closed
 failure codes and no URL. For a provider with `mtls = true`, a client identity
 that EdgeZero refuses before sending, because an entry is missing or invalid or
 the origin is not in its hosts list, records `transport` and adds
-`outbound client identity auction-providers: <reason>`, such as
+`outbound client identity auction-providers-<slot>: <reason>`, such as
 `private key is missing`; the reason names a store entry or the provider's
 origin, never certificate or key contents. A key that does not match the
 certificate fails later, as `launch_failed` if Fastly rejects the backend

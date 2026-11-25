@@ -1002,6 +1002,7 @@ mod routing_metadata_tests {
                 )]),
                 mediator: None,
                 request_signing: None,
+                mtls_slot: Default::default(),
             })
             .expect("should compile profile plan");
             let inbound = http::Request::new(edgezero_core::body::Body::empty());

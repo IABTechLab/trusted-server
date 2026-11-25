@@ -39,21 +39,24 @@ mod tests {
     use edgezero_core::outbound::{ClientIdentityName, ClientIdentityPolicy};
 
     use super::*;
-    use crate::auction::plan::AUCTION_PROVIDERS_CLIENT_IDENTITY;
+    use crate::auction::plan::MtlsSlot;
 
     #[test]
-    fn baked_manifest_declares_the_auction_client_identity() {
+    fn baked_manifest_declares_every_auction_client_identity_slot() {
         let BakedManifest::Present(manifest) = baked_edgezero_manifest() else {
             panic!("should bake the repository manifest");
         };
-        let name = ClientIdentityName::new(AUCTION_PROVIDERS_CLIENT_IDENTITY)
-            .expect("should accept the auction identity name");
         let policy = ClientIdentityPolicy::from_manifest(manifest);
 
-        assert!(
-            policy.identity(&name).is_some(),
-            "should declare the auction-providers identity"
-        );
+        for slot in MtlsSlot::ALL {
+            let name = ClientIdentityName::new(slot.identity_name())
+                .expect("should accept the auction identity name");
+            assert!(
+                policy.identity(&name).is_some(),
+                "should declare the {} identity",
+                slot.identity_name()
+            );
+        }
         assert!(
             manifest
                 .capabilities

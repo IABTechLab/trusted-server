@@ -2366,6 +2366,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile plan");
         let auction_request = AuctionRequest {

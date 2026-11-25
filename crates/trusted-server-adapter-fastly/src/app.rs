@@ -1986,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn assembled_app_accepts_mtls_and_declares_the_auction_client_identity() {
+    fn assembled_app_accepts_mtls_and_declares_both_auction_client_identity_slots() {
         let mut settings = test_settings();
         let (id, provider) = trusted_server_core::test_support::fixtures::mtls_auction_provider();
         settings.auction.providers.insert(id, provider);
@@ -1994,18 +1994,19 @@ mod tests {
         let retained = assemble_app(Ok(settings), &"")
             .unwrap_or_else(|_| panic!("should assemble the Fastly app with an mtls provider"));
 
-        let name = edgezero_core::outbound::ClientIdentityName::new(
-            trusted_server_core::auction::plan::AUCTION_PROVIDERS_CLIENT_IDENTITY,
-        )
-        .expect("should accept the identity name");
-        assert!(
-            retained
-                .app
-                .client_identity_policy()
-                .identity(&name)
-                .is_some(),
-            "should attach the manifest's auction-providers identity to the assembled app"
-        );
+        for slot in trusted_server_core::auction::plan::MtlsSlot::ALL {
+            let name = edgezero_core::outbound::ClientIdentityName::new(slot.identity_name())
+                .expect("should accept the identity name");
+            assert!(
+                retained
+                    .app
+                    .client_identity_policy()
+                    .identity(&name)
+                    .is_some(),
+                "should attach the manifest's {} identity to the assembled app",
+                slot.identity_name()
+            );
+        }
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {

@@ -598,6 +598,11 @@ rewrite_creatives = true
 # server's iframe), since it removes script-based creatives entirely and would
 # blank slots on a script-heavy demand stack.
 sanitize_creatives = false
+# Client identity slot that providers with `mtls = true` present: "blue"
+# (default) or "green". Rotate by provisioning the idle slot's
+# auction-providers-<slot>.* entries, waiting for them to propagate, then
+# switching this. Binaries older than this setting reject "green".
+# mtls_slot = "blue"
 timeout_ms = 2000
 # mediator = "adserver_mock"       # optional mediator integration
 # Context keys the JS client may forward into auction requests (allowlist;
@@ -611,8 +616,9 @@ profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 # `prebid-server` defaults to 1000 ms when omitted.
 routing = "explicit"
-# Present the `auction-providers` client certificate from the Fastly config and
-# secret stores, for a provider that requires mTLS. Fastly only; requires https.
+# Present the active `auction.mtls_slot` client certificate from the Fastly
+# config and secret stores, for a provider that requires mTLS. Fastly only;
+# requires https.
 # mtls = true
 
 [auction.providers.pbs-main.profile_config]

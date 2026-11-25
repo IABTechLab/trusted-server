@@ -70,6 +70,7 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
         },
         mediator: None,
         request_signing: None,
+        mtls_slot: Default::default(),
     }
 }
 
@@ -1616,7 +1617,7 @@ fn mtls_provider_presents_the_auction_identity_and_changes_nothing_else() {
         );
         assert_eq!(
             secured_sent[0].client_identity.as_deref(),
-            Some(crate::auction::plan::AUCTION_PROVIDERS_CLIENT_IDENTITY),
+            Some(crate::auction::plan::MtlsSlot::Blue.identity_name()),
             "should present the auction identity with mtls"
         );
         let (plain_request, secured_request) = (&plain_sent[0], &secured_sent[0]);

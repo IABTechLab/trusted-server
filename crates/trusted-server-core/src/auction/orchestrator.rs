@@ -1507,6 +1507,7 @@ mod tests {
                 config_store_id: "fictional-config-store".to_string(),
                 secret_store_id: "fictional-secret-store".to_string(),
             }),
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2019,6 +2020,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2057,6 +2059,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2188,7 +2191,7 @@ mod tests {
             let clock = TestClock::new();
             let bidders = ScriptedHttpClient::new(&clock);
             let name = edgezero_core::outbound::ClientIdentityName::new(
-                crate::auction::plan::AUCTION_PROVIDERS_CLIENT_IDENTITY,
+                crate::auction::plan::MtlsSlot::Blue.identity_name(),
             )
             .expect("should accept the identity name");
             bidders.respond_to(
@@ -2244,9 +2247,7 @@ mod tests {
                     .iter()
                     .map(|request| request.client_identity.as_deref())
                     .collect::<Vec<_>>(),
-                vec![Some(
-                    crate::auction::plan::AUCTION_PROVIDERS_CLIENT_IDENTITY
-                )],
+                vec![Some(crate::auction::plan::MtlsSlot::Blue.identity_name())],
                 "should try once with the identity and never retry without it"
             );
         }
@@ -2333,6 +2334,7 @@ mod tests {
                     bidders: BTreeMap::new(),
                     mediator: None,
                     request_signing: None,
+                    mtls_slot: Default::default(),
                 })
                 .expect("should compile the batch plan"),
             )

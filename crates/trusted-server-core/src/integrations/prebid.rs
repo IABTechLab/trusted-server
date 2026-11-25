@@ -5641,6 +5641,7 @@ external_bundle_sri = "sha384-AAAA"
             ]),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile plan while browser integration is not part of compilation");
 
@@ -9146,6 +9147,7 @@ set = { networkId = 42 }
             )]),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile planned PBS test plan");
         let inbound = http::Request::new(EdgeBody::empty());
@@ -9873,6 +9875,7 @@ set = { networkId = 42 }
                 bidders: std::collections::BTreeMap::new(),
                 mediator: None,
                 request_signing: None,
+                mtls_slot: Default::default(),
             })
             .expect("should compile empty plan");
         let routed = crate::auction::routing::route_auction(
