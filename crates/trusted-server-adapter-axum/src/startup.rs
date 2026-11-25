@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_adapter_axum::dev_server::PreparedStores;
 use edgezero_core::app::App;
+use edgezero_core::config_store::ConfigExtractionLimits;
 use edgezero_core::error::EdgeError;
+use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::config_payload::{
     DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID, VerifiedConfigBlob,
@@ -21,14 +23,14 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::app::{build_state_with_settings, router_builder};
+use crate::app::{build_state_with_settings, router_builder, startup_error_router};
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
 /// Only declared stores and explicitly loaded keys exist in these snapshots.
 /// Missing keys and all management writes fail rather than consulting legacy
 /// environment variables or opening another provider.
-pub struct NativeStoreSnapshot {
+pub(crate) struct NativeStoreSnapshot {
     pub(crate) config_store: Arc<dyn PlatformConfigStore>,
     pub(crate) secret_store: Arc<dyn PlatformSecretStore>,
 }
@@ -69,11 +71,11 @@ impl PlatformConfigStore for ConfigSnapshot {
         _key: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(read_only_config())
+        Err(read_only_snapshot(PlatformError::ConfigStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-        Err(read_only_config())
+        Err(read_only_snapshot(PlatformError::ConfigStore))
     }
 }
 
@@ -101,22 +103,16 @@ impl PlatformSecretStore for SecretSnapshot {
         _name: &str,
         _value: &str,
     ) -> Result<(), Report<PlatformError>> {
-        Err(read_only_secret())
+        Err(read_only_snapshot(PlatformError::SecretStore))
     }
 
     async fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-        Err(read_only_secret())
+        Err(read_only_snapshot(PlatformError::SecretStore))
     }
 }
 
-fn read_only_config() -> Report<PlatformError> {
-    Report::new(PlatformError::ConfigStore)
-        .attach("native startup snapshots are read-only; publish inputs and restart")
-}
-
-fn read_only_secret() -> Report<PlatformError> {
-    Report::new(PlatformError::SecretStore)
-        .attach("native startup snapshots are read-only; publish inputs and restart")
+fn read_only_snapshot(error: PlatformError) -> Report<PlatformError> {
+    Report::new(error).attach("native startup snapshots are read-only; publish inputs and restart")
 }
 
 fn configuration_error(message: &str) -> EdgeError {
@@ -173,7 +169,36 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 /// Load and validate the finite native inputs before the framework listens.
 ///
 /// The framework retains ownership of the App, clock, policies, listener,
-/// readiness, and signal/drain lifecycle. Selected-provider failures are fatal.
+/// readiness, and signal/drain lifecycle. Selected-provider preparation, which
+/// the framework runs before this initializer, still fails startup. A failure
+/// here to read the prepared stores, validate the settings or build the
+/// application state installs the failure router instead, so liveness stays up
+/// while `/ready` and every supported route answer the fixed unavailable
+/// response.
+///
+/// # Errors
+/// Returns an error when the application's config extraction limits are
+/// invalid.
+pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result<(), EdgeError> {
+    let limits = app.config_extraction_limits().validate()?;
+    match prepare_native(app, stores, limits).await {
+        Ok((router, snapshot)) => {
+            app.set_router(router);
+            app.insert_state(snapshot);
+        }
+        Err(error) => {
+            // The framework no longer sees this failure, so this safe
+            // application diagnostic is the only one that tells operators
+            // which input to fix.
+            log::error!("Trusted Server initialization failed: {error}");
+            app.set_router(startup_error_router(&error));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the prepared stores and builds the application router and the
+/// store snapshot it serves from.
 ///
 /// # Errors
 /// Returns an error for missing bindings/values, bounded-read failures, invalid
@@ -181,8 +206,11 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 ///
 /// # Panics
 /// Panics if newly constructed application state unexpectedly has another owner.
-pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result<(), EdgeError> {
-    let limits = app.config_extraction_limits().validate()?;
+async fn prepare_native(
+    app: &App,
+    stores: &PreparedStores,
+    limits: ConfigExtractionLimits,
+) -> Result<(RouterService, Arc<NativeStoreSnapshot>), EdgeError> {
     let clock = app.monotonic_clock();
     let deadline = clock.deadline_after(limits.timeout);
     let binding = stores
@@ -224,9 +252,18 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
     verified
         .check_structure(limits.max_json_depth, limits.max_json_nodes)
         .map_err(settings_error)?;
-    let keys = verified.required_secret_keys().map_err(settings_error)?;
+    let references = verified
+        .required_secret_references()
+        .map_err(settings_error)?;
     let mut values = BTreeMap::new();
-    for key in keys {
+    for (key, paths) in references {
+        // Diagnostics name config paths only. A key is an operator-supplied
+        // string, so a secret pasted into a reference field must not be logged.
+        let paths = paths
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         if remaining == 0 {
             return Err(configuration_error(
                 "native secret extraction exhausts the total byte budget",
@@ -238,15 +275,15 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
             deadline,
             limits.max_backend_bytes.min(remaining),
             limits.max_secret_bytes.min(remaining),
-        ).await.map_err(|_| configuration_error(
-            "failed bounded read of a required app-config secret; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
-        ))?;
+        ).await.map_err(|_| configuration_error(&format!(
+            "failed bounded read of the required app-config secret at {paths}; check the selected trusted_server_secrets provider, required references, extraction limits and deadline; legacy environment fallback is disabled",
+        )))?;
         remaining = remaining.checked_sub(read.backend_bytes).ok_or_else(|| {
             configuration_error("native secret extraction exceeds the total byte budget")
         })?;
-        let value = read.value.ok_or_else(|| configuration_error(
-            "a required app-config secret is missing in trusted_server_secrets; publish every active reference before starting",
-        ))?;
+        let value = read.value.ok_or_else(|| configuration_error(&format!(
+            "the required app-config secret at {paths} is missing in trusted_server_secrets; publish every active reference before starting",
+        )))?;
         values.insert(key, value.to_vec());
     }
     let secret_store = Arc::new(SecretSnapshot(values));
@@ -292,9 +329,7 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         }),
         secret_store,
     });
-    app.set_router(router);
-    app.insert_state(snapshot);
-    Ok(())
+    Ok((router, snapshot))
 }
 
 #[cfg(test)]
@@ -441,12 +476,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_prepared_stores_fail_initialization() {
+    async fn missing_prepared_stores_serve_the_failure_router() {
         let mut app = App::build::<TrustedServerApp>(AXUM_PLATFORM)
             .expect("should assemble the empty pre-initialization router");
-        let error = initialize_native(&mut app, &PreparedStores::default())
+        let limits = app
+            .config_extraction_limits()
+            .validate()
+            .expect("should accept the default extraction limits");
+        let Err(error) = prepare_native(&app, &PreparedStores::default(), limits).await else {
+            panic!("should reject absent prepared stores");
+        };
+        assert!(
+            error.to_string().contains("not prepared"),
+            "should name the unprepared store: {error}"
+        );
+
+        initialize_native(&mut app, &PreparedStores::default())
             .await
-            .expect_err("should reject absent prepared stores");
-        assert!(error.to_string().contains("not prepared"));
+            .expect("should install the failure router instead of failing startup");
+
+        for (path, status) in [("/health", 200), ("/ready", 503), ("/", 503)] {
+            let response = app
+                .router()
+                .clone()
+                .oneshot(
+                    edgezero_core::http::request_builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should construct startup request"),
+                )
+                .await
+                .expect("should serve the failure router");
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "should answer {path} from the failure router"
+            );
+        }
     }
 }
