@@ -2760,10 +2760,11 @@ route tests, the whole parity suite, and the CLI proxy test move to
 - `./scripts/integration-tests-browser.sh`, with loopback bidders.
 - `scripts/smoke-fastly.sh`, `scripts/smoke-axum.sh`,
   `scripts/smoke-cloudflare.sh`, and `scripts/smoke-spin.sh`, with the
-  `smoke-axum.sh` change in section 7. `smoke-cloudflare.sh` is a known
-  failure: it exits 1 with `smoke: missing Wrangler pin in .tool-versions`.
-  `.tool-versions` pins no Wrangler, and `main`'s has no Wrangler line either
-  (Follow-ups, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
+  `smoke-axum.sh` change in section 7. `.tool-versions` pins Wrangler 4.83.0,
+  shared by the Cloudflare integration jobs. The Cloudflare first-success smoke
+  passes locally with this version: all four missing-binding controls return
+  HTTP 500 with the expected diagnostics, and the configured publisher request
+  returns HTTP 200 with the origin sentinel and rewritten asset URL (#1610).
 - **Fastly response diff.** A script under `scripts/` sends a fixed request list
   to a `main` build and to the branch build, both under Viceroy. It diffs
   status, headers, and a body hash. The list covers a publisher page, `HEAD` and
@@ -2875,8 +2876,6 @@ old layer. That transient dual path exists only inside the pull request.
 - Moving the pin from the `rc/identity` commit to an EdgeZero release tag once
   PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
-- A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
-  run (Runtime, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers

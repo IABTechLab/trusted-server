@@ -33,8 +33,9 @@ Install the Wrangler version pinned in `.tool-versions`, then run:
 ```
 
 The smoke refuses an absent pin or a different Wrangler executable. It creates
-an isolated Worker manifest, maps the EdgeZero config store to
-`TRUSTED_SERVER_RUNTIME_KV`, and runs `ts config push --adapter cloudflare --local`.
+an isolated Worker manifest, copies the tool version declarations into its
+temporary workspace so Node and Wrangler shims retain their selected versions,
+maps the EdgeZero config store to `TRUSTED_SERVER_RUNTIME_KV`, and runs `ts config push --adapter cloudflare --local`.
 It reads `trusted_server_config` back with `wrangler kv key get` using both the
 explicit binding and local mode. The returned envelope becomes the string
 value of `app_config` in a JSON object; that outer JSON is assigned to the
