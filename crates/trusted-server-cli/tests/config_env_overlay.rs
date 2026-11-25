@@ -806,7 +806,10 @@ allowed_domains = ["envelope.example.com"]
 sources = ["liveramp.example.com"]
 [ec.identity_providers.settings]
 placement_id = 14
-custom_id_namespace = "ana-example"
+hashed_email = { enabled = true, path = ".liveramp" }
+
+[ec.hashed_email]
+endpoint = "https://www.example.com/api/user/status"
 "#,
     );
     fs::write(&project.config_path, config).expect("should write enabled provider config");

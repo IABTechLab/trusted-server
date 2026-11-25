@@ -824,6 +824,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
@@ -867,6 +869,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,

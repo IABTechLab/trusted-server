@@ -895,7 +895,8 @@ pub fn current_timestamp() -> u64 {
 ///
 /// Use this instead of [`current_timestamp`] when a fallback could authorize
 /// a time-bounded correctness decision.
-pub(crate) fn checked_current_timestamp() -> Option<u64> {
+#[must_use]
+pub fn checked_current_timestamp() -> Option<u64> {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1096,8 +1097,13 @@ mod tests {
             &mut ec,
             None,
             &registry::PartnerRegistry::empty(),
-            None,
-            &crate::ec::sharedid::SharedIdRequest::default(),
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;

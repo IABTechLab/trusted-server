@@ -32,7 +32,9 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::app::{
     AfterResponseLookups, IdentityApp, IdentityPlatform, joined_cookie_header,
 };
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::current_timestamp;
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use trusted_server_core::ec::kv_backend::{
     EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
@@ -62,6 +64,16 @@ fn lookups_for(
         user_agent: request
             .headers()
             .get(edgezero_core::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        referer: request
+            .headers()
+            .get(edgezero_core::http::header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        accept_language: request
+            .headers()
+            .get(edgezero_core::http::header::ACCEPT_LANGUAGE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         cookie_header: joined_cookie_header(request),
@@ -316,8 +328,11 @@ impl Hooks for FixtureApp {
                     &mut ec,
                     Some(&graph),
                     identity.partners(),
-                    None,
-                    &SharedIdRequest::default(),
+                    &FinalizeRequest {
+                        eids_cookie: None,
+                        sharedid: &SharedIdRequest::default(),
+                        now: Some(UnixSeconds::new(current_timestamp())),
+                    },
                     &mut response,
                 )
                 .await;
@@ -837,8 +852,11 @@ async fn registration_case(permit: bool) -> RegistrationCase {
             &mut context,
             Some(&graph),
             identity.partners(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut Response::new(Body::empty()),
         )
         .await;

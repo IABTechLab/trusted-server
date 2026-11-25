@@ -8,7 +8,8 @@ The crate maps Spin HTTP, variables, and the `default` key-value store into the
 shared runtime. Its `/health`, `/ready`, and startup-failure responses follow the
 shared [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
 Multi-provider auctions fan out as one EdgeZero request batch.
-Request-time KV services beyond startup config loading remain unavailable.
+Request-time config, including request-signing metadata, also reads the
+`default` label; runtime KV is the opt-in `trusted_server_runtime_kv` label.
 EdgeZero's Spin client cannot override the outbound `Host`, so the adapter
 ignores `publisher.origin_host_header_override` and logs a warning. EdgeZero's
 Spin `run_app` installs the log backend, which writes to the component's stderr

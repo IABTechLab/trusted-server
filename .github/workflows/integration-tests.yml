@@ -95,7 +95,10 @@ jobs:
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 
       - name: Install wrangler
-        run: npm install -g wrangler
+        run: |
+          wrangler_version=$(awk '$1 == "wrangler" { print $2; exit }' "$GITHUB_WORKSPACE/.tool-versions")
+          test -n "$wrangler_version"
+          npm install --global "wrangler@$wrangler_version"
 
       - name: Run integration tests
         run: >-
@@ -203,7 +206,9 @@ jobs:
           npm ci --prefix crates/trusted-server-integration-tests/browser
           cd crates/trusted-server-integration-tests/browser
           npx playwright install --with-deps chromium
-          npm install -g wrangler@4.83.0
+          wrangler_version=$(awk '$1 == "wrangler" { print $2; exit }' "$GITHUB_WORKSPACE/.tool-versions")
+          test -n "$wrangler_version"
+          npm install --global "wrangler@$wrangler_version"
 
       - name: Install the verified Spin runtime
         run: |
