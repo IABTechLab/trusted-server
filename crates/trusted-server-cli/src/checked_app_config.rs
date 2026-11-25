@@ -122,7 +122,19 @@ mod tests {
         "/../../trusted-server.example.toml"
     ));
 
+    /// `LiveRamp` settings for a complete hashed-email envelope lookup.
+    const LIVERAMP_LOOKUP: &str =
+        "placement_id = 14\nhashed_email = { enabled = true, path = \".liveramp\" }";
+
+    /// A config with a `LiveRamp` provider and the hashed-email endpoint.
     fn with_liveramp(settings: &str) -> CheckedAppConfig {
+        with_liveramp_and(
+            settings,
+            "[ec.hashed_email]\nendpoint = \"https://www.example.com/api/user/status\"",
+        )
+    }
+
+    fn with_liveramp_and(settings: &str, extra: &str) -> CheckedAppConfig {
         let config = format!(
             "{EXAMPLE_CONFIG}\n\
              [[ec.partners]]\n\
@@ -137,7 +149,8 @@ mod tests {
              allowed_domains = [\"envelope.example.com\"]\n\
              sources = [\"liveramp.example.com\"]\n\
              [ec.identity_providers.settings]\n\
-             {settings}\n"
+             {settings}\n\
+             {extra}\n"
         );
         toml::from_str(&config).expect("should parse app config")
     }
@@ -182,9 +195,7 @@ mod tests {
 
     #[test]
     fn providerless_config_rejects_an_enabled_provider() {
-        let config = ProviderlessAppConfig(with_liveramp(
-            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
-        ));
+        let config = ProviderlessAppConfig(with_liveramp(LIVERAMP_LOOKUP));
 
         let message = adapter_error(&config).expect("should reject the enabled provider");
 
@@ -220,7 +231,7 @@ mod tests {
 
     #[test]
     fn reports_no_provider_error_for_a_provider_that_builds() {
-        let config = with_liveramp("placement_id = 14\ncustom_id_namespace = \"ana-example\"");
+        let config = with_liveramp(LIVERAMP_LOOKUP);
 
         assert_eq!(
             provider_error(&config),
@@ -237,7 +248,7 @@ mod tests {
         let errors = config.validate().expect_err("should fail validation");
 
         assert!(
-            message.contains("custom_id_namespace"),
+            message.contains("hashed_email"),
             "should name the missing setting, got: {message}"
         );
         assert!(
@@ -247,10 +258,20 @@ mod tests {
     }
 
     #[test]
-    fn names_the_unknown_setting_in_a_provider_settings_typo() {
-        let config = with_liveramp(
-            "placement_id = 14\ncustom_id_namespace = \"ana-example\"\ncookie_nmes = [\"_lr_env\"]",
+    fn rejects_hashed_email_without_the_status_endpoint() {
+        let config = with_liveramp_and(LIVERAMP_LOOKUP, "");
+
+        let message = provider_error(&config).expect("should report the provider error");
+
+        assert!(
+            message.contains("[ec.hashed_email]"),
+            "should name the missing endpoint, got: {message}"
         );
+    }
+
+    #[test]
+    fn names_the_unknown_setting_in_a_provider_settings_typo() {
+        let config = with_liveramp(&format!("{LIVERAMP_LOOKUP}\ncookie_nmes = [\"_lr_env\"]"));
 
         let message = provider_error(&config).expect("should report the provider error");
 
