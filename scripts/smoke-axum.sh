@@ -56,11 +56,18 @@ stop_app() {
 }
 
 cleanup() {
-    local status=0
-    stop_app || status=$?
+    # The status the script was already exiting with when the trap fired.
+    local exit_status=$?
+    local teardown_status=0
+    stop_app || teardown_status=$?
     smoke_stop_process "$ORIGIN_PID"
     smoke_remove_workspace "$WORKSPACE"
-    return "$status"
+    # Fail an otherwise passing run explicitly rather than relying on errexit
+    # to act on the trap's return status, and let an earlier failure keep its
+    # own status instead of replacing it with the teardown status.
+    if [ "$exit_status" -eq 0 ] && [ "$teardown_status" -ne 0 ]; then
+        exit "$teardown_status"
+    fi
 }
 trap cleanup EXIT INT TERM
 
