@@ -1,16 +1,19 @@
 //! ID5 identity provider: resolves the ID5 ID server side.
 //!
 //! Posts the request's consent and network signals to ID5's fetch endpoint.
-//! It needs no login and sends no hashed email. ID5 returns complete EIDs
+//! With the hashed-email capability enabled (`[settings.hashed_email]`) and a
+//! hashed email for the request, the body also carries it as partner data
+//! `pd`: the padded URL-safe base64 of `1=<percent-encoded hashed email>`,
+//! key 1 being ID5's SHA-256 email hash. ID5 returns complete EIDs
 //! under `ids`, or the legacy `universal_uid`, which is given to the first
 //! configured source with the reply's `ext.linkType` as UID `ext`, as
 //! Prebid's ID5 module does.
 //!
-//! Parsing is lenient per entry: an entry of `ids`, `universal_uid` or
-//! `cache_control` with an unexpected shape is skipped rather than failing
-//! the whole response. The opt-out UID `"0"` is never stored or forwarded.
-//! `cache_control.max_age_sec` is bounded by [`bounded_expiry`]: a missing
-//! value gets the default TTL and a zero or tiny one the minimum TTL.
+//! Parsing is lenient per entry: an entry of `ids` or `universal_uid` with
+//! an unexpected shape is skipped rather than failing the whole response.
+//! The opt-out UID `"0"` is never stored or forwarded. As ID5's server-side
+//! fetch documentation asks, UIDs from a reply are kept for 30 days from that
+//! reply and refreshed after 8 hours; the reply's `cache_control` is ignored.
 //!
 //! Before any lookup, the provider reads ID5's first-party cookies listed
 //! in `cookie_names` (default `id5id`, written by Prebid's ID5 module), in
@@ -19,9 +22,9 @@
 //! (plain or percent-encoded) is parsed exactly like a lookup response, and
 //! a bare ID string becomes one UID on the first source with agent type 1
 //! and the default TTL. A reply's non-empty `signature` is kept as the
-//! UIDs' private refresh state, due a tenth of their TTL before they
-//! expire, and sent back as `s` in the next fetch so ID5 can return the
-//! same ID, as Prebid's ID5 module does. A
+//! UIDs' private refresh state, due 8 hours after the reply, and sent back
+//! as `s` in the next fetch so ID5 can return the same ID. A reply without a
+//! signature is not refreshed before its UIDs expire. A
 //! percent-encoded JSON cookie is decoded and its entries, `ext` objects
 //! included, are copied out of the decoded text. A cookie that yields no
 //! usable UID is ignored and the lookup runs as usual. A cookie holding
@@ -30,13 +33,14 @@
 //! removed. A fetch reply whose `universal_uid` is `0` reports the same
 //! opt-out.
 //!
-//! The request follows ID5's server-side client (its Prebid Server module):
-//! `gpp_sid` is sent comma-joined, the client IP goes in `ip` (IPv4) or
-//! `ipv6`, `provider` names who operates the integration (`provider_name`,
-//! default the publisher domain), `domain` is the publisher domain,
-//! `origin` is `trusted-server` and `v` is the crate version, without which
-//! ID5 rejects the fetch. The field names for the client IP and user
-//! agent should be confirmed with ID5 for each partner account.
+//! The request follows ID5's server-side fetch documentation: `o` is
+//! `server-side-fetch-api`, `u` is the publisher origin, `top` is 1 (a
+//! navigation loads the top window), the client IP goes in `ipv4` or
+//! `ipv6`, `ref` is the origin of the visitor's `Referer` and
+//! `accept_language` the visitor's `Accept-Language`. `gpp_sid` is sent
+//! comma-joined, `provider` names who operates the integration
+//! (`provider_name`, default the publisher domain) and `v` is the crate
+//! version, without which ID5 rejects the fetch.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -44,6 +48,8 @@ use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE;
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use error_stack::{Report, ResultExt as _};
@@ -52,18 +58,19 @@ use http::{HeaderMap, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use trusted_server_core::ec::eid_types::{SourceDomain, UnixSeconds};
 use trusted_server_core::ec::provider::{
-    CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
-    ProviderCapabilities, ProviderCommon, ProviderConfigError, ProviderEid, ProviderError,
-    ProviderExpiry, ProviderKind, ProviderRefresh, ProviderRequest, ProviderResponse, ProviderUid,
-    RequestCookies, SourceCapability, SourceInput,
+    CookieRead, EidLevelFields, EidShape, HashedEmailPath, IdentityProvider, LookupInput,
+    LookupOutcome, ProviderCapabilities, ProviderCommon, ProviderConfigError, ProviderEid,
+    ProviderError, ProviderExpiry, ProviderKind, ProviderRefresh, ProviderRequest,
+    ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
 };
 use url::Url;
 
 use serde_json::value::RawValue;
 
 use crate::common::{
-    CookieReader, LockrSettings, ReadsLockr, VendorEid, bounded_expiry, is_routable_ip,
-    is_usable_id, join_section_ids, percent_decoded,
+    CookieReader, HashedEmailSettings, LockrSettings, ReadsLockr, UsesHashedEmail, VendorEid,
+    bounded_expiry, hashed_email_path, is_routable_ip, is_usable_id, join_section_ids,
+    percent_decoded,
 };
 
 /// Formats the request time as the RFC 3339 `ts` the `/gs/v2` fetch requires.
@@ -74,9 +81,14 @@ fn request_timestamp(now: UnixSeconds) -> Result<String, Report<ProviderError>> 
         .ok_or_else(|| Report::new(ProviderError::Request).attach("current time is out of range"))
 }
 
-/// Names this integration to ID5 in `origin`, as ID5's Prebid Server module
-/// sends `pbs-java`.
-const INTEGRATION_ORIGIN: &str = "trusted-server";
+/// The caller type ID5's server-side fetch endpoint expects in `o`.
+const FETCH_ORIGIN: &str = "server-side-fetch-api";
+
+/// How long UIDs from an ID5 reply are kept; every reply restarts it.
+const REPLY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How long after a reply its signature is due for a refresh fetch.
+const REFRESH_AFTER: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// The integration version sent to ID5 as `v`; the fetch endpoint rejects a
 /// request without one.
@@ -111,6 +123,9 @@ pub struct Id5Settings {
     /// The Lockr capability; see [`LockrSettings`].
     #[serde(default)]
     pub lockr: LockrSettings,
+    /// The hashed-email capability; see [`HashedEmailSettings`].
+    #[serde(default)]
+    pub hashed_email: HashedEmailSettings,
 }
 
 impl Id5Settings {
@@ -127,11 +142,16 @@ pub struct Id5Provider {
     partner_id: u32,
     provider_name: Option<String>,
     cookies: CookieReader,
+    /// Where the hashed email sits in the status response; `None` sends no
+    /// `pd`.
+    hashed_email_path: Option<HashedEmailPath>,
 }
 
 impl ReadsLockr for Id5 {
     const LOCKR_COOKIE_NAMES: &'static [&'static str] = &["id5id"];
 }
+
+impl UsesHashedEmail for Id5 {}
 
 impl ProviderKind for Id5 {
     const KIND: &'static str = "id5";
@@ -182,6 +202,7 @@ impl ProviderKind for Id5 {
                 settings.cookie_names,
                 settings.lockr,
             )?,
+            hashed_email_path: hashed_email_path::<Self>(settings.hashed_email)?,
         })
     }
 }
@@ -190,8 +211,11 @@ impl ProviderKind for Id5 {
 struct FetchBody<'a> {
     partner: u32,
     provider: &'a str,
-    domain: &'a str,
-    origin: &'static str,
+    o: &'static str,
+    u: &'a str,
+    top: u8,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    referer: Option<String>,
     v: &'static str,
     gdpr: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,12 +230,32 @@ struct FetchBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ip: Option<String>,
+    accept_language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ipv6: Option<String>,
     /// The previous reply's `signature`, which lets ID5 return the same ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<&'a str>,
+    /// Partner data carrying the hashed email; see [`partner_data`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pd: Option<String>,
+}
+
+/// The origin of a `Referer`, which ID5 takes as `ref` without path or query.
+fn referer_origin(referer: &str) -> Option<String> {
+    Url::parse(referer)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// ID5 partner data for a hashed email: the padded URL-safe base64 of
+/// `1=<percent-encoded value>`, key 1 being the SHA-256 email hash. ID5's
+/// server-side fetch documentation requires the URL-safe alphabet.
+fn partner_data(hashed_email: &str) -> String {
+    URL_SAFE.encode(format!("1={}", urlencoding::encode(hashed_email)))
 }
 
 /// The top-level reply; each field is parsed separately so one bad shape
@@ -222,8 +266,6 @@ struct FetchReply<'body> {
     universal_uid: Option<&'body RawValue>,
     #[serde(default, borrow)]
     ids: Option<&'body RawValue>,
-    #[serde(default, borrow)]
-    cache_control: Option<&'body RawValue>,
     #[serde(default, borrow)]
     ext: Option<&'body RawValue>,
     #[serde(default, borrow)]
@@ -250,11 +292,6 @@ struct Id5Id<'body> {
     eid: Option<VendorEid<'body>>,
 }
 
-#[derive(Deserialize)]
-struct CacheControl {
-    max_age_sec: Option<u64>,
-}
-
 impl Id5Provider {
     fn primary_source(&self) -> &SourceDomain {
         &self.capabilities.sources[0].source
@@ -277,12 +314,7 @@ impl Id5Provider {
         body: &'body [u8],
     ) -> Result<Vec<ProviderEid<'body>>, serde_json::Error> {
         let reply: FetchReply<'body> = serde_json::from_slice(body)?;
-        let max_age = reply
-            .cache_control
-            .and_then(|raw| serde_json::from_str::<CacheControl>(raw.get()).ok())
-            .and_then(|cache| cache.max_age_sec)
-            .map(Duration::from_secs);
-        let expiry = bounded_expiry(max_age);
+        let expiry = ProviderExpiry::After(REPLY_TTL);
         let signature = reply
             .signature
             .and_then(|raw| serde_json::from_str::<Cow<'body, str>>(raw.get()).ok())
@@ -290,7 +322,7 @@ impl Id5Provider {
         let refresh = || {
             signature.as_ref().map(|signature| ProviderRefresh {
                 state: signature.clone(),
-                from: refresh_from(expiry),
+                from: ProviderExpiry::After(REFRESH_AFTER),
             })
         };
 
@@ -395,6 +427,10 @@ impl IdentityProvider for Id5Provider {
         false
     }
 
+    fn hashed_email_path(&self) -> Option<&HashedEmailPath> {
+        self.hashed_email_path.as_ref()
+    }
+
     fn build_request(
         &self,
         lookup: &LookupInput<'_>,
@@ -408,8 +444,10 @@ impl IdentityProvider for Id5Provider {
                 .provider_name
                 .as_deref()
                 .unwrap_or(lookup.publisher_domain),
-            domain: lookup.publisher_domain,
-            origin: INTEGRATION_ORIGIN,
+            o: FETCH_ORIGIN,
+            u: &origin,
+            top: 1,
+            referer: lookup.client.referer.and_then(referer_origin),
             v: INTEGRATION_VERSION,
             gdpr: u8::from(consent.gdpr_applies),
             gdpr_consent: consent.raw_tc_string.as_deref(),
@@ -418,7 +456,8 @@ impl IdentityProvider for Id5Provider {
             gpp_sid: consent.gpp_section_ids.as_deref().map(join_section_ids),
             ts: request_timestamp(lookup.now)?,
             ua: lookup.client.user_agent,
-            ip: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
+            accept_language: lookup.client.accept_language,
+            ipv4: routable_ip.filter(IpAddr::is_ipv4).map(|ip| ip.to_string()),
             ipv6: routable_ip.filter(IpAddr::is_ipv6).map(|ip| ip.to_string()),
             s: lookup
                 .current
@@ -426,10 +465,16 @@ impl IdentityProvider for Id5Provider {
                 .flat_map(|(_, eid)| eid.uids())
                 .find_map(|uid| uid.refresh())
                 .map(|refresh| refresh.state.as_str()),
+            pd: lookup
+                .hashed_email
+                .map(|hashed_email| partner_data(hashed_email.as_str())),
         };
         let body = serde_json::to_vec(&body).change_context(ProviderError::Request)?;
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=UTF-8"),
+        );
         headers.insert(
             ORIGIN,
             HeaderValue::from_str(&origin).change_context(ProviderError::Request)?,
@@ -551,16 +596,6 @@ fn owned<'any>(eid: ProviderEid<'_>) -> ProviderEid<'any> {
     }
 }
 
-/// When a UID that expires at `expiry` is refreshed: a tenth of its TTL
-/// early, so the refresh runs while the UID and its signature are still
-/// stored.
-fn refresh_from(expiry: ProviderExpiry) -> ProviderExpiry {
-    match expiry {
-        ProviderExpiry::After(ttl) => ProviderExpiry::After(ttl - ttl / 10),
-        other => other,
-    }
-}
-
 /// Returns whether `id` is a real UID: not empty and not the opt-out UID.
 fn is_usable_uid(id: &str) -> bool {
     !id.is_empty() && id != OPTED_OUT_UID
@@ -574,7 +609,7 @@ mod tests {
     use trusted_server_core::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue};
     use trusted_server_core::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvRefresh, KvUid};
     use trusted_server_core::ec::provider::{
-        ClientSignals, OwnedEntries, ProviderExpiry, build_kind,
+        ClientSignals, HashedEmail, OwnedEntries, ProviderExpiry, build_kind,
     };
     use trusted_server_core::settings::{IdentityProviderConfig, ProviderSecrets};
 
@@ -633,8 +668,12 @@ mod tests {
             "should store the signature"
         );
         assert!(
-            matches!(refresh.from, ProviderExpiry::After(ttl) if ttl == Duration::from_secs(32_400)),
-            "should refresh a tenth of the TTL before the UID expires"
+            matches!(refresh.from, ProviderExpiry::After(after) if after == REFRESH_AFTER),
+            "should refresh 8 hours after the reply"
+        );
+        assert!(
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(ttl) if ttl == REPLY_TTL),
+            "should keep the UID for 30 days"
         );
     }
 
@@ -686,6 +725,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &sources,
@@ -710,6 +751,111 @@ mod tests {
         );
     }
 
+    fn hashed_email_provider() -> Box<dyn IdentityProvider> {
+        let config: IdentityProviderConfig = serde_json::from_value(json!({
+            "id": "id5",
+            "kind": "id5",
+            "endpoint": "https://id5.example.com/gs/v2",
+            "allowed_domains": ["id5.example.com"],
+            "sources": ["id5.example.com"],
+            "settings": {
+                "partner_id": 1234,
+                "hashed_email": { "enabled": true, "path": ".id5" },
+            },
+        }))
+        .expect("should parse provider config");
+        build_kind::<Id5>(&config, &ProviderSecrets::default()).expect("should build provider")
+    }
+
+    fn fetch_body(
+        provider: &dyn IdentityProvider,
+        hashed_email: Option<&HashedEmail>,
+    ) -> serde_json::Value {
+        let consent = ConsentContext::default();
+        let lookup = LookupInput {
+            ec_id: "ec-example",
+            consent: &consent,
+            client: ClientSignals {
+                ip: None,
+                user_agent: None,
+                referer: None,
+                accept_language: None,
+            },
+            publisher_domain: "www.example.com",
+            due_sources: &[],
+            current: OwnedEntries::empty(),
+            cookies: RequestCookies::default(),
+            hashed_email,
+            now: UnixSeconds::new(1_700_000_000),
+        };
+        let request = provider
+            .build_request(&lookup)
+            .expect("should build request");
+        serde_json::from_slice(&request.body).expect("should send JSON")
+    }
+
+    #[test]
+    fn sends_a_hashed_email_as_partner_data() {
+        // Arrange
+        let provider = hashed_email_provider();
+        let hashed_email = HashedEmail::new("ab+c/=d").expect("should accept the hashed email");
+
+        // Act
+        let body = fetch_body(&*provider, Some(&hashed_email));
+
+        // Assert
+        let pd = body["pd"].as_str().expect("should send pd");
+        let decoded = URL_SAFE
+            .decode(pd)
+            .expect("should be padded URL-safe base64");
+        assert_eq!(
+            String::from_utf8(decoded).expect("should be UTF-8"),
+            "1=ab%2Bc%2F%3Dd",
+            "should percent-encode the value under key 1"
+        );
+    }
+
+    #[test]
+    fn encodes_partner_data_with_the_url_safe_alphabet() {
+        // Arrange: `1=~~` is `MT1+fg==` in the standard alphabet.
+        let provider = hashed_email_provider();
+        let hashed_email = HashedEmail::new("~~").expect("should accept the hashed email");
+
+        // Act
+        let body = fetch_body(&*provider, Some(&hashed_email));
+
+        // Assert
+        assert_eq!(
+            body["pd"], "MT1-fg==",
+            "should use `-` and `_` instead of `+` and `/`"
+        );
+    }
+
+    #[test]
+    fn sends_no_partner_data_without_a_hashed_email() {
+        let body = fetch_body(&*hashed_email_provider(), None);
+
+        assert!(body.get("pd").is_none(), "should omit pd");
+    }
+
+    #[test]
+    fn reads_a_hashed_email_only_when_enabled() {
+        let provider_with_hashed_email = hashed_email_provider();
+        let status = json!({ "id5": "hash-example" });
+
+        assert_eq!(
+            provider_with_hashed_email
+                .hashed_email_path()
+                .and_then(|path| path.read(&status)),
+            Some("hash-example"),
+            "should expose the configured path"
+        );
+        assert!(
+            provider().hashed_email_path().is_none(),
+            "should read no hashed email by default"
+        );
+    }
+
     #[test]
     fn posts_consent_and_network_signals_to_the_partner_url() {
         let provider = provider();
@@ -724,6 +870,8 @@ mod tests {
             client: ClientSignals {
                 ip: Some("11.22.33.44".parse().expect("should parse ip")),
                 user_agent: Some("ExampleBrowser/1.0"),
+                referer: Some("https://search.example.org/results?q=news#top"),
+                accept_language: Some("de-DE,de;q=0.9,en;q=0.8"),
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
@@ -750,25 +898,39 @@ mod tests {
             Some(&b"https://www.example.com"[..]),
             "should send the publisher origin"
         );
+        assert_eq!(
+            request.headers.get(CONTENT_TYPE).map(HeaderValue::as_bytes),
+            Some(&b"application/json; charset=UTF-8"[..]),
+            "should send the documented content type"
+        );
         assert_eq!(body["partner"], 1234, "should send the partner");
         assert_eq!(
             body["provider"], "www.example.com",
             "should name the publisher as operator by default"
         );
         assert_eq!(
-            body["domain"], "www.example.com",
-            "should send the publisher domain"
+            body["o"], "server-side-fetch-api",
+            "should name the server-side fetch caller"
         );
         assert_eq!(
-            body["origin"], "trusted-server",
-            "should name the integration"
+            body["u"], "https://www.example.com",
+            "should send the publisher origin as the page URL"
+        );
+        assert_eq!(body["top"], 1, "should report the top window");
+        assert_eq!(
+            body["ref"], "https://search.example.org",
+            "should send only the referrer origin"
+        );
+        assert_eq!(
+            body["accept_language"], "de-DE,de;q=0.9,en;q=0.8",
+            "should send the visitor's languages"
         );
         assert_eq!(
             body["v"],
             env!("CARGO_PKG_VERSION"),
             "should send the integration version ID5 requires"
         );
-        for legacy in ["o", "tml", "nbPage"] {
+        for legacy in ["origin", "domain", "ip", "tml", "nbPage"] {
             assert!(body.get(legacy).is_none(), "should not send `{legacy}`");
         }
         let ts = body["ts"].as_str().expect("should send a ts string");
@@ -779,7 +941,7 @@ mod tests {
             body["gpp_sid"], "7,8",
             "should send GPP section IDs comma-joined"
         );
-        assert_eq!(body["ip"], "11.22.33.44", "should send the client IP");
+        assert_eq!(body["ipv4"], "11.22.33.44", "should send the client IPv4");
         assert_eq!(
             body["ua"], "ExampleBrowser/1.0",
             "should send the user agent"
@@ -796,6 +958,8 @@ mod tests {
             client: ClientSignals {
                 ip: Some("10.1.2.3".parse().expect("should parse ip")),
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
@@ -811,7 +975,11 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("should send JSON");
 
-        assert!(body.get("ip").is_none(), "should not send a private IP");
+        assert!(body.get("ipv4").is_none(), "should not send a private IP");
+        assert!(
+            body.get("ref").is_none() && body.get("accept_language").is_none(),
+            "should omit headers the visitor did not send"
+        );
     }
 
     #[test]
@@ -824,6 +992,8 @@ mod tests {
             client: ClientSignals {
                 ip: Some("2001:4860::1".parse().expect("should parse ip")),
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
@@ -839,8 +1009,27 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("should send JSON");
 
-        assert!(body.get("ip").is_none(), "should not send IPv6 as ip");
+        assert!(body.get("ipv4").is_none(), "should not send IPv6 as ipv4");
         assert_eq!(body["ipv6"], "2001:4860::1", "should send ipv6");
+    }
+
+    #[test]
+    fn keeps_only_the_origin_of_a_referrer() {
+        for (referer, expected) in [
+            (
+                "https://news.example.org:8443/a/b?c=d",
+                Some("https://news.example.org:8443"),
+            ),
+            ("http://news.example.org", Some("http://news.example.org")),
+            ("android-app://com.example.app/", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(
+                referer_origin(referer).as_deref(),
+                expected,
+                "should map {referer:?} to {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -865,8 +1054,8 @@ mod tests {
         assert_eq!(eids[0].uids[0].id, "id5-example", "should keep the UID");
         assert!(eids[0].uids[0].ext.is_some(), "should keep the UID ext");
         assert!(
-            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == Duration::from_secs(3600)),
-            "should use the cache max age"
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == REPLY_TTL),
+            "should keep the UID for 30 days, ignoring cache_control"
         );
     }
 
@@ -901,13 +1090,13 @@ mod tests {
             "should carry the reply linkType as UID ext"
         );
         assert!(
-            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == crate::common::DEFAULT_TTL),
-            "should use the default TTL without a cache max age"
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == REPLY_TTL),
+            "should keep the UID for 30 days"
         );
     }
 
     #[test]
-    fn normalizes_sources_skips_bad_entries_and_bounds_expiry() {
+    fn normalizes_sources_and_skips_bad_entries() {
         let provider = provider();
         let headers = HeaderMap::new();
         let body = serde_json::to_vec(&json!({
@@ -932,8 +1121,8 @@ mod tests {
         assert_eq!(eids[0].uids.len(), 1, "should drop the opt-out UID");
         assert_eq!(eids[0].uids[0].id, "id5-example", "should keep the UID");
         assert!(
-            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == crate::common::MIN_TTL),
-            "should keep a zero max age for the minimum TTL"
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(d) if d == REPLY_TTL),
+            "should ignore a zero cache max age"
         );
     }
 
@@ -1062,7 +1251,7 @@ mod tests {
                 "id5-example".to_owned(),
                 Some(1),
                 true,
-                Duration::from_secs(7200)
+                REPLY_TTL
             )],
             "should parse the reply like a lookup response"
         );
@@ -1082,7 +1271,7 @@ mod tests {
                 "id5-example".to_owned(),
                 Some(1),
                 true,
-                Duration::from_secs(7200)
+                REPLY_TTL
             )],
             "should decode the reply and keep ext objects"
         );
