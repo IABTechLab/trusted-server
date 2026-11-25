@@ -1,17 +1,16 @@
 //! Target-independent config-first auction plan compiler.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::time::Duration;
 
-use error_stack::{Report, ResultExt as _};
+use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::Url;
+use url::{Host, Url};
 
 use super::profile::{CompiledOpenRtbProfile, ProfileTimeoutDefault, find_profile};
 use crate::error::TrustedServerError;
-use crate::platform::{AuctionTargetId, PlatformBackendSpec};
 use crate::settings::RequestSigning;
 
 const MAX_ID_BYTES: usize = 128;
@@ -19,6 +18,10 @@ const MAX_SUPPRESS_SEATS: usize = 128;
 const MAX_SUPPRESS_SEAT_BYTES: usize = 128;
 const MOCK_MEDIATOR_ID: &str = "adserver_mock";
 const RESERVED_BROWSER_ENVELOPE_BIDDER_ID: &str = "trustedServer";
+/// Dynamic backends a Fastly service may register.
+const FASTLY_DYNAMIC_BACKEND_LIMIT: usize = 200;
+/// Fastly dynamic backends kept for the sites outside the auction.
+const FASTLY_NON_AUCTION_BACKEND_RESERVE: usize = 40;
 
 /// Validated operator-defined provider identifier.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, derive_more::Display)]
@@ -255,7 +258,6 @@ pub struct ProviderPlan {
 #[derive(Debug, Clone)]
 pub struct AuctionPlan {
     enabled: bool,
-    timeout_ms: u32,
     providers: Vec<ProviderPlan>,
     bidder_routes: BTreeMap<BidderId, usize>,
     signing_enabled: bool,
@@ -361,7 +363,6 @@ impl AuctionPlan {
         }
         Ok(Self {
             enabled: true,
-            timeout_ms: config.timeout_ms,
             providers,
             bidder_routes,
             signing_enabled,
@@ -370,106 +371,7 @@ impl AuctionPlan {
     }
 }
 
-impl ProviderPlan {
-    /// Build the canonical backend specification with the configured timeout.
-    #[must_use]
-    pub(crate) fn backend_spec(&self) -> PlatformBackendSpec {
-        self.backend_spec_with_transport_timeout(self.timeout_ms)
-    }
-
-    /// Build the canonical backend specification with request-local transport timers.
-    #[must_use]
-    pub(crate) fn backend_spec_with_transport_timeout(
-        &self,
-        transport_timeout_ms: u32,
-    ) -> PlatformBackendSpec {
-        let endpoint = self.endpoint.url();
-        let timeout = Duration::from_millis(u64::from(transport_timeout_ms));
-        PlatformBackendSpec {
-            scheme: endpoint.scheme().to_owned(),
-            host: endpoint
-                .host_str()
-                .expect("should retain validated provider endpoint host")
-                .to_owned(),
-            port: endpoint.port(),
-            host_header_override: None,
-            certificate_check: true,
-            first_byte_timeout: timeout,
-            between_bytes_timeout: timeout,
-            discriminator: Some(self.id.as_str().to_owned()),
-        }
-    }
-}
-
 impl AuctionPlan {
-    /// Validate adapter capabilities and backend-name correlation before I/O.
-    ///
-    /// Each provider is predicted from a canonical backend specification using
-    /// its exact configured provider timeout as both transport timers and its
-    /// provider ID as the stable discriminator. These transport timers do not
-    /// replace the auction-wide logical budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error when the target cannot fan out to every
-    /// configured provider, backend prediction fails, or two predicted names
-    /// collide.
-    pub fn validate_for_target(
-        &self,
-        target_id: AuctionTargetId,
-    ) -> Result<(), Report<TrustedServerError>> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let target = target_id.descriptor();
-        if self.providers.len() > 1 && !target.capabilities().supports_concurrent_provider_fanout()
-        {
-            return Err(configuration_error(format!(
-                "auction target `{}` does not support concurrent provider fanout; configured {} providers",
-                target_id.adapter_id(),
-                self.providers.len()
-            )));
-        }
-
-        let naming_policy = target.naming_policy();
-        let backend_budget = naming_policy.auction_dynamic_backend_budget();
-        let mut required_backend_names = 0_usize;
-        let mut predicted_names = BTreeMap::<String, &ProviderId>::new();
-        for provider in &self.providers {
-            let reachable_timeout_ms = provider.timeout_ms.min(self.timeout_ms);
-            required_backend_names = required_backend_names
-                .saturating_add(naming_policy.transport_timeout_bucket_count(reachable_timeout_ms));
-            if let Some(budget) = backend_budget
-                && required_backend_names > budget
-            {
-                return Err(configuration_error(format!(
-                    "auction target `{}` requires up to {required_backend_names} dynamic provider backends, exceeding its auction budget of {budget}",
-                    target_id.adapter_id(),
-                )));
-            }
-            let spec = provider.backend_spec();
-            let prediction =
-                naming_policy
-                    .predict(&spec)
-                    .change_context(TrustedServerError::Configuration {
-                        message: format!(
-                            "provider `{}` backend prediction failed for target `{}`",
-                            provider.id,
-                            target_id.adapter_id()
-                        ),
-                    })?;
-            if let Some(existing) = predicted_names.insert(prediction.name.clone(), &provider.id) {
-                return Err(configuration_error(format!(
-                    "providers `{existing}` and `{}` predict the same backend name `{}` for target `{}`",
-                    provider.id,
-                    prediction.name,
-                    target_id.adapter_id()
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Borrow compiled providers in deterministic provider-ID order.
     #[must_use]
     pub fn providers(&self) -> &[ProviderPlan] {
@@ -522,6 +424,75 @@ impl AuctionPlan {
     }
 }
 
+/// Rejects an enabled plan whose providers need more Fastly backends than the auction may use.
+///
+/// Each distinct tuple of provider scheme, host, port, and configured timeout is at most one
+/// `EdgeZero` backend configuration on Fastly, because bidders set no host override and every
+/// request carries the same connect timeout. The count can only overstate: `EdgeZero` keys
+/// identity on the rounded timer, so two timeouts that round alike share a configuration but
+/// count twice here. The auction may use 160 of Fastly's 200 dynamic backends, which keeps 40 for
+/// the other outbound sites. A disabled auction registers no provider backend and passes.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when an enabled plan has more than 160 distinct
+/// provider tuples.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::plan::{
+///     AuctionPlan, AuctionPlanConfig, validate_fastly_backend_bound,
+/// };
+///
+/// let plan = AuctionPlan::compile(AuctionPlanConfig {
+///     timeout_ms: 1000,
+///     ..AuctionPlanConfig::default()
+/// })
+/// .expect("should compile an empty plan");
+/// validate_fastly_backend_bound(&plan).expect("should fit an empty plan");
+/// ```
+pub fn validate_fastly_backend_bound(plan: &AuctionPlan) -> Result<(), Report<TrustedServerError>> {
+    if !plan.enabled {
+        return Ok(());
+    }
+    let bound = FASTLY_DYNAMIC_BACKEND_LIMIT - FASTLY_NON_AUCTION_BACKEND_RESERVE;
+    let tuples = plan
+        .providers
+        .iter()
+        .map(|provider| {
+            let endpoint = provider.endpoint.url();
+            (
+                endpoint.scheme(),
+                endpoint.host_str(),
+                endpoint.port_or_known_default(),
+                provider.timeout_ms,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if tuples.len() > bound {
+        return Err(configuration_error(format!(
+            "auction providers need {} Fastly backend configurations, exceeding the bound of {bound} ({FASTLY_DYNAMIC_BACKEND_LIMIT} dynamic backends less {FASTLY_NON_AUCTION_BACKEND_RESERVE} kept for other sites)",
+            tuples.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Reports whether `url` is plain HTTP to the loopback IP literal `127.0.0.1` or `[::1]`.
+///
+/// Hosted runtimes cannot reach loopback, so these endpoints serve only local test bidders.
+/// Names and other addresses, such as `localhost` or `127.0.0.2`, do not qualify. The port is
+/// optional.
+fn is_loopback_http_endpoint(url: &Url) -> bool {
+    url.scheme() == "http"
+        && match url.host() {
+            Some(Host::Ipv4(address)) => address == Ipv4Addr::LOCALHOST,
+            Some(Host::Ipv6(address)) => address == Ipv6Addr::LOCALHOST,
+            Some(Host::Domain(_)) | None => false,
+        }
+}
+
 fn default_profile() -> String {
     "standard".to_string()
 }
@@ -569,17 +540,17 @@ fn canonicalize_endpoint(
 ) -> Result<CanonicalProviderEndpoint, Report<TrustedServerError>> {
     let mut endpoint = Url::parse(value).map_err(|error| {
         configuration_error(format!(
-            "provider `{provider_id}` endpoint must be an absolute HTTPS URL: {error}"
+            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1]: {error}"
         ))
     })?;
-    if endpoint.scheme() != "https"
+    if !(endpoint.scheme() == "https" || is_loopback_http_endpoint(&endpoint))
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
         || endpoint.fragment().is_some()
     {
         return Err(configuration_error(format!(
-            "provider `{provider_id}` endpoint must be absolute HTTPS with a host and no credentials or fragment"
+            "provider `{provider_id}` endpoint must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1], with a host and no credentials or fragment"
         )));
     }
     if profile_id == "aps"
@@ -687,199 +658,6 @@ mod tests {
             value = Value::Array(vec![value]);
         }
         value
-    }
-
-    #[test]
-    fn target_validation_accepts_fanout_and_rejects_unsupported_targets() {
-        let providers = BTreeMap::from([
-            (id("provider-one"), provider("standard")),
-            (id("provider-two"), provider("standard")),
-        ]);
-        let plan = AuctionPlan::compile(config(providers)).expect("should compile plan");
-
-        assert!(
-            plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-                .is_ok(),
-            "Fastly should accept provider fanout"
-        );
-        assert!(
-            plan.validate_for_target(crate::platform::AuctionTargetId::Axum)
-                .is_ok(),
-            "Axum should accept provider fanout"
-        );
-        for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
-            crate::platform::AuctionTargetId::Spin,
-        ] {
-            let error = plan
-                .validate_for_target(target)
-                .expect_err("should reject unsupported provider fanout");
-            assert!(
-                error.to_string().contains("fanout"),
-                "should explain fanout rejection: {error:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn fastly_target_validation_canonicalizes_url_derived_ipv6_prediction() {
-        let mut ipv6_provider = provider("standard");
-        ipv6_provider.endpoint = "https://[2001:db8::5]:8443/openrtb".to_string();
-        ipv6_provider.timeout_ms = Some(750);
-        let plan = AuctionPlan::compile(config(BTreeMap::from([(
-            id("ipv6-provider"),
-            ipv6_provider,
-        )])))
-        .expect("should compile IPv6 provider plan");
-
-        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("Fastly target validation should accept canonical IPv6 prediction");
-        let bracketed_spec = plan.providers()[0].backend_spec();
-        assert_eq!(bracketed_spec.host, "[2001:db8::5]");
-        let mut bare_spec = bracketed_spec.clone();
-        bare_spec.host = "2001:db8::5".to_string();
-        let policy = crate::platform::BackendNamingPolicy::Fastly;
-        assert_eq!(
-            policy
-                .predict(&bracketed_spec)
-                .expect("should predict URL-derived bracketed IPv6 backend"),
-            policy
-                .predict(&bare_spec)
-                .expect("should predict runtime-normalized bare IPv6 backend"),
-            "startup target validation and Fastly runtime must hash the same backend spec"
-        );
-    }
-
-    #[test]
-    fn fastly_target_validation_reserves_dynamic_backends_outside_auction() {
-        let plan_with = |count: usize| {
-            let providers = (0..count)
-                .map(|index| {
-                    let mut provider = provider("standard");
-                    provider.timeout_ms = Some(1000);
-                    (id(&format!("provider-{index}")), provider)
-                })
-                .collect();
-            AuctionPlan::compile(config(providers)).expect("should compile provider plan")
-        };
-
-        plan_with(19)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("below-budget provider plan should validate");
-        plan_with(20)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("at-budget provider plan should validate");
-        let error = plan_with(21)
-            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect_err("over-budget provider plan should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("exceeding its auction budget of 160")
-        );
-    }
-
-    #[test]
-    fn fastly_backend_quota_uses_auction_timeout_as_reachable_bucket_ceiling() {
-        let providers = (0..21)
-            .map(|index| {
-                let mut provider = provider("standard");
-                provider.timeout_ms = Some(1000);
-                (id(&format!("provider-{index}")), provider)
-            })
-            .collect();
-        let mut bounded = config(providers);
-        bounded.timeout_ms = 100;
-        let plan = AuctionPlan::compile(bounded).expect("should compile bounded provider plan");
-
-        assert!(
-            plan.providers()
-                .iter()
-                .all(|provider| provider.timeout_ms == 1000),
-            "quota validation must not rewrite configured provider timeouts"
-        );
-        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-            .expect("21 providers reach only the 50ms and 100ms Fastly buckets");
-    }
-
-    #[test]
-    fn disabled_target_validation_skips_fanout_and_collision_checks() {
-        let providers = BTreeMap::from([
-            (id("provider-one"), provider("standard")),
-            (id("provider-two"), provider("standard")),
-        ]);
-        let disabled = AuctionPlan::compile(config(providers))
-            .expect("should compile plan")
-            .with_enabled(false);
-
-        for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
-            crate::platform::AuctionTargetId::Spin,
-        ] {
-            disabled
-                .validate_for_target(target)
-                .expect("disabled dormant providers should skip target validation");
-        }
-
-        let provider = disabled.providers[0].clone();
-        let disabled_collision = AuctionPlan {
-            enabled: false,
-            timeout_ms: disabled.timeout_ms,
-            providers: vec![provider.clone(), provider],
-            bidder_routes: BTreeMap::new(),
-            signing_enabled: false,
-            mediator: None,
-        };
-        disabled_collision
-            .validate_for_target(crate::platform::AuctionTargetId::Axum)
-            .expect("disabled dormant providers should skip collision validation");
-    }
-
-    #[test]
-    fn target_validation_keeps_same_origin_timeout_profile_instances_distinct() {
-        let shared = ProviderConfig {
-            timeout_ms: Some(777),
-            ..provider("standard")
-        };
-        let plan = AuctionPlan::compile(config(BTreeMap::from([
-            (id("provider-one"), shared.clone()),
-            (id("provider-two"), shared),
-        ])))
-        .expect("should compile same-origin provider instances");
-
-        for target in [
-            crate::platform::AuctionTargetId::Fastly,
-            crate::platform::AuctionTargetId::Axum,
-        ] {
-            plan.validate_for_target(target)
-                .expect("provider ID discriminators should prevent predicted collisions");
-        }
-    }
-
-    #[test]
-    fn target_validation_rejects_predicted_name_collisions() {
-        let compiled = AuctionPlan::compile(config(BTreeMap::from([(
-            id("provider-a"),
-            provider("standard"),
-        )])))
-        .expect("should compile plan");
-        let provider = compiled.providers[0].clone();
-        // The compiler prevents duplicate provider IDs. Construct the otherwise
-        // impossible duplicate internally to pin validation's defense-in-depth
-        // collision rejection independently of compiler invariants.
-        let collision_plan = AuctionPlan {
-            enabled: true,
-            timeout_ms: compiled.timeout_ms,
-            providers: vec![provider.clone(), provider],
-            bidder_routes: BTreeMap::new(),
-            signing_enabled: false,
-            mediator: None,
-        };
-
-        let error = collision_plan
-            .validate_for_target(crate::platform::AuctionTargetId::Axum)
-            .expect_err("should reject predicted backend collision");
-        assert!(error.to_string().contains("same backend name"));
     }
 
     #[test]
@@ -1121,6 +899,127 @@ mod tests {
         aps.endpoint = "https://aps.example/e/dtb/bid".to_string();
         aps.profile_config = serde_json::json!({"account_id": "example-account"});
         assert!(AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)]))).is_err());
+    }
+
+    /// Compiles one standard provider per `(endpoint, timeout_ms)` pair.
+    fn plan_with_providers(endpoints: impl IntoIterator<Item = (String, u32)>) -> AuctionPlan {
+        let providers = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, (endpoint, timeout_ms))| {
+                let mut raw_provider = provider("standard");
+                raw_provider.endpoint = endpoint;
+                raw_provider.timeout_ms = Some(timeout_ms);
+                (id(&format!("provider-{index}")), raw_provider)
+            })
+            .collect();
+        AuctionPlan::compile(config(providers)).expect("should compile the provider plan")
+    }
+
+    /// One endpoint per port, so every provider has its own backend tuple.
+    fn distinct_tuples(count: u16) -> impl Iterator<Item = (String, u32)> {
+        (0..count).map(|index| {
+            (
+                format!("https://bid.example:{}/openrtb", 9000 + index),
+                1000,
+            )
+        })
+    }
+
+    #[test]
+    fn fastly_backend_bound_accepts_160_and_rejects_161_tuples() {
+        validate_fastly_backend_bound(&plan_with_providers(distinct_tuples(160)))
+            .expect("should accept 160 distinct provider backend tuples");
+
+        let error = validate_fastly_backend_bound(&plan_with_providers(distinct_tuples(161)))
+            .expect_err("should reject 161 distinct provider backend tuples");
+        assert!(
+            error.to_string().contains("161") && error.to_string().contains("160"),
+            "should name the tuple count and the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn providers_sharing_a_tuple_count_once() {
+        // The extra provider differs from the first only in its path, which is
+        // not part of backend identity.
+        let shared = ("https://bid.example:9000/other-path".to_string(), 1000);
+        let plan = plan_with_providers(distinct_tuples(160).chain([shared]));
+
+        assert_eq!(plan.providers().len(), 161, "should compile 161 providers");
+        validate_fastly_backend_bound(&plan)
+            .expect("should count two providers that share a tuple once");
+
+        let other_timeout = ("https://bid.example:9000/openrtb".to_string(), 999);
+        let error = validate_fastly_backend_bound(&plan_with_providers(
+            distinct_tuples(160).chain([other_timeout]),
+        ))
+        .expect_err("should count a different configured timeout as its own tuple");
+        assert!(
+            error.to_string().contains("161"),
+            "should count the timeout in the tuple: {error}"
+        );
+    }
+
+    #[test]
+    fn disabled_auction_skips_backend_bound() {
+        let disabled = plan_with_providers(distinct_tuples(161)).with_enabled(false);
+
+        validate_fastly_backend_bound(&disabled)
+            .expect("should skip the bound while the auction is disabled");
+    }
+
+    fn compile_endpoint(endpoint: &str) -> Result<AuctionPlan, Report<TrustedServerError>> {
+        let mut raw_provider = provider("standard");
+        raw_provider.endpoint = endpoint.to_string();
+        AuctionPlan::compile(config(BTreeMap::from([(id("loopback"), raw_provider)])))
+    }
+
+    #[test]
+    fn loopback_http_endpoints_are_accepted() {
+        for endpoint in [
+            "http://127.0.0.1:8080/bid",
+            "http://127.0.0.1/bid",
+            "http://[::1]:8080/bid",
+            "http://[::1]/bid",
+        ] {
+            let plan = compile_endpoint(endpoint)
+                .unwrap_or_else(|error| panic!("should accept {endpoint}: {error:?}"));
+            assert_eq!(
+                plan.providers()[0].endpoint.as_str(),
+                endpoint,
+                "should keep the loopback endpoint as configured"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_lookalike_endpoints_are_rejected() {
+        for endpoint in [
+            "http://localhost:8080/bid",
+            "http://127.0.0.2:8080/bid", // allow-domain: 127.0.0.2
+            "http://0.0.0.0:8080/bid",   // allow-domain: 0.0.0.0
+            "http://user@127.0.0.1:8080/bid",
+            "http://127.0.0.1:8080/bid#fragment",
+        ] {
+            assert!(
+                compile_endpoint(endpoint).is_err(),
+                "should reject plain HTTP to {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparsable_endpoint_error_states_the_loopback_rule() {
+        let Err(error) = compile_endpoint("not a URL") else {
+            panic!("should reject an unparsable endpoint");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must be absolute HTTPS, or plain HTTP to 127.0.0.1 or [::1]"),
+            "should state the loopback-aware endpoint rule: {error}"
+        );
     }
 
     #[test]

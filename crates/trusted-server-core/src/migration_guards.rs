@@ -172,11 +172,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("models.rs", include_str!("models.rs")),
         ("openrtb.rs", include_str!("openrtb.rs")),
         ("platform/error.rs", include_str!("platform/error.rs")),
-        ("platform/http.rs", include_str!("platform/http.rs")),
-        (
-            "platform/image_optimizer.rs",
-            include_str!("platform/image_optimizer.rs"),
-        ),
         ("platform/kv.rs", include_str!("platform/kv.rs")),
         ("platform/mod.rs", include_str!("platform/mod.rs")),
         (

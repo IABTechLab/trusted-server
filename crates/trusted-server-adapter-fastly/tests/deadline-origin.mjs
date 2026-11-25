@@ -107,8 +107,10 @@ async function main() {
     const config = join(directory, 'fastly.toml')
     await writeFile(
       config,
-      '[local_server.backends.deadline_origin]\n' +
-        `url = "http://127.0.0.1:${server.address().port}"\n`
+      '[local_server.config_stores.deadline_fixture]\n' +
+        'format = "inline-toml"\n' +
+        '[local_server.config_stores.deadline_fixture.contents]\n' +
+        `port = "${server.address().port}"\n`
     )
     const environment = { ...process.env }
     if (existsSync('/etc/ssl/cert.pem'))
@@ -120,7 +122,7 @@ async function main() {
         '-C',
         config,
         binary,
-        'platform::deadline::tests::network_',
+        'deadline_network::tests::network_',
         '--ignored',
         '--nocapture',
       ],
@@ -147,8 +149,8 @@ async function main() {
       assert.equal(code, 0, 'should run the network tests successfully')
       assert.match(
         output,
-        /^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured;/m,
-        'should execute all five network tests, including when the filter changes'
+        /^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured;/m,
+        'should execute all six network tests, including when the filter changes'
       )
       return code ?? 1
     } finally {
