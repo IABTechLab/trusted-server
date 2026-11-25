@@ -16,7 +16,7 @@ use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -26,8 +26,6 @@ use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
-use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
-use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -72,7 +70,7 @@ use crate::platform::{
 ///
 /// It matches the KV store `edgezero.toml` declares. Its label must never be
 /// `default`, which holds the app config and request-signing metadata.
-pub const SPIN_KV_STORE_ID: &str = "trusted_server_kv";
+pub const SPIN_KV_STORE_ID: &str = "trusted_server_runtime_kv";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -145,6 +143,9 @@ fn build_state_with_services(
     settings
         .publisher
         .drop_origin_host_header_override_for_spin();
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Spin)?;
     settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -502,7 +503,7 @@ impl Hooks for TrustedServerApp {
 
     /// Declares only the generic runtime KV store.
     ///
-    /// `EdgeZero` opens the `trusted_server_kv` label on first use, so a
+    /// `EdgeZero` opens the `trusted_server_runtime_kv` label on first use, so a
     /// component without that label still serves every route. Config and
     /// secrets are not declared: startup and request-time config read the
     /// `default` label directly, and secrets come from component variables.
@@ -642,13 +643,19 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             async move {
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
-                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                    s.identity
+                        .unavailable_identify(&req)
+                        .unwrap_or_else(|e| http_error(&e)),
                 )
             }
         };
-        let batch_sync_handler = |ctx: RequestContext| async move {
-            let req = ctx.into_request()?;
-            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
+        let batch_state = Arc::clone(&state);
+        let batch_sync_handler = move |ctx: RequestContext| {
+            let state = Arc::clone(&batch_state);
+            async move {
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(state.identity.batch_sync(req).await)
+            }
         };
 
         // /auction
@@ -679,8 +686,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
@@ -800,6 +806,16 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx)?;
             let mut req = ctx.into_request()?;
+            if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+                // Reserve this path without an identity graph; never forward
+                // consent snapshots or acknowledge an unpersisted revocation.
+                return Ok(
+                    match IdentityApp::prepare_consent_update(&services, req).await {
+                        Ok(req) => state.identity.consent_update(&req),
+                        Err(response) => *response,
+                    },
+                );
+            }
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -911,6 +927,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // The core identity app registers `GET` on the admin EC and EIDs
         // lookups; without a record store, admin EC lookup answers 501.
         builder = state.identity.mount(builder);
+        let ec_state = Arc::clone(&state);
+        builder = state.identity.mount_ec_route(builder, move |context| {
+            ec_state.services_for_request(context)
+        });
         builder = builder
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
@@ -959,7 +979,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 method.clone(),
                 identify_handler.clone(),
             );
-            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
+            builder = builder.route(
+                "/_ts/api/v1/batch-sync",
+                method.clone(),
+                batch_sync_handler.clone(),
+            );
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
@@ -1041,6 +1065,28 @@ mod tests {
         let (mut parts, body) = request.into_parts();
         normalize_spin_request(&mut parts);
         *req = Request::from_parts(parts, body);
+    }
+
+    #[test]
+    fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
+        for storage in [
+            serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
+        ] {
+            let mut settings = Settings::default();
+            settings.ec.storage =
+                Some(serde_json::from_value(storage).expect("should parse pure provider settings"));
+            let error = build_state_with_settings(settings)
+                .err()
+                .expect("should reject unsupported EC provider before route work");
+            assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
+        }
+        let mut settings = Settings::default();
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
+        assert!(
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
     }
 
     fn multi_provider_settings() -> Settings {

@@ -123,6 +123,10 @@ async fn origin(State(state): State<OriginState>, request: Request) -> Response<
             leaked_forwarding,
         });
     match path.as_str() {
+        "/bid" => Response::builder()
+            .status(204)
+            .body(Body::empty())
+            .expect("should answer captured bidder request without a bid"),
         "/drain" => {
             state.drain_release.notified().await;
             Response::builder()

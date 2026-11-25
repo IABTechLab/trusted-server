@@ -7,18 +7,6 @@
 //! next page load. Browser ingest never runs here: it belongs to the
 //! navigation's own write.
 
-use std::net::IpAddr;
-use std::sync::Arc;
-
-use edgezero_core::http::{Request, header};
-use edgezero_core::outbound::HttpClient;
-
-use super::EcContext;
-use super::app::IdentityApp;
-use super::coordinator::transport::OutboundLookupTransport;
-use super::coordinator::{IdentityCoordinator as _, LookupContext, ProviderCoordinator};
-use super::provider::{ClientSignals, RequestCookies};
-
 use super::coordinator::results::LookupResults;
 use super::eid_types::UnixSeconds;
 use super::kv::KvIdentityGraph;
@@ -26,143 +14,6 @@ use super::page_load::{AfterResponseWrite, RowChange};
 use super::registry::PartnerRegistry;
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
-
-/// Owned request signals for identity lookups dispatched after response delivery.
-///
-/// Adapters must retain their delivery gate and supply the finalized navigation's
-/// single-use [`AfterResponseWrite`] permit to [`Self::run`].
-pub struct AfterResponseLookups {
-    /// Coordinator built once for the after-response phase.
-    pub coordinator: Arc<ProviderCoordinator>,
-    /// EC captured before routing consumed the request.
-    pub ec_id: String,
-    /// Trusted raw client address, preserving IPv6 separators.
-    pub client_ip: Option<IpAddr>,
-    /// Request user agent.
-    pub user_agent: Option<String>,
-    /// All request Cookie fields joined with semicolons.
-    pub cookie_header: String,
-}
-
-impl AfterResponseLookups {
-    /// Captures provider inputs before the publisher consumes the request.
-    ///
-    /// The caller applies its browser, navigation and available-store gates.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let work = AfterResponseLookups::capture(coordinator, ec_id, client_ip, &request);
-    /// ```
-    #[must_use]
-    pub fn capture(
-        coordinator: Arc<ProviderCoordinator>,
-        ec_id: String,
-        client_ip: Option<IpAddr>,
-        request: &Request,
-    ) -> Self {
-        Self {
-            coordinator,
-            ec_id,
-            client_ip,
-            user_agent: request
-                .headers()
-                .get(header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned),
-            cookie_header: request
-                .headers()
-                .get_all(header::COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>()
-                .join("; "),
-        }
-    }
-
-    /// Runs eligible lookups and their guarded follow-up write after delivery.
-    ///
-    /// The permit must come from successful page finalization. Reads the live
-    /// row before disclosure and again before the generation-guarded write.
-    /// Outbound requests start here, inside the adapter's post-response scope.
-    ///
-    /// # Performance
-    ///
-    /// Skips storage reads when nothing is due; otherwise loads before lookup
-    /// and before the conditional write. Adds no page-response latency.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// work.run(&ec_context, permit, &identity, &client).await;
-    /// ```
-    pub async fn run(
-        self,
-        ec_context: &EcContext,
-        permit: AfterResponseWrite,
-        identity: &IdentityApp,
-        client: &HttpClient,
-    ) {
-        let lookups = self;
-        if ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
-            log::debug!("After-response lookups skipped: EC changed during the request");
-            return;
-        }
-        // The request snapshot holds the row as finalize left it. A source held
-        // there is still held in the live row unless consent was withdrawn, which
-        // blocks the lookup anyway, so the live read is skipped when nothing is due.
-        // Only pull sync can be skipped: configured providers always run, so their
-        // cookie opt-outs and regional exclusions are processed.
-        let now = UnixSeconds::new(current_timestamp());
-        let request_entry = ec_context.kv_snapshot().entry_for(&lookups.ec_id);
-        if !lookups.coordinator.any_due(request_entry, now) {
-            log::debug!("After-response lookups skipped: nothing due");
-            return;
-        }
-        let Some(graph) = identity.identity_graph() else {
-            return;
-        };
-        let snapshot = graph.load_snapshot(&lookups.ec_id).await;
-        if !after_response_lookups_allowed(&snapshot, &lookups.ec_id, ec_context.ec_generated()) {
-            log::debug!("After-response lookups skipped: new EC or no live row");
-            return;
-        }
-        let transport = OutboundLookupTransport::new(client);
-        let pending = lookups
-            .coordinator
-            .dispatch(
-                &transport,
-                &LookupContext {
-                    ec_id: &lookups.ec_id,
-                    snapshot: &snapshot,
-                    minted_entry: None,
-                    consent: ec_context.consent(),
-                    client: ClientSignals {
-                        ip: lookups.client_ip,
-                        user_agent: lookups.user_agent.as_deref(),
-                    },
-                    publisher_domain: &identity.settings().publisher.domain,
-                    cookies: RequestCookies::new(&lookups.cookie_header),
-                    rate_limiter: identity.rate_limiter(),
-                    now,
-                },
-            )
-            .await;
-        if pending.is_empty() {
-            return;
-        }
-        let results = lookups.coordinator.collect(&transport, pending).await;
-        let outcome = commit_after_response_lookups(
-            &graph,
-            permit,
-            identity.partners(),
-            &lookups.ec_id,
-            &results,
-        )
-        .await;
-        log::info!("After-response lookups: write outcome={outcome}");
-    }
-}
 
 /// What the follow-up write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
@@ -293,37 +144,6 @@ mod tests {
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvUid};
     use crate::ec::page_load::{Generation, KvWriteError};
     use crate::settings::EcPartner;
-
-    #[test]
-    fn captured_work_preserves_raw_signals_and_all_cookie_headers() {
-        let request = edgezero_core::http::request_builder()
-            .uri("https://publisher.example.com/")
-            .header("user-agent", "example-browser")
-            .header("cookie", "first=one")
-            .header("cookie", "second=two")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let coordinator = std::sync::Arc::new(
-            super::super::coordinator::ProviderCoordinator::new(
-                vec![],
-                std::sync::Arc::new(registry()),
-                std::time::Duration::from_secs(1),
-            )
-            .expect("should build coordinator"),
-        );
-        let ip = "2001:db8::1234".parse().expect("should parse raw IPv6");
-        let work = AfterResponseLookups::capture(coordinator, EC_ID.to_owned(), Some(ip), &request);
-        assert_eq!(work.client_ip, Some(ip), "should preserve IPv6 separators");
-        assert_eq!(
-            work.cookie_header, "first=one; second=two",
-            "should join split cookies"
-        );
-        assert_eq!(
-            work.user_agent.as_deref(),
-            Some("example-browser"),
-            "should retain user agent"
-        );
-    }
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
 

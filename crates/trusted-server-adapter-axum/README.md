@@ -2,16 +2,17 @@
 
 Native adapter for Trusted Server. It runs the shared application through Axum
 on the host, without an edge simulator, for local development and as the
-production entry point. Edge Cookie record storage on Axum is not available
-yet.
+production entry point. The shared core identity app uses an EdgeZero-prepared
+record service for Edge Cookies, partner APIs and body EID persistence.
 
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
-unavailable (`KvError::Unavailable`) until #1587 then #1574 connect identity
-storage through EdgeZero's declared store. There is no adapter-local KV store;
-config/secret snapshots are not live identity storage. Its `/health`, `/ready`,
-and startup-failure responses follow the shared
+unavailable (`KvError::Unavailable`), and there is no adapter-local KV store;
+live identity records use the separate prepared record capability. The logical
+record store is declared unconditionally, so its local provider requires a
+writable `EDGEZERO__ADAPTER__DATA_DIR`. Its `/health`, `/ready`, and
+startup-failure responses follow the shared
 [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
 
 Before listening, the native initializer reads the declared prepared stores,
@@ -28,7 +29,7 @@ See [Axum production startup](../../docs/guide/native-rc-demo.md) for the
 AWS providers and their checks.
 
 The binary runs through EdgeZero's Axum production startup,
-`run_production_app_with_initializer`, which installs the logger and binds the
+`run_production_app_with_options_and_initializer`, which installs the logger and binds the
 listener; the adapter installs no logger of its own. The log level comes from
 `EDGEZERO__LOGGING__LEVEL` (default `info`) and the listener address from
 `EDGEZERO__ADAPTER__HOST` and `EDGEZERO__ADAPTER__PORT` (default

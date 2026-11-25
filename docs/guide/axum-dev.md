@@ -7,8 +7,9 @@ is the production entry point: it loads config and secrets from prepared stores
 selected store cannot be prepared, answers `/ready` and every route with `503`
 when a required config value or secret is missing or invalid, and drains
 in-flight requests on SIGTERM. See
-[Axum production startup](./native-rc-demo). Edge Cookie record storage on
-Axum is not available yet.
+[Axum production startup](./native-rc-demo). Edge Cookie records and partner
+APIs run through the shared identity app over EdgeZero's prepared record
+service; see [native EC persistence](./native-ec-persistence).
 
 ## Support status
 
@@ -37,6 +38,12 @@ config push --adapter axum --local`. It places the exported envelope in the
 local provider from `EDGEZERO__ADAPTER__CONFIG_DIR`, validates its bounded
 envelope and active secret references, and installs immutable snapshots and
 the actual router before listening.
+
+The smoke also supplies a writable `EDGEZERO__ADAPTER__DATA_DIR`. The record
+store is always declared and EdgeZero prepares its local provider before TS
+loads application config, even when `ec.storage` is absent. Every local-provider
+start needs that directory; remote-only bindings do not. See
+[Getting started](./getting-started), Option B, for the complete shell setup.
 
 Local secrets use these variables:
 
@@ -118,20 +125,21 @@ sessions.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses, because
-the adapter has no EC record store or key-management stores. It sanitizes
-forwarded client-IP headers but does not resolve `[trusted_client_ip]`; see
-the [adapter matrix](./api-reference#adapter-and-startup-support).
+Axum implements the read-only `/_ts/admin/eids` diagnostic and EC record lookup
+through the configured shared record service. Record lookup returns 501 without
+identity storage; key rotation and other administrative mutations remain
+unsupported. It sanitizes forwarded client-IP headers but does not resolve
+`[trusted_client_ip]`; see the
+[adapter matrix](./api-reference#adapter-and-startup-support).
 
 The generic runtime KV store is unsupported: reads and writes return
 `KvError::Unavailable`, a warning is logged once per process, and publisher
 pages continue to be served. `trusted_server_kv` remains declared in the
-application manifest because identity storage needs it. Axum support will come
-through EdgeZero's declared store in #1587 (shared record backend), then #1574
-(Axum identity); there is no adapter-local file store. Config and required
-secrets are loaded once at startup from prepared stores, independently of KV.
-See the [store inventory](./edgezero#store-inventory).
+application manifest because identity storage needs it; identity records reach
+it through EdgeZero's prepared record service, not generic KV, and there is no
+adapter-local file store. Config and required secrets are loaded once at
+startup from prepared stores, independently of KV. See the
+[store inventory](./edgezero#store-inventory).
 
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.

@@ -1,4 +1,8 @@
-//! Controlled identity activation: production Axum has no record store until A2.
+//! Real-process SIGTERM drain tests for the shared after-response runner.
+//!
+//! A controlled fixture store and scripted pull-sync partner make the
+//! follow-up timing observable; production work registers through the same
+//! [`IdentityApp::schedule_after_response`].
 
 #![cfg(unix)]
 
@@ -25,9 +29,12 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use tempfile::TempDir;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::after_response::AfterResponseLookups;
-use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::app::{
+    AfterResponseLookups, IdentityApp, IdentityPlatform, joined_cookie_header,
+};
+use trusted_server_core::ec::current_timestamp;
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use trusted_server_core::ec::kv_backend::{
     EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
@@ -42,10 +49,46 @@ use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
 
-use super::schedule_lookups;
-
 const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
 const LOOKUP: &str = "https://sync.example.com/pull";
+
+/// Captures the request signals the shared runner hands to providers.
+fn lookups_for(
+    coordinator: Arc<trusted_server_core::ec::coordinator::ProviderCoordinator>,
+    request: &edgezero_core::http::Request,
+) -> AfterResponseLookups {
+    AfterResponseLookups {
+        coordinator,
+        ec_id: EC_ID.to_owned(),
+        client_ip: None,
+        user_agent: request
+            .headers()
+            .get(edgezero_core::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        referer: request
+            .headers()
+            .get(edgezero_core::http::header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        accept_language: request
+            .headers()
+            .get(edgezero_core::http::header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        cookie_header: joined_cookie_header(request),
+    }
+}
+
+/// Libtest name of [`runtime_child`], derived from this module's path so the
+/// re-executed child still finds it if the module moves.
+fn runtime_child_test_name() -> String {
+    let path = module_path!();
+    let module = path
+        .split_once("::")
+        .map_or(path, |(_crate_name, module)| module);
+    format!("{module}::runtime_child")
+}
 
 struct FixtureStore {
     entries: Mutex<BTreeMap<String, EcKvLookup>>,
@@ -285,13 +328,15 @@ impl Hooks for FixtureApp {
                     &mut ec,
                     Some(&graph),
                     identity.partners(),
-                    None,
-                    &SharedIdRequest::default(),
+                    &FinalizeRequest {
+                        eids_cookie: None,
+                        sharedid: &SharedIdRequest::default(),
+                        now: Some(UnixSeconds::new(current_timestamp())),
+                    },
                     &mut response,
                 )
                 .await;
-                let lookups =
-                    AfterResponseLookups::capture(coordinator, EC_ID.to_owned(), None, &req);
+                let lookups = lookups_for(coordinator, &req);
                 let clock = TestClock::new();
                 let scripted = ScriptedHttpClient::new(&clock).with_request_observer({
                     let root = root.clone();
@@ -309,13 +354,12 @@ impl Hooks for FixtureApp {
                 store.armed.store(true, Ordering::SeqCst);
                 if enabled {
                     assert!(
-                        schedule_lookups(
-                            handle.as_ref(),
-                            Some(lookups),
+                        identity.schedule_after_response(
                             ec,
-                            identity,
+                            Some(lookups),
+                            handle,
                             scripted.http_client()
-                        )?,
+                        ),
                         "should register eligible work"
                     );
                 }
@@ -422,7 +466,7 @@ impl Running {
         let child = Command::new(std::env::current_exe().expect("should locate test executable"))
             .args([
                 "--exact",
-                "after_response::tests::runtime_child",
+                runtime_child_test_name().as_str(),
                 "--ignored",
                 "--nocapture",
             ])
@@ -703,14 +747,12 @@ fn no_work_needs_no_scheduler_and_registers_nothing() {
     )
     .expect("should build fixture identity");
     assert!(
-        !schedule_lookups(
-            None,
-            None,
+        !identity.schedule_after_response(
             EcContext::default(),
-            identity,
+            None,
+            None,
             HttpClient::with_client(ScriptedHttpClient::forbidding())
-        )
-        .expect("should skip absent work"),
+        ),
         "should not register a no-op task"
     );
 }
@@ -810,13 +852,16 @@ async fn registration_case(permit: bool) -> RegistrationCase {
             &mut context,
             Some(&graph),
             identity.partners(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut Response::new(Body::empty()),
         )
         .await;
     }
-    let work = AfterResponseLookups::capture(coordinator, EC_ID.to_owned(), None, &request);
+    let work = lookups_for(coordinator, &request);
     store.armed.store(true, Ordering::SeqCst);
     RegistrationCase {
         root,
@@ -848,14 +893,12 @@ async fn work_without_a_permit_registers_nothing() {
         Arc::clone(&calls),
     ));
     assert!(
-        !schedule_lookups(
-            Some(&handle),
-            Some(fixture.work),
+        !fixture.identity.schedule_after_response(
             fixture.context,
-            fixture.identity,
+            Some(fixture.work),
+            Some(handle),
             fixture.client.http_client()
-        )
-        .expect("should skip work without a permit"),
+        ),
         "should not register unauthorized work"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "should not call scheduler");
@@ -863,36 +906,49 @@ async fn work_without_a_permit_registers_nothing() {
 }
 
 #[tokio::test]
-async fn eligible_work_without_a_scheduler_reports_an_error_without_running() {
+async fn eligible_work_without_a_scheduler_is_dropped_without_running() {
     let fixture = registration_case(true).await;
     assert!(
-        schedule_lookups(
-            None,
-            Some(fixture.work),
+        fixture.context.has_after_response_permit(),
+        "should hold a follow-up permit, so only the scheduler is missing"
+    );
+    assert!(
+        !fixture.identity.schedule_after_response(
             fixture.context,
-            fixture.identity,
+            Some(fixture.work),
+            None,
             fixture.client.http_client()
-        )
-        .is_err(),
-        "should report unavailable scheduler for eligible work"
+        ),
+        "should not register eligible work without a scheduler"
     );
     fixture.client.assert_no_requests();
+    assert!(
+        !fixture.root.path().join("probe").exists(),
+        "should not poll work that was never registered"
+    );
 }
 
 #[tokio::test]
 async fn cloning_a_context_does_not_duplicate_a_follow_up_permit() {
     let fixture = registration_case(true).await;
     let cloned = fixture.context.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = edgezero_core::after_response::AfterResponseHandle::new(RejectingScheduler(
+        Arc::clone(&calls),
+    ));
     assert!(
-        !schedule_lookups(
-            None,
-            Some(fixture.work),
+        !fixture.identity.schedule_after_response(
             cloned,
-            Arc::clone(&fixture.identity),
+            Some(fixture.work),
+            Some(handle),
             fixture.client.http_client()
-        )
-        .expect("should skip cloned context"),
+        ),
         "should never authorize the cloned context"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "should skip the cloned context before reaching the scheduler"
     );
     let mut original = fixture.context;
     assert!(
@@ -914,15 +970,13 @@ async fn rejected_registration_drops_work_without_executing_it() {
         Arc::clone(&calls),
     ));
     assert!(
-        schedule_lookups(
-            Some(&handle),
-            Some(fixture.work),
+        !fixture.identity.schedule_after_response(
             fixture.context,
-            fixture.identity,
+            Some(fixture.work),
+            Some(handle),
             fixture.client.http_client()
-        )
-        .is_err(),
-        "should propagate rejected registration"
+        ),
+        "should report rejected registration as not registered"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),

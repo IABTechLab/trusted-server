@@ -8,7 +8,8 @@
 //!
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
 //!    when none exists and consent allows it. This is called only for
-//!    publisher navigations — never in integration proxies or read-only
+//!    publisher navigations or admitted EC POSTs — never in integration
+//!    proxies or read-only
 //!    endpoints like `/_ts/api/v1/identify`. The new row is written by the
 //!    navigation's single page-load write in finalize ([`page_load`]).
 //!
@@ -43,6 +44,7 @@ pub mod after_response;
 pub mod app;
 pub mod batch_sync;
 pub mod consent;
+pub mod consent_update;
 pub mod cookies;
 pub mod coordinator;
 pub mod device;
@@ -51,6 +53,7 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+mod ja4_family;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
@@ -60,8 +63,10 @@ pub mod partner;
 pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
+pub mod record_backend;
 pub mod registry;
 pub mod sharedid;
+pub mod storage;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -108,7 +113,8 @@ use self::page_load::{AfterResponseWrite, NavigationPermit};
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
 /// admitted SPA navigation. Only a publisher navigation holding a
 /// [`NavigationPermit`] persists the cookies; `Auction` and `PageBids` read them
-/// for bidders only. Challenged or blocked requests remain unclassified.
+/// for bidders only. `Auction` also saves the EIDs its request body carried to
+/// a live row, filling missing partner UIDs. Challenged or blocked requests remain unclassified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -315,7 +321,8 @@ pub struct EcContext {
     client_ip: Option<String>,
     /// Geo information captured pre-routing for downstream KV writes.
     geo_info: Option<GeoInfo>,
-    /// Device signals derived from TLS/H2/UA in the adapter layer.
+    /// Device signals the shared identity app derives from the User-Agent,
+    /// `EdgeZero`'s ingress JA4 and the HTTP/2 fingerprint.
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
@@ -325,9 +332,9 @@ pub struct EcContext {
     recovery_eligible: bool,
     /// EIDs the route resolved from the current request: the `/auction` JSON
     /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
+    /// request-local identity consumers. Navigation finalization may ingest
+    /// these EIDs; explicit auction body persistence belongs to the shared
+    /// endpoint, independently of cookie fallback.
     client_eids: Option<Vec<Eid>>,
     /// Whether the request carried the retired pull-sync marker cookie.
     pull_marker_present: bool,
@@ -347,6 +354,9 @@ pub struct EcContext {
     /// Sources of identity providers whose first-party cookies on this
     /// request record an opt-out; their IDs never leave the server for it.
     cookie_opted_out_sources: Vec<String>,
+    /// The `SharedID` this response leaves the reader with, when SID-2 and
+    /// SID-6 allow it, as decided by the `SharedID` write-back.
+    kept_sharedid: Option<String>,
 }
 
 impl EcContext {
@@ -435,6 +445,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         })
     }
 
@@ -445,7 +456,9 @@ impl EcContext {
     ///
     /// Never writes KV. When `kv` is available, the new row is held as the
     /// pending entry and created by the navigation's single page-load write
-    /// in finalize; the EC is issued only if that write succeeds.
+    /// in finalize, which retries an ID collision with a fresh ID (see
+    /// [`KvIdentityGraph::commit_page_load_create`]); the EC is issued only if
+    /// that write succeeds.
     ///
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
@@ -493,7 +506,7 @@ impl EcContext {
 
         if kv.is_some() {
             // The row is created by the navigation's single page-load write in
-            // finalize; a collision there leaves this EC unissued.
+            // finalize, which retries an ID collision with a fresh ID.
             self.pending_entry = Some(Box::new(entry));
             self.kv_snapshot = EcKvSnapshot::Missing {
                 ec_id: ec_id.clone(),
@@ -544,11 +557,14 @@ impl EcContext {
         &mut self.consent
     }
 
-    /// Sets the device signals derived from the adapter layer.
+    /// Sets the request's device signals.
     ///
     /// Must be called before [`generate_if_needed`] so that new entries
-    /// include the [`KvDevice`] record. The adapter derives these from
-    /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
+    /// include the [`KvDevice`] record. [`IdentityApp::read_request`] derives
+    /// them from the User-Agent, the JA4 `EdgeZero`'s request ingress
+    /// captured (`ctx.ja4()`) and the platform's HTTP/2 fingerprint.
+    ///
+    /// [`IdentityApp::read_request`]: app::IdentityApp::read_request
     ///
     /// [`KvDevice`]: super::kv_types::KvDevice
     /// [`generate_if_needed`]: Self::generate_if_needed
@@ -608,7 +624,8 @@ impl EcContext {
     }
 
     /// Records the current request's own EIDs (e.g. an `/auction` body) for
-    /// use by response finalization's KV ingestion.
+    /// request-local identity use. The auction endpoint persists its explicit
+    /// body separately; finalization never repeats that write.
     pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
         self.client_eids = Some(eids);
     }
@@ -655,6 +672,17 @@ impl EcContext {
         self.mirror_cookie.as_deref()
     }
 
+    /// The `SharedID` this response leaves the reader with, when the
+    /// `SharedID` write-back ran and SID-2 and SID-6 allow it.
+    #[must_use]
+    pub(crate) fn kept_sharedid(&self) -> Option<&str> {
+        self.kept_sharedid.as_deref()
+    }
+
+    pub(crate) fn set_kept_sharedid(&mut self, sharedid: Option<String>) {
+        self.kept_sharedid = sharedid;
+    }
+
     /// Sets the mirror cookie the request carried, for tests.
     #[cfg(test)]
     pub(crate) fn set_mirror_cookie_for_test(&mut self, value: Option<&str>) {
@@ -673,7 +701,11 @@ impl EcContext {
     }
 
     /// Whether this request still holds its page-load write permit.
-    pub(crate) fn has_navigation_permit(&self) -> bool {
+    ///
+    /// Adapters use this shared decision to dispatch page providers and permit
+    /// orphan recovery before response finalization consumes the permit.
+    #[must_use]
+    pub fn has_navigation_permit(&self) -> bool {
         self.navigation_permit.0.is_some()
     }
 
@@ -685,6 +717,14 @@ impl EcContext {
     /// Stores the after-response permit confirmed with the navigation permit.
     pub(crate) fn set_after_response_permit(&mut self, permit: AfterResponseWrite) {
         self.after_response_permit = AfterResponsePermitSlot(Some(permit));
+    }
+
+    /// Whether finalize left a follow-up write permit for after-response work.
+    ///
+    /// A check only: the permit stays in place for the runner that takes it.
+    #[must_use]
+    pub fn has_after_response_permit(&self) -> bool {
+        self.after_response_permit.0.is_some()
     }
 
     /// Takes the after-response permit; returns `None` when finalize did not
@@ -707,6 +747,13 @@ impl EcContext {
     /// Provider lookup results collected for this navigation.
     pub(crate) fn lookup_results(&self) -> &LookupResults {
         &self.lookup_results
+    }
+
+    /// Whether provider lookup results were collected, for adapter tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn has_lookup_results_for_test(&self) -> bool {
+        !self.lookup_results.is_empty()
     }
 
     /// Takes the row built by [`Self::generate_if_needed`].
@@ -784,6 +831,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -815,6 +863,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -849,6 +898,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 }
@@ -868,7 +918,8 @@ pub fn current_timestamp() -> u64 {
 ///
 /// Use this instead of [`current_timestamp`] when a fallback could authorize
 /// a time-bounded correctness decision.
-pub(crate) fn checked_current_timestamp() -> Option<u64> {
+#[must_use]
+pub fn checked_current_timestamp() -> Option<u64> {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1069,8 +1120,13 @@ mod tests {
             &mut ec,
             None,
             &registry::PartnerRegistry::empty(),
-            None,
-            &crate::ec::sharedid::SharedIdRequest::default(),
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;

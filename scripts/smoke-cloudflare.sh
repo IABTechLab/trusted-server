@@ -54,7 +54,7 @@ CLOUDFLARE_BUILD_PATH=${CLOUDFLARE_BUILD_PATH:-$CLOUDFLARE_ROOT/build}
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 # The positive case uses the final listener in the case sequence.
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT" "cloudflare"
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"
@@ -69,7 +69,9 @@ sed \
 
 (
     cd "$WORKSPACE"
-    EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=TRUSTED_SERVER_KV \
+    # Smoke-only: the isolated local namespace stages the envelope. Deployments
+    # push config to a namespace other than the runtime KV binding.
+    EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=TRUSTED_SERVER_RUNTIME_KV \
         "$SMOKE_TS_BIN" config push \
         --adapter cloudflare \
         --local \
@@ -81,7 +83,7 @@ sed \
 ENVELOPE=$(
     cd "$CLOUDFLARE_WORK"
     wrangler kv key get trusted_server_config \
-        --binding TRUSTED_SERVER_KV \
+        --binding TRUSTED_SERVER_RUNTIME_KV \
         --local \
         --config wrangler.toml
 )

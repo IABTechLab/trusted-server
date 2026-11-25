@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "geo-cloudfront")]
+use base64::Engine as _;
 use edgezero_core::blob_envelope::BlobEnvelope;
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
@@ -22,6 +24,16 @@ use trusted_server_core::config_payload::{
     CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID, VerifiedConfigBlob,
 };
 use trusted_server_core::test_support::nextjs_auction;
+
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+#[path = "support/celld.rs"]
+mod celld_fixture;
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+use base64::engine::general_purpose::STANDARD;
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+use trusted_server_core::ec::kv_backend::{
+    EcKvStore as _, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+};
 
 const ADMIN_PASSWORD: &str = "native-admin-password-32-bytes-example";
 const PROXY_SECRET: &str = "native-proxy-secret-32-bytes-example";
@@ -37,6 +49,161 @@ const SECRETS: [&str; 5] = [
     FORWARDER_SECRET,
     SHORT_EC_PASSPHRASE,
 ];
+
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+fn ec_response_cookie(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.strip_prefix("ts-ec=").map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .expect("should contain cookie value")
+                    .to_owned()
+            })
+        })
+}
+
+#[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+#[test]
+#[ignore = "requires official CELLD_EC_TEST_BINARY, matching EDGEZERO_CELLD_STORE_SERVICE and celld-ec,geo-cloudfront"]
+fn real_celld_envelope_drives_native_http_issuance_withdrawal_restart_and_outage() {
+    let mut celld = celld_fixture::CelldFixture::new();
+    let origin = origin::Origin::start("celld-ec-http");
+    let mut prepared = Prepared::new(&origin.base_url);
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.record_binding(
+        serde_json::to_value(celld.settings()).expect("should serialize native binding"),
+    );
+    prepared.data["ec"]["partners"] = json!([{"name":"Fixture partner","source_domain":"partner.example.com","bidstream_enabled":true,"pull_sync_enabled":false}]);
+    prepared.publish();
+    let profile = prepared.workspace.path().join("native-geo.toml");
+    fs::write(&profile,"version = 1\n[geo]\nprovider = \"cloudfront\"\nalb_peer_cidrs = [\"127.0.0.1/32\"]\norigin_credential_header_name = \"x-origin-synthetic-fixture\"\n").expect("should write synthetic local protected-ingress profile");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("should drive typed record inspection");
+    let store = runtime.block_on(celld.store());
+    let client = client();
+    let document = |server: &Running, country: &str, cookie: Option<&str>, withdrawal: bool| {
+        let mut request = client
+            .get(format!("{}/article", server.base_url()))
+            .header("host", "publisher.example.com")
+            .header(
+                "forwarded",
+                "for=198.51.100.24;proto=https;host=publisher.example.com",
+            )
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
+            )
+            .header("cloudfront-viewer-country", country)
+            .header("cloudfront-viewer-country-region", "TN")
+            .header("x-origin-synthetic-fixture", "synthetic-fixture-only");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        if withdrawal {
+            request = request.header("sec-gpc", "1");
+        }
+        request
+            .send()
+            .expect("should complete actual native publisher HTTP request")
+    };
+    let mut app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    let issued = document(&app, "AU", None, false);
+    assert_eq!(issued.status().as_u16(), 200);
+    assert_eq!(
+        issued
+            .headers()
+            .get("x-geo-country")
+            .expect("should admit checked synthetic geography"),
+        "AU"
+    );
+    let ec = ec_response_cookie(&issued)
+        .expect("should issue only with confirmed real record persistence");
+    let created = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read actual persisted identity")
+        .expect("should retain issued identity");
+    let eids = STANDARD.encode(
+        json!([{"source":"partner.example.com","uids":[{"id":"fixture-uid","atype":1}]}])
+            .to_string(),
+    );
+    let cookie = format!("ts-ec={ec}; ts-eids={eids}");
+    let updated = document(&app, "AU", Some(&cookie), false);
+    assert_eq!(updated.status().as_u16(), 200);
+    let updated = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read real native EID update")
+        .expect("should retain updated identity");
+    let row: Value =
+        serde_json::from_slice(&updated.body).expect("should decode persisted graph schema");
+    assert_eq!(row["ids"]["partner.example.com"]["uid"], "fixture-uid");
+    assert!(updated.generation > created.generation);
+    drop(app);
+    app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", Some(&cookie), false)).is_none(),
+        "should reuse identity across application recreation"
+    );
+    let withdrawn = document(&app, "US", Some(&cookie), true);
+    assert_eq!(ec_response_cookie(&withdrawn).as_deref(), Some(""));
+    let tombstone = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read acknowledged native withdrawal")
+        .expect("should retain tombstone");
+    let row: Value =
+        serde_json::from_slice(&tombstone.body).expect("should decode actual tombstone");
+    assert_eq!(row["consent"]["ok"], false);
+    celld.stop();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", None, false)).is_none(),
+        "should not issue unsupported cookie during real storage outage"
+    );
+    drop(app);
+    celld.restart();
+    prepared.record_binding(
+        serde_json::to_value(celld.settings())
+            .expect("should update native endpoint after restart"),
+    );
+    prepared.publish();
+    app = prepared.spawn_with_geo(true, Some(&profile));
+    app.ready();
+    assert!(
+        ec_response_cookie(&document(&app, "AU", Some(&cookie), false)).is_none(),
+        "should not revive withdrawal after server and application restart"
+    );
+    let store = runtime.block_on(celld.store());
+    let restored = runtime
+        .block_on(store.lookup(&ec))
+        .expect("should read recovered tombstone")
+        .expect("should restore withdrawal");
+    assert_eq!(restored.body, tombstone.body);
+    assert_eq!(
+        runtime
+            .block_on(store.insert(
+                &ec,
+                EcKvWrite {
+                    body: std::str::from_utf8(&updated.body).expect("should decode old entry"),
+                    metadata: "{}",
+                    ttl: Duration::from_secs(60),
+                    mode: EcKvWriteMode::IfGenerationMatch(updated.generation)
+                }
+            ))
+            .expect("should reject stale writer"),
+        EcKvWriteOutcome::PreconditionFailed
+    );
+}
 
 struct Prepared {
     workspace: TempDir,
@@ -117,7 +284,35 @@ impl Prepared {
         .expect("should publish local prepared config");
     }
 
+    #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
+    fn record_binding(&self, mut binding: Value) {
+        binding["provider"] = json!("celld-records");
+        fs::write(
+            self.workspace.path().join("native-bindings.toml"),
+            toml::to_string(&json!({"version":1,"kv":{"trusted_server_kv":binding}}))
+                .expect("should encode native connector settings"),
+        )
+        .expect("should write native connector settings");
+    }
+
     fn spawn(&self, trusted_proxy: bool) -> Running {
+        self.spawn_with_geo(trusted_proxy, None)
+    }
+
+    fn spawn_with_geo(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+    ) -> Running {
+        self.spawn_with_geo_options(trusted_proxy, geo_profile, false)
+    }
+
+    fn spawn_with_geo_options(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+        cloudfront: bool,
+    ) -> Running {
         let port = reserve_port()
             .local_addr()
             .expect("should read reserved port")
@@ -173,10 +368,26 @@ impl Prepared {
                 value,
             );
         }
+        let bindings = root.join("native-bindings.toml");
+        if bindings.is_file() {
+            command.env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
+        }
         if trusted_proxy {
             command
                 .env("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
                 .env("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "forwarded");
+        }
+        if let Some(profile) = geo_profile {
+            command.env("TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE", profile);
+        }
+        if cloudfront {
+            command
+                .env("EDGEZERO__ADAPTER__GEO__PROVIDER", "cloudfront")
+                .env("EDGEZERO__ADAPTER__GEO__ALB_PEER_CIDRS", "127.0.0.1/32")
+                .env(
+                    "EDGEZERO__ADAPTER__GEO__ORIGIN_CREDENTIAL_HEADER_NAME",
+                    "x-origin-synthetic-fixture",
+                );
         }
         Running {
             child: command
@@ -1092,5 +1303,159 @@ fn real_nextjs_action_and_api_after_truncated_post() {
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("should parse real API response"),
         json!({"native": "real-nextjs-api"})
+    );
+}
+
+#[cfg(feature = "geo-cloudfront")]
+#[test]
+fn prepared_provider_opt_out_filters_cookie_and_body_on_repeated_visits() {
+    let origin = origin::Origin::start("provider-opt-out");
+    let mut prepared = Prepared::new(&origin.base_url);
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.data["ec"]["partners"] =
+        json!([{"name":"SharedID fixture","source_domain":"pubcid.org","bidstream_enabled":true}]);
+    prepared.data["ec"]["identity_providers"] = json!([{"id":"sharedid","kind":"sharedid"}]);
+    prepared.data["auction"] = json!({"enabled":true,"providers":{"fixture":{"protocol":"openrtb-2.6","profile":"standard","endpoint":format!("{}/bid", origin.base_url),"routing":"all_eligible"}}});
+    prepared.publish();
+    let mut running = prepared.spawn_with_geo_options(true, None, true);
+    running.ready();
+    let client = client();
+    let ingress = |request: reqwest::blocking::RequestBuilder| {
+        request
+            .header("host", "publisher.example.com")
+            .header(
+                "forwarded",
+                "for=198.51.100.24;proto=https;host=publisher.example.com",
+            )
+            .header("cloudfront-viewer-country", "AU")
+            .header("x-origin-synthetic-fixture", "synthetic-fixture-only")
+    };
+    let navigate = |cookies: &str| {
+        ingress(client.get(format!("{}/article", running.base_url())))
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", cookies)
+            .send()
+            .expect("should navigate through prepared production startup")
+    };
+    let issued = navigate("_pubcid=11111111-1111-4111-8111-111111111111");
+    assert_eq!(issued.status().as_u16(), 200, "should reach publisher");
+    let ec = issued
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.strip_prefix("ts-ec=").map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .expect("should contain EC")
+                    .to_owned()
+            })
+        })
+        .expect("should issue EC using prepared persistent records and protected country");
+    let auction = |cookie: &str, body_eids: Option<Value>| {
+        let before = origin
+            .received
+            .lock()
+            .expect("should lock captures")
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .count();
+        let mut body = json!({"adUnits":[{"code":"fixture-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]});
+        if let Some(eids) = body_eids {
+            body["eids"] = eids;
+        }
+        let response = ingress(client.post(format!("{}/auction", running.base_url())))
+            .header("referer", "https://publisher.example.com/article")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", cookie)
+            .json(&body)
+            .send()
+            .expect("should dispatch real auction");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return auction response"
+        );
+        let received = origin.received.lock().expect("should lock captures");
+        let bids: Vec<_> = received
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .collect();
+        assert_eq!(
+            bids.len(),
+            before + 1,
+            "should capture one actual bidder request"
+        );
+        let payload: Value = serde_json::from_slice(&bids.last().expect("should capture bid").body)
+            .expect("should decode bidder request");
+        payload["user"]["eids"].clone()
+    };
+    let cookie = format!("ts-ec={ec}");
+    assert!(
+        auction(&cookie, None)
+            .as_array()
+            .expect("should deliver provider EID")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"),
+        "should prove positive provider delivery"
+    );
+    let opted_out = format!("{cookie}; _pubcid_optout=1");
+    assert_eq!(
+        navigate(&opted_out).status().as_u16(),
+        200,
+        "should apply provider cookie opt-out"
+    );
+    let forged = json!([{ "source":"pubcid.org","uids":[{"id":"forged-client-copy","atype":1}] },{ "source":"other.example.com","uids":[{"id":"unrelated-client","atype":1}] }]);
+    for _ in 0..2 {
+        assert_eq!(
+            navigate(&opted_out).status().as_u16(),
+            200,
+            "should keep repeated visits working"
+        );
+        for from_cookie in [false, true] {
+            let cookies = if from_cookie {
+                format!(
+                    "{opted_out}; ts-eids={}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&forged).expect("should encode EIDs"))
+                )
+            } else {
+                opted_out.clone()
+            };
+            let delivered = auction(&cookies, (!from_cookie).then(|| forged.clone()));
+            let sources: Vec<_> = delivered
+                .as_array()
+                .expect("should retain unrelated EID")
+                .iter()
+                .filter_map(|eid| eid["source"].as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["other.example.com"],
+                "should suppress owned browser and client EIDs on every visit"
+            );
+        }
+    }
+    assert_eq!(
+        navigate(&format!(
+            "{cookie}; _pubcid=22222222-2222-4222-8222-222222222222"
+        ))
+        .status()
+        .as_u16(),
+        200,
+        "should opt back in through provider cookie"
+    );
+    let restored = auction(&cookie, None);
+    assert!(
+        restored
+            .as_array()
+            .expect("should restore provider delivery")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"
+                && eid["uids"][0]["id"] == "22222222-2222-4222-8222-222222222222"),
+        "should restore provider EID after opt-back-in"
     );
 }

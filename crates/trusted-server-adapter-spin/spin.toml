@@ -9,11 +9,11 @@ version = "0.1.0"
 # signing metadata such as `current-kid`, `active-kids`, and public JWK entries
 # therefore belongs directly in `default`.
 #
-# The generic runtime KV store is the `trusted_server_kv` label, which this
+# The generic runtime KV store is the `trusted_server_runtime_kv` label, which this
 # manifest does not grant: KV operations fail and every route is still served.
 # To enable it, add the label below and give it a backend in the runtime config:
-#   key_value_stores = ["default", "trusted_server_kv"]
-# Never map EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME to `default`.
+#   key_value_stores = ["default", "trusted_server_runtime_kv"]
+# Never map EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME to `default`.
 #
 # Secret stores read Spin component variables. The adapter encodes the store and
 # key into a collision-resistant variable name. Every generated name starts with

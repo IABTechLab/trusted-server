@@ -31,56 +31,7 @@ const IDENTITY_ENTRY_POINTS: &[&str] = &[
 
 /// Adapter uses that remain until the EC lifecycle and the identify and
 /// batch-sync routes move into the core identity app, as `(file, symbol)`.
-const PENDING_LIFECYCLE_MOVE: &[(&str, &str)] = &[
-    (
-        "trusted-server-adapter-axum/src/app.rs",
-        "answer_batch_sync_locally",
-    ),
-    (
-        "trusted-server-adapter-axum/src/app.rs",
-        "answer_identify_locally",
-    ),
-    (
-        "trusted-server-adapter-cloudflare/src/app.rs",
-        "answer_batch_sync_locally",
-    ),
-    (
-        "trusted-server-adapter-cloudflare/src/app.rs",
-        "answer_identify_locally",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/app.rs",
-        "answer_batch_sync_locally",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/app.rs",
-        "answer_identify_locally",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/app.rs",
-        "generate_if_needed",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/app.rs",
-        "handle_batch_sync",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/app.rs",
-        "handle_identify",
-    ),
-    (
-        "trusted-server-adapter-fastly/src/main.rs",
-        "ec_finalize_response",
-    ),
-    (
-        "trusted-server-adapter-spin/src/app.rs",
-        "answer_batch_sync_locally",
-    ),
-    (
-        "trusted-server-adapter-spin/src/app.rs",
-        "answer_identify_locally",
-    ),
-];
+const PENDING_LIFECYCLE_MOVE: &[(&str, &str)] = &[];
 
 fn crates_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

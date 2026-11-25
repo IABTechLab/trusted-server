@@ -50,7 +50,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy --version 0.21.0 --locked --force
+cargo install viceroy --version 0.22.0 --locked --force
 ```
 
 Create and push the starter config, then start the local Fastly simulator:
@@ -76,9 +76,26 @@ The Axum server reads its config envelope from a local config-store file in
 variables. It does **not** auto-load `.env` files, so export the variables into
 your shell before starting the server.
 
+The local record store is declared at boot even when `ec.storage` is omitted.
+`EDGEZERO__ADAPTER__DATA_DIR` must therefore name a writable directory for local
+starts, including a deployment without identity storage. Store preparation runs
+before the application config is loaded. Remote-only store bindings do not
+require a local data directory.
+
+Copy `trusted-server.example.toml` to `trusted-server.toml`. In the copied
+file, add `provider` to the existing storage table:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+The starter's default provider is Fastly-only. Set the native provider explicitly
+in TOML: environment overlays can replace existing keys but cannot add one.
+
 ```bash
-# Create the local app config and apply the non-secret development overlay.
-cp trusted-server.example.toml trusted-server.toml
+# Apply the non-secret development overlay.
 set -a && source .env.dev && set +a
 # Axum listens on 8787, not the Viceroy port in .env.dev.
 export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
@@ -90,6 +107,7 @@ unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
 # Write .edgezero/local-config-trusted_server_config.json.
 ts config push --adapter axum --local --yes
 export EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero"
+export EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero"
 
 # Populate the three secret references from the starter config for this shell.
 # Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
@@ -120,8 +138,10 @@ the envelope; the running server does not read them. The older
 Do not put secret values in the TOML config, the config-store file, or a
 source-controlled environment file.
 
-> **Axum limitations:** The Axum adapter does not support KV store,
-> geo lookup, config/secret-store writes, or admin key-management routes.
+> **Axum capabilities:** The shared identity app uses EdgeZero's prepared record
+> service; the local provider stores records in `EDGEZERO__ADAPTER__DATA_DIR`.
+> Protected geo is optional and off by default. Generic platform KV operations,
+> config/secret-store writes and admin key-management mutations remain unavailable.
 > See [Architecture](/guide/architecture) for the full list, and
 > [Axum production startup](/guide/native-rc-demo) for AWS-backed stores.
 

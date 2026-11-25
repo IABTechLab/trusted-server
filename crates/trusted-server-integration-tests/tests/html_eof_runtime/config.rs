@@ -56,12 +56,18 @@ fn table<'a>(
 
 pub(super) fn fixture_config(
     template: &str,
+    adapter: &str,
     case: &str,
     origin: u16,
     bid: u16,
     public_port: u16,
 ) -> HarnessResult<String> {
     let mut value = parse(template)?;
+    if adapter != "fastly" {
+        // The shared template selects Fastly's graph. Other EOF fixtures
+        // intentionally exercise their existing unconfigured EC path.
+        table(&mut value, &["ec"])?.remove("storage");
+    }
     for (key, replacement) in [
         ("domain", "127.0.0.1".to_owned()),
         ("cookie_domain", "127.0.0.1".to_owned()),
@@ -263,7 +269,7 @@ mod tests {
     #[test]
     fn fixture_config_is_loopback_only_with_explicit_permission() {
         for case in ["disabled", "success", "hung", "auction", "streaming"] {
-            let config = fixture_config(CONFIG, case, 12345, 12346, 12347)
+            let config = fixture_config(CONFIG, "axum", case, 12345, 12346, 12347)
                 .expect("should generate isolated configuration");
             let parsed: toml::Value = toml::from_str(&config).expect("should parse configuration");
             assert_eq!(
@@ -295,9 +301,24 @@ mod tests {
     }
 
     #[test]
+    fn fixture_storage_matches_the_serving_runtime() {
+        for adapter in ["axum", "cloudflare", "spin", "fastly"] {
+            let config = fixture_config(CONFIG, adapter, "success", 12345, 12346, 12347)
+                .expect("should generate the runtime-specific fixture");
+            let value = parse(&config).expect("should parse the fixture");
+            assert_eq!(
+                value["ec"].get("storage").is_some(),
+                adapter == "fastly",
+                "should retain the Fastly graph only for its serving runtime"
+            );
+        }
+    }
+
+    #[test]
     fn fixture_config_rejects_missing_required_template_fields() {
         let result = fixture_config(
             "[publisher]\ndomain = 'example.com'",
+            "axum",
             "success",
             12345,
             12346,
@@ -308,7 +329,7 @@ mod tests {
 
     #[test]
     fn fixture_validation_rejects_external_endpoints() {
-        let config = fixture_config(CONFIG, "auction", 12345, 12346, 12347)
+        let config = fixture_config(CONFIG, "axum", "auction", 12345, 12346, 12347)
             .expect("should generate auction configuration");
         let mut value = parse(&config).expect("should parse generated configuration");
         let provider = table(&mut value, &["auction", "providers"])

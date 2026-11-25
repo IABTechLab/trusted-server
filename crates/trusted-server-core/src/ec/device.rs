@@ -1,9 +1,9 @@
 //! Device signal derivation for bot detection and browser classification.
 //!
-//! All functions in this module are pure computations — no KV I/O or Fastly
-//! SDK calls. The Fastly adapter extracts raw strings from the request
-//! (`get_tls_ja4()`, `get_client_h2_fingerprint()`, UA header) and passes
-//! them here for classification.
+//! All functions in this module are pure computations — no KV I/O or
+//! platform SDK calls. The shared identity app passes the User-Agent, the
+//! trusted JA4 from `EdgeZero`'s request ingress, and the platform's HTTP/2
+//! fingerprint here for classification.
 //!
 //! # Signals
 //!
@@ -13,16 +13,25 @@
 //! - **`platform_class`** — coarse OS family from UA
 //! - **`h2_fp_hash`** — SHA256 prefix (12 hex chars) of raw H2 SETTINGS
 //! - **`known_browser`** — `true` if `ja4_class` + `h2_fp_hash` match a known
-//!   browser pattern; `false` for known bots; `None` for unknown
+//!   browser pattern; `None` for unknown. Analytics only.
+//! - **`ja4_contradiction`** — `true` when a trusted JA4's TLS client family
+//!   contradicts the User-Agent's browser family (ID-7); never stored
+//!
+//! Under the default `lenient` browser gate only a known non-browser or a
+//! trusted JA4 contradiction refuses identity creation and record writes;
+//! missing or unknown signals never do. The `strict` gate also refuses a
+//! request without both `ja4_class` and `platform_class`.
 
 use sha2::{Digest as _, Sha256};
 
+use super::ja4_family;
 use super::kv_types::KvDevice;
+use crate::settings::{BrowserGate, Ja4ContradictionExempt};
 
 /// Device signals derived from a single request.
 ///
-/// Computed in the Fastly adapter from raw TLS/H2/UA data, then passed to
-/// core for storage and gating decisions. This type lives in core so it
+/// Computed by the shared identity app from the User-Agent, trusted JA4 and
+/// HTTP/2 data for storage and gating decisions. This type lives in core so it
 /// can be used in [`KvDevice`] construction and tested without Fastly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSignals {
@@ -35,23 +44,45 @@ pub struct DeviceSignals {
     pub platform_class: Option<String>,
     /// SHA256 prefix (12 hex chars) of the raw H2 SETTINGS string.
     pub h2_fp_hash: Option<String>,
-    /// `true` = known browser, `false` = known bot, `None` = unknown.
+    /// `true` = known browser, `false` = known non-browser, `None` = unknown.
     pub known_browser: Option<bool>,
+    /// `true` when a trusted JA4's TLS client family contradicts the
+    /// User-Agent's browser family and `[ec].ja4_contradiction_exempt` does
+    /// not exempt it. Gates creation only; it is not stored.
+    pub ja4_contradiction: bool,
 }
 
 impl DeviceSignals {
     /// Derives all device signals from raw request data.
     ///
-    /// `ua` is the `User-Agent` header value. `ja4` is the full JA4 hash
-    /// from `req.get_tls_ja4()`. `h2_fp` is the raw H2 SETTINGS string
-    /// from `req.get_client_h2_fingerprint()`.
+    /// `ua` is the `User-Agent` header value. `ja4` is the full trusted JA4
+    /// fingerprint; only its section 1 is kept. `h2_fp` is the raw H2
+    /// SETTINGS string.
+    ///
+    /// A JA4 whose TLS client family contradicts the User-Agent's browser
+    /// family sets [`Self::ja4_contradiction`].
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
+        Self::derive_with_tls_rule(ua, ja4, h2_fp, Ja4ContradictionExempt::Off)
+    }
+
+    /// Derives device signals as [`Self::derive`] does, except that a
+    /// contradiction `exempt` (`[ec].ja4_contradiction_exempt`) covers does
+    /// not set [`Self::ja4_contradiction`].
+    #[must_use]
+    pub fn derive_with_tls_rule(
+        ua: &str,
+        ja4: Option<&str>,
+        h2_fp: Option<&str>,
+        exempt: Ja4ContradictionExempt,
+    ) -> Self {
         let is_mobile = parse_is_mobile(ua);
         let ja4_class = ja4.and_then(extract_ja4_section1);
         let platform_class = parse_platform_class(ua);
         let h2_fp_hash = h2_fp.map(compute_h2_fp_hash);
         let known_browser = evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref());
+        let ja4_contradiction =
+            ja4.is_some_and(|ja4| ja4_family::contradicts_user_agent(ua, ja4, exempt));
 
         Self {
             is_mobile,
@@ -59,6 +90,7 @@ impl DeviceSignals {
             platform_class,
             h2_fp_hash,
             known_browser,
+            ja4_contradiction,
         }
     }
 
@@ -78,11 +110,27 @@ impl DeviceSignals {
     /// consistency checks can be added later if product requirements demand
     /// stronger spoof resistance.
     ///
-    /// `known_browser` is still computed and stored on [`KvDevice`] for
-    /// analytics but does not gate identity operations.
+    /// This check ignores `known_browser`; [`Self::allows_creation`] applies
+    /// it, and this check only under [`BrowserGate::Strict`].
     #[must_use]
     pub fn looks_like_browser(&self) -> bool {
         self.ja4_class.is_some() && self.platform_class.is_some()
+    }
+
+    /// Returns `true` when these signals allow Edge Cookie creation under
+    /// `gate`.
+    ///
+    /// Both rules block a known non-browser and a trusted JA4 that
+    /// contradicts the User-Agent's browser family
+    /// ([`Self::ja4_contradiction`]). [`BrowserGate::Strict`] also requires
+    /// [`Self::looks_like_browser`].
+    #[must_use]
+    pub fn allows_creation(&self, gate: BrowserGate) -> bool {
+        let known_non_browser = self.known_browser == Some(false) || self.ja4_contradiction;
+        match gate {
+            BrowserGate::Lenient => !known_non_browser,
+            BrowserGate::Strict => !known_non_browser && self.looks_like_browser(),
+        }
     }
 
     /// Converts these signals into a [`KvDevice`] for KV storage.
@@ -206,9 +254,11 @@ fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
 
 /// Evaluates whether a request comes from a known browser.
 ///
-/// Returns `Some(true)` if `ja4_class` + `h2_fp_hash` match a known
-/// legitimate browser pattern. Returns `Some(false)` for known
-/// bot/scraper patterns. Returns `None` for unrecognized combinations.
+/// Returns the `known_browser` flag of the [`KNOWN_BROWSERS`] entry that
+/// `ja4_class` + `h2_fp_hash` match, or `None` for an unrecognized
+/// combination. Every entry lists a browser, so in practice this yields
+/// `Some(true)` or `None` and feeds analytics only; the family rule in
+/// [`ja4_family`] sets [`DeviceSignals::ja4_contradiction`] instead.
 ///
 /// Both signals must be present for a match — if either is `None`,
 /// returns `None`.
@@ -230,6 +280,9 @@ fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ja4::{
+        CHROMIUM_JA4, FIREFOX_JA4, NEWER_CHROMIUM_JA4, PYTHON_JA4, SAFARI_JA4, UNLISTED_JA4,
+    };
 
     // Chrome Mac UA
     const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -570,5 +623,169 @@ mod tests {
             !signals.looks_like_browser(),
             "unrecognizable UA should be rejected even with JA4"
         );
+    }
+
+    #[test]
+    fn lenient_gate_allows_creation_without_ja4() {
+        let signals = DeviceSignals::derive(CHROME_MAC_UA, None, None);
+
+        assert!(
+            signals.allows_creation(BrowserGate::Lenient),
+            "should not block a client only because JA4 is missing"
+        );
+    }
+
+    #[test]
+    fn strict_gate_requires_ja4_and_platform() {
+        for (ua, ja4, allowed) in [
+            (
+                CHROME_MAC_UA,
+                Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+                true,
+            ),
+            (CHROME_MAC_UA, None, false),
+            (BOT_UA, Some("t13d1516h2_8daaf6152771_e5627efa2ab1"), false),
+        ] {
+            let signals = DeviceSignals::derive(ua, ja4, None);
+
+            assert_eq!(
+                signals.allows_creation(BrowserGate::Strict),
+                allowed,
+                "should require both JA4 and platform for {ua:?} with JA4 {ja4:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_gates_block_a_known_non_browser() {
+        let mut signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+            None,
+        );
+        signals.known_browser = Some(false);
+
+        for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+            assert!(
+                !signals.allows_creation(gate),
+                "should block a known non-browser fingerprint under {gate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_gates_refuse_a_browser_user_agent_with_a_non_browser_ja4() {
+        let signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some(PYTHON_JA4),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        );
+
+        assert!(
+            signals.ja4_contradiction,
+            "should flag a JA4 that contradicts the User-Agent"
+        );
+        assert_eq!(
+            signals.known_browser, None,
+            "should leave the allowlist classification to the allowlist"
+        );
+        for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+            assert!(
+                !signals.allows_creation(gate),
+                "should refuse creation under {gate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contradiction_does_not_change_the_known_browser_analytics() {
+        // Chrome's allowlisted JA4 class and HTTP/2 settings behind a Firefox
+        // User-Agent: the allowlist still names a known browser, while the
+        // family rule refuses creation.
+        let signals = DeviceSignals::derive(
+            FIREFOX_MAC_UA,
+            Some(CHROMIUM_JA4),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        );
+
+        assert!(signals.ja4_contradiction, "should flag the engine mismatch");
+        assert_eq!(
+            signals.known_browser,
+            Some(true),
+            "should keep the allowlist's known-browser classification"
+        );
+        assert_eq!(
+            signals.to_kv_device().known_browser,
+            Some(true),
+            "should store the allowlist classification, not the contradiction"
+        );
+        for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+            assert!(
+                !signals.allows_creation(gate),
+                "should refuse creation under {gate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exemptions_clear_only_the_contradictions_they_cover() {
+        for (exempt, non_browser_refused, engine_mismatch_refused) in [
+            (Ja4ContradictionExempt::Off, true, true),
+            (Ja4ContradictionExempt::NonBrowser, false, true),
+            (Ja4ContradictionExempt::All, false, false),
+        ] {
+            for (ja4, refused) in [
+                (PYTHON_JA4, non_browser_refused),
+                (FIREFOX_JA4, engine_mismatch_refused),
+            ] {
+                let signals =
+                    DeviceSignals::derive_with_tls_rule(CHROME_MAC_UA, Some(ja4), None, exempt);
+                assert_eq!(
+                    signals.ja4_contradiction, refused,
+                    "should flag a Chrome User-Agent with {ja4:?} only when {exempt:?} leaves it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_gates_refuse_a_browser_family_mismatch() {
+        for (ua, ja4) in [
+            (FIREFOX_MAC_UA, CHROMIUM_JA4),
+            (SAFARI_MAC_UA, CHROMIUM_JA4),
+            (CHROME_WINDOWS_UA, FIREFOX_JA4),
+        ] {
+            let signals = DeviceSignals::derive(ua, Some(ja4), None);
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    !signals.allows_creation(gate),
+                    "should refuse {ua:?} with another family's JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_browser_ja4s_still_create() {
+        for (ua, ja4) in [
+            (CHROME_MAC_UA, CHROMIUM_JA4),
+            (FIREFOX_MAC_UA, FIREFOX_JA4),
+            (SAFARI_MAC_UA, SAFARI_JA4),
+            (SAFARI_IOS_UA, SAFARI_JA4),
+            (CHROME_MAC_UA, NEWER_CHROMIUM_JA4),
+            (CHROME_MAC_UA, UNLISTED_JA4),
+        ] {
+            let signals = DeviceSignals::derive(ua, Some(ja4), None);
+            assert!(
+                !signals.ja4_contradiction,
+                "should not flag {ua:?} with JA4 {ja4:?}"
+            );
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    signals.allows_creation(gate),
+                    "should allow {ua:?} with JA4 {ja4:?} under {gate:?}"
+                );
+            }
+        }
     }
 }

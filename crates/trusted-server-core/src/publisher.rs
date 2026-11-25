@@ -5707,6 +5707,7 @@ fn apply_auction_eids_and_device(
     let client_eids = drop_vendor_denied_client_eids(
         client_eids,
         targeting.partner_registry,
+        targeting.kv_snapshot,
         targeting.ec_context,
     );
     let sharedid_opted_out = targeting
@@ -7192,8 +7193,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 /// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
-/// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
+/// graph. Fastly and selected native EC providers supply an identity store.
+/// Cloudflare and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
 /// on every adapter, so no adapter forwards unconsented EIDs.
 ///
 /// # Errors
@@ -9530,6 +9531,96 @@ mod tests {
                 special_feature_opt_ins: vec![false; 12],
             }),
             ..ConsentContext::default()
+        }
+    }
+
+    #[test]
+    fn navigation_and_page_bids_drop_opted_out_cookie_eids() {
+        // Arrange: both publisher dispatch paths use the same targeting helper.
+        for path_label in ["Server-side", "Page-bids"] {
+            let partners: Vec<crate::settings::EcPartner> =
+                ["ids.example.com", "other.example.com"]
+                    .iter()
+                    .map(|source| {
+                        serde_json::from_value(serde_json::json!({
+                            "name": source, "source_domain": source, "bidstream_enabled": true
+                        }))
+                        .expect("should build partner")
+                    })
+                    .collect();
+            let mut ec = create_test_settings().ec;
+            ec.partners = partners;
+            ec.identity_providers =
+                vec![toml::from_str(
+            "id = \"example-provider\"\nkind = \"test\"\nsources = [\"ids.example.com\"]"
+        ).expect("should parse provider")];
+            let registry =
+                PartnerRegistry::from_ec_with_kinds(&ec, |_| true).expect("should build registry");
+            let cookie_eids = serde_json::json!([
+                {"source": "ids.example.com", "id": "owned-uid", "atype": 1},
+                {"source": "other.example.com", "id": "other-uid", "atype": 1}
+            ]);
+            let mut jar = CookieJar::new();
+            jar.add_original(
+                cookie::Cookie::build((
+                    COOKIE_TS_EIDS,
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&cookie_eids).expect("should serialize")),
+                ))
+                .secure(true)
+                .build(),
+            );
+            let ec_id = format!("{}.navvnd", "a".repeat(64));
+            let ec_context = EcContext::new_for_test(
+                Some(ec_id.clone()),
+                ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..ConsentContext::default()
+                },
+            );
+            let mut entry = crate::ec::kv_types::KvEntry::tombstone(1);
+            entry.consent.ok = true;
+            entry.opt_outs.insert(
+                crate::ec::eid_types::ProviderId::new("example-provider"),
+                u64::MAX,
+            );
+            let snapshot = crate::ec::EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(entry),
+                generation: None,
+            };
+            let services = noop_services();
+            let mut auction_request = test_auction_request();
+
+            // Act
+            apply_auction_eids_and_device(
+                &mut auction_request,
+                &AuctionEidTargeting {
+                    cookie_jar: Some(&jar),
+                    ec_id: Some(&ec_id),
+                    kv_snapshot: &snapshot,
+                    partner_registry: Some(&registry),
+                    ec_context: &ec_context,
+                    services: &services,
+                    geo: None,
+                    path_label,
+                },
+            );
+
+            // Assert
+            let sources: Vec<&str> = auction_request
+                .user
+                .eids
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|eid| eid.source.as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["other.example.com"],
+                "should drop remembered opt-out cookie EIDs on both publisher paths"
+            );
         }
     }
 
@@ -15345,8 +15436,13 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
-                        &crate::ec::sharedid::SharedIdRequest::default(),
+                        &crate::ec::finalize::FinalizeRequest {
+                            eids_cookie: None,
+                            sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                            now: Some(crate::ec::eid_types::UnixSeconds::new(
+                                crate::ec::current_timestamp(),
+                            )),
+                        },
                         &mut response,
                     )
                     .await;

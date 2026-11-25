@@ -46,8 +46,10 @@ function fixture(t, version = '4.83.0', pin = 'wrangler 4.83.0\n') {
     writeFileSync(join(bin, name), '#!/usr/bin/env bash\nset -eu\n' + source, {
       mode: 0o755,
     })
-  for (const name of ['cargo', 'curl', 'jq', 'python3', 'pgrep'])
+  for (const name of ['cargo', 'curl', 'jq', 'pgrep'])
     executable(name, 'exit 99\n')
+  // smoke_require_python runs `python3 -c` for its 3.11 floor; pass only that probe.
+  executable('python3', 'if [ "$1" = -c ]; then exit 0; fi\nexit 99\n')
   executable(
     'wrangler',
     `
@@ -66,7 +68,14 @@ test "$(awk '$1 == "nodejs" {print $2}' "$candidate/.tool-versions")" = 24.20.0
 if [ "$1" = kv ]; then echo reached-pinned-kv >&2; exit 42; fi
 `
   )
-  executable('ts', 'if [ "$1 $2" = "config push" ]; then wrangler check; fi\n')
+  // `ts config init --app-config <path>` writes the template's Fastly storage
+  // block, which the smoke removes for non-Fastly adapters.
+  executable(
+    'ts',
+    `if [ "$1 $2" = "config init" ]; then printf '[ec.storage]\\nstore = "trusted_server_kv"\\n' > "$4"; fi
+if [ "$1 $2" = "config push" ]; then wrangler check; fi
+`
+  )
   return () =>
     spawnSync('bash', [join(repository, 'scripts/smoke-cloudflare.sh')], {
       cwd: directory,
@@ -75,6 +84,11 @@ if [ "$1" = kv ]; then echo reached-pinned-kv >&2; exit 42; fi
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
         TS_BIN: join(bin, 'ts'),
+        // The smoke builds the Worker unless it is handed a prebuilt bundle.
+        CLOUDFLARE_BUILD_PATH: join(
+          repository,
+          'crates/trusted-server-adapter-cloudflare/build'
+        ),
         TMPDIR: directory,
       },
     })

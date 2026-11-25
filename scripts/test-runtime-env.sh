@@ -167,20 +167,31 @@ RS
     "$root/crates/trusted-server-core/src/runtime_env.rs" -o "$scratch/libchecked.rlib"
 # Make the checked macro available through the fixture helper's existing extern.
 cp "$scratch/libchecked.rlib" "$scratch/libhelper.rlib"
-for key in TRUSTED_SERVER__EXAMPLE FASTLY_IS_STAGING FASTLY_SERVICE_VERSION FASTLY_HOSTNAME FASTLY_REGION EDGEZERO__ADAPTER__GEO__PROVIDER; do
+for key in TRUSTED_SERVER__EXAMPLE FASTLY_IS_STAGING FASTLY_SERVICE_VERSION FASTLY_HOSTNAME FASTLY_REGION TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE; do
     check "checked_$key" pass <<RS
 const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY); }
 RS
+    check "checked_os_$key" pass <<RS
+const KEY: &str = "$key";
+pub fn read() { let _ = helper::runtime_env!(KEY, os); }
+RS
 done
-for key in TS_EXAMPLE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__ EDGEZERO__EXAMPLE EDGEZERO__ADAPTER__GEO__OTHER; do
+for key in TS_EXAMPLE TS_NATIVE_GEO_PROFILE_FILE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__ EDGEZERO__EXAMPLE EDGEZERO__ADAPTER__GEO__OTHER; do
     check "checked_$key" fail 'runtime environment name is not allowed' <<RS
 const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY); }
 RS
+    check "checked_os_$key" fail 'runtime environment name is not allowed' <<RS
+const KEY: &str = "$key";
+pub fn read() { let _ = helper::runtime_env!(KEY, os); }
+RS
 done
 check checked_computed fail 'non-constant' <<'RS'
 pub fn read(name: &str) { let _ = helper::runtime_env!(name); }
+RS
+check checked_os_computed fail 'non-constant' <<'RS'
+pub fn read(name: &str) { let _ = helper::runtime_env!(name, os); }
 RS
 check checked_runtime_built fail 'non-constant' <<'RS'
 pub fn read() { let name = format!("TS_{}", "EXAMPLE"); let _ = helper::runtime_env!(&name); }

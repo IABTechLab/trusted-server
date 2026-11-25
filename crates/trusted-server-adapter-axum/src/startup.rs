@@ -16,13 +16,14 @@ use error_stack::Report;
 use trusted_server_core::config_payload::{
     DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID, VerifiedConfigBlob,
 };
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::integrations::datadome::{DataDomeConfig, ProtectionMatcherConfig};
 use trusted_server_core::platform::{
     PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
 };
 use trusted_server_core::settings::Settings;
 
-use crate::app::{TrustedServerApp, startup_error_router};
+use crate::app::{build_state_with_settings, router_builder, startup_error_router};
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -170,10 +171,10 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 /// The framework retains ownership of the App, clock, policies, listener,
 /// readiness, and signal/drain lifecycle. Selected-provider preparation, which
 /// the framework runs before this initializer, still fails startup. A failure
-/// here to read the prepared stores, validate the settings or build the
-/// application state installs the failure router instead, so liveness stays up
-/// while `/ready` and every supported route answer the fixed unavailable
-/// response.
+/// here to read the prepared stores, validate the settings, build the
+/// application state or bind the configured EC record store installs the
+/// failure router instead, so liveness stays up while `/ready` and every
+/// supported route answer the fixed unavailable response.
 ///
 /// # Errors
 /// Returns an error when the application's config extraction limits are
@@ -202,6 +203,12 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
 /// # Errors
 /// Returns an error for missing bindings/values, bounded-read failures, invalid
 /// envelopes or runtime settings, unsupported store consumers, or invalid plans.
+/// It also returns an error when the configured EC record store is not
+/// prepared or cannot meet the record contract, so those failures install the
+/// failure router too.
+///
+/// # Panics
+/// Panics if newly constructed application state unexpectedly has another owner.
 async fn prepare_native(
     app: &App,
     stores: &PreparedStores,
@@ -290,7 +297,29 @@ async fn prepare_native(
         )
         .map_err(settings_error)?;
     validate_snapshot_consumers(&settings)?;
-    let router = TrustedServerApp::routes_with_settings(settings).map_err(settings_error)?;
+    let mut state = build_state_with_settings(settings).map_err(settings_error)?;
+    // EC records stay live. Only the validated provider handle is shared, never
+    // mutable identity rows in the immutable config/secret snapshot.
+    let provider_settings = Arc::clone(&state.settings);
+    match provider_settings
+        .ec
+        .resolve_storage(EcRuntime::Native)
+        .map_err(settings_error)?
+    {
+        None => {}
+        Some(EcStorageSelection::Records(store_id)) => {
+            let provider = crate::record_ec::acquire(stores, store_id)?;
+            Arc::get_mut(&mut state)
+                .expect("should uniquely own initializing app state")
+                .set_ec_store(provider);
+        }
+        Some(EcStorageSelection::Fastly(_)) => {
+            return Err(configuration_error(
+                "Fastly EC storage is unsupported by the native adapter",
+            ));
+        }
+    }
+    let router = router_builder(&state).build();
     if deadline.is_expired_at(clock.now()) {
         return Err(configuration_error(
             "native application initialization exceeds its extraction deadline",
@@ -309,6 +338,7 @@ async fn prepare_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::TrustedServerApp;
     use edgezero_adapter_axum::AXUM_PLATFORM;
 
     #[test]

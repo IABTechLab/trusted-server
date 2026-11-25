@@ -93,6 +93,12 @@ pub trait EcKvStore {
     ///
     /// A completed issuance must be visible even when [`Self::lookup`] lags.
     /// Prefix matches are insufficient and an inconclusive check is an error.
+    /// Logical expiry alone does not prove absence when a previously authorized
+    /// conditional write can still commit against the expired row. Such backends
+    /// must include physically held expired rows in this check for withdrawal
+    /// and orphan protection, even when lookup and listing hide logical expiry.
+    /// Returning `false` must establish that an old generation cannot still
+    /// update the apparently absent row.
     ///
     /// # Implementing this method
     ///
@@ -304,6 +310,75 @@ pub(crate) mod test_support {
             key: &str,
             write: EcKvWrite<'_>,
         ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write).await
+        }
+
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// [`EcKvStore`] wrapper that counts conditional write attempts, optionally conflicting once.
+    #[cfg(test)]
+    pub(crate) struct ConditionalWriteCountingEcKv {
+        inner: InMemoryEcKv,
+        conflict_first: bool,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(test)]
+    impl ConditionalWriteCountingEcKv {
+        pub(crate) fn new(
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            conflict_first: bool,
+        ) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("conditional-write-count"),
+                conflict_first,
+                writes,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for ConditionalWriteCountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
+        }
+
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                let attempt = self
+                    .writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.conflict_first && attempt == 0 {
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
             self.inner.insert(key, write).await
         }
 

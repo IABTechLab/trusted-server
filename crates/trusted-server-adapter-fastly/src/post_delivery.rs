@@ -94,17 +94,8 @@ pub(crate) async fn run_after_response_lookups(
     identity: &IdentityApp,
     client: &HttpClient,
 ) {
-    let Some(lookups) = lookups else {
-        return;
-    };
-    let Some(permit) = ec_state.ec_context.take_after_response_permit() else {
-        log::debug!(
-            "After-response lookups skipped: no permit (consent, redirect or failed page-load write)"
-        );
-        return;
-    };
-    lookups
-        .run(&ec_state.ec_context, permit, identity, client)
+    identity
+        .run_after_response_lookups(&mut ec_state.ec_context, lookups, client)
         .await;
 }
 
@@ -118,7 +109,9 @@ mod tests {
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
     use trusted_server_core::ec::EcContext;
     use trusted_server_core::ec::coordinator::transport::MAX_PROVIDER_RESPONSE_BYTES;
-    use trusted_server_core::ec::finalize::ec_finalize_response;
+    use trusted_server_core::ec::current_timestamp;
+    use trusted_server_core::ec::eid_types::UnixSeconds;
+    use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
     use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::page_load::NavigationPermit;
     use trusted_server_core::geo::GeoInfo;
@@ -276,7 +269,7 @@ mod tests {
     // Pull sync after delivery, against the local identity store
     // -----------------------------------------------------------------------
 
-    /// EC ID `fastly.toml` seeds, consented, in the local `ec_identity_store`.
+    /// EC ID `fastly.toml` seeds, consented, in logical `trusted_server_kv`.
     fn seeded_ec_id() -> String {
         format!("{}.test01", "a".repeat(64))
     }
@@ -289,7 +282,7 @@ mod tests {
     /// Settings with Tinybird, the local identity store, and one pull-sync partner.
     fn pull_sync_settings() -> Settings {
         let mut settings = settings_with_tinybird();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings.ec.partners = vec![EcPartner {
             name: "Example partner".to_owned(),
             source_domain: "partner.example.com".to_owned(),
@@ -348,6 +341,7 @@ mod tests {
                 use_finalize_kv: false,
                 eids_cookie: None,
                 sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                after_response: None,
             },
             after_response: None,
         }
@@ -380,8 +374,11 @@ mod tests {
             &mut state.ec_state.ec_context,
             Some(&kv),
             app.identity.partners(),
-            None,
-            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         ));
         state.identity = Arc::clone(&app.identity);
@@ -394,6 +391,8 @@ mod tests {
             ec_id: ec_id.to_owned(),
             client_ip: None,
             user_agent: None,
+            referer: None,
+            accept_language: None,
             cookie_header: String::new(),
         });
         state

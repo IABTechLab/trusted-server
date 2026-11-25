@@ -56,9 +56,63 @@ Visibility changes trigger a fresh read; background timers may be throttled by
 the browser. Sampling pauses on `pagehide` and resumes after a BFCache restore.
 No auction or forced ID refresh is started to obtain IDs.
 
-Mirrored IDs are not copied back into this cookie. This mode does not call an
-EC endpoint or independently grant consent. It does not disable server auctions
-configured elsewhere.
+Mirrored IDs are not copied back into this cookie. This mode does not
+independently grant consent. It does not disable server auctions configured
+elsewhere.
+
+### Consent reporting to the EC route
+
+In identity mode, when the mounted EC route has a record store, the server
+injects `window.__tsjs_prebid.ecRoute = "/_ts/api/v1/ec"`. tsjs reports the
+publisher CMP's TCF and GPP decisions to that same-origin route, so a reader who consents after the page loads gets an Edge Cookie on that page
+view and a withdrawal reaches the server without waiting for the next
+navigation. tsjs only observes the existing `__tcfapi` and `__gpp` APIs; it
+never installs a CMP. Without an injected route, or with no CMP on the page, no
+call is made. Auction mode and adapters without a bound identity record store
+omit the route, including adapters where it returns 501.
+
+When Sourcepoint is enabled, it remains the page's only consent reporter through
+`/_ts/consent`, so Prebid receives no `ecRoute`. This holds even when
+`rewrite_sdk = false` or the CMP loads later. Prebid still captures native IDs
+and merges the navigation mirror in identity mode. Sourcepoint's endpoint does
+not mint identity: these pages wait for a later eligible navigation to establish
+an EC after consent. A TCF-only server reconciliation can also wait for that
+navigation. A future migration must move both reporters onto one queue and
+define identity minting and null-clear behavior together.
+
+Each report is a `POST` with the CMP's TC string (when GDPR applies) and GPP
+string, with at most 32 applicable GPP section IDs. Reports are sent in order, one at a time. A newer grant replaces a
+grant still waiting to be sent, but a possible withdrawal is never replaced:
+it is sent after the call in flight and before any later change. A failed
+withdrawal is resent on the next consent change, focus or visibility change;
+a failed grant is dropped until the CMP reports again.
+
+When EC reporting is active, the route's answer is merged into identity-mode
+publisher auctions in place
+of the mirror cookie while that cookie is unchanged. While a possible
+withdrawal is waiting or in flight, no mirrored or route IDs are merged; a
+TCF denial of Purpose 1 or 4 also deletes the mirror cookie at once. A merge
+happens when the publisher calls `requestBids`, so a withdrawal made while
+Prebid is still delaying that auction does not reach it. Auction mode merges
+nothing in the browser.
+
+CMPs that keep their decision outside the standard `euconsent-v2` and `__gpp`
+cookies cause each page's first report to be treated as a possible withdrawal,
+so mirrored IDs wait for the route's answer on every page view.
+
+### SharedID opt-out
+
+Prebid's SharedID module honors `_pubcid_optout` in a cookie or in
+localStorage, but the server can read only the cookie. In both modes tsjs
+copies an active localStorage opt-out, using Prebid's own rule (a non-empty
+value whose optional `_pubcid_optout_exp` is in the future), into a host-only
+`_pubcid_optout` cookie with a `_ts_pubcid_optout_src` marker. The copy lasts
+until the localStorage expiry or one year, and is removed when the localStorage
+opt-out ends. A publisher-written `_pubcid_optout` cookie is left alone. While
+either opt-out is present, identity mode drops `pubcid.org` IDs from mirrored
+and route IDs. The copy runs at load, on visibility changes, before each route
+report and, in auction mode, before each `requestBids`; in identity mode it
+also runs once per second.
 
 ## Configuration
 
@@ -732,6 +786,13 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
+EIDs that a publisher or an identity SDK sets directly with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })` are not User ID Module
+output, so `pbjs.getUserIdsAsEids()` does not return them. The shim also reads
+`ortb2.user.ext.eids` from the Prebid config and appends those EIDs after the
+User ID Module ones. A source present in both is forwarded once with its uids
+merged, and a uid already seen for that source is skipped.
+
 User ID submodule inclusion comes from `bundle.modules.user_id`. The available
 modules and default preset are checked in at
 `crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`.
@@ -919,9 +980,12 @@ page or auction. When available, the opaque value follows the standard path:
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
    Server as `user.eids`.
 4. The browser also persists the opaque value in the bounded `ts-eids` cookie.
-   The next top-level page navigation ingests it into an EC/KV partner
+   A later eligible document navigation or EC POST ingests it into an EC/KV partner
    configured with `source_domain = "liveramp.com"`, when that partner UID is
-   not already stored. `/auction` and `GET /_ts/page-bids` never write KV.
+   not already stored. `/auction` also saves explicit body EIDs into an existing
+   live EC record under the same consent, ownership and fill-missing rules,
+   including when bidding is disabled. It never creates or revives a record and
+   emits no identity cookie. `GET /_ts/page-bids` does not write identity records.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -1005,11 +1069,11 @@ not passed by this implementation.
 
 Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` and the `ortb2.user.ext.eids` Prebid config in the browser and sent in the `/auction` request body.
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.
-5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the SharedID cookie named by the `sharedId` entry's `storage.name`. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
+5. Explicit `/auction` body EIDs can fill missing partner UIDs in an existing live EC record under consent, ownership and opt-out rules, including when bidding is disabled. The operation never creates or revives an identity. Cookie ingestion occurs on an eligible document navigation or admitted EC POST, reading `ts-eids` and then the SharedID cookie named by the `sharedId` entry's `storage.name`. Auction cookie fallback remains read-only.
 
 The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
@@ -1033,7 +1097,7 @@ sequenceDiagram
     T->>P: OpenRTB request\nuser.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
-    Note over B,K: /auction writes nothing to KV; ts-eids and sharedId\nare ingested on the next top-level navigation
+    Note over B,K: /auction may save explicit body EIDs to an existing live row;\nts-eids and sharedId cookie ingestion waits for a document navigation or EC POST
 ```
 
 ### Merge and deduplication rules

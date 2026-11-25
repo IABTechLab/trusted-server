@@ -1512,6 +1512,24 @@ impl IntegrationHeadInjector for PrebidIntegration {
         PREBID_INTEGRATION_ID
     }
 
+    fn head_inserts_with_ec_route(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        ec_route_available: bool,
+    ) -> Vec<String> {
+        let mut inserts = self.head_inserts(ctx);
+        if self.config.mode == PrebidMode::Identity && ec_route_available {
+            inserts.insert(
+                1,
+                format!(
+                    r#"<script>window.__tsjs_prebid.ecRoute="{}";</script>"#,
+                    crate::ec::app::EC_PATH,
+                ),
+            );
+        }
+        inserts
+    }
+
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         if let Some(inserts) = &self.planned_head_inserts {
             return inserts.clone();
@@ -3744,6 +3762,8 @@ mod tests {
     };
 
     use crate::consent::{ConsentContext, ConsentSource};
+    use crate::ec::app::{IdentityApp, IdentityPlatform};
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::geo::GeoInfo;
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
@@ -4218,6 +4238,88 @@ server_url = "https://prebid.example/openrtb2/auction"
             config.excluded_gam_ad_unit_path_suffixes.is_empty(),
             "should default to no refresh-auction exclusions"
         );
+    }
+
+    #[test]
+    fn ec_route_injection_requires_identity_mode_and_a_bound_record_store() {
+        for mode in ["identity", "auction"] {
+            for (sourcepoint_enabled, rewrite_sdk) in [
+                (None, true),
+                (Some(false), true),
+                (Some(true), true),
+                (Some(true), false),
+            ] {
+                let mut settings = make_settings();
+                if let Some(enabled) = sourcepoint_enabled {
+                    settings
+                        .integrations
+                        .insert_config(
+                            "sourcepoint",
+                            &json!({
+                                "enabled": enabled, "rewrite_sdk": rewrite_sdk,
+                            }),
+                        )
+                        .expect("should configure Sourcepoint consent synchronization");
+                }
+                settings
+                    .integrations
+                    .insert_config(
+                        PREBID_INTEGRATION_ID,
+                        &json!({
+                            "enabled": true,
+                            "mode": mode,
+                            "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                        }),
+                    )
+                    .expect("should configure Prebid mode");
+                let plan = Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                );
+                let mut registry = IntegrationRegistry::with_plan(&settings, plan)
+                    .expect("should build integration registry");
+                let mut identity =
+                    IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+                        .expect("should build unsupported identity app");
+                let document_state = IntegrationDocumentState::default();
+                let context = IntegrationHtmlContext {
+                    request_host: "pub.example",
+                    request_scheme: "https",
+                    origin_host: "origin.example",
+                    document_state: &document_state,
+                };
+                registry.set_identity_app(&identity);
+                assert!(
+                    !registry.head_inserts(&context).join("").contains("ecRoute"),
+                    "should omit route when the app returns 501, even in identity mode"
+                );
+                Arc::get_mut(&mut identity)
+                    .expect("should own identity app")
+                    .bind_record_store(Arc::new(InMemoryEcKv::new("prebid-injection")));
+                registry.set_identity_app(&identity);
+                let inserts = registry.head_inserts(&context);
+                let route = inserts.iter().position(|insert| insert.contains("ecRoute"));
+                assert_eq!(
+                    route.is_some(),
+                    mode == "identity" && sourcepoint_enabled != Some(true),
+                    "should inject only identity mode with a real bound store and no Sourcepoint writer"
+                );
+                if let Some(index) = route {
+                    assert!(
+                        index > 0 && inserts[0].contains("window.__tsjs_prebid="),
+                        "should create the config before assigning its EC route"
+                    );
+                    assert!(
+                        inserts[index].contains("/_ts/api/v1/ec"),
+                        "should inject the mounted same-origin route path"
+                    );
+                    assert!(
+                        inserts[index + 1].contains("src="),
+                        "should assign the route before loading the external bundle"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

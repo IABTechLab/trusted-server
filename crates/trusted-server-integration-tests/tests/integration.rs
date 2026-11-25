@@ -15,6 +15,7 @@ use frameworks::{FRAMEWORKS, FrontendFramework};
 use reqwest::header::CONTENT_TYPE;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::panic::catch_unwind;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
@@ -2089,18 +2090,18 @@ fn spin_runtime_discovery_reads_signing_metadata_from_default() {
             let response =
                 reqwest::blocking::get(format!("{base_url}/.well-known/trusted-server.json"))
                     .expect("should request the discovery document");
-            let status = response.status().as_u16();
-            let body = response.text().expect("should read the discovery document");
             assert_eq!(
-                status, 200,
-                "Spin discovery should read signing metadata from `default`: {body}"
+                response.status().as_u16(),
+                200,
+                "Spin discovery should read signing metadata from `default`"
             );
-            let document: serde_json::Value =
-                serde_json::from_str(&body).expect("should return a JSON discovery document");
+            let document: serde_json::Value = response
+                .json()
+                .expect("should return a JSON discovery document");
             assert_eq!(
                 document["jwks"]["keys"][0]["kid"],
                 serde_json::json!("example-kid-a"),
-                "discovery should publish the active key seeded in `default`: {body}"
+                "discovery should publish the active key seeded in `default`: {document}"
             );
         },
     );
@@ -3466,12 +3467,39 @@ const SLOW_PAGE_STREAM: Duration = Duration::from_secs(35);
 /// Marker the slow publisher page ends with.
 const SLOW_PAGE_END: &str = "<p>example slow page end</p>";
 
+/// Owns the slow origin's listener and worker through successful or failed tests.
+struct SlowStreamingOrigin {
+    listener: TcpListener,
+    shutdown_tx: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for SlowStreamingOrigin {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        // Keep the listener alive until the wakeup has released a blocked accept.
+        if let Ok(address) = self.listener.local_addr() {
+            let _ = TcpStream::connect(address);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Serves one chunked HTML page on `listener` whose body takes [`SLOW_PAGE_STREAM`] to arrive.
-fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let Ok((mut stream, _addr)) = listener.accept() else {
+fn serve_slow_streaming_page(listener: TcpListener) -> SlowStreamingOrigin {
+    let worker_listener = listener
+        .try_clone()
+        .expect("should share the owned listener");
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        let Ok((mut stream, _addr)) = worker_listener.accept() else {
             return;
         };
+        if !matches!(shutdown_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            return;
+        }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let Some(_request) = read_origin_request(&mut stream) else {
             return;
@@ -3490,7 +3518,12 @@ fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
         }
         let started = std::time::Instant::now();
         while started.elapsed() < SLOW_PAGE_STREAM {
-            thread::sleep(Duration::from_secs(1));
+            if !matches!(
+                shutdown_rx.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                return;
+            }
             if write_chunk(&mut stream, "<p>example slow chunk</p>").is_err() {
                 return;
             }
@@ -3498,7 +3531,30 @@ fn serve_slow_streaming_page(listener: TcpListener) -> JoinHandle<()> {
         let _ = write_chunk(&mut stream, &format!("{SLOW_PAGE_END}</body></html>"))
             .and_then(|()| stream.write_all(b"0\r\n\r\n"))
             .and_then(|()| stream.flush());
-    })
+    });
+    SlowStreamingOrigin {
+        listener,
+        shutdown_tx,
+        handle: Some(handle),
+    }
+}
+
+#[test]
+fn slow_streaming_origin_releases_port_when_test_unwinds_before_request() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("should bind an isolated origin");
+    let address = listener
+        .local_addr()
+        .expect("should read the origin address");
+    let result = catch_unwind(|| {
+        let _origin = serve_slow_streaming_page(listener);
+        panic!("simulate a failed response assertion before origin receives a request");
+    });
+    assert!(
+        result.is_err(),
+        "should exercise the failed-test unwind path"
+    );
+    let _listener = TcpListener::bind(address)
+        .expect("should release the origin listener before the next test starts");
 }
 
 #[test]
@@ -3535,5 +3591,5 @@ fn publisher_page_streaming_35_seconds_completes() {
         "should deliver the page past EdgeZero's 30 s default write deadline"
     );
     drop(process);
-    let _ = origin.join();
+    drop(origin);
 }

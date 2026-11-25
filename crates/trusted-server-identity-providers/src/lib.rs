@@ -11,7 +11,7 @@
 
 mod common;
 
-pub use common::LockrSettings;
+pub use common::{HashedEmailSettings, LockrSettings};
 pub mod connectid;
 pub mod criteo;
 pub mod id5;
@@ -71,6 +71,16 @@ pub fn reads_lockr(kind: &str) -> bool {
         kind,
         id5::Id5::KIND | liveramp::LiveRamp::KIND | uid2::Uid2::KIND
     )
+}
+
+/// Whether `kind` declares the hashed-email capability, so its settings
+/// accept a `[ec.identity_providers.settings.hashed_email]` table.
+///
+/// The settings of every other kind reject that table as an unknown field
+/// when the provider is built.
+#[must_use]
+pub fn uses_hashed_email(kind: &str) -> bool {
+    matches!(kind, id5::Id5::KIND | liveramp::LiveRamp::KIND)
 }
 
 /// Whether a provider of `kind` excludes `source` where GDPR applies.
@@ -249,38 +259,54 @@ pub fn validate_providers(settings: &Settings) -> Result<(), Report<ProviderConf
     Ok(())
 }
 
-/// The cookie Prebid's `SharedID` module stores its ID in, as configured in
-/// `integrations.prebid.managed_user_ids[].storage.name`.
+/// Applies Prebid's `SharedID` storage to a `sharedid` provider.
 ///
-/// `None` when Prebid is not configured, manages no `SharedID` module, or
-/// keeps it in local storage only.
-fn prebid_sharedid_cookie(settings: &Settings) -> Option<String> {
-    match settings.sharedid_storage() {
-        SharedIdStorage::Cookie(name) => Some(name),
-        SharedIdStorage::LocalStorageOnly | SharedIdStorage::Unconfigured => None,
-    }
-}
-
-/// Fills a `sharedid` provider's `cookie_names` with the cookie Prebid's
-/// `SharedID` module is configured to use, unless the provider sets its own.
+/// When Prebid stores the `SharedID` in a cookie, fills `cookie_names` with
+/// that cookie and turns `generate` on, unless the provider sets either
+/// itself: the server creates a `SharedID` for a reader who has none and
+/// writes it back to the cookie. When Prebid keeps the `SharedID` in local
+/// storage only, turns `generate` off: Prebid never reads a server-made ID
+/// there, so generating one would split the reader's identity.
 fn with_prebid_sharedid_cookie<'config>(
     config: &'config IdentityProviderConfig,
     settings: &Settings,
 ) -> Cow<'config, IdentityProviderConfig> {
-    if config.kind() != sharedid::SharedId::KIND
-        || config.settings.contains_key(sharedid::COOKIE_NAMES_SETTING)
-    {
+    if config.kind() != sharedid::SharedId::KIND {
         return Cow::Borrowed(config);
     }
-    let Some(cookie) = prebid_sharedid_cookie(settings) else {
-        return Cow::Borrowed(config);
-    };
-    let mut config = config.clone();
-    config.settings.insert(
-        sharedid::COOKIE_NAMES_SETTING.to_owned(),
-        serde_json::Value::from(vec![cookie]),
-    );
-    Cow::Owned(config)
+    match settings.sharedid_storage() {
+        SharedIdStorage::Cookie(cookie)
+            if !config.settings.contains_key(sharedid::COOKIE_NAMES_SETTING)
+                || !config.settings.contains_key(sharedid::GENERATE_SETTING) =>
+        {
+            let mut config = config.clone();
+            config
+                .settings
+                .entry(sharedid::COOKIE_NAMES_SETTING)
+                .or_insert_with(|| serde_json::Value::from(vec![cookie]));
+            config
+                .settings
+                .entry(sharedid::GENERATE_SETTING)
+                .or_insert(serde_json::Value::Bool(true));
+            Cow::Owned(config)
+        }
+        SharedIdStorage::LocalStorageOnly
+            if config.settings.get(sharedid::GENERATE_SETTING)
+                == Some(&serde_json::Value::Bool(true)) =>
+        {
+            log::warn!(
+                "Identity providers: `{}` does not generate SharedID because Prebid keeps it in local storage",
+                config.id
+            );
+            let mut config = config.clone();
+            config.settings.insert(
+                sharedid::GENERATE_SETTING.to_owned(),
+                serde_json::Value::Bool(false),
+            );
+            Cow::Owned(config)
+        }
+        _ => Cow::Borrowed(config),
+    }
 }
 
 fn build_phase_coordinator(
@@ -311,8 +337,40 @@ fn build_phase_coordinator(
         return Ok(None);
     }
     let pull_sync_concurrency = NonZeroUsize::new(settings.ec.pull_sync_concurrency);
-    ProviderCoordinator::new(registered, partners, budget)
-        .map(|coordinator| Some(coordinator.with_pull_sync_concurrency(pull_sync_concurrency)))
+    ProviderCoordinator::new(registered, partners, budget)?
+        .with_pull_sync_concurrency(pull_sync_concurrency)
+        .with_hashed_email_source(settings.ec.hashed_email.as_ref())
+        .map(Some)
+}
+
+/// Builds provider coordinators shared by serving adapters.
+///
+/// # Errors
+///
+/// Returns a configuration error when an enabled provider cannot be constructed.
+pub fn identity_providers(
+    settings: &Settings,
+) -> Result<trusted_server_core::ec::app::IdentityProviders, Report<TrustedServerError>> {
+    let partners = Arc::new(partner_registry(&settings.ec)?);
+    let page = build_coordinator_with(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    let after_response = build_after_response_coordinator(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    Ok(trusted_server_core::ec::app::IdentityProviders {
+        partners,
+        page,
+        after_response,
+    })
 }
 
 #[cfg(test)]
@@ -405,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn only_liveramp_with_an_endpoint_sends_the_ec_id() {
+    fn no_provider_sends_the_ec_id() {
         for (kind, endpoint, sources, settings) in [
             (
                 "id5",
@@ -424,7 +482,10 @@ mod tests {
                 "liveramp",
                 Some("https://lr.example.com/api/identity/v2/envelope"),
                 json!(["liveramp.example.com"]),
-                json!({ "placement_id": 1, "custom_id_namespace": "ns-example" }),
+                json!({
+                    "placement_id": 1,
+                    "hashed_email": { "enabled": true, "path": ".liveramp" },
+                }),
             ),
             (
                 "connectid",
@@ -456,10 +517,9 @@ mod tests {
             let built = build(&config, &ProviderSecrets::default())
                 .unwrap_or_else(|error| panic!("should build {kind}: {error:?}"));
 
-            assert_eq!(
-                built.sends_ec_id(),
-                kind == "liveramp" && has_endpoint,
-                "should send the EC ID only from LiveRamp with an endpoint, checked {kind} (endpoint: {has_endpoint})"
+            assert!(
+                !built.sends_ec_id(),
+                "should not send the EC ID, checked {kind} (endpoint: {has_endpoint})"
             );
         }
     }
@@ -646,6 +706,69 @@ mod tests {
     }
 
     #[test]
+    fn sharedid_does_not_generate_when_prebid_uses_local_storage() {
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers[0]
+            .settings
+            .insert("generate".to_owned(), json!(true));
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "html5", "name": "_pubcid" }),
+        );
+
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(false)),
+            "should not generate a SharedID Prebid would never read"
+        );
+    }
+
+    #[test]
+    fn sharedid_generates_by_default_when_prebid_uses_a_cookie() {
+        // Arrange
+        let mut settings = settings_with_cookie_providers("page", "page");
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+
+        // Act
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        // Assert
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(true)),
+            "should create a SharedID for a reader who has none"
+        );
+    }
+
+    #[test]
+    fn sharedid_generate_setting_wins_over_the_default() {
+        // Arrange
+        let mut settings = settings_with_cookie_providers("page", "page");
+        settings.ec.identity_providers[0]
+            .settings
+            .insert("generate".to_owned(), json!(false));
+        with_prebid_sharedid(
+            &mut settings,
+            &json!({ "type": "cookie", "name": "_pubcid" }),
+        );
+
+        // Act
+        let config = with_prebid_sharedid_cookie(&settings.ec.identity_providers[0], &settings);
+
+        // Assert
+        assert_eq!(
+            config.settings.get("generate"),
+            Some(&json!(false)),
+            "should honour an explicit generate setting"
+        );
+    }
+
+    #[test]
     fn sharedid_cookie_names_setting_wins_over_prebid() {
         let mut settings = settings_with_cookie_providers("page", "page");
         with_prebid_sharedid(
@@ -675,8 +798,16 @@ mod tests {
         .expect("should parse liveramp")
     }
 
+    /// `LiveRamp` settings for a complete hashed-email envelope lookup.
+    const LIVERAMP_LOOKUP: &str =
+        "placement_id = 14\nhashed_email = { enabled = true, path = \".liveramp\" }";
+
     fn settings_with_liveramp(collect: &str, settings: &str) -> Settings {
         let mut configured = settings_with_cookie_providers("page", "page");
+        configured.ec.hashed_email = Some(
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse the hashed email source"),
+        );
         configured.ec.partners.push(
             toml::from_str(
                 "name = \"liveramp\"\nsource_domain = \"liveramp.example.com\"\nbidstream_enabled = true",
@@ -692,14 +823,8 @@ mod tests {
 
     #[test]
     fn validate_providers_accepts_buildable_providers_in_both_phases() {
-        let page = settings_with_liveramp(
-            "page",
-            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
-        );
-        let after = settings_with_liveramp(
-            "after_response",
-            "placement_id = 14\ncustom_id_namespace = \"ana-example\"",
-        );
+        let page = settings_with_liveramp("page", LIVERAMP_LOOKUP);
+        let after = settings_with_liveramp("after_response", LIVERAMP_LOOKUP);
 
         validate_providers(&page).expect("should accept a buildable page provider");
         validate_providers(&after).expect("should accept a buildable after-response provider");
@@ -712,8 +837,89 @@ mod tests {
 
             assert!(
                 validate_providers(&settings).is_err(),
-                "should reject a {collect} liveramp endpoint without a namespace"
+                "should reject a {collect} liveramp endpoint without hashed_email"
             );
+        }
+    }
+
+    #[test]
+    fn validate_providers_rejects_hashed_email_without_the_status_endpoint() {
+        for collect in ["page", "after_response"] {
+            let mut settings = settings_with_liveramp(collect, LIVERAMP_LOOKUP);
+            settings.ec.hashed_email = None;
+
+            let error = validate_providers(&settings)
+                .expect_err("should refuse hashed_email without [ec.hashed_email]");
+
+            assert!(
+                format!("{error:?}").contains("[ec.hashed_email] is not configured"),
+                "should name the missing endpoint for {collect}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_hashed_email_capable_kinds_accept_hashed_email_settings() {
+        for (kind, endpoint, sources, settings) in [
+            (
+                "id5",
+                Some("https://id5.example.com/gs/v2"),
+                json!(["id5.example.com"]),
+                json!({ "partner_id": 1234 }),
+            ),
+            (
+                "liveintent",
+                Some("https://li.example.com/idex"),
+                json!(["liveintent.com"]),
+                json!({ "resolve": ["nonId"] }),
+            ),
+            (
+                "liveramp",
+                Some("https://lr.example.com/api/identity/v2/envelope"),
+                json!(["liveramp.example.com"]),
+                json!({ "placement_id": 1 }),
+            ),
+            (
+                "connectid",
+                None,
+                json!(["connectid.example.com"]),
+                json!({}),
+            ),
+            ("uid2", None, json!(["uid2.example.com"]), json!({})),
+            ("sharedid", None, json!(["sharedid.example.com"]), json!({})),
+            ("criteo", None, json!(["criteo.example.com"]), json!({})),
+            (
+                "unifiedid",
+                None,
+                json!(["unifiedid.example.com"]),
+                json!({}),
+            ),
+        ] {
+            let mut settings = settings;
+            settings["hashed_email"] = json!({ "enabled": true, "path": ".hash" });
+            let config: IdentityProviderConfig = serde_json::from_value(json!({
+                "id": kind,
+                "kind": kind,
+                "endpoint": endpoint,
+                "allowed_domains": ["id5.example.com", "li.example.com", "lr.example.com"],
+                "sources": sources,
+                "settings": settings,
+            }))
+            .expect("should parse provider config");
+
+            let built = build(&config, &ProviderSecrets::default());
+
+            assert_eq!(
+                built.is_ok(),
+                uses_hashed_email(kind),
+                "should accept hashed_email settings only for capable kind {kind}"
+            );
+            if let Ok(provider) = built {
+                assert!(
+                    provider.hashed_email_path().is_some(),
+                    "should expose the path for {kind}"
+                );
+            }
         }
     }
 

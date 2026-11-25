@@ -32,8 +32,10 @@ import type { AuctionSlot, TsjsApi } from '../../core/types';
 import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace/runtime';
 import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
-import { mergeIdentityMirror } from './identity';
+import { installEcRouteClient, validEcRoute } from './ec_route';
+import { mergeIdentityMirror, readMirror, type MirrorEid } from './identity';
 import { installNativeIdCapture } from './native_capture';
+import { isPubcidOptedOut, syncPubcidOptOut } from './pubcid_optout';
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
   userIdConfigNameAliases,
@@ -202,6 +204,18 @@ interface InjectedPrebidConfig {
   excludedGamAdUnitPathSuffixes?: string[];
   /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
   managedUserIds?: InjectedManagedUserId[];
+  /** Same-origin EC route path; consent reporting stays off without it. */
+  ecRoute?: string;
+}
+
+/** SharedID's canonical EID source (SID-3). */
+const SHARED_ID_SOURCE = 'pubcid.org';
+
+/** Drops SharedID from mirrored IDs while the reader has opted out of it (SID-2). */
+function withoutOptedOutSharedId(eids: MirrorEid[]): MirrorEid[] {
+  return eids.length && isPubcidOptedOut()
+    ? eids.filter((eid) => eid.source !== SHARED_ID_SOURCE)
+    : eids;
 }
 
 /**
@@ -1902,26 +1916,71 @@ function removePublisherState(adUnitCode?: string | string[]): void {
   }
 }
 
-function collectAuctionEids(): AuctionEid[] | undefined {
-  if (typeof pbjs.getUserIdsAsEids !== 'function') {
+/**
+ * Reads the EIDs a publisher or identity SDK set through
+ * `pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })`.
+ *
+ * Prebid's client-side bid adapters receive these EIDs, but the User ID Module
+ * does not own them, so `getUserIdsAsEids()` never returns them.
+ */
+function readConfiguredOrtb2Eids(): unknown {
+  try {
+    const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
+    const ortb2 = getConfig?.call(pbjs, 'ortb2') as
+      | { user?: { ext?: { eids?: unknown } } }
+      | null
+      | undefined;
+    return ortb2?.user?.ext?.eids;
+  } catch {
+    // A failed config read must not drop the User ID Module EIDs.
     return undefined;
   }
+}
 
-  const rawEids = (pbjs.getUserIdsAsEids() ?? []) as PrebidUserIdEid[];
+/**
+ * Collects the EIDs to forward to `/auction` and the `ts-eids` cookie.
+ *
+ * User ID Module EIDs come first, and sources found only in
+ * `ortb2.user.ext.eids` follow, so the cookie's tail trim drops those
+ * config-only sources first. A source present in both is emitted once at its
+ * User ID Module position with the configured uids appended, and a uid id
+ * already seen for that source is skipped.
+ */
+function collectAuctionEids(): AuctionEid[] | undefined {
   const eids: AuctionEid[] = [];
+  const eidsBySource = new Map<string, AuctionEid>();
+  const userIdModuleEids =
+    typeof pbjs.getUserIdsAsEids === 'function' ? pbjs.getUserIdsAsEids() : undefined;
 
-  for (const eid of rawEids) {
-    if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+  for (const rawEids of [userIdModuleEids, readConfiguredOrtb2Eids()]) {
+    if (!Array.isArray(rawEids)) {
       continue;
     }
 
-    const uids = Array.isArray(eid.uids) ? eid.uids.map(sanitizeAuctionUid).filter(isDefined) : [];
+    for (const eid of rawEids as PrebidUserIdEid[]) {
+      if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+        continue;
+      }
 
-    if (uids.length === 0) {
-      continue;
+      const uids = Array.isArray(eid.uids)
+        ? eid.uids.map(sanitizeAuctionUid).filter(isDefined)
+        : [];
+
+      for (const uid of uids) {
+        let merged = eidsBySource.get(eid.source);
+        if (merged?.uids.some((existing) => existing.id === uid.id)) {
+          continue;
+        }
+
+        if (!merged) {
+          merged = { source: eid.source, uids: [] };
+          eidsBySource.set(eid.source, merged);
+          eids.push(merged);
+        }
+
+        merged.uids.push(uid);
+      }
     }
-
-    eids.push({ source: eid.source, uids });
   }
 
   return eids.length > 0 ? eids : undefined;
@@ -2330,13 +2389,26 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     }
   }
 
+  // Prebid also honors a localStorage SharedID opt-out the server cannot see;
+  // copy it into the cookie in both modes (SID-2).
+  syncPubcidOptOut();
+  document.addEventListener('visibilitychange', syncPubcidOptOut);
+  const ecRoutePath = validEcRoute(injected?.ecRoute, window.location);
+  const ecRoute =
+    ecRoutePath && typeof window.fetch === 'function'
+      ? installEcRouteClient(ecRoutePath, syncPubcidOptOut)
+      : undefined;
+
   if (merged.mode === 'identity') {
     const originalRequestBids = pbjs.requestBids;
     pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
       trySeedManagedUserIds?.();
       recordUserIdModuleDiagnostics();
       const opts = { ...(requestObj ?? {}) };
-      const ortb2 = mergeIdentityMirror(opts.ortb2, () => pbjs.getConfig('ortb2'));
+      const mirror = withoutOptedOutSharedId(
+        ecRoute ? ecRoute.client.mirrorSource() : readMirror()
+      );
+      const ortb2 = mergeIdentityMirror(opts.ortb2, () => pbjs.getConfig('ortb2'), mirror);
       if (ortb2 !== opts.ortb2) opts.ortb2 = ortb2 as typeof opts.ortb2;
       const originalBidsBack = opts.bidsBackHandler;
       opts.bidsBackHandler = function (...args: unknown[]) {
@@ -2348,7 +2420,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       return originalRequestBids.call(this, opts);
     };
     pbjs.processQueue();
-    installNativeIdCapture(() => syncPrebidEidsCookie(true));
+    installNativeIdCapture(() => {
+      syncPrebidEidsCookie(true);
+      syncPubcidOptOut();
+      ecRoute?.discover();
+    });
     recordUserIdModuleDiagnostics();
     return pbjs;
   }
@@ -2527,6 +2603,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
+    syncPubcidOptOut();
     trySeedManagedUserIds?.();
     recordUserIdModuleDiagnostics();
 
@@ -3098,9 +3175,9 @@ function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<s
 let nativeCaptureFailureWarned = false;
 
 /**
- * Collects EIDs from Prebid's User ID Module and writes them as a
- * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
- * and auction fallback on later requests.
+ * Collects EIDs from Prebid's User ID Module and `ortb2.user.ext.eids` config
+ * and writes them as a base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for
+ * backend ingestion and auction fallback on later requests.
  */
 function syncPrebidEidsCookie(onlyChanges = false): void {
   const currentValue = (): string | undefined =>

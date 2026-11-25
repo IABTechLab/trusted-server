@@ -11,7 +11,7 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -23,8 +23,6 @@ use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
-use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
-use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -212,6 +210,9 @@ fn build_state_with_services(
     mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Cloudflare)?;
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
     settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
@@ -507,6 +508,16 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx)?;
             let mut req = ctx.into_request()?;
+            if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+                // Reserve this path without an identity graph; never forward
+                // consent snapshots or acknowledge an unpersisted revocation.
+                return Ok(
+                    match IdentityApp::prepare_consent_update(&services, req).await {
+                        Ok(req) => state.identity.consent_update(&req),
+                        Err(response) => *response,
+                    },
+                );
+            }
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -617,6 +628,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // The core identity app registers `GET` on the admin EC and EIDs
         // lookups; without a record store, admin EC lookup answers 501.
         router = state.identity.mount(router);
+        let ec_state = Arc::clone(&state);
+        router = state.identity.mount_ec_route(router, move |context| {
+            ec_state.services_for_request(context)
+        });
         router = router
             .get(
                 "/.well-known/trusted-server.json",
@@ -656,8 +671,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
@@ -752,10 +766,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // adapter has no EC record store, so identify and batch sync answer 501
         // and any other method answers 405.
         let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
-            answer_identify_locally(&s.settings, &req)
+            s.identity.unavailable_identify(&req)
         });
-        let batch_sync = make_handler(Arc::clone(&state), |_s, _services, req| async move {
-            Ok(answer_batch_sync_locally(&req))
+        let batch_sync = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            Ok(s.identity.batch_sync(req).await)
         });
         for method in publisher_fallback_methods() {
             router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());
@@ -818,6 +832,28 @@ fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
+        for storage in [
+            serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
+        ] {
+            let mut settings = Settings::default();
+            settings.ec.storage =
+                Some(serde_json::from_value(storage).expect("should parse pure provider settings"));
+            let error = build_state_with_settings(settings)
+                .err()
+                .expect("should reject unsupported EC provider before route work");
+            assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
+        }
+        let mut settings = Settings::default();
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
+        assert!(
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
+    }
 
     #[test]
     fn enabled_identity_provider_fails_startup() {

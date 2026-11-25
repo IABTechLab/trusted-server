@@ -15,6 +15,7 @@ use edgezero_core::http::{
     HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
 };
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::ja4::Ja4Source;
 use edgezero_core::outbound::{ResponseDecoding, ResponseMode};
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
@@ -22,6 +23,9 @@ use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, PYTHON_JA4, captured_ja4, insert_ja4,
+};
 use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
     RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
@@ -1278,4 +1282,37 @@ async fn identify_and_batch_sync_answer_other_methods_405_locally() {
         "should answer every other method on the partner API paths with 405: {cases:?}"
     );
     origin.assert_no_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ec_route_creates_no_record_whatever_the_bot_management_ja4() {
+    // EdgeZero captures `cf.botManagement.ja4` as a runtime TLS JA4, but
+    // Cloudflare binds no EC record store yet, so the EC route answers 501
+    // before reading identity: neither a contradicting nor a matching JA4
+    // reaches the ID-7 rule, and no EC cookie is issued.
+    for ja4 in [CHROMIUM_JA4, PYTHON_JA4] {
+        let mut req = request_builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.example.com/_ts/api/v1/ec")
+            .header(header::ORIGIN, "https://test-publisher.example.com")
+            .header(header::USER_AGENT, CHROME_USER_AGENT)
+            .body(Body::empty())
+            .expect("should build EC request");
+        insert_ja4(
+            req.extensions_mut(),
+            captured_ja4(ja4, Ja4Source::RuntimeTls),
+        );
+
+        let resp = route(test_router(), req).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store for JA4 {ja4:?}"
+        );
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "should issue no identity cookie for JA4 {ja4:?}"
+        );
+    }
 }

@@ -3,9 +3,13 @@ pub(crate) mod body_read;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod identity_conformance;
 #[cfg(any(test, feature = "test-utils"))]
+pub mod ja4;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod logging;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod publisher_input_cap;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod record_ec;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod scripted_client;
 
