@@ -18,7 +18,7 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build the native adapter with `aws-dynamodb-ec`, which forwards to EdgeZero's default-off `aws-dynamodb-records` feature. For this adoption stage, `TS_EC_DYNAMODB_ENABLED=true` declares the EC record requirement before preparation. Absence or `false` leaves EC persistence disabled. Invalid values or selecting it without the compiled feature fail startup.
+Build the native adapter with `aws-dynamodb-ec`, which forwards to EdgeZero's default-off `aws-dynamodb-records` feature. For this adoption stage, `TRUSTED_SERVER__EC_DYNAMODB_ENABLED=true` declares the EC record requirement before preparation. Absence or `false` leaves EC persistence disabled. Invalid values or selecting it without the compiled feature fail startup.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 

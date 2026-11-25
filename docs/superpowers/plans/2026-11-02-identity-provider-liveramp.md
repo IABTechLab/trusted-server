@@ -4,7 +4,7 @@
 
 **Status:** Implemented; checkboxes are not updated.
 
-**Goal:** Store the LiveRamp RampID envelope the browser already sends in LiveRamp's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "liveramp"`. No login. With an `endpoint`, a visitor without an envelope cookie is also looked up server to server.
+**Goal:** Store the LiveRamp RampID envelope the browser already sends in LiveRamp's own first-party cookie, as an `[[ec.identity_providers]]` entry with `kind = "liveramp"`. With an `endpoint` and the hashed-email capability (`2026-11-25-identity-provider-hashed-email-capability.md`), a signed-in visitor without an envelope is looked up server to server by hashed email, and envelopes TS obtained are refreshed server side.
 
 **Architecture:** `crates/trusted-server-identity-providers/src/liveramp.rs` holds `LiveRamp` (a `ProviderKind`), `LiveRampSettings` and `LiveRampProvider`. The provider reads the envelope cookies in `IdentityProvider::read_request_cookies`; without an `endpoint`, `build_request` fails, so no lookup is sent. The coordinator reads cookies on every navigation (a cookie repeating the held UID is not rewritten) and applies consent, validation, expiry and persistence exactly as for lookup results.
 
@@ -21,7 +21,13 @@
 
 - One EID for the single configured source, one UID with `atype = 3`.
 - Expiry `ProviderExpiry::After(15 days)` through `bounded_expiry`.
-- Optional server lookup (with `endpoint`): `GET /api/identity/v2/envelope` with `pid` (`placement_id`), `it=15`, `iv=<custom_id_namespace>:<full EC ID>`, `atype=3` (server to server; `2` is the ATS API), consent as `ct`/`cv` (TCF `4`, else US Privacy `3`), `gpp` and `gpp_sid` (the first section ID only); headers `Origin` (publisher) and `X-Forwarded-For` (routable visitor IP, else no lookup). `200 {"envelopes":[{"type":19,"value":…}]}`: the `RampID` entry (`type` 19) is stored like the cookie, and a reply without one is no match; `204` is an opt-out; a blank envelope is no match; other statuses fail. Without `endpoint`, no server call. LiveRamp must enable Custom ID for the placement and approve the origin. LiveRamp resolves a Custom ID only through a mapping file the publisher sends it, which ties each Custom ID to a hashed email; without that file, or for an EC ID absent from it, the lookup finds nothing.
+- Optional server lookup (with `endpoint`, `placement_id` and `[settings.hashed_email]` enabled; each requires the others). Shared query: `pid` (`placement_id`), `atype=3` (server to server; `2` is the ATS API), consent as `ct`/`cv` (TCF `4`, else US Privacy `3`), `gpp` and `gpp_sid` (the first section ID only); headers `Origin` (publisher) and `X-Forwarded-For` (routable visitor IP, else no lookup). The EC ID is never sent, so the provider may run on the navigation that mints the EC.
+  - Envelope lookup, for a source without a live envelope when the provider got a hashed email (spec §8.7): `GET <endpoint>` with `it=4` and `iv=<hashed email>`, passed as the publisher returned it. The source's input is `SourceInput::HashedEmail`, so without a hashed email the coordinator skips it.
+  - Refresh, for a live stored envelope whose refresh state is due: `GET <endpoint>/refresh` with `it=19` and `iv=<stored envelope>`. Needs no hashed email.
+  - `200 {"envelopes":[{"type":19,"value":…}]}`: the `RampID` entry (`type` 19) is stored for 15 days with refresh state due `refresh_interval_secs` later (default 1800, LiveRamp's recommended 30 minutes); a reply without one is no match. `204` from the envelope API is an opt-out; `204` from the refresh API means LiveRamp no longer accepts the envelope: the stored envelope (carried in the request context, never sent) is rewritten without refresh state to expire one refresh interval later, after which the visitor is looked up by hashed email again. A blank envelope is no match; other statuses fail.
+  - Envelopes read from cookies carry no refresh state: ATS refreshes those in the browser.
+  - LiveRamp must approve the publisher origin for the placement.
+  - The Custom ID lookup (`it=15`, `custom_id_namespace`) is removed: LiveRamp resolves a Custom ID only through a mapping file that ties it to a hashed email.
 
 ## Lockr
 
@@ -29,11 +35,12 @@
 
 ## Not ported from the reference provider
 
-- Hashed-email and hashed-phone lookups (`it=4`, `it=11`): out of scope (no logged-in experience).
+- Hashed-phone lookups (`it=11`) and sending SHA-1 or MD5 hashes alongside SHA-256.
 
 ## Tasks
 
 - [x] Custom ID envelope lookup with `endpoint`, `placement_id` and `custom_id_namespace`, with tests.
+- [x] Replace the Custom ID lookup with the hashed-email envelope lookup (`it=4`) and the envelope refresh (`it=19`), with tests.
 
 - [ ] Add `cookie_capabilities`, `cookie_eid`, `is_usable_id` and `percent_decoded` to `common.rs`.
 - [ ] Add `liveramp.rs` and register the kind in `is_registered_kind` and `build`.

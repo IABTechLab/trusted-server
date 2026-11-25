@@ -8,7 +8,7 @@ use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 pub(crate) const STORE_ID: &str = "trusted_server_kv";
 
 fn selected() -> Result<bool, EdgeError> {
-    match std::env::var("TS_EC_DYNAMODB_ENABLED") {
+    match trusted_server_core::runtime_env!("TRUSTED_SERVER__EC_DYNAMODB_ENABLED") {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(value) if value == "false" => Ok(false),
         Ok(value) if value == "true" => Ok(true),

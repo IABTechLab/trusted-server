@@ -466,7 +466,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     AWS_EC2_METADATA_DISABLED: 'true',
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
-    TS_EC_DYNAMODB_ENABLED: 'true',
+    TRUSTED_SERVER__EC_DYNAMODB_ENABLED: 'true',
     TS_EC_DYNAMODB_REGION: 'us-east-1',
     TS_EC_DYNAMODB_TABLE: table,
     TS_EC_DYNAMODB_NAMESPACE: namespace,

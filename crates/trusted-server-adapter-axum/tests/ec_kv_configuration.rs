@@ -28,11 +28,11 @@ fn ec_kv_configuration_is_process_isolated() {
                 .env("AWS_EC2_METADATA_DISABLED", "true")
                 .envs(match case {
                     "absent" => Vec::new(),
-                    "false" => vec![("TS_EC_DYNAMODB_ENABLED", "false")],
-                    "empty" => vec![("TS_EC_DYNAMODB_ENABLED", "")],
-                    "uppercase" => vec![("TS_EC_DYNAMODB_ENABLED", "TRUE")],
-                    "numeric" => vec![("TS_EC_DYNAMODB_ENABLED", "1")],
-                    "selected" => vec![("TS_EC_DYNAMODB_ENABLED", "true")],
+                    "false" => vec![("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", "false")],
+                    "empty" => vec![("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", "")],
+                    "uppercase" => vec![("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", "TRUE")],
+                    "numeric" => vec![("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", "1")],
+                    "selected" => vec![("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", "true")],
                     _ => unreachable!("should select a known fixture"),
                 })
                 .output()

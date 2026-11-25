@@ -113,7 +113,17 @@ pub fn enforce_private_no_store(response: &mut Response) {
 }
 
 /// Marks a Trusted Server response as terminal-private and applies its cache policy.
-pub(crate) fn enforce_terminal_private_cache_privacy(response: &mut Response) {
+///
+/// # Examples
+///
+/// ```
+/// use edgezero_core::body::Body;
+/// use edgezero_core::http::Response;
+/// use trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy;
+/// let mut response = Response::new(Body::empty());
+/// enforce_terminal_private_cache_privacy(&mut response);
+/// ```
+pub fn enforce_terminal_private_cache_privacy(response: &mut Response) {
     enforce_private_no_store(response);
     response.extensions_mut().insert(TerminalPrivateResponse);
 }
@@ -213,6 +223,13 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     // pre-apply pass could not see. Re-run the downgrade so the final response
     // can never pair Set-Cookie with shared cacheability.
     enforce_set_cookie_cache_privacy(response);
+    if response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some()
+    {
+        enforce_private_no_store(response);
+    }
 }
 
 /// Logs one warning for each configured response header that
@@ -272,6 +289,36 @@ mod tests {
 
     use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
     use crate::test_support::logging::LogCapture;
+
+    #[test]
+    fn proxy_policy_terminal_privacy_survives_operator_validators() {
+        let settings = settings_with_response_headers(&[
+            ("cache-control", "public, max-age=3600"),
+            ("etag", "reader-specific"),
+            ("expires", "Wed, 01 Jan 2031 00:00:00 GMT"),
+        ]);
+        let mut response = response_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        enforce_terminal_private_cache_privacy(&mut response);
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should not restore public caching"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should not restore identity response validators"
+        );
+        assert!(
+            !response.headers().contains_key(header::EXPIRES),
+            "should not restore identity response expiry"
+        );
+    }
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
