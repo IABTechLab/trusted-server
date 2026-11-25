@@ -35,6 +35,7 @@ import {
   userIdConfigNameAliases,
   userIdSubmoduleKey,
 } from './user_id_modules';
+import { createRelayConsentGuard } from './relay_consent';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -187,6 +188,8 @@ interface InjectedPrebidConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
+  /** Opt-in relay basic-ads soft vendor exception for testing. Defaults to false. */
+  relaySoftVendorException?: boolean;
   /** Validated browser bidder route codes owned by the server auction plan. */
   serverSideBidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
@@ -2478,6 +2481,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   });
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
+  const prepareRelayConsent = createRelayConsentGuard(
+    ADAPTER_CODE,
+    (key) => (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig?.(key),
+    (value) => pbjs.setConfig(value as PbjsConfig)
+  );
 
   // Browser demand ownership is explicit. Only validated auction-plan route
   // codes are folded; every other publisher bidder entry remains in Prebid.js.
@@ -2657,6 +2665,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     };
 
     try {
+      if (adUnits.length > 0 && injected?.relaySoftVendorException === true) {
+        prepareRelayConsent();
+      }
       return originalRequestBids(opts);
     } catch (error) {
       for (const [adUnitCode, token] of firstImpressionTokens) {
