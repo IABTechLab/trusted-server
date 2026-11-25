@@ -73,7 +73,9 @@ pub fn run_show(args: &ShowArgs, out: &mut impl std::io::Write) -> CliResult<()>
     if !response.status.is_success() {
         let explanation = match response.status.as_u16() {
             401 => UNAUTHORIZED_HINT,
-            404 => " — no record for this EC ID",
+            404 => {
+                " — no record for this EC ID, or this service may predate the EC lookup endpoint"
+            }
             501 => {
                 " — this deployment has no EC identity graph; only the Fastly adapter holds \
                  one, and only when an EC store is configured"
@@ -215,8 +217,14 @@ mod tests {
         })));
 
         assert!(report.contains("Tombstone:  no"), "got: {report}");
-        assert!(report.contains("Store:      ec_store (generation 7)"));
-        assert!(report.contains("Auction EIDs (1):\n  live.example: uid-live (atype 3)"));
+        assert!(
+            report.contains("Store:      ec_store (generation 7)"),
+            "should show the store and generation, got: {report}"
+        );
+        assert!(
+            report.contains("Auction EIDs (1):\n  live.example: uid-live (atype 3)"),
+            "should list the auction EIDs, got: {report}"
+        );
         assert!(
             report.contains("off.example: bidstream_disabled (the partner has bidstream_enabled"),
             "should explain a known reason, got: {report}"
@@ -233,14 +241,20 @@ mod tests {
             "ec_id": "id", "store": "s", "generation": 1, "tombstone": true,
             "auction": {"eids": [], "skipped": []}
         })));
-        assert!(tombstone.contains("Tombstone:  yes (consent withdrawn"));
+        assert!(
+            tombstone.contains("Tombstone:  yes (consent withdrawn"),
+            "should spell out a tombstone, got: {tombstone}"
+        );
 
         let corrupt = render(&lookup(serde_json::json!({
             "ec_id": "id", "store": "s", "generation": 1,
             "entry_error": "failed to parse entry JSON", "raw_body": "{"
         })));
         assert!(corrupt.contains("Tombstone:  unknown"), "got: {corrupt}");
-        assert!(corrupt.contains("Entry error: failed to parse entry JSON"));
+        assert!(
+            corrupt.contains("Entry error: failed to parse entry JSON"),
+            "should show the entry error, got: {corrupt}"
+        );
         assert!(
             corrupt.contains("Auction preview: none"),
             "should say no EIDs would be attached, got: {corrupt}"

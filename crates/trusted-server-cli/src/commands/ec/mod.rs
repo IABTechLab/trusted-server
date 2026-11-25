@@ -110,23 +110,35 @@ fn json_passthrough(body: &str) -> String {
     }
 }
 
-/// Escape response control characters before placing a value in a terminal report.
+/// Escape response control and invisible formatting characters before placing a value in
+/// a terminal report.
 ///
 /// Escape only data fields, so the report's own line breaks and JSON passthrough stay
 /// unchanged. Cookie decoding can produce controls even when the cookie itself is ASCII.
+/// Bidirectional overrides and zero-width characters are not controls, but they can
+/// reorder or hide part of a UID on screen, so they are escaped too.
 fn terminal_text(value: &str) -> Cow<'_, str> {
-    if !value.chars().any(char::is_control) {
+    if !value.chars().any(needs_terminal_escape) {
         return Cow::Borrowed(value);
     }
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
-        if character.is_control() {
+        if needs_terminal_escape(character) {
             escaped.extend(character.escape_debug());
         } else {
             escaped.push(character);
         }
     }
     Cow::Owned(escaped)
+}
+
+/// Whether a character could change terminal state or how a value reads on screen.
+fn needs_terminal_escape(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
 }
 
 /// Write the rendered report, mapping an I/O failure to a CLI error.
@@ -170,5 +182,38 @@ mod tests {
             "{}\n",
             "should not double the newline"
         );
+    }
+
+    #[test]
+    fn terminal_text_escapes_bidi_overrides_and_invisible_characters() {
+        for character in [
+            '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            let value = format!("uid{character}cba");
+
+            let escaped = terminal_text(&value);
+
+            assert_eq!(
+                escaped,
+                format!("uid\\u{{{:x}}}cba", u32::from(character)),
+                "should escape U+{:04X} as text",
+                u32::from(character)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_text_escapes_controls_and_borrows_plain_text() {
+        assert_eq!(
+            terminal_text("uid\n\u{1b}[2J"),
+            r"uid\n\u{1b}[2J",
+            "should escape controls"
+        );
+        for plain in ["uid-fictional", "café\u{200A}\u{2010}\u{202F}\u{2065}"] {
+            assert!(
+                matches!(terminal_text(plain), Cow::Borrowed(_)),
+                "should leave characters outside the escaped ranges unchanged: {plain:?}"
+            );
+        }
     }
 }

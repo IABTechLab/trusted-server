@@ -261,11 +261,18 @@ mod tests {
 
         let report = render(&preview);
 
-        assert!(report.contains("ts-eids cookie:  received, 1 EID source(s) parsed"));
-        assert!(report.contains("sharedId cookie: not received by the service"));
-        assert!(report.contains("Matched partner IDs (1):\n  configured.example: uid-1"));
-        assert!(report.contains("unknown.example: no_partner (no configured partner"));
-        assert!(report.contains("empty.example: no_valid_uid (every UID is empty"));
+        for expected in [
+            "ts-eids cookie:  received, 1 EID source(s) parsed",
+            "sharedId cookie: not received by the service",
+            "Matched partner IDs (1):\n  configured.example: uid-1",
+            "unknown.example: no_partner (no configured partner",
+            "empty.example: no_valid_uid (every UID is empty",
+        ] {
+            assert!(
+                report.contains(expected),
+                "should contain {expected:?}, got: {report}"
+            );
+        }
     }
 
     #[test]
@@ -287,7 +294,10 @@ mod tests {
             ),
             "should escape diagnostic text, got: {report:?}"
         );
-        assert!(report.contains("Matched partner IDs (0):"));
+        assert!(
+            report.contains("Matched partner IDs (0):"),
+            "should still list zero matches, got: {report}"
+        );
     }
 
     #[test]

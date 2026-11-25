@@ -111,7 +111,7 @@ fn run_to_string(command: EcCommand) -> (Result<(), String>, String) {
     let outcome = with_password(Some("admin-pass"), || run(command, &mut out));
     (
         outcome,
-        String::from_utf8(out).expect("output should be UTF-8"),
+        String::from_utf8(out).expect("should write UTF-8 output"),
     )
 }
 
@@ -139,8 +139,12 @@ fn show_requests_the_lookup_route_with_credentials_and_summarizes_the_record() {
     let (outcome, rendered) =
         run_to_string(EcCommand::Show(show_args(server.url(""), &ec_id(), false)));
 
-    outcome.expect("a 200 lookup should exit zero");
-    assert_eq!(server.request_count(), 1);
+    outcome.expect("should succeed for a 200 lookup");
+    assert_eq!(
+        server.request_count(),
+        1,
+        "should send exactly one lookup request"
+    );
     assert!(rendered.contains("Tombstone:  no"), "got: {rendered}");
     assert!(
         rendered.contains("configured.example: uid-live (atype 3)"),
@@ -182,7 +186,7 @@ fn show_refuses_a_malformed_ec_id_before_sending_anything() {
             run_to_string(EcCommand::Show(show_args(server.url(""), &bad, false)));
         let error = outcome.expect_err("should refuse a malformed EC ID");
         assert!(error.contains("invalid EC ID"), "got: {error}");
-        assert!(rendered.is_empty());
+        assert!(rendered.is_empty(), "should print nothing for {bad:?}");
     }
     assert_eq!(
         server.request_count(),
@@ -196,23 +200,29 @@ fn show_explains_not_found_unsupported_and_unauthorized() {
     for (status, body, expected) in [
         (
             404u16,
-            r#"{"error":"EC entry not found"}"#,
-            "no record for this EC ID",
+            serde_json::json!({"error": "EC entry not found"}).to_string(),
+            "no record for this EC ID, or this service may predate the EC lookup endpoint",
         ),
         (
             501,
-            r#"{"error":"EC identity graph is not configured on this deployment"}"#,
+            serde_json::json!({"error": "EC identity graph is not configured on this deployment"})
+                .to_string(),
             "only the Fastly adapter",
         ),
-        (401, "Unauthorized", "TRUSTED_SERVER_ADMIN_PASSWORD"),
+        (
+            401,
+            "Unauthorized".to_owned(),
+            "TRUSTED_SERVER_ADMIN_PASSWORD",
+        ),
     ] {
-        let server =
-            FixtureServer::start(move |_request| FixtureResponse::html(body).with_status(status));
+        let server = FixtureServer::start(move |_request| {
+            FixtureResponse::html(body.clone()).with_status(status)
+        });
 
         let (outcome, rendered) =
             run_to_string(EcCommand::Show(show_args(server.url(""), &ec_id(), false)));
 
-        let error = outcome.expect_err("a refused lookup must exit non-zero");
+        let error = outcome.expect_err("should exit non-zero for a refused lookup");
         assert!(
             error.contains(expected),
             "a {status} should explain itself, got: {error}"
@@ -242,15 +252,18 @@ fn show_does_not_follow_redirects() {
 
     let (outcome, _) = run_to_string(EcCommand::Show(show_args(server.url(""), &ec_id(), false)));
 
-    assert!(outcome.is_err());
+    assert!(outcome.is_err(), "should refuse a redirect");
     assert_eq!(server.request_count(), 1, "should not follow the redirect");
 }
 
 #[test]
 fn eids_sends_the_values_as_the_requests_cookies_and_lists_matches() {
     let server = FixtureServer::start(|request| {
-        assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/_ts/admin/eids");
+        assert_eq!(request.method, "GET", "should use GET");
+        assert_eq!(
+            request.path, "/_ts/admin/eids",
+            "should request the EIDs diagnostic route"
+        );
         assert_eq!(
             request.header("cookie"),
             Some("ts-eids=eyJmaWN0aW9uYWwiOnRydWV9; sharedId=shared-fictional"),
@@ -297,7 +310,11 @@ fn a_non_default_username_is_sent_with_the_password() {
     let (outcome, _) = run_to_string(EcCommand::Show(args));
 
     outcome.expect("should succeed");
-    assert_eq!(server.request_count(), 1);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "should send exactly one lookup request"
+    );
 }
 
 #[test]
@@ -321,16 +338,25 @@ fn eids_json_prints_the_full_response_unchanged() {
 #[test]
 fn eids_explains_a_refusal_and_prints_nothing() {
     for (status, body, expected) in [
-        (401u16, "Unauthorized", "TRUSTED_SERVER_ADMIN_PASSWORD"),
+        (
+            401u16,
+            "Unauthorized".to_owned(),
+            "TRUSTED_SERVER_ADMIN_PASSWORD",
+        ),
         (
             404,
-            r#"{"error":"admin diagnostic route not found"}"#,
+            serde_json::json!({"error": "admin diagnostic route not found"}).to_string(),
             "predate the EIDs diagnostic endpoint",
         ),
-        (500, "Internal Server Error", "Internal Server Error"),
+        (
+            500,
+            "Internal Server Error".to_owned(),
+            "Internal Server Error",
+        ),
     ] {
-        let server =
-            FixtureServer::start(move |_request| FixtureResponse::html(body).with_status(status));
+        let server = FixtureServer::start(move |_request| {
+            FixtureResponse::html(body.clone()).with_status(status)
+        });
 
         let (outcome, rendered) = run_to_string(EcCommand::Eids(eids_args(
             server.url(""),
@@ -338,7 +364,7 @@ fn eids_explains_a_refusal_and_prints_nothing() {
             Some("shared-fictional"),
         )));
 
-        let error = outcome.expect_err("a refused preview must exit non-zero");
+        let error = outcome.expect_err("should exit non-zero for a refused preview");
         assert!(
             error.contains(expected),
             "a {status} should explain itself, got: {error}"
@@ -354,7 +380,11 @@ fn eids_requires_a_cookie_value_before_touching_the_service() {
     let (outcome, _) = run_to_string(EcCommand::Eids(eids_args(server.url(""), None, None)));
 
     assert!(outcome.is_err(), "should require --ts-eids or --shared-id");
-    assert_eq!(server.request_count(), 0);
+    assert_eq!(
+        server.request_count(),
+        0,
+        "should not contact the service without a cookie value"
+    );
 }
 
 #[test]
@@ -382,7 +412,11 @@ fn both_commands_need_the_password_from_the_environment() {
             "got: {error}"
         );
     }
-    assert_eq!(server.request_count(), 0);
+    assert_eq!(
+        server.request_count(),
+        0,
+        "should not contact the service without a password"
+    );
 }
 
 #[test]
@@ -401,7 +435,7 @@ fn both_commands_refuse_plaintext_remote_services() {
     for (outcome, rendered) in [show, eids] {
         let error = outcome.expect_err("should refuse plaintext remote transport");
         assert!(error.contains("HTTPS"), "got: {error}");
-        assert!(rendered.is_empty());
+        assert!(rendered.is_empty(), "should print nothing");
     }
 }
 

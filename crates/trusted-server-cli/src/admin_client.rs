@@ -243,9 +243,13 @@ mod tests {
     fn error_text_prefers_the_json_error_field() {
         let json = AdminResponse {
             status: StatusCode::NOT_FOUND,
-            body: r#"{"error":"EC entry not found"}"#.to_owned(),
+            body: serde_json::json!({"error": "EC entry not found"}).to_string(),
         };
-        assert_eq!(json.error_text(), "EC entry not found");
+        assert_eq!(
+            json.error_text(),
+            "EC entry not found",
+            "should read the JSON error field"
+        );
 
         let plain = AdminResponse {
             status: StatusCode::UNAUTHORIZED,
