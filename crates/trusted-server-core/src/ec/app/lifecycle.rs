@@ -12,13 +12,14 @@ use crate::constants::{
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use crate::ec::consent::ec_consent_withdrawn;
 use crate::ec::device::DeviceSignals;
-use crate::ec::finalize::ec_finalize_response;
+use crate::ec::eid_types::UnixSeconds;
+use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_backend::EcKvStore;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::SharedIdRequest;
-use crate::ec::{EcContext, EidSyncSource};
+use crate::ec::{EcContext, EidSyncSource, checked_current_timestamp};
 use crate::error::{TrustedServerError, http_error};
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
@@ -145,6 +146,9 @@ impl IdentityApp {
     /// Core-generated EC, configured `SharedID` and mirror expiries may accompany
     /// every finalized response (S2S design §10, WB-1). Origin identity cookies
     /// are filtered first on ineligible responses; every expiry remains private.
+    ///
+    /// Reads the clock at most once, and only for a navigation with an
+    /// eligible, non-redirect response.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -177,13 +181,23 @@ impl IdentityApp {
             self.filter_ineligible_identity_cookies(response, false);
         }
         let graph = self.identity_graph().filter(|_| use_store);
+        // Only a navigation with an eligible response uses the request time,
+        // so other responses never read the clock or log its failure.
+        let now = (context.has_navigation_permit()
+            && !NavigationPermit::is_redirect(response.status()))
+        .then(checked_current_timestamp)
+        .flatten()
+        .map(UnixSeconds::new);
         ec_finalize_response(
             &self.settings,
             context,
             graph.as_ref(),
             &self.partners,
-            eids_cookie,
-            sharedid,
+            &FinalizeRequest {
+                eids_cookie,
+                sharedid,
+                now,
+            },
             response,
         )
         .await;

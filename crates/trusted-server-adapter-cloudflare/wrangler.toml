@@ -17,8 +17,8 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled", "enable_weak_ref
 command = "bash build.sh"
 
 [[kv_namespaces]]
-binding = "TRUSTED_SERVER_KV"
-# Run `wrangler kv:namespace create TRUSTED_SERVER_KV` and paste the returned
+binding = "TRUSTED_SERVER_RUNTIME_KV"
+# Run `wrangler kv:namespace create TRUSTED_SERVER_RUNTIME_KV` and paste the returned
 # id here before `wrangler deploy` or `wrangler dev --remote`.
 # `wrangler dev --local` (Miniflare default) tolerates this placeholder.
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"

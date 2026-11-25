@@ -28,8 +28,10 @@ hosts = ["*"]
 # have to match any one platform's names. `default` is the primary logical id.
 
 [stores.kv]
-ids = ["trusted_server_kv"]
-default = "trusted_server_kv"
+# `trusted_server_kv` is the logical record store for EC records that
+# `[ec.storage]` selects; generic runtime KV is `trusted_server_runtime_kv`.
+ids = ["trusted_server_runtime_kv", "trusted_server_kv"]
+default = "trusted_server_runtime_kv"
 
 [stores.config]
 ids = ["trusted_server_config"]

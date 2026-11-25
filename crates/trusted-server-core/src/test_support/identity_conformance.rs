@@ -1556,8 +1556,19 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let mirrored = adapter.exchange(&post);
     let mirror: serde_json::Value =
         serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let mut eids = mirror["eids"].clone();
+    let exp = eids[0]["uids"][0]
+        .as_object_mut()
+        .and_then(|uid| uid.remove("exp"))
+        .and_then(|exp| exp.as_u64())
+        .expect("should give a UID without stated expiry a numeric exp");
+    let now = now_deciseconds() / 10;
+    assert!(
+        exp > now && exp <= now + 30 * 24 * 60 * 60,
+        "should mirror a UID without stated expiry with an expiry within 30 days: exp={exp}, now={now}"
+    );
     assert_eq!(
-        mirror["eids"],
+        eids,
         serde_json::json!([{"source":"mirror.example.com","uids":[{"id":"allowed-mirror-id","atype":1}]}]),
         "should expose only the live mirrored provider UID"
     );

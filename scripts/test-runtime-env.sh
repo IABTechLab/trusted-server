@@ -177,7 +177,7 @@ const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY, os); }
 RS
 done
-for key in TS_EXAMPLE TS_NATIVE_GEO_PROFILE_FILE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__; do
+for key in TS_EXAMPLE TS_NATIVE_GEO_PROFILE_FILE TRUSTED_SERVER_CONFIG_EXAMPLE TRUSTED_SERVER_SECRET_EXAMPLE OTHER_EXAMPLE TRUSTED_SERVER_ TRUSTED_SERVER__ EDGEZERO__EXAMPLE EDGEZERO__ADAPTER__GEO__OTHER; do
     check "checked_$key" fail 'runtime environment name is not allowed' <<RS
 const KEY: &str = "$key";
 pub fn read() { let _ = helper::runtime_env!(KEY); }

@@ -14,6 +14,7 @@ use crate::checked_app_config::{
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::config::proxy::{ProxyCommand, run_proxy};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
@@ -86,6 +87,9 @@ enum ConfigCommand {
     AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
+    /// Explain creative proxy destination and disclosure policy.
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
@@ -155,6 +159,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Audit(args) => run_audit(&args),
         Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
         Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
+        Command::Config(ConfigCommand::Proxy(args)) => run_proxy(&args),
         Command::Config(ConfigCommand::Init(args)) => {
             run_config_init(&args).map(|()| RunOutcome::Success)
         }
