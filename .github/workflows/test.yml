@@ -165,6 +165,9 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Run protected CloudFront Geo tests
+        run: cargo test --locked -p trusted-server-adapter-axum --features geo-cloudfront
+
       - name: Verify finalization harness process cleanup
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime
 

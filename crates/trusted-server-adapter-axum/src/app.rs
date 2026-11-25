@@ -155,8 +155,8 @@ where
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
-/// users. Geo comes from the platform (a no-op on the local Axum dev server, so
-/// jurisdiction stays Unknown there unless the request carries TCF consent). A
+/// users. Geo comes from the immutable managed request snapshot. Off, untrusted
+/// or unavailable results remain Unknown unless real consent supplies it. A
 /// malformed consent string is logged and falls back to the default
 /// (fail-closed) context rather than being silently swallowed.
 fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
@@ -574,7 +574,10 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
             }),
-            kv: None,
+            kv: crate::native_geo::kv_selected().then_some(StoreMetadata {
+                default: crate::native_geo::GEO_STORE_ID,
+                ids: &[crate::native_geo::GEO_STORE_ID],
+            }),
         }
     }
 }
