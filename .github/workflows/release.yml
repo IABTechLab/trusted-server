@@ -103,3 +103,130 @@ jobs:
           # would exit 0 without publishing.
           test "$(node --version)" = "v$NODE_VERSION"
           node publisher/scripts/release/publish.mjs
+  # Mirrors the published release into GHCR: one OCI artifact per binary with
+  # its SPDX SBOM and Sigstore bundles. An existing tag is refused unless it
+  # already holds exactly the release files; GHCR tags stay mutable.
+  packages:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PACKAGE_PUBLICATION_ENABLED == 'true'
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Run only the package publisher and the asset list it imports.
+      - uses: actions/checkout@v5
+        with:
+          path: publisher
+          persist-credentials: false
+          sparse-checkout: |
+            .tool-versions
+            scripts/release/publish.mjs
+            scripts/release/packages.mjs
+            scripts/release/release-notes.md
+          sparse-checkout-cone-mode: false
+      - name: Read pinned Node version
+        id: tools
+        run: echo "node=$(awk '$1 == "nodejs" { print $2 }' publisher/.tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned GitHub CLI and oras
+        env:
+          GH_VERSION: 2.102.0
+          GH_SHA256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+          ORAS_VERSION: 1.3.4
+          ORAS_SHA256: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+        run: |
+          set -euo pipefail
+          gh_archive="gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${gh_archive}" \
+            --output "$RUNNER_TEMP/$gh_archive"
+          printf '%s  %s\n' "$GH_SHA256" "$RUNNER_TEMP/$gh_archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$gh_archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64/bin" >> "$GITHUB_PATH"
+          oras_archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${oras_archive}" \
+            --output "$RUNNER_TEMP/$oras_archive"
+          printf '%s  %s\n' "$ORAS_SHA256" "$RUNNER_TEMP/$oras_archive" | sha256sum --check
+          mkdir "$RUNNER_TEMP/oras"
+          tar -xzf "$RUNNER_TEMP/$oras_archive" -C "$RUNNER_TEMP/oras" oras
+          echo "$RUNNER_TEMP/oras" >> "$GITHUB_PATH"
+      - name: Check the release, then push and verify each package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          PACKAGE_PUBLICATION_ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
+          NODE_VERSION: ${{ steps.tools.outputs.node }}
+        run: |
+          set -euo pipefail
+          test "$(gh --version | head -1 | cut -d' ' -f3)" = 2.102.0
+          test "$(oras version | sed -n 's/^Version: *//p')" = 1.3.4
+          test "$(node --version)" = "v$NODE_VERSION"
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          node publisher/scripts/release/packages.mjs
+  # Builds the Axum server image from the tagged source and pushes it to GHCR
+  # with GitHub build provenance. It is an ordinary build, outside the
+  # reproducible release cohort. If a push or attestation fails, delete the
+  # package version before re-running; see the maintainer checklist.
+  axum-image:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PACKAGE_PUBLICATION_ENABLED == 'true'
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build, push and record the image digest
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/trusted-server-axum"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          # GHCR tags are mutable; refuse to replace one at publish time. Only
+          # the registry's not-found answer counts as absent.
+          if lookup="$(docker buildx imagetools inspect "$image:$RELEASE_TAG" 2>&1)"; then
+            echo "Refusing to overwrite $image:$RELEASE_TAG" >&2
+            exit 1
+          elif ! grep -qF -- "$image:$RELEASE_TAG: not found" <<< "$lookup"; then
+            echo "Cannot check whether $image:$RELEASE_TAG exists: $lookup" >&2
+            exit 1
+          fi
+          docker buildx build \
+            --file crates/trusted-server-adapter-axum/Dockerfile \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --build-arg "TRUSTED_SERVER_VERSION=$SOURCE_COMMIT" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            --label "org.opencontainers.image.description=Trusted Server on Axum $RELEASE_TAG (development status)" \
+            --tag "$image:$RELEASE_TAG" \
+            --metadata-file "$RUNNER_TEMP/image.json" \
+            --push .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image.json")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker buildx imagetools inspect "$image:$RELEASE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')" = "$digest"
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest the image's build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true

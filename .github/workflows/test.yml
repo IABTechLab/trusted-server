@@ -124,6 +124,39 @@ jobs:
           path: ${{ runner.temp }}/trusted-server-finalize-fastly-*/
           if-no-files-found: ignore
 
+  axum-image:
+    name: Axum image smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: cargo-axum-image
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # The smoke builds the `ts` CLI, whose core dependency runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
+
+      - name: Build the Axum image
+        run: |
+          docker buildx build --load \
+            --file crates/trusted-server-adapter-axum/Dockerfile \
+            --tag trusted-server-axum:smoke .
+
+      - name: Run the Axum smoke against the image
+        run: AXUM_SMOKE_IMAGE=trusted-server-axum:smoke ./scripts/smoke-axum.sh
+
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest

@@ -1,0 +1,16 @@
+# Build context for crates/trusted-server-adapter-axum/Dockerfile. Keep the
+# workspace sources; drop history, build output, local secrets and docs.
+.git
+**/target
+**/node_modules
+**/dist
+.env*
+!.env.example
+trusted-server.toml
+.ts-write-*
+js-assets.toml
+.edgezero
+.claude
+.wolf
+docs
+tinybird

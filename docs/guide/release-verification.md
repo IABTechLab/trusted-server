@@ -302,6 +302,78 @@ copy that verified file into a directory on their `PATH` as `ts` and make it
 executable. Verify before first execution. Individual commands may still require
 a source checkout and provider tools; see [CLI](./cli.md).
 
+## Download from GitHub Packages
+
+When a maintainer enables package publication, each release also appears in
+the repository's **Packages** list. These packages copy the release; they add no
+new trust. Verify the files you pull exactly as you verify release downloads.
+
+| Package                 | Tag              | Contents                                                           |
+| ----------------------- | ---------------- | ------------------------------------------------------------------ |
+| `trusted-server-cli`    | `<tag>-<target>` | `ts-<target>`, its SPDX SBOM and both Sigstore bundles             |
+| `trusted-server-fastly` | `<tag>`          | the wasm, its `.tar.gz` package, SBOM, both bundles, rebuild check |
+| `trusted-server-axum`   | `<tag>`          | Axum server container image for `linux/amd64` (development status) |
+
+Pulling the CLI and Fastly packages needs ORAS 1.2 or
+later; the image needs Docker with Buildx. Neither tool is trusted: the
+commands below verify what they fetched. The CLI and Fastly packages are OCI
+artifacts, not runnable images. Each file
+is one layer, and each layer's digest is that file's SHA-256 from the release's
+`SHA256SUMS`. The packages job downloads the published release, authenticates
+its `SHA256SUMS`, checks every file against it, then pushes. At publish time it
+refuses to replace a tag that holds anything else, but GHCR tags stay mutable:
+always verify the files you pulled, or an image by its digest, never a tag
+alone.
+
+```bash
+set -euo pipefail
+# Take REPO, TAG and COMMIT from your independent source review.
+REPO=Example-Org/trusted-server
+TAG=v1.2.3
+COMMIT=0123456789abcdef0123456789abcdef01234567
+TARGET=x86_64-unknown-linux-gnu
+OWNER=$(printf '%s' "${REPO%%/*}" | tr '[:upper:]' '[:lower:]')
+asset="ts-$TARGET"
+oras pull "ghcr.io/$OWNER/trusted-server-cli:$TAG-$TARGET" --output pulled
+cd pulled
+gh attestation verify "$asset" --repo "$REPO" --bundle "$asset.provenance.sigstore.json" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+  --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPO/.github/workflows/release-build.yml"
+gh release verify-asset "$TAG" "$asset" --repo "$REPO"
+```
+
+The final command confirms the pulled bytes are the published release asset. To
+check the SBOM too, run the per-asset loop from
+[Download and verify](#download-and-verify) in the `pulled` directory. `oras
+pull` needs no login for a public package.
+
+The Fastly package carries `trusted-server-fastly.tar.gz`, the archive that
+[Deploy the verified Fastly package](#deploy-the-verified-fastly-package)
+deploys. The wasm's provenance and SBOM bundles cover it. Pull
+`trusted-server-fastly:$TAG` the same way, then complete that section's checks
+on the pulled files, including `gh release verify-asset` for the archive, before
+deployment.
+
+The Axum image is an ordinary build of the tagged source, and Axum itself is
+still development status. The image is outside the reproducible release cohort:
+no rebuild check, SBOM or release asset covers it, only GitHub build provenance
+attached to the image digest. Resolve the digest once, verify it, then run that
+digest, so a tag moved in between cannot swap the image:
+
+```bash
+image="ghcr.io/$OWNER/trusted-server-axum"
+digest=$(docker buildx imagetools inspect "$image:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+gh attestation verify "oci://$image@$digest" --repo "$REPO" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" \
+  --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPO/.github/workflows/release.yml"
+echo "Run $image@$digest"
+```
+
+See [Axum development server](./axum-dev#run-the-container-image) for running it.
+
 ## Deploy the verified Fastly package
 
 Download `trusted-server-fastly.tar.gz` with the other release assets and complete the provenance, SPDX, release-membership and checksum checks above before deployment. Both build jobs package their own wasm with the tracked `scripts/release/fastly.toml`: exactly `manifest_version = 3` and `name = "trusted-server-fastly"`. It contains no service ID, configuration, build hooks or credentials. The release gate compares the complete normalized tar/gzip bytes as well as the wasm; signing and publication refuse either mismatch. Owner/group, timestamp, paths, member order and permissions are fixed independently of the packing host.
@@ -558,6 +630,19 @@ commands below only inspect settings; this workflow applies none of them.
   release build it gets. A later `main` push cancels an older run that is still
   waiting in the workflow's concurrency group; re-run a cancelled run before
   tagging its commit. Phase 1 does not enforce source eligibility.
+- **Settings → Secrets and variables → Actions → Variables:** set
+  `PACKAGE_PUBLICATION_ENABLED` to `true` to mirror releases into GitHub
+  Packages. First rehearse the exact commit in a separate repository with the
+  variable set there, and confirm the `packages` and `axum-image` jobs pass on
+  packages that did not exist before. Without it, the `packages` and `axum-image` jobs are skipped and the
+  release is unaffected. After the first package publish, check each package's
+  visibility under the organization's **Packages** settings; make it public
+  only when the release is public. If the `packages` job fails partway, re-run
+  it: tags that already hold exactly the release files are kept and the rest
+  are pushed, and any tag with other content stops the job. If `axum-image`
+  fails after its push (for example in attestation), delete that package
+  version under **Packages** before re-running, because the job refuses an
+  existing tag.
 - Push the commit to a branch, normally `main`, before pushing its lightweight
   tag. The build `checks` job refuses a tagged commit that is on no branch,
   before anything is built or signed: in fork rehearsals, draft creation
