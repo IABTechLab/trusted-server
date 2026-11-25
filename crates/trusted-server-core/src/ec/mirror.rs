@@ -63,8 +63,9 @@ impl MirrorValue {
 /// Holds live, provider-written UIDs of partners with both
 /// `bidstream_enabled` and `mirror_enabled` while no TCF vendor gating the
 /// source is denied consent, no provider excludes it where GDPR applies for
-/// this visitor and no provider's cookies on this request record an opt-out
-/// for it, in partner config order, as unpadded base64url JSON
+/// this visitor, no enabled owner of it or its `SharedID` alias has an active
+/// opt-out in the row and no provider's cookies on this request record an
+/// opt-out for it, in partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. Every UID carries `exp`: its stated expiry,
 /// capped at the start of `now`'s UTC day plus 30 days, or that cap when it
 /// states none. Every mirrored UID therefore expires within 30 days (WB-4).
@@ -97,13 +98,16 @@ pub fn build_mirror(
     // page while a TCF vendor gating its source (that of any configured
     // provider claiming it, enabled or disabled) is denied consent, or while
     // a provider excludes its source where GDPR applies, as it never reaches
-    // the bidstream (`KvEntry::live_eids`). Nor while the provider's cookies
-    // on this request record an opt-out the row may not reflect yet.
+    // the bidstream (`KvEntry::live_eids`). Nor while any enabled owner of
+    // the source has an active opt-out in the row, even when another owner
+    // wrote the UID, nor while the provider's cookies on this request record
+    // an opt-out the row may not reflect yet.
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
             && partner.mirror_enabled
             && !partner.owner_vendor_consent_denied(consent)
             && !partner.excluded_for(consent)
+            && !partners.source_owner_opted_out(&partner.source_domain, row, now)
             && !ec_context.source_opted_out_in_cookies(&partner.source_domain)
     }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
@@ -884,6 +888,66 @@ mod tests {
         assert!(
             matches!(both, MirrorCookie::Set(_)),
             "should mirror the source once every gating vendor has consent"
+        );
+    }
+
+    #[test]
+    fn withholds_uids_while_another_owner_remembers_an_opt_out() {
+        // Arrange: providers `a` and `b` both own the source. `a` has a
+        // remembered opt-out until 2000, then `b` wrote a UID.
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            serde_json::from_value(json!({
+                "name": "ids", "source_domain": "ids.example.com",
+                "bidstream_enabled": true, "mirror_enabled": true
+            }))
+            .expect("should build partner"),
+        ];
+        ec.identity_providers = ["a", "b"]
+            .map(|id| {
+                toml::from_str(&format!(
+                    "id = \"{id}\"\nkind = \"k\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]"
+                ))
+                .expect("should parse provider")
+            })
+            .to_vec();
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let mut entry = row(vec![KvUid::new(
+            UidValue::try_from("from-b").expect("should build"),
+            AgentType::try_from(1).expect("should build"),
+            None,
+            Some(ProviderId::new("b")),
+            Expiry::Never,
+        )]);
+        entry.opt_outs.insert(ProviderId::new("a"), 2000);
+        let consent = granting();
+        let ec_context = context(granting());
+        let (active, lapsed) = (UnixSeconds::new(1000), UnixSeconds::new(2000));
+
+        // Act
+        let withheld = build_mirror(Some(&entry), &ec_context, &registry, active);
+        let kept = build_mirror(Some(&entry), &ec_context, &registry, lapsed);
+
+        // Assert
+        assert_eq!(
+            entry.live_eids(&registry, &consent, active).count(),
+            0,
+            "should withhold the source from the bidstream while `a` is opted out"
+        );
+        assert_eq!(
+            withheld,
+            MirrorCookie::Expire,
+            "should not mirror `b`'s UID while `a` has an active opt-out, as the bidstream does not"
+        );
+        assert_eq!(
+            entry.live_eids(&registry, &consent, lapsed).count(),
+            1,
+            "should send the source once `a`'s opt-out lapses"
+        );
+        assert!(
+            matches!(kept, MirrorCookie::Set(_)),
+            "should mirror `b`'s UID once `a`'s opt-out lapses"
         );
     }
 

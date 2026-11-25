@@ -1916,26 +1916,71 @@ function removePublisherState(adUnitCode?: string | string[]): void {
   }
 }
 
-function collectAuctionEids(): AuctionEid[] | undefined {
-  if (typeof pbjs.getUserIdsAsEids !== 'function') {
+/**
+ * Reads the EIDs a publisher or identity SDK set through
+ * `pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })`.
+ *
+ * Prebid's client-side bid adapters receive these EIDs, but the User ID Module
+ * does not own them, so `getUserIdsAsEids()` never returns them.
+ */
+function readConfiguredOrtb2Eids(): unknown {
+  try {
+    const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
+    const ortb2 = getConfig?.call(pbjs, 'ortb2') as
+      | { user?: { ext?: { eids?: unknown } } }
+      | null
+      | undefined;
+    return ortb2?.user?.ext?.eids;
+  } catch {
+    // A failed config read must not drop the User ID Module EIDs.
     return undefined;
   }
+}
 
-  const rawEids = (pbjs.getUserIdsAsEids() ?? []) as PrebidUserIdEid[];
+/**
+ * Collects the EIDs to forward to `/auction` and the `ts-eids` cookie.
+ *
+ * User ID Module EIDs come first, and sources found only in
+ * `ortb2.user.ext.eids` follow, so the cookie's tail trim drops those
+ * config-only sources first. A source present in both is emitted once at its
+ * User ID Module position with the configured uids appended, and a uid id
+ * already seen for that source is skipped.
+ */
+function collectAuctionEids(): AuctionEid[] | undefined {
   const eids: AuctionEid[] = [];
+  const eidsBySource = new Map<string, AuctionEid>();
+  const userIdModuleEids =
+    typeof pbjs.getUserIdsAsEids === 'function' ? pbjs.getUserIdsAsEids() : undefined;
 
-  for (const eid of rawEids) {
-    if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+  for (const rawEids of [userIdModuleEids, readConfiguredOrtb2Eids()]) {
+    if (!Array.isArray(rawEids)) {
       continue;
     }
 
-    const uids = Array.isArray(eid.uids) ? eid.uids.map(sanitizeAuctionUid).filter(isDefined) : [];
+    for (const eid of rawEids as PrebidUserIdEid[]) {
+      if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+        continue;
+      }
 
-    if (uids.length === 0) {
-      continue;
+      const uids = Array.isArray(eid.uids)
+        ? eid.uids.map(sanitizeAuctionUid).filter(isDefined)
+        : [];
+
+      for (const uid of uids) {
+        let merged = eidsBySource.get(eid.source);
+        if (merged?.uids.some((existing) => existing.id === uid.id)) {
+          continue;
+        }
+
+        if (!merged) {
+          merged = { source: eid.source, uids: [] };
+          eidsBySource.set(eid.source, merged);
+          eids.push(merged);
+        }
+
+        merged.uids.push(uid);
+      }
     }
-
-    eids.push({ source: eid.source, uids });
   }
 
   return eids.length > 0 ? eids : undefined;
@@ -3130,9 +3175,9 @@ function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<s
 let nativeCaptureFailureWarned = false;
 
 /**
- * Collects EIDs from Prebid's User ID Module and writes them as a
- * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
- * and auction fallback on later requests.
+ * Collects EIDs from Prebid's User ID Module and `ortb2.user.ext.eids` config
+ * and writes them as a base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for
+ * backend ingestion and auction fallback on later requests.
  */
 function syncPrebidEidsCookie(onlyChanges = false): void {
   const currentValue = (): string | undefined =>

@@ -786,6 +786,13 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
+EIDs that a publisher or an identity SDK sets directly with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })` are not User ID Module
+output, so `pbjs.getUserIdsAsEids()` does not return them. The shim also reads
+`ortb2.user.ext.eids` from the Prebid config and appends those EIDs after the
+User ID Module ones. A source present in both is forwarded once with its uids
+merged, and a uid already seen for that source is skipped.
+
 User ID submodule inclusion comes from `bundle.modules.user_id`. The available
 modules and default preset are checked in at
 `crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`.
@@ -1062,7 +1069,7 @@ not passed by this implementation.
 
 Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` and the `ortb2.user.ext.eids` Prebid config in the browser and sent in the `/auction` request body.
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.

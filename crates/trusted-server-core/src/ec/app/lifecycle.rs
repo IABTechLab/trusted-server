@@ -12,6 +12,7 @@ use crate::constants::{
     COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_MIRROR,
 };
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
+use crate::ec::consent::ec_consent_withdrawn;
 use crate::ec::device::DeviceSignals;
 use crate::ec::eid_types::UnixSeconds;
 use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
@@ -114,6 +115,10 @@ impl IdentityApp {
 
     /// Prepares identity creation on a publisher document navigation.
     ///
+    /// A client refused creation gets no navigation write permission, so its
+    /// existing EC is never refreshed and no browser EIDs or `SharedID` are
+    /// ingested for it.
+    ///
     /// Call only after publisher route selection and request filters succeed.
     pub async fn prepare_navigation(
         &self,
@@ -121,7 +126,8 @@ impl IdentityApp {
         request: &Request,
         allowed: bool,
     ) {
-        if !is_navigation_request(request)
+        if !allowed
+            || !is_navigation_request(request)
             || (matches!(*request.method(), Method::GET | Method::HEAD)
                 && self
                     .settings
@@ -422,13 +428,23 @@ fn cookie_value(request: &Request, name: &str) -> Option<String> {
 }
 
 impl IdentityRequest {
+    /// Whether finalization may write this request's identity record.
+    ///
+    /// Only clients allowed to create identity write, except that a consent
+    /// withdrawal always reaches the store so its tombstone stays authoritative.
+    #[must_use]
+    pub fn store_writes_allowed(&self) -> bool {
+        self.creation_allowed || ec_consent_withdrawn(self.context.consent())
+    }
+
     /// Commits this request's identity state before releasing the response.
     pub async fn finalize(mut self, app: &IdentityApp, mut response: Response) -> Response {
+        let use_store = self.store_writes_allowed();
         app.finalize(
             &mut self.context,
             self.eids_cookie.as_deref(),
             &self.sharedid,
-            true,
+            use_store,
             &mut response,
         )
         .await;
@@ -440,19 +456,27 @@ impl IdentityApp {
     /// Registers shared follow-up identity work with the runtime's drained task API.
     ///
     /// Outbound futures are created inside the task's fresh outbound scope.
+    ///
+    /// Registers nothing when there is no work or finalize issued no follow-up
+    /// permit, so a skipped navigation never holds the shutdown drain. The
+    /// permit stays in `context` for [`Self::run_after_response_lookups`].
+    ///
+    /// Returns whether a task was registered. A missing scheduler or a rejected
+    /// registration is logged and drops the work without running it.
+    #[must_use = "returns whether follow-up work was registered; failures are already logged"]
     pub fn schedule_after_response(
         self: &Arc<Self>,
         mut context: EcContext,
         work: Option<super::AfterResponseLookups>,
         scheduler: Option<edgezero_core::after_response::AfterResponseHandle>,
         client: edgezero_core::outbound::HttpClient,
-    ) {
-        if work.is_none() {
-            return;
+    ) -> bool {
+        if work.is_none() || !context.has_after_response_permit() {
+            return false;
         }
         let Some(scheduler) = scheduler else {
             log::error!("Identity follow-up requires the runtime after-response capability");
-            return;
+            return false;
         };
         let app = Arc::clone(self);
         let budget =
@@ -462,16 +486,18 @@ impl IdentityApp {
                 .await;
         }) {
             log::error!("Identity follow-up registration fails: {error}");
+            return false;
         }
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::cookie_value;
-    use crate::ec::EcContext;
     use crate::ec::app::{IdentityApp, IdentityPlatform};
     use crate::ec::device::DeviceSignals;
+    use crate::ec::{EcContext, EidSyncSource};
     use crate::platform::test_support::noop_services;
     use crate::platform::{ClientInfo, RuntimeServices};
     use crate::settings::{BrowserGate, Ja4ContradictionExempt, ProxyAssetRoute};
@@ -676,7 +702,7 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build publisher request");
             let mut context = EcContext::default();
-            block_on(app.prepare_navigation(&mut context, &request, false));
+            block_on(app.prepare_navigation(&mut context, &request, true));
             assert_eq!(
                 context.has_navigation_permit(),
                 method == edgezero_core::http::Method::POST,
@@ -935,6 +961,65 @@ mod tests {
             !identity.creation_allowed,
             "should derive from the ingress JA4, not trust signals a caller supplied"
         );
+    }
+
+    #[test]
+    fn refused_creation_gets_no_navigation_write_authority() {
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build identity app");
+        for allowed in [false, true] {
+            let request = http::Request::builder()
+                .method(edgezero_core::http::Method::GET)
+                .uri("/article")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build publisher navigation");
+            let mut context = EcContext::default();
+            block_on(app.prepare_navigation(&mut context, &request, allowed));
+            assert_eq!(
+                context.has_navigation_permit(),
+                allowed,
+                "should grant a navigation permit only when creation is allowed"
+            );
+            assert_eq!(
+                context.eid_sync_source(),
+                allowed.then_some(EidSyncSource::Navigation),
+                "should mark browser EID ingestion only when creation is allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_creation_writes_only_a_consent_withdrawal() {
+        for (creation_allowed, withdrawn, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let mut context = EcContext::default();
+            if withdrawn {
+                let consent = context.consent_mut();
+                consent.jurisdiction =
+                    crate::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned());
+                consent.gpc = true;
+            }
+            let identity = super::IdentityRequest {
+                context,
+                graph: None,
+                creation_allowed,
+                eids_cookie: None,
+                sharedid: crate::ec::sharedid::SharedIdRequest::default(),
+            };
+            assert_eq!(
+                identity.store_writes_allowed(),
+                expected,
+                "should decide store writes for creation_allowed={creation_allowed}, withdrawn={withdrawn}"
+            );
+        }
     }
 
     #[test]

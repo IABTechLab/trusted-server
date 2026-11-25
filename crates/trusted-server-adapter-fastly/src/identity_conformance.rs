@@ -22,9 +22,9 @@ use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
     Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
-    verify_failed_ec_creation, verify_http_contract,
+    verify_failed_ec_creation, verify_http_contract, verify_known_non_browser_navigation,
 };
-use trusted_server_core::test_support::ja4::insert_ja4;
+use trusted_server_core::test_support::ja4::{PYTHON_JA4, insert_ja4};
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
@@ -305,7 +305,15 @@ impl FastlyAdapter {
                 request,
                 |_request, extensions| {
                     values.prepare(extensions, &self.settings, &queue);
-                    if let Some(ja4) = navigation.ja4 {
+                    // A known non-browser API client sends a browser
+                    // User-Agent over a non-browser TLS stack, whose runtime
+                    // JA4 the shared gate refuses.
+                    let ja4 = if api.is_some_and(|request| request.known_non_browser) {
+                        Some(PYTHON_JA4)
+                    } else {
+                        navigation.ja4
+                    };
+                    if let Some(ja4) = ja4 {
                         extensions.insert(FixtureTlsJa4(ja4));
                     }
                     extensions.insert(HttpClient::with_client(origin));
@@ -401,6 +409,12 @@ fn identity_conformance_fastly() {
     let store = RecordingStore::new(true);
     let mut adapter = FastlyAdapter::new(store.clone());
     verify_failed_ec_creation(&mut adapter, &store);
+}
+
+#[test]
+fn known_non_browser_navigation_fastly() {
+    let store = RecordingStore::new(false);
+    verify_known_non_browser_navigation(&mut FastlyAdapter::new(store.clone()), &store);
 }
 
 #[test]

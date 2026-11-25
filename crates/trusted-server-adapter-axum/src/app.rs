@@ -11,7 +11,7 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -23,6 +23,9 @@ use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
+};
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
@@ -76,12 +79,13 @@ pub(crate) fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     settings
         .ec
         .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Native)?;
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -242,7 +246,10 @@ async fn dispatch_ec_route(
     };
     // Borrows of the graph and context remain local to this request. Neither
     // the non-Send graph nor a response snapshot enters shared App extensions.
-    let graph = ec.graph.as_ref().filter(|_| ec.creation_allowed);
+    // A client refused creation keeps the graph so bidders receive only an EC
+    // with a consented row; its writes are gated separately below.
+    let graph = ec.graph.as_ref();
+    let use_store = ec.store_writes_allowed();
     let auction = AuctionDispatch {
         integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
@@ -257,8 +264,11 @@ async fn dispatch_ec_route(
             handle_auction(
                 &state.settings,
                 &state.orchestrator,
-                graph,
-                Some(state.identity.partners()),
+                AuctionIdentity {
+                    graph,
+                    registry: Some(state.identity.partners()),
+                    persist_body: ec.creation_allowed,
+                },
                 &mut ec.context,
                 services,
                 req,
@@ -359,11 +369,12 @@ async fn dispatch_ec_route(
             &mut ec.context,
             ec.eids_cookie.as_deref(),
             &ec.sharedid,
-            true,
+            use_store,
             &mut response,
         )
         .await;
-    state.identity.schedule_after_response(
+    // Registration failures are logged inside; the response is sent either way.
+    let _registered = state.identity.schedule_after_response(
         ec.context,
         after_response,
         scheduler,
@@ -620,7 +631,10 @@ fn named_route_handler(
                         }
                     }
                     NamedRouteHandler::FirstPartyProxy => {
-                        handle_first_party_proxy(&state.settings, &services, req).await
+                        // The shared identity read supplies the consented EC
+                        // that proxy disclosure policy may forward, as on Fastly.
+                        let ec = state.identity.read_request(&services, &req)?;
+                        handle_first_party_proxy(&state.settings, &services, &ec.context, req).await
                     }
                     NamedRouteHandler::FirstPartyClick => {
                         handle_first_party_click(&state.settings, &services, req).await
@@ -653,6 +667,24 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
+/// Returns a [`RouterService`] that preserves probes and returns generic 503s on ordinary routes.
+///
+/// The native initializer installs it when initialization fails. The failure
+/// is never read, so no detail of it reaches a response.
+pub(crate) fn startup_error_router(_error: &dyn core::fmt::Debug) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.method());
+        async move { Ok::<Response, EdgeError>(response) }
+    };
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
+    }
+    router.build()
+}
+
 // ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
@@ -671,7 +703,8 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        // The prepared-store initializer installs the complete router before listening.
+        // The prepared-store initializer installs the complete router, or the
+        // failure router when initialization fails, before listening.
         Ok(RouterService::builder().build())
     }
 
@@ -824,10 +857,13 @@ pub(crate) fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 );
             }
         })
-        .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-            Arc::clone(&state.settings),
-            Arc::new(move |request| trace_metadata(&trace_state, request)),
-        )))
+        .pre_dispatch_hook(ProbePreDispatchHook::new(
+            StartupState::Ready,
+            Some(Arc::new(TracePreDispatchHook::new(
+                Arc::clone(&state.settings),
+                Arc::new(move |request| trace_metadata(&trace_state, request)),
+            ))),
+        ))
         // Outermost middleware: strips the configured trusted-client-IP
         // headers before anything else sees the request. Must stay first —
         // any middleware registered ahead of it would observe the
@@ -835,16 +871,6 @@ pub(crate) fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
-
-    router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
-        Ok::<Response, EdgeError>(
-            edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-                .body(edgezero_core::body::Body::from("ok"))
-                .expect("should build health response"),
-        )
-    });
 
     // The core identity app registers `GET` on the admin EC and EIDs lookups;
     // without a record store, admin EC lookup answers 501. Their other methods
@@ -1330,5 +1356,85 @@ mod trace_dispatch_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }

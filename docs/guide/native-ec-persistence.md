@@ -32,7 +32,7 @@ provider = "records"
 store = "trusted_server_kv"
 ```
 
-A configured record reference must already have the declared layout and capability before initialization. An undeclared store ID or raw binding is an error, not permission to construct a provider late. Obsolete `TS_EC_RECORDS_ENABLED` and `TS_EC_DYNAMODB_ENABLED` switches are no longer read; migrate to the declared logical store and EdgeZero binding. Omitting `ec.storage` leaves identity without a graph, while the declared provider is still prepared. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+A configured record reference must already have the declared layout and capability before initialization. An undeclared store ID or raw binding is an error, not permission to construct a provider late. Obsolete `TRUSTED_SERVER__EC_RECORDS_ENABLED` and `TRUSTED_SERVER__EC_DYNAMODB_ENABLED` switches are no longer read; migrate to the declared logical store and EdgeZero binding. Omitting `ec.storage` leaves identity without a graph, while the declared provider is still prepared. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 

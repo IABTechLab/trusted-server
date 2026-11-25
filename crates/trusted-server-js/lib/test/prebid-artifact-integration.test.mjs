@@ -331,10 +331,11 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // Trace lifecycle, identity capture and EC route consent reporting keep the
-    // shim below 66.5 KB. Importing the separate Prebid runtime (above 200 KB)
-    // must fail this guard.
-    expect(shimCode.length).toBeLessThan(66_500);
+    // Trace lifecycle, identity capture, EC route consent reporting and merging
+    // `ortb2.user.ext.eids` into the auction EIDs keep the shim below 67 KB: it
+    // measures 66,572 characters, 428 below the guard. Importing the separate
+    // Prebid runtime (above 200 KB) must fail this guard.
+    expect(shimCode.length).toBeLessThan(67_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
