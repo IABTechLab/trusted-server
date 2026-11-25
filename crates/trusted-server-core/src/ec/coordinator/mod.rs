@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::Report;
+use web_time::Instant;
 
 use self::results::{LookupResults, LookupStatus, OptOutMemory, ProviderLookup, SkipReason};
 use self::transport::{LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse};
@@ -27,14 +28,14 @@ use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeco
 use crate::ec::generation::ec_hash;
 use crate::ec::kv_types::{KvEid, KvEntry, KvUid, opt_out_uid_hash};
 use crate::ec::provider::{
-    ClientSignals, CookieRead, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries,
-    ProviderConfigError, ProviderEid, ProviderResponse, RequestCookies, SourceInput,
-    destination_allowed, parse_sources, validate_enabled_configs,
+    ClientSignals, CookieRead, HashedEmail, IdentityProvider, LookupInput, LookupOutcome,
+    OwnedEntries, ProviderConfigError, ProviderEid, ProviderRequest, ProviderResponse,
+    RequestCookies, SourceInput, destination_allowed, parse_sources, validate_enabled_configs,
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
 
-use crate::settings::IdentityProviderConfig;
+use crate::settings::{HashedEmailSource, IdentityProviderConfig};
 
 /// Coordinates server-side identity lookups for one navigation.
 ///
@@ -46,7 +47,12 @@ use crate::settings::IdentityProviderConfig;
 /// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
-    /// Starts lookups for every eligible provider without waiting.
+    /// Starts lookups for every eligible provider without waiting for them.
+    ///
+    /// When a provider would use a hashed email, it first awaits the one
+    /// publisher status call (spec §8.7), at most its `timeout_ms`. The call
+    /// and the lookups share the coordinator's budget: lookups get what the
+    /// call left. Callers run this beside the origin fetch, not before it.
     ///
     /// Returns empty pending lookups when no provider is enabled; skipped
     /// providers are recorded and reported by [`Self::collect`].
@@ -202,6 +208,24 @@ pub struct ProviderCoordinator<P = Box<dyn IdentityProvider>> {
     /// Partner config: `openrtb_atype` for validation.
     partners: Arc<PartnerRegistry>,
     budget: Duration,
+    /// The publisher's hashed-email status endpoint (spec §8.7).
+    hashed_email: Option<StatusEndpoint>,
+}
+
+/// The validated `[ec.hashed_email]` endpoint.
+struct StatusEndpoint {
+    url: url::Url,
+    timeout: Duration,
+}
+
+/// A provider that passed eligibility, consent, cookie and opt-out checks
+/// and still has due sources, before its request is built.
+struct Prepared {
+    provider: ProviderIndex,
+    due: Vec<SourceDomain>,
+    /// Due sources that need a hashed email: dropped when none arrives.
+    held: Vec<SourceDomain>,
+    cookie_uids: Vec<String>,
 }
 
 impl<P: IdentityProvider> ProviderCoordinator<P> {
@@ -243,7 +267,59 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             providers,
             partners,
             budget,
+            hashed_email: None,
         })
+    }
+
+    /// Sets the publisher endpoint that returns a signed-in visitor's hashed
+    /// email (`[ec.hashed_email]`, spec §8.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderConfigError::Invalid`] when `source`'s endpoint is
+    /// not `https` with a host, when a registered provider reads a hashed
+    /// email and `source` is `None`, or when such a provider is registered
+    /// and `source`'s `timeout_ms` is not below this coordinator's budget,
+    /// which the status call shares with the lookups.
+    pub fn with_hashed_email_source(
+        mut self,
+        source: Option<&HashedEmailSource>,
+    ) -> Result<Self, Report<ProviderConfigError>> {
+        let Some(source) = source else {
+            if let Some(registered) = self
+                .providers
+                .iter()
+                .find(|registered| registered.provider.hashed_email_path().is_some())
+            {
+                return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                    "provider `{}` enables hashed_email but [ec.hashed_email] is not configured",
+                    registered.id
+                )));
+            }
+            self.hashed_email = None;
+            return Ok(self);
+        };
+        let url = source.endpoint_url().ok_or_else(|| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach("ec.hashed_email.endpoint must be an https URL with a host")
+        })?;
+        let timeout = Duration::from_millis(source.timeout_ms);
+        if timeout >= self.budget
+            && let Some(registered) = self
+                .providers
+                .iter()
+                .find(|registered| registered.provider.hashed_email_path().is_some())
+        {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "ec.hashed_email.timeout_ms ({} ms) must be below the identity budget ({} ms) \
+                 that provider `{}` shares with the status call",
+                source.timeout_ms,
+                self.budget.as_millis(),
+                registered.id
+            )));
+        }
+        self.hashed_email = Some(StatusEndpoint { url, timeout });
+        Ok(self)
     }
 
     fn register(
@@ -327,15 +403,16 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Claimed sources lacking a live provider-written UID (a browser
-    /// fallback does not count), minus sources needing input V1
-    /// never has; the flag reports whether any source was removed for input.
+    /// fallback does not count), in source order, and the subset of them
+    /// that needs a hashed email (spec §8.7). A refresh-due source never
+    /// needs one.
     fn due_sources(
         registered: &Registered<P>,
         entry: Option<&KvEntry>,
         now: UnixSeconds,
-    ) -> (Vec<SourceDomain>, bool) {
+    ) -> (Vec<SourceDomain>, Vec<SourceDomain>) {
         let capabilities = registered.provider.capabilities();
-        let mut input_blocked = false;
+        let mut held = Vec::new();
         let mut due = Vec::new();
         for source in &registered.policy.sources {
             let record = entry
@@ -356,12 +433,105 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 .find(|capability| capability.source == *source)
                 .is_some_and(|capability| capability.input != SourceInput::Anonymous);
             if needs_input {
-                input_blocked = true;
-                continue;
+                held.push(source.clone());
             }
             due.push(source.clone());
         }
-        (due, input_blocked)
+        (due, held)
+    }
+
+    /// Whether a prepared provider would use a hashed email on this
+    /// navigation: it reads one and has a due source that is not merely
+    /// refresh-due.
+    fn wants_hashed_email(
+        &self,
+        prepared: &Prepared,
+        entry: Option<&KvEntry>,
+        now: UnixSeconds,
+    ) -> bool {
+        let registered = &self.providers[prepared.provider.get()];
+        registered.provider.hashed_email_path().is_some()
+            && prepared
+                .due
+                .iter()
+                .any(|source| !Self::refresh_due(registered, entry, source, now))
+    }
+
+    /// Calls the publisher's status endpoint once and returns its JSON body,
+    /// or `None` when it gives no usable reply (spec §8.7).
+    ///
+    /// The call carries the visitor's whole `Cookie` header; a request
+    /// without cookies cannot be signed in, so it makes no call. Neither the
+    /// body nor any hashed email is logged.
+    async fn hashed_email_status<T: LookupTransport>(
+        &self,
+        transport: &T,
+        cookies: RequestCookies<'_>,
+        tag: ProviderIndex,
+    ) -> Option<serde_json::Value> {
+        let endpoint = self.hashed_email.as_ref()?;
+        let cookie_header = cookies.header().trim();
+        if cookie_header.is_empty() {
+            log::debug!("Identity lookup: hashed email status skipped: no cookies");
+            return None;
+        }
+        let Ok(mut cookie) = http::HeaderValue::from_str(cookie_header) else {
+            log::debug!("Identity lookup: hashed email status skipped: invalid Cookie header");
+            return None;
+        };
+        cookie.set_sensitive(true);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(http::header::COOKIE, cookie);
+        let request = ProviderRequest {
+            method: http::Method::GET,
+            url: endpoint.url.clone(),
+            headers,
+            body: bytes::Bytes::new(),
+            context: None,
+        };
+        let in_flight = transport.start(
+            vec![Tagged {
+                provider: tag,
+                value: request,
+            }],
+            endpoint.timeout,
+        );
+        let response = transport.gather(in_flight).await.into_iter().next()?.value;
+        match response {
+            Ok(response) if response.status.is_success() => {
+                match serde_json::from_slice(&response.body) {
+                    Ok(body) => {
+                        log::debug!(
+                            "Identity lookup: hashed email status status={}",
+                            response.status
+                        );
+                        Some(body)
+                    }
+                    Err(_) => {
+                        log::debug!("Identity lookup: hashed email status reply is not JSON");
+                        None
+                    }
+                }
+            }
+            Ok(response) => {
+                log::debug!(
+                    "Identity lookup: hashed email status status={}",
+                    response.status
+                );
+                None
+            }
+            Err(report) => {
+                log::debug!(
+                    "Identity lookup: hashed email status failed: {}",
+                    report.current_context()
+                );
+                None
+            }
+        }
     }
 
     /// The provider's sources it may not collect or keep for this request:
@@ -563,6 +733,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
         let mut requests = Vec::new();
+        let mut prepared = Vec::new();
         for (index, registered) in self.providers.iter().enumerate() {
             let provider = ProviderIndex::new(index);
             let skip = |reason| Tagged {
@@ -596,8 +767,16 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
             let mut opted_back_in = false;
             let mut cookie_uids = Vec::new();
-            let (mut due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
+            let (mut due, mut held) = Self::due_sources(registered, entry, lookup.now);
+            let input_blocked = !held.is_empty();
             due.retain(|source| !excluded.contains(source));
+            held.retain(|source| due.contains(source));
+            // Without a hashed-email endpoint, or for a provider that reads
+            // no hashed email, a source that needs one is never looked up.
+            if self.hashed_email.is_none() || registered.provider.hashed_email_path().is_none() {
+                due.retain(|source| !held.contains(source));
+                held.clear();
+            }
             // The vendor's own first-party cookies are read on every
             // navigation, so an opt-out or a changed ID is noticed while the
             // sources still hold live UIDs. Their IDs stand in for a lookup.
@@ -719,6 +898,56 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 }));
                 continue;
             }
+            // Cookies may have filled a source that needed a hashed email.
+            held.retain(|source| due.contains(source));
+            prepared.push(Prepared {
+                provider,
+                due,
+                held,
+                cookie_uids,
+            });
+        }
+        // The status endpoint is called at most once, before any lookup is
+        // built, and only when a provider would use its answer. Its time
+        // comes out of the lookups' budget, so the phase keeps one deadline.
+        let (status, spent) = match prepared
+            .iter()
+            .find(|prepared| self.wants_hashed_email(prepared, entry, lookup.now))
+        {
+            Some(first) => {
+                let started = Instant::now();
+                let status = self
+                    .hashed_email_status(transport, lookup.cookies, first.provider)
+                    .await;
+                (status, started.elapsed())
+            }
+            None => (None, Duration::ZERO),
+        };
+        for Prepared {
+            provider,
+            mut due,
+            held,
+            cookie_uids,
+        } in prepared
+        {
+            let registered = &self.providers[provider.get()];
+            let skip = |reason| Tagged {
+                provider,
+                value: LookupStatus::Skipped(reason),
+            };
+            let hashed_email = registered
+                .provider
+                .hashed_email_path()
+                .zip(status.as_ref())
+                .and_then(|(path, body)| path.read(body))
+                .and_then(HashedEmail::new);
+            if hashed_email.is_none() && !held.is_empty() {
+                due.retain(|source| !held.contains(source));
+                if due.is_empty() {
+                    pending.early.push(skip(SkipReason::Input));
+                    continue;
+                }
+            }
             let input = LookupInput {
                 ec_id: lookup.ec_id,
                 consent: lookup.consent,
@@ -731,7 +960,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     .at(lookup.now)
                     .where_gdpr_applies(lookup.consent.gdpr_applies),
                 now: lookup.now,
-                hashed_email: None,
+                hashed_email: hashed_email.as_ref(),
             };
             if let Some(mut eids) = registered.provider.generate(&input) {
                 // Only a due source without a live UID may take a generated
@@ -791,7 +1020,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         // under one cutoff.
         if !requests.is_empty() {
             pending.started = requests.len();
-            pending.in_flight = Some(transport.start(requests, self.budget));
+            pending.in_flight = Some(transport.start(requests, self.budget.saturating_sub(spent)));
         }
         pending
     }
@@ -1198,47 +1427,86 @@ mod tests {
         }
     }
 
+    /// The hashed-email status endpoint the tests configure.
+    const STATUS_URL: &str = "https://status.example.com/user";
+
     /// Answers every request with a canned result, recording the URLs sent.
+    /// Requests to [`STATUS_URL`] get the status reply instead.
     struct CannedTransport {
         reply: Reply,
+        status: Reply,
         sent: RefCell<Vec<String>>,
+        /// The `Cookie` header and cutoff of each status call.
+        status_calls: RefCell<Vec<(Option<String>, Duration)>>,
+        /// The cutoff of each lookup batch.
+        lookup_budgets: RefCell<Vec<Duration>>,
+        /// How long the status reply takes to arrive.
+        status_delay: Duration,
     }
 
     impl CannedTransport {
         fn new(reply: Reply) -> Self {
+            Self::with_status(reply, not_found_reply)
+        }
+
+        fn with_status(reply: Reply, status: Reply) -> Self {
             Self {
                 reply,
+                status,
                 sent: RefCell::default(),
+                status_calls: RefCell::default(),
+                lookup_budgets: RefCell::default(),
+                status_delay: Duration::ZERO,
             }
         }
     }
 
     impl LookupTransport for CannedTransport {
-        type Pending = Vec<ProviderIndex>;
+        type Pending = Vec<(ProviderIndex, bool)>;
 
         fn start(
             &self,
             requests: Vec<Tagged<ProviderRequest>>,
-            _budget: Duration,
-        ) -> Vec<ProviderIndex> {
+            budget: Duration,
+        ) -> Vec<(ProviderIndex, bool)> {
+            if requests
+                .first()
+                .is_some_and(|request| request.value.url.as_str() != STATUS_URL)
+            {
+                self.lookup_budgets.borrow_mut().push(budget);
+            }
             requests
                 .into_iter()
                 .map(|Tagged { provider, value }| {
+                    let is_status = value.url.as_str() == STATUS_URL;
+                    if is_status {
+                        let cookie = value
+                            .headers
+                            .get(http::header::COOKIE)
+                            .and_then(|cookie| cookie.to_str().ok())
+                            .map(str::to_owned);
+                        self.status_calls.borrow_mut().push((cookie, budget));
+                    }
                     self.sent.borrow_mut().push(value.url.to_string());
-                    provider
+                    (provider, is_status)
                 })
                 .collect()
         }
 
         async fn gather(
             &self,
-            pending: Vec<ProviderIndex>,
+            pending: Vec<(ProviderIndex, bool)>,
         ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
             pending
                 .into_iter()
-                .map(|provider| Tagged {
+                .map(|(provider, is_status)| Tagged {
                     provider,
-                    value: (self.reply)(),
+                    value: if is_status {
+                        std::thread::sleep(self.status_delay);
+                        (self.status)()
+                    } else {
+                        (self.reply)()
+                    },
                 })
                 .collect()
         }
@@ -1391,6 +1659,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             cookies: RequestCookies::new(cookies),
@@ -1524,6 +1794,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             rate_limiter: &limiter,
@@ -1937,6 +2209,507 @@ mod tests {
             LookupStatus::Skipped(SkipReason::Input),
             "should skip sources needing hashed email"
         );
+    }
+
+    /// An echo provider that reads a hashed email at `.hem` and sends the
+    /// value it got as the `hem` query parameter.
+    struct HashedEmailProvider(EchoProvider, Option<crate::ec::provider::HashedEmailPath>);
+
+    impl IdentityProvider for HashedEmailProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            let mut request = self.0.build_request(lookup)?;
+            request.url.query_pairs_mut().append_pair(
+                "hem",
+                lookup.hashed_email.map_or("none", HashedEmail::as_str),
+            );
+            Ok(request)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn hashed_email_path(&self) -> Option<&crate::ec::provider::HashedEmailPath> {
+            self.1.as_ref()
+        }
+    }
+
+    fn hashed_email_provider(input: SourceInput, path: &str) -> HashedEmailProvider {
+        HashedEmailProvider(
+            echo_provider(input),
+            Some(crate::ec::provider::HashedEmailPath::parse(path).expect("should parse the path")),
+        )
+    }
+
+    fn status_source() -> HashedEmailSource {
+        HashedEmailSource {
+            endpoint: STATUS_URL.to_owned(),
+            timeout_ms: 150,
+        }
+    }
+
+    fn hashed_email_coordinator(input: SourceInput) -> ProviderCoordinator<HashedEmailProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(input, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint")
+    }
+
+    fn status_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(
+            http::StatusCode::OK,
+            br#"{"hem":"h-1","other":"h-2"}"#,
+        ))
+    }
+
+    fn status_without_path() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, br#"{"signed_in":false}"#))
+    }
+
+    fn status_not_json() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, b"<html>"))
+    }
+
+    fn status_unauthorized() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::UNAUTHORIZED, br#"{"hem":"h-1"}"#))
+    }
+
+    fn status_empty_value() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, br#"{"hem":""}"#))
+    }
+
+    const LOOKUP_WITH_HEM: &str = "https://ids.example.com/lookup?due=1&hem=h-1";
+    const LOOKUP_WITHOUT_HEM: &str = "https://ids.example.com/lookup?due=1&hem=none";
+
+    #[test]
+    fn a_status_hashed_email_makes_a_hashed_email_source_due() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1; other=o-1",
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up the source with the hashed email"
+        );
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![STATUS_URL.to_owned(), LOOKUP_WITH_HEM.to_owned()],
+            "should call the status endpoint first, then look up with its value"
+        );
+        assert_eq!(
+            *transport.status_calls.borrow(),
+            vec![(
+                Some("session=s-1; other=o-1".to_owned()),
+                Duration::from_millis(150)
+            )],
+            "should forward the whole Cookie header with the status timeout"
+        );
+    }
+
+    #[test]
+    fn no_usable_status_reply_skips_a_hashed_email_source_for_input() {
+        for status in [
+            status_without_path as Reply,
+            status_not_json,
+            status_unauthorized,
+            status_empty_value,
+            timeout_reply,
+            server_error_reply,
+        ] {
+            let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+            let transport = CannedTransport::with_status(ok_reply, status);
+
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &live_row(),
+                &granting(),
+                &Limiter(false),
+                "session=s-1",
+            );
+
+            assert_eq!(
+                only_status(&results),
+                LookupStatus::Skipped(SkipReason::Input),
+                "should skip the source without a hashed email"
+            );
+            assert_eq!(
+                *transport.sent.borrow(),
+                vec![STATUS_URL.to_owned()],
+                "should make only the status call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_without_cookies_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_due_refresh_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should refresh the held UID"
+        );
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![LOOKUP_WITHOUT_HEM.to_owned()],
+            "should refresh without calling the status endpoint"
+        );
+    }
+
+    #[test]
+    fn a_live_source_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(4000)),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not be due"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_anonymous_source_is_looked_up_with_or_without_a_hashed_email() {
+        for (status, expected) in [
+            (status_reply as Reply, LOOKUP_WITH_HEM),
+            (status_unauthorized, LOOKUP_WITHOUT_HEM),
+        ] {
+            let coordinator = hashed_email_coordinator(SourceInput::Anonymous);
+            let transport = CannedTransport::with_status(ok_reply, status);
+
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &live_row(),
+                &granting(),
+                &Limiter(false),
+                "session=s-1",
+            );
+
+            assert!(
+                matches!(only_status(&results), LookupStatus::Found { .. }),
+                "should look up the anonymous source"
+            );
+            assert_eq!(
+                *transport.sent.borrow(),
+                vec![STATUS_URL.to_owned(), expected.to_owned()],
+                "should add the hashed email only when there is one"
+            );
+        }
+    }
+
+    #[test]
+    fn consent_failure_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                ..Default::default()
+            },
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call the status endpoint without consent"
+        );
+    }
+
+    #[test]
+    fn two_providers_share_one_status_call_and_read_their_own_paths() {
+        // Arrange
+        let partner = |source: &str| -> EcPartner {
+            serde_json::from_value(serde_json::json!({
+                "name": source, "source_domain": source, "bidstream_enabled": true
+            }))
+            .expect("should build partner")
+        };
+        let partners = Arc::new(
+            PartnerRegistry::from_config(&[
+                partner("ids.example.com"),
+                partner("other.example.com"),
+            ])
+            .expect("should build registry"),
+        );
+        let mut second = echo_provider(SourceInput::HashedEmail);
+        second.0.sources = Box::new([SourceCapability {
+            source: SourceDomain::try_from("other.example.com").expect("should parse"),
+            input: SourceInput::HashedEmail,
+        }]);
+        let second_config: IdentityProviderConfig = toml::from_str(
+            "id = \"second-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"other.example.com\"]",
+        )
+        .expect("should parse config");
+        let coordinator = ProviderCoordinator::new(
+            vec![
+                RegisteredProvider::new(
+                    provider_config(""),
+                    hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+                ),
+                RegisteredProvider::new(
+                    second_config,
+                    HashedEmailProvider(
+                        second,
+                        Some(
+                            crate::ec::provider::HashedEmailPath::parse(".other")
+                                .expect("should parse the path"),
+                        ),
+                    ),
+                ),
+            ],
+            partners,
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![
+                STATUS_URL.to_owned(),
+                LOOKUP_WITH_HEM.to_owned(),
+                "https://ids.example.com/lookup?due=1&hem=h-2".to_owned(),
+            ],
+            "should call the status endpoint once and give each provider its own value"
+        );
+    }
+
+    #[test]
+    fn hashed_email_source_settings_are_checked() {
+        let with_path = || {
+            coordinator_with(RegisteredProvider::new(
+                provider_config(""),
+                hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+            ))
+        };
+
+        let missing = with_path()
+            .with_hashed_email_source(None)
+            .err()
+            .expect("should reject a provider path without the status endpoint");
+        let insecure = with_path()
+            .with_hashed_email_source(Some(&HashedEmailSource {
+                endpoint: "http://status.example.com/user".to_owned(),
+                timeout_ms: 150,
+            }))
+            .err()
+            .expect("should reject a non-https status endpoint");
+
+        assert!(
+            format!("{missing:?}").contains("[ec.hashed_email] is not configured"),
+            "should name the missing endpoint: {missing:?}"
+        );
+        assert!(
+            matches!(insecure.current_context(), ProviderConfigError::Invalid),
+            "should report invalid config"
+        );
+        coordinator("")
+            .with_hashed_email_source(None)
+            .expect("should accept no endpoint when no provider reads one");
+    }
+
+    #[test]
+    fn the_status_timeout_must_leave_room_in_the_budget() {
+        // Arrange: the coordinators' budget is 200 ms.
+        let at_budget = HashedEmailSource {
+            endpoint: STATUS_URL.to_owned(),
+            timeout_ms: 200,
+        };
+
+        // Act
+        let error = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&at_budget))
+        .err()
+        .expect("should reject a status timeout that fills the budget");
+
+        // Assert
+        assert!(
+            format!("{error:?}").contains("must be below the identity budget (200 ms)"),
+            "should name the budget: {error:?}"
+        );
+        coordinator("")
+            .with_hashed_email_source(Some(&at_budget))
+            .expect("should accept any timeout when no provider reads a hashed email");
+    }
+
+    #[test]
+    fn lookups_get_the_budget_the_status_call_left() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport {
+            status_delay: Duration::from_millis(60),
+            ..CannedTransport::with_status(ok_reply, status_reply)
+        };
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        let budgets = transport.lookup_budgets.borrow();
+        assert_eq!(budgets.len(), 1, "should start one lookup batch");
+        assert!(
+            budgets[0] <= Duration::from_millis(140),
+            "should take the status call's time out of the 200 ms budget: {:?}",
+            budgets[0]
+        );
+    }
+
+    #[test]
+    fn lookups_keep_the_whole_budget_without_a_status_call() {
+        // Arrange: a provider without a hashed-email path never wants one.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            echo_provider(SourceInput::Anonymous),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport {
+            status_delay: Duration::from_millis(60),
+            ..CannedTransport::with_status(ok_reply, status_reply)
+        };
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        assert!(
+            transport.status_calls.borrow().is_empty(),
+            "should make no status call"
+        );
+        assert_eq!(
+            *transport.lookup_budgets.borrow(),
+            vec![Duration::from_millis(200)],
+            "should give the lookups the whole budget"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_a_path_never_gets_a_status_call() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            echo_provider(SourceInput::HashedEmail),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source needing input"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
     #[test]

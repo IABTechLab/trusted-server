@@ -126,6 +126,16 @@ pub trait IdentityProvider: Send + Sync {
     fn sends_ec_id(&self) -> bool {
         true
     }
+
+    /// Where this provider's hashed email sits in the publisher's status
+    /// response (spec §8.7); `None` when it uses none.
+    ///
+    /// The coordinator calls the status endpoint only for providers that
+    /// return a path, and passes the value it finds there in
+    /// [`LookupInput::hashed_email`]. The default is `None`.
+    fn hashed_email_path(&self) -> Option<&HashedEmailPath> {
+        None
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -168,6 +178,10 @@ impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
 
     fn keeps_fresher_stored_uids(&self) -> bool {
         (**self).keeps_fresher_stored_uids()
+    }
+
+    fn hashed_email_path(&self) -> Option<&HashedEmailPath> {
+        (**self).hashed_email_path()
     }
 }
 
@@ -255,6 +269,11 @@ impl<'a> RequestCookies<'a> {
         }
     }
 
+    /// The whole `Cookie` header, as the request carried it.
+    pub(crate) fn header(&self) -> &'a str {
+        self.header
+    }
+
     /// Whether GDPR applies to the request.
     #[must_use]
     pub fn gdpr_applies(&self) -> bool {
@@ -326,7 +345,8 @@ pub struct SourceCapability {
 pub enum SourceInput {
     /// Works for any visitor.
     Anonymous,
-    /// Needs a hashed email. Always skipped in V1.
+    /// Needs a hashed email to be looked up, unless its stored UID is due
+    /// for a refresh (spec §8.7). Skipped when the provider gets none.
     HashedEmail,
 }
 
@@ -370,7 +390,9 @@ pub struct LookupInput<'a> {
     pub cookies: RequestCookies<'a>,
     /// Request time; providers use it instead of reading the clock.
     pub now: UnixSeconds,
-    /// Always `None` in V1.
+    /// The hashed email the publisher's status endpoint returned at this
+    /// provider's [`IdentityProvider::hashed_email_path`] (spec §8.7);
+    /// `None` without one.
     pub hashed_email: Option<&'a HashedEmail>,
 }
 
@@ -381,6 +403,10 @@ pub struct ClientSignals<'a> {
     pub ip: Option<IpAddr>,
     /// Client `User-Agent`.
     pub user_agent: Option<&'a str>,
+    /// Client `Referer`, as sent.
+    pub referer: Option<&'a str>,
+    /// Client `Accept-Language`, as sent.
+    pub accept_language: Option<&'a str>,
 }
 
 /// This provider's stored entries, borrowed from the row.
@@ -438,16 +464,174 @@ impl<'a> OwnedEntries<'a> {
     }
 }
 
-/// A validated lowercase hex SHA-256 email digest. V1 never constructs one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Largest hashed email accepted from the publisher's status endpoint.
+pub const MAX_HASHED_EMAIL_BYTES: usize = 512;
+
+/// A visitor's hashed email, as the publisher's status endpoint returned it
+/// (spec §8.7).
+///
+/// The value is opaque: Trusted Server neither normalises, hashes nor
+/// validates it beyond its length. It lives for one request and is never
+/// stored or logged, so `Debug` hides it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HashedEmail(Box<str>);
 
 impl HashedEmail {
-    /// Returns the digest.
+    /// Wraps a value returned by the publisher's status endpoint.
+    ///
+    /// Returns `None` for an empty value or one longer than
+    /// [`MAX_HASHED_EMAIL_BYTES`].
+    #[must_use]
+    pub fn new(value: &str) -> Option<Self> {
+        (!value.is_empty() && value.len() <= MAX_HASHED_EMAIL_BYTES).then(|| Self(Box::from(value)))
+    }
+
+    /// Returns the value.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+impl fmt::Debug for HashedEmail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HashedEmail(..)")
+    }
+}
+
+/// Where a provider's hashed email sits in the publisher's status response:
+/// a subset of jq path syntax (spec §8.7).
+///
+/// A path starts with `.` and is a sequence of `.key`, `."quoted key"` and
+/// `[index]` segments, for example `.user.hashes.sha256` or
+/// `.ids[0]."ats-hash"`. Pipes, filters, slices, negative indexes and the
+/// bare `.` are rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedEmailPath {
+    segments: Box<[PathSegment]>,
+}
+
+/// One step of a [`HashedEmailPath`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathSegment {
+    /// An object member.
+    Key(Box<str>),
+    /// An array element.
+    Index(usize),
+}
+
+impl HashedEmailPath {
+    /// Parses a jq-style path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderConfigError::Invalid`] when `path` is not a
+    /// non-empty sequence of `.key`, `."quoted key"` and `[index]` segments
+    /// starting with `.`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::ec::provider::HashedEmailPath;
+    ///
+    /// let path = HashedEmailPath::parse(".user.hashes[0]").expect("should parse");
+    /// let body = serde_json::json!({ "user": { "hashes": ["abc"] } });
+    /// assert_eq!(path.read(&body), Some("abc"));
+    /// ```
+    pub fn parse(path: &str) -> Result<Self, Report<ProviderConfigError>> {
+        let invalid = |reason: &str| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach(format!("hashed_email path `{path}` {reason}"))
+        };
+        let mut chars = path.trim().chars().peekable();
+        if chars.next() != Some('.') {
+            return Err(invalid("must start with `.`"));
+        }
+        let mut segments = Vec::new();
+        // The leading `.` may be followed directly by a key or an index.
+        let mut after_dot = true;
+        loop {
+            if after_dot {
+                after_dot = false;
+                match chars.peek() {
+                    Some('"') => {
+                        chars.next();
+                        segments.push(PathSegment::Key(quoted_key(&mut chars).ok_or_else(
+                            || invalid("has an unterminated or invalid quoted key"),
+                        )?));
+                    }
+                    Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
+                        let mut key = String::new();
+                        while let Some(c) =
+                            chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        {
+                            key.push(c);
+                        }
+                        segments.push(PathSegment::Key(key.into_boxed_str()));
+                    }
+                    Some('[') if segments.is_empty() => {}
+                    _ => return Err(invalid("has a `.` not followed by a key")),
+                }
+                continue;
+            }
+            match chars.next() {
+                None => break,
+                Some('.') => after_dot = true,
+                Some('[') => {
+                    let mut digits = String::new();
+                    while let Some(c) = chars.next_if(char::is_ascii_digit) {
+                        digits.push(c);
+                    }
+                    if chars.next() != Some(']') {
+                        return Err(invalid("has an index that is not a non-negative integer"));
+                    }
+                    let index = digits
+                        .parse::<usize>()
+                        .map_err(|_| invalid("has an index that is not a non-negative integer"))?;
+                    segments.push(PathSegment::Index(index));
+                }
+                Some(_) => return Err(invalid("uses syntax outside `.key`, `.\"key\"` and `[n]`")),
+            }
+        }
+        if segments.is_empty() {
+            return Err(invalid("selects no member"));
+        }
+        Ok(Self {
+            segments: segments.into_boxed_slice(),
+        })
+    }
+
+    /// Reads the string at this path, or `None` when a member or element is
+    /// missing or the value is not a string.
+    #[must_use]
+    pub fn read<'value>(&self, value: &'value serde_json::Value) -> Option<&'value str> {
+        let mut current = value;
+        for segment in &self.segments {
+            current = match segment {
+                PathSegment::Key(key) => current.as_object()?.get(key.as_ref())?,
+                PathSegment::Index(index) => current.as_array()?.get(*index)?,
+            };
+        }
+        current.as_str()
+    }
+}
+
+/// Reads a quoted key after its opening `"`, accepting `\"` and `\\`
+/// escapes. Returns `None` when the key is unterminated, empty or holds
+/// another escape.
+fn quoted_key(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Box<str>> {
+    let mut key = String::new();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => match chars.next()? {
+                escaped @ ('"' | '\\') => key.push(escaped),
+                _ => return None,
+            },
+            c => key.push(c),
+        }
+    }
+    (!key.is_empty()).then(|| key.into_boxed_str())
 }
 
 /// An outbound request description. The coordinator, not the provider, sends it.
@@ -793,6 +977,93 @@ mod tests {
     use super::*;
     use serde::Deserialize;
     use serde_json::json;
+
+    #[test]
+    fn hashed_email_path_reads_keys_quoted_keys_and_indexes() {
+        let body = json!({
+            "user": { "hashes": ["first", "second"], "ats-hash": "quoted" },
+            "list": [{ "value": "nested" }],
+            "flag": true
+        });
+
+        for (path, expected) in [
+            (".user.hashes[1]", Some("second")),
+            (".user.\"ats-hash\"", Some("quoted")),
+            (" .list[0].value ", Some("nested")),
+            (".[0]", None),
+            (".user.missing", None),
+            (".user.hashes[5]", None),
+            (".flag", None),
+            (".user", None),
+        ] {
+            let parsed = HashedEmailPath::parse(path).expect("should parse the path");
+
+            assert_eq!(parsed.read(&body), expected, "should read {path}");
+        }
+    }
+
+    #[test]
+    fn hashed_email_path_reads_a_top_level_array() {
+        let parsed = HashedEmailPath::parse(".[1]").expect("should parse the path");
+
+        assert_eq!(
+            parsed.read(&json!(["a", "b"])),
+            Some("b"),
+            "should index the top-level array"
+        );
+    }
+
+    #[test]
+    fn hashed_email_path_rejects_syntax_outside_the_subset() {
+        for path in [
+            "",
+            ".",
+            "user",
+            ".user | .hash",
+            ".user // .hash",
+            ".user[-1]",
+            ".user[1:2]",
+            ".user[]",
+            ".user.",
+            ".user..hash",
+            ".\"unterminated",
+            ".\"\"",
+            ".\"bad\\nescape\"",
+            ".user.[0]",
+            ".1abc",
+            ".user[x]",
+        ] {
+            assert!(
+                HashedEmailPath::parse(path).is_err(),
+                "should reject {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_accepts_only_non_empty_bounded_values_and_hides_them() {
+        assert!(
+            HashedEmail::new("").is_none(),
+            "should reject an empty value"
+        );
+        assert!(
+            HashedEmail::new(&"a".repeat(MAX_HASHED_EMAIL_BYTES + 1)).is_none(),
+            "should reject an oversized value"
+        );
+        let value = HashedEmail::new(&"a".repeat(MAX_HASHED_EMAIL_BYTES))
+            .expect("should accept a value at the limit");
+
+        assert_eq!(
+            value.as_str().len(),
+            MAX_HASHED_EMAIL_BYTES,
+            "should keep the value"
+        );
+        assert_eq!(
+            format!("{value:?}"),
+            "HashedEmail(..)",
+            "should hide the value in Debug"
+        );
+    }
 
     struct Fixed(ProviderCapabilities);
 

@@ -754,6 +754,65 @@ pub struct ProviderSecrets {
     pub token: Option<Redacted<String>>,
 }
 
+/// The publisher endpoint that returns a signed-in visitor's hashed email
+/// (`[ec.hashed_email]`, spec §8.7).
+///
+/// Identity providers with the hashed-email capability read their value
+/// from its JSON response at their own path.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HashedEmailSource {
+    /// Status endpoint; must be `https` with a host. Called with `GET` and
+    /// the visitor's whole `Cookie` header.
+    #[validate(custom(function = HashedEmailSource::validate_endpoint))]
+    pub endpoint: String,
+    /// Cutoff for the status call, in milliseconds. The call shares the
+    /// collection phase's identity budget with the lookups, so it must be
+    /// below `identity_budget_ms`, and below
+    /// `identity_after_response_budget_ms` when an after-response provider
+    /// reads a hashed email.
+    #[serde(
+        default = "HashedEmailSource::default_timeout_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub timeout_ms: u64,
+}
+
+impl HashedEmailSource {
+    /// Default status call cutoff (100 ms), half the default page-phase
+    /// identity budget.
+    #[must_use]
+    pub const fn default_timeout_ms() -> u64 {
+        100
+    }
+
+    /// The parsed endpoint, when it is `https` with a host.
+    #[must_use]
+    pub fn endpoint_url(&self) -> Option<Url> {
+        Url::parse(&self.endpoint)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.host_str().is_some())
+    }
+
+    fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
+        let source = Self {
+            endpoint: endpoint.to_owned(),
+            timeout_ms: Self::default_timeout_ms(),
+        };
+        if source.endpoint_url().is_some() {
+            Ok(())
+        } else {
+            Err(ValidationError::new("hashed_email_endpoint")
+                .with_message("must be an https URL with a host".into()))
+        }
+    }
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -832,6 +891,12 @@ pub struct Ec {
         deserialize_with = "vec_from_seq_or_map"
     )]
     pub identity_providers: Vec<IdentityProviderConfig>,
+
+    /// The publisher endpoint that returns a signed-in visitor's hashed
+    /// email, for providers with the hashed-email capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub hashed_email: Option<HashedEmailSource>,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -848,6 +913,7 @@ impl Default for Ec {
             identity_budget_ms: Self::default_identity_budget_ms(),
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
+            hashed_email: None,
         }
     }
 }
@@ -4660,6 +4726,7 @@ mod tests {
             "identity_budget_ms",
             "identity_after_response_budget_ms",
             "identity_providers",
+            "hashed_email",
         ] {
             assert!(
                 serialized.get(field).is_none(),
@@ -4690,6 +4757,43 @@ mod tests {
                 ec.validate().is_err(),
                 invalid,
                 "should enforce identity budget bounds for {page} and {after_response}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_source_is_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse the hashed email source");
+
+        assert_eq!(
+            source.timeout_ms,
+            HashedEmailSource::default_timeout_ms(),
+            "should default the timeout"
+        );
+        for (endpoint, timeout_ms, invalid) in [
+            ("https://www.example.com/api/user/status", 300, false),
+            ("https://www.example.com/api/user/status", 1000, false),
+            ("https://www.example.com/api/user/status", 0, true),
+            ("https://www.example.com/api/user/status", 1001, true),
+            ("http://www.example.com/api/user/status", 300, true),
+            ("not a url", 300, true),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: endpoint.to_owned(),
+                    timeout_ms,
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should check {endpoint} with {timeout_ms} ms"
             );
         }
     }

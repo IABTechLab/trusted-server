@@ -271,6 +271,8 @@ mod tests {
             client: trusted_server_core::ec::provider::ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &[],
