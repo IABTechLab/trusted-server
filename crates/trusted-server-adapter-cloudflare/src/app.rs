@@ -24,7 +24,10 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
-use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::error::{TrustedServerError, http_error};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
+};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
@@ -204,13 +207,14 @@ fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     settings
         .ec
         .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Cloudflare)?;
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -373,6 +377,21 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
+/// Returns a [`RouterService`] that preserves probes and returns generic 503s on ordinary routes.
+fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.method());
+        async move { Ok::<Response, EdgeError>(response) }
+    };
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
+    }
+    router.build()
+}
+
 // ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
@@ -390,12 +409,17 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        let state = build_state().map_err(|report| {
-            log::error!("{report:?}");
-            startup_error(&report)
-        })?;
-
-        Ok(router_builder(&state).build())
+        // A startup failure serves the failure router rather than failing
+        // assembly, so liveness stays up and readiness and every supported
+        // route answer the fixed unavailable response. The report is logged
+        // once here and never reaches a caller.
+        Ok(match build_state() {
+            Ok(state) => router_builder(&state).build(),
+            Err(report) => {
+                log::error!("{report:?}");
+                startup_error_router(&report)
+            }
+        })
     }
 }
 
@@ -587,10 +611,13 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
 
         let trace_state = Arc::clone(&state);
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(move |request| trace_metadata(&trace_state, request)),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(move |request| trace_metadata(&trace_state, request)),
+                ))),
+            ))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
@@ -655,7 +682,8 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             .get(
                 "/first-party/proxy",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_first_party_proxy(&s.settings, &services, req).await
+                    let ec = build_ec_context(&s.settings, &services, &req);
+                    handle_first_party_proxy(&s.settings, &services, &ec, req).await
                 }),
             )
             .get(
@@ -1280,5 +1308,85 @@ mod trace_dispatch_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }

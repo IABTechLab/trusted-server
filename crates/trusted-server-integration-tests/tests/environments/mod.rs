@@ -72,7 +72,7 @@ pub fn find_available_port() -> TestResult<u16> {
 /// # Arguments
 ///
 /// * `base_url` - Runtime base URL, such as `http://127.0.0.1:7676`.
-/// * `health_path` - Path to poll for readiness, such as `/health`.
+/// * `health_path` - Path to poll; application startup uses `/ready` and requires 200.
 /// * `fallback_to_root` - Whether a successful or 404 response from `/`
 ///   should also count as ready when the dedicated health endpoint is absent.
 ///
@@ -111,7 +111,11 @@ pub(crate) fn wait_for_http_ready(
 
     for _ in 0..options.max_attempts {
         if let Ok(resp) = reqwest::blocking::get(&health_url)
-            && resp.status().is_success()
+            && if health_path == "/ready" {
+                resp.status().as_u16() == 200
+            } else {
+                resp.status().is_success()
+            }
         {
             return Ok(());
         }

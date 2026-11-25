@@ -21,3 +21,6 @@ pub mod startup;
 
 #[cfg(test)]
 mod identity_conformance;
+
+#[cfg(test)]
+mod after_response_drain_tests;

@@ -30,8 +30,8 @@ use trusted_server_core::test_support::scripted_client::{
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
-/// How long the startup test waits for the binary to exit.
-const STARTUP_EXIT_DEADLINE: Duration = Duration::from_secs(10);
+/// How long the startup test waits for the binary to listen.
+const STARTUP_LISTEN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Settings the route tests build the application from.
 ///
@@ -207,19 +207,27 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
-/// Waits up to `deadline` for `child` to exit, killing it if it does not.
+/// Waits up to `deadline` for `child` to accept connections on `address`.
 ///
-/// Returns `None` when the child was still running at the deadline.
-fn wait_for_exit(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+/// Returns the child's exit status when it exits first, or when it is still
+/// not listening at the deadline, after killing it.
+fn wait_for_listener(
+    child: &mut Child,
+    address: SocketAddr,
+    deadline: Duration,
+) -> Result<(), Option<std::process::ExitStatus>> {
     let started = Instant::now();
     loop {
+        if TcpStream::connect(address).is_ok() {
+            return Ok(());
+        }
         if let Some(status) = child.try_wait().expect("should poll the Axum binary") {
-            return Some(status);
+            return Err(Some(status));
         }
         if started.elapsed() >= deadline {
             child.kill().expect("should stop the Axum binary");
             child.wait().expect("should reap the Axum binary");
-            return None;
+            return Err(None);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -236,7 +244,9 @@ fn read_pipe(pipe: Option<impl std::io::Read>) -> String {
 }
 
 #[test]
-fn axum_main_exits_non_zero_when_settings_fail() {
+fn axum_main_serves_the_failure_router_when_settings_fail() {
+    // The prepared local config holds a value that is not a Trusted Server
+    // app-config envelope, so the native initializer fails after preparation.
     let workspace = tempfile::tempdir().expect("should create isolated native config");
     let contents = serde_json::to_vec(&serde_json::json!({
         CONFIG_BLOB_KEY: "not-a-trusted-server-config-envelope"
@@ -249,45 +259,76 @@ fn axum_main_exits_non_zero_when_settings_fail() {
         contents,
     )
     .expect("should publish the invalid app-config value");
+    let port = free_loopback_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
         .env_clear()
         .env("EDGEZERO__ADAPTER__CONFIG_DIR", workspace.path())
         // Prepare the declared local record store before exercising blob validation.
         .env("EDGEZERO__ADAPTER__DATA_DIR", workspace.path())
         .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
-        .env("EDGEZERO__ADAPTER__PORT", free_loopback_port().to_string())
+        .env("EDGEZERO__ADAPTER__PORT", port.to_string())
         .env("EDGEZERO__LOGGING__LEVEL", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("should spawn the Axum binary");
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
 
-    let status = wait_for_exit(&mut child, STARTUP_EXIT_DEADLINE);
+    let listening = wait_for_listener(&mut child, address, STARTUP_LISTEN_DEADLINE);
+    let responses = listening.is_ok().then(|| {
+        [
+            send_raw(
+                address,
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            ),
+            send_raw(
+                address,
+                "GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            ),
+            send_raw(
+                address,
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            ),
+        ]
+    });
+    if listening.is_ok() {
+        child.kill().expect("should stop the Axum binary");
+        child.wait().expect("should reap the Axum binary");
+    }
     let output = format!(
         "{}{}",
         read_pipe(child.stdout.take()),
         read_pipe(child.stderr.take())
     );
 
-    let status = status.unwrap_or_else(|| {
-        panic!("should exit instead of serving after a settings failure; output:\n{output}")
-    });
+    let Some([health, ready, page]) = responses else {
+        panic!(
+            "should keep serving after a settings failure, got {listening:?}; output:\n{output}"
+        );
+    };
     assert!(
-        !status.success(),
-        "should exit non-zero after a settings failure, got {status}; output:\n{output}"
+        health.starts_with("HTTP/1.1 200") && health.ends_with("\r\n\r\nok"),
+        "should keep liveness up after a settings failure; got:\n{health}"
     );
+    for (path, response) in [("/ready", &ready), ("/", &page)] {
+        assert!(
+            response.starts_with("HTTP/1.1 503")
+                && response.ends_with("\r\n\r\nService Unavailable\n"),
+            "should answer {path} with the fixed unavailable response; got:\n{response}"
+        );
+    }
     assert!(
         output.contains("failed to parse Trusted Server app-config blob envelope"),
         "should log the settings failure report; output:\n{output}"
     );
     assert!(
-        output.contains("trusted-server-adapter-axum failed:"),
-        "should log the startup failure before exiting; output:\n{output}"
+        output.contains("Trusted Server initialization failed:"),
+        "should log the initialization failure; output:\n{output}"
     );
     assert!(
-        !output.contains("starting axum server"),
-        "should not reach the listener; output:\n{output}"
+        !output.contains("trusted-server-adapter-axum failed:"),
+        "should not report a startup failure exit; output:\n{output}"
     );
 }
 
@@ -1345,6 +1386,12 @@ async fn health_reports_git_version() {
 // Operator response headers that egress framing owns
 // ---------------------------------------------------------------------------
 
+/// Sends the identify preflight, a local `200` that carries the operator's
+/// `response_headers`. The `/health` probe bypasses them.
+fn request_with_response_headers(server: &TestServer) -> reqwest::RequestBuilder {
+    server.request("OPTIONS", "/_ts/api/v1/identify")
+}
+
 /// The route test settings with `headers` as the operator's `response_headers`.
 fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
     let mut settings = test_settings();
@@ -1363,7 +1410,7 @@ async fn runtime_skips_malformed_connection_entry_and_serves_real_status() {
         let server =
             TestServer::start(settings_with_response_headers(&[("connection", value)])).await;
 
-        let response = send(server.request("GET", "/health")).await;
+        let response = send(request_with_response_headers(&server)).await;
 
         assert_eq!(
             response.status().as_u16(),
@@ -1382,7 +1429,7 @@ async fn runtime_skip_of_connection_x_example_serves_x_example() {
     ]))
     .await;
 
-    let response = send(server.request("GET", "/health")).await;
+    let response = send(request_with_response_headers(&server)).await;
 
     assert_eq!(
         response.status().as_u16(),
