@@ -6,12 +6,15 @@ use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
-use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::constants::TS_GIT_VERSION;
 
+use crate::checked_app_config::{
+    CheckedAppConfig, ProviderlessAppConfig, adapter_runs_identity_providers,
+};
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::config::proxy::{ProxyCommand, run_proxy};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
@@ -77,6 +80,9 @@ enum ConfigCommand {
     AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
+    /// Explain creative proxy destination and disclosure policy.
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
@@ -140,11 +146,17 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Audit(args) => run_audit(&args),
         Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
         Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
+        Command::Config(ConfigCommand::Proxy(args)) => run_proxy(&args),
         Command::Config(ConfigCommand::Init(args)) => {
             run_config_init(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Diff(args)) => {
-            match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
+            let diff = if adapter_runs_identity_providers(&args.adapter) {
+                edgezero_cli::run_config_diff_typed::<CheckedAppConfig>(&args)
+            } else {
+                edgezero_cli::run_config_diff_typed::<ProviderlessAppConfig>(&args)
+            };
+            match diff {
                 Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
                 Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
@@ -155,11 +167,15 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Push(args)) => {
-            edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
-                .map(|()| RunOutcome::Success)
+            if adapter_runs_identity_providers(&args.adapter) {
+                edgezero_cli::run_config_push_typed::<CheckedAppConfig>(&args)
+            } else {
+                edgezero_cli::run_config_push_typed::<ProviderlessAppConfig>(&args)
+            }
+            .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
-            edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+            edgezero_cli::run_config_validate_typed::<CheckedAppConfig>(&args)
                 .map(|()| RunOutcome::Success)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),

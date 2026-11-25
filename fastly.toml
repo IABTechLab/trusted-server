@@ -23,21 +23,22 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
-        [[local_server.kv_stores.counter_store]]
+        record_ec_fixture = []
+        # Generic runtime KV, linked under the logical ID `trusted_server_runtime_kv`
+        # that `edgezero.toml` and the adapter's `Hooks::stores()` declare.
+        [[local_server.kv_stores.trusted_server_runtime_kv]]
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.creative_store]]
-            key = "placeholder"
-            data = "placeholder"
-
-        [[local_server.kv_stores.ec_identity_store]]
+        # EC records, linked under the logical record store ID `trusted_server_kv`
+        # that `[ec.storage]` in trusted-server.example.toml selects.
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "placeholder"
             data = "placeholder"
 
         # Pre-seeded test EC entry for local script testing (test-prebid-eids.sh).
         # Matches the TEST_EC_ID used in that script.
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.trusted_server_kv]]
             key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
             data = '{"v":1,"created":1700000000,"last_seen":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US"}}'
     [local_server.secret_stores]
@@ -70,10 +71,26 @@ build = """
             key = "tinybird_auction_append_token"
             data = "test-tinybird-auction-append-token"
 
+        # Auction provider mTLS: the active slot's client key for providers with
+        # `mtls = true` (auction-providers-blue unless auction.mtls_slot = "green").
+        # Uncomment with a development key, for example from
+        # deploy/pbs-example/scripts/make-dev-mtls-certs.sh.
+        # [[local_server.secret_stores.trusted_server_secrets]]
+        #     key = "auction-providers-blue.private-key"
+        #     data = '''-----BEGIN PRIVATE KEY-----
+        #     ...
+        #     -----END PRIVATE KEY-----'''
+
     [local_server.config_stores]
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]
+            # Auction provider mTLS: the client certificate chain and the origins it is
+            # presented to, one per line.
+            # "auction-providers-blue.certificate" = '''-----BEGIN CERTIFICATE-----
+            # ...
+            # -----END CERTIFICATE-----'''
+            # "auction-providers-blue.hosts" = "https://pbs.example.com"
 
         [local_server.config_stores.jwks_store]
             format = "inline-toml"

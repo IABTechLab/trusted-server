@@ -125,6 +125,59 @@ run "plans_both_regional_provider_mappings" {
   }
 }
 
+run "plans_independent_regional_mtls_settings" {
+  command = plan
+
+  variables {
+    east_client_ca_bundle_s3_bucket = "pbs-example-east-trust"
+    east_client_ca_bundle_s3_key    = "client-ca/bundle-v1.pem"
+    east_connection_logs_bucket     = "pbs-example-east-connection-logs"
+    west_client_ca_bundle_s3_bucket = "pbs-example-west-trust"
+    west_client_ca_bundle_s3_key    = "client-ca/bundle-v2.pem"
+    west_connection_logs_bucket     = "pbs-example-west-connection-logs"
+  }
+
+  assert {
+    condition = (
+      module.east.alb_tls_settings.mode == "verify" &&
+      module.east.alb_tls_settings.client_ca_bundle.bucket == var.east_client_ca_bundle_s3_bucket &&
+      module.east.alb_tls_settings.client_ca_bundle.key == var.east_client_ca_bundle_s3_key &&
+      module.east.alb_tls_settings.connection_logs_bucket == var.east_connection_logs_bucket
+    )
+    error_message = "The east ALB should use its own CA bundle and connection log bucket."
+  }
+
+  assert {
+    condition = (
+      module.west.alb_tls_settings.mode == "verify" &&
+      module.west.alb_tls_settings.client_ca_bundle.bucket == var.west_client_ca_bundle_s3_bucket &&
+      module.west.alb_tls_settings.client_ca_bundle.key == var.west_client_ca_bundle_s3_key &&
+      module.west.alb_tls_settings.connection_logs_bucket == var.west_connection_logs_bucket
+    )
+    error_message = "The west ALB should use its own CA bundle and connection log bucket."
+  }
+}
+
+run "rejects_east_ca_bundle_without_key" {
+  command = plan
+
+  variables {
+    east_client_ca_bundle_s3_bucket = "pbs-example-east-trust"
+  }
+
+  expect_failures = [var.east_client_ca_bundle_s3_bucket]
+}
+
+run "rejects_west_ca_bundle_without_bucket" {
+  command = plan
+
+  variables {
+    west_client_ca_bundle_s3_key = "client-ca/bundle-v1.pem"
+  }
+
+  expect_failures = [var.west_client_ca_bundle_s3_bucket]
+}
+
 run "rejects_duplicate_east_availability_zones" {
   command = plan
 

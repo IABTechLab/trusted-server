@@ -21,6 +21,7 @@ crates/
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
+  trusted-server-identity-providers/    # Server-side identity provider kinds (used by the Fastly adapter)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -40,6 +41,7 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Viceroy     | 0.22.0 (from `.tool-versions`)           |
 | Wasmtime    | 48.0.1 (from `.tool-versions`)           |
 | Spin        | 4.1.0 (from `.tool-versions`)            |
+| Wrangler    | 4.83.0 (from `.tool-versions`)           |
 | AWS CLI     | 2.36.45 (from `.tool-versions`)          |
 | Terraform   | 1.16.2 (from `.tool-versions`)           |
 
@@ -223,7 +225,7 @@ pub struct UserId(Uuid);
 
 ### Crate Preferences
 
-- `log` (with `log-fastly`) for instrumentation.
+- `log` for instrumentation. EdgeZero installs the backend on every adapter.
 
 ---
 
@@ -285,7 +287,8 @@ impl core::error::Error for MyError {}
 - Use `log` crate level-specific macros: `log::info!`, `log::debug!`, `log::trace!`, `log::warn!`, `log::error!`.
 - Provide context in log messages with format strings.
 - Format messages with present-tense verbs.
-- Use `log-fastly` as the backend for Fastly Compute.
+- Never install a logger in Trusted Server. EdgeZero installs the backend on
+  every adapter, and its managed setup fails when another logger is installed.
 
 ## Other guidelines
 
@@ -378,6 +381,10 @@ Every PR must pass:
 14. Fastly absolute-deadline network fixtures under Viceroy (the harness builds the adapter test binary itself): `node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"`
 15. Worker auction-deadline runtime fixtures (`worker-auction-deadlines.yml`): build and lint the runtime fixture, then run it under the local runtime. For Cloudflare, `cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare` and `node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"` (requires wrangler and the `Cargo.lock` wasm-bindgen CLI). For Spin, `cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin` and `node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"`. CI lints each fixture with the same `cargo clippy` arguments plus `-- -D warnings`
 16. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
+17. Native provider acceptance script helpers: `node --test 'scripts/tests/*.test.mjs'` with the `.tool-versions` Node (the full Docker run, `node scripts/test-native-providers.mjs <absolute binary path>`, stays local)
+18. Fastly response diff script: `node --test scripts/fastly-response-diff.test.mjs` with the `.tool-versions` Node
+19. Production health/startup contract (`health-startup-contract.yml`): `./scripts/smoke-fastly.sh`, `./scripts/smoke-axum.sh`, `./scripts/smoke-cloudflare.sh`, and `./scripts/smoke-spin.sh`, using the pinned runtimes from `.tool-versions` and Python 3.11 or newer. These build production artifacts without `test-utils`; any explicit artifact override must point to a fresh build of the tested revision. See `scripts/README.md` for prerequisites and retained diagnostics.
+20. Serving runtime process-environment guard: `scripts/test-runtime-env.sh && scripts/lint-runtime-env.sh`. Production code must use `trusted_server_core::runtime_env!` with a compile-time `TRUSTED_SERVER__` name or a justified platform exception (Fastly metadata or EdgeZero's native Geo provider override). Build scripts, compile-time inputs, tests, operator tools, platform bindings and EdgeZero internals are outside this gate.
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

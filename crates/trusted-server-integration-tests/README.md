@@ -5,11 +5,14 @@ end-to-end publisher behavior. It is not linked into an adapter artifact.
 
 ## Test surfaces
 
-- `tests/parity.rs` calls Axum, Cloudflare, and Spin routers in process and
-  compares their shared route behavior.
+- `tests/parity.rs` serves the Axum, Cloudflare, and Spin apps on EdgeZero's
+  `AxumTestServer`, a loopback listener that applies each app's production
+  policies, and compares their shared route behavior. A scripted outbound
+  client in router state answers their upstream calls.
 - `tests/documentation_snippets.rs` extracts the checked integration-guide
   fixture and compiles it in an isolated offline crate.
-- `tests/integration.rs` exercises the Fastly/Viceroy and Axum paths against the
+- `tests/integration.rs` exercises the Fastly (Viceroy), Axum, Cloudflare
+  (workerd), and Spin runtimes against local origins, loopback bidders, and the
   WordPress and Next.js fixture containers.
 - `browser/` uses Playwright and Chromium to verify script loading, navigation,
   rewriting, APS rendering, and GPT diagnostics in real pages.
@@ -36,5 +39,71 @@ dependencies, and generated configuration remain for reuse. Tests use an
 isolated readable app-config fixture and do not consume an operator's
 gitignored `trusted-server.toml`.
 
+## Creative proxy policy qualification
+
+The Fastly network fixture is separate from native route parity:
+
+```bash
+node crates/trusted-server-adapter-fastly/tests/proxy-policy-origin.mjs "$(command -v viceroy)"
+```
+
+Use pinned Node 24.20.0 and Viceroy 0.21.0. This fixture observes actual HTTP
+origin URLs through the signed core handler and real Fastly transport. It checks
+two-reader static URL equivalence, removal of carried EC on redirects, and
+rejection of exhausted redirects. These HTTP destinations cannot match HTTPS
+identity rules. Positive identity delivery and terminal adapter privacy are
+covered by separate route fixtures; this command does not qualify them. Viceroy
+does not implement HTTP readthrough caching. HTTPS delivery and real Fastly
+cache reuse need separately authorized staging with a controlled cacheable
+origin and origin counter; record the exact binary/config revision and results.
+Native parity or target builds alone also do not establish real Cloudflare or
+Spin runtime qualification.
+
 See [Testing](../../TESTING.md) for the complete gate matrix and
 [`scripts/README.md`](../../scripts/README.md) for inputs and cleanup behavior.
+
+## Identity conformance
+
+The reusable EC contract lives in core test support, with the current Fastly
+runner in `trusted-server-adapter-fastly/src/identity_conformance.rs`. Run from
+the repository root with the repository-pinned Rust, Node and Viceroy:
+
+```bash
+node --test scripts/test-identity-conformance.test.mjs
+node scripts/test-identity-conformance.mjs fastly
+cargo test -p trusted-server-core --lib identity_conformance
+```
+
+The launcher lists the required Fastly test before executing it and rejects
+zero-test success. Selecting `axum`, `cloudflare` or `spin` fails explicitly
+until its runner is available. Native core tests check the assertion contract;
+they do not claim Axum identity support.
+
+The Fastly application test executes nine isolated scenarios: fresh creation,
+rejected writes, missing and failed geo, denied and absent GDPR consent,
+subresources, returning readers, and the current missing-browser-metadata gate.
+It uses the production native request read and `prepare`, the real request
+conversion, router, shared production finalization callback composition and
+consumed HTML response. The client IP, geo result, browser device signals,
+record storage and publisher origin are controlled test fixtures. Successful
+issuance requires the matching record before response release; failed writes
+must be observed before release. Refused scenarios must stop before any write
+is attempted. Returning scenarios apply cookie expiry rules and replay the
+resulting identity. Fastly's production geo lookup reports a failure as missing
+geo, so the failed-geo scenario uses a test-only failing lookup to check the
+shared contract that other platforms' error results must also preserve. The missing-metadata expectation describes
+the current pre-T12 policy and must change when #1592 permits absent JA4.
+
+The suite ends when the finalized response is delivered. Post-delivery work
+(queued telemetry and the after-response identity lookups, EC pull sync among
+them) does not run, so release-ordering assertions cover writes made during
+finalization only.
+
+This is application conformance, not fresh-browser qualification through an
+unmodified deployed artifact. Viceroy 0.21 does not expose JA4, so the current
+production browser gate prevents fresh issuance over ordinary local HTTP.
+The existing seeded Fastly runtime tests remain useful for their separate
+boundary. Startup capability rejection, removal of adapter-owned identity
+calls (#1600), Axum activation (#1574), later adapter integrations and deployed
+browser/provider qualification remain outstanding under #1586. Infrastructure
+delivery alone must not close that issue.

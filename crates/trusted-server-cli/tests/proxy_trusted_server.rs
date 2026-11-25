@@ -1,21 +1,24 @@
 //! Exercises the proxy against the production Axum listener and trace router.
 //!
-//! A child test process owns the real HTTP server. A TLS relay additionally
-//! exercises the proxy's encrypted upstream transport without inventing ingress
-//! metadata or replacing the server's trace authorization with an echo handler.
+//! `EdgeZero`'s `AxumTestServer` serves the real Trusted Server app over
+//! loopback TCP. A TLS relay additionally exercises the proxy's encrypted
+//! upstream transport without inventing ingress metadata or replacing the
+//! server's trace authorization with an echo handler.
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser as _;
+use edgezero_adapter_axum::AXUM_PLATFORM;
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::test_utils::AxumTestServer;
+use edgezero_core::app::App;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Full};
 use hyper::client::conn::http1::SendRequest;
@@ -36,24 +39,14 @@ mod support;
 const PUBLIC_HOST: &str = "www.publisher.example.com";
 const PUBLIC_AUTHORITY: &str = "www.publisher.example.com:8443";
 const PUBLIC_ORIGIN: &str = "https://www.publisher.example.com:8443";
-const FIXTURE_ADDR: &str = "TS_TEST_AXUM_ADDR";
-const FIXTURE_ORIGIN: &str = "TS_TEST_AXUM_ORIGIN";
-const FIXTURE_TRUST: &str = "TS_TEST_AXUM_TRUST";
 
-/// Run only as a fixture child; the parent always kills and reaps this process.
-#[test]
-#[ignore = "server fixture invoked only by proxy integration tests"]
-fn trusted_server_fixture() {
-    // Direct ignored-test runs have no parent process to serve.
-    let Ok(addr) = std::env::var(FIXTURE_ADDR) else {
-        return;
-    };
+/// Serves the actual Trusted Server app on a loopback port.
+///
+/// The app reads no `EdgeZero` store: its settings are injected here, so no
+/// store is attached.
+async fn serve_trusted_server(origin: &str, trust: bool) -> AxumTestServer {
+    // The adapter's outbound client expects a process-level crypto provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let addr: SocketAddr = addr
-        .parse()
-        .expect("should parse the fixture listener address");
-    let origin = std::env::var(FIXTURE_ORIGIN).expect("should supply the publisher origin");
-    let trust = std::env::var(FIXTURE_TRUST).expect("should supply the forwarder policy");
     let mut value = json!({
         "handlers": [{
             "path": "^/_ts/admin",
@@ -72,7 +65,7 @@ fn trusted_server_fixture() {
             "gpt_diagnostics": {"enabled": true, "trace_page_enabled": true}
         }
     });
-    if trust == "enabled" {
+    if trust {
         value["trusted_forwarder"] = json!({
             "auth_header": "x-ts-forwarder-auth",
             "shared_secret": support::FORWARDER_TOKEN
@@ -81,21 +74,27 @@ fn trusted_server_fixture() {
     let settings = Settings::from_json_value(value).expect("should load fixture settings");
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should build the actual Trusted Server router");
-    AxumDevServer::with_config(
-        router,
+    let app = App::from_router::<TrustedServerApp>(router, AXUM_PLATFORM)
+        .expect("should assemble the actual Trusted Server app");
+    AxumTestServer::start(AxumDevServer::with_config(
+        app,
         AxumDevServerConfig {
-            addr,
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             enable_ctrl_c: false,
+            ..AxumDevServerConfig::default()
         },
-    )
-    .run()
-    .expect("should run the actual Axum HTTP listener");
+    ))
+    .await
+    .expect("should start the actual Axum HTTP listener")
 }
 
 struct Fixture {
     addr: SocketAddr,
-    child: Child,
+    // Held for its lifetime: dropping it shuts the listener down.
+    _server: AxumTestServer,
     origin_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    origin_uris: Arc<Mutex<Vec<String>>>,
+    origin_url: String,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -104,8 +103,6 @@ impl Drop for Fixture {
         for task in &self.tasks {
             task.abort();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -119,11 +116,14 @@ async fn start_fixture(trust: bool) -> Fixture {
     );
     let headers = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&headers);
+    let uris = Arc::new(Mutex::new(Vec::new()));
+    let recorded_uris = Arc::clone(&uris);
     let html =
         format!("<html><head></head><body><a href=\"{origin_url}/next\">next</a></body></html>");
     let origin_task = tokio::spawn(async move {
         while let Ok((stream, _)) = origin.accept().await {
             let recorded = Arc::clone(&recorded);
+            let recorded_uris = Arc::clone(&recorded_uris);
             let html = html.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<hyper::body::Incoming>| {
@@ -131,8 +131,23 @@ async fn start_fixture(trust: bool) -> Fixture {
                         .lock()
                         .expect("should record publisher-bound headers")
                         .push(request.headers().clone());
+                    recorded_uris
+                        .lock()
+                        .expect("should record origin URI")
+                        .push(request.uri().to_string());
+                    let asset = request.uri().path() == "/proxy-resource";
                     let html = html.clone();
                     async move {
+                        if asset {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header(header::CONTENT_TYPE, "image/png")
+                                    .header(header::CACHE_CONTROL, "public, max-age=300")
+                                    .header(header::ETAG, "origin-asset")
+                                    .body(Full::new(Bytes::from_static(b"asset-bytes")))
+                                    .expect("should serve static resource"),
+                            );
+                        }
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -147,49 +162,16 @@ async fn start_fixture(trust: bool) -> Fixture {
             });
         }
     });
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("should reserve the Axum fixture address");
-    let addr = reserved.local_addr().expect("should read the Axum address");
-    drop(reserved);
-    let child = Command::new(std::env::current_exe().expect("should locate the test executable"))
-        .args([
-            "--ignored",
-            "--exact",
-            "trusted_server_fixture",
-            "--nocapture",
-        ])
-        .env(FIXTURE_ADDR, addr.to_string())
-        .env(FIXTURE_ORIGIN, origin_url)
-        .env(FIXTURE_TRUST, if trust { "enabled" } else { "disabled" })
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("should spawn the real Axum fixture");
-    let mut fixture = Fixture {
-        addr,
-        child,
+    // `start` returns once the listener is bound, so no readiness poll is needed.
+    let server = serve_trusted_server(&origin_url, trust).await;
+    Fixture {
+        addr: server.address(),
+        _server: server,
         origin_headers: headers,
+        origin_uris: uris,
+        origin_url,
         tasks: vec![origin_task],
-    };
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if TcpStream::connect(addr).await.is_ok() {
-                return;
-            }
-            assert!(
-                fixture
-                    .child
-                    .try_wait()
-                    .expect("should inspect the child")
-                    .is_none(),
-                "should keep the Axum fixture running until ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("should start the actual Axum listener promptly");
-    fixture
+    }
 }
 
 async fn add_tls_relay(fixture: &mut Fixture) -> SocketAddr {
@@ -621,5 +603,96 @@ async fn real_publisher_rewrites_public_port_and_strips_forwarding_credentials()
     assert_eq!(
         value["base"], "https://cdn.example.com/asset.js",
         "should use public HTTPS for protocol-relative signing over plaintext ingress"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_policy_cli_transport_preserves_static_fetch_and_cache_headers() {
+    let mut fixture = start_fixture(true).await;
+    let mut browser = browser(&mut fixture, true, true, true).await;
+    let target = format!("{}/proxy-resource?version=1", fixture.origin_url);
+    let sign_query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("url", &target)
+        .finish();
+    let request = Request::builder()
+        .uri(format!("/first-party/sign?{sign_query}"))
+        .header(header::HOST, PUBLIC_AUTHORITY)
+        .body(Full::new(Bytes::new()))
+        .expect("should build real signing request");
+    let (status, _, body) = send(&mut browser, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "should sign the actual fixture origin"
+    );
+    let href = serde_json::from_slice::<serde_json::Value>(&body)
+        .expect("should decode signed URL")["href"]
+        .as_str()
+        .expect("should return href")
+        .to_owned();
+    let href = url::Url::parse(&href).expect("should parse absolute proxy href");
+    let path = format!(
+        "{}?{}",
+        href.path(),
+        href.query().expect("should contain signed parameters")
+    );
+    let expiry = href
+        .query_pairs()
+        .find(|(key, _)| key == "tsexp")
+        .map(|(_, value)| value.into_owned())
+        .expect("should retain real signer expiry");
+    let expected_origin = format!("/proxy-resource?version=1&tsexp={expiry}");
+    let direct = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build direct client");
+    for prefix in ["a", "b"] {
+        let identity = format!("{}.Ab1234", prefix.repeat(64));
+        assert!(
+            trusted_server_core::ec::is_valid_ec_id(&identity),
+            "should seed canonical reader cookies"
+        );
+        let cookie = format!("ts-ec={identity}");
+        let request = Request::builder()
+            .uri(&path)
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .header(header::COOKIE, &cookie)
+            .body(Full::new(Bytes::new()))
+            .expect("should build browser resource request");
+        let (status, proxied_headers, bytes) = send(&mut browser, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "should serve resource through CLI transport"
+        );
+        assert_eq!(bytes, "asset-bytes", "should preserve asset bytes");
+        let response = direct
+            .get(format!("http://{}{path}", fixture.addr))
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .expect("should request TS directly");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve resource directly"
+        );
+        for name in [header::CACHE_CONTROL, header::ETAG, header::CONTENT_TYPE] {
+            assert_eq!(
+                proxied_headers.get(&name),
+                response.headers().get(&name),
+                "should preserve runtime resource headers for {name}"
+            );
+        }
+    }
+    let observed = fixture
+        .origin_uris
+        .lock()
+        .expect("should inspect actual origin URIs");
+    assert_eq!(
+        observed.as_slice(),
+        vec![expected_origin; 4],
+        "should use the same identity-free upstream URL directly and through CLI for both readers"
     );
 }

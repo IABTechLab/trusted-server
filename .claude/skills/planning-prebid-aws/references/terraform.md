@@ -44,6 +44,12 @@ Terraform owns AWS resources, secret metadata, and access policy. An authorized 
 
 Prefer provider-native resources, image builds, and explicit deployment tools over provisioner side effects. Keep application releases outside `local-exec`, `remote-exec`, and shell-command wrappers such as `null_resource`. For ECS, assign task-definition revisions and the service's selected revision to one writer. If a deployer selects revisions outside Terraform, document and test drift handling so a later apply cannot silently revert a release.
 
+## Optional ALB client verification
+
+Offer mTLS for a public PBS ALB when the operator wants to authenticate Trusted Server in addition to restricting caller CIDRs. Keep the ACM server certificate and allowlist. In the PBS example, set both `east_client_ca_bundle_s3_bucket` and `east_client_ca_bundle_s3_key` or both corresponding `west_` inputs to enable verification in that region. The PBS operator owns the CA. Put only the PEM CA bundle in S3, use a new key for each revision, and grant the Terraform principal `s3:GetObject`. Keep private keys out of Terraform.
+
+The optional `east_connection_logs_bucket` and `west_connection_logs_bucket` inputs refer to existing same-region SSE-S3 buckets. The bucket policy must allow `s3:PutObject` by the ELB log delivery service under `AWSLogs/<account-id>/`. Include the [PBS mTLS runbook](../../../../deploy/pbs-example/RUNBOOK.md#optional-alb-mutual-tls) in the handoff. Enable verification one region at a time, and switch listeners off before withdrawing the client identity. Public `/status` probes need a client certificate in verify mode. Target group HTTP health checks do not.
+
 ## Tests and safe local checks
 
 Generate module tests for input restrictions, conditional resources, capacity bounds, provider mappings, tags/security settings, secret references, and meaningful outputs as applicable to the approved topology. Include negative cases using `expect_failures` for custom validation. Use explicit mock values when assertions depend on computed attributes; plan-time values may otherwise remain unknown.

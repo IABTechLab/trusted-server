@@ -8,7 +8,7 @@ The auction orchestrator is the core system that manages server-side ad auctions
 
 Key capabilities:
 
-- **Parallel execution** — Bid requests to all providers launch concurrently using Fastly's `select()` API
+- **Parallel execution** — Bid requests to all providers leave together as one EdgeZero request batch on every adapter
 - **Strategy-based winner selection** — Automatic strategy detection based on configuration
 - **Mediator support** — Optional external mediator for final winner selection and unified floor pricing
 - **Provider abstraction** — Pluggable provider interface for adding new demand sources
@@ -185,7 +185,7 @@ POST /auction (AdRequest in Prebid.js format)
 AuctionOrchestrator.run_auction()
   │
   ├─ Detect strategy (parallel_only or parallel_mediation)
-  ├─ Launch all providers in parallel via select()
+  ├─ Send all bidder requests as one EdgeZero batch
   ├─ Collect responses as they complete
   │
   ├─[parallel_only]─── Select highest decoded CPM per slot
@@ -330,15 +330,17 @@ Mediation is optional for APS. APS reduces to one candidate per impression befor
 
 Demand sources implement the async, platform-neutral
 [`AuctionProvider`](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs).
-The trait receives an `AuctionRequest` and `AuctionContext`, launches a request
-as a `ProviderRequestOutcome`, and parses a `PlatformResponse` into an
-`AuctionResponse`. It also supplies capability, timeout, enablement, and
-platform-backend metadata. Providers that need request-local response state use
-the context-aware parsing hooks instead of storing mutable state on the shared
-provider instance.
+The trait receives an `AuctionRequest` and `AuctionContext` and returns a
+`ProviderRequestOutcome`: `Ready` with an unsent EdgeZero `OutboundRequest`, or
+an immediate response that needs no upstream call. It parses the
+`OutboundResponse` into an `AuctionResponse`, and also supplies media-type
+support, its timeout, and enablement. Providers that need request-local
+response state use the context-aware parsing hooks instead of storing mutable
+state on the shared provider instance.
 
-The orchestrator launches every request before collecting pending responses, so
-providers can run concurrently without depending on a Fastly-specific API.
+The orchestrator builds and signs every bidder request before it sends any, then
+sends them together as one batch, so providers run concurrently without
+depending on a Fastly-specific API.
 
 ### Prebid Provider
 
@@ -767,21 +769,34 @@ timeout_ms = 500
 ```
 
 `[auction.providers]` is a map, not a provider-name list. Each provider ID owns
-endpoint/backend correlation and telemetry. `[auction.bidders]` maps each
+endpoint correlation and telemetry. `[auction.bidders]` maps each
 client-visible bidder ID to one provider. The mediator remains a separately
 registered integration selected by `[auction].mediator`.
 
 Common provider fields and defaults:
 
-| Field            | Default         | Meaning                                                        |
-| ---------------- | --------------- | -------------------------------------------------------------- |
-| `protocol`       | Required        | `openrtb-2.6`                                                  |
-| `profile`        | `standard`      | Typed OpenRTB behavior                                         |
-| `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
-| `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
-| `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
-| `profile_config` | `{}`            | Profile-owned typed settings                                   |
-| `notifications`  | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats |
+| Field                 | Default         | Meaning                                                                            |
+| --------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `protocol`            | Required        | `openrtb-2.6`                                                                      |
+| `profile`             | `standard`      | Typed OpenRTB behavior                                                             |
+| `endpoint`            | Required        | Fixed absolute HTTPS endpoint                                                      |
+| `allow_insecure_http` | `false`         | Explicit per-provider HTTP opt-in for approved demos/tests; traffic is unencrypted |
+| `mtls`                | `false`         | Present the active slot's client certificate; see [Provider mTLS](#provider-mtls)  |
+| `timeout_ms`          | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout                         |
+| `routing`             | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles                                 |
+| `profile_config`      | `{}`            | Profile-owned typed settings                                                       |
+| `notifications`       | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats                     |
+
+HTTPS remains the default. The existing plain-HTTP exception for literal
+`127.0.0.1` and `[::1]` endpoints remains available without the opt-in.
+`localhost` and `127.0.0.2` do not qualify for that exception. Other HTTP endpoints
+require that provider's `allow_insecure_http = true`. Credentials, fragments and
+non-HTTP schemes remain invalid even with the opt-in. A provider with
+`mtls = true` needs an `https` endpoint; plain HTTP fails validation even
+through the loopback exception or `allow_insecure_http`.
+
+A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
+`[::1]`.
 
 APS normally uses `all_eligible`, which sends every compatible banner slot but
 never another provider's bidder parameters. `explicit` providers receive only
@@ -812,58 +827,231 @@ are each limited to 16 KiB, eight container levels, and 256 keys at one object
 level. Notification seat lists are limited to 128 unique entries of at most 128
 UTF-8 bytes each.
 
-### Validation and target capability
+### Validation and the Fastly backend bound
 
 Target-independent `ts config validate` compiles profiles, defaults, routes,
 endpoints, bounds, signing structure, and mediator selection. Every adapter
-startup compiles the same plan and then validates backend-name prediction,
-fan-out capability, and target resource limits. Fastly and Axum allow
-multi-provider fan-out; Cloudflare and Spin currently reject enabled auctions
-with more than one provider. Fastly reserves 40 of its default 200 dynamic
-backend names for non-auction traffic and rejects auction plans whose provider
-IDs and reachable timeout buckets could require more than the remaining 160.
+startup compiles the same plan, and every adapter runs multi-provider auctions.
+Fastly startup adds one check: an enabled plan may need at most 160 Fastly
+backend configurations, which leaves 40 of Fastly's 200 dynamic backends for
+other outbound traffic. Each distinct tuple of provider scheme, host, port,
+timeout, and `mtls` counts as one configuration, because a backend that presents
+a client certificate is separate from one that does not. Config validation and
+push do not run this check, so Fastly startup is where it applies.
 
-This tree does not yet have the EdgeZero callback required to run target-aware
-validation before `ts config push --adapter <target>` performs remote work.
-Until that callback lands, startup remains the mandatory target-aware gate.
+### Provider mTLS
+
+A provider can require Trusted Server to present a TLS client certificate, for
+example a self-hosted Prebid Server behind a load balancer that verifies
+clients. Set `mtls = true` on that provider:
+
+```toml
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://pbs.example.com/openrtb2/auction"
+mtls = true
+```
+
+Every provider with `mtls = true` presents the client identity of the active
+rotation slot. Trusted Server declares two in `edgezero.toml`,
+`auction-providers-blue` and `auction-providers-green`, and
+`[auction] mtls_slot` selects one, `blue` by default. See
+[Rotation](#rotation). Only the Fastly adapter presents client certificates. Axum, Cloudflare and Spin refuse to
+start when any provider sets `mtls`, even with the auction disabled, and
+`ts config push` and `ts config diff` refuse such a config for those adapters.
+
+#### Certificates
+
+The party that verifies the certificate owns the CA that issues it: the
+publisher for a self-hosted Prebid Server, or the host of a third-party one.
+Public CAs are ending client-authentication certificates, so use a private CA.
+The recommended flow uses an offline CA:
+
+1. The CA owner keeps the CA certificate and key offline.
+2. The Trusted Server operator generates a client key and a certificate signing
+   request locally.
+3. The CA signs a certificate with the `clientAuth` extended key usage and
+   about a one-year lifetime.
+4. The key goes into the Fastly Secret Store, as below, and nowhere else. The
+   certificate goes into the Fastly Config Store. It is not secret: Trusted
+   Server presents it to the provider on every connection.
+5. The CA certificate goes to the verifier, such as an AWS load balancer trust
+   store.
+
+The provider's server certificate is verified as usual, so it needs a publicly
+trusted certificate.
+
+The certificate identifies the Trusted Server deployment, not a user. Give it a
+service name as its subject, with no personal information. The verifier sees
+the certificate on each connection and may record it; an AWS load balancer in
+verify mode passes its details to the targets in `X-Amzn-Mtls-Clientcert-*`
+headers, and its connection logs record the subject, serial and source IP.
+Bid request bodies, consent and forwarded headers do not change. The
+[Prebid Server AWS example](https://github.com/IABTechLab/trusted-server/tree/main/deploy/pbs-example)
+can require client certificates at its load balancer.
+
+#### Fastly entries
+
+Each slot has three entries in the stores that `trusted_server_config` and
+`trusted_server_secrets` link to. `<identity>` is `auction-providers-blue` or
+`auction-providers-green`. Provision the active slot before you turn on `mtls`.
+
+| Store                                   | Key                      | Value                                                                                                    |
+| --------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Config Store (`trusted_server_config`)  | `<identity>.certificate` | PEM certificate chain, leaf first, at most 8,000 bytes                                                   |
+| Config Store (`trusted_server_config`)  | `<identity>.hosts`       | The origin of every provider with `mtls = true`, one per line, at most 4,000 bytes including line breaks |
+| Secret Store (`trusted_server_secrets`) | `<identity>.private-key` | Unencrypted PEM private key                                                                              |
+
+An origin is the endpoint's scheme, host and port, such as
+`https://pbs.example.com` or `https://pbs.example.com:8443`. A request to an
+origin missing from the list is refused before it is sent. A list over the limit makes the
+whole identity invalid, so every `mtls` provider fails with
+`hosts list is invalid`. The two Config Store
+entries count toward the store's entry limit, and `ts config push` leaves them
+alone.
+
+#### Secret Store reads
+
+Fastly allows 5 Secret Store reads per Compute request by default, and Trusted
+Server uses some for its own secrets, such as request signing keys. EdgeZero
+reads the private key each time a sandbox tries to register a backend for a new
+combination of origin, port, timeout and certificate; a failed registration
+reads again on the next try. Without the
+`reusable-sandbox` feature every request starts with no backends, so each
+auction spends one read per distinct mTLS origin and timeout (timeouts that
+round to the same backend timer share one). One Prebid Server
+endpoint costs one read per auction. A Secret Store read that fails, which
+likely includes one past the limit, fails that provider with
+`store is missing`. Measure the reads with your real provider set before
+relying on several mTLS origins.
+
+#### Rotation
+
+Rotate by switching slots. Never rewrite the active slot's entries in place.
+The key and the chain live in different stores, and each write reaches Fastly
+POPs on its own schedule, usually within a minute or two. Without
+`reusable-sandbox` every request registers its backend, reading the current key
+and the current chain, so an in-place rewrite fails every `mtls` auction until
+both writes have arrived. A staging test saw about three minutes of failures.
+
+To rotate from `blue` to `green`:
+
+1. Check the new pair before writing it: the key matches the certificate
+   (`openssl x509 -noout -pubkey` against `openssl pkey -pubout`), and the
+   verifier accepts the certificate, for example with
+   `curl --cert <certificate> --key <key> https://pbs.example.com/status`.
+2. Write `auction-providers-green.private-key`,
+   `auction-providers-green.certificate` and `auction-providers-green.hosts`.
+   Nothing reads the idle slot, so these writes cannot fail an auction.
+3. Wait for the entries to propagate. Five minutes is a safe margin.
+4. Push the config with `mtls_slot = "green"`. While the push propagates, each
+   request reads one slot or the other, and both hold a complete, matching
+   pair.
+5. Confirm with auctions, and with the verifier's logs, that the new
+   certificate is in use.
+6. Leave the `blue` entries in place as the rollback until you retire the old
+   certificate. Rolling back is another push of `mtls_slot`.
+
+Each slot names its own backends, because EdgeZero names a backend after the
+identity and its certificate chain. With `reusable-sandbox`, a sandbox keeps the
+old slot's backend until it loads the new config, and both certificates stay
+valid during that window. The verifier must trust both certificates until the
+switch is complete, which holds when one CA issues both. To change CAs, follow
+the verifier's own procedure, such as the PBS example's three-step bundle
+change.
+
+#### Rollout and rollback
+
+Versions of Trusted Server without this setting reject a config that has
+`mtls`, so the order matters:
+
+1. Deploy a Trusted Server version that supports `mtls`, with no `mtls` in the
+   config, and confirm every version serving traffic is on it.
+2. Provision the three Fastly entries.
+3. Push the config with `mtls = true`. With `reusable-sandbox`, a running
+   sandbox keeps its old settings until it is recycled, so allow for that
+   before the next step.
+
+`mtls_slot = "green"` follows the same rule: versions without the field reject
+it, so deploy a version that supports it before the first push that sets it.
+The default `blue` is omitted from the stored config. 4. Turn on client verification at the provider, and confirm auctions succeed.
+The PBS AWS example does this one region at a time.
+
+To roll back, reverse the order: turn client verification off at the provider,
+then push a config without `mtls`, and only then deploy an older Trusted Server
+version.
+
+#### Failures
+
+When Trusted Server refuses to send a request because the identity's material
+or hosts list is wrong, the provider returns no bids for that auction, with
+`error_type` `transport`; other providers are unaffected. The request is never
+retried without the certificate. Trusted Server logs one warning that names the
+identity and the reason:
+
+```text
+Planned provider 'pbs-main' request failed: ... outbound client identity auction-providers-blue: private key is missing
+```
+
+| Reason in the log                                    | Fix                                                                                           |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `certificate is missing` or `certificate is invalid` | Provision a PEM chain, leaf first, in the named identity's `.certificate` entry               |
+| `private key is missing`                             | Provision an unencrypted PEM key in the named identity's `.private-key` entry                 |
+| `hosts list is missing` or `hosts list is invalid`   | Provision the named identity's `.hosts` entry, one `https` origin per line                    |
+| `<origin> is not in the identity's hosts`            | Add the provider's origin; the logged origin includes the port, such as `:443`                |
+| `store is missing`                                   | Link both stores to the service; if they are linked, check the Secret Store read budget above |
+| `identity is not declared in the manifest`           | Deploy a Trusted Server build whose `edgezero.toml` declares it                               |
+
+Other failures follow the existing paths. Fastly reads the private key only as
+a handle, so a key that does not match the certificate is found later: either
+Fastly rejects the backend registration, which records `launch_failed`, or the
+handshake fails, which records `transport`. If every routed provider fails to
+launch, direct `/auction` returns `502 Bad Gateway`, as described under
+[Error Handling](#error-handling). A certificate the provider rejects
+is also a `transport` failure; check the provider's TLS logs, such as AWS
+connection logs, for the reason. Reading the store entries is
+bounded by the auction deadline, and running out of it is a `timeout`.
 
 ### Timeout behavior
 
-Auction requests start at dispatch and progress while the publisher origin loads.
-Response collection waits for headers and complete upstream bodies only until the
-original absolute deadline. At expiry, one nonblocking snapshot preserves complete
-responses already available; unfinished providers become timeouts. A slow origin
-never restarts the budget or causes an already-buffered bid to be discarded.
-Fastly has no upstream arrival timestamp, so this is a bound on network waiting,
-not bid eligibility based on an exact server-side arrival time. A mediator starts
-only with remaining budget and uses the earlier of the auction cutoff and its own
-logical timeout.
+The orchestrator builds and signs every bidder request, then sends them together
+as one EdgeZero request batch whose cutoff is the auction deadline, measured
+from auction start. The bids progress while the publisher origin loads. Each
+bidder request carries the provider's configured timeout as its total timeout
+and a 1 s connect timeout, and the batch cutoff bounds it by the remaining
+auction budget. Collection waits on the batch until every bidder has answered
+or the cutoff passes. A bid that has not arrived by the cutoff becomes a
+provider timeout. A slow origin never restarts the budget or discards a bid that
+already arrived. The mediator starts after the batch finishes, only with
+remaining budget, and uses the earlier of the auction deadline and its own
+timeout.
 
-Provider bids that are already complete at the final nonblocking snapshot remain
-eligible even after `tmax`; mediation starts only with remaining budget and
-rejects responses collected after its cutoff.
+A provider's reported response time runs from the batch start to its bid's
+arrival, so a collection that waits after an on-time bid does not increase it.
 
-Personalized auction and mediator requests explicitly bypass intermediary caches.
-Fastly uses the SDK's direct pending-request handles and body readiness handles in
-a timed wait. Retained partial payloads share a 10 MiB budget. Under memory pressure,
-the largest partial response is rejected with its own backend attribution so a
-large stalled provider cannot make a small healthy sibling take the failure.
-Completed payloads move directly into the platform body without a host-buffer
-round trip. This cap covers retained payloads, not every allocator or host buffer. The final nonblocking body drain is bounded by this payload limit; its local CPU work can extend beyond the network cutoff.
+Personalized auction and mediator requests explicitly bypass intermediary
+caches. A `prebid-server` or `aps` bidder response is capped at 2 MiB, a
+`standard` bidder response at 1 MiB, and the mediator response at 2 MiB. A
+bidder response over its cap fails that provider with `error_type`
+`transport`. No cap applies across all bidder responses together.
 
-On expiry Fastly closes acquired response bodies and abandons unfinished requests;
-the installed SDK has no pending-request cancellation API. Axum aborts outstanding
-request tasks. Cloudflare and Spin start owned background tasks at dispatch and
-retain abort handles until response collection completes. Cloudflare also aborts
-its fetch through an AbortController. Both workers retain their single-provider
-restriction. Dropping a pending handle cancels queued or running guest work;
-upstream side effects that already happened cannot be undone.
+On Fastly, EdgeZero records a bid's arrival whenever one of its polls services
+the provider, including the origin body reads while a page streams. A bid that
+completes while nothing polls, and is first observed after the cutoff, is
+dropped.
 
-Backend first-byte and between-byte timeouts remain transport safeguards rather
-than total deadlines. Timer granularity and runtime scheduling can add a small
-overshoot. Parsing, ranking, HTML processing, and delivery are local work outside
-network collection, so this cutoff is not a hard ceiling on the whole publisher
-response time.
+Dropping the batch cancels its in-flight requests on every adapter. An abandoned
+auction, an origin error, a non-HTML response, or a client that disconnects
+mid-stream therefore cancels the bidder and mediator requests. Only guest-side
+cancellation is guaranteed: host cancellation is best effort on Cloudflare,
+Fastly, and Spin, so a bidder may still receive and answer a cancelled request. Upstream side effects that
+already happened cannot be undone.
+
+Timer granularity and runtime scheduling can add a small overshoot. Parsing,
+ranking, HTML processing, and delivery are local work outside network
+collection, so this cutoff is not a hard ceiling on the whole publisher response
+time.
 
 Browser Prebid `timeout_ms` and `debug` stay under `[integrations.prebid]` and
 are independent of all server provider values. Server endpoint, timeout,
@@ -915,7 +1103,7 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — The provider records a `launch_failed` outcome and other providers continue. If every eligible provider fails before producing a pending or immediate outcome, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
+- **Provider launch failure** — The provider records a `launch_failed` outcome when its request cannot be built, Fastly cannot register its backend, or the Spin or Cloudflare adapter cannot prepare the request, and other providers continue. If every routed provider fails before the request batch starts, because Trusted Server cannot build its request or Fastly cannot register its backend, direct `/auction` execution returns `502 Bad Gateway`, and split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids. Spin and Cloudflare prepare each request inside the batch, so their preparation failures are recorded during collection: even when every provider fails that way, the auction completes without bids, and split execution records it as completed.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
 - **No providers configured** — Completes as a no-bid without provider I/O.
 - **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.
@@ -930,9 +1118,9 @@ The auction system logs at multiple levels throughout execution:
 
 | Level   | Examples                                                                                |
 | ------- | --------------------------------------------------------------------------------------- |
-| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing   |
+| `info`  | Auction request received, in-flight bidders, bid counts, winner selection, total timing |
 | `debug` | Bid-drop reasons, mediation restoration notes, creative processing mode and byte counts |
-| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices          |
+| `warn`  | Provider request failures, parse failures, mediator bids without decoded prices         |
 
 ### Response Metadata
 

@@ -1,13 +1,12 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
 //! Registers all routes for Trusted Server into a
-//! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
-//! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
-//! [`startup_error_router`] returns a bare router without middleware.
-//! Builds the [`AppState`] once per Wasm instance.
+//! [`RouterService`], with [`FinalizeResponseMiddleware`] (outermost) and
+//! [`AuthMiddleware`] (inner). [`assemble_app`] builds the [`AppState`] and
+//! the [`App`] once per sandbox through [`App::from_router`].
 //!
 //! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
+//! protocol or cipher metadata. The entry point injects a trusted `fastly-ssl`
 //! header after stripping client-spoofable headers, so [`detect_request_scheme`]
 //! in `http_util` can still derive the correct scheme for HTTPS traffic.
 //! It also captures the full [`ClientInfo`] (TLS, JA4, H2 fingerprint, server
@@ -22,14 +21,13 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
-//! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
+//! | GET | `/_ts/admin/ec`, `/_ts/admin/ec/{id}`, `/_ts/admin/eids` | [`IdentityApp::mount`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
-//! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | OPTIONS | `/_ts/api/v1/identify` | [`answer_identify_locally`] (CORS preflight) |
+//! | other | `/_ts/api/v1/identify`, `/_ts/api/v1/batch-sync` | `405` with `Allow` |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -43,8 +41,8 @@
 //!
 //! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
 //! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
-//! > This is a known intentional restriction of the EdgeZero router; the entry-point
-//! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
+//! > This is a known intentional restriction of the EdgeZero router; the entry point's
+//! > `finalize` step still adds TS headers to those 405 responses.
 //!
 //! # EC identity lifecycle
 //!
@@ -60,8 +58,8 @@
 //!   [`EcContext`], [`KvIdentityGraph`], and [`PartnerRegistry`] inputs as
 //!   legacy; the publisher fallback generates EC IDs for browser navigations.
 //! - Handlers attach an [`EcFinalizeState`] to the response via extensions;
-//!   `edgezero_main` pops it and runs `ec_finalize_response` plus the
-//!   pull-sync hook on the converted fastly response before sending.
+//!   the entry point's `finalize` step pops it and runs `ec_finalize_response`,
+//!   and post-delivery work runs pull sync once the response is delivered.
 //!
 //! ## Intentional deviations from legacy
 //!
@@ -79,60 +77,84 @@
 //!
 //! # Startup error handling
 //!
-//! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
-//! that responds to all routes with the startup error. This router does **not**
-//! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
-//! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! [`assemble_app`] and [`Hooks::routes`] return a settings or state failure
+//! as the [`EdgeError`] from [`startup_error`], and [`App::from_router`]
+//! returns a `configure` failure. The entry point retains nothing, so the next
+//! request retries. Whatever the error's status, it answers `GET` and `HEAD`
+//! `/ready` and every publisher fallback method with the fixed unavailable
+//! response from [`trusted_server_core::health`]; other methods get
+//! `EdgeZero`'s assembly-error response. Neither carries runtime or geo
+//! headers, and only the fixed response carries the compiled TS version.
+//! Liveness answers before assembly, so it stays `200`.
 
+use std::cell::RefCell;
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::ec_record_store::LazyEcRecordStore;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::FASTLY_PLATFORM;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+    HandlerFuture, HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
 };
+use edgezero_core::manifest::ResolvedLoggingConfig;
+use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::RouterService;
-use error_stack::Report;
-use trusted_server_core::auction::AuctionTelemetrySink;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::plan::validate_fastly_backend_bound;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::admin::{
-    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
-};
-use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::consent::ConsentContext;
+use trusted_server_core::constants::{COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
+use trusted_server_core::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::coordinator::transport::{InFlightLookups, OutboundLookupTransport};
+use trusted_server_core::ec::coordinator::{
+    IdentityCoordinator as _, LookupContext, PendingLookups, ProviderCoordinator,
+};
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::{EcContext, EidSyncSource};
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::ec::kv_backend::EcKvStore;
+use trusted_server_core::ec::kv_types::KvEntry;
+use trusted_server_core::ec::page_load::NavigationPermit;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
+use trusted_server_core::ec::rate_limiter::RateLimiter;
+use trusted_server_core::ec::record_backend::EcRecordLayout;
+use trusted_server_core::ec::sharedid::SharedIdRequest;
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
+use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
+use trusted_server_core::edge_app::install_edge_policies;
+use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
+use trusted_server_core::health::{ProbePreDispatchHook, StartupState};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, KvHandleStore, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
-    publisher_response_into_streaming_response,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_owner_error, publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -142,12 +164,19 @@ use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
-
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+use trusted_server_identity_providers::{
+    build_after_response_coordinator, build_coordinator_with, partner_registry,
 };
+
+use crate::middleware::{
+    AuthMiddleware, FinalizeResponseMiddleware, version_synthesized_headers,
+    warn_unsynthesizable_operator_response_headers,
+};
+use crate::platform::{
+    FastlyPlatformConfigStore, FastlyPlatformSecretStore, RequestGeo, UnavailableKvStore,
+};
+use crate::sandbox::RetainedApp;
+use crate::tinybird::{QueueingTelemetrySink, TelemetryQueue};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -189,27 +218,18 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
-    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
-}
-
-/// Build the application state, loading settings and constructing all per-application components.
-///
-/// # Errors
-///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-pub(crate) fn build_state(
-    stores: &RuntimeStoreConfig,
-) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store(stores)?)
+    /// Identity state (partner registry, identity-provider coordinators, EC
+    /// record store, rate limiter) built once and shared by every identity
+    /// route and EC finalization.
+    pub(crate) identity: Arc<IdentityApp>,
 }
 
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
     get_settings_from_config_store(
-        &FastlyPlatformConfigStore,
-        &FastlyPlatformSecretStore,
+        &FastlyPlatformConfigStore::read_only(),
+        &FastlyPlatformSecretStore::read_only(),
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
@@ -217,33 +237,108 @@ pub(crate) fn load_settings_from_config_store(
 }
 
 pub(crate) fn build_state_from_settings(
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    warn_if_certificate_check_disabled(&settings);
-
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    validate_fastly_backend_bound(&plan)?;
+    // Each request's synthesized set leaves these entries out at debug, so
+    // they warn here, once per sandbox.
+    warn_unsynthesizable_operator_response_headers(&settings);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let settings = Arc::new(settings);
+    let identity = build_identity_app(Arc::clone(&settings))?;
 
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
-        auction_telemetry_sink,
+        identity,
     }))
 }
 
-fn warn_if_certificate_check_disabled(settings: &Settings) {
-    if !settings.proxy.certificate_check {
-        log::warn!(
-            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
-        );
+/// Builds the core identity app with Fastly's EC record store, Edge Rate
+/// Limiting counter and identity providers.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the partner
+/// configuration cannot build a partner registry, or when an identity
+/// provider cannot run.
+pub(crate) fn build_identity_app(
+    settings: Arc<Settings>,
+) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
+    // A provider that cannot run must stop startup: skipping it would quietly
+    // hand its sources back to browser ingest.
+    let partners = Arc::new(partner_registry(&settings.ec)?);
+    let page = build_coordinator_with(&settings, Arc::clone(&partners))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    let after_response = build_after_response_coordinator(&settings, Arc::clone(&partners))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    identity_app_with_providers(
+        settings,
+        IdentityProviders {
+            partners,
+            page,
+            after_response,
+        },
+    )
+}
+
+/// Builds the core identity app with Fastly's EC record store and Edge Rate
+/// Limiting counter around already built identity `providers`.
+///
+/// # Errors
+///
+/// Returns the errors of [`IdentityApp::build`].
+fn identity_app_with_providers(
+    settings: Arc<Settings>,
+    providers: IdentityProviders,
+) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
+    let record_store = open_identity_record_store(&settings)?;
+    IdentityApp::build(
+        settings,
+        IdentityPlatform {
+            record_store,
+            rate_limiter: Some(Arc::new(FastlyRateLimiter::new(RATE_COUNTER_NAME))),
+            providers: Some(providers),
+        },
+    )
+}
+
+/// Selects the EC record store `ec.storage` (or the legacy `ec.ec_store`)
+/// names, held once per sandbox.
+///
+/// The Fastly binding is opened on the first EC operation, not here, so a
+/// missing or failing store fails only EC work rather than every route.
+///
+/// # Errors
+///
+/// Returns a configuration error for an invalid selection.
+pub(crate) fn open_identity_record_store(
+    settings: &Settings,
+) -> Result<Option<Arc<dyn EcKvStore + Send + Sync>>, Report<TrustedServerError>> {
+    let store_id = match settings.ec.resolve_storage(EcRuntime::Fastly)? {
+        None => return Ok(None),
+        Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
+    };
+    // A conformance run substitutes its inspectable fixture store, so
+    // every identity route and EC finalization reads and writes it.
+    #[cfg(test)]
+    if let Some(store) = crate::identity_conformance::fixture_store(store_id) {
+        return Ok(Some(store));
     }
+    Ok(Some(Arc::new(LazyEcRecordStore::new(store_id.to_owned()))))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,46 +347,106 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Prefers the full [`ClientInfo`] captured by `edgezero_main` from the original
+/// Uses the [`ClientInfo`] the entry point captured from the original
 /// `FastlyRequest` (TLS protocol/cipher, JA4, H2 fingerprint, and server
-/// hostname/region) and stored in the request extensions — the metadata
+/// hostname/region) and stored in the request extensions: the metadata
 /// integration bot protection (e.g. `DataDome`) serializes, which the
-/// reconstructed `EdgeZero` request cannot expose. Falls back to the client IP
-/// from the dispatch-inserted [`FastlyRequestContext`] when the extension is
-/// absent (e.g. tests that dispatch without the entry point). Scheme detection
-/// continues to rely on the trusted `fastly-ssl` header injected by
-/// `edgezero_main` after sanitization.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+/// reconstructed `EdgeZero` request cannot expose. Scheme detection continues
+/// to rely on the trusted `fastly-ssl` header injected by the entry point after
+/// sanitization.
+///
+/// The outbound client is the one `EdgeZero`'s Fastly request conversion
+/// installs in the request context, with the proxy marker turned off. The
+/// config and secret stores make their management API writes through it. The
+/// clock is the context's monotonic clock. Geo answers from the request's
+/// [`RequestGeo`], the lookup the entry point ran once.
+///
+/// With Tinybird enabled, the auction telemetry sink queues NDJSON on the
+/// request's [`TelemetryQueue`], which the entry point inserts and sends after
+/// delivery. Otherwise the sink is the no-op default.
+///
+/// # Errors
+///
+/// Returns an internal [`EdgeError`] when the request carries no outbound
+/// client, no [`RequestGeo`], no [`ClientInfo`], or no telemetry queue while
+/// Tinybird is enabled.
+fn build_per_request_services(
+    state: &AppState,
+    ctx: &RequestContext,
+) -> Result<RuntimeServices, EdgeError> {
     // No cooperative timer is installed: Fastly host calls block. EOF consumers
     // must bound their own transport calls using the remaining finish budget.
+    let outbound_client = request_outbound_client(ctx)?;
+    let request_geo = ctx
+        .extensions()
+        .get::<RequestGeo>()
+        .cloned()
+        .ok_or_else(|| EdgeError::internal(std::io::Error::other("request has no geo")))?;
     let client_info = ctx
-        .request()
         .extensions()
         .get::<ClientInfo>()
         .cloned()
-        .unwrap_or_else(|| ClientInfo {
-            client_ip: FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
-            ..ClientInfo::default()
-        });
+        .ok_or_else(|| EdgeError::internal(std::io::Error::other("request has no client info")))?;
 
-    RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(Arc::clone(&state.default_kv_store))
+    let mut services = RuntimeServices::builder();
+    if state.settings.tinybird.enabled {
+        let queue = ctx
+            .extensions()
+            .get::<TelemetryQueue>()
+            .cloned()
+            .ok_or_else(|| {
+                EdgeError::internal(std::io::Error::other("request has no telemetry queue"))
+            })?;
+        services = services.auction_telemetry_sink(Arc::new(QueueingTelemetrySink::new(
+            &state.settings.tinybird,
+            queue,
+        )));
+    }
+
+    Ok(services
+        .config_store(Arc::new(FastlyPlatformConfigStore::with_outbound_client(
+            outbound_client.clone(),
+        )))
+        .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
+            outbound_client.clone(),
+        )))
+        .kv_store(request_kv_store(state, ctx))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
-        .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
-        .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
+        .outbound_client(outbound_client)
+        .clock(ctx.monotonic_clock())
+        .geo(Arc::new(request_geo))
         .client_info(client_info)
-        .build()
+        .build())
 }
 
-fn publisher_fallback_methods() -> [Method; 7] {
+/// Logical ID of the generic runtime KV store.
+///
+/// It is distinct from `trusted_server_kv`, which is reserved for identity
+/// records, so generic KV writes never land in the identity store.
+pub(crate) const RUNTIME_KV_STORE_ID: &str = "trusted_server_runtime_kv";
+
+/// Returns the generic runtime KV store for one request.
+///
+/// `EdgeZero` registers the store [`TrustedServerApp::stores`] declares
+/// ([`RUNTIME_KV_STORE_ID`]) in every production request and opens the linked
+/// Fastly KV store on first use. The store is looked up by its ID, not as the
+/// registry default, so declaring another KV store cannot redirect it. A service without that store linked answers
+/// each KV operation with `KvError::OpenFailed`, and routes that do not use KV
+/// are unaffected. A request without a registry, which only test contexts
+/// build, uses [`AppState::default_kv_store`].
+fn request_kv_store(state: &AppState, ctx: &RequestContext) -> Arc<dyn PlatformKvStore> {
+    ctx.kv_store(RUNTIME_KV_STORE_ID).map_or_else(
+        || Arc::clone(&state.default_kv_store),
+        |handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>,
+    )
+}
+
+/// Returns the methods supported by publisher fallback and startup responses.
+pub(super) fn publisher_fallback_methods() -> [Method; 7] {
     [
         Method::GET,
         Method::POST,
@@ -314,24 +469,274 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 /// EC state threaded from route handlers to the `main.rs` entry point via
 /// response extensions.
 ///
-/// `edgezero_main` pops this from the response after dispatch and runs
-/// [`trusted_server_core::ec::finalize::ec_finalize_response`] plus the
-/// pull-sync hook on the converted fastly response — the same EC response
-/// lifecycle the legacy path drives through `RouteResult`.
+/// The entry point's `finalize` step pops this from the routed response and
+/// runs [`trusted_server_core::ec::finalize::ec_finalize_response`], and
+/// post-delivery work runs pull sync from it, the same EC response lifecycle
+/// the legacy path drives through `RouteResult`.
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so `edgezero_main` rebuilds the graph from
-    /// settings when this is set.
+    /// Whether EC finalization may write to the KV identity graph, which the
+    /// entry point takes from the identity app built once per sandbox.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
-    pub(crate) sharedid_cookie: Option<String>,
-    pub(crate) is_real_browser: bool,
-    /// Per-request services carried to the entry point so the pull-sync
-    /// dispatcher can reuse the same platform HTTP client.
-    pub(crate) services: RuntimeServices,
+    pub(crate) sharedid: SharedIdRequest,
+}
+
+/// Identity lookups dispatched for this navigation, collected before finalize.
+pub(crate) struct IdentityLookups {
+    pub(crate) coordinator: Arc<ProviderCoordinator>,
+    pub(crate) transport: OutboundLookupTransport,
+    pub(crate) pending: PendingLookups<InFlightLookups>,
+}
+
+/// What a navigation's after-response identity lookups need once the response
+/// has been sent.
+///
+/// The router owns the request, so the request signals the providers read are
+/// copied here. The lookups are dispatched only after the response, so they
+/// never delay the page.
+pub(crate) struct AfterResponseLookups {
+    pub(crate) coordinator: Arc<ProviderCoordinator>,
+    pub(crate) ec_id: String,
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) referer: Option<String>,
+    pub(crate) accept_language: Option<String>,
+    pub(crate) cookie_header: String,
+}
+
+/// Identity work a navigation hands to the entry point.
+///
+/// An in-flight `EdgeZero` batch is not `Send`, so it cannot ride in response
+/// extensions with [`EcFinalizeState`], and `EdgeZero` offers no other
+/// request-scoped slot that both the handler and `finalize` reach. The work
+/// travels through one request-local slot instead: the entry point clears it
+/// before sending the request and `finalize` takes it. The batch stays bound to
+/// the serving callback's outbound scope, which outlives `finalize`.
+#[derive(Default)]
+pub(crate) struct NavigationLookups {
+    /// Page-phase lookups, collected before EC finalization.
+    pub(crate) page: Option<IdentityLookups>,
+    /// After-response lookups, dispatched once the response has been sent.
+    pub(crate) after_response: Option<AfterResponseLookups>,
+}
+
+thread_local! {
+    static NAVIGATION_LOOKUPS: RefCell<NavigationLookups> = RefCell::new(NavigationLookups::default());
+}
+
+/// Takes the identity work stored for the current request.
+///
+/// The entry point calls this before routing (discarding anything a prior
+/// request left behind) and after the router returns.
+pub(crate) fn take_navigation_lookups() -> NavigationLookups {
+    NAVIGATION_LOOKUPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Request signals lent to identity providers, copied out of the request so
+/// lookups can run while the router hands the request to the origin fetch.
+struct ProviderRequestSignals {
+    client_ip: Option<IpAddr>,
+    user_agent: Option<String>,
+    referer: Option<String>,
+    accept_language: Option<String>,
+    cookie_header: String,
+}
+
+impl ProviderRequestSignals {
+    fn read(req: &Request, services: &RuntimeServices) -> Self {
+        Self {
+            // The trusted raw address: `EcContext::client_ip` is the
+            // normalized EC-hash input, which drops IPv6 separators.
+            client_ip: services.client_info().client_ip,
+            user_agent: header_string(req, &header::USER_AGENT),
+            referer: header_string(req, &header::REFERER),
+            accept_language: header_string(req, &header::ACCEPT_LANGUAGE),
+            cookie_header: joined_cookie_header(req),
+        }
+    }
+
+    fn client(&self) -> ClientSignals<'_> {
+        ClientSignals {
+            ip: self.client_ip,
+            user_agent: self.user_agent.as_deref(),
+            referer: self.referer.as_deref(),
+            accept_language: self.accept_language.as_deref(),
+        }
+    }
+}
+
+/// The first `name` header on the request, when it is visible ASCII.
+fn header_string(req: &Request, name: &header::HeaderName) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Joins every `Cookie` header on the request into one `; `-separated value.
+///
+/// HTTP/2 and HTTP/3 clients may split cookies across several headers.
+fn joined_cookie_header(req: &Request) -> String {
+    req.headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Captures the request signals for after-response identity lookups on a
+/// permitted publisher navigation.
+///
+/// Returns `None` when no after-response provider (including a pull-sync
+/// partner) is enabled, the client failed the browser check, the request has
+/// no EC, or the identity graph is unavailable.
+fn prepare_after_response_lookups(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+    ec: &EcRequestState,
+) -> Option<AfterResponseLookups> {
+    let coordinator = Arc::clone(state.identity.after_response_identity()?);
+    // Bot gate: pull sync and other after-response lookups disclose the EC ID
+    // to partners, so they run only for recognized browsers.
+    if !ec.is_real_browser {
+        return None;
+    }
+    ec.kv_graph.as_ref()?;
+    let ec_id = ec.ec_context.ec_value()?.to_owned();
+    let signals = ProviderRequestSignals::read(req, services);
+    Some(AfterResponseLookups {
+        coordinator,
+        ec_id,
+        client_ip: signals.client_ip,
+        user_agent: signals.user_agent,
+        referer: signals.referer,
+        accept_language: signals.accept_language,
+        cookie_header: signals.cookie_header,
+    })
+}
+
+/// What a navigation's page-phase identity lookups read, copied out of the
+/// request and its EC context.
+///
+/// The lookups, and the hashed-email status call before them (spec §8.7),
+/// run beside the origin fetch, which takes the request and borrows the EC
+/// context mutably, so this owns its inputs.
+///
+/// # Performance
+///
+/// Clones the consent context and the stored and pending rows once per
+/// navigation that dispatches providers.
+struct PageIdentityDispatch {
+    coordinator: Arc<ProviderCoordinator>,
+    ec_id: String,
+    snapshot: EcKvSnapshot,
+    minted_entry: Option<KvEntry>,
+    consent: ConsentContext,
+    signals: ProviderRequestSignals,
+}
+
+impl PageIdentityDispatch {
+    /// Copies the inputs of a permitted publisher navigation's lookups,
+    /// reading the stored row first when the request has not read it.
+    ///
+    /// Returns `None` when no provider is enabled, the request has no EC, or
+    /// the identity graph is unavailable. For an EC minted on this request
+    /// only providers that do not send the EC ID are dispatched, against the
+    /// row this navigation will create.
+    async fn prepare(
+        state: &AppState,
+        services: &RuntimeServices,
+        req: &Request,
+        ec: &mut EcRequestState,
+    ) -> Option<Self> {
+        let coordinator = Arc::clone(state.identity.page_identity()?);
+        let graph = ec.kv_graph.as_ref()?;
+        let ec_id = ec.ec_context.ec_value()?.to_owned();
+        if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
+            let snapshot = graph.load_snapshot(&ec_id).await;
+            ec.ec_context.set_kv_snapshot(snapshot);
+        }
+        Some(Self {
+            coordinator,
+            ec_id,
+            snapshot: ec.ec_context.kv_snapshot().clone(),
+            minted_entry: ec.ec_context.pending_entry().cloned(),
+            consent: ec.ec_context.consent().clone(),
+            signals: ProviderRequestSignals::read(req, services),
+        })
+    }
+
+    /// Starts the lookups, after the status call when a provider needs it,
+    /// counting them against the identity app's `rate_limiter`.
+    async fn start(
+        self,
+        services: &RuntimeServices,
+        rate_limiter: &dyn RateLimiter,
+        publisher_domain: &str,
+    ) -> IdentityLookups {
+        // The request's own client: the batch it starts is bound to the
+        // serving callback, so it stays in flight until `finalize` collects it.
+        let transport = OutboundLookupTransport::for_services(services);
+        let now = trusted_server_core::ec::current_timestamp();
+        let pending = self
+            .coordinator
+            .dispatch(
+                &transport,
+                &LookupContext {
+                    ec_id: &self.ec_id,
+                    snapshot: &self.snapshot,
+                    minted_entry: self.minted_entry.as_ref(),
+                    consent: &self.consent,
+                    client: self.signals.client(),
+                    publisher_domain,
+                    cookies: RequestCookies::new(&self.signals.cookie_header),
+                    rate_limiter,
+                    now: UnixSeconds::new(now),
+                },
+            )
+            .await;
+        IdentityLookups {
+            coordinator: self.coordinator,
+            transport,
+            pending,
+        }
+    }
+}
+
+/// Records on the EC context the sources whose identity providers' own
+/// cookies on this request record an opt-out.
+///
+/// Runs on every route before any identity egress, so the publisher auction,
+/// page-bids, `/auction` and identify withhold those sources on the request
+/// the opt-out cookie arrives on. Only cookies are read: no lookup is made.
+fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestState) {
+    let coordinators = [
+        state.identity.page_identity(),
+        state.identity.after_response_identity(),
+    ];
+    if coordinators.iter().all(Option::is_none) {
+        return;
+    }
+    let cookie_header = joined_cookie_header(req);
+    let cookies = RequestCookies::new(&cookie_header)
+        .at(UnixSeconds::new(
+            trusted_server_core::ec::current_timestamp(),
+        ))
+        .where_gdpr_applies(ec.ec_context.consent().gdpr_applies);
+    let sources: Vec<String> = coordinators
+        .into_iter()
+        .flatten()
+        .flat_map(|coordinator| coordinator.cookie_opted_out_sources(cookies))
+        .map(|source| source.as_str().to_owned())
+        .collect();
+    if !sources.is_empty() {
+        log::debug!("Identity egress: withholding sources opted out in cookies: {sources:?}");
+    }
+    ec.ec_context.set_cookie_opted_out_sources(sources);
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -341,11 +746,10 @@ pub(crate) struct EcFinalizeState {
 struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
-    finalize_kv_graph: Option<KvIdentityGraph>,
+    use_finalize_kv: bool,
     eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
+    sharedid: SharedIdRequest,
     is_real_browser: bool,
-    services: RuntimeServices,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
     /// filtering.
@@ -361,11 +765,9 @@ impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            use_finalize_kv: self.use_finalize_kv,
             eids_cookie: self.eids_cookie,
-            sharedid_cookie: self.sharedid_cookie,
-            is_real_browser: self.is_real_browser,
-            services: self.services,
+            sharedid: self.sharedid,
         }
     }
 }
@@ -388,7 +790,7 @@ fn derive_request_device_signals(req: &Request) -> DeviceSignals {
 
 /// Returns the device signals for an `EdgeZero` request.
 ///
-/// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
+/// The entry point derives [`DeviceSignals`] from the original `FastlyRequest`
 /// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
 /// real values — and stores them in the request extensions. Reading them back
 /// here preserves the bot gate's browser classification, which the `EdgeZero`
@@ -405,10 +807,11 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
-    settings: &Settings,
+    identity: &IdentityApp,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
+    let settings = identity.settings().as_ref();
     let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
@@ -421,7 +824,7 @@ fn build_ec_request_state(
     }
 
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(identity.sharedid_storage().cookie_name(), req);
 
     let geo_info = services
         .geo()
@@ -450,24 +853,23 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
+    let identity_graph = identity.identity_graph();
+    let use_finalize_kv = identity_graph.is_some()
+        && setup_error.is_none()
+        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()));
+    let kv_graph = if is_real_browser {
+        identity_graph
     } else {
         None
     };
-    let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
         ec_context,
         kv_graph,
-        finalize_kv_graph,
+        use_finalize_kv,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
         is_real_browser,
-        services: services.clone(),
         geo_info,
         setup_error,
     }
@@ -517,19 +919,17 @@ async fn run_pre_route_filters(
             response: *response,
             effects,
         },
-        Err(report) => {
-            log::error!("Failed to run integration request filters: {report:?}");
-            PreRoute::ShortCircuit {
-                response: http_error(&report),
-                effects: RequestFilterEffects::default(),
-            }
-        }
+        Err(report) => PreRoute::ShortCircuit {
+            response: http_error(&report),
+            effects: RequestFilterEffects::default(),
+        },
     }
 }
 
 /// Attaches the EC finalize state and any non-empty request-filter response
-/// effects to a dispatched response via extensions, so `edgezero_main` can run
-/// EC finalization and apply the filter effects after it (legacy ordering).
+/// effects to a dispatched response via extensions, so the entry point's
+/// `finalize` step can run EC finalization and apply the filter effects after it
+/// (legacy ordering).
 fn attach_dispatch_extensions(
     mut response: Response,
     ec: EcRequestState,
@@ -547,15 +947,23 @@ async fn execute_named(
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
-    let services = build_per_request_services(&state, &ctx);
-    let mut req = ctx.into_request();
+    let services = build_per_request_services(&state, &ctx)?;
+    let mut req = ctx.into_request()?;
+    if matches!(handler, NamedRouteHandler::ConsentUpdate) {
+        req = match trusted_server_core::ec::consent_update::prepare_consent_update(&services, req)
+            .await
+        {
+            Ok(req) => req,
+            Err(response) => return Ok(*response),
+        };
+    }
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
     // legacy route_request. Batch-sync also skips request filters, matching
     // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
-        return Ok(run_batch_sync(&state, &services, req));
+        return Ok(run_batch_sync(&state, req).await);
     }
 
     // An operator cache purge is not a reader request: running the EC lifecycle would
@@ -572,29 +980,6 @@ async fn execute_named(
         return Ok(response);
     }
 
-    // These diagnostics are read-only. Running the normal EC lifecycle would
-    // attach finalization state and could ingest request cookies into KV after
-    // the handler returns, violating that contract.
-    if matches!(
-        handler,
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
-    ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| match handler {
-                NamedRouteHandler::AdminEcLookup => {
-                    // Deliberately do not use an EC request-state graph: that
-                    // copy is bot-gated, while operators use curl for this
-                    // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
-                }
-                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
-                _ => unreachable!("admin diagnostics should use early dispatch"),
-            })
-            .unwrap_or_else(|error| http_error(&error));
-        return Ok(response);
-    }
-
     if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -602,7 +987,8 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state.identity, &services, &req);
+    apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -640,12 +1026,11 @@ async fn run_named_route(
             handle_trusted_server_discovery(&state.settings, services, req)
         }
         NamedRouteHandler::VerifySignature => {
-            handle_verify_signature(&state.settings, services, req)
+            handle_verify_signature(&state.settings, services, req).await
         }
-        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
-        NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
-            unreachable!("admin diagnostics should be handled before EC setup")
+        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req).await,
+        NamedRouteHandler::DeactivateKey => {
+            handle_deactivate_key(&state.settings, services, req).await
         }
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
@@ -656,29 +1041,45 @@ async fn run_named_route(
             unreachable!("batch-sync should be handled by run_batch_sync")
         }
         NamedRouteHandler::Identify => {
-            if req.method() == Method::OPTIONS {
-                cors_preflight_identify(&state.settings, &req)
-            } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                handle_identify(
-                    &state.settings,
-                    &kv,
-                    &partner_registry,
+            let identity_graph = state
+                .identity
+                .identity_graph()
+                .filter(|_| req.method() == Method::GET);
+            let Some(kv) = identity_graph else {
+                return answer_identify_locally(&state.settings, &req);
+            };
+            handle_identify(
+                &state.settings,
+                &kv,
+                state.identity.partners(),
+                &req,
+                &ec.ec_context,
+            )
+            .await
+        }
+        NamedRouteHandler::ConsentUpdate => {
+            // The finalize graph: present for browsers and for withdrawals
+            // from any client, matching the response-finalization write gate.
+            let finalize_kv_graph = state
+                .identity
+                .identity_graph()
+                .filter(|_| ec.use_finalize_kv);
+            Ok(
+                trusted_server_core::ec::consent_update::handle_consent_update(
                     &req,
-                    &ec.ec_context,
-                )
-            }
+                    finalize_kv_graph.as_ref(),
+                ),
+            )
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = state.identity.partners().as_ref();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -698,11 +1099,11 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = state.identity.partners().as_ref();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -721,7 +1122,7 @@ async fn run_named_route(
             .await
         }
         NamedRouteHandler::FirstPartyProxy => {
-            handle_first_party_proxy(&state.settings, services, req).await
+            handle_first_party_proxy(&state.settings, services, &ec.ec_context, req).await
         }
         NamedRouteHandler::FirstPartyClick => {
             handle_first_party_click(&state.settings, services, req).await
@@ -738,28 +1139,28 @@ async fn run_named_route(
 /// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
-fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    let sharedid =
+        SharedIdRequest::from_request(state.identity.sharedid_storage().cookie_name(), &req);
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
-
-    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    let identity = &state.identity;
+    let identity_graph = identity
+        .identity_graph()
+        .filter(|_| req.method() == Method::POST);
+    let mut response = match identity_graph {
+        None => answer_batch_sync_locally(&req),
+        Some(kv) => handle_batch_sync(&kv, identity.partners(), identity.rate_limiter(), req)
+            .await
+            .unwrap_or_else(|e| http_error(&e)),
+    };
     // Legacy parity: batch-sync responses still pass through
     // ec_finalize_response with a default EC context and no finalize KV graph.
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: EcContext::default(),
         use_finalize_kv: false,
         eids_cookie,
-        sharedid_cookie,
-        is_real_browser,
-        services: services.clone(),
+        sharedid,
     });
     response
 }
@@ -768,8 +1169,8 @@ async fn execute_fallback(
     state: Arc<AppState>,
     ctx: RequestContext,
 ) -> Result<Response, EdgeError> {
-    let services = build_per_request_services(&state, &ctx);
-    let req = ctx.into_request();
+    let services = build_per_request_services(&state, &ctx)?;
+    let req = ctx.into_request()?;
     Ok(dispatch_fallback(&state, &services, req).await)
 }
 
@@ -778,6 +1179,14 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
+    if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+        return match trusted_server_core::ec::consent_update::prepare_consent_update(services, req)
+            .await
+        {
+            Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(&req, None),
+            Err(response) => *response,
+        };
+    }
     if let Some(response) = deny_admin_diagnostic_fallback(&req) {
         return response;
     }
@@ -792,7 +1201,8 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(&state.identity, services, &req);
+    apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -820,8 +1230,6 @@ async fn dispatch_fallback(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
-                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })
@@ -848,16 +1256,45 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_navigation = is_navigation_request(&req);
+        let mut has_permit = false;
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+            // The page-load write permit uses the stricter Fetch Metadata test
+            // (spec §3.1); requests without it never write KV.
+            if let Some(permit) = NavigationPermit::classify(&req) {
+                ec.ec_context.set_navigation_permit(permit);
+                has_permit = true;
+            }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        // A new EC is minted only when this request may also write its row,
+        // so a client without Fetch Metadata never receives a throwaway EC.
         if is_publisher_navigation
+            && has_permit
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+                .await
         {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
+        }
+
+        // Identity lookups run beside the origin fetch, joined with it below;
+        // the entry point collects them before EC finalization. A hashed-email
+        // status call (spec §8.7) precedes them inside that join, so it never
+        // delays the origin fetch.
+        let page_identity = if is_publisher_navigation && has_permit {
+            PageIdentityDispatch::prepare(state, services, &req, &mut ec).await
+        } else {
+            None
+        };
+        // After-response providers only capture request signals here; they
+        // are built and dispatched once the response has been sent.
+        if is_publisher_navigation
+            && has_permit
+            && let Some(lookups) = prepare_after_response_lookups(state, services, &req, &ec)
+        {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
         }
 
         // Run the server-side auction with the configured creative-
@@ -867,44 +1304,64 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match PartnerRegistry::from_config(&state.settings.ec.partners) {
-            Ok(partner_registry) => {
-                let auction = AuctionDispatch {
-                    integration_registry: &state.registry,
-                    orchestrator: &state.orchestrator,
-                    slots,
-                    registry: Some(&partner_registry),
-                };
-                match handle_publisher_request(
-                    &state.settings,
-                    services,
-                    ec.kv_graph.as_ref(),
-                    &mut ec.ec_context,
-                    auction,
-                    req,
-                    EdgeCacheHeader::SurrogateControl,
+        let auction = AuctionDispatch {
+            integration_registry: &state.registry,
+            orchestrator: &state.orchestrator,
+            slots,
+            registry: Some(state.identity.partners().as_ref()),
+        };
+        let start_identity = async {
+            match page_identity {
+                Some(dispatch) => Some(
+                    dispatch
+                        .start(
+                            services,
+                            state.identity.rate_limiter(),
+                            &state.settings.publisher.domain,
+                        )
+                        .await,
+                ),
+                None => None,
+            }
+        };
+        let origin = handle_publisher_request(
+            &state.settings,
+            services,
+            ec.kv_graph.as_ref(),
+            &mut ec.ec_context,
+            auction,
+            req,
+            PublisherOriginOptions {
+                edge_header: EdgeCacheHeader::SurrogateControl,
+                input_cap: None,
+                response_decoding: ResponseDecoding::Original,
+            },
+        );
+        let (page_lookups, origin) = futures::future::join(start_identity, origin).await;
+        if let Some(lookups) = page_lookups {
+            NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().page = Some(lookups));
+        }
+        match origin {
+            Ok((pub_response, owner)) => {
+                // Origin start succeeded on the sole publisher-page
+                // path. Authorize orphan recovery only for real-browser
+                // document navigations so named routes, integration
+                // proxies, and filter short circuits cannot rotate an
+                // identity.
+                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                // The owner keeps the auction batch and the origin body
+                // alive until the client body ends: `EdgeZero`'s
+                // delivery takes it from the body and holds it to the end.
+                publisher_response_into_streaming_response(
+                    pub_response,
+                    &method,
+                    Arc::clone(&state.settings),
+                    state.registry.as_ref(),
+                    Arc::clone(&state.orchestrator),
+                    services.clone(),
                 )
                 .await
-                {
-                    Ok(pub_response) => {
-                        // Origin start succeeded on the sole publisher-page
-                        // path. Authorize orphan recovery only for real-browser
-                        // document navigations so named routes, integration
-                        // proxies, and filter short circuits cannot rotate an
-                        // identity.
-                        ec.ec_context.set_recovery_eligible(is_publisher_navigation);
-                        publisher_response_into_streaming_response(
-                            pub_response,
-                            &method,
-                            Arc::clone(&state.settings),
-                            state.registry.as_ref(),
-                            Arc::clone(&state.orchestrator),
-                            services.clone(),
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                }
+                .and_then(|response| owner.attach(response).map_err(publisher_owner_error))
             }
             Err(e) => Err(e),
         }
@@ -914,35 +1371,22 @@ async fn dispatch_fallback(
     attach_dispatch_extensions(response, ec, effects)
 }
 
-/// Returns `true` when an asset response should carry a (streamed) body.
-///
-/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
-/// representation length in their `Content-Length` header while carrying no
-/// body. Attaching the origin stream would either contradict that header or
-/// stream bytes a client does not expect, so those responses drop the stream and
-/// keep the origin's `Content-Length` untouched.
-fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
-    *method != Method::HEAD
-        && status != StatusCode::NO_CONTENT
-        && status != StatusCode::NOT_MODIFIED
-}
-
 /// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
 /// `route_request` asset branch.
 ///
 /// Proxies the request to the configured asset origin and threads the
-/// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
-/// can reapply protected cache directives after finalization. EC finalization
-/// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
-/// legacy `should_finalize_ec = false` behavior for asset responses.
+/// [`AssetProxyCachePolicy`] out via response extensions so the entry point's
+/// `finalize` step can reapply protected cache directives after finalization.
+/// EC finalization is intentionally skipped: no [`EcFinalizeState`] is
+/// attached, matching the legacy `should_finalize_ec = false` behavior for
+/// asset responses.
 ///
 /// Like legacy `route_request`, asset bodies are streamed straight to the client
-/// with no cap: the origin stream is attached to the response and `edgezero_main`
-/// commits the headers, then pipes the body chunk-by-chunk via
-/// [`fastly::Response::stream_to_client`] and
-/// [`stream_asset_body`](trusted_server_core::proxy::stream_asset_body). The
-/// origin stream is left untouched here, so large images never materialize in
-/// the Wasm heap.
+/// with no cap: the response keeps the origin stream, and `EdgeZero`'s response
+/// delivery commits the headers and pumps the body chunk by chunk, so large
+/// images never materialize in the Wasm heap. A `HEAD`, 204, or 304 carries an
+/// empty body. A `HEAD` or 304 keeps the origin's `Content-Length`; a 204 has
+/// none.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -952,23 +1396,10 @@ async fn dispatch_asset_fallback(
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
-    let method = req.method().clone();
-
     match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
         Ok(asset_response) => {
             let cache_policy = asset_response.cache_policy();
-            let (mut response, stream_body) = asset_response.into_response_and_body();
-
-            // Attach the origin stream so `edgezero_main` streams it to the
-            // client. HEAD and bodiless statuses (204, 304) advertise the origin
-            // Content-Length but carry no body, so their stream is dropped to
-            // preserve that header and avoid a length/body mismatch.
-            if let Some(body) = stream_body
-                && asset_response_carries_body(&method, response.status())
-            {
-                *response.body_mut() = body;
-            }
-
+            let mut response = asset_response.into_response();
             response.extensions_mut().insert(cache_policy);
             attach_request_filter_effects(&mut response, effects);
             response
@@ -996,29 +1427,6 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
-/// mirroring [`crate::http_error_response`] exactly.
-///
-/// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types.
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the `EdgeZero` path.
 ///
@@ -1037,39 +1445,6 @@ fn legacy_admin_alias_denied() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
-// ---------------------------------------------------------------------------
-
-/// Returns a [`RouterService`] that responds to every registered route with the startup error.
-///
-/// Called when [`build_state`] fails so that request handling degrades to a
-/// structured HTTP error response rather than an unrecoverable panic.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
-    };
-
-    let mut router = RouterService::builder();
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
-    }
-    router.build()
-}
-
-// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1079,14 +1454,13 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
-    AdminEcLookup,
-    AdminEidsLookup,
     AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
     BatchSync,
     Identify,
+    ConsentUpdate,
     SetTester,
     ClearTester,
     Auction,
@@ -1120,6 +1494,21 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
 
 const NAMED_ROUTES: &[NamedRoute] = &[
     NamedRoute {
+        path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
+        primary_methods: &[
+            Method::GET,
+            Method::POST,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::TRACE,
+            Method::CONNECT,
+        ],
+        handler: NamedRouteHandler::ConsentUpdate,
+    },
+    NamedRoute {
         path: "/.well-known/trusted-server.json",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::TrustedServerDiscovery,
@@ -1148,25 +1537,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::AdminCachePurge,
     },
-    // Admin EC lookup: the bare route reads the EC ID from the caller's
-    // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
-    NamedRoute {
-        path: "/_ts/admin/ec",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    NamedRoute {
-        path: "/_ts/admin/ec/{id}",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
-    // an ingestion preview. Pure request inspection — no KV access.
-    NamedRoute {
-        path: "/_ts/admin/eids",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEidsLookup,
-    },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
     // regex `^/_ts/admin` does not match them, and letting them fall through to
@@ -1183,14 +1553,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
     },
+    // Partner APIs claim every method so no request on these paths, nor the
+    // partner's Bearer token, reaches the publisher. The handlers answer
+    // methods other than the primary ones with 405.
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
-        primary_methods: &[Method::POST],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::BatchSync,
     },
     NamedRoute {
         path: "/_ts/api/v1/identify",
-        primary_methods: &[Method::GET, Method::OPTIONS],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::Identify,
     },
     NamedRoute {
@@ -1276,41 +1649,68 @@ fn fallback_route_handler(
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// Assembles the application from loaded `settings`.
+///
+/// Builds the [`AppState`] and its routes, then [`App::from_router`], which
+/// applies the name, [`Hooks::configure`], and the platform check exactly once.
+/// The entry point retains the result in its sandbox only on success.
+/// `log_context` ends the settings or state failure log, so it matches the
+/// request that triggered assembly.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] from [`startup_error`] when settings or state
+/// fail, or the `configure` error, either of which the entry point answers
+/// with `EdgeZero`'s assembly-error response.
+pub(crate) fn assemble_app(
+    settings: Result<Settings, Report<TrustedServerError>>,
+    log_context: &dyn fmt::Display,
+) -> Result<RetainedApp, EdgeError> {
+    let state = startup_state(settings, log_context)?;
+    let app = App::from_router::<TrustedServerApp>(
+        TrustedServerApp::routes_for_state(&state),
+        FASTLY_PLATFORM,
+    )?;
+    Ok(RetainedApp { app, state })
+}
+
+/// Builds the [`AppState`] from loaded `settings`.
+///
+/// # Errors
+///
+/// Returns the [`EdgeError`] from [`startup_error`] after logging the full
+/// report, followed by `log_context`.
+fn startup_state(
+    settings: Result<Settings, Report<TrustedServerError>>,
+    log_context: &dyn fmt::Display,
+) -> Result<Arc<AppState>, EdgeError> {
+    settings
+        .and_then(build_state_from_settings)
+        .map_err(|report| {
+            log::error!("failed to build application state: {report:?}{log_context}");
+            startup_error(&report)
+        })
+}
+
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state(
-        stores: &RuntimeStoreConfig,
-    ) -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state(stores);
-        let mut app = App::with_name(router, Self::name());
-        Self::configure(&mut app);
-        (app, state)
-    }
-
-    fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state(stores) {
-            Ok(state) => state,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return (startup_error_router(e), None);
-            }
-        };
-
-        (Self::routes_for_state(&state), Some(state))
-    }
-
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(trace_metadata),
-            )))
-            .middleware(FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(trace_metadata),
+                ))),
             ))
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
+
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups. Their other methods reach the catch-all fallback, which
+        // denies admin diagnostics locally.
+        router = state.identity.mount(router);
 
         // matchit prefers exact path+method over a wildcard catch-all. Each
         // named route is registered from this single table, then every
@@ -1343,34 +1743,71 @@ impl TrustedServerApp {
     }
 }
 
-fn trace_metadata(request: &Request) -> TraceMetadata {
+fn trace_metadata(request: &RequestParts) -> TraceMetadata {
     let client_info = request
-        .extensions()
+        .extensions
         .get::<ClientInfo>()
         .cloned()
-        .unwrap_or_else(|| ClientInfo {
-            client_ip: FastlyRequestContext::get(request).and_then(|context| context.client_ip),
-            ..ClientInfo::default()
-        });
-    let geo = client_info.client_ip.and_then(|client_ip| {
-        FastlyPlatformGeo
-            .lookup(Some(client_ip))
-            .unwrap_or_else(|_| {
-                log::warn!("trace_geo_unavailable");
-                None
-            })
-    });
+        .unwrap_or_default();
+    let geo = request
+        .extensions
+        .get::<RequestGeo>()
+        .and_then(RequestGeo::geo)
+        .cloned();
     TraceMetadata { client_info, geo }
 }
 
 impl Hooks for TrustedServerApp {
+    /// Installs the edge policies with the version headers as the synthesized set.
+    ///
+    /// The set is [`version_synthesized_headers`] for `FASTLY_SERVICE_VERSION`,
+    /// read as the finalize middleware reads it. The entry point replaces the
+    /// set for each request with the finalize headers that do not depend on
+    /// the response.
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        app.require_record_store("trusted_server_kv", EcRecordLayout)
+            .map_err(|_| EdgeError::validation("invalid Fastly EC record declaration"))?;
+        install_edge_policies(
+            app,
+            version_synthesized_headers(
+                trusted_server_core::runtime_env!(ENV_FASTLY_SERVICE_VERSION)
+                    .ok()
+                    .as_deref(),
+            ),
+        )
+    }
+
+    /// Returns `[adapters.<adapter>.logging]` from the repository's `edgezero.toml`.
+    ///
+    /// `EdgeZero`'s `run_custom` and `serve_custom` call this before every
+    /// callback to install the managed Fastly logger. `EdgeZero`'s
+    /// `logging_config!` resolves and validates the table at compile time, the
+    /// same way the `app!` macro does, so no request parses the manifest and it
+    /// stays the single source of the Fastly logging settings.
+    fn logging_for(adapter: &str) -> ResolvedLoggingConfig {
+        edgezero_core::logging_config!("../../edgezero.toml", adapter)
+    }
+
+    /// Returns the repository's `edgezero.toml`, baked at build time.
+    ///
+    /// [`App::from_router`] builds the outbound client-identity policy from this hook, so
+    /// auction providers with `mtls = true` can present the `auction-providers` identity. The
+    /// trait default reports no manifest, which would leave that policy empty. On Fastly the
+    /// policy is the only runtime reader of the hook.
+    fn manifest() -> edgezero_core::manifest::BakedManifest {
+        trusted_server_core::edgezero_manifest::baked_edgezero_manifest()
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let stores = RuntimeStoreConfig::logical();
-        Self::router_with_state(&stores).0
+    fn routes() -> Result<RouterService, EdgeError> {
+        let state = startup_state(
+            load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+            &"",
+        )?;
+        Ok(Self::routes_for_state(&state))
     }
 
     fn stores() -> StoresMetadata {
@@ -1380,8 +1817,8 @@ impl Hooks for TrustedServerApp {
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
             kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
+                default: RUNTIME_KV_STORE_ID,
+                ids: &[RUNTIME_KV_STORE_ID, "trusted_server_kv"],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1399,14 +1836,16 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
-        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
-        build_state_from_settings, compile_auction_plan, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        App, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, FASTLY_PLATFORM,
+        HandlerFuture, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+        PublisherOriginOptions, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        compile_auction_plan, handle_publisher_request, load_settings_from_config_store,
+        publisher_owner_error, publisher_response_into_streaming_response,
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_adapter_fastly::FastlyLogging;
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
@@ -1414,6 +1853,7 @@ mod tests {
         HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
     };
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::outbound::ResponseDecoding;
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1421,22 +1861,42 @@ mod tests {
     use error_stack::Report;
     use futures::StreamExt as _;
     use futures::executor::block_on;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use std::borrow::Cow;
+    use std::num::NonZeroUsize;
+    use trusted_server_core::auction::AuctionEventBatch;
+    use trusted_server_core::constants::{ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE};
+    use trusted_server_core::ec::app::IdentityProviders;
+    use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
     use trusted_server_core::ec::device::DeviceSignals;
+    use trusted_server_core::ec::eid_types::SourceDomain;
+    use trusted_server_core::ec::kv::KvIdentityGraph;
+    use trusted_server_core::ec::kv_types::KvEntry;
+    use trusted_server_core::ec::provider::{
+        CookieRead, EidLevelFields, EidShape, IdentityProvider, LookupInput, LookupOutcome,
+        ProviderCapabilities, ProviderEid, ProviderError, ProviderExpiry, ProviderRequest,
+        ProviderResponse, ProviderUid, RequestCookies, SourceCapability, SourceInput,
+    };
+    use trusted_server_core::ec::registry::PartnerRegistry;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
-        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
-        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
+        ClientInfo, GeoInfo, HttpClient, PlatformKvStore, PlatformTemplateCache,
+        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
+        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
+        TemplateMetadata,
     };
-    use trusted_server_core::settings::Settings;
-    use trusted_server_core::test_support::nextjs_auction;
+    use trusted_server_core::settings::{EcPartner, IdentityProviderConfig, Settings};
+    use trusted_server_core::test_support::logging::LogCapture;
+    use trusted_server_core::test_support::scripted_client::{
+        RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
+    use trusted_server_core::test_support::{insert_outbound_client, nextjs_auction};
+
+    use crate::platform::RequestGeo;
+    use crate::tinybird::TelemetryQueue;
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -1482,12 +1942,71 @@ mod tests {
     }
 
     #[test]
+    fn logging_for_reads_the_fastly_logging_table() {
+        let logging = FastlyLogging::from(TrustedServerApp::logging_for("fastly"));
+
+        assert_eq!(
+            logging.endpoint.as_deref(),
+            Some("tslog"),
+            "should log to the manifest's tslog endpoint"
+        );
+        assert_eq!(
+            logging.level,
+            log::LevelFilter::Info,
+            "should log at the manifest's info level"
+        );
+        assert!(
+            logging.echo_stdout,
+            "should echo records to stdout as the manifest says"
+        );
+    }
+
+    #[test]
     fn runtime_store_config_opens_logical_store_ids_and_key() {
         let stores = RuntimeStoreConfig::logical();
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
         assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
+
+    #[test]
+    fn startup_accepts_any_fastly_ec_store_link_name() {
+        // The EC store opens by its Fastly resource-link name on the first EC
+        // operation, so startup accepts a deployment's existing link name as
+        // well as the logical `trusted_server_kv` link.
+        for name in ["ec_id_store", "trusted_server_kv"] {
+            let mut settings = test_settings();
+            settings.ec.ec_store = Some(name.to_owned());
+            assert!(
+                build_state_from_settings(settings).is_ok(),
+                "should build app state for EC store link `{name}` without opening it"
+            );
+        }
+    }
+
+    #[test]
+    fn assembled_app_accepts_mtls_and_declares_both_auction_client_identity_slots() {
+        let mut settings = test_settings();
+        let (id, provider) = trusted_server_core::test_support::fixtures::mtls_auction_provider();
+        settings.auction.providers.insert(id, provider);
+
+        let retained = assemble_app(Ok(settings), &"")
+            .unwrap_or_else(|_| panic!("should assemble the Fastly app with an mtls provider"));
+
+        for slot in trusted_server_core::auction::plan::MtlsSlot::ALL {
+            let name = edgezero_core::outbound::ClientIdentityName::new(slot.identity_name())
+                .expect("should accept the identity name");
+            assert!(
+                retained
+                    .app
+                    .client_identity_policy()
+                    .identity(&name)
+                    .is_some(),
+                "should attach the manifest's {} identity to the assembled app",
+                slot.identity_name()
+            );
+        }
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
@@ -1506,6 +2025,49 @@ mod tests {
     }
 
     fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
+        // `oneshot` skips `EdgeZero`'s request conversion, which installs the
+        // adapter's default client, so install one that fails every request.
+        route_through(router, request, &ScriptedHttpClient::forbidding())
+    }
+
+    /// Routes `request` with `origin` as its outbound client.
+    fn route_through(
+        router: &RouterService,
+        mut request: edgezero_core::http::Request,
+        origin: &ScriptedHttpClient,
+    ) -> Response {
+        // `oneshot` also skips the entry point's `prepare`, so add the client
+        // info and the geo `prepare` would hold for the request's client IP,
+        // without host geo data.
+        insert_outbound_client(&mut request, HttpClient::with_client(origin.clone()));
+        let client_ip = request
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>()
+            .client_ip;
+        request
+            .extensions_mut()
+            .insert(RequestGeo::new(client_ip, None));
+        block_on(router.oneshot(request)).expect("should route request")
+    }
+
+    /// Routes `request` with `client`, and the geo lookup `prepare` runs for
+    /// the request's client IP.
+    ///
+    /// Viceroy geolocates loopback to a US privacy state, which tests that
+    /// need consent to mint an EC rely on.
+    fn route_with_host_geo(
+        router: &RouterService,
+        mut request: edgezero_core::http::Request,
+        client: &ScriptedHttpClient,
+    ) -> Response {
+        insert_outbound_client(&mut request, HttpClient::with_client(client.clone()));
+        let client_ip = request
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>()
+            .client_ip;
+        request
+            .extensions_mut()
+            .insert(RequestGeo::lookup_once(client_ip));
         block_on(router.oneshot(request)).expect("should route request")
     }
 
@@ -1560,15 +2122,298 @@ mod tests {
         TrustedServerApp::routes_for_state(&state)
     }
 
+    /// Wraps `request` in a context that carries `client`, as `EdgeZero`'s Fastly
+    /// request conversion installs its default client, and an empty
+    /// [`RequestGeo`] and the request's [`ClientInfo`] (empty unless the
+    /// caller set one), as the entry point inserts them.
+    fn context_with_client(
+        mut request: edgezero_core::http::Request,
+        client: HttpClient,
+    ) -> RequestContext {
+        request.extensions_mut().insert(client);
+        request.extensions_mut().insert(RequestGeo::default());
+        request
+            .extensions_mut()
+            .get_or_insert_default::<ClientInfo>();
+        RequestContext::new(request, PathParams::default())
+    }
+
     #[test]
-    fn per_request_services_register_the_fastly_template_assembler() {
+    fn per_request_services_carry_the_context_client_with_the_proxy_marker_off() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+        assert!(
+            client.proxy_marker_enabled(),
+            "should start from a client whose marker is on"
+        );
+        let context = context_with_client(empty_request(Method::GET, "/article"), client);
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+
+        assert!(
+            !services.outbound_client().proxy_marker_enabled(),
+            "should turn the proxy marker off on the context client"
+        );
+    }
+
+    /// Builds a context whose `KvRegistry` holds the Fastly KV store linked
+    /// under the id [`TrustedServerApp::stores`] declares, as `EdgeZero`'s
+    /// dispatch registers it for a production request.
+    fn context_with_declared_kv_store(request: edgezero_core::http::Request) -> RequestContext {
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+        let store = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+            .expect("should open the KV store fastly.toml links under the declared id");
+        let registry = edgezero_core::store_registry::KvRegistry::new(
+            std::collections::BTreeMap::from([(
+                declared.default.to_owned(),
+                edgezero_core::key_value_store::KvHandle::new(Arc::new(store)),
+            )]),
+            declared.default.to_owned(),
+        );
+        let mut request = request;
+        request.extensions_mut().insert(registry);
+        context_with_client(
+            request,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        )
+    }
+
+    #[test]
+    fn per_request_services_write_through_to_the_declared_kv_store() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_declared_kv_store(empty_request(Method::GET, "/article"));
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.kv_store().put_bytes(
+            "per-request-services-write-through",
+            Bytes::from_static(b"example-value"),
+        ))
+        .expect("should write through the request's KV store");
+
+        let independent =
+            edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+                .expect("should reopen the linked KV store");
+        assert_eq!(
+            block_on(PlatformKvStore::get_bytes(
+                &independent,
+                "per-request-services-write-through"
+            ))
+            .expect("should read the linked KV store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should persist the write in the store linked under `trusted_server_runtime_kv`"
+        );
+    }
+
+    #[test]
+    fn per_request_services_without_a_kv_registry_report_kv_unavailable() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        let result = block_on(services.kv_store().get_bytes("example-key"));
+
+        assert!(
+            matches!(
+                result,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should fall back to the unavailable KV store, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_a_request_without_an_outbound_client() {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         let context = RequestContext::new(
             empty_request(Method::GET, "/article"),
             PathParams::default(),
         );
 
-        let services = build_per_request_services(&state, &context);
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no outbound client");
+
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a missing client with an internal error"
+        );
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no outbound client",
+            "should name the missing client"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_a_request_without_geo() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let mut request = empty_request(Method::GET, "/article");
+        request
+            .extensions_mut()
+            .insert(ScriptedHttpClient::forbidding().http_client());
+        let context = RequestContext::new(request, PathParams::default());
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no geo");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no geo",
+            "should name the missing geo"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_a_request_without_client_info() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let mut request = empty_request(Method::GET, "/article");
+        request
+            .extensions_mut()
+            .insert(ScriptedHttpClient::forbidding().http_client());
+        request.extensions_mut().insert(RequestGeo::default());
+        let context = RequestContext::new(request, PathParams::default());
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no client info");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no client info",
+            "should name the missing client info"
+        );
+    }
+
+    #[test]
+    fn per_request_services_answer_geo_from_the_entry_point_lookup() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let reader_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+        let held = GeoInfo {
+            city: Some("Springfield".to_owned()),
+            country: "US".to_owned(),
+            continent: Some("NorthAmerica".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 39.78,
+                longitude: -89.65,
+            }),
+            metro_code: Some(648),
+            region: Some("IL".to_owned()),
+            asn: None,
+        };
+        let mut request = empty_request(Method::GET, "/article");
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(reader_ip),
+            ..ClientInfo::default()
+        });
+        let mut context =
+            context_with_client(request, ScriptedHttpClient::forbidding().http_client());
+        context
+            .extensions_mut()
+            .insert(RequestGeo::new(Some(reader_ip), Some(held)));
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+
+        assert_eq!(
+            services
+                .geo()
+                .lookup(services.client_info().client_ip)
+                .expect("should answer geo")
+                .and_then(|geo| geo.city),
+            Some("Springfield".to_owned()),
+            "should answer the client IP from the entry point's lookup"
+        );
+    }
+
+    #[test]
+    fn per_request_services_queue_telemetry_when_tinybird_is_enabled() {
+        let mut settings = test_settings();
+        settings.tinybird = crate::tinybird::tests::enabled_config();
+        let state = build_state_from_settings(settings).expect("should build test state");
+        let queue = TelemetryQueue::default();
+        let mut request = empty_request(Method::GET, "/article");
+        request.extensions_mut().insert(queue.clone());
+        let client = ScriptedHttpClient::forbidding();
+        let context = context_with_client(request, client.http_client());
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.auction_telemetry_sink().emit_auction_events(
+            &services,
+            AuctionEventBatch::new(vec![crate::tinybird::tests::test_row()]),
+        ))
+        .expect("should queue the batch");
+
+        client.assert_no_requests();
+
+        assert!(
+            services.auction_telemetry_sink().is_enabled(),
+            "should enable the telemetry sink"
+        );
+        assert_eq!(
+            queue.take().len(),
+            1,
+            "should queue the batch on the request's queue instead of sending it"
+        );
+    }
+
+    #[test]
+    fn per_request_services_reject_tinybird_without_a_telemetry_queue() {
+        let mut settings = test_settings();
+        settings.tinybird = crate::tinybird::tests::enabled_config();
+        let state = build_state_from_settings(settings).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let error = build_per_request_services(&state, &context)
+            .expect_err("should reject a request with no telemetry queue");
+
+        assert_eq!(
+            error.to_string(),
+            "internal error: request has no telemetry queue",
+            "should name the missing queue"
+        );
+    }
+
+    #[test]
+    fn per_request_services_send_no_telemetry_when_tinybird_is_disabled() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services without a queue");
+
+        assert!(
+            !services.auction_telemetry_sink().is_enabled(),
+            "should keep the no-op sink"
+        );
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
         let template = format!(
             "<html><body>article{}</body></html>",
             trusted_server_core::publisher::AD_ASSEMBLY_SEAM
@@ -1607,14 +2452,15 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        let settings = Arc::new(settings);
+        let identity =
+            super::build_identity_app(Arc::clone(&settings)).expect("should build identity app");
         let state = Arc::new(super::AppState {
-            auction_telemetry_sink: Arc::new(
-                trusted_server_core::auction::NoopAuctionTelemetrySink,
-            ),
-            settings: Arc::new(settings),
+            settings,
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            identity,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -1716,24 +2562,6 @@ mod tests {
         }
     }
 
-    struct TraceCountingTelemetry(Arc<AtomicUsize>);
-
-    #[async_trait::async_trait(?Send)]
-    impl trusted_server_core::auction::AuctionTelemetrySink for TraceCountingTelemetry {
-        fn is_enabled(&self) -> bool {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            true
-        }
-        async fn emit_auction_events(
-            &self,
-            _services: &RuntimeServices,
-            _batch: trusted_server_core::auction::AuctionEventBatch,
-        ) -> Result<(), Report<TrustedServerError>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     #[test]
     fn trace_dispatch_bypasses_fastly_identity_filters_and_telemetry() {
         let mut settings = test_settings();
@@ -1744,14 +2572,14 @@ mod tests {
                 &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
             )
             .expect("should configure trace");
+        settings.tinybird = crate::tinybird::tests::enabled_config();
         let mut state = build_state_from_settings(settings).expect("should build trace state");
         let kv = Arc::new(AtomicUsize::new(0));
-        let telemetry = Arc::new(AtomicUsize::new(0));
+        let telemetry = TelemetryQueue::default();
         let filter = Arc::new(Mutex::new(None));
         let mutable = Arc::get_mut(&mut state)
             .expect("should retain unique test state before router construction");
         mutable.default_kv_store = Arc::new(TraceCountingKv(Arc::clone(&kv)));
-        mutable.auction_telemetry_sink = Arc::new(TraceCountingTelemetry(Arc::clone(&telemetry)));
         mutable.registry = Arc::new(IntegrationRegistry::from_request_filters(vec![Arc::new(
             ClientInfoCapturingFilter(Arc::clone(&filter)),
         )]));
@@ -1763,7 +2591,9 @@ mod tests {
             (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
             (Method::PATCH, "/_ts/trace", StatusCode::METHOD_NOT_ALLOWED),
         ] {
-            let response = route(&router, empty_request(method, path));
+            let mut request = empty_request(method, path);
+            request.extensions_mut().insert(telemetry.clone());
+            let response = route(&router, request);
             assert_eq!(
                 response.status(),
                 status,
@@ -1789,10 +2619,9 @@ mod tests {
             0,
             "should never touch identity KV for trace"
         );
-        assert_eq!(
-            telemetry.load(Ordering::SeqCst),
-            0,
-            "should never inspect or emit auction telemetry for trace"
+        assert!(
+            telemetry.take().is_empty(),
+            "should never queue auction telemetry for trace"
         );
         assert!(
             filter
@@ -1822,6 +2651,69 @@ mod tests {
         }
     }
 
+    /// [`test_settings`] with `count` standard providers in place of its own,
+    /// each on its own port, so each is a distinct Fastly backend tuple.
+    fn settings_with_provider_tuples(count: u16) -> Settings {
+        let mut settings = test_settings();
+        settings.auction.providers = (0..count)
+            .map(|index| {
+                (
+                    format!("provider-{index}")
+                        .parse()
+                        .expect("should parse provider ID"),
+                    trusted_server_core::auction::ProviderConfig {
+                        allow_insecure_http: false,
+                        mtls: false,
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "standard".to_string(),
+                        endpoint: format!("https://bid.example:{}/openrtb", 9000 + index),
+                        timeout_ms: Some(1000),
+                        routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                        notifications: trusted_server_core::auction::NotificationConfig::default(),
+                        profile_config: serde_json::json!({}),
+                    },
+                )
+            })
+            .collect();
+        settings
+    }
+
+    #[test]
+    fn state_builder_enforces_the_fastly_backend_bound() {
+        build_state_from_settings(settings_with_provider_tuples(160))
+            .expect("should start with 160 distinct provider backend tuples");
+
+        let Err(error) = build_state_from_settings(settings_with_provider_tuples(161)) else {
+            panic!("should refuse to start with 161 distinct provider backend tuples");
+        };
+        assert!(
+            error.to_string().contains("161") && error.to_string().contains("160"),
+            "should name the tuple count and the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn state_builder_warns_once_for_an_unsynthesizable_operator_response_header() {
+        let mut settings = test_settings();
+        settings.response_headers =
+            HashMap::from([("content-type".to_owned(), "text/plain".to_owned())]);
+        let capture = LogCapture::start();
+
+        build_state_from_settings(settings).expect("should build state with the operator header");
+
+        let records = capture.take_all();
+        drop(capture);
+        let naming_content_type: Vec<(log::Level, &str)> = records
+            .iter()
+            .filter(|record| record.message.contains("`content-type`"))
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert!(
+            matches!(naming_content_type.as_slice(), [(log::Level::Warn, _)]),
+            "should warn once, naming `content-type`, as it loads the settings, got {naming_content_type:?}"
+        );
+    }
+
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = test_settings();
@@ -1829,6 +2721,8 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
+                mtls: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -1851,40 +2745,214 @@ mod tests {
     }
 
     #[test]
-    fn startup_error_router_handles_head_and_options() {
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failed".to_string(),
-        });
-        let router = startup_error_router(&report);
-
-        let head_response = route(&router, empty_request(Method::HEAD, "/"));
-        let options_response = route(&router, empty_request(Method::OPTIONS, "/any"));
+    fn hooks_routes_report_a_missing_config_blob_as_the_startup_error() {
+        // The test runtime links an empty `trusted_server_config` store, so the
+        // app config blob is missing.
+        let Err(error) = TrustedServerApp::routes() else {
+            panic!("should fail route building without an app config blob");
+        };
 
         assert_eq!(
-            head_response.status(),
-            StatusCode::BAD_REQUEST,
-            "HEAD should use the degraded startup-error response"
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should keep today's configuration-failure status"
         );
+    }
+
+    /// Completes `envelope` and returns the response the client would receive.
+    fn delivered_response(envelope: edgezero_core::ResponseEgressEnvelope) -> Response {
+        let Ok((prepared, _policy, mut attempt, clock)) = envelope.begin(
+            edgezero_core::response_egress_framing::ResponseEgressFramingMode::HostAutomatic,
+        ) else {
+            panic!("should begin response egress");
+        };
+        assert!(attempt.begin_writing(), "should start writing");
+        assert!(attempt.complete(clock.now()), "should complete the body");
+        prepared.into_response()
+    }
+
+    #[test]
+    fn missing_config_blob_fails_startup_then_recovers_in_same_sandbox() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+        let assemble = || {
+            assemble_app(
+                load_settings_from_config_store(&RuntimeStoreConfig::logical()),
+                &"",
+            )
+        };
+
+        // Request 1: the linked store has no app config blob, and a publisher
+        // fallback method gets the fixed unavailable response.
+        let crate::ApplicationDispatch::Operational(response) =
+            crate::initialize_dispatch(&mut sandbox, &Method::GET, "/", assemble)
+        else {
+            panic!("should answer the failed startup locally");
+        };
         assert_eq!(
-            options_response.status(),
-            StatusCode::BAD_REQUEST,
-            "OPTIONS should use the degraded startup-error response"
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "should answer the fixed startup-failure status"
         );
+        let body = block_on(response.into_body().into_bytes_bounded(4096))
+            .expect("should read the startup failure body");
         assert_eq!(
-            head_response
+            body.as_ref(),
+            b"Service Unavailable\n",
+            "should disclose nothing about the failure"
+        );
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after a failed assembly"
+        );
+
+        // Request 2: still no blob. A method outside the publisher fallback
+        // set keeps `EdgeZero`'s assembly-error response.
+        let crate::ApplicationDispatch::Ordinary(Err(error)) =
+            crate::initialize_dispatch(&mut sandbox, &Method::TRACE, "/", assemble)
+        else {
+            panic!("should fail assembly without an app config blob");
+        };
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after a failed assembly"
+        );
+        let first = crate::sandbox::SandboxCounters::capture(&sandbox, 2, "request-2");
+        let clock = edgezero_core::time::MonotonicClock::default();
+        let response = delivered_response(App::assembly_error_egress(
+            error,
+            Method::TRACE,
+            clock.now(),
+            clock,
+        ));
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer with today's configuration-failure status"
+        );
+        assert!(
+            response
                 .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/plain; charset=utf-8"),
-            "startup errors should stay plain-text for HEAD requests"
+                .get(trusted_server_core::constants::HEADER_X_TS_VERSION)
+                .is_none(),
+            "should carry no configured headers on an assembly error"
+        );
+        let body = block_on(response.into_body().into_bytes_bounded(4096))
+            .expect("should read the assembly error body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("should answer with EdgeZero's JSON error");
+        assert!(
+            json["error"].is_object(),
+            "should render EdgeZero's error body: {json}"
+        );
+
+        // Request 3: the blob is restored.
+        sandbox
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
+            .expect("should assemble once the blob is restored");
+        let second = crate::sandbox::SandboxCounters::capture(&sandbox, 3, "request-3");
+
+        assert!(
+            sandbox.state().is_some(),
+            "should retain the recovered application"
         );
         assert_eq!(
-            options_response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/plain; charset=utf-8"),
-            "startup errors should stay plain-text for OPTIONS requests"
+            second.builds,
+            first.builds + 1,
+            "should count one more build in the same sandbox"
+        );
+    }
+
+    #[test]
+    fn assembly_runs_configure_once_with_the_edge_policies() {
+        let retained = assemble_app(Ok(test_settings()), &"").expect("should assemble the app");
+        let headers = edgezero_core::http::HeaderMap::new();
+        let request_start = edgezero_core::time::MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_secs(5))
+            .expect("should represent an egress start after the request start");
+        let head = edgezero_core::response_egress::ResponseEgressHead::new(
+            StatusCode::OK,
+            edgezero_core::http::Version::HTTP_11,
+            &headers,
+            None,
+            request_start,
+            None,
+        );
+
+        let policy = (retained.app.response_egress_policy())(&head, egress_started_at);
+
+        assert_eq!(
+            retained.app.platform(),
+            FASTLY_PLATFORM,
+            "should assemble under Fastly's platform metadata"
+        );
+        assert_eq!(
+            retained.app.name(),
+            TrustedServerApp::name(),
+            "should name the app after its hooks"
+        );
+        assert_eq!(
+            policy.write_deadline.instant(),
+            egress_started_at
+                .checked_add(trusted_server_core::edge_app::RESPONSE_WRITE_DEADLINE)
+                .expect("should represent the expected deadline"),
+            "should install configure's write deadline instead of EdgeZero's default"
+        );
+    }
+
+    /// Sets `FASTLY_SERVICE_VERSION` for one test and restores it on drop.
+    struct ServiceVersionGuard(Option<String>);
+
+    impl ServiceVersionGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(ENV_FASTLY_SERVICE_VERSION).ok();
+            // SAFETY: the wasm32-wasip1 test binary runs its tests one at a
+            // time on one thread, so nothing reads the environment meanwhile.
+            unsafe { std::env::set_var(ENV_FASTLY_SERVICE_VERSION, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ServiceVersionGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`, the test binary is single-threaded.
+            unsafe {
+                match &self.0 {
+                    Some(previous) => std::env::set_var(ENV_FASTLY_SERVICE_VERSION, previous),
+                    None => std::env::remove_var(ENV_FASTLY_SERVICE_VERSION),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configure_failure_fails_assembly_with_500_and_retries_next_request() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+
+        // A service version past the synthesized set's 4096-byte bound is the
+        // smallest configure failure a deployment can reach.
+        let guard = ServiceVersionGuard::set(&"9".repeat(4097));
+        let error = sandbox
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
+            .expect_err("should fail assembly when configure rejects the synthesized set");
+        drop(guard);
+
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer a configure failure with a 500"
+        );
+        assert!(
+            sandbox.state().is_none(),
+            "should retain nothing after configure fails"
+        );
+        sandbox
+            .initialize(|| assemble_app(Ok(test_settings()), &""))
+            .expect("should assemble on the next request once configure succeeds");
+        assert_eq!(
+            sandbox.initialization_attempts(),
+            2,
+            "should retry assembly on the next request"
         );
     }
 
@@ -1904,30 +2972,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn asset_response_carries_body_preserves_bodiless_content_length() {
-        // GET/200 buffers a body and recomputes Content-Length.
-        assert!(
-            super::asset_response_carries_body(&Method::GET, StatusCode::OK),
-            "a GET 200 asset response should carry a buffered body"
-        );
-        // HEAD advertises the origin representation length with no body — the
-        // recomputed (zero) length must not overwrite it.
-        assert!(
-            !super::asset_response_carries_body(&Method::HEAD, StatusCode::OK),
-            "HEAD asset responses must preserve the origin Content-Length"
-        );
-        // Bodiless statuses keep their origin metadata regardless of method.
-        assert!(
-            !super::asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
-            "204 responses must preserve the origin Content-Length"
-        );
-        assert!(
-            !super::asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
-            "304 responses must preserve the origin Content-Length"
-        );
-    }
-
     // ---------------------------------------------------------------------------
     // Full EdgeZero dispatch-path tests
     // ---------------------------------------------------------------------------
@@ -1943,8 +2987,9 @@ mod tests {
         // FinalizeResponseMiddleware for header injection.
         //
         // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
-        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
-        // short-circuits without calling any Fastly ABI.
+        // (reads settings + request headers only) and the finalize middleware
+        // reads the geo-less RequestGeo that `route` inserts, so nothing calls a
+        // Fastly ABI.
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
@@ -2078,40 +3123,22 @@ mod tests {
 
     #[test]
     fn admin_ec_lookup_routes_are_registered() {
-        // Both lookup shapes must be explicitly routed to the admin EC
-        // handler: the bare cookie-based route and the parameterized route.
-        // Leaving either unrouted would fall through to the publisher
-        // fallback, forwarding the caller's `Authorization` header to the
-        // origin.
-        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
-            let route = NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} must be a named route"));
+        let router = test_router();
+
+        let routes = router.routes();
+
+        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}", "/_ts/admin/eids"] {
             assert!(
-                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
-                "{path} must map to the admin EC lookup handler"
+                routes
+                    .iter()
+                    .any(|route| route.path() == path && *route.method() == Method::GET),
+                "should register GET {path} through the core identity app"
             );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET],
-                "{path} must have GET as its only primary method"
+            assert!(
+                !NAMED_ROUTES.iter().any(|route| route.path == path),
+                "{path} should be mounted by the core identity app, not the adapter table"
             );
         }
-
-        let eids_route = NAMED_ROUTES
-            .iter()
-            .find(|route| route.path == "/_ts/admin/eids")
-            .expect("should register /_ts/admin/eids as a named route");
-        assert!(
-            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
-            "/_ts/admin/eids must map to the admin EIDs lookup handler"
-        );
-        assert_eq!(
-            eids_route.primary_methods,
-            &[Method::GET],
-            "/_ts/admin/eids must have GET as its only primary method"
-        );
     }
 
     #[test]
@@ -2366,40 +3393,136 @@ mod tests {
         );
     }
 
+    fn partner_api_request(method: Method, path: &str) -> edgezero_core::http::Request {
+        request_builder()
+            .method(method)
+            .uri(format!("https://publisher.example.com{path}"))
+            .header("host", "publisher.example.com")
+            .header("authorization", "Bearer fictional-partner-token-0123456789")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mappings":[]}"#))
+            .expect("should build partner API request")
+    }
+
+    fn partner_api_statuses(
+        router: &RouterService,
+        origin: &ScriptedHttpClient,
+    ) -> [StatusCode; 2] {
+        [
+            route_through(
+                router,
+                partner_api_request(Method::GET, "/_ts/api/v1/identify"),
+                origin,
+            )
+            .status(),
+            route_through(
+                router,
+                partner_api_request(Method::POST, "/_ts/api/v1/batch-sync"),
+                origin,
+            )
+            .status(),
+        ]
+    }
+
     #[test]
-    fn dispatch_identify_get_routes_to_identity_handler() {
-        // Parity guard: GET /_ts/api/v1/identify must reach the identify
-        // handler chain. The test settings configure no ec.ec_store, so
-        // require_identity_graph fails with a KvStore error (503) — proving
-        // the request was NOT proxied to the publisher origin.
+    fn scripted_origin_receives_publisher_fallback_requests() {
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        origin.respond_to(
+            Method::GET,
+            &format!("{}/article", test_settings().publisher.origin_url),
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "text/plain")
+                .body("served by origin"),
+        );
         let router = test_router();
-        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
+
+        let response = route_through(&router, empty_request(Method::GET, "/article"), &origin);
 
         assert_eq!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "GET identify without ec_store should fail with the KvStore error, not a publisher proxy error"
+            StatusCode::OK,
+            "should proxy the publisher page to the origin"
+        );
+        assert_eq!(
+            origin
+                .requests()
+                .iter()
+                .map(RecordedRequest::method_and_path)
+                .collect::<Vec<_>>(),
+            vec!["GET /article".to_owned()],
+            "should record the proxied publisher request"
         );
     }
 
     #[test]
-    fn dispatch_batch_sync_routes_to_batch_sync_handler() {
-        // Parity guard: POST /_ts/api/v1/batch-sync must reach the batch-sync
-        // handler chain instead of forwarding the request (body and
-        // Authorization header included) to the publisher origin. With no
-        // ec.ec_store configured, require_identity_graph fails with a KvStore
-        // error (503).
+    fn identify_and_batch_sync_answer_501_locally_without_record_store() {
+        let origin = ScriptedHttpClient::forbidding();
         let router = test_router();
-        let response = route(
-            &router,
-            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
-        );
+
+        let statuses = partner_api_statuses(&router, &origin);
 
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "POST batch-sync without ec_store should fail with the KvStore error, not reach the publisher"
+            statuses,
+            [StatusCode::NOT_IMPLEMENTED; 2],
+            "identify and batch sync should answer 501 without ec.ec_store"
         );
+        origin.assert_no_requests();
+    }
+
+    #[test]
+    fn identify_and_batch_sync_answer_other_methods_405_locally() {
+        let cases = [
+            (Method::HEAD, "/_ts/api/v1/identify"),
+            (Method::POST, "/_ts/api/v1/identify"),
+            (Method::PUT, "/_ts/api/v1/identify"),
+            (Method::PATCH, "/_ts/api/v1/identify"),
+            (Method::DELETE, "/_ts/api/v1/identify"),
+            (Method::GET, "/_ts/api/v1/batch-sync"),
+            (Method::HEAD, "/_ts/api/v1/batch-sync"),
+            (Method::OPTIONS, "/_ts/api/v1/batch-sync"),
+            (Method::PUT, "/_ts/api/v1/batch-sync"),
+            (Method::PATCH, "/_ts/api/v1/batch-sync"),
+            (Method::DELETE, "/_ts/api/v1/batch-sync"),
+        ];
+        for ec_store in [None, Some("trusted_server_kv".to_owned())] {
+            let origin = ScriptedHttpClient::forbidding();
+            let mut settings = test_settings();
+            settings.ec.ec_store = ec_store.clone();
+            let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings));
+
+            let statuses: Vec<StatusCode> = cases
+                .iter()
+                .map(|(method, path)| {
+                    route_through(&router, partner_api_request(method.clone(), path), &origin)
+                        .status()
+                })
+                .collect();
+
+            assert_eq!(
+                statuses,
+                vec![StatusCode::METHOD_NOT_ALLOWED; cases.len()],
+                "should answer every other partner API method with 405 (ec_store {ec_store:?}): {cases:?}"
+            );
+            origin.assert_no_requests();
+        }
+    }
+
+    #[test]
+    fn identify_and_batch_sync_run_locally_with_record_store() {
+        let origin = ScriptedHttpClient::forbidding();
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings));
+
+        let statuses = partner_api_statuses(&router, &origin);
+
+        assert_eq!(
+            statuses,
+            [StatusCode::UNAUTHORIZED; 2],
+            "identify and batch sync should run and reject the unknown partner token"
+        );
+        origin.assert_no_requests();
     }
 
     #[test]
@@ -2490,7 +3613,8 @@ mod tests {
     fn dispatch_fallback_attaches_ec_finalize_state() {
         // The publisher fallback must thread EC finalize state to the entry
         // point via response extensions — even on error responses — so that
-        // edgezero_main can run ec_finalize_response and pull sync.
+        // its `finalize` step can run ec_finalize_response and post-delivery
+        // work can run pull sync.
         let router = test_router();
         let response = route(&router, empty_request(Method::GET, "/some-page"));
 
@@ -2592,9 +3716,694 @@ mod tests {
         }
     }
 
+    fn navigation_request(path: &str) -> Request {
+        let mut request = browser_request(Method::GET, path, "document");
+        request
+            .headers_mut()
+            .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        request
+    }
+
+    #[test]
+    fn provider_cookies_join_every_cookie_header() {
+        // Arrange: HTTP/2 clients may split cookies across headers.
+        let mut request = navigation_request("/article");
+        let headers = request.headers_mut();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
+        headers.append(header::COOKIE, HeaderValue::from_static("vendor_id=c-1"));
+
+        // Act
+        let joined = super::joined_cookie_header(&request);
+
+        // Assert
+        assert_eq!(
+            joined, "a=1; b=2; vendor_id=c-1",
+            "should join every Cookie header"
+        );
+        assert_eq!(
+            RequestCookies::new(&joined).get("vendor_id"),
+            Some("c-1"),
+            "should let providers read a cookie from a later header"
+        );
+    }
+
+    fn take_finalize_state(response: &mut Response) -> super::EcFinalizeState {
+        response
+            .extensions_mut()
+            .remove::<super::EcFinalizeState>()
+            .expect("should attach finalize state")
+    }
+
+    #[test]
+    fn publisher_navigation_receives_navigation_permit() {
+        let router = test_router();
+
+        let mut response = route(&router, navigation_request("/article"));
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_some(),
+            "should issue a permit"
+        );
+    }
+
+    fn consented_navigation(mut request: Request) -> Request {
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out lets the navigation mint an EC.
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..ClientInfo::default()
+        });
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_static("us_privacy=1YNN"));
+        request
+    }
+
+    #[test]
+    fn enabled_provider_with_unregistered_kind_fails_startup() {
+        let mut settings = test_settings();
+        settings.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "Example IDs",
+                "source_domain": "ids.example.com"
+            }))
+            .expect("should parse partner"),
+        );
+        settings.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/v1\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+            )
+            .expect("should parse provider"),
+        );
+
+        let Err(error) = build_state_from_settings(settings) else {
+            panic!("should refuse to start with a provider this build cannot run");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("example-kind"),
+            "should name the provider and its unregistered kind: {message}"
+        );
+    }
+
+    #[test]
+    fn navigation_without_fetch_metadata_mints_no_ec() {
+        let router = test_router();
+        let mut request = consented_navigation(empty_request(Method::GET, "/article"));
+        request
+            .headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let mut response = route_with_host_geo(&router, request, &ScriptedHttpClient::forbidding());
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_none(),
+            "should not mint an EC that no row can back"
+        );
+    }
+
+    #[test]
+    fn navigation_with_fetch_metadata_mints_an_ec() {
+        let router = test_router();
+
+        let mut response = route_with_host_geo(
+            &router,
+            consented_navigation(navigation_request("/article")),
+            &ScriptedHttpClient::forbidding(),
+        );
+
+        let state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.ec_value().is_some(),
+            "should mint an EC on a page-load navigation"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_without_providers_dispatches_nothing() {
+        let router = test_router();
+
+        let mut response = route(&router, navigation_request("/article"));
+
+        let _state = take_finalize_state(&mut response);
+        assert!(
+            super::take_navigation_lookups().page.is_none(),
+            "should dispatch no identity lookups without enabled providers"
+        );
+    }
+
+    /// Looks up `ids.example.com` and returns the response body as its UID.
+    /// The flag is whether its request carries the EC ID.
+    struct EchoProvider(bool, ProviderCapabilities);
+
+    impl IdentityProvider for EchoProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            &self.1
+        }
+
+        fn sends_ec_id(&self) -> bool {
+            self.0
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Ok(ProviderRequest {
+                method: Method::GET,
+                url: LOOKUP_URL.parse().expect("should parse the lookup URL"),
+                headers: edgezero_core::http::HeaderMap::new(),
+                body: Bytes::new(),
+                context: None,
+            })
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            let id = std::str::from_utf8(response.body)
+                .map_err(|_| Report::new(ProviderError::InvalidResponse))?;
+            Ok(LookupOutcome::Found(vec![ProviderEid {
+                source: Cow::Borrowed("ids.example.com"),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed(id),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::Unspecified,
+                    refresh: None,
+                }],
+            }]))
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            if cookies.get("vendor_id") == Some("optout") {
+                CookieRead::OptedOut
+            } else {
+                CookieRead::Absent
+            }
+        }
+    }
+
+    #[test]
+    fn provider_cookie_opt_outs_reach_the_ec_context_of_every_route() {
+        for after_response in [false, true] {
+            for (cookie, opted_out) in [("vendor_id=optout", true), ("vendor_id=c-1", false)] {
+                // Arrange
+                let fixture = identity_fixture(after_response);
+                let mut request = browser_request(Method::POST, "/auction", "empty");
+                request
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static(cookie));
+                let mut ec = super::EcRequestState {
+                    ec_context: EcContext::default(),
+                    kv_graph: None,
+                    use_finalize_kv: false,
+                    eids_cookie: None,
+                    sharedid: super::SharedIdRequest::default(),
+                    is_real_browser: true,
+                    geo_info: None,
+                    setup_error: None,
+                };
+
+                // Act
+                super::apply_cookie_opt_outs(&fixture.state, &request, &mut ec);
+
+                // Assert
+                assert_eq!(
+                    ec.ec_context.source_opted_out_in_cookies("ids.example.com"),
+                    opted_out,
+                    "should withhold the source only when the provider's cookies opt out \
+                     (after_response={after_response}, cookie={cookie})"
+                );
+            }
+        }
+    }
+
+    /// The echo provider's lookup endpoint.
+    const LOOKUP_URL: &str = "https://ids.example.com/lookup";
+
+    struct AfterResponseFixture {
+        state: Arc<AppState>,
+        clock: TestClock,
+        /// Answers the echo provider's lookups with `p-1`; it is both the
+        /// request's client and the post-delivery client.
+        client: ScriptedHttpClient,
+        graph: trusted_server_core::ec::kv::KvIdentityGraph,
+    }
+
+    impl AfterResponseFixture {
+        /// How many lookups reached the provider.
+        fn sends(&self) -> usize {
+            self.client
+                .requests()
+                .iter()
+                .filter(|request| request.uri.host() == Some("ids.example.com"))
+                .count()
+        }
+    }
+
+    /// An app state whose after-response phase runs the echo provider.
+    fn after_response_fixture() -> AfterResponseFixture {
+        identity_fixture(true)
+    }
+
+    /// An app state that runs the echo provider in the page or the
+    /// after-response phase.
+    fn identity_fixture(after_response: bool) -> AfterResponseFixture {
+        identity_fixture_with(after_response, true)
+    }
+
+    fn identity_fixture_with(after_response: bool, sends_ec_id: bool) -> AfterResponseFixture {
+        let provider_config: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]",
+        )
+        .expect("should parse provider config");
+        let partner: EcPartner = serde_json::from_value(serde_json::json!({
+            "name": "ids", "source_domain": "ids.example.com", "bidstream_enabled": true
+        }))
+        .expect("should build partner");
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings.ec.partners = vec![partner];
+        // This build registers no kind, so the app state is built without the
+        // provider and the test supplies its registry and coordinator.
+        let partners = {
+            let mut with_provider = settings.ec.clone();
+            with_provider.identity_providers = vec![provider_config.clone()];
+            Arc::new(
+                PartnerRegistry::from_ec_with_kinds(&with_provider, |_| true)
+                    .expect("should build registry"),
+            )
+        };
+        let provider: Box<dyn IdentityProvider> = Box::new(EchoProvider(
+            sends_ec_id,
+            ProviderCapabilities {
+                sources: Box::new([SourceCapability {
+                    source: SourceDomain::try_from("ids.example.com").expect("should parse source"),
+                    input: SourceInput::Anonymous,
+                }]),
+                shape: EidShape {
+                    max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                    max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                    eid_level_fields: EidLevelFields::Preserved,
+                },
+            },
+        ));
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(provider_config, provider)],
+            Arc::clone(&partners),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let coordinator = Some(Arc::new(coordinator));
+        let (page_identity, after_response_identity) = if after_response {
+            (None, coordinator)
+        } else {
+            (coordinator, None)
+        };
+        let app_state =
+            Arc::into_inner(app_state_for_settings(settings)).expect("should own the app state");
+        let identity = super::identity_app_with_providers(
+            Arc::clone(&app_state.settings),
+            IdentityProviders {
+                partners,
+                page: page_identity,
+                after_response: after_response_identity,
+            },
+        )
+        .expect("should build the identity app");
+        let graph = crate::require_identity_graph(&identity).expect("should open identity graph");
+        let state = Arc::new(AppState {
+            identity,
+            ..app_state
+        });
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        // One answer for each phase that may look up.
+        for _ in 0..2 {
+            client.respond_to(
+                Method::GET,
+                LOOKUP_URL,
+                ScriptedReply::status(StatusCode::OK).body("p-1"),
+            );
+        }
+        AfterResponseFixture {
+            state,
+            clock,
+            client,
+            graph,
+        }
+    }
+
+    fn seed_live_row(graph: &trusted_server_core::ec::kv::KvIdentityGraph, ec_id: &str) {
+        let mut entry = trusted_server_core::ec::kv_types::KvEntry::tombstone(
+            trusted_server_core::ec::current_timestamp(),
+        );
+        entry.consent.ok = true;
+        block_on(graph.create(ec_id, &entry)).expect("should seed the row");
+    }
+
+    /// Runs the after-response phase on the fixture's post-delivery client.
+    fn run_after_response(
+        fixture: &AfterResponseFixture,
+        ec_state: &mut super::EcFinalizeState,
+        lookups: Option<super::AfterResponseLookups>,
+    ) {
+        fixture
+            .clock
+            .drive(crate::post_delivery::run_after_response_lookups(
+                ec_state,
+                lookups,
+                &fixture.state.identity,
+                &fixture.state.settings,
+                &fixture.client.http_client(),
+            ));
+    }
+
+    /// Routes one navigation, finalizes it and returns its after-response work.
+    fn finalized_navigation(
+        fixture: &AfterResponseFixture,
+        ec_id: Option<&str>,
+        client_ip: IpAddr,
+    ) -> (super::EcFinalizeState, Option<super::AfterResponseLookups>) {
+        let (ec_state, _, lookups) = finalized_navigation_with_page(fixture, ec_id, client_ip);
+        (ec_state, lookups)
+    }
+
+    /// Like [`finalized_navigation`], and also reports whether page-phase
+    /// lookups were dispatched.
+    fn finalized_navigation_with_page(
+        fixture: &AfterResponseFixture,
+        ec_id: Option<&str>,
+        client_ip: IpAddr,
+    ) -> (
+        super::EcFinalizeState,
+        bool,
+        Option<super::AfterResponseLookups>,
+    ) {
+        let router = TrustedServerApp::routes_for_state(&fixture.state);
+        let mut request = navigation_request("/article");
+        request.extensions_mut().insert(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        });
+        // Viceroy geolocates loopback to a US privacy state; a US Privacy
+        // string without a sale opt-out grants consent.
+        let cookie = ec_id.map_or_else(
+            || "us_privacy=1YNN".to_owned(),
+            |ec_id| format!("us_privacy=1YNN; ts-ec={ec_id}"),
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("should build cookie header"),
+        );
+        super::take_navigation_lookups();
+        // Page-phase lookups leave on the request's client while it routes.
+        let mut response = route_with_host_geo(&router, request, &fixture.client);
+        let navigation = super::take_navigation_lookups();
+        let lookups = navigation.after_response;
+        let page = navigation.page;
+        let page_dispatched = page.is_some();
+        let mut ec_state = take_finalize_state(&mut response);
+        fixture.clock.drive(crate::apply_edgezero_ec_finalize(
+            &fixture.state,
+            &mut ec_state,
+            page,
+            &mut response,
+        ));
+        (ec_state, page_dispatched, lookups)
+    }
+
+    #[test]
+    fn page_phase_lookups_reach_the_write_for_a_returning_ec() {
+        // Arrange
+        let fixture = identity_fixture(false);
+        let ec_id = format!("{}.pg0001", "c".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (_, dispatched, _) =
+            finalized_navigation_with_page(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        assert!(dispatched, "should dispatch page-phase lookups");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the page-load write"
+        );
+    }
+
+    #[test]
+    fn page_phase_lookups_skip_a_newly_minted_ec() {
+        // Arrange
+        let fixture = identity_fixture(false);
+
+        // Act
+        let (ec_state, _, _) =
+            finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        assert!(
+            ec_state.ec_context.ec_value().is_some(),
+            "should mint an EC"
+        );
+        let ec_id = ec_state.ec_context.ec_value().expect("should mint an EC");
+        assert_eq!(
+            owned_uid(&fixture, ec_id),
+            None,
+            "should not send a newly minted EC to a provider that sends the EC ID"
+        );
+    }
+
+    #[test]
+    fn page_phase_lookups_write_a_minted_ec_row_for_a_provider_without_the_ec_id() {
+        // Arrange
+        let fixture = identity_fixture_with(false, false);
+
+        // Act
+        let (ec_state, dispatched, _) =
+            finalized_navigation_with_page(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Assert
+        let ec_id = ec_state
+            .ec_context
+            .ec_value()
+            .expect("should mint an EC")
+            .to_owned();
+        assert!(dispatched, "should dispatch page-phase lookups");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID in the write that creates the row"
+        );
+    }
+
+    fn owned_uid(fixture: &AfterResponseFixture, ec_id: &str) -> Option<String> {
+        let snapshot = block_on(fixture.graph.load_snapshot(ec_id));
+        snapshot
+            .entry_for(ec_id)
+            .and_then(|entry| entry.ids.get("ids.example.com"))
+            .map(|record| record.uid.clone())
+    }
+
+    #[test]
+    fn after_response_lookups_capture_the_raw_ipv6_address() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0006", "7".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0xabcd, 1, 0, 0, 0, 0x1234,
+        ));
+
+        // Act
+        let (_, lookups) = finalized_navigation(&fixture, Some(&ec_id), ipv6);
+
+        // Assert
+        assert_eq!(
+            lookups.and_then(|lookups| lookups.client_ip),
+            Some(ipv6),
+            "should pass the raw IPv6 address to providers"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_write_to_a_live_row() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0001", "1".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+
+        // Act
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        run_after_response(&fixture, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(fixture.sends(), 1, "should send one lookup");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id).as_deref(),
+            Some("p-1"),
+            "should write the provider UID to the row"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_a_newly_minted_ec() {
+        // Arrange
+        let fixture = after_response_fixture();
+
+        // Act
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ec_id = ec_state
+            .ec_context
+            .ec_value()
+            .expect("should mint an EC")
+            .to_owned();
+        run_after_response(&fixture, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(fixture.sends(), 0, "should send nothing");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id),
+            None,
+            "should not write provider UIDs"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_skip_when_the_ec_changed_since_capture() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0002", "2".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut lookups = lookups.expect("should capture after-response work");
+        lookups.ec_id = format!("{}.ar0003", "3".repeat(64));
+        // A live row for the other EC, so only the EC check can stop the send.
+        seed_live_row(&fixture.graph, &lookups.ec_id);
+
+        // Act
+        run_after_response(&fixture, &mut ec_state, Some(lookups));
+
+        // Assert
+        assert_eq!(fixture.sends(), 0, "should send nothing");
+    }
+
+    #[test]
+    fn after_response_lookups_skip_without_a_permit() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0004", "4".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(
+            ec_state.ec_context.take_after_response_permit().is_some(),
+            "should have issued a permit"
+        );
+
+        // Act
+        run_after_response(&fixture, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(fixture.sends(), 0, "should send nothing");
+    }
+
+    #[test]
+    fn after_response_lookups_skip_a_row_withdrawn_before_the_phase() {
+        // Arrange
+        let fixture = after_response_fixture();
+        let ec_id = format!("{}.ar0005", "b".repeat(64));
+        seed_live_row(&fixture.graph, &ec_id);
+        let (mut ec_state, lookups) =
+            finalized_navigation(&fixture, Some(&ec_id), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        block_on(fixture.graph.delete(&ec_id)).expect("should delete the row");
+        block_on(fixture.graph.create(
+            &ec_id,
+            &trusted_server_core::ec::kv_types::KvEntry::tombstone(
+                trusted_server_core::ec::current_timestamp(),
+            ),
+        ))
+        .expect("should write the tombstone");
+
+        // Act
+        run_after_response(&fixture, &mut ec_state, lookups);
+
+        // Assert
+        assert_eq!(fixture.sends(), 0, "should send nothing");
+        assert_eq!(
+            owned_uid(&fixture, &ec_id),
+            None,
+            "should keep the tombstone"
+        );
+    }
+
+    #[test]
+    fn publisher_request_without_fetch_metadata_navigation_gets_no_permit() {
+        let router = test_router();
+        let mut prefetch = navigation_request("/article");
+        prefetch
+            .headers_mut()
+            .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+
+        for request in [
+            browser_request(Method::GET, "/article", "document"),
+            prefetch,
+        ] {
+            let mut response = route(&router, request);
+
+            let mut state = take_finalize_state(&mut response);
+            assert!(
+                state.ec_context.take_navigation_permit_for_test().is_none(),
+                "should not issue a permit without a top-level navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_proxy_never_generates_ec() {
+        let router = test_router();
+
+        let mut response = route(
+            &router,
+            navigation_request("/integrations/prebid/bundle.js"),
+        );
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            !state.ec_context.ec_generated(),
+            "should not mint an EC on an integration proxy"
+        );
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_none(),
+            "should not issue a permit to an integration proxy"
+        );
+    }
+
     #[test]
     fn browser_device_signals_from_extension_reach_ec_finalize_state() {
-        // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
+        // Regression guard for the EdgeZero JA4/H2 signal loss: the entry point
         // derives DeviceSignals from the original FastlyRequest (the only place
         // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
         // them in the request extensions. A browser-shaped signal must survive
@@ -2616,8 +4425,109 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            finalize.is_real_browser,
+            finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn ec_request_state_reads_the_configured_sharedid_cookie() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } },
+                    "managed_user_ids": [
+                        { "name": "sharedId", "storage": { "type": "cookie", "name": "_pubcid" } }
+                    ],
+                }),
+            )
+            .expect("should configure Prebid");
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "sharedId=legacy-id; _pubcid=configured-id")
+            .body(Body::empty())
+            .expect("should build request");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+
+        let ec = super::build_ec_request_state(&state.identity, &services, &req);
+
+        assert_eq!(
+            ec.sharedid.readable_value(),
+            Some("configured-id"),
+            "should read the cookie named by Prebid's storage.name, not `sharedId`"
+        );
+    }
+
+    #[test]
+    fn after_response_lookups_run_only_for_real_browsers() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Pull partner",
+                "source_domain": "partner.example.com",
+                "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"],
+                "ts_pull_token": "example-pull-token-32-bytes-minimum",
+            }))
+            .expect("should build pull-sync partner"),
+        ];
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let browser_request = || {
+            let mut req = request_builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/article")
+                .header(header::COOKIE, format!("ts-ec={}.test01", "a".repeat(64)))
+                .body(Body::empty())
+                .expect("should build request");
+            req.extensions_mut().insert(DeviceSignals::derive(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+                Some("1:65536;2:0;4:6291456;6:262144"),
+            ));
+            req
+        };
+        let context = context_with_client(
+            browser_request(),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+        let req = browser_request();
+        let mut ec = super::build_ec_request_state(&state.identity, &services, &req);
+        assert!(
+            ec.is_real_browser,
+            "should classify the request as a browser"
+        );
+
+        let browser = super::prepare_after_response_lookups(&state, &services, &req, &ec);
+        ec.is_real_browser = false;
+        let bot = super::prepare_after_response_lookups(&state, &services, &req, &ec);
+
+        assert!(
+            browser.is_some(),
+            "should prepare pull sync for a real browser"
+        );
+        assert!(
+            bot.is_none(),
+            "should never prepare pull sync for a client that fails the browser check"
         );
     }
 
@@ -2635,7 +4545,10 @@ mod tests {
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
         assert!(
-            !finalize.is_real_browser,
+            !finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
             "a request without captured device signals should not be classified as a real browser"
         );
     }
@@ -2643,7 +4556,7 @@ mod tests {
     #[test]
     fn entry_point_client_info_reaches_request_filters() {
         // Regression guard for the EdgeZero bot-protection metadata loss:
-        // `edgezero_main` captures the full ClientInfo (TLS protocol/cipher, JA4,
+        // the entry point captures the full ClientInfo (TLS protocol/cipher, JA4,
         // H2 fingerprint, server hostname/region) from the original FastlyRequest
         // and stores it in the request extensions. It must survive dispatch so
         // integration request filters (e.g. DataDome) serialize the same signals
@@ -2714,6 +4627,131 @@ mod tests {
             observed.server_region.as_deref(),
             Some("US-East"),
             "filter should see the captured server region"
+        );
+    }
+
+    #[test]
+    fn proxy_policy_named_route_preserves_withdrawal_and_terminal_privacy() {
+        let mut settings = test_settings();
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
+        settings
+            .response_headers
+            .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
+        settings
+            .response_headers
+            .insert("etag".to_owned(), "late-validator".to_owned());
+        let graph = KvIdentityGraph::new(crate::ec_record_store::LazyEcRecordStore::new(
+            "trusted_server_kv".to_owned(),
+        ));
+        let identity = format!("{}.Pd1234", "9".repeat(64));
+        let mut entry = KvEntry::tombstone(1_700_000_000);
+        entry.consent.ok = true;
+        block_on(graph.create(&identity, &entry)).expect("should seed a live test identity");
+        let state = app_state_for_settings(settings.clone());
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut request = empty_request(
+            Method::GET,
+            "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=invalid",
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-ec={identity}; us_privacy=1YYN"))
+                .expect("should attach withdrawal cookies"),
+        );
+        request
+            .headers_mut()
+            .insert("sec-gpc", HeaderValue::from_static("1"));
+        // The geo the entry point's lookup would hold for a US privacy state.
+        let geo = GeoInfo {
+            country: "US".to_owned(),
+            region: Some("CA".to_owned()),
+            city: Some("Example City".to_owned()),
+            continent: Some("NA".to_owned()),
+            coordinates: Some(trusted_server_core::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
+            asn: None,
+        };
+        let origin = ScriptedHttpClient::forbidding();
+        insert_outbound_client(&mut request, HttpClient::with_client(origin.clone()));
+        request
+            .extensions_mut()
+            .insert(RequestGeo::new(None, Some(geo)));
+        request.extensions_mut().insert(ClientInfo::default());
+        let mut response = block_on(router.oneshot(request)).expect("should route request");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should preserve the existing invalid-signature status"
+        );
+        {
+            let finalize = response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .expect("should retain normal named-route finalization state");
+            assert!(
+                finalize.use_finalize_kv,
+                "should keep authoritative withdrawal writes even without browser signals"
+            );
+            assert!(
+                !finalize.ec_context.ec_generated(),
+                "should not mint identity on an asset request"
+            );
+        }
+        response.extensions_mut().insert(RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, max-age=600"),
+                HeaderMutation::set("etag", "late-filter-validator"),
+            ],
+        });
+        let counters = crate::sandbox::SandboxCounters {
+            ordinal: 1,
+            builds: 1,
+            request_id: "request-example".to_owned(),
+        };
+        // The actual entry-point finalizer: EC finalization, then the late
+        // request-filter effects and the terminal privacy that must survive them.
+        crate::finalize_response(
+            &mut response,
+            &crate::FinalizeInputs {
+                state: &state,
+                geo: None,
+                counters: &counters,
+            },
+        );
+        origin.assert_no_requests();
+        let record = block_on(graph.get(&identity))
+            .expect("should read withdrawn record")
+            .expect("should retain a tombstone")
+            .0;
+        assert!(
+            !record.consent.ok,
+            "should tombstone the identity through normal route finalization"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("ts-ec=") && value.contains("Max-Age=0"))),
+            "should expire the withdrawn EC cookie"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("should set privacy"),
+            "no-store, private",
+            "should retain terminal privacy after late filters"
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should remove late identity validators"
         );
     }
 
@@ -2943,74 +4981,26 @@ mod tests {
         );
     }
 
-    struct FixedBackend;
-
-    impl PlatformBackend for FixedBackend {
-        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
-            trusted_server_core::platform::BackendNamingPolicy::Fastly
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok(format!("{}-{}", spec.scheme, spec.host))
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.predict_name(spec)
-        }
-    }
-
-    struct StreamingHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for StreamingHttpClient {
-        fn supports_streaming_responses(&self) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            assert!(
-                request.stream_response,
-                "streaming Fastly routes should request an origin response stream"
-            );
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html")
-                .body(Body::stream(futures::stream::iter(vec![
-                    Bytes::from_static(b"streamed-asset"),
-                ])))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    fn streaming_runtime_services() -> RuntimeServices {
+    /// Streaming runtime services whose `EdgeZero` outbound requests go to `upstream`.
+    fn runtime_services_with_upstream(
+        upstream: &ScriptedHttpClient,
+        clock: &TestClock,
+    ) -> RuntimeServices {
         RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .config_store(Arc::new(
+                crate::platform::FastlyPlatformConfigStore::with_outbound_client(
+                    upstream.http_client(),
+                ),
+            ))
+            .secret_store(Arc::new(
+                crate::platform::FastlyPlatformSecretStore::with_outbound_client(
+                    upstream.http_client(),
+                ),
+            ))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::new(StreamingHttpClient))
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .outbound_client(upstream.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build()
     }
@@ -3116,44 +5106,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct DispatchOriginClient {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for DispatchOriginClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .header(header::CACHE_CONTROL, "public, max-age=300")
-                .body(Body::from(
-                    b"<html><head></head><body>origin</body></html>".as_ref(),
-                ))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
     #[test]
     fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
         let settings = Arc::new(
@@ -3195,16 +5147,36 @@ mod tests {
             .expect("should parse dispatch cache settings"),
         );
         let cache = Arc::new(DispatchTemplateCache::default());
-        let origin = Arc::new(DispatchOriginClient::default());
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        // Two replies: a warm dispatch that wrongly fetched the origin would take the second.
+        for _ in 0..2 {
+            origin.respond_to(
+                Method::GET,
+                &format!("{}/secure/article", settings.publisher.origin_url),
+                ScriptedReply::status(StatusCode::OK)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .header("cache-control", "public, max-age=300")
+                    .body("<html><head></head><body>origin</body></html>"),
+            );
+        }
         let services = RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .config_store(Arc::new(
+                crate::platform::FastlyPlatformConfigStore::with_outbound_client(
+                    origin.http_client(),
+                ),
+            ))
+            .secret_store(Arc::new(
+                crate::platform::FastlyPlatformSecretStore::with_outbound_client(
+                    origin.http_client(),
+                ),
+            ))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
             .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .outbound_client(origin.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(RequestGeo::default()))
             .client_info(ClientInfo::default())
             .build();
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
@@ -3228,7 +5200,7 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let orchestrator = Arc::clone(&orchestrator);
                 Box::pin(async move {
-                    let request = ctx.into_request();
+                    let request = ctx.into_request()?;
                     let method = request.method().clone();
                     let mut ec_context =
                         match EcContext::read_from_request(&settings, &request, &services) {
@@ -3247,13 +5219,18 @@ mod tests {
                             registry: None,
                         },
                         request,
-                        EdgeCacheHeader::SurrogateControl,
+                        PublisherOriginOptions {
+                            edge_header: EdgeCacheHeader::SurrogateControl,
+                            input_cap: None,
+                            response_decoding: ResponseDecoding::Original,
+                        },
                     )
                     .await
                     {
                         Ok(response) => response,
                         Err(report) => return Ok(super::http_error(&report)),
                     };
+                    let (response, owner) = response;
                     match publisher_response_into_streaming_response(
                         response,
                         &method,
@@ -3263,6 +5240,7 @@ mod tests {
                         services,
                     )
                     .await
+                    .and_then(|response| owner.attach(response).map_err(publisher_owner_error))
                     {
                         Ok(response) => Ok(response),
                         Err(report) => Ok(super::http_error(&report)),
@@ -3308,7 +5286,7 @@ mod tests {
         block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
             .expect("should drain warm response");
         assert_eq!(
-            origin.calls.load(Ordering::Relaxed),
+            origin.requests().len(),
             1,
             "the warm dispatch must not fetch the publisher origin"
         );
@@ -3317,10 +5295,10 @@ mod tests {
     #[test]
     fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
         // Regression guard for the EdgeZero asset streaming cutover: a successful
-        // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
-        // rather than draining the origin into a buffered `Body::Once`. Injecting a
-        // streaming HTTP client lets us assert the body type the entry point will
-        // pipe straight to the client via `stream_to_client`.
+        // asset proxy must hand the entry point a streaming body (`Body::Stream`)
+        // rather than draining the origin into a buffered `Body::Once`. A scripted
+        // upstream with a chunked body lets us assert the body type the entry point
+        // hands to `EdgeZero`'s delivery to pump straight to the client.
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
@@ -3352,7 +5330,16 @@ mod tests {
         .expect("should parse asset-route settings");
         let state = build_state_from_settings(settings).expect("should build state");
 
-        let services = streaming_runtime_services();
+        let clock = TestClock::new();
+        let upstream = ScriptedHttpClient::new(&clock);
+        upstream.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/logo.png",
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "image/png")
+                .chunks(vec![Bytes::from_static(b"streamed-asset")]),
+        );
+        let services = runtime_services_with_upstream(&upstream, &clock);
         let req = empty_request(Method::GET, "/.images/logo.png");
         let asset_route = state
             .settings
@@ -3374,7 +5361,7 @@ mod tests {
             "should preserve the streaming origin status"
         );
         assert!(
-            matches!(response.body(), Body::Stream(_)),
+            response.body().is_stream(),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
         );
     }
@@ -3384,12 +5371,12 @@ mod tests {
         for gzip in [false, true] {
             let state = build_state_from_settings(nextjs_auction::script_composition_settings())
                 .expect("should build mixed state");
-            let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            let origin = nextjs_auction::NextJsAuctionOrigin::with_html_response(
                 &nextjs_auction::script_composition_html(),
                 gzip,
                 true,
-            ));
-            let services = nextjs_auction::services(origin);
+            );
+            let services = nextjs_auction::services(&origin);
             let request = request_builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -3418,7 +5405,7 @@ mod tests {
                 gzip.then_some("gzip"),
                 "should retain the requested response compression"
             );
-            let Body::Stream(mut stream) = response.into_body() else {
+            let Ok(mut stream) = response.into_body().into_stream() else {
                 panic!("should retain lazy Fastly body");
             };
             let mut bytes = Vec::new();
@@ -3434,14 +5421,26 @@ mod tests {
     #[test]
     fn dispatch_fallback_streams_publisher_body_without_buffering() {
         // Regression guard for the publisher streaming cutover (#849): a
-        // successful publisher origin fetch must hand `edgezero_main` a lazy
+        // successful publisher origin fetch must hand the entry point a lazy
         // streaming body (`Body::Stream`) so headers commit at origin first
         // byte, rather than draining the processed page into a buffered
         // `Body::Once`. Core tests cover the rewrite pipeline itself; this
         // guards the adapter wiring that could silently re-buffer.
         let settings = test_settings();
         let state = build_state_from_settings(settings).expect("should build state");
-        let services = streaming_runtime_services();
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        origin.respond_to(
+            Method::GET,
+            &format!("{}/article", state.settings.publisher.origin_url),
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "text/html")
+                .chunks(vec![
+                    Bytes::from_static(b"<html><body>"),
+                    Bytes::from_static(b"streamed</body></html>"),
+                ]),
+        );
+        let services = runtime_services_with_upstream(&origin, &clock);
         let req = empty_request(Method::GET, "/article");
 
         let response = block_on(super::dispatch_fallback(&state, &services, req));
@@ -3452,7 +5451,7 @@ mod tests {
             "publisher proxy should succeed against the streaming origin stub"
         );
         assert!(
-            matches!(response.body(), Body::Stream(_)),
+            response.body().is_stream(),
             "EdgeZero publisher dispatch must attach the lazy streaming body, not buffer it"
         );
         assert!(

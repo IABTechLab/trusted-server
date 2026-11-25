@@ -71,6 +71,10 @@ public_origin = "https://ads.example.com"
 proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.
 # origin_host_header_override = "www.example.com"
+# Optional: send the resolved client IP to origin_url in this header. Trusted
+# Server strips client-supplied Fastly-Client-IP, so set this when the origin's
+# WAF, logs, or geolocation read it. Pair with [trusted_client_ip] behind a CDN.
+# origin_client_ip_header = "fastly-client-ip"
 # Optional: max bytes buffered when a response is post-processed in full (HTML
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
@@ -88,15 +92,24 @@ proxy_secret = "publisher_proxy_secret"
 [ec]
 # Secret Store key for the secret used to derive EC identifiers.
 passphrase = "ec_passphrase"
-# KV store that persists EC identity state. This is the physical store name
-# bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
-# logical KV id is `trusted_server_kv`.
-ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
+# Optional identity-provider budgets (see [[ec.identity_providers]] below).
+# Every page-phase provider shares one budget (1-1000 ms):
+# identity_budget_ms = 200
+# Budget for providers with collect = "after_response", which run after the
+# response is sent and write their results in a follow-up write (1-5000 ms):
+# identity_after_response_budget_ms = 2000
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Fastly persistence uses this exact physical binding. Provider omission is
+# Fastly-only; native providers require explicit configuration. An ordinary
+# logical KV declaration does not select EC storage. Legacy ec.ec_store remains
+# supported on Fastly, but cannot be combined with this section.
+[ec.storage]
+store = "trusted_server_kv"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
@@ -108,12 +121,264 @@ pull_sync_concurrency = 3
 # openrtb_atype = 3
 # include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
+# also mirror provider-written UIDs to the JS-readable __Host-ts-eids-mirror
+# cookie (default false; requires bidstream_enabled)
+# mirror_enabled = false
 # Only for inbound identify or batch-sync API access:
 # api_token = "partner_api_token"
 # Required when pull sync is enabled:
 # ts_pull_token = "partner_ts_pull_token"
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
+
+# Optional server-side identity providers (Fastly only), looked up on publisher
+# navigations before the origin fetch. Their budgets are set in [ec] above.
+#
+# [[ec.identity_providers]]
+# id = "example-provider"
+# kind = "example-kind"
+# enabled = false
+# endpoint = "https://ids.example.com/v1/lookup"
+# The endpoint host must be listed here.
+# allowed_domains = ["ids.example.com"]
+# Each source needs an [[ec.partners]] entry with a matching source_domain and
+# must be claimed by only one enabled provider.
+# sources = ["ids.example.com"]
+# Optional: require TCF vendor consent for lookups and for sending any ID of
+# these sources to bidders, including browser IDs, even while disabled. Set it
+# to the vendor's IAB Global Vendor List ID for every kind whose vendor is
+# registered there; without it, GDPR traffic is gated only by the purpose
+# consents.
+# tcf_vendor_id = 9999
+# "page" (default) collects before the response; "after_response" collects
+# after it is sent, only for an EC issued on an earlier request. Keep
+# cookie-only kinds on "page".
+# collect = "page"
+# Optional: most lookups per EC hash (client IP) per hour. On Fastly this is
+# enforced per minute with a minimum of one, so values below 60 behave like 60.
+# Useful for kinds whose unresolved sources stay due, such as LiveIntent
+# partner IDs.
+# rate_limit_per_hour = 60
+# Secret Store key name, resolved like other secret references.
+# [ec.identity_providers.secrets]
+# token = "example_provider_token"
+# Provider-specific settings, parsed by the provider kind.
+# [ec.identity_providers.settings]
+#
+# Hashed-email capability (id5 and liveramp only): sends a signed-in
+# visitor's hashed email, read from your status endpoint below at `path` (jq
+# syntax limited to `.key`, `."quoted key"` and `[index]`). Trusted Server
+# calls the endpoint with the visitor's whole Cookie header, at most
+# once per collection phase and only when such a provider has a source
+# without a live ID. Return the value the vendor expects (lowercase hex SHA-256 of the
+# normalised email); it is sent as returned and never stored or logged.
+# The call runs beside the origin fetch and shares the phase's identity
+# budget with the lookups, so `timeout_ms` (default 100) must be below
+# `identity_budget_ms`. The call is a GET by default. An endpoint that needs
+# a POST, a body or an extra header can set `method`, `body` (POST only, sent
+# as is, as application/json unless a content-type header says otherwise) and
+# `headers`, each a fixed value or `{ cookie = "name" }` for the value of the
+# visitor's cookie `name`; without that cookie no call is made.
+# [ec.hashed_email]
+# endpoint = "https://www.example.com/api/user/status"
+# timeout_ms = 100
+# method = "POST"
+# body = "{}"
+# [ec.hashed_email.headers]
+# x-session = { cookie = "session" }
+#
+# ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
+# the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
+# Before any lookup it reads the first-party cookies in `cookie_names`, in
+# order. Prebid's ID5 module writes the `id5id` cookie only with
+# `storage.type: 'cookie'`; with `html5` storage the lookup runs.
+#
+# Lockr capability (id5, liveramp and uid2 only): Lockr AIM writes other
+# vendors' raw tokens into first-party cookies under key names configured per
+# publisher in Lockr. Enable `[ec.identity_providers.settings.lockr]` to read
+# them after the vendor's own cookies and before any lookup. Lockr cookies are
+# not read where GDPR applies, because Lockr AIM does not run there. The
+# default Lockr key of each kind equals one of its own cookie names, which are
+# already read, so the capability changes nothing until `cookie_names` lists
+# the key configured in Lockr when it differs. kinds other than id5, liveramp
+# and uid2 reject a `lockr` table.
+# [[ec.identity_providers]]
+# id = "id5"
+# kind = "id5"
+# enabled = false
+# endpoint = "https://id5.example.com/gs/v2"
+# allowed_domains = ["id5.example.com"]
+# sources = ["id5.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# partner_id = 1234
+# Optional: who operates this integration, sent to ID5 as `provider`.
+# Defaults to the publisher domain.
+# provider_name = "publisher.example.com"
+# cookie_names = ["id5id"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_id5"]
+# Optional: send the hashed email as ID5 partner data (`pd`).
+# [ec.identity_providers.settings.hashed_email]
+# enabled = true
+# path = ".user.sha256"
+#
+# LiveIntent (kind "liveintent"): no hashed email, no secrets. Sends the
+# visitor's first-party LiveIntent cookie (the first present one of
+# `cookie_names`, default `_lc2_fpi`) as `duid`. `resolve` lists the attributes
+# to ask for (default `nonId`); each one is stored under LiveIntent's fixed
+# source for it, which must be listed in `sources`: nonId liveintent.com,
+# bidswitch bidswitch.net, medianet media.net, magnite rubiconproject.com,
+# index liveintent.indexexchange.com, openx openx.net, pubmatic pubmatic.com,
+# sovrn liveintent.sovrn.com, sharethrough sharethrough.com, sonobi
+# liveintent.sonobi.com, triplelift liveintent.triplelift.com, zetassp
+# zeta-ssp.liveintent.com, vidazoo liveintent.vidazoo.com, nexxen
+# liveintent.unrulymedia.com, uid2 uidapi.com, thetradedesk adserver.org.
+# Where GDPR applies, uid2 is neither resolved nor kept, as for kind "uid2".
+# `nonId` is LiveIntent's own ID and carries the reply's `segments` as EID
+# `ext`; the others are partner IDs, sent with UID `ext.provider` naming
+# LiveIntent, except the Trade Desk ID, whose UID `ext` carries `rtiPartner`
+# and `provider` naming the publisher domain, with EID `matcher`.
+# `distributor_id` must be a LiveIntent-issued `did-...` ID; without it the
+# lookup uses the `prebid` path, as Prebid does. Set it to the publisher's own
+# distributor ID (its Prebid `liveIntentId` `distributorId`) to get partner
+# IDs: on the `prebid` path LiveIntent returns only `nonId`.
+# [[ec.identity_providers]]
+# id = "liveintent"
+# kind = "liveintent"
+# enabled = false
+# endpoint = "https://liveintent.example.com/idex"
+# allowed_domains = ["liveintent.example.com"]
+# sources = ["liveintent.com", "rubiconproject.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# publisher_id = "any"
+# distributor_id = "did-0123"
+# resolve = ["nonId", "magnite"]
+# cookie_names = ["_lc2_fpi"]
+#
+# LiveRamp (kind "liveramp"): reads the RampID envelope from LiveRamp's own
+# first-party `_lr_env` cookie (ATS) or the bare envelope Prebid's
+# identityLink module stores in `idl_env`, and keeps it for 15 days. Takes
+# exactly one source; use the one LiveRamp gives you. Supports the Lockr
+# capability. Optional server lookup: with an `endpoint` (LiveRamp's ATS
+# envelope API, `/api/identity/v2/envelope`), `placement_id` and the
+# hashed-email capability, a signed-in visitor without a live envelope is
+# looked up by hashed email (`it=4`) with the visitor IP and consent, and the
+# envelope is refreshed every `refresh_interval_secs` (default 1800) at
+# `<endpoint>/refresh` without the hashed email. LiveRamp must approve the
+# publisher origin for the placement. The EC ID is never sent.
+# [[ec.identity_providers]]
+# id = "liveramp"
+# kind = "liveramp"
+# enabled = false
+# endpoint = "https://liveramp.example.com/api/identity/v2/envelope"
+# allowed_domains = ["liveramp.example.com"]
+# sources = ["liveramp.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["_lr_env", "idl_env"]
+# placement_id = 14
+# refresh_interval_secs = 1800
+# [ec.identity_providers.settings.hashed_email]
+# enabled = true
+# path = ".user.sha256"
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_lr_env"]
+#
+# Yahoo ConnectID (kind "connectid"): no lookup and no endpoint. Reads
+# ConnectID from Yahoo's own first-party `connectId` cookie and keeps it until
+# its last sync plus TTL (at most 14 days). Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "connectid"
+# kind = "connectid"
+# enabled = false
+# sources = ["connectid.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["connectId"]
+#
+# UID2 (kind "uid2"): reads the advertising token from the UID2 SDK's
+# `__uid_2` cookie until its `identity_expires`, falling back to Prebid's raw
+# `__uid2_advertising_token` cookie. Both clients keep the token in
+# localStorage by default, which the server never sees: set the SDK's
+# `useCookie: true` or Prebid's `params.storage: 'cookie'`. Takes exactly one
+# source. `cookie_names` lists the raw token cookies, read in order after
+# `identity_cookie_name`.
+# Supports the Lockr capability; Lockr cookies are read last, as raw tokens.
+# Optional server refresh: set `endpoint` to the UID2 operator's
+# `/v2/token/refresh` URL. The `__uid_2` cookie's refresh token and response
+# key are then kept privately in the row (never served), and the token is
+# refreshed server side from `refresh_from`, with no API key and no email.
+# Tokens are never generated: that needs an email or phone number. Without
+# `endpoint`, the refresh token is never stored. The authenticated
+# `/_ts/admin/ec/{id}` view shows refresh state as "[redacted]". UID2 is not
+# offered where GDPR applies: for a visitor whose detected jurisdiction is
+# GDPR it is skipped and the UIDs the row holds for it are removed. A TCF
+# string alone does not count, since some CMPs set one for every visitor.
+# [[ec.identity_providers]]
+# id = "uid2"
+# kind = "uid2"
+# enabled = false
+# endpoint = "https://uid2.example.com/v2/token/refresh"
+# allowed_domains = ["uid2.example.com"]
+# sources = ["uid2.example.com"]
+# [ec.identity_providers.settings]
+# identity_cookie_name = "__uid_2"
+# cookie_names = ["__uid2_advertising_token"]
+# [ec.identity_providers.settings.lockr]
+# enabled = true
+# cookie_names = ["example_lockr_uid2"]
+#
+# Prebid SharedID (kind "sharedid"): no lookup and no endpoint. Reads the
+# publisher common ID from the cookie named in
+# [[integrations.prebid.managed_user_ids]] `storage.name` for the `sharedId`
+# module, or else from `_sharedid`, falling back to the legacy `_pubcid`, and
+# sends it as a device-based (atype 1) ID. `sources` defaults to
+# ["pubcid.org"], which needs a matching [[ec.partners]] entry. Cookie IDs
+# are kept for 24 hours; generated IDs for 30 days. A different cookie ID
+# replaces the stored ID.
+# The `_pubcid_optout` cookie suppresses it. With generate = true, when no
+# cookie holds an ID and none is stored, Trusted Server generates a random UUID
+# and stores it in the row only (no cookie is set). Leave it off unless Prebid
+# keeps its opt-out in the `_pubcid_optout` cookie: a localStorage opt-out is
+# invisible to the server. SharedID is the publisher's own ID, so it has no TCF
+# vendor.
+# [[ec.identity_providers]]
+# id = "sharedid"
+# kind = "sharedid"
+# enabled = false
+# [ec.identity_providers.settings]
+# generate = false
+#
+# Criteo (kind "criteo"): no lookup and no endpoint. Reads Criteo's bid ID
+# from the first-party `cto_bidid` cookie Prebid's Criteo module keeps and
+# stores it percent-decoded, as Prebid sends it, as a device-based (atype 1)
+# ID. Takes exactly one source.
+# [[ec.identity_providers]]
+# id = "criteo"
+# kind = "criteo"
+# enabled = false
+# sources = ["criteo.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["cto_bidid"]
+#
+# Unified ID (kind "unifiedid"): no lookup and no endpoint. Reads The Trade
+# Desk ID from the `TDID` field of Prebid's `pbjs-unifiedid` cookie and stores
+# it as Prebid sends it: atype 1, UID `ext` `{"rtiPartner":"TDID"}`, and
+# `inserter`/`matcher` `adserver.org` with `mm` 4. Takes exactly one source;
+# do not also list that source for a liveintent `thetradedesk` attribute.
+# [[ec.identity_providers]]
+# id = "unifiedid"
+# kind = "unifiedid"
+# enabled = false
+# sources = ["unifiedid.example.com"]
+# tcf_vendor_id = 9999
+# [ec.identity_providers.settings]
+# cookie_names = ["pbjs-unifiedid"]
 
 
 # =============================================================================
@@ -210,14 +475,32 @@ proxy = "enabled"
 
 # Proxy behavior and first-party asset routing. Kept active with defaults.
 [proxy]
-# Verify TLS certs when proxying to HTTPS origins (default true; false only for
-# local self-signed dev).
+# Must be true. TLS is always verified on every outbound HTTPS request, and
+# validation rejects false.
 # certificate_check = true
 # Allowlist for first-party proxy signing, initial fetch targets, and redirect
 # targets. Supports exact ("example.com") and wildcard ("*.example.com", also
 # matches apex).
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
+# Empty allowed_domains permits valid hosts; identity_endpoints is separately
+# DEFAULT OFF: omitted/empty grants no creative-proxy EC disclosure.
+# Explicit opt-in only after reviewing destinations, redirects, and consent.
+# IDs must be unique, 1-64 ASCII letters/digits/underscore/hyphen.
+# Each HTTPS DNS origin requires exactly one path_exact or path_prefix.
+# Prefixes must be / or end in /; query strings do not select a rule.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
+# Matching endpoints always bypass upstream caching and make the final response
+# private/no-store, even without eligible existing-cookie EC. No ID is generated.
+# Deploy compatible binaries first, then publish nonempty endpoint rules.
 #
 # Route first-party asset paths to a different backend origin. Longest matching
 # prefix wins; only GET/HEAD participate; query string is preserved.
@@ -319,6 +602,11 @@ rewrite_creatives = true
 # server's iframe), since it removes script-based creatives entirely and would
 # blank slots on a script-heavy demand stack.
 sanitize_creatives = false
+# Client identity slot that providers with `mtls = true` present: "blue"
+# (default) or "green". Rotate by provisioning the idle slot's
+# auction-providers-<slot>.* entries, waiting for them to propagate, then
+# switching this. Binaries older than this setting reject "green".
+# mtls_slot = "blue"
 timeout_ms = 2000
 # mediator = "adserver_mock"       # optional mediator integration
 # Context keys the JS client may forward into auction requests (allowlist;
@@ -332,6 +620,10 @@ profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 # `prebid-server` defaults to 1000 ms when omitted.
 routing = "explicit"
+# Present the active `auction.mtls_slot` client certificate from the Fastly
+# config and secret stores, for a provider that requires mTLS. Fastly only;
+# requires https.
+# mtls = true
 
 [auction.providers.pbs-main.profile_config]
 debug = false
@@ -406,9 +698,8 @@ auction_timeout_ms = 500
 # With either list nonempty, false bypasses unlisted cookies; true asserts those
 # cookies do not change origin HTML. No identity or consent cookie is exempt.
 # With both lists empty, false bypasses all Cookie headers, as before.
-# On the template path, origin `Vary: Cookie` is always refused. Readthrough
-# has no response-side guard; run `ts origin probe-shareability` before enabling.
-# Configured key-cookie dimensions disable readthrough, preserving template variants.
+# On the template path, origin `Vary: Cookie` is always refused. Run
+# `ts origin probe-shareability` before setting true.
 # origin_is_cookie_independent = false
 # Invalid names, duplicates, cross-list overlap, and TS identity cookies in the
 # key list reject configuration. Named policies bypass ambiguous/nonconforming
@@ -418,17 +709,11 @@ auction_timeout_ms = 500
 # Rollback: older binaries reject both new fields even as empty lists. Remove
 # both fields AND restore independence=false or disable ESI when HTML uses cookies.
 #
-# Applies shareability checks to the platform's origin cache. Default false keeps
-# the existing policy: ad-serving requests bypass; other publisher requests use
-# the platform default. True admits shareable ad requests and bypasses unshareable
-# non-ad requests. A DIFFERENT cache from the template cache
-# above, and a weaker one: the decision is made before the origin replies, so
-# none of the template cache's response-side refusals (`Set-Cookie`, CSP nonce,
-# missing freshness) apply. `ts origin probe-shareability` must pass on every
-# axis and verdict first. Tagged readthrough objects can be purged with
-# ts cache purge (--all or the exact reader-facing --page URL). Older untagged
-# objects must expire on the origin TTL; see the configuration guide's rollback note.
-# origin_readthrough_enabled = false
+# Origin readthrough is unavailable. `ts config validate` and `ts config push`
+# reject origin_readthrough_enabled = true. A live config that still sets it
+# keeps loading, logs a warning, and treats it as false. Ad-serving requests
+# bypass the platform's origin cache; other publisher requests keep its default.
+# Leave the setting out.
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id
@@ -529,6 +814,8 @@ auction_timeout_ms = 500
 # [proxy].allowed_domains. Kept active but disabled.
 [integrations.prebid]
 enabled = false
+# Use "identity" to capture and merge IDs without the browser auction shim.
+mode = "auction"
 timeout_ms = 1000
 debug = false
 client_side_bidders = []          # bidders running via native Prebid.js adapters

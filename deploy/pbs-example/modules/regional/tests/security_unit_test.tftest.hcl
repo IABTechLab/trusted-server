@@ -15,60 +15,16 @@ mock_provider "aws" {
     }
   }
 
-  mock_resource "aws_secretsmanager_secret" {
-    override_during = plan
-
+  mock_resource "aws_lb" {
     defaults = {
-      arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:example-AbCdEf"
+      arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/pbs-example/1111111111111111"
     }
   }
-}
 
-override_resource {
-  target          = aws_subnet.public["us-east-1a"]
-  override_during = plan
-  values = {
-    id = "subnet-00000000000000001"
-  }
-}
-
-override_resource {
-  target          = aws_subnet.public["us-east-1b"]
-  override_during = plan
-  values = {
-    id = "subnet-00000000000000002"
-  }
-}
-
-override_resource {
-  target          = aws_subnet.private["us-east-1a"]
-  override_during = plan
-  values = {
-    id = "subnet-00000000000000003"
-  }
-}
-
-override_resource {
-  target          = aws_subnet.private["us-east-1b"]
-  override_during = plan
-  values = {
-    id = "subnet-00000000000000004"
-  }
-}
-
-override_resource {
-  target          = aws_security_group.alb
-  override_during = plan
-  values = {
-    id = "sg-00000000000000001"
-  }
-}
-
-override_resource {
-  target          = aws_security_group.pbs
-  override_during = plan
-  values = {
-    id = "sg-00000000000000002"
+  mock_resource "aws_lb_target_group" {
+    defaults = {
+      arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/pbs-example/2222222222222222"
+    }
   }
 }
 
@@ -86,6 +42,64 @@ variables {
 
 run "plans_private_hosts_and_scoped_ingress" {
   command = plan
+
+  # Keep plan-time overrides local to this run. The apply runs let the
+  # mock fill in computed values during apply instead of re-generating them.
+  override_resource {
+    target          = aws_subnet.public["us-east-1a"]
+    override_during = plan
+    values = {
+      id = "subnet-00000000000000001"
+    }
+  }
+
+  override_resource {
+    target          = aws_subnet.public["us-east-1b"]
+    override_during = plan
+    values = {
+      id = "subnet-00000000000000002"
+    }
+  }
+
+  override_resource {
+    target          = aws_subnet.private["us-east-1a"]
+    override_during = plan
+    values = {
+      id = "subnet-00000000000000003"
+    }
+  }
+
+  override_resource {
+    target          = aws_subnet.private["us-east-1b"]
+    override_during = plan
+    values = {
+      id = "subnet-00000000000000004"
+    }
+  }
+
+  override_resource {
+    target          = aws_security_group.alb
+    override_during = plan
+    values = {
+      id = "sg-00000000000000001"
+    }
+  }
+
+  override_resource {
+    target          = aws_security_group.pbs
+    override_during = plan
+    values = {
+      id = "sg-00000000000000002"
+    }
+  }
+
+  override_resource {
+    target          = aws_secretsmanager_secret.bidder["examplebidder"]
+    override_during = plan
+    values = {
+      arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:example-AbCdEf"
+    }
+  }
 
   assert {
     condition     = length(aws_instance.pbs) == 2
@@ -121,6 +135,20 @@ run "plans_private_hosts_and_scoped_ingress" {
       aws_instance.pbs["us-east-1b"].subnet_id == aws_subnet.private["us-east-1b"].id,
     ])
     error_message = "PBS hosts should launch in the private subnet of their own AZ."
+  }
+
+  assert {
+    condition = (
+      length(aws_lb_trust_store.clients) == 0 &&
+      aws_lb_listener.https.mutual_authentication[0].mode == "off" &&
+      aws_lb_listener.https.mutual_authentication[0].trust_store_arn == null
+    )
+    error_message = "With no CA bundle, the listener should set mTLS off and have no trust store."
+  }
+
+  assert {
+    condition     = !aws_lb.main.connection_logs[0].enabled
+    error_message = "With no connection log bucket, the ALB should set connection logging off."
   }
 
   assert {
@@ -246,6 +274,103 @@ run "accepts_single_character_resource_name" {
   }
 }
 
+run "plans_connection_logs_without_client_verification" {
+  command = plan
+
+  variables {
+    connection_logs_bucket = "pbs-example-east-connection-logs"
+  }
+
+  assert {
+    condition = (
+      aws_lb.main.connection_logs[0].enabled &&
+      aws_lb.main.connection_logs[0].bucket == var.connection_logs_bucket &&
+      aws_lb_listener.https.mutual_authentication[0].mode == "off"
+    )
+    error_message = "The ALB should support connection logging without client certificate verification."
+  }
+}
+
+run "enables_client_verification_and_connection_logs" {
+  command = apply
+
+  variables {
+    # The collapsed prefix has a hyphen at the truncation boundary.
+    name = "a--bcdefghijkl--mnopqrstuvwx"
+    client_ca_bundle = {
+      bucket = "pbs-example-east-trust"
+      key    = "client-ca/bundle-v1.pem"
+    }
+    connection_logs_bucket = "pbs-example-east-connection-logs"
+  }
+
+  override_resource {
+    target = aws_lb_trust_store.clients[0]
+    values = {
+      arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:truststore/pbs-example/1111111111111111"
+    }
+  }
+
+  assert {
+    condition = (
+      length(aws_lb_trust_store.clients) == 1 &&
+      aws_lb_trust_store.clients[0].ca_certificates_bundle_s3_bucket == var.client_ca_bundle.bucket &&
+      aws_lb_trust_store.clients[0].ca_certificates_bundle_s3_key == var.client_ca_bundle.key
+    )
+    error_message = "The regional trust store should use the configured S3 CA bundle."
+  }
+
+  assert {
+    condition = (
+      length(var.name) == 28 &&
+      length(aws_lb_trust_store.clients[0].name) <= 32 &&
+      can(regex("^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$", aws_lb_trust_store.clients[0].name))
+    )
+    error_message = "The trust store name should meet AWS rules even for a 28-character prefix with consecutive hyphens."
+  }
+
+  assert {
+    condition = (
+      aws_lb_listener.https.mutual_authentication[0].mode == "verify" &&
+      aws_lb_listener.https.mutual_authentication[0].trust_store_arn == aws_lb_trust_store.clients[0].arn &&
+      aws_lb_listener.https.certificate_arn == var.certificate_arn &&
+      aws_lb_target_group.pbs.health_check[0].protocol == "HTTP" &&
+      aws_lb_target_group.pbs.health_check[0].path == "/status"
+    )
+    error_message = "Verify mode should attach the trust store without changing the ACM certificate or target health check."
+  }
+
+  assert {
+    condition = (
+      aws_lb.main.connection_logs[0].enabled &&
+      aws_lb.main.connection_logs[0].bucket == var.connection_logs_bucket
+    )
+    error_message = "The ALB should write connection logs to the configured bucket."
+  }
+}
+
+run "disables_client_verification_and_connection_logs" {
+  command = apply
+
+  variables {
+    name = "a--bcdefghijkl--mnopqrstuvwx"
+  }
+
+  assert {
+    condition = (
+      length(aws_lb_trust_store.clients) == 0 &&
+      aws_lb_listener.https.mutual_authentication[0].mode == "off" &&
+      aws_lb_listener.https.mutual_authentication[0].trust_store_arn == null
+    )
+    error_message = "Removing the CA bundle inputs should disable listener mTLS and remove the trust store."
+  }
+
+  assert {
+    condition     = !aws_lb.main.connection_logs[0].enabled
+    error_message = "Removing the connection log bucket should disable logging."
+  }
+}
+
 run "uses_current_partition_for_ssm_policy" {
   command = plan
 
@@ -262,6 +387,14 @@ run "uses_current_partition_for_ssm_policy" {
 
 run "scopes_optional_kms_decryption" {
   command = plan
+
+  override_resource {
+    target          = aws_secretsmanager_secret.bidder["examplebidder"]
+    override_during = plan
+    values = {
+      arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:example-AbCdEf"
+    }
+  }
 
   variables {
     secrets_kms_key_arn = "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-4111-8111-111111111111"

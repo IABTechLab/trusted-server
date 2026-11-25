@@ -4,14 +4,19 @@ This guide covers setting up your Fastly account and Compute service for Trusted
 
 ## Support status
 
-| Adapter  | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization |
-| -------- | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | --------------------- |
-| `fastly` | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                  |
+| Adapter  | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization |
+| -------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | --------------------- |
+| `fastly` | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                  |
 
 The row above summarizes the
 [adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
-response does not prove that configuration loaded: Fastly serves `/health`
-before it constructs the application.
+response does not prove that configuration loaded: Fastly serves GET/HEAD
+`/health` before it constructs the application. GET/HEAD `/ready` follows the
+ordinary initialization path, including required configuration-store access.
+If EdgeZero's managed logger fails to install, EdgeZero answers every route
+with its JSON `500`, `/health` and `/ready` included (see
+[When the logger fails to install](#when-the-logger-fails-to-install)). See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 ## Create a Fastly Account
 
@@ -39,20 +44,14 @@ before it constructs the application.
    - Add your domain of the website you'll be testing or using
    - Click **Update**
 
-## Configure Origins
+## Origins
 
-Origins are the backend servers that Trusted Server will communicate with (ad servers, SSPs, etc.).
-
-1. In your Compute service, click on the **Origins** section
-2. For each backend you need to add:
-   - Enter the FQDN or IP address
-   - Click **Add**
-   - Enter a **Name** in the first field - this name will be referenced in your code (e.g., `my_ad_integration_1`)
-   - Configure port numbers and TLS settings as needed
-
-::: tip
-After saving origin information, you can select port numbers and toggle TLS on/off.
-:::
+Trusted Server needs no static origins on the Compute service. For every
+upstream it calls, such as the publisher origin, an auction provider, or an
+integration, EdgeZero registers a dynamic backend at request time from the
+request URL. Each backend is named `ez_b31v1_` followed by a hash of its
+configuration, so dashboards that group by backend name see those names. TLS
+to an HTTPS upstream is always verified.
 
 ## Configure Fastly CLI Profile
 
@@ -253,11 +252,29 @@ bare address and rejects bracketed, ported, or zone-suffixed forms.
 ### Effect on origin requests
 
 Trusted Server treats `fastly-client-ip` as client-spoofable and strips it at
-request entry whether or not `[trusted_client_ip]` is configured, so it no
-longer forwards an inbound `Fastly-Client-IP` to the publisher origin. Check
-whether the origin reads that header for geolocation, fraud checks, or logging
-before deploying. Reconstructing a trustworthy client-address header for origin
-requests is tracked separately from this mechanism.
+request entry whether or not `[trusted_client_ip]` is configured, so it does not
+forward an inbound `Fastly-Client-IP` to the publisher origin. An origin whose
+WAF rules, logging, rate limits, or geolocation read that header otherwise
+receives no reader address on requests that pass through Trusted Server.
+
+To send the resolved address to the origin, set
+[`publisher.origin_client_ip_header`](./configuration.md#origin-client-ip-header):
+
+```toml
+[publisher]
+origin_client_ip_header = "fastly-client-ip"
+```
+
+Trusted Server then writes the address it resolved into that header on every
+publisher-origin request, replacing any client-supplied copy. With
+`[trusted_client_ip]` configured and authenticated, that is the reader; without
+it, the value is the immediate peer, which behind a front door is the fronting
+POP. Behind a front door, enable `origin_client_ip_header` only after the
+verification steps above pass; otherwise the origin receives one POP address for
+every reader, which can trip origin rate limits. If the request to `origin_url` passes back through a Fastly VCL service
+that overwrites `Fastly-Client-IP` with `client.ip`, that service replaces the
+value with Trusted Server's egress address, so point `origin_url` at the origin
+directly or exempt that route from the overwrite.
 
 ## Create Config and Secret Stores
 
@@ -339,7 +356,8 @@ Services deployed before this change link the physical store directly, such as
 opens `trusted_server_secrets` instead, and only a managed deployment creates
 that link. A plain `fastly compute publish` clones the active version's links,
 so it activates a version whose link is missing: app config fails to load and
-every publisher route returns 500 while `/health` keeps answering 200.
+every publisher route returns 503 while `/health` keeps answering 200 and
+`/ready` returns 503.
 
 When upgrading an existing service:
 
@@ -355,11 +373,15 @@ When upgrading an existing service:
   `EDGEZERO__STORES__<KIND>__<ID>__NAME` variable. An unset selector falls
   back to the logical ID, so the deploy links whichever account-level store
   carries that name, which can belong to another service.
-- Select a KV store for logical ID `trusted_server_kv`. The managed deploy
-  links every declared store, and this one is usually absent on Fastly. Set
-  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` to an existing KV store or
-  run `ts provision --adapter fastly`; otherwise the deploy stops with
-  "selected Fastly KV store `trusted_server_kv` does not exist".
+- Select a KV store for logical ID `trusted_server_runtime_kv`, the generic runtime
+  KV store that features reach through `RuntimeServices::kv_store()`. The
+  managed deploy links every declared store, and this one is usually absent on
+  Fastly. Set `EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME` to a dedicated KV
+  store or run `ts provision --adapter fastly`; otherwise the deploy stops with
+  "selected Fastly KV store `trusted_server_runtime_kv` does not exist". Never select
+  `ec_identity_store` or another store a feature already owns: runtime KV
+  writes land in the selected store. A version without the link still serves
+  every route, and its KV operations answer `KvError::OpenFailed`.
 - Re-push staging app config under the logical key into the staging Config
   Store, with `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` set to
   that store. Entries previously pushed under `<logical-store-id>_staging` are
@@ -430,6 +452,70 @@ If EC sync returns `kv_unavailable` or identify responses are degraded, first ch
 
 Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
 
+## Logging
+
+EdgeZero's Fastly lifecycle installs its managed logger before Trusted
+Server's request callback runs, and Trusted Server installs no logger of its
+own. The settings come from
+`[adapters.fastly.logging]` in `edgezero.toml`:
+
+```toml
+[adapters.fastly.logging]
+endpoint = "tslog"
+level = "info"
+echo_stdout = true
+```
+
+Records go to the Fastly log endpoint named `tslog` and are echoed to stdout,
+which `fastly compute serve` prints. Each line reads
+`<timestamp> <level> <target> <message>`. EdgeZero keeps its `edgezero::boot`
+startup warnings at `warn` whatever the level.
+
+### Raising the level at runtime
+
+A Config Store linked as `edgezero_logging` with the key
+`EDGEZERO__LOGGING__LEVEL` overrides the manifest level without a rebuild. The
+value is one of `off`, `error`, `warn`, `info`, `debug`, or `trace`, in any
+case; an invalid value selects `info`. Without the store or the key, the
+manifest level applies. EdgeZero reads the override once per instance, so a
+change reaches new instances only. It changes neither the endpoint nor the
+stdout echo.
+
+To log at `debug` locally with the same production wasm, add this to the local
+Fastly configuration that `fastly compute serve` or Viceroy reads, then restart
+it:
+
+```toml
+[local_server.config_stores.edgezero_logging]
+format = "inline-toml"
+
+[local_server.config_stores.edgezero_logging.contents]
+EDGEZERO__LOGGING__LEVEL = "debug"
+```
+
+On a deployed service, leave `edgezero_logging` unlinked to keep the manifest
+level, or link a Config Store with that key to change it.
+
+### When the logger fails to install
+
+If EdgeZero cannot install its logger, no Trusted Server route answers,
+`/health` included: EdgeZero's lifecycle stops before Trusted Server's
+callback runs. EdgeZero answers the request itself with its redacted JSON
+`500`, whose body is
+`{"error":{"kind":"internal","message":"internal server error","status":500}}`,
+and sends no body to a `HEAD`. The response carries none of Trusted Server's
+headers, such as `x-ts-version`, because no Trusted Server code runs. The
+guest then prints `managed logger installation failed: <reason>` on stderr.
+Earlier releases answered `/health` before installing the logger, and served
+every request after printing the failure.
+
+The usual cause is an `edgezero_logging` Config Store that is linked but
+cannot be opened or read. EdgeZero checks the `endpoint` name in
+`[adapters.fastly.logging]` when the build reads the manifest, so a name that
+is empty, contains `:` or a line feed, or is `stdout` or `stderr` fails the
+build instead. Whether the endpoint exists is checked only when the logger
+installs. The failure lasts for the instance.
+
 ## Verify the complete local handoff
 
 Run the repository smoke from a clean shell:
@@ -447,8 +533,9 @@ through Viceroy. The required keys are `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase`.
 
 The check deliberately proves both halves of startup. With no config entry, it
-requires `/health` to return 200 while the publisher route returns 500 with the
-missing `trusted_server_config` diagnostic. It then removes each required
+requires `/health` to return 200 while `/ready` and the publisher route return
+503 with the fixed unavailable body. Logs must identify the missing
+`trusted_server_config` input. It then removes each required
 secret independently and requires the corresponding setting path to fail.
 Finally, the publisher request must return 200, retain the stub-origin
 sentinel, rewrite an origin URL to the Fastly listener, and omit the original
@@ -460,6 +547,14 @@ tracked manifests remain untouched, including when smoke runs overlap. Its trap
 stops Viceroy and the stub origin and removes the temporary project. For a
 deployed service, provision and link the stores described above and write the
 three secrets through Fastly's secret-store interface.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Next Steps
 

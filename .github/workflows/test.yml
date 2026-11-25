@@ -55,8 +55,18 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
 
+      - name: Verify identity conformance selection and Fastly lifecycle
+        run: |
+          node --test scripts/test-identity-conformance.test.mjs
+          node scripts/test-identity-conformance.mjs fastly
+
       - name: Run Fastly absolute deadline slow-network tests
         run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
+
+      - name: Run Fastly proxy policy network tests
+        run: |
+          node --test crates/trusted-server-adapter-fastly/tests/proxy-policy-origin.test.mjs
+          node crates/trusted-server-adapter-fastly/tests/proxy-policy-origin.mjs "$(command -v viceroy)"
 
       - name: Run trace emitted-script regressions
         run: |
@@ -165,6 +175,12 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Verify native identity conformance rejection controls
+        run: cargo test -p trusted-server-core --lib identity_conformance
+
+      - name: Run protected CloudFront Geo tests
+        run: cargo test --locked -p trusted-server-adapter-axum --features geo-cloudfront
+
       - name: Verify finalization harness process cleanup
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime
 
@@ -186,8 +202,8 @@ jobs:
           path: ${{ runner.temp }}/trusted-server-finalize-axum-*/
           if-no-files-found: ignore
 
-      - name: Test template build digest inputs (native)
-        run: cargo test -p trusted-server-core --test template_build_digest
+      - name: Test build digest inputs and AWS config envelopes (native)
+        run: cargo test -p trusted-server-core --test template_build_digest --test aws_example_config
 
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
@@ -279,7 +295,6 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -311,6 +326,9 @@ jobs:
 
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+
+      - name: Guard adapter identity wiring
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test adapter_identity_guard
 
       - name: Clippy (parity test crate)
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
