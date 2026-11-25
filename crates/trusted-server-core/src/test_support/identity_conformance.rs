@@ -24,6 +24,7 @@ use crate::test_support::ja4::{
     CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
     SAFARI_USER_AGENT,
 };
+use crate::test_support::scripted_client::RecordedRequest;
 
 /// An observed persistence or response-release boundary in a conformance run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +177,22 @@ pub enum Consent {
 /// ```
 #[must_use]
 pub fn tcf_consent_cookie(granted: bool) -> String {
+    tcf_purposes_cookie(granted, granted)
+}
+
+/// Encodes current TCF v2 consent with Purposes 1 and 4 chosen separately.
+///
+/// Purpose 1 alone permits the EC; reading, storing, sending and writing back
+/// `SharedID` also need Purpose 4 (SID-6).
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::test_support::identity_conformance::tcf_purposes_cookie;
+/// assert!(tcf_purposes_cookie(true, false).starts_with("euconsent-v2="));
+/// ```
+#[must_use]
+pub fn tcf_purposes_cookie(purpose_one: bool, purpose_four: bool) -> String {
     let mut core = [0_u8; 32];
     // TCF v2, followed by current Created and LastUpdated decisecond fields.
     core[0] = 2 << 2;
@@ -187,8 +204,8 @@ pub fn tcf_consent_cookie(granted: bool) -> String {
             }
         }
     }
-    // Purpose 1 and Purpose 4 authorize storage and EID persistence.
-    core[19] = if granted { 0x90 } else { 0 };
+    // Purpose 1 authorizes storage; Purpose 4 authorizes EID persistence.
+    core[19] = if purpose_one { 0x80 } else { 0 } | if purpose_four { 0x10 } else { 0 };
     format!("euconsent-v2={}", URL_SAFE_NO_PAD.encode(core))
 }
 
@@ -739,7 +756,19 @@ pub struct ApiRequest {
     pub origin_status: StatusCode,
     /// Publisher response type for fallback controls; empty omits the header.
     pub origin_content_type: &'static str,
+    /// Prebid's `SharedID` `storage.type`, `cookie` unless a case needs `html5`.
+    pub sharedid_storage_type: &'static str,
+    /// Whether an enabled ID5 provider looks up IDs at [`ID5_LOOKUP`].
+    pub identity_provider: bool,
+    /// Whether an `OpenRTB` bidder at [`BIDDER_ENDPOINT`] receives auctions.
+    pub bidder: bool,
 }
+
+/// The lookup URL the provider enabled by [`ApiRequest::identity_provider`] calls.
+pub const ID5_LOOKUP: &str = "https://id5.example.com/gs/v2/1234.json";
+
+/// The endpoint the bidder enabled by [`ApiRequest::bidder`] receives bids at.
+pub const BIDDER_ENDPOINT: &str = "https://bidder.example.com/openrtb2/auction";
 
 impl ApiRequest {
     /// Builds a local API request without navigation headers.
@@ -755,6 +784,9 @@ impl ApiRequest {
             auction_enabled: true,
             origin_status: StatusCode::OK,
             origin_content_type: "application/json",
+            sharedid_storage_type: "cookie",
+            identity_provider: false,
+            bidder: false,
         }
     }
 }
@@ -763,12 +795,26 @@ impl ApiRequest {
 pub struct ApiObservation {
     /// Fully consumed response.
     pub response: Observation,
-    /// Outbound requests received by the publisher origin.
+    /// Outbound requests the exchange made: those to the publisher origin,
+    /// plus any to an ID5 provider or bidder the request turned on.
     pub origin_requests: usize,
     /// Response cache policy.
     pub cache_control: Option<String>,
     /// Whether a runtime shared-cache directive survived finalization.
     pub edge_cache_headers_present: bool,
+    /// Every outbound request this exchange made, the publisher's included.
+    pub outbound: Vec<RecordedRequest>,
+}
+
+impl ApiObservation {
+    /// Counts outbound requests sent to `url`.
+    #[must_use]
+    pub fn requests_to(&self, url: &str) -> usize {
+        self.outbound
+            .iter()
+            .filter(|request| request.uri == url)
+            .count()
+    }
 }
 
 /// Applies identical partner and auction configuration to supported runners.
@@ -778,11 +824,10 @@ pub struct ApiObservation {
 pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
     // Shared JSON uses fixed TCF timestamps; age policy has separate consent tests.
     settings.consent.check_expiration = false;
-    settings.integrations.insert_config("prebid", &serde_json::json!({
-        "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
-        "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
-        "managed_user_ids":[{"name":"sharedId","storage":{"type":"cookie","name":"_pubcid"}}]
-    })).expect("should configure SharedID cookie storage");
+    settings
+        .integrations
+        .insert_config("prebid", &prebid_fixture("cookie"))
+        .expect("should configure SharedID cookie storage");
     settings
         .proxy
         .allowed_domains
@@ -808,6 +853,55 @@ pub fn configure_http_fixture(settings: &mut crate::settings::Settings) {
         {"name":"Unmirrored fixture","source_domain":"unmirrored.example.com","bidstream_enabled":true}
     ]))
     .expect("should configure conformance partner and SharedID");
+}
+
+/// The Prebid integration fixture, with `SharedID` kept in `storage_type`.
+fn prebid_fixture(storage_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": true, "external_bundle_url": "https://assets.example.com/prebid.js",
+        "bundle": {"modules":{"bidder":["exampleBidderBidAdapter"]}},
+        "managed_user_ids":[{"name":"sharedId","storage":{"type": storage_type, "name":"_pubcid"}}]
+    })
+}
+
+/// Applies one request's fixture switches on top of [`configure_http_fixture`].
+///
+/// # Panics
+/// Panics if the static provider, bidder or Prebid fixtures cannot deserialize.
+pub fn configure_api_request(settings: &mut crate::settings::Settings, request: &ApiRequest) {
+    settings.auction.enabled = request.auction_enabled;
+    if request.sharedid_storage_type != "cookie" {
+        settings
+            .integrations
+            .insert_config("prebid", &prebid_fixture(request.sharedid_storage_type))
+            .expect("should configure SharedID storage type");
+    }
+    if request.identity_provider {
+        settings.ec.identity_providers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"id5", "kind":"id5", "endpoint":"https://id5.example.com/gs/v2",
+                "allowed_domains":["id5.example.com"], "sources":["id5.example.com"],
+                "settings":{"partner_id":1234}
+            }))
+            .expect("should configure the ID5 provider"),
+        );
+        settings.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"ID5 fixture", "source_domain":"id5.example.com", "bidstream_enabled":true
+            }))
+            .expect("should configure the ID5 partner"),
+        );
+    }
+    if request.bidder {
+        settings.auction.providers.insert(
+            "capture".parse().expect("should parse bidder provider ID"),
+            serde_json::from_value(serde_json::json!({
+                "protocol":"openrtb-2.6", "profile":"standard",
+                "endpoint": BIDDER_ENDPOINT, "routing":"all_eligible"
+            }))
+            .expect("should configure the capture bidder"),
+        );
+    }
 }
 
 // Static cross-language consent strings test transport and policy, not age.
@@ -1899,6 +1993,301 @@ fn verify_ec_route_sequence(adapter: &mut impl Adapter, store: &RecordingStore, 
         "grant C should create a live record"
     );
     assert!(tombstoned(&graph), "grant C should leave A tombstoned");
+    clear_store(store);
+}
+
+/// A UUID v4 a browser holds under a cookie or value the server must ignore.
+const FOREIGN_SHAREDID: &str = "22222222-3333-4444-8555-666666666666";
+/// A UUID v4 a browser holds in Prebid's configured `_pubcid` cookie.
+const BROWSER_SHAREDID: &str = "33333333-4444-4555-8666-777777777777";
+
+fn tc_string(cookie: &str) -> &str {
+    cookie
+        .strip_prefix("euconsent-v2=")
+        .expect("should encode a TCF cookie")
+}
+
+fn consent_body(cookie: &str) -> String {
+    serde_json::json!({"tcString": tc_string(cookie), "applicableSections": []}).to_string()
+}
+
+fn stored_sharedid(store: &RecordingStore, identity: &str) -> Option<String> {
+    block_on(KvIdentityGraph::new(store.clone()).get(&normalize_ec_id_for_kv(identity)))
+        .expect("should read the identity record")
+        .expect("should retain the identity record")
+        .0
+        .ids
+        .get("pubcid.org")
+        .map(|id| id.uid.clone())
+}
+
+fn sharedid_cookies(response: &Observation) -> Vec<&String> {
+    response
+        .cookies
+        .iter()
+        .filter(|cookie| cookie.starts_with("_pubcid=") || cookie.starts_with("_pubcid_cst="))
+        .collect()
+}
+
+/// The `user.eids` sources of the one bid request the capture bidder received.
+fn bid_sources(observed: &ApiObservation) -> Vec<String> {
+    let bids: Vec<_> = observed
+        .outbound
+        .iter()
+        .filter(|request| request.uri == BIDDER_ENDPOINT)
+        .collect();
+    assert_eq!(bids.len(), 1, "should send one bid request to the bidder");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bids[0].body).expect("should send a JSON bid request");
+    body["user"]["eids"]
+        .as_array()
+        .map(|eids| {
+            eids.iter()
+                .filter_map(|eid| eid["source"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn auction(cookie: String) -> ApiRequest {
+    let mut auction = ApiRequest::new(http::Method::POST, "/auction");
+    auction.bidder = true;
+    auction.headers.push(("cookie".to_owned(), cookie));
+    auction.body = serde_json::json!({"adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}).to_string();
+    auction
+}
+
+/// Verifies the `SharedID` and provider gates of #1581 through a real adapter.
+///
+/// SID-1: the configured `_pubcid` cookie is read and `sharedId` is not.
+/// SID-2 and SID-6: an opt-out, or Purpose 4 denied with Purpose 1 granted,
+/// keeps `SharedID` out of the record, the bid request and the response.
+/// WB-3: Purpose 1 denied expires `SharedID` and its companion, and `html5`
+/// storage gets no server-made `SharedID`. ID-9: a cross-site `POST` and a
+/// `GET` call no provider.
+///
+/// # Panics
+/// Panics when the adapter reads, stores, sends or sets a `SharedID` it must
+/// not, or calls a provider from a request that may not mint.
+pub fn verify_identity_gates(adapter: &mut impl Adapter, store: &RecordingStore) {
+    let granted = tcf_purposes_cookie(true, true);
+    let purpose_one_only = tcf_purposes_cookie(true, false);
+    clear_store(store);
+
+    // SID-1: `storage.name` is `_pubcid`, so a `sharedId` cookie is not read.
+    let created = adapter.exchange(&ec_post(
+        consent_body(&granted),
+        Some(format!("sharedId={FOREIGN_SHAREDID}")),
+    ));
+    let identity = assert_created(&created.response, store);
+    let sharedid = assert_sharedid_cookies(&created.response);
+    assert_ne!(
+        sharedid, FOREIGN_SHAREDID,
+        "should not read SharedID from a cookie named sharedId"
+    );
+    assert_eq!(
+        stored_sharedid(store, &identity).as_deref(),
+        Some(sharedid.as_str()),
+        "should store the created SharedID, not the sharedId cookie"
+    );
+    assert!(
+        !String::from_utf8_lossy(&created.response.body).contains(FOREIGN_SHAREDID),
+        "should not echo the sharedId cookie"
+    );
+    // WB-3 and SID-6: Purpose 1 granted and Purpose 4 denied leaves the
+    // browser's SharedID cookies alone.
+    for browser in [String::new(), format!("; _pubcid={FOREIGN_SHAREDID}")] {
+        let observed = adapter.exchange(&ec_post(
+            consent_body(&purpose_one_only),
+            Some(format!("ts-ec={identity}{browser}")),
+        ));
+        assert_eq!(
+            observed.response.status,
+            StatusCode::OK,
+            "should accept Purpose 1 consent"
+        );
+        assert!(
+            sharedid_cookies(&observed.response).is_empty(),
+            "should neither set nor expire SharedID without Purpose 4 ({browser:?}): {:?}",
+            observed.response.cookies
+        );
+        assert_eq!(
+            route_json(&observed).1,
+            None,
+            "SID-6: should answer without a SharedID when Purpose 4 is denied ({browser:?})"
+        );
+    }
+
+    // SID-6 and SID-2 on the bidstream, against a control that sends it.
+    let sent = adapter.exchange(&auction(format!("{granted}; ts-ec={identity}")));
+    assert!(
+        bid_sources(&sent)
+            .iter()
+            .any(|source| source == "pubcid.org"),
+        "should send the stored SharedID with full consent, proving the capture"
+    );
+    for (cookie, case) in [
+        (
+            format!("{purpose_one_only}; ts-ec={identity}; _pubcid={FOREIGN_SHAREDID}"),
+            "Purpose 4 denied",
+        ),
+        (
+            format!("{granted}; ts-ec={identity}; _pubcid={sharedid}; _pubcid_optout=1"),
+            "_pubcid_optout",
+        ),
+    ] {
+        let withheld = adapter.exchange(&auction(cookie));
+        assert!(
+            !bid_sources(&withheld)
+                .iter()
+                .any(|source| source == "pubcid.org"),
+            "should send no SharedID with {case}"
+        );
+    }
+
+    // WB-3: Purpose 1 denied, with Purpose 4 still granted, expires both.
+    let denied = adapter.exchange(&ec_post(
+        consent_body(&tcf_purposes_cookie(false, true)),
+        Some(format!(
+            "ts-ec={identity}; _pubcid={sharedid}; _pubcid_cst=AAAAAA%3D%3D"
+        )),
+    ));
+    for name in ["_pubcid", "_pubcid_cst"] {
+        assert!(
+            denied
+                .response
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{name}=;"))
+                    && cookie.contains("Max-Age=0")),
+            "should expire {name} when Purpose 1 is denied: {:?}",
+            denied.response.cookies
+        );
+    }
+
+    // SID-6: a record without SharedID, so a read would show in the store.
+    clear_store(store);
+    let bare = adapter.exchange(&ec_post(
+        consent_body(&granted),
+        Some("_pubcid_optout=1".to_owned()),
+    ));
+    let bare_identity = assert_created(&bare.response, store);
+    let purpose_one = adapter.exchange(&ec_post(
+        consent_body(&purpose_one_only),
+        Some(format!("ts-ec={bare_identity}; _pubcid={FOREIGN_SHAREDID}")),
+    ));
+    assert_eq!(
+        purpose_one.response.status,
+        http::StatusCode::OK,
+        "should accept the Purpose 1 only POST, so the SharedID gate is what runs"
+    );
+    assert_eq!(
+        stored_sharedid(store, &bare_identity),
+        None,
+        "should not read the browser SharedID without Purpose 4"
+    );
+
+    // SID-1: the configured `_pubcid` cookie is read, and `sharedId` is not.
+    clear_store(store);
+    let read = adapter.exchange(&ec_post(
+        consent_body(&granted),
+        Some(format!(
+            "sharedId={FOREIGN_SHAREDID}; _pubcid={BROWSER_SHAREDID}"
+        )),
+    ));
+    let read_identity = assert_created(&read.response, store);
+    assert_eq!(
+        stored_sharedid(store, &read_identity).as_deref(),
+        Some(BROWSER_SHAREDID),
+        "should read SharedID from the configured _pubcid cookie"
+    );
+    // SID-2: with `_pubcid_optout` the browser's SharedID is not read either.
+    clear_store(store);
+    let opted_out = adapter.exchange(&ec_post(
+        consent_body(&granted),
+        Some(format!("_pubcid={BROWSER_SHAREDID}; _pubcid_optout=1")),
+    ));
+    let opted_out_identity = assert_created(&opted_out.response, store);
+    assert_eq!(
+        stored_sharedid(store, &opted_out_identity),
+        None,
+        "should not read the browser SharedID after an opt-out"
+    );
+    assert!(
+        sharedid_cookies(&opted_out.response)
+            .iter()
+            .all(|cookie| cookie.contains("Max-Age=0")),
+        "should set no SharedID after an opt-out: {:?}",
+        opted_out.response.cookies
+    );
+
+    // WB-3: Prebid never reads an `html5` SharedID from the cookie, so the
+    // server neither creates nor sets one.
+    clear_store(store);
+    let mut html5 = ec_post(consent_body(&granted), None);
+    html5.sharedid_storage_type = "html5";
+    let html5 = adapter.exchange(&html5);
+    let html5_identity = assert_created(&html5.response, store);
+    assert!(
+        sharedid_cookies(&html5.response).is_empty(),
+        "should set no SharedID with html5 storage: {:?}",
+        html5.response.cookies
+    );
+    assert_eq!(
+        stored_sharedid(store, &html5_identity),
+        None,
+        "should create no SharedID with html5 storage"
+    );
+
+    // ID-9: only a same-origin POST that may mint calls providers.
+    clear_store(store);
+    let mut control = ec_post(consent_body(&granted), None);
+    control.identity_provider = true;
+    let control = adapter.exchange(&control);
+    let provider_identity = assert_created(&control.response, store);
+    assert_eq!(
+        control.requests_to(ID5_LOOKUP),
+        1,
+        "should call the provider from a same-origin POST, proving the capture"
+    );
+    // The control's request with only its `Origin` changed, so the origin
+    // check is the one thing that can refuse it.
+    let mut cross_site = ec_post(consent_body(&granted), None);
+    cross_site.identity_provider = true;
+    for (name, value) in &mut cross_site.headers {
+        if name == "origin" {
+            *value = "https://cross-site.example.com".to_owned();
+        }
+    }
+    let mut get = ApiRequest::new(http::Method::GET, "/_ts/api/v1/ec");
+    get.identity_provider = true;
+    get.headers.push((
+        "cookie".to_owned(),
+        format!("{granted}; ts-ec={provider_identity}"),
+    ));
+    for (request, case, status) in [
+        (cross_site, "cross-site POST", http::StatusCode::FORBIDDEN),
+        (get, "GET", http::StatusCode::NO_CONTENT),
+    ] {
+        let observed = adapter.exchange(&request);
+        assert_eq!(
+            observed.response.status, status,
+            "should answer a {case} with {status}"
+        );
+        assert_eq!(
+            observed.requests_to(ID5_LOOKUP),
+            0,
+            "should call no provider from a {case}"
+        );
+        assert!(
+            !observed
+                .response
+                .cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec=") && !cookie.starts_with("ts-ec=;")),
+            "should mint no EC from a {case}"
+        );
+    }
     clear_store(store);
 }
 
