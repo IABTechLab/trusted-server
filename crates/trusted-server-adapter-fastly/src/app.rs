@@ -110,7 +110,7 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::consent::ConsentContext;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
+use trusted_server_core::constants::{COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
@@ -128,6 +128,7 @@ use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::sharedid::{SharedIdRequest, SharedIdStorage};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -217,6 +218,8 @@ pub(crate) struct AppState {
     pub(crate) page_identity: Option<Arc<ProviderCoordinator>>,
     /// Coordinator for providers collected after the response, if any.
     pub(crate) after_response_identity: Option<Arc<ProviderCoordinator>>,
+    /// Where Prebid keeps the `SharedID`, resolved once per sandbox.
+    pub(crate) sharedid_storage: SharedIdStorage,
 }
 
 impl AppState {
@@ -266,6 +269,8 @@ pub(crate) fn build_state_from_settings(
             })?
             .map(Arc::new);
 
+    let sharedid_storage = settings.sharedid_storage();
+
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
@@ -274,6 +279,7 @@ pub(crate) fn build_state_from_settings(
         partner_registry,
         page_identity,
         after_response_identity,
+        sharedid_storage,
     }))
 }
 
@@ -395,7 +401,7 @@ pub(crate) struct EcFinalizeState {
     /// settings when this is set.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
-    pub(crate) sharedid_cookie: Option<String>,
+    pub(crate) sharedid: SharedIdRequest,
 }
 
 /// Identity lookups dispatched for this navigation, collected before finalize.
@@ -658,7 +664,7 @@ struct EcRequestState {
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
     eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
+    sharedid: SharedIdRequest,
     is_real_browser: bool,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
@@ -677,7 +683,7 @@ impl EcRequestState {
             ec_context: self.ec_context,
             use_finalize_kv: self.finalize_kv_graph.is_some(),
             eids_cookie: self.eids_cookie,
-            sharedid_cookie: self.sharedid_cookie,
+            sharedid: self.sharedid,
         }
     }
 }
@@ -718,6 +724,7 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
     settings: &Settings,
+    sharedid_storage: &SharedIdStorage,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
@@ -733,7 +740,7 @@ fn build_ec_request_state(
     }
 
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(sharedid_storage.cookie_name(), req);
 
     let geo_info = services
         .geo()
@@ -777,7 +784,7 @@ fn build_ec_request_state(
         kv_graph,
         finalize_kv_graph,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
         is_real_browser,
         geo_info,
         setup_error,
@@ -897,7 +904,9 @@ async fn execute_named(
                 let kv = crate::maybe_identity_graph(&state.settings);
                 handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
             }
-            NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
+            NamedRouteHandler::AdminEidsLookup => {
+                handle_admin_eids_lookup(&registry, state.sharedid_storage.cookie_name(), &req)
+            }
             _ => unreachable!("admin diagnostics should use early dispatch"),
         }
         .unwrap_or_else(|error| http_error(&error));
@@ -911,7 +920,7 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state.settings, &state.sharedid_storage, &services, &req);
     apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -1053,7 +1062,7 @@ async fn run_named_route(
 /// response finalization.
 async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    let sharedid = SharedIdRequest::from_request(state.sharedid_storage.cookie_name(), &req);
 
     let identity_graph =
         crate::maybe_identity_graph(&state.settings).filter(|_| req.method() == Method::POST);
@@ -1073,7 +1082,7 @@ async fn run_batch_sync(state: &AppState, req: Request) -> Response {
         ec_context: EcContext::default(),
         use_finalize_kv: false,
         eids_cookie,
-        sharedid_cookie,
+        sharedid,
     });
     response
 }
@@ -1106,7 +1115,7 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(&state.settings, &state.sharedid_storage, services, &req);
     apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
@@ -2224,6 +2233,7 @@ mod tests {
             partner_registry: Arc::new(PartnerRegistry::empty()),
             page_identity: None,
             after_response_identity: None,
+            sharedid_storage: trusted_server_core::ec::sharedid::SharedIdStorage::Unconfigured,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -3687,7 +3697,7 @@ mod tests {
                     kv_graph: None,
                     finalize_kv_graph: None,
                     eids_cookie: None,
-                    sharedid_cookie: None,
+                    sharedid: super::SharedIdRequest::default(),
                     is_real_browser: true,
                     geo_info: None,
                     setup_error: None,
@@ -4176,6 +4186,51 @@ mod tests {
     }
 
     #[test]
+    fn ec_request_state_reads_the_configured_sharedid_cookie() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } },
+                    "managed_user_ids": [
+                        { "name": "sharedId", "storage": { "type": "cookie", "name": "_pubcid" } }
+                    ],
+                }),
+            )
+            .expect("should configure Prebid");
+        let state = build_state_from_settings(settings).expect("should build app state");
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "sharedId=legacy-id; _pubcid=configured-id")
+            .body(Body::empty())
+            .expect("should build request");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+
+        let ec = super::build_ec_request_state(
+            &state.settings,
+            &state.sharedid_storage,
+            &services,
+            &req,
+        );
+
+        assert_eq!(
+            ec.sharedid.readable_value(),
+            Some("configured-id"),
+            "should read the cookie named by Prebid's storage.name, not `sharedId`"
+        );
+    }
+
+    #[test]
     fn after_response_lookups_run_only_for_real_browsers() {
         let mut settings = test_settings();
         settings.ec.ec_store = Some("ec_identity_store".to_owned());
@@ -4213,7 +4268,12 @@ mod tests {
         let services =
             build_per_request_services(&state, &context).expect("should build request services");
         let req = browser_request();
-        let mut ec = super::build_ec_request_state(&state.settings, &services, &req);
+        let mut ec = super::build_ec_request_state(
+            &state.settings,
+            &state.sharedid_storage,
+            &services,
+            &req,
+        );
         assert!(
             ec.is_real_browser,
             "should classify the request as a browser"

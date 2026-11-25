@@ -417,7 +417,7 @@ mod tests {
                 ec_context,
                 use_finalize_kv: false,
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
             },
             after_response: None,
         }
@@ -451,7 +451,7 @@ mod tests {
             &app.partner_registry,
             &FinalizeRequest {
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
                 now: Some(UnixSeconds::new(current_timestamp())),
             },
             &mut response,

@@ -965,7 +965,7 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.
-5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `sharedId` cookie. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
+5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the SharedID cookie named by the `sharedId` entry's `storage.name`. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
 
 The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
