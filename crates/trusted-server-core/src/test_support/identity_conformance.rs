@@ -701,6 +701,8 @@ pub struct ApiRequest {
     pub origin_status: StatusCode,
     /// Publisher response type for fallback controls; empty omits the header.
     pub origin_content_type: &'static str,
+    /// Whether trusted device signals classify the client as a known non-browser.
+    pub known_non_browser: bool,
 }
 
 impl ApiRequest {
@@ -717,6 +719,7 @@ impl ApiRequest {
             auction_enabled: true,
             origin_status: StatusCode::OK,
             origin_content_type: "application/json",
+            known_non_browser: false,
         }
     }
 }
@@ -729,6 +732,8 @@ pub struct ApiObservation {
     pub origin_requests: usize,
     /// Response cache policy.
     pub cache_control: Option<String>,
+    /// Whether a runtime shared-cache directive survived finalization.
+    pub edge_cache_headers_present: bool,
 }
 
 /// Applies identical partner and auction configuration to supported runners.
@@ -879,6 +884,206 @@ fn assert_ec_expired(response: &Observation) {
             .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
         "should expire browser EC in the withdrawal response"
     );
+}
+
+/// Verifies that a client refused creation never writes on a navigation.
+///
+/// A known non-browser returning with a live EC and browser EIDs gets no
+/// record write and no `SharedID`, while an allowed client with the same
+/// request writes both. The EC route GET restores the stored `SharedID` only
+/// for the allowed client. Consent withdrawal still tombstones for the refused
+/// client.
+///
+/// # Panics
+///
+/// Panics when a refused client writes, the allowed control does not, or the
+/// refused client's withdrawal does not tombstone.
+pub fn verify_known_non_browser_navigation(adapter: &mut impl Adapter, store: &RecordingStore) {
+    let graph = KvIdentityGraph::new(store.clone());
+    let identity = format!("{}.nb0001", "c".repeat(64));
+    let key = normalize_ec_id_for_kv(&identity);
+    let mut live = crate::ec::kv_types::KvEntry::new(
+        &crate::consent::types::ConsentContext::default(),
+        None,
+        100,
+        "example.com",
+    );
+    live.consent.ok = true;
+    block_on(graph.create(&key, &live)).expect("should seed a live returning identity");
+    let eids = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::json!([{"source":"body.example.com","uids":[{"id":"cookie-uid","atype":1}]}])
+            .to_string(),
+    );
+    let navigation = |known_non_browser: bool, consent: bool| {
+        let mut request = ApiRequest::new(http::Method::GET, "/article");
+        request.origin_content_type = "text/html";
+        request.known_non_browser = known_non_browser;
+        request.headers = vec![
+            ("sec-fetch-dest".to_owned(), "document".to_owned()),
+            ("sec-fetch-mode".to_owned(), "navigate".to_owned()),
+            ("accept".to_owned(), "text/html".to_owned()),
+            (
+                "cookie".to_owned(),
+                format!(
+                    "{}; ts-ec={identity}; ts-eids={eids}",
+                    tcf_consent_cookie(consent)
+                ),
+            ),
+        ];
+        request
+    };
+    let writes = |store: &RecordingStore| {
+        store
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Persisted(_) | Event::Rejected(_)))
+            .count()
+    };
+    let issues_sharedid = |response: &Observation| {
+        response
+            .cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0"))
+    };
+
+    let before = block_on(graph.get(&key)).expect("should read the seeded identity");
+    let writes_before = writes(store);
+    let refused = adapter.exchange(&navigation(true, true));
+    assert_document(&refused.response);
+    assert_eq!(
+        writes(store),
+        writes_before,
+        "should not write for a known non-browser navigation"
+    );
+    assert_eq!(
+        block_on(graph.get(&key)).expect("should reread the identity"),
+        before,
+        "should leave a known non-browser's record unchanged"
+    );
+    assert!(
+        !issues_sharedid(&refused.response),
+        "should not issue SharedID to a known non-browser: {:?}",
+        refused.response.cookies
+    );
+
+    // The same request from an allowed client proves the EIDs and SharedID
+    // reach the write the refused client was denied.
+    let allowed = adapter.exchange(&navigation(false, true));
+    assert_document(&allowed.response);
+    assert!(
+        writes(store) > writes_before,
+        "should write for the allowed control"
+    );
+    assert!(
+        issues_sharedid(&allowed.response),
+        "should issue SharedID to the allowed control: {:?}",
+        allowed.response.cookies
+    );
+
+    // The EC route GET restores the stored SharedID only for an allowed client.
+    for (known_non_browser, restored) in [(true, false), (false, true)] {
+        let mut pixel = ApiRequest::new(http::Method::GET, "/_ts/api/v1/ec");
+        pixel.known_non_browser = known_non_browser;
+        pixel.headers.push((
+            "cookie".to_owned(),
+            format!("{}; ts-ec={identity}", tcf_consent_cookie(true)),
+        ));
+        let observed = adapter.exchange(&pixel);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::NO_CONTENT,
+            "should answer the EC route GET"
+        );
+        assert_eq!(
+            issues_sharedid(&observed.response),
+            restored,
+            "should restore SharedID on EC GET only for an allowed client: {:?}",
+            observed.response.cookies
+        );
+    }
+
+    let withdrawn = adapter.exchange(&navigation(true, false));
+    assert_ec_expired(&withdrawn.response);
+    let (row, _) = block_on(graph.get(&key))
+        .expect("should read the withdrawal")
+        .expect("should retain the tombstone");
+    assert!(
+        !row.consent.ok,
+        "should tombstone a known non-browser's withdrawal"
+    );
+}
+
+/// Verifies core-generated identity expiries and cache privacy on API responses.
+///
+/// # Panics
+///
+/// Panics if an adapter strips a required deletion or permits shared caching.
+pub fn verify_api_identity_expiries(adapter: &mut impl Adapter) {
+    for (consent, extra, expected) in [
+        (
+            false,
+            "__Host-ts-eids-mirror=stale".to_owned(),
+            vec!["__Host-ts-eids-mirror"],
+        ),
+        (
+            true,
+            "_pubcid=browser-id; _pubcid_cst=old; _pubcid_optout=1".to_owned(),
+            vec!["_pubcid", "_pubcid_cst"],
+        ),
+        (
+            false,
+            format!(
+                "ts-ec={}.abc123; __Host-ts-eids-mirror=stale; _pubcid=browser-id; _pubcid_cst=old",
+                "a".repeat(64)
+            ),
+            vec!["ts-ec", "__Host-ts-eids-mirror", "_pubcid", "_pubcid_cst"],
+        ),
+    ] {
+        let mut request = ApiRequest::new(http::Method::GET, "/publisher-api");
+        request.headers.push((
+            "cookie".to_owned(),
+            format!("{}; {extra}", tcf_consent_cookie(consent)),
+        ));
+        let observed = adapter.exchange(&request);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::OK,
+            "should finalize an ordinary API response"
+        );
+        for name in expected {
+            assert!(
+                observed.response.cookies.iter().any(|value| {
+                    let cookie =
+                        Cookie::parse(value.as_str()).expect("should parse generated expiry");
+                    cookie.name() == name
+                        && cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+                }),
+                "should expire {name} on a non-document API response"
+            );
+        }
+        assert!(
+            observed.response.cookies.iter().all(|value| {
+                let cookie = Cookie::parse(value.as_str()).expect("should parse response cookie");
+                cookie.max_age().is_some_and(|age| age.whole_seconds() == 0)
+            }),
+            "should emit only expiry cookies on the API response"
+        );
+        assert!(
+            !observed.edge_cache_headers_present,
+            "should strip runtime shared-cache directives from expiry responses"
+        );
+        assert!(
+            observed.cache_control.as_deref().is_some_and(|value| value
+                .split(',')
+                .map(str::trim)
+                .any(|directive| directive == "private")
+                && !value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|directive| directive == "public" || directive.starts_with("s-maxage"))),
+            "should keep identity deletion responses private"
+        );
+    }
 }
 
 /// Executes the shared HTTP acceptance cases against a real adapter.
@@ -1182,7 +1387,33 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
             response.response.status,
             String::from_utf8_lossy(&response.response.body)
         );
-        assert_no_identity_cookies(&response.response);
+        assert_eq!(
+            response.response.cookies.len(),
+            1,
+            "should emit only the required mirror revocation expiry, filtering the retired marker"
+        );
+        let cookie = Cookie::parse(response.response.cookies[0].as_str())
+            .expect("should parse mirror expiry");
+        assert_eq!(
+            cookie.name(),
+            "__Host-ts-eids-mirror",
+            "should revoke a stale mirror whose vendor is denied"
+        );
+        assert!(
+            cookie.max_age().is_some_and(|age| age.whole_seconds() == 0),
+            "should emit no positive identity cookie on publisher API responses"
+        );
+        assert!(
+            !response.edge_cache_headers_present,
+            "should strip shared cache directives from mirror revocation responses"
+        );
+        assert!(
+            response
+                .cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("private")),
+            "should keep mirror revocation responses private"
+        );
     }
 
     let (mut seeded, generation) = block_on(graph.get(&key))
