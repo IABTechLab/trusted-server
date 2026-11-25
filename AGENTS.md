@@ -38,7 +38,7 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | WASM target | `wasm32-wasip1`                          |
 | Node        | 24.20.0 (from `.tool-versions`)          |
 | Fastly CLI  | 16.0.0 (from `.tool-versions`)           |
-| Viceroy     | 0.21.0 (from `.tool-versions`)           |
+| Viceroy     | 0.22.0 (from `.tool-versions`)           |
 | Wasmtime    | 48.0.1 (from `.tool-versions`)           |
 | Spin        | 4.1.0 (from `.tool-versions`)            |
 | AWS CLI     | 2.36.45 (from `.tool-versions`)          |
@@ -160,7 +160,7 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy --version 0.21.0 --locked --force
+cargo install viceroy --version 0.22.0 --locked --force
 ```
 
 ---
