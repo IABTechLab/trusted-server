@@ -153,6 +153,21 @@ http.createServer((req, res) => {
   }
   const secrets =
     'EDGEZERO__SECRETS__EC_KEY=synthetic-container-ec-passphrase-32-bytes\nEDGEZERO__SECRETS__PROXY_KEY=synthetic-container-proxy-secret-32-bytes\nEDGEZERO__SECRETS__ADMIN_KEY=synthetic-container-admin-secret-32-bytes\n'
+  // An early listener error cannot substitute for the required initialization error.
+  const noListenProfile = join(work, 'deny-bind-listen.json')
+  await writeFile(
+    noListenProfile,
+    JSON.stringify({
+      defaultAction: 'SCMP_ACT_ALLOW',
+      syscalls: [
+        {
+          names: ['bind', 'listen'],
+          action: 'SCMP_ACT_ERRNO',
+          errnoRet: 1,
+        },
+      ],
+    })
+  )
   const launch = async (label, data, secretText) => {
     check()
     const root = join(work, label)
@@ -185,6 +200,9 @@ http.createServer((req, res) => {
       '--read-only',
       '--cap-drop=ALL',
       '--security-opt=no-new-privileges',
+      ...(label === 'missing-secret'
+        ? ['--security-opt', `seccomp=${noListenProfile}`]
+        : []),
       '--network',
       network,
       '--publish',
@@ -270,8 +288,14 @@ http.createServer((req, res) => {
       'must reject application inputs, not fail the launcher'
     )
     assert.match(logs, diagnostic, `${label} must report its own cause`)
+    if (label === 'missing-secret')
+      assert.match(
+        logs,
+        /is missing in trusted_server_secrets/,
+        'must reject a missing secret from the prepared secret store'
+      )
     const failed = logs.indexOf('Trusted Server initialization failed')
-    const ready = logs.indexOf('phase=ready')
+    const ready = logs.search(/\bevent=lifecycle\b[^\n]*\bphase=ready\b/)
     assert(
       ready === -1 || failed < ready,
       `${label} must fail initialization before the listener is ready`

@@ -43,7 +43,9 @@ node scripts/test-native-container.mjs ts-native:local
 
 The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks that invalid configuration and missing secrets serve the failure router (`/health` `200`, `/ready` and routes `503`), the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
 
-The `Native container` workflow builds the local-provider image and runs this test on relevant pull requests or manual dispatch. It does not publish an image or deploy a service.
+The missing-secret container uses a temporary seccomp profile that makes `bind` and `listen` fail with EPERM. It must still exit non-zero with both `Trusted Server initialization failed` and `is missing in trusted_server_secrets` in its log. Port probes and the absence of a ready lifecycle event are additional checks. A listener failure before secret validation cannot substitute for the required missing-secret diagnostic.
+
+The `Native RC container` workflow builds the local-provider image and runs this test on relevant pull requests or manual dispatch. It does not publish an image or deploy a service.
 
 ## Local record persistence proof
 
@@ -56,5 +58,9 @@ node scripts/test-native-ec-image.mjs \
 ```
 
 The same fixture accepts `--binary /absolute/path/trusted-server-axum` instead of an image. It supplies a prepared record binding, dummy AWS credentials, synthetic Geo/consent and an isolated table. It observes the SDK's native keys instead of reconstructing partition encoding. Checks cover acknowledgement-before-cookie, restart, withdrawal, a present past-TTL row racing a delayed CAS, denied and lost acknowledgements, and draining while storage waits. TTL eligibility is not a physical-deletion deadline.
+
+Two SIGTERM cases exercise pending record writes. The request-time case requires the response to complete during drain. The after-response case uses a cookie-only SharedID provider: a returning navigation's full response completes while its conditional follow-up write remains paused. Both cases observe draining, wait another 250 ms, and verify that the process is still running and the selected write is still pending before release. Signal-to-exit observation is bounded by the configured three-second grace plus 500 ms for Docker delivery and observation.
+
+After each process exits, the fixture reads the exact native row directly from DynamoDB and compares its complete value and generation with the acknowledged write. The after-response row must also retain the distinctive SharedID UID and advance its generation. The JSON proof retains both post-exit rows and the shutdown ordering. Its limitations list explicitly records `grace expiry not tested`: holding a write past the configured grace and checking timeout/cancellation remain a possible follow-up.
 
 The fixture never builds/pulls or publishes an image, contacts hosted AWS, or runs a deployment wrapper. Binary-mode proof does not qualify the container build; image-mode proof does not qualify hosted IAM, release security, capacity or real browser consent transport.
