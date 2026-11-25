@@ -20,8 +20,11 @@ use trusted_server_core::creative_opportunities::RuntimeAdStackExpected;
 /// audited page can put ANSI/OSC escape sequences in `document.title` and drive
 /// the operator's terminal (cursor movement, clipboard writes, forged output)
 /// when the value is printed verbatim. Every C0 control (including ESC), DEL,
-/// and the C1 range are rendered as `\u{XXXX}` so the text stays inert. JSON
-/// output is unaffected — `serde_json` escapes these already.
+/// and the C1 range are rendered as `\u{XXXX}` so the text stays inert. So are
+/// bidirectional controls, zero-width and invisible characters, line and
+/// paragraph separators and soft hyphens, which can reorder, hide or break text
+/// on screen. JSON output does not use this function: `serde_json` escapes the
+/// controls but leaves the other characters as they are.
 ///
 /// Returns a borrowed `Cow` when the input needs no escaping.
 #[must_use]
@@ -40,13 +43,20 @@ pub fn escape_terminal_text(value: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-/// Whether `ch` can act as a terminal control code (C0, DEL, or C1).
+/// Whether `ch` can act as a terminal control code (C0, DEL, or C1) or change how
+/// the surrounding text reads on screen.
 fn is_terminal_control(ch: char) -> bool {
-    let code = ch as u32;
-    code < 0x20
-        || (0x7f..=0x9f).contains(&code)
-        || (0x202a..=0x202e).contains(&code)
-        || (0x2066..=0x2069).contains(&code)
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// Confirmation status for a single configured slot.
@@ -404,6 +414,21 @@ mod tests {
             escape_terminal_text("safe\u{202E}forged\u{2066}tail"),
             "safe\\u{202E}forged\\u{2066}tail",
             "Unicode bidi controls should be rendered inert"
+        );
+        for character in [
+            '\u{00AD}', '\u{061C}', '\u{200B}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{2060}',
+            '\u{2064}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert_eq!(
+                escape_terminal_text(&format!("a{character}b")),
+                format!("a\\u{{{:04X}}}b", u32::from(character)),
+                "invisible, separator and soft-hyphen characters should be rendered inert"
+            );
+        }
+        let neighbours = "\u{00AC}\u{061B}\u{200A}\u{2010}\u{2027}\u{202F}\u{205F}\u{2065}";
+        assert!(
+            matches!(escape_terminal_text(neighbours), Cow::Borrowed(_)),
+            "characters next to the escaped ranges should pass through unchanged"
         );
     }
 

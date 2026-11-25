@@ -115,8 +115,9 @@ fn json_passthrough(body: &str) -> String {
 ///
 /// Escape only data fields, so the report's own line breaks and JSON passthrough stay
 /// unchanged. Cookie decoding can produce controls even when the cookie itself is ASCII.
-/// Bidirectional overrides and zero-width characters are not controls, but they can
-/// reorder or hide part of a UID on screen, so they are escaped too.
+/// Bidirectional controls, zero-width and invisible characters, line separators and soft
+/// hyphens are not controls, but they can reorder, hide or break part of a UID on screen,
+/// so they are escaped too.
 fn terminal_text(value: &str) -> Cow<'_, str> {
     if !value.chars().any(needs_terminal_escape) {
         return Cow::Borrowed(value);
@@ -137,7 +138,13 @@ fn needs_terminal_escape(character: char) -> bool {
     character.is_control()
         || matches!(
             character,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
         )
 }
 
@@ -187,7 +194,8 @@ mod tests {
     #[test]
     fn terminal_text_escapes_bidi_overrides_and_invisible_characters() {
         for character in [
-            '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+            '\u{00AD}', '\u{061C}', '\u{200B}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}',
+            '\u{202E}', '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{FEFF}',
         ] {
             let value = format!("uid{character}cba");
 
@@ -209,7 +217,10 @@ mod tests {
             r"uid\n\u{1b}[2J",
             "should escape controls"
         );
-        for plain in ["uid-fictional", "café\u{200A}\u{2010}\u{202F}\u{2065}"] {
+        for plain in [
+            "uid-fictional",
+            "café\u{00AC}\u{061B}\u{200A}\u{2010}\u{2027}\u{202F}\u{205F}\u{2065}",
+        ] {
             assert!(
                 matches!(terminal_text(plain), Cow::Borrowed(_)),
                 "should leave characters outside the escaped ranges unchanged: {plain:?}"
