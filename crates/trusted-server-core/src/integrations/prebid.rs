@@ -38,7 +38,7 @@ use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
-use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar, tcf_consent_cookie};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -2123,7 +2123,13 @@ impl PrebidConsentCookies {
         let jar = parse_cookies_to_jar(header);
         let mut pairs = Vec::new();
         for name in CONSENT_COOKIE_NAMES {
-            let Some(cookie) = jar.get(name) else {
+            let selected = if *name == COOKIE_EUCONSENT_V2 {
+                // Use the canonical name on the wire, including in cookies-only mode.
+                tcf_consent_cookie(&jar)
+            } else {
+                jar.get(name)
+            };
+            let Some(cookie) = selected else {
                 continue;
             };
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
@@ -10047,6 +10053,16 @@ set = { networkId = 42 }
     fn prebid_cookie_selection_matches_extraction_and_preserves_safe_framing() {
         for (input, expected, requires_body) in [
             ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
+            (
+                "__Host-ts-tcf=TC-example",
+                Some("euconsent-v2=TC-example"),
+                false,
+            ),
+            (
+                "__Host-ts-tcf=bridge; euconsent-v2=publisher",
+                Some("euconsent-v2=publisher"),
+                false,
+            ),
             (
                 "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
                 Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),

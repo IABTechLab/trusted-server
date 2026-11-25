@@ -678,6 +678,7 @@ fn log_consent_context(ctx: &ConsentContext) {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use edgezero_core::body::Body as EdgeBody;
     use http::Request;
 
@@ -691,7 +692,9 @@ mod tests {
         ConsentContext, GppConsent, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
     };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
+    use crate::constants::COOKIE_SOURCEPOINT_TCF;
     use crate::cookies::parse_cookies_to_jar;
+    use crate::geo::GeoInfo;
 
     fn build_request() -> Request<EdgeBody> {
         Request::builder()
@@ -983,6 +986,67 @@ mod tests {
             !allows_ec_creation(&ctx),
             "missing geo should keep EC creation fail-closed"
         );
+    }
+
+    #[test]
+    fn sourcepoint_tcf_mirror_uses_existing_gdpr_grant_and_withdrawal_rules() {
+        // Minimal synthetic TCF v2 core segments with Purpose 1 toggled.
+        let mut core = [0u8; 32];
+        core[0] = 2 << 2;
+        let denial = URL_SAFE_NO_PAD.encode(core);
+        core[19] = 0x80;
+        let grant = URL_SAFE_NO_PAD.encode(core);
+        let geo = GeoInfo {
+            city: String::new(),
+            country: "GB".to_owned(),
+            continent: "EU".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+        let config = ConsentConfig {
+            check_expiration: false,
+            ..ConsentConfig::default()
+        };
+        let req = build_request();
+
+        for (cookie, allowed, withdrawn) in [
+            (format!("{COOKIE_SOURCEPOINT_TCF}={grant}"), true, false),
+            (format!("{COOKIE_SOURCEPOINT_TCF}={denial}"), false, true),
+            (
+                format!("{COOKIE_SOURCEPOINT_TCF}={grant}; euconsent-v2={denial}"),
+                false,
+                true,
+            ),
+            (format!("{COOKIE_SOURCEPOINT_TCF}=invalid"), false, false),
+        ] {
+            let jar = parse_cookies_to_jar(&cookie);
+            let ctx = build_consent_context(&ConsentPipelineInput {
+                jar: Some(&jar),
+                req: &req,
+                config: &config,
+                geo: Some(&geo),
+            });
+
+            assert_eq!(
+                ctx.jurisdiction,
+                Jurisdiction::Gdpr,
+                "should classify UK geo"
+            );
+            assert_eq!(allows_ec_creation(&ctx), allowed, "should gate EC issuance");
+            assert_eq!(
+                consent_allows_server_side_auction(&ctx),
+                allowed,
+                "should gate auction dispatch"
+            );
+            assert_eq!(
+                has_explicit_ec_withdrawal(&ctx),
+                withdrawn,
+                "should distinguish withdrawal from unavailable consent"
+            );
+        }
     }
 
     #[test]
