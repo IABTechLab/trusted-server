@@ -465,18 +465,23 @@ curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
 
 **Causes & Solutions:**
 
-**Wrong payload encoding:**
+**Payload is not exactly what was signed:**
+
+Send the signed message itself, not an encoding of it. The service verifies the
+UTF-8 bytes of `payload` as received, so base64-encoding it, or dropping a trailing
+newline, makes a valid signature fail. The signature may be base64url, as Trusted
+Server signs, or standard base64.
 
 ```bash
-# Ensure base64 encoding (not base64url)
-echo -n "Hello World" | base64
+ts keys verify --service https://edge.example.com \
+  --kid ts-2025-01-A --payload 'Hello World' --signature '<signature>'
 ```
 
 **Wrong key ID:**
 
 ```bash
-# Check current key ID
-curl https://edge.example.com/.well-known/trusted-server.json | jq '.jwks.keys[].kid'
+# List the published key IDs
+ts keys list --service https://edge.example.com
 ```
 
 **Signature from wrong key:**

@@ -32,22 +32,7 @@ fn request_body(args: &PurgeArgs) -> CliResult<String> {
 
 /// Join the service base URL and the purge path without doubling or dropping a slash.
 fn purge_endpoint(service: &str) -> CliResult<String> {
-    let mut url =
-        reqwest::Url::parse(service).map_err(|_| "--service must be an absolute HTTPS URL")?;
-    crate::url_guard::require_credential_safe_transport(&url, "--service")?;
-    if url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !url.path().trim_matches('/').is_empty()
-    {
-        return cli_error(
-            "--service must be a base HTTPS URL without credentials, a path, query, or fragment",
-        );
-    }
-    url.set_path(PURGE_PATH);
-    Ok(url.to_string())
+    crate::url_guard::service_endpoint(service, PURGE_PATH)
 }
 
 /// The acknowledgment returned by the purge endpoint.

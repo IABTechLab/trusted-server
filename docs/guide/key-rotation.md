@@ -196,10 +196,10 @@ Verify your setup is correct:
 fastly compute serve
 
 # Check that stores are accessible
-curl http://localhost:7676/.well-known/trusted-server.json
+ts keys list --service http://localhost:7676
 ```
 
-You should see a JWKS response with your public keys.
+You should see one line per active public key.
 
 ## Key Rotation Process
 
@@ -299,6 +299,39 @@ curl -X POST https://your-domain/_ts/admin/keys/rotate \
   "jwk": { ... }
 }
 ```
+
+### Confirm the New Key Is Published
+
+Before deactivating the previous key, confirm the new key appears in the service's
+discovery document (`/.well-known/trusted-server.json`). `ts keys list` fetches it and
+prints each active kid with its key type and curve; it needs no admin password:
+
+```bash
+ts keys list --service https://edge.example.com
+```
+
+```
+ts-2024-01-15	OKP	Ed25519
+ts-2024-02-15	OKP	Ed25519
+```
+
+Pass `--json` to print the discovery document exactly as the service returned it. To
+check a signature end to end against the new key, use `ts keys verify`:
+
+```bash
+ts keys verify --service https://edge.example.com \
+  --kid ts-2024-02-15 --payload '<payload>' --signature '<signature>'
+```
+
+It exits `0` when the service reports that the signature verified, `1` when the service
+reports that it did not (an unknown kid reports this way too), and `2` when the check
+could not be made, for example because the service was unreachable or answered with an
+error status. The service checks the key stored under the kid whether or not that kid is
+still active, so a deactivated key that was kept in storage still verifies. Use
+`ts keys list` to see which keys partners can fetch.
+
+Both commands require HTTPS, with plain HTTP allowed only for loopback development
+services.
 
 ### Using the Rust API
 
@@ -591,8 +624,8 @@ Document your rotation:
 Test rotation in staging first:
 
 - Verify new key generation
-- Test signature verification
-- Validate JWKS endpoint
+- Test signature verification with `ts keys verify`
+- Validate the JWKS endpoint with `ts keys list`
 - Check partner integrations
 
 ## Troubleshooting
@@ -629,14 +662,15 @@ Test rotation in staging first:
 **Solutions**:
 
 - Verify old key is still in active-kids
-- Check JWKS endpoint includes old key
+- Check the old key is still published with `ts keys list --service https://edge.example.com`
 - Wait for partner caches to update
 
 ### Key Not in JWKS
 
 **Symptoms**:
 
-- New key missing from `.well-known/trusted-server.json`
+- New key missing from `.well-known/trusted-server.json` (check with
+  `ts keys list --service https://edge.example.com`)
 
 **Solutions**:
 
