@@ -1015,7 +1015,7 @@ The auction preview validates the stored record and partner configuration, but c
 `ts ec show` checks the EC ID format before sending anything, then prints the
 tombstone state, the auction EIDs, and each skipped partner ID with its reason.
 `--json` prints the full response unchanged. A `404` is reported as no record for
-the EC ID, and a `501` as a deployment without an identity graph. The bare
+the EC ID, or a service that may predate the EC lookup endpoint, and a `501` as a deployment without an identity graph. The bare
 `/_ts/admin/ec` route has no command; pass the `ts-ec` cookie's value to
 `ts ec show` instead.
 

@@ -80,8 +80,9 @@ The endpoint-joining and URL-rejection unit tests move with the code they test.
 3. On a non-success status, exits non-zero with the status, a hint and the
    server's `error` text:
    - `401`: the shared hint naming the username and the environment variable.
-   - `404`: "no record for this EC ID". The server's own text adds that KV reads
-     are eventually consistent.
+   - `404`: "no record for this EC ID, or this service may predate the EC
+     lookup endpoint". The server's own text tells the two apart, and adds that KV
+     reads are eventually consistent.
    - `501`: the deployment has no EC identity graph; only the Fastly adapter
      holds one, and only when an EC store is configured. Fastly answers `501`
      too when `ec.ec_store` is unset.
