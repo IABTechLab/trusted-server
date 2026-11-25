@@ -1,11 +1,12 @@
 //! Work the Fastly entry point runs after a response is delivered.
 //!
 //! [`run_post_delivery`] sends the request's queued auction telemetry, then
-//! runs EC pull sync. Telemetry goes first because its requests are short,
-//! while a pull-sync group can take its whole cutoff. Both run only after a
-//! committed application body (see [`crate::delivery`]).
+//! runs EC pull sync, then the navigation's after-response identity lookups.
+//! Telemetry goes first because its requests are short, while a pull-sync
+//! group can take its whole cutoff. All of them run only after a committed
+//! application body (see [`crate::delivery`]).
 //!
-//! Both use a fresh `EdgeZero` client and clock, because the request's client
+//! They use a fresh `EdgeZero` client and clock, because the request's client
 //! went away with the request. They run under
 //! [`futures::executor::block_on`] inside the serving callback, after
 //! `send_request_with_registries_and_hooks` returned. That is the only safe
@@ -15,12 +16,21 @@
 //! extends only the sandbox's lifetime.
 
 use std::fmt;
+use std::sync::Arc;
 
 use edgezero_adapter_fastly::outbound::FastlyOutboundClient;
 use edgezero_core::outbound::HttpClient;
 use edgezero_core::time::MonotonicClock;
 use error_stack::Report;
+use trusted_server_core::ec::after_response::{
+    after_response_lookups_allowed, commit_after_response_lookups,
+};
+use trusted_server_core::ec::coordinator::transport::OutboundLookupTransport;
+use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupContext};
+use trusted_server_core::ec::current_timestamp;
+use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::provider::ClientSignals;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
@@ -28,18 +38,21 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::settings::Settings;
 
-use crate::app::EcFinalizeState;
+use crate::app::{AfterResponseLookups, EcFinalizeState};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use crate::require_identity_graph;
 use crate::tinybird::{TelemetryQueue, send_queued_batches};
+use crate::{maybe_identity_graph, require_identity_graph};
 
-/// Pull-sync inputs a routed response's finalize step hands to post-delivery work.
+/// Inputs a routed response's finalize step hands to post-delivery work.
 pub(crate) struct FinalizeState {
-    pub(crate) partner_registry: PartnerRegistry,
+    pub(crate) partner_registry: Arc<PartnerRegistry>,
     pub(crate) ec_state: EcFinalizeState,
+    /// The navigation's after-response identity lookups, if any.
+    pub(crate) after_response: Option<AfterResponseLookups>,
 }
 
-/// Sends the queued telemetry, then runs pull sync for `state`, on a fresh client and clock.
+/// Sends the queued telemetry, then runs pull sync and after-response lookups
+/// for `state`, on a fresh client and clock.
 ///
 /// `log_context` ends each failure log, so it matches the delivered response.
 pub(crate) fn run_post_delivery(
@@ -67,7 +80,8 @@ fn post_delivery_client() -> HttpClient {
     HttpClient::with_client(FastlyOutboundClient::new()).with_proxy_marker(false)
 }
 
-/// The post-delivery work itself, on `client` and `clock`: telemetry, then pull sync.
+/// The post-delivery work itself, on `client` and `clock`: telemetry, pull
+/// sync, then after-response lookups.
 async fn post_delivery_work(
     state: Option<FinalizeState>,
     queue: &TelemetryQueue,
@@ -78,27 +92,45 @@ async fn post_delivery_work(
 ) {
     send_queued_batches(client, &settings.tinybird, queue, log_context).await;
     if let Some(state) = state {
-        pull_sync(state, settings, client, clock, log_context).await;
+        let FinalizeState {
+            partner_registry,
+            mut ec_state,
+            after_response,
+        } = state;
+        pull_sync(
+            &partner_registry,
+            &ec_state,
+            settings,
+            client,
+            clock,
+            log_context,
+        )
+        .await;
+        run_after_response_lookups(
+            &mut ec_state,
+            after_response,
+            &partner_registry,
+            settings,
+            client,
+        )
+        .await;
     }
 }
 
 /// Runs pull sync for a real browser whose EC state still has partners to fill.
 async fn pull_sync(
-    state: FinalizeState,
+    partner_registry: &PartnerRegistry,
+    ec_state: &EcFinalizeState,
     settings: &Settings,
     client: &HttpClient,
     clock: &MonotonicClock,
     log_context: &dyn fmt::Display,
 ) {
-    let FinalizeState {
-        partner_registry,
-        ec_state,
-    } = state;
     if !ec_state.is_real_browser {
         return;
     }
 
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, &partner_registry);
+    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
     let Some((context, kv)) = prepare_pull_sync_after_send(
         prepared_context,
         || require_identity_graph(settings),
@@ -111,13 +143,82 @@ async fn pull_sync(
     dispatch_pull_sync(
         settings,
         &kv,
-        &partner_registry,
+        partner_registry,
         &limiter,
         &context,
         client,
         clock,
     )
     .await;
+}
+
+/// Runs after-response identity lookups and applies their follow-up write.
+///
+/// Runs once the response has been delivered, so provider latency never
+/// delays the page. Skipped unless finalize confirmed the navigation (it
+/// issues the follow-up permit) and the EC is still the one the lookups were
+/// prepared for. Lookups go out on the post-delivery `client`.
+pub(crate) async fn run_after_response_lookups(
+    ec_state: &mut EcFinalizeState,
+    lookups: Option<AfterResponseLookups>,
+    partner_registry: &PartnerRegistry,
+    settings: &Settings,
+    client: &HttpClient,
+) {
+    let Some(lookups) = lookups else {
+        return;
+    };
+    let Some(permit) = ec_state.ec_context.take_after_response_permit() else {
+        log::debug!(
+            "After-response lookups skipped: no permit (consent, redirect or failed page-load write)"
+        );
+        return;
+    };
+    if ec_state.ec_context.ec_value() != Some(lookups.ec_id.as_str()) {
+        log::debug!("After-response lookups skipped: EC changed during the request");
+        return;
+    }
+    let Some(graph) = maybe_identity_graph(settings) else {
+        return;
+    };
+    let snapshot = graph.load_snapshot(&lookups.ec_id).await;
+    if !after_response_lookups_allowed(
+        &snapshot,
+        &lookups.ec_id,
+        ec_state.ec_context.ec_generated(),
+    ) {
+        log::debug!("After-response lookups skipped: new EC or no live row");
+        return;
+    }
+    let transport = OutboundLookupTransport::new(client);
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    let pending = lookups
+        .coordinator
+        .dispatch(
+            &transport,
+            &LookupContext {
+                ec_id: &lookups.ec_id,
+                snapshot: &snapshot,
+                minted_entry: None,
+                consent: ec_state.ec_context.consent(),
+                client: ClientSignals {
+                    ip: lookups.client_ip,
+                    user_agent: lookups.user_agent.as_deref(),
+                },
+                publisher_domain: &settings.publisher.domain,
+                rate_limiter: &limiter,
+                now: UnixSeconds::new(current_timestamp()),
+            },
+        )
+        .await;
+    if pending.is_empty() {
+        return;
+    }
+    let results = lookups.coordinator.collect(&transport, pending).await;
+    let outcome =
+        commit_after_response_lookups(&graph, permit, partner_registry, &lookups.ec_id, &results)
+            .await;
+    log::info!("After-response lookups: write outcome={outcome}");
 }
 
 /// Opens the identity graph only when there is a pull-sync context to run.
@@ -387,8 +488,10 @@ mod tests {
             kv.load_snapshot(&seeded_ec_id()),
         ));
         FinalizeState {
-            partner_registry: PartnerRegistry::from_config(&settings.ec.partners)
-                .expect("should build the partner registry"),
+            partner_registry: Arc::new(
+                PartnerRegistry::from_config(&settings.ec.partners)
+                    .expect("should build the partner registry"),
+            ),
             ec_state: EcFinalizeState {
                 ec_context,
                 use_finalize_kv: false,
@@ -396,6 +499,7 @@ mod tests {
                 sharedid_cookie: None,
                 is_real_browser: true,
             },
+            after_response: None,
         }
     }
 

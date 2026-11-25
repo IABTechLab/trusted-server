@@ -7135,6 +7135,7 @@ dependencies = [
  "serde_json",
  "toml",
  "trusted-server-core",
+ "trusted-server-identity-providers",
  "urlencoding",
 ]
 
@@ -7261,6 +7262,15 @@ dependencies = [
  "uuid",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-identity-providers"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "toml",
+ "trusted-server-core",
 ]
 
 [[package]]
