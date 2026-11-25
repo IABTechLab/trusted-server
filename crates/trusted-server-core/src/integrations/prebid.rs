@@ -523,10 +523,24 @@ pub struct PrebidBundleModulesConfig {
     pub analytics: Option<Vec<String>>,
 }
 
+/// Browser behavior installed by the Prebid integration.
+#[derive(Debug, Default, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrebidMode {
+    /// Install the Trusted Server bidder and publisher auction integration.
+    #[default]
+    Auction,
+    /// Capture native IDs and merge the server mirror into publisher auctions.
+    Identity,
+}
+
 /// Browser-only Prebid integration settings.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidIntegrationConfig {
+    /// Browser integration mode; defaults to [`PrebidMode::Auction`].
+    #[serde(default)]
+    pub mode: PrebidMode,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -573,6 +587,7 @@ pub struct PrebidIntegrationConfig {
 impl Default for PrebidIntegrationConfig {
     fn default() -> Self {
         Self {
+            mode: PrebidMode::default(),
             enabled: default_enabled(),
             account_id: None,
             timeout_ms: default_timeout_ms(),
@@ -599,6 +614,7 @@ impl IntegrationConfig for PrebidIntegrationConfig {
 impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
     fn from(config: &LegacyPrebidServerConfig) -> Self {
         Self {
+            mode: PrebidMode::default(),
             enabled: config.enabled,
             account_id: config.account_id.clone(),
             timeout_ms: config.timeout_ms,
@@ -1574,6 +1590,7 @@ impl<'a> From<&'a PrebidManagedUserIdConfig> for InjectedManagedUserId<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InjectedPrebidClientConfig<'a> {
+    mode: PrebidMode,
     account_id: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     managed_user_ids: Vec<InjectedManagedUserId<'a>>,
@@ -1592,6 +1609,7 @@ struct InjectedPrebidClientConfig<'a> {
 impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
     fn from(config: &'a PrebidIntegrationConfig) -> Self {
         Self {
+            mode: config.mode,
             account_id: config.account_id.as_deref().unwrap_or_default(),
             managed_user_ids: config
                 .managed_user_ids
@@ -5404,6 +5422,33 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn browser_mode_defaults_and_validates() {
+        let config: PrebidIntegrationConfig =
+            serde_json::from_value(json!({})).expect("should parse default browser config");
+        assert_eq!(
+            config.mode,
+            PrebidMode::Auction,
+            "should default to auction mode"
+        );
+        let config: PrebidIntegrationConfig = serde_json::from_value(json!({"mode": "identity"}))
+            .expect("should parse identity mode");
+        assert_eq!(
+            config.mode,
+            PrebidMode::Identity,
+            "should select identity mode"
+        );
+        assert!(
+            serde_json::from_value::<PrebidIntegrationConfig>(json!({"mode": "other"})).is_err(),
+            "should reject an unknown mode"
+        );
+        let payload = serialize_injected_prebid_config(&InjectedPrebidClientConfig::from(&config));
+        assert!(
+            payload.contains(r#""mode":"identity""#),
+            "should inject identity mode"
+        );
+    }
+
+    #[test]
     fn head_injector_emits_config_script() {
         let integration = PrebidIntegration::new(base_config());
         let document_state = IntegrationDocumentState::default();
@@ -5589,6 +5634,7 @@ external_bundle_sri = "sha384-AAAA"
         let integration = PrebidIntegration::new(base_config());
         let mut browser_config = PrebidIntegrationConfig::default();
         browser_config.account_id = Some("browser-account".to_string());
+        browser_config.mode = PrebidMode::Identity;
         browser_config.timeout_ms = 1750;
         browser_config.debug = false;
         let plan = AuctionPlan::compile(AuctionPlanConfig {
@@ -5648,6 +5694,10 @@ external_bundle_sri = "sha384-AAAA"
         let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
         let script = &inserts[0];
 
+        assert!(
+            script.contains(r#""mode":"identity""#),
+            "should inject planned browser mode"
+        );
         assert!(script.contains(r#""timeout":1750,"debug":false"#));
         assert!(
             script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),
