@@ -1,7 +1,7 @@
 # Native prepared startup
 
 The native adapter uses the workspace EdgeZero pin,
-`9d02d7b3185b49e81d9ac972ca3feef932ed848a` on EdgeZero's `rc/identity`
+`d063a8e7f83f691186ab6010ac36893c48c14212` on EdgeZero's `rc/identity`
 branch; see [the pinned version](./edgezero#pinned-version). It retains PR
 #1506's direct outbound API and current-main application behavior. Historical
 demo results do not qualify this combination.
