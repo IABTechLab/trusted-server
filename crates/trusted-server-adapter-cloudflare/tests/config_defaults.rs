@@ -36,3 +36,25 @@ fn wrangler_placeholder_uses_the_runtime_blob_key() {
         "placeholder should use the runtime key and remain invalid until seeded"
     );
 }
+
+#[test]
+fn runtime_kv_binding_matches_both_wrangler_manifests() {
+    for (name, raw) in [
+        ("wrangler.toml", include_str!("../wrangler.toml")),
+        ("wrangler.ci.toml", include_str!("../wrangler.ci.toml")),
+    ] {
+        let manifest: toml::Value =
+            toml::from_str(raw).expect("should parse the Wrangler manifest");
+        let bindings = manifest["kv_namespaces"]
+            .as_array()
+            .expect("should declare KV namespaces")
+            .iter()
+            .filter_map(|namespace| namespace["binding"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            bindings.contains(&trusted_server_adapter_cloudflare::platform::CLOUDFLARE_KV_BINDING),
+            "{name} should bind the namespace the Worker opens as runtime KV, found {bindings:?}"
+        );
+    }
+}

@@ -498,7 +498,7 @@ async function launch(label, originEndpoint, proxyEndpoint) {
     AWS_REGION: 'us-east-1',
     AWS_DEFAULT_REGION: 'us-east-1',
     TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE: `${root}/native-geo.toml`,
-    TS_EC_RECORDS_ENABLED: 'true',
+    TRUSTED_SERVER__EC_RECORDS_ENABLED: 'true',
     EDGEZERO__STORE_BINDINGS_FILE: `${root}/native-bindings.toml`,
     TMPDIR: opt.binary ? tmpdir() : '/tmp',
     EDGEZERO__ADAPTER__CONFIG_DIR: root,

@@ -235,7 +235,7 @@ registration or `transport` if the handshake fails.
 **Solution:**
 
 - Verify the provider endpoint is HTTPS, reachable from the edge, and serves a
-  valid certificate; origin TLS is always verified
+  valid certificate; TLS is always verified
 - For an `outbound client identity` reason, fix the entry it names; see
   [Provider mTLS](./auction-orchestration.md#provider-mtls)
 - Read the outbound status and kind in the warning's report, and its
@@ -738,7 +738,7 @@ Warning: viceroy version mismatch
 **Solution:**
 
 ```bash
-cargo install viceroy --version 0.21.0 --locked --force
+cargo install viceroy --version 0.22.0 --locked --force
 ```
 
 ---

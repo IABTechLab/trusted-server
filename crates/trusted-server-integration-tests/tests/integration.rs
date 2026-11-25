@@ -2506,6 +2506,172 @@ fn with_spin_ingress(status: u16, check: impl FnOnce(&str, &RecordingOrigin)) {
     OriginRuntime::Spin.serve(&envelope, |base_url| check(base_url, &origin));
 }
 
+/// Spin serves request-time config, including request-signing metadata, from
+/// the `default` label startup reads. Before that wiring, discovery answered
+/// 500 because every request-time config read failed.
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_discovery_reads_signing_metadata_from_default() {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the integration app config");
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "example-kid-a",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw",
+    })
+    .to_string();
+    let default_entries = [
+        ("current-kid", "example-kid-a"),
+        ("active-kids", "example-kid-a"),
+        ("example-kid-a", jwk.as_str()),
+    ];
+
+    common::trace_boundary::with_spin_runtime(
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        &default_entries,
+        &[],
+        |base_url| {
+            let response =
+                reqwest::blocking::get(format!("{base_url}/.well-known/trusted-server.json"))
+                    .expect("should request the discovery document");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "Spin discovery should read signing metadata from `default`"
+            );
+            let document: serde_json::Value = response
+                .json()
+                .expect("should return a JSON discovery document");
+            assert_eq!(
+                document["jwks"]["keys"][0]["kid"],
+                serde_json::json!("example-kid-a"),
+                "discovery should publish the active key seeded in `default`: {document}"
+            );
+        },
+    );
+}
+
+/// Spin signs an outbound auction request at request time: the signing
+/// metadata comes from the `default` label and the private key from its
+/// encoded component variable. The key pair is the public development fixture
+/// that `fastly.toml` also uses.
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn spin_runtime_signs_auction_requests_with_an_encoded_private_key() {
+    init_logger();
+    let _port = lock_origin_port();
+    let _origin = RecordingOrigin::start(origin_port(), 200);
+    let bidder = start_loopback_bidder("signed-seat", 1.0, Duration::ZERO);
+    let envelope = common::config::auction_app_config_envelope(
+        origin_port(),
+        &loopback_bidder_fixtures(&[("signed-bidder", &bidder, Duration::from_millis(800))]),
+        1000,
+    )
+    .expect("should build the auction config");
+    let envelope = common::config::envelope_with_request_signing(&envelope)
+        .expect("should enable request signing");
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "ts-2025-10-A",
+        "use": "sig",
+        "x": "UVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw",
+    })
+    .to_string();
+    let default_entries = [
+        ("current-kid", "ts-2025-10-A"),
+        ("active-kids", "ts-2025-10-A"),
+        ("ts-2025-10-A", jwk.as_str()),
+    ];
+    // Store `signing_keys` and key `ts-2025-10-A`, encoded as Spin requires.
+    let private_key = [(
+        "v_signing_x5fkeys_v_ts_x2d2025_x2d10_x2d_x41",
+        "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k=",
+    )];
+
+    common::trace_boundary::with_spin_runtime(
+        &envelope,
+        Some("http://127.0.0.1:*"),
+        &default_entries,
+        &private_key,
+        |base_url| {
+            let response = post_auction(base_url);
+            let requests = bidder.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "the bidder should receive one auction request: {response}"
+            );
+            let request = requests.first().expect("should record the bidder request");
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("should send an OpenRTB JSON request");
+            let trusted_server = &body["ext"]["trusted_server"];
+            assert_eq!(
+                trusted_server["kid"],
+                serde_json::json!("ts-2025-10-A"),
+                "Spin should sign with the current kid from `default`: {body}"
+            );
+            assert!(
+                trusted_server["signature"]
+                    .as_str()
+                    .is_some_and(|signature| !signature.is_empty()),
+                "Spin should sign with the private key variable: {body}"
+            );
+            let params = trusted_server_core::request_signing::SigningParams {
+                request_id: body["id"]
+                    .as_str()
+                    .expect("should send request id")
+                    .to_owned(),
+                request_host: trusted_server["request_host"]
+                    .as_str()
+                    .expect("should bind request host")
+                    .to_owned(),
+                request_scheme: trusted_server["request_scheme"]
+                    .as_str()
+                    .expect("should bind request scheme")
+                    .to_owned(),
+                timestamp: trusted_server["ts"]
+                    .as_u64()
+                    .expect("should bind timestamp"),
+            };
+            let payload = params
+                .build_payload("ts-2025-10-A")
+                .expect("should reconstruct the signed payload");
+            let client = reqwest::blocking::Client::new();
+            for (payload, expected) in [(payload.as_str(), true), ("tampered-payload", false)] {
+                let response = client
+                    .post(format!("{base_url}/verify-signature"))
+                    .json(&serde_json::json!({
+                        "kid": "ts-2025-10-A",
+                        "payload": payload,
+                        "signature": trusted_server["signature"],
+                    }))
+                    .send()
+                    .expect("should verify the captured auction signature");
+                assert_eq!(
+                    response.status().as_u16(),
+                    200,
+                    "should answer verification"
+                );
+                let verified: serde_json::Value = response
+                    .json()
+                    .expect("should decode signature verification");
+                assert_eq!(
+                    verified["verified"],
+                    serde_json::json!(expected),
+                    "should verify only the authentic payload against the JWK in default"
+                );
+            }
+        },
+    );
+}
+
 #[test]
 #[ignore = "requires Spin and the current production Spin WASM artifact"]
 fn spin_runtime_post_auction_with_json_body() {

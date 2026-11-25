@@ -786,3 +786,49 @@ fn config_validate_and_push_reject_unknown_integration_ids_and_fields() {
         }
     }
 }
+
+#[test]
+fn identity_endpoint_typed_validation_and_push_share_effective_overlay() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["proxy"]["identity_endpoints"]["0"] = toml_edit::table();
+    for (key, raw) in [
+        ("id", "measurement"),
+        ("origin", "https://measurement.example.com"),
+        ("path_exact", "/event"),
+    ] {
+        document["proxy"]["identity_endpoints"]["0"][key] = value(raw);
+    }
+    fs::write(&project.config_path, document.to_string()).expect("should seed endpoint leaves");
+    let overlay = "TRUSTED_SERVER__PROXY__IDENTITY_ENDPOINTS__0__PATH_EXACT";
+    let pushed = pushed_config_with_env(&project, overlay, "/overlay");
+    assert_eq!(
+        pushed["proxy"]["identity_endpoints"][0]["path_exact"], "/overlay",
+        "should publish validated effective endpoint overlay"
+    );
+    for operation in ["validate", "push"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ts"));
+        command
+            .args(["config", operation, "--manifest"])
+            .arg(&project.manifest_path)
+            .arg("--app-config")
+            .arg(&project.config_path)
+            .current_dir(project.directory.path())
+            .env(overlay, "invalid-path");
+        if operation == "push" {
+            command.args(["--adapter", "axum", "--yes", "--no-diff"]);
+        }
+        let output = command.output().expect("should run typed config command");
+        assert!(
+            !output.status.success(),
+            "should reject invalid endpoint during {operation}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("identity_endpoints"),
+            "should identify endpoint validation failure"
+        );
+    }
+}

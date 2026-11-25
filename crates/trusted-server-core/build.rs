@@ -2,6 +2,8 @@
 //! config store ID, the template build digest, and the deployed git version
 //! (`TRUSTED_SERVER__GIT_VERSION`).
 
+// Build inputs are outside the serving runtime environment policy.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![allow(
     clippy::print_stdout,
     reason = "Cargo build scripts communicate rebuild inputs on stdout"

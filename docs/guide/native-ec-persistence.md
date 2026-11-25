@@ -22,7 +22,7 @@ flowchart TD
 
 ## Select the prepared binding
 
-Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TS_EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
+Build with `aws-dynamodb-ec` or `celld-ec` for the corresponding default-off EdgeZero connector. Set `TRUSTED_SERVER__EC_RECORDS_ENABLED=true` at native boot to declare EC placement before provider preparation. This is a layout declaration, not a provider connection selector. Absence or `false` keeps that declaration off; malformed values fail startup.
 
 Published application config selects the logical prepared store, not an endpoint or credentials:
 
@@ -32,7 +32,7 @@ provider = "records"
 store = "trusted_server_kv"
 ```
 
-A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TS_EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+A configured record reference must already have the declared layout and capability before initialization. A missing declaration or raw binding is an error, not permission to construct a provider late. Legacy `TRUSTED_SERVER__EC_DYNAMODB_ENABLED` selection is rejected with migration guidance. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 
@@ -52,7 +52,7 @@ For celld, use the same logical ID with `provider = "celld-records"`, its endpoi
 
 Region, table, namespace, credentials and endpoint behavior belong to EdgeZero's binding/provider configuration. The old `TS_EC_DYNAMODB_REGION`, `TS_EC_DYNAMODB_TABLE`, `TS_EC_DYNAMODB_NAMESPACE` and `TS_EC_DYNAMODB_LOCAL_ENDPOINT` do not configure another TS-owned provider. Tests use an explicitly isolated DynamoDB Local process with dummy credentials. No hosted IAM or deployment qualification is implied.
 
-Fastly uses the same shared adapter and the logical `trusted_server_kv` declaration. Its compatibility `ec_store`/`provider="fastly"` references name logical IDs, not arbitrary physical store names. The application rejects undeclared IDs at startup. Request handling, response finalization and separately gated post-delivery pull sync retain the prepared handle; none reopens a store from settings. Link the desired physical Fastly store under that logical ID through the normal deployment workflow; these changes do not perform that operation.
+Fastly uses the same shared record adapter. Its `ec_store`, `[ec.storage] store` and `provider="fastly"` values name a KV store's resource link on the Fastly service. That can be the logical `trusted_server_kv` link the deployment workflow creates or an existing link such as `ec_id_store`. Trusted Server opens the store on the first EC operation and keeps it for the sandbox, so a missing link fails EC work, not startup. Request handling, response finalization and separately gated post-delivery pull sync share that handle.
 
 ## Key placement and generation lifetime
 
