@@ -5964,6 +5964,39 @@ mod tests {
     }
 
     #[test]
+    fn handle_asset_proxy_request_omits_publisher_origin_client_ip_header() {
+        let (_clock, client, services) = scripted_services();
+        let services = RuntimeServices {
+            client_info: crate::platform::ClientInfo {
+                client_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7))),
+                ..Default::default()
+            },
+            ..services
+        };
+        client.respond_to(
+            Method::GET,
+            "https://assets.example.com/.images/foo.jpg",
+            ScriptedReply::status(StatusCode::OK).body("ok"),
+        );
+        let mut settings = create_test_settings();
+        settings.publisher.origin_client_ip_header = Some("fastly-client-ip".to_owned());
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+        futures::executor::block_on(handle_asset_proxy_request(
+            &settings, &services, req, &route,
+        ))
+        .expect("should proxy asset request");
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one asset request");
+        assert!(
+            !requests[0].headers.contains_key("fastly-client-ip"),
+            "should keep the publisher-origin client IP header off asset proxy requests"
+        );
+    }
+
+    #[test]
     fn asset_proxy_get_request_readback() {
         let (_clock, client, services) = scripted_services();
         client.respond_to(
