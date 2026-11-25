@@ -161,6 +161,8 @@ pub(crate) async fn run_after_response_lookups(
                 client: ClientSignals {
                     ip: lookups.client_ip,
                     user_agent: lookups.user_agent.as_deref(),
+                    referer: lookups.referer.as_deref(),
+                    accept_language: lookups.accept_language.as_deref(),
                 },
                 publisher_domain: &settings.publisher.domain,
                 cookies: RequestCookies::new(&lookups.cookie_header),
@@ -464,6 +466,8 @@ mod tests {
             ec_id: seeded_ec_id(),
             client_ip: None,
             user_agent: None,
+            referer: None,
+            accept_language: None,
             cookie_header: String::new(),
         });
         state
