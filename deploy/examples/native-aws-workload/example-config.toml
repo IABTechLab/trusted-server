@@ -1,0 +1,37 @@
+# Fictional EC-only publisher-proxy configuration. Review for your publisher.
+# Generate the AppConfig BlobEnvelope with the existing TS CLI, not Terraform.
+[publisher]
+domain = "publisher.example.com"
+origin_url = "https://origin.publisher.example.com"
+cookie_domain = ".publisher.example.com"
+proxy_secret = "publisher_proxy_secret"
+
+[ec]
+passphrase = "ec_passphrase"
+
+# Logical reference only. The retained ec_storage output goes to native bindings.
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+
+# Rust regex has no negative lookahead. These alternatives match every path
+# beginning '/' EXCEPT the exact '/health'. Review and test the actual policy;
+# the health handler is a native readiness route, not an ALB 401 exception.
+[[handlers]]
+path = '^/(?:$|[^h]|h(?:$|[^e])|he(?:$|[^a])|hea(?:$|[^l])|heal(?:$|[^t])|healt(?:$|[^h])|health.)'
+username = "reviewer"
+password = "handler_password"
+
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "browser_forwarder_secret"
+
+[integrations.sourcepoint]
+enabled = true
+rewrite_sdk = false
+
+[auction]
+enabled = false
+
+[integrations.prebid]
+enabled = false
