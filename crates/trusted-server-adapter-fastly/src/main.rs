@@ -16,18 +16,23 @@ use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::checked_current_timestamp;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
+use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::health::{
+    OperationalResponse, Probe, StartupState, classify_probe, probe_response,
+    startup_unavailable_response,
+};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::ClientInfo;
 use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
-use trusted_server_core::version_header::git_version_header_value;
 
 mod app;
 mod compat;
@@ -36,10 +41,14 @@ mod deadline_network;
 mod delivery;
 mod ec_record_store;
 mod esi_assembly;
+#[cfg(test)]
+mod identity_conformance;
 mod management_api;
 mod middleware;
 mod platform;
 mod post_delivery;
+#[cfg(test)]
+mod proxy_policy_runtime;
 mod rate_limiter;
 mod sandbox;
 mod template_cache;
@@ -67,16 +76,28 @@ use crate::tinybird::TelemetryQueue;
 use crate::sandbox::RetirementCounters;
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        let mut response = FastlyResponse::from_status(200).with_body_text_plain("ok");
-        // Compiled-in constant: keeps the probe free of settings and app construction.
-        if let Some(version) = git_version_header_value() {
-            response.set_header(HEADER_X_TS_VERSION, version);
-        }
-        return Some(response);
-    }
+    (classify_probe(req.get_method(), req.get_path()) == Some(Probe::Liveness)).then(|| {
+        native_operational_response(&probe_response(
+            req.get_method(),
+            Probe::Liveness,
+            StartupState::Ready,
+        ))
+    })
+}
 
-    None
+/// Converts a fixed operational response into the SDK response that sends it natively.
+///
+/// Operational responses never reach `EdgeZero`'s egress, so their contract
+/// headers and fixed body bytes are copied as they are. They never stream.
+fn native_operational_response(response: &HttpResponse) -> FastlyResponse {
+    let mut native = FastlyResponse::from_status(response.status().as_u16());
+    for (name, value) in response.headers() {
+        native.append_header(name.as_str(), value.as_bytes());
+    }
+    if let Some(body) = response.body().as_bytes().filter(|body| !body.is_empty()) {
+        native.set_body(body.to_vec());
+    }
+    native
 }
 
 /// Entry point for the Fastly Compute program.
@@ -186,6 +207,8 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
 /// the sandbox's retained app and sent through `EdgeZero`, which owns the
 /// response; [`handle_delivery`] then decides whether anything is left to do,
 /// and [`log_outbound_observation`] logs the request's backend registrations.
+/// Readiness, and a failed assembly on a publisher fallback method, are
+/// answered natively by [`initialize_dispatch`] instead.
 ///
 /// Every non-panicking path through this function must answer exactly once.
 /// In a reused sandbox the SDK refuses to wait for the next request until the
@@ -269,13 +292,20 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // counters short-circuits, so none of those pays for construction.
     // `initialize` retains only success and returns the error unchanged, so a
     // transient config-store failure answers this request and the next
-    // callback retries assembly.
-    let assembled = sandbox.initialize(|| {
+    // callback retries assembly. Readiness and a failed assembly on a
+    // supported method answer with fixed operational responses instead.
+    let assembled = match initialize_dispatch(sandbox, req.get_method(), req.get_path(), || {
         assemble_app(
             load_settings_from_config_store(&RuntimeStoreConfig::logical()),
             &LogContext::new(ordinal, &request_id),
         )
-    });
+    }) {
+        ApplicationDispatch::Operational(response) => {
+            native_operational_response(&response).send_to_client();
+            return;
+        }
+        ApplicationDispatch::Ordinary(assembled) => assembled,
+    };
     let counters = SandboxCounters::capture(sandbox, ordinal, &request_id);
     match assembled.and_then(|()| retained_app(sandbox)) {
         Ok(retained) => serve(req, retained, &counters, trace_path),
@@ -350,16 +380,26 @@ fn serve(
         geo: request_geo.geo(),
         counters,
     };
-    let delivery = send_request_with_registries_and_hooks(
-        &retained.app,
-        TrustedServerApp::stores(),
-        req,
-        prepare,
-        |response: &mut HttpResponse| finalize_response(response, &inputs),
-    );
+    let delivery = with_finalization(&inputs, |finalize| {
+        send_request_with_registries_and_hooks(
+            &retained.app,
+            TrustedServerApp::stores(),
+            req,
+            prepare,
+            finalize,
+        )
+    });
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
+}
+
+/// Supplies the production finalization callback to a request lifecycle.
+fn with_finalization<T>(
+    inputs: &FinalizeInputs<'_>,
+    send: impl FnOnce(&mut dyn FnMut(&mut HttpResponse) -> Option<FinalizeState>) -> T,
+) -> T {
+    send(&mut |response| finalize_response(response, inputs))
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
@@ -483,11 +523,13 @@ fn finalize_response(
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
     let settings = inputs.state.settings.as_ref();
-    // Trace responses keep their exact hardened headers; no finalizer touches them.
+    // Trace and operational responses keep their exact hardened headers; no
+    // finalizer touches them.
     if response
         .extensions()
         .get::<TraceTerminalResponse>()
         .is_some()
+        || response.extensions().get::<OperationalResponse>().is_some()
     {
         return None;
     }
@@ -529,6 +571,44 @@ fn finalize_response(
         attach_sandbox_counters(response, inputs.counters);
     }
     state
+}
+
+/// What the entry point does with a request once initialization has run.
+enum ApplicationDispatch {
+    /// A fixed operational response, sent natively without the application.
+    Operational(HttpResponse),
+    /// Ordinary handling, with the initialization result.
+    Ordinary(Result<(), EdgeError>),
+}
+
+/// Initializes the sandbox's application, then answers readiness and failed startup locally.
+///
+/// `GET` and `HEAD` `/ready` report whether this sandbox now retains an
+/// application and never dispatch. A failed initialization answers every
+/// publisher fallback method with the fixed unavailable response, whatever the
+/// error's status; other methods keep `EdgeZero`'s assembly-error response.
+/// `initialize` still discards the failure, so the next callback retries.
+fn initialize_dispatch(
+    sandbox: &mut Sandbox,
+    method: &edgezero_core::http::Method,
+    path: &str,
+    build: impl FnOnce() -> Result<RetainedApp, EdgeError>,
+) -> ApplicationDispatch {
+    let readiness = classify_probe(method, path) == Some(Probe::Readiness);
+    match sandbox.initialize(build) {
+        Ok(()) if readiness => ApplicationDispatch::Operational(probe_response(
+            method,
+            Probe::Readiness,
+            StartupState::Ready,
+        )),
+        Err(error) if readiness || app::publisher_fallback_methods().contains(method) => {
+            // The client sees only the fixed response, so the error that
+            // `EdgeZero`'s assembly-error response would have logged is logged here.
+            log::error!("application assembly failed: {error:?}");
+            ApplicationDispatch::Operational(startup_unavailable_response(method))
+        }
+        assembled => ApplicationDispatch::Ordinary(assembled),
+    }
 }
 
 /// Builds the counters snapshot response.
@@ -657,13 +737,23 @@ async fn apply_edgezero_ec_finalize(
     } else {
         None
     };
+    // Only a navigation with an eligible response uses the request time, so
+    // other responses never read the clock or log its failure.
+    let now = (ec_state.ec_context.has_navigation_permit()
+        && !NavigationPermit::is_redirect(response.status()))
+    .then(checked_current_timestamp)
+    .flatten()
+    .map(UnixSeconds::new);
     ec_finalize_response(
         identity_app.settings(),
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         identity_app.partners(),
-        ec_state.eids_cookie.as_deref(),
-        &ec_state.sharedid,
+        &FinalizeRequest {
+            eids_cookie: ec_state.eids_cookie.as_deref(),
+            sharedid: &ec_state.sharedid,
+            now,
+        },
         response,
     )
     .await;
@@ -804,9 +894,11 @@ mod tests {
     };
     use edgezero_core::pre_dispatch::PreDispatchRequest;
     use edgezero_core::router::{PreDispatchHook, RouterService};
+    use error_stack::Report;
     use fastly::mime;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use trusted_server_core::error::{TrustedServerError, startup_error};
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
@@ -1957,6 +2049,174 @@ mod tests {
         assert!(
             body.contains("ch-platform: not sent"),
             "should include sec-ch-ua-platform fallback"
+        );
+    }
+
+    #[test]
+    fn native_head_health_is_local_and_uncacheable() {
+        let request = FastlyRequest::head("https://example.com/health?probe=1");
+        let mut response = health_response(&request).expect("should answer HEAD health locally");
+        assert_eq!(
+            response.get_status().as_u16(),
+            200,
+            "should report liveness"
+        );
+        assert_eq!(
+            response.get_header_str("cache-control"),
+            Some("no-store"),
+            "should prevent caching"
+        );
+        assert!(
+            response.get_header("x-ts-fastly-version").is_none(),
+            "should omit runtime version"
+        );
+        assert!(
+            response.take_body_bytes().is_empty(),
+            "should send no HEAD body"
+        );
+    }
+
+    #[test]
+    fn operational_responses_bypass_finalize_and_filter_effects() {
+        let mut settings = test_settings();
+        settings.response_headers.insert(
+            "Cache-Control".to_string(),
+            "public, max-age=3600".to_string(),
+        );
+        settings
+            .response_headers
+            .insert("Set-Cookie".to_string(), "fictional=value".to_string());
+        settings.debug.sandbox_metrics_enabled = true;
+        let state = app_state(&settings);
+        let counters = counters();
+        for mut response in [
+            probe_response(&Method::GET, Probe::Readiness, StartupState::Ready),
+            startup_unavailable_response(&Method::GET),
+        ] {
+            response.extensions_mut().insert(RequestFilterEffects {
+                request_headers: Vec::new(),
+                response_headers: vec![
+                    HeaderMutation::set("cache-control", "public"),
+                    HeaderMutation::append("set-cookie", "fictional=effect"),
+                ],
+            });
+            let headers = response.headers().clone();
+
+            let finalized = finalize_response(
+                &mut response,
+                &FinalizeInputs {
+                    state: &state,
+                    geo: None,
+                    counters: &counters,
+                },
+            );
+
+            assert!(finalized.is_none(), "should hand no EC state on");
+            assert_eq!(
+                response.headers(),
+                &headers,
+                "should preserve terminal operational headers"
+            );
+        }
+    }
+
+    /// A caught startup failure of the named kind, as `assemble_app` returns it.
+    fn startup_failure(kind: &str) -> EdgeError {
+        let error = match kind {
+            "configuration" => TrustedServerError::Configuration {
+                message: "fictional-startup-detail".to_string(),
+            },
+            "bad_request" => TrustedServerError::BadRequest {
+                message: "fictional-startup-detail".to_string(),
+            },
+            _ => TrustedServerError::KvStore {
+                store_name: "fictional-store".to_string(),
+                message: "fictional-startup-detail".to_string(),
+            },
+        };
+        startup_error(&Report::new(error).attach("fictional-attachment"))
+    }
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        for kind in ["configuration", "bad_request", "kv_store"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                    let request = FastlyRequest::new(
+                        Method::from_bytes(method.as_bytes()).expect("should parse method"),
+                        format!("https://example.com{path}"),
+                    );
+                    let mut sandbox = crate::sandbox::Sandbox::default();
+                    let mut response = health_response(&request).unwrap_or_else(|| {
+                        match initialize_dispatch(
+                            &mut sandbox,
+                            request.get_method(),
+                            request.get_path(),
+                            || Err(startup_failure(kind)),
+                        ) {
+                            ApplicationDispatch::Operational(response) => {
+                                native_operational_response(&response)
+                            }
+                            ApplicationDispatch::Ordinary(_) => {
+                                panic!("should answer {method} {path} locally")
+                            }
+                        }
+                    });
+                    let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                    assert_eq!(
+                        response.get_status().as_u16(),
+                        if live { 200 } else { 503 },
+                        "should classify {method} {path}"
+                    );
+                    assert_eq!(
+                        response.get_header_str("cache-control"),
+                        Some("no-store"),
+                        "should prevent startup caching"
+                    );
+                    assert_eq!(
+                        response.get_header_str("content-type"),
+                        Some(if live {
+                            "text/plain"
+                        } else {
+                            "text/plain; charset=utf-8"
+                        }),
+                        "should preserve startup content type"
+                    );
+                    for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                        assert!(response.get_header(name).is_none(), "should omit {name}");
+                    }
+                    let expected: &[u8] = if method == "HEAD" {
+                        b""
+                    } else if live {
+                        b"ok"
+                    } else {
+                        b"Service Unavailable\n"
+                    };
+                    assert_eq!(
+                        response.take_body_bytes(),
+                        expected,
+                        "should emit exact safe body for {method} {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_startup_keeps_the_assembly_error_for_unsupported_methods() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+
+        let dispatch = initialize_dispatch(&mut sandbox, &Method::TRACE, "/", || {
+            Err(startup_failure("configuration"))
+        });
+
+        let ApplicationDispatch::Ordinary(Err(error)) = dispatch else {
+            panic!("should leave an unsupported method to the assembly-error response");
+        };
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should keep the startup failure's own status"
         );
     }
 }

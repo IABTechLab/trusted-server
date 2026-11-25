@@ -599,6 +599,16 @@ describe('prebid/installPrebidNpm', () => {
     delete mockPbjs.bidderSettings;
   });
 
+  // Publishers and identity SDKs can set EIDs through
+  // `pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })` instead of the
+  // User ID Module. Prebid exposes that global first-party data via
+  // `getConfig('ortb2')`.
+  function configureOrtb2Eids(eids: unknown): void {
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'ortb2' ? { user: { ext: { eids } } } : undefined
+    );
+  }
+
   afterEach(() => {
     delete mockPbjs.bidderSettings;
     vi.restoreAllMocks();
@@ -2551,6 +2561,166 @@ describe('prebid/installPrebidNpm', () => {
       expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
+    it('buildRequests appends EIDs configured in ortb2.user.ext.eids after User ID Module EIDs', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+      ]);
+      configureOrtb2Eids([
+        { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+        { source: 'uidapi.com', uids: [{ id: 'uid2_token', atype: 3 }] },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(result.data).eids).toEqual([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+        { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+        { source: 'uidapi.com', uids: [{ id: 'uid2_token', atype: 3 }] },
+      ]);
+    });
+
+    it('buildRequests merges uids for a source present in both the User ID Module and ortb2', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'criteo.com', uids: [{ id: 'criteo_module', atype: 1 }] },
+      ]);
+      configureOrtb2Eids([
+        {
+          source: 'criteo.com',
+          uids: [
+            { id: 'criteo_module', atype: 3 },
+            { id: 'criteo_configured', atype: 3 },
+          ],
+        },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(result.data).eids).toEqual([
+        {
+          source: 'criteo.com',
+          uids: [
+            { id: 'criteo_module', atype: 1 },
+            { id: 'criteo_configured', atype: 3 },
+          ],
+        },
+      ]);
+    });
+
+    it('buildRequests collapses an EID repeated within ortb2.user.ext.eids', () => {
+      const spec = getAdapterSpec();
+      configureOrtb2Eids([
+        { source: 'id5-sync.com', uids: [{ id: 'ID5_abc', atype: 1 }] },
+        { source: 'id5-sync.com', uids: [{ id: 'ID5_abc', atype: 1 }] },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(result.data).eids).toEqual([
+        { source: 'id5-sync.com', uids: [{ id: 'ID5_abc', atype: 1 }] },
+      ]);
+    });
+
+    it('buildRequests includes ortb2 EIDs when the User ID Module is not installed', () => {
+      const spec = getAdapterSpec();
+      configureOrtb2Eids([{ source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] }]);
+      delete (mockPbjs as { getUserIdsAsEids?: unknown }).getUserIdsAsEids;
+
+      try {
+        const result = spec.buildRequests([
+          {
+            adUnitCode: 'div-gpt-1',
+            bidder: 'trustedServer',
+            mediaTypes: { banner: { sizes: [[300, 250]] } },
+            params: {},
+          },
+        ]);
+
+        expect(JSON.parse(result.data).eids).toEqual([
+          { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+        ]);
+      } finally {
+        mockPbjs.getUserIdsAsEids = mockGetUserIdsAsEids;
+      }
+    });
+
+    it('buildRequests ignores malformed ortb2.user.ext.eids entries', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+      ]);
+      configureOrtb2Eids([
+        null,
+        'not-an-eid',
+        { source: '', uids: [{ id: 'no-source' }] },
+        { source: 'empty-uids.example', uids: [] },
+        { source: 'bad-uid.example', uids: [{ id: 42 }] },
+        { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(result.data).eids).toEqual([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+        { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+      ]);
+    });
+
+    it('buildRequests keeps User ID Module EIDs when reading the ortb2 config throws', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+      ]);
+      mockGetConfig.mockImplementation((key?: string) => {
+        if (key === 'ortb2') {
+          throw new Error('config unavailable');
+        }
+        return undefined;
+      });
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(result.data).eids).toEqual([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+      ]);
+    });
+
     it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
       const spec = getAdapterSpec();
       document.cookie = 'ts-eids=stale-value';
@@ -3195,6 +3365,51 @@ describe('prebid/installPrebidNpm', () => {
           ],
         },
       ]);
+    });
+
+    it('syncs EIDs configured in ortb2.user.ext.eids to the ts-eids cookie', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+      ]);
+      configureOrtb2Eids([{ source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] }]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        { source: 'sharedid.org', uids: [{ id: 'shared_123', atype: 1 }] },
+        { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+      ]);
+    });
+
+    it('syncs ortb2 EIDs to the ts-eids cookie when the User ID Module is not installed', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      configureOrtb2Eids([{ source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] }]);
+      delete (mockPbjs as { getUserIdsAsEids?: unknown }).getUserIdsAsEids;
+
+      try {
+        const pbjs = installPrebidNpm();
+        pbjs.requestBids({
+          adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+        } as unknown as RequestBidsArg);
+
+        const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+        expect(cookieValue).toBeDefined();
+        expect(JSON.parse(atob(cookieValue!))).toEqual([
+          { source: 'liveramp.com', uids: [{ id: 'envelope_abc', atype: 3 }] },
+        ]);
+      } finally {
+        mockPbjs.getUserIdsAsEids = mockGetUserIdsAsEids;
+      }
     });
 
     it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {

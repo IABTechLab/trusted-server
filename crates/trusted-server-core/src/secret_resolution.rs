@@ -4,7 +4,7 @@
 //! public `EdgeZero` metadata contract and replaces those names only in the
 //! in-memory value used to build runtime [`crate::settings::Settings`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use edgezero_core::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
@@ -65,6 +65,27 @@ pub fn secret_reference_keys<C: AppConfigMeta>(
         Ok(key.to_owned())
     })?;
     Ok(keys)
+}
+
+/// Collect each required key with the config field paths that reference it.
+///
+/// Diagnostics should name the paths: a key is an operator-supplied string, and
+/// a misplaced secret value in a reference field would otherwise be printed.
+///
+/// # Errors
+/// Returns a configuration error for missing or malformed secret references.
+pub fn secret_reference_paths<C: AppConfigMeta>(
+    data: &Value,
+) -> Result<BTreeMap<String, BTreeSet<String>>, Report<TrustedServerError>> {
+    let mut references: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    visit_secret_references::<C>(&mut data.clone(), &mut |key, path| {
+        references
+            .entry(key.to_owned())
+            .or_default()
+            .insert(path.to_owned());
+        Ok(key.to_owned())
+    })?;
+    Ok(references)
 }
 
 type ResolveReference<'a> =
@@ -292,6 +313,29 @@ mod tests {
         assert_eq!(
             data, original,
             "should not mutate references during collection"
+        );
+    }
+
+    #[test]
+    fn collects_the_field_paths_of_each_key() {
+        let data = serde_json::json!({
+            "outer": [{"token": "token-a"}, {"token": "token-a", "optional": "token-b"}]
+        });
+        let references =
+            secret_reference_paths::<Fixture>(&data).expect("should collect finite references");
+        assert_eq!(
+            references,
+            BTreeMap::from([
+                (
+                    "token-a".to_owned(),
+                    BTreeSet::from(["outer[0].token".to_owned(), "outer[1].token".to_owned()]),
+                ),
+                (
+                    "token-b".to_owned(),
+                    BTreeSet::from(["outer[1].optional".to_owned()]),
+                ),
+            ]),
+            "should map every key to the paths that reference it"
         );
     }
 

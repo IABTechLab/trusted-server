@@ -26,7 +26,7 @@ const HEADER_REQUEST_ID: &str = "x-ts-sandbox-request-id";
 const INSTANCE_UNAVAILABLE: &str = "unavailable";
 
 /// Paths that never carry counters because they short-circuit before dispatch.
-const NON_WORKLOAD_PATHS: &[&str] = &["/health", "/_ts/debug/sandbox", "/_ts/debug/ja4"];
+const NON_WORKLOAD_PATHS: &[&str] = &["/health", "/ready", "/_ts/debug/sandbox", "/_ts/debug/ja4"];
 
 /// Arguments for `ts dev sandbox-probe`.
 #[derive(Debug, clap::Args)]
@@ -37,7 +37,7 @@ pub struct SandboxProbeArgs {
 
     /// Workload path to exercise.
     ///
-    /// Required, and it must reach the router. `/health` and the debug probes
+    /// Required, and it must reach the router. `/health`, `/ready`, and the debug probes
     /// short-circuit ahead of the point where counters are attached, so
     /// probing one of those reports nothing.
     #[arg(long)]
@@ -81,7 +81,11 @@ enum Ending {
 /// Returns a message when the path is not a workload route, the async runtime
 /// cannot start, or the connection cannot be established.
 pub fn run(args: &SandboxProbeArgs) -> Result<(), String> {
-    if NON_WORKLOAD_PATHS.contains(&args.path.as_str()) {
+    let uri = args
+        .path
+        .parse::<hyper::Uri>()
+        .map_err(|error| format!("invalid workload path: {error}"))?;
+    if NON_WORKLOAD_PATHS.contains(&uri.path()) {
         return Err(format!(
             "`{}` short-circuits before counters are attached; choose a workload route",
             args.path
@@ -516,10 +520,19 @@ mod tests {
 
     #[test]
     fn non_workload_paths_are_rejected_before_connecting() {
-        for path in NON_WORKLOAD_PATHS {
+        for path in [
+            "/health",
+            "/health?check=1",
+            "/ready",
+            "/ready?check=1",
+            "/_ts/debug/sandbox",
+            "/_ts/debug/sandbox?check=1",
+            "/_ts/debug/ja4",
+            "/_ts/debug/ja4?check=1",
+        ] {
             let args = SandboxProbeArgs {
                 authority: "127.0.0.1:7676".to_owned(),
-                path: (*path).to_owned(),
+                path: path.to_owned(),
                 requests: 2,
                 timeout_ms: 100,
             };

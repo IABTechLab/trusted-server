@@ -77,6 +77,22 @@ jobs:
       - name: Test the response comparison
         run: node --test scripts/fastly-response-diff.test.mjs
 
+  native-provider-script:
+    name: Native provider acceptance script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      # Unit tests only. The full acceptance needs Docker and a prebuilt
+      # binary, so it runs locally (docs/guide/native-rc-demo.md).
+      - name: Test the provider acceptance helpers
+        run: node --test 'scripts/tests/*.test.mjs'
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -125,6 +141,12 @@ jobs:
 
       - name: Run cargo clippy (Cloudflare — wasm32-unknown-unknown)
         run: cargo clippy-cloudflare-wasm
+
+      - name: Test runtime environment guard fixtures
+        run: scripts/test-runtime-env.sh
+
+      - name: Check serving runtime environment names
+        run: scripts/lint-runtime-env.sh
 
       - name: Check wasm-safe clock usage in the Cloudflare build (wasm32-unknown-unknown)
         run: scripts/lint-wasm-clock.sh

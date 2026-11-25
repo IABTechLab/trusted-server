@@ -148,7 +148,7 @@ impl GptIntegration {
             .with_streaming()
             .without_forward_headers();
         config.follow_redirects = false;
-        config.forward_ec_id = false;
+        config = config.without_ec_id();
 
         Self::apply_request_header_allowlist(config, req)
     }
@@ -845,7 +845,7 @@ mod tests {
             "should stream GPT assets verbatim without rewrite processing"
         );
         assert!(
-            !config.forward_ec_id,
+            config.query_identity == crate::proxy_policy::ProxyQueryIdentity::Disabled,
             "should not append EC ID to GPT asset requests"
         );
         assert!(

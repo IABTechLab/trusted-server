@@ -9,21 +9,21 @@ use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 pub(crate) const STORE_ID: &str = "trusted_server_kv";
 
 fn declared() -> Result<bool, EdgeError> {
-    match std::env::var("TS_EC_DYNAMODB_ENABLED") {
+    match trusted_server_core::runtime_env!("TRUSTED_SERVER__EC_DYNAMODB_ENABLED") {
         Err(std::env::VarError::NotPresent) => {}
         Ok(value) if value == "false" => {}
         _ => {
             return Err(EdgeError::validation(
-                "legacy TS_EC_DYNAMODB_ENABLED is obsolete; declare TS_EC_RECORDS_ENABLED and select an EdgeZero record binding",
+                "legacy TRUSTED_SERVER__EC_DYNAMODB_ENABLED is obsolete; declare TRUSTED_SERVER__EC_RECORDS_ENABLED and select an EdgeZero record binding",
             ));
         }
     }
-    match std::env::var("TS_EC_RECORDS_ENABLED") {
+    match trusted_server_core::runtime_env!("TRUSTED_SERVER__EC_RECORDS_ENABLED") {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(value) if value == "false" => Ok(false),
         Ok(value) if value == "true" => Ok(true),
         _ => Err(EdgeError::validation(
-            "invalid TS_EC_RECORDS_ENABLED declaration",
+            "invalid TRUSTED_SERVER__EC_RECORDS_ENABLED declaration",
         )),
     }
 }
