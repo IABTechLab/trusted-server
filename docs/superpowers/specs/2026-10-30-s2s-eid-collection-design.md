@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-30
 **Status:** PR A (#1487) implements PR1 to PR4, PR B (#1489) PR5 and PR6;
-reviewed (see the review log)
+reviewed (see the review log). #1488 adds hashed-email intake (§8.7, #1567).
 **Source of intent:** the S2S EID collection requirements document, kept
 outside this repository (sections referenced as "R§n")
 
@@ -44,11 +44,12 @@ server-side collection, and both feed the same consent-gated KV row.
 
 ### 2.2 Non-goals (firm, from R§6)
 
-- Logged-in identity and email contribution: no hashed-email intake, no
-  `ts-hem` cookie, no `tsjs.setEmail()`, no publisher sign-in changes. The
-  trait carries a typed `HashedEmail` slot that is always empty in V1; a source
-  that requires it is skipped before any call. TS never receives a raw email
-  from the page.
+- Email contribution from the page: no `ts-hem` cookie, no
+  `tsjs.setEmail()`, no publisher sign-in changes. TS never receives a raw
+  email from the page. The one logged-in input is the hashed-email intake of
+  §8.7 (added in #1488): TS asks a publisher endpoint for the visitor's hashed
+  email and keeps it only for the request. Without `[ec.hashed_email]`, a
+  source that requires a hashed email is skipped before any call, as in V1.
 - Proxying vendor identity JavaScript through TS.
 - Concrete vendor implementations (each gets its own spec, see §13.2 F1).
 - Adapters other than Fastly. KV identity remains Fastly-only; Axum,
@@ -89,8 +90,8 @@ These were agreed before drafting and are binding on the rest of the spec.
 | D12 | KV schema                 | Stay on `v: 1` with additive optional fields; no migration.                                                                                                                                                |
 | D13 | Other consumers           | Provider IDs appear in `x-ts-eids` and `/_ts/api/v1/identify`, subject to `bidstream_enabled`, expiry and consent.                                                                                         |
 
-§5.2.1 (opt-in `collect = "after_response"`) and §5.6 (refresh state) extend
-D2 and D3 additively; defaults are unchanged.
+§5.2.1 (opt-in `collect = "after_response"`), §5.6 (refresh state) and §8.7
+(hashed-email intake) extend D2 and D3 additively; defaults are unchanged.
 
 ### 3.1 Choices this spec makes to apply those decisions
 
@@ -281,9 +282,12 @@ never write. They do not receive a permit, so the write API cannot be called
   From F1, vendor cookies are read first on every navigation; a usable cookie ID is
   used instead of a refresh request. Refresh state that is empty, over 2048
   bytes or has no stated time is dropped and the UID is kept.
-- A UID is refresh-due only while it is still live. A failing refresh is
-  therefore retried at most until the UID expires, and the provider's
-  `rate_limit_per_hour` also bounds it.
+- Once a UID expires its source is due like any source without a live UID,
+  and its refresh state is still passed to the provider, so a refresh can
+  still run: a vendor refresh token may outlive the UID (UID2's does). A
+  failing refresh keeps the state and is retried on later navigations;
+  only the provider's `rate_limit_per_hour` bounds the retries, and the
+  state is dropped when the expired UID is pruned on the next write.
 - A refresh reply may report an opt-out (`LookupOutcome::OptedOut`). It is
   handled like a cookie opt-out: the provider's sources are cleared from the
   row.
@@ -491,13 +495,17 @@ through the retained `uid` field, unless that `uid` (the first live provider
 UID) is over 512 bytes: older code rejects such a row whole.
 
 The row also gains `opt_outs`, a map from provider ID to the Unix time until
-which that provider's opt-out is remembered (30 days, §8.3).
+which that provider's opt-out is remembered (30 days, §8.3), `opt_out_uids`,
+hashes of the UIDs known when that opt-out was recorded (§8.3), and
+`revocations`, a map from provider ID to the Unix time of the latest opt-out
+the provider reported that removed its sources from the row (kept for one day,
+§8.3).
 
 `uid` is rewritten on every write to the first live UID of `eids`, and new code
 ignores it when `eids` is non-empty. A known limitation of staying on `v: 1`
 (D12): during a rollout or rollback, older code reads only `uid`, so it can
 serve that UID after its `exp`, and an older writer that re-saves the row drops
-`eids` and `opt_outs`. A UID served past its `exp` and dropped `eids` end at the
+`eids`, `opt_outs`, `opt_out_uids` and `revocations`. A UID served past its `exp` and dropped `eids` end at the
 next write by new code; a dropped opt-out is lost, so that provider is called
 again. Stored values are built only by validation
 (§8.2) or by deserializing rows TS wrote, so `KvEid` and `KvUid` fields are
@@ -659,6 +667,14 @@ pub trait IdentityProvider {
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
         None
     }
+
+    /// Where this provider's hashed email sits in the publisher's status
+    /// response (§8.7); `None` when it uses none.
+    ///
+    /// The default is `None`.
+    fn hashed_email_path(&self) -> Option<&HashedEmailPath> {
+        None
+    }
 }
 
 impl<P: IdentityProvider + ?Sized> IdentityProvider for Box<P> {
@@ -689,7 +705,8 @@ pub struct SourceCapability {
 pub enum SourceInput {
     /// Works for any visitor.
     Anonymous,
-    /// Needs a hashed email. Always skipped in V1.
+    /// Needs a hashed email to be looked up, unless its stored UID is due
+    /// for a refresh (§8.7). Skipped when the provider gets none.
     HashedEmail,
 }
 
@@ -722,7 +739,8 @@ pub struct LookupInput<'a> {
     pub due_sources: &'a [SourceDomain],
     /// This provider's currently stored entries, borrowed from the row.
     pub current: OwnedEntries<'a>,
-    /// Always `None` in V1.
+    /// The hashed email the publisher's status endpoint returned at this
+    /// provider's path (§8.7); `None` without one.
     pub hashed_email: Option<&'a HashedEmail>,
 }
 
@@ -912,8 +930,10 @@ impl core::error::Error for ProviderConfigError {}
 ```
 
 `IdentityProviderConfig` is the deserialized `[[ec.identity_providers]]` entry
-(§12.1). `HashedEmail` is a newtype over a validated lowercase hex SHA-256
-digest with no constructor reachable from request data in V1.
+(§12.1). `HashedEmail` is a newtype over the opaque value the publisher's
+status endpoint returned (§8.7). TS neither normalises nor hashes it; its
+`Debug` output hides the value. `HashedEmailPath` is a parsed path into that
+response.
 
 ## 8. Coordinator
 
@@ -923,7 +943,8 @@ The coordinator owns, for every provider:
 
 1. **Eligibility.** Provider enabled; the EC's row exists and is not
    tombstoned (an EC minted on this navigation, or a cookie EC with no row, is
-   not sent to vendors); at least one due source; sources needing `HashedEmail` removed.
+   not sent to vendors); at least one due source; sources needing `HashedEmail` removed
+   unless they are refresh-due or the provider got a hashed email (§8.7).
    A provider whose request does not carry the EC ID (`sends_ec_id` is
    `false`) also runs for an EC minted on this navigation, against the row the
    navigation will create: its results go into that create, and a failed or
@@ -1270,14 +1291,30 @@ For each provider with a `Found` outcome and each source in its response:
   unowned ones (D8). Each written UID records `owner` and `exp`.
 - Sources the provider claims but did not return stay unchanged.
 - `NoMatch`, failures, timeouts and skipped providers leave the row unchanged.
-- `OptedOut` (a refresh reply, or from F1 a cookie) clears every source the provider
-  claims and records the opt-out in the row's `opt_outs` map for 30 days. Until
-  it lapses the provider is skipped as `skipped_opted_out` and not called, and
-  a result from a lookup dispatched before the opt-out was recorded is
-  discarded rather than written over it. Only an opt-out the provider reports
-  (outcome `opted_out`) starts the 30 days; a `skipped_opted_out` skip never
-  renews them, and one whose opt-out lapsed before the write is discarded. Generated and cookie IDs merge like
+- `OptedOut` (a cookie or a vendor server's reply) clears every source the
+  provider claims. Only an opt-out a vendor server reports (outcome
+  `opted_out`) is recorded in the row's `opt_outs` map for 30 days: a cookie
+  opt-out is re-read on every navigation, so it needs no memory. Until a
+  recorded opt-out lapses the provider is skipped as `skipped_opted_out` and
+  not called, and a result from a lookup dispatched before the opt-out was
+  recorded is discarded rather than written over it. A `skipped_opted_out`
+  skip never renews the 30 days, and one whose opt-out lapsed before the write
+  is discarded. The vendor's cookies are read before the recorded opt-out is
+  checked: an ID in them that is new means the visitor opted back in, so the
+  opt-out is forgotten and the ID stored. A recorded opt-out keeps, in the
+  row's `opt_out_uids` map, short hashes of the UIDs known for the provider at
+  dispatch (its cookies' and the row's, at most 16); cookies holding only those
+  UIDs repeat the opted-out identity, because a server refresh never rewrites
+  them, so the provider stays skipped. An opt-out recorded without hashes knew
+  no UID, so any cookie ID is new. Generated and cookie IDs merge like
   `Found`.
+- An `OptedOut` outcome that removes a source also records the time in the
+  row's `revocations` map (a later value if one from the same second is held).
+  Dispatch captures the row's `revocations`; a result for a provider whose
+  revocation differs at the write was superseded by a newer opt-out, from a
+  cookie or a server, and is discarded. An opt-out that removes nothing
+  records none, so it adds no write. Revocations older than a day are pruned
+  with a real change.
 
 Browser ingest (§8.4) is applied in the same in-memory merge, before provider
 results, so the write order never lets browser data overwrite provider data.
@@ -1306,6 +1343,111 @@ ingest may fill the source again. Its `tcf_vendor_id` still gates egress of
 every ID for its sources, stored or sent by the browser, so disabling a
 provider never releases its UIDs without that vendor's consent. Removing the
 provider's entry does drop that gate (#1548). Other providers are unaffected.
+
+### 8.7 Hashed-email intake
+
+LiveRamp's ATS resolves only hashed emails, and ID5 accepts one as partner
+data. The publisher operates TS and already knows whether the visitor is
+signed in, so TS asks the publisher rather than the page.
+
+**Configuration.** `[ec.hashed_email]` names one publisher status endpoint
+(`endpoint`, `https` only) and a `timeout_ms` (1–1000, default 100), and
+optionally how to call it: `method` (`GET`, the default, or `POST`), `body`
+(only with `POST`) and `headers`, a table of extra request headers whose
+values are fixed strings or `{ cookie = "name" }`. A body without `POST`, a
+header name that is not valid or that the call sets itself (`Cookie`, `Host`,
+`Content-Length`, `Transfer-Encoding`), a fixed value that is not a valid
+header value and an empty cookie name fail startup and deploy validation. Both
+coordinators (page and after-response) share it. Provider kinds that can send
+a hashed email declare the hashed-email capability (`liveramp`, `id5`); each
+such provider opts in under `[ec.identity_providers.settings.hashed_email]`
+with `enabled` and `path`. The settings of every other kind reject that table.
+A provider that enables the capability without `[ec.hashed_email]` fails
+startup and deploy validation.
+
+**Path.** `path` is a subset of jq path syntax: it starts with `.` and is a
+sequence of `.key`, `."quoted key"` and `[index]` segments, for example
+`.user.hashes.sha256` or `.ids[0]."ats-hash"`. Anything else (pipes, filters,
+`//`, slices, negative indexes, an empty path) is rejected when the provider
+is built. A missing key, an index out of range or a value that is not a string
+reads as no hashed email.
+
+**When TS calls the endpoint.** In `dispatch`, after each provider's
+eligibility, consent, region, cookie and opt-out steps and before any lookup
+request is built, TS calls the endpoint at most once per `dispatch`, and only
+when some provider with the capability enabled still has a due source that is
+not refresh-due (its UID is missing or expired) and the request carries
+cookies. A refresh never triggers the call, and a navigation with nothing due
+makes none. The page and after-response coordinators (§5.2.1) dispatch
+separately, so a navigation whose hashed-email providers are split across
+both phases makes one call per phase. The call is made before rate-limit and
+destination checks, so a provider those checks then skip may still have
+caused it.
+
+**The call.** A request with `method` to `endpoint` carrying the visitor's
+whole `Cookie` header as received, `Accept: application/json`, the `body` with
+`Content-Type: application/json` when there is one, and the configured
+`headers`, which override those two. A header taken from a cookie carries that
+cookie's first non-empty value, unquoted; when the request has no such cookie
+the visitor cannot be signed in, so no call is made, as for a request without
+cookies. Header values are marked sensitive. Publishers whose session check
+needs a header rather than the `Cookie` header (for example a token from a
+cookie in `X-Session`), or a `POST`, can point TS at their existing endpoint
+this way. The call is sent through the
+coordinator's `LookupTransport` with `timeout_ms` as its cutoff and the same
+64 KiB body cap. The call and the lookups share one deadline, the phase's
+identity budget: lookups start when the call returns, with the budget less
+the time the call took. `timeout_ms` must be below the budget of every phase
+that has a provider with the capability enabled; startup and deploy
+validation reject it otherwise. On the page phase the adapter runs `dispatch`
+beside the origin fetch, joined with it, so the call never delays the origin
+fetch (ID-4 of the server-side identity on every adapter design, #1559). A `2xx` reply with a JSON body is read; any other status, a
+transport error, a timeout or a body that is not JSON means no provider gets a
+hashed email, and TS logs the outcome at debug level without the body.
+
+**The value.** The string at a provider's path is passed on as it is when it
+is non-empty and at most 512 bytes; otherwise the provider gets none. TS does
+not normalise, hash or validate it: the publisher returns what the vendor
+expects (for LiveRamp and ID5, the lowercase hex SHA-256 of the normalised
+email).
+
+**Use.** A provider with a value gets it in `LookupInput::hashed_email`. A
+`SourceInput::HashedEmail` source that is not refresh-due stays due only when
+its provider got a value; otherwise it is removed, and a provider left with no
+due source is skipped as `skipped_input`. An `Anonymous` source is looked up
+either way; for it the hashed email only adds input.
+
+**Retention.** The value lives for the request only. It is never written to
+KV, a cookie, a response header, refresh state or a log, and it goes only to
+providers that enabled the capability and passed consent (§8.1 step 2).
+
+**Not detected.** Calling the endpoint only when a source is due means a
+sign-out or an account change is not noticed while a stored ID is live or
+refreshing: the stored ID serves until it expires, the vendor stops
+refreshing it, or consent is withdrawn.
+
+**Providers.**
+
+- `liveramp`: with `endpoint` and `placement_id`, its source needs a hashed
+  email. A visitor without a live envelope is looked up at the ATS envelope
+  API with `it=4` and the hashed email. A stored envelope TS obtained carries
+  refresh state due `refresh_interval_secs` (default 1800, LiveRamp's
+  recommended 30 minutes) after it was written, and its refresh calls
+  `<endpoint>/refresh` with `it=19` and the envelope, which needs no hashed
+  email. A `204` from the envelope API reports an opt-out. A `204` from the
+  refresh API means LiveRamp no longer accepts the envelope: it is rewritten
+  without refresh state to expire one refresh interval later, so it is not
+  refreshed on every navigation and, once it lapses, a signed-in visitor is
+  looked up by hashed email again. Removing the `endpoint` while stored
+  envelopes still hold refresh state leaves those sources refresh-due with no
+  way to refresh; each such navigation records `request_error` until the
+  envelope expires. Neither call sends
+  the EC ID, so the provider may run on the navigation that mints the EC. The
+  Custom ID lookup (`it=15`) is removed: LiveRamp resolves a Custom ID only
+  through a hashed-email mapping file.
+- `id5`: with a value, the `/gs/v2` fetch body carries `pd`, the padded
+  URL-safe base64 of `1=<percent-encoded value>` (ID5's partner-data key 1 is
+  the SHA-256 email hash). Without one the fetch is unchanged.
 
 ## 9. KV write counting, failure and retry
 
@@ -1494,6 +1636,17 @@ token = "example_provider_token"
 
 [ec.identity_providers.settings]
 # Provider-specific settings, parsed by the provider implementation.
+
+# Optional, only for kinds with the hashed-email capability (§8.7).
+[ec.identity_providers.settings.hashed_email]
+enabled = true
+path = ".user.sha256"
+
+# Optional: the publisher endpoint that returns the signed-in visitor's
+# hashed email (§8.7).
+[ec.hashed_email]
+endpoint = "https://www.example.com/api/user/status"
+timeout_ms = 100
 ```
 
 Startup validation rejects: unknown `kind`; a source with no `[[ec.partners]]`
@@ -1503,7 +1656,12 @@ secrets in deploy validation.
 
 Validation also rejects an empty or duplicate provider `id`, an empty
 `sources` list, a non-HTTPS `endpoint`, and identity budgets outside 1–1000 ms
-(page) and 1–5000 ms (after-response).
+(page) and 1–5000 ms (after-response). For §8.7 it rejects a non-HTTPS
+`[ec.hashed_email].endpoint`, a `timeout_ms` outside 1–1000 ms or not
+below the identity budget of a phase with a capability-enabled provider, a
+`hashed_email` table on a kind without the capability, an enabled capability
+with no `path` or an invalid one, and an enabled capability without
+`[ec.hashed_email]`.
 
 PR3 registers no provider kind, so deploy validation (`ts config validate`,
 `push` and `diff`) rejects every enabled provider; a push therefore cannot
@@ -1530,7 +1688,10 @@ logged as `no_generation`. A navigation that runs the after-response phase
 (§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`
 or `failed`. The outcome log holds the provider ID, the outcome and the kept
 and dropped totals; other logs hold the EC ID only in its existing truncated
-form. Raw UIDs, EID values and encrypted envelopes are never logged.
+form. Raw UIDs, EID values and encrypted envelopes are never logged. The
+hashed-email call (§8.7) logs one debug line per navigation that makes it,
+with the reply status or the transport error only; the hashed email and the
+reply body are never logged.
 
 ### 12.3 Compatibility and rollout
 
@@ -1654,8 +1815,10 @@ request the units are separate, ordered commits so they stay reviewable.
     request to it; the other provider and browser ingest behave as before.
 15. **Destination rule.** A provider builds a URL whose host is not in
     `allowed_domains`. → No request is sent; counted as `destination_rejected`.
-16. **Hashed-email source.** A source requires `HashedEmail`. → Skipped before
-    any call, counted as `skipped_input`.
+16. **Hashed-email source.** A source requires `HashedEmail` and no hashed
+    email is available (no `[ec.hashed_email]`, or the endpoint returns none
+    at the provider's path). → Skipped before any lookup, counted as
+    `skipped_input`.
 17. **Mirror trimming.** Provider UIDs exceed 3,584 encoded bytes. → The mirror
     holds the deterministic config-order fill of §10; KV holds all of them.
 18. **No secrets or IDs in logs.** Every outcome above produces logs and metrics
@@ -1693,6 +1856,20 @@ request the units are separate, ordered commits so they stay reviewable.
 27. **Refresh state is never served.** A row holds a UID with refresh state.
     → `/auction`, the mirror cookie and `x-ts-eids` carry the UID's `id`,
     `atype` and `ext` only.
+28. **Signed-in visitor.** A LiveRamp source has no live envelope and the
+    status endpoint returns a value at the provider's path. → One status
+    call carrying the request's `Cookie` header, then one envelope lookup
+    with `it=4` and that value; the envelope is stored with refresh state.
+    The value appears in no KV row, cookie, header or log.
+29. **Signed-out visitor.** The status endpoint returns `401`, a body
+    without the path, or times out. → No LiveRamp lookup (`skipped_input`);
+    ID5 still fetches without `pd`.
+30. **Refresh needs no status call.** The only due source is a LiveRamp
+    envelope whose refresh state is due. → No status call; one refresh with
+    `it=19` and the stored envelope.
+31. **One status call.** LiveRamp and ID5 both enable the capability and
+    both have due sources. → Exactly one status call; each provider gets the
+    value at its own path.
 
 ## Review log
 
@@ -1790,3 +1967,37 @@ combinations and adapter differences, on the tree after round 5's fix.
 - Non-blocking, no change: only the Fastly adapter builds the registry with
   provider ownership and vendor gates (§12.3 "On Fastly"); per-adapter deploy
   validation stays with #1552.
+
+### Round 7 (2026-11-12, PR #1488 at 5d22274c1, Claude Code (Opus 5.5) review agent)
+
+Angle: data flow and edge cases end to end per provider (UID2, ID5,
+LiveRamp, ConnectID, LiveIntent, SharedID, Criteo, Lockr): cookie parsing,
+request building, reply parsing, opt-out, 204 and 404 handling, refresh,
+expiry, and consent and region gating.
+
+- No blocking findings.
+- Non-blocking, fixed in 371e0ccba: LiveIntent kept a blank or `0` ID from
+  the reply; it now uses the shared usable-ID check. A LiveRamp envelope
+  entry without `type` failed the whole reply; it is now skipped.
+- Non-blocking, no change: Lockr's storage format was checked against
+  Prebid's `lockrAIMIdSystem`. It writes only the raw `advertising_token`
+  under `key_name` to a cookie, with no `inserter` and no revoke marker, so
+  neither can be read from cookies.
+- Known, open: LiveIntent partner UIDs carry `ext.provider` of
+  `liveintent.com` rather than the page domain, and a reply's `m` is not
+  copied into the `nonId` EID's `ext`.
+
+### Round 8 (2026-11-12, PR #1488 at 371e0ccba, Claude Code (Opus 5.5) review agent)
+
+Angle: adversarial. Malformed cookies and replies, config combinations,
+clock edges and privacy leaks.
+
+- No blocking findings. Re-checked non-integer, negative, huge and NaN
+  expiry and TTL values (rejected, clamped to 30 days in validation, or
+  read as expired); empty and duplicate cookies, a stale opt-out cookie
+  beside a live ID (the opt-out wins); Lockr names equal to own names, Lockr
+  with empty own cookies, and Lockr under GDPR; and that no cookie value or
+  token is logged.
+- Non-blocking, no change: a UID2 refresh that keeps failing is retried on
+  every navigation until the token expires unless `rate_limit_per_hour` is
+  set. The fix for overdue UID2 refresh state (834af2591) chose this bound.

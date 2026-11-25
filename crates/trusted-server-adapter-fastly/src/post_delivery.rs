@@ -30,7 +30,7 @@ use trusted_server_core::ec::coordinator::{IdentityCoordinator as _, LookupConte
 use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::provider::ClientSignals;
+use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
@@ -204,8 +204,11 @@ pub(crate) async fn run_after_response_lookups(
                 client: ClientSignals {
                     ip: lookups.client_ip,
                     user_agent: lookups.user_agent.as_deref(),
+                    referer: lookups.referer.as_deref(),
+                    accept_language: lookups.accept_language.as_deref(),
                 },
                 publisher_domain: &settings.publisher.domain,
+                cookies: RequestCookies::new(&lookups.cookie_header),
                 rate_limiter: &limiter,
                 now: UnixSeconds::new(current_timestamp()),
             },
