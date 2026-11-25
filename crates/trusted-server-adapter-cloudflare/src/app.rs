@@ -25,6 +25,8 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
+use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -734,6 +736,21 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 method,
                 cache_purge_unsupported.clone(),
             );
+        }
+
+        // Partner APIs are answered locally on every method so a partner's
+        // Bearer token and mapping body never reach the publisher origin. This
+        // adapter has no EC record store, so identify and batch sync answer 501
+        // and any other method answers 405.
+        let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            answer_identify_locally(&s.settings, &req)
+        });
+        let batch_sync = make_handler(Arc::clone(&state), |_s, _services, req| async move {
+            Ok(answer_batch_sync_locally(&req))
+        });
+        for method in publisher_fallback_methods() {
+            router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());
+            router = router.route("/_ts/api/v1/batch-sync", method, batch_sync.clone());
         }
 
         let legacy_admin_deny =
