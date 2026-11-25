@@ -43,6 +43,7 @@ pub mod after_response;
 pub mod app;
 pub mod batch_sync;
 pub mod consent;
+pub mod consent_update;
 pub mod cookies;
 pub mod coordinator;
 pub mod device;
