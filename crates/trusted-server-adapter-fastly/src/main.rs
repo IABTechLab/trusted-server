@@ -17,9 +17,11 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::checked_current_timestamp;
 use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::eid_types::UnixSeconds;
+use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::registry::PartnerRegistry;
@@ -692,13 +694,23 @@ async fn apply_edgezero_ec_finalize(
     } else {
         None
     };
+    // Only a navigation with an eligible response uses the request time, so
+    // other responses never read the clock or log its failure.
+    let now = (ec_state.ec_context.has_navigation_permit()
+        && !NavigationPermit::is_redirect(response.status()))
+    .then(checked_current_timestamp)
+    .flatten()
+    .map(UnixSeconds::new);
     ec_finalize_response(
         settings,
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
-        ec_state.eids_cookie.as_deref(),
-        ec_state.sharedid_cookie.as_deref(),
+        &FinalizeRequest {
+            eids_cookie: ec_state.eids_cookie.as_deref(),
+            sharedid_cookie: ec_state.sharedid_cookie.as_deref(),
+            now,
+        },
         response,
     )
     .await;
