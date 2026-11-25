@@ -153,6 +153,8 @@ pub(crate) async fn run_after_response_lookups(
                 client: ClientSignals {
                     ip: lookups.client_ip,
                     user_agent: lookups.user_agent.as_deref(),
+                    referer: lookups.referer.as_deref(),
+                    accept_language: lookups.accept_language.as_deref(),
                 },
                 publisher_domain: &settings.publisher.domain,
                 cookies: RequestCookies::new(&lookups.cookie_header),
@@ -186,7 +188,9 @@ mod tests {
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink as _};
     use trusted_server_core::ec::EcContext;
     use trusted_server_core::ec::coordinator::transport::MAX_PROVIDER_RESPONSE_BYTES;
-    use trusted_server_core::ec::finalize::ec_finalize_response;
+    use trusted_server_core::ec::current_timestamp;
+    use trusted_server_core::ec::eid_types::UnixSeconds;
+    use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
     use trusted_server_core::ec::kv_types::KvEntry;
     use trusted_server_core::ec::page_load::NavigationPermit;
     use trusted_server_core::geo::GeoInfo;
@@ -448,8 +452,11 @@ mod tests {
             &mut state.ec_state.ec_context,
             Some(&kv),
             app.identity.partners(),
-            None,
-            &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         ));
         state.identity = Arc::clone(&app.identity);
@@ -462,6 +469,8 @@ mod tests {
             ec_id: ec_id.to_owned(),
             client_ip: None,
             user_agent: None,
+            referer: None,
+            accept_language: None,
             cookie_header: String::new(),
         });
         state
