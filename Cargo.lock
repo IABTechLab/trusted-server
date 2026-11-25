@@ -7173,11 +7173,14 @@ name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
  "axum",
  "base64",
  "derive_more",
  "edgezero-adapter-axum",
  "edgezero-core",
+ "edgezero-store-aws",
  "error-stack",
  "futures",
  "log",
@@ -7189,6 +7192,7 @@ dependencies = [
  "tokio",
  "toml",
  "trusted-server-core",
+ "url",
 ]
 
 [[package]]

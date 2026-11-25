@@ -15,5 +15,6 @@ pub mod middleware;
 pub mod native_geo;
 /// Native request-scoped platform services.
 pub mod platform;
+mod record_ec;
 /// Prepared-store initialization and immutable native snapshots.
 pub mod startup;

@@ -22,7 +22,7 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::app::{TrustedServerApp, startup_error_router};
+use crate::app::{build_state_with_settings, router_builder, startup_error_router};
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -202,6 +202,9 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
 /// # Errors
 /// Returns an error for missing bindings/values, bounded-read failures, invalid
 /// envelopes or runtime settings, unsupported store consumers, or invalid plans.
+///
+/// # Panics
+/// Panics if newly constructed application state unexpectedly has another owner.
 async fn prepare_native(
     app: &App,
     stores: &PreparedStores,
@@ -290,7 +293,15 @@ async fn prepare_native(
         )
         .map_err(settings_error)?;
     validate_snapshot_consumers(&settings)?;
-    let router = TrustedServerApp::routes_with_settings(settings).map_err(settings_error)?;
+    let mut state = build_state_with_settings(settings).map_err(settings_error)?;
+    // EC records stay live. Only the validated provider handle is shared, never
+    // mutable identity rows in the immutable config/secret snapshot.
+    if let Some(provider) = crate::record_ec::acquire(stores)? {
+        Arc::get_mut(&mut state)
+            .expect("should uniquely own initializing app state")
+            .set_ec_store(provider);
+    }
+    let router = router_builder(&state).build();
     if deadline.is_expired_at(clock.now()) {
         return Err(configuration_error(
             "native application initialization exceeds its extraction deadline",
@@ -309,6 +320,7 @@ async fn prepare_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::TrustedServerApp;
     use edgezero_adapter_axum::AXUM_PLATFORM;
 
     #[test]
