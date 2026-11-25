@@ -91,7 +91,7 @@ Each handler checks its switch first: before reading the body, validating a sign
   - `docs/guide/configuration.md` and `docs/guide/api-reference.md` wherever they describe these endpoints, the two creative switches or a disabled auction.
 - **Tests that lock in today's behavior:**
   - `proxy.rs`: the test that proxies HTML with `rewrite_creatives = false`.
-  - `auction/endpoints.rs`: `disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work` and `trace_auction_api_frozen_disabled_capture_delivers_private_evidence`.
+  - `auction/endpoints.rs`: `disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work` and `trace_auction_api_frozen_disabled_capture_delivers_private_evidence` assert the disabled branch's `200`, telemetry and trace facts. `trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active` uses a disabled auction only as a harness for trace slot-reference echoing, so it moves to an enabled auction with no bidding provider.
   - Route and parity tests that use "not `404`" to mean "routed", among them `auction_not_challenged_by_auth_parity` in `crates/trusted-server-integration-tests/tests/parity.rs`. `/auction` is off under a default config, so these need a config with the auction on.
 - **`CHANGELOG.md`:** a **Breaking:** entry under Changed covering the five endpoints and the reversal of #1234's routing.
 
