@@ -1041,12 +1041,12 @@ origins, bidders, identity stores, or other request-time dependencies. It
 represents the selected instance's configuration snapshot, not the latest
 external configuration, another instance, or guaranteed publisher success.
 
-| Adapter    | Timing and boundary                                                                                                                                                                       |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | Liveness answers before settings and app construction. Readiness follows ordinary initialization, including required configuration-store access; failed initialization remains retryable. |
-| Axum       | App or failure-router construction completes before the listener binds; probes answer after that selection.                                                                               |
-| Cloudflare | Probes answer after Worker and SDK application dispatch begins; caught app initialization errors are covered.                                                                             |
-| Spin       | Probes answer after component and SDK application dispatch begins; caught app initialization errors are covered.                                                                          |
+| Adapter    | Timing and boundary                                                                                                                                                                                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fastly     | Liveness answers before settings and app construction. Readiness follows ordinary initialization, including required configuration-store access; failed initialization remains retryable.                                                                                                                    |
+| Axum       | App or failure-router construction completes before the listener binds; probes answer after that selection. A failure before that selection, including provider preparation, config extraction limits, the hosting or Geo profile, ingress limits, or the bind, exits before listening, so no probe answers. |
+| Cloudflare | Probes answer after Worker and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                                |
+| Spin       | Probes answer after component and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                             |
 
 No response is promised when a runtime cannot start, imports fail, a listener
 cannot bind, execution traps or hangs, conversion fails before dispatch, or the

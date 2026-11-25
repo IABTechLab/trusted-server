@@ -3,6 +3,7 @@
 //! An explicit legacy TS boot profile overrides EdgeZero's native Geo settings.
 //! When absent, EdgeZero resolves the provider before listening.
 
+use std::env::VarError;
 use std::fs;
 
 use edgezero_adapter_axum::geo::{NativeGeoSelection, ProtectedCloudFrontAlb};
@@ -17,8 +18,12 @@ pub(crate) const GEO_STORE_ID: &str = "geo_index";
 /// Declare the Geo store only for deployments selecting KV Geo through native settings.
 pub(crate) fn kv_selected() -> bool {
     cfg!(feature = "geo-kv")
-        && std::env::var_os(PROFILE_FILE_ENV).is_none()
-        && std::env::var("EDGEZERO__ADAPTER__GEO__PROVIDER").as_deref() == Ok("kv")
+        && matches!(
+            trusted_server_core::runtime_env!(PROFILE_FILE_ENV),
+            Err(VarError::NotPresent)
+        )
+        && trusted_server_core::runtime_env!("EDGEZERO__ADAPTER__GEO__PROVIDER").as_deref()
+            == Ok("kv")
 }
 
 /// Safe startup categories that never retain profile bytes or policy inputs.
@@ -64,8 +69,13 @@ enum GeoSelection {
 /// # Errors
 /// Returns a bounded category without the file path, input bytes, CIDRs or name.
 pub fn load_selection() -> Result<Option<NativeGeoSelection>, Report<NativeGeoProfileError>> {
-    let Some(path) = std::env::var_os(PROFILE_FILE_ENV) else {
-        return Ok(None);
+    let path = match trusted_server_core::runtime_env!(PROFILE_FILE_ENV) {
+        Ok(path) => path,
+        Err(VarError::NotPresent) => return Ok(None),
+        // A path that is not Unicode cannot name a readable profile.
+        Err(VarError::NotUnicode(_)) => {
+            return Err(Report::new(NativeGeoProfileError::Unavailable));
+        }
     };
     let bytes =
         fs::read_to_string(path).map_err(|_| Report::new(NativeGeoProfileError::Unavailable))?;
@@ -91,10 +101,31 @@ fn parse_selection(bytes: &str) -> Result<NativeGeoSelection, Report<NativeGeoPr
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt as _;
+
     use edgezero_adapter_axum::dev_server::AxumRunOptions;
     use edgezero_adapter_axum::geo::NativeGeoCapability;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_profile_path_is_unavailable() {
+        let path = std::ffi::OsStr::from_bytes(b"/nonexistent/profile-\xff.toml");
+        temp_env::with_var(PROFILE_FILE_ENV, Some(path), || {
+            let error = load_selection().expect_err("should reject a non-Unicode profile path");
+            assert_eq!(
+                *error.current_context(),
+                NativeGeoProfileError::Unavailable,
+                "should report a non-Unicode profile path as unavailable"
+            );
+            assert!(
+                !kv_selected(),
+                "should not declare the Geo store while a profile is selected"
+            );
+        });
+    }
 
     const PROFILE: &str = r#"version = 1
 [geo]
