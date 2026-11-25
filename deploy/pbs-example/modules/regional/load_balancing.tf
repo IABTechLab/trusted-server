@@ -7,6 +7,12 @@ resource "aws_lb" "main" {
   drop_invalid_header_fields = true
   idle_timeout               = 30
 
+  connection_logs {
+    enabled = var.connection_logs_bucket != null
+    # Provider 6.64.0 requires a bucket but does not send it when logs are off.
+    bucket = var.connection_logs_bucket == null ? "" : var.connection_logs_bucket
+  }
+
   tags = merge(var.tags, {
     Name = "${var.name}-alb"
   })
@@ -45,12 +51,33 @@ resource "aws_lb_target_group_attachment" "pbs" {
   port             = local.pbs_port
 }
 
+resource "aws_lb_trust_store" "clients" {
+  count = var.client_ca_bundle == null ? 0 : 1
+
+  # The 14-character prefix leaves room for -mtls- and a 12-character hash.
+  # Hash the original name to distinguish prefixes that normalize alike.
+  name                             = "${trim(substr(replace(var.name, "/-+/", "-"), 0, 14), "-")}-mtls-${substr(sha256(var.name), 0, 12)}"
+  ca_certificates_bundle_s3_bucket = var.client_ca_bundle.bucket
+  ca_certificates_bundle_s3_key    = var.client_ca_bundle.key
+  tags                             = var.tags
+
+  # Update the listener before deleting a trust store it still references.
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.main.arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = var.certificate_arn
+
+  mutual_authentication {
+    mode            = var.client_ca_bundle == null ? "off" : "verify"
+    trust_store_arn = one(aws_lb_trust_store.clients[*].arn)
+  }
 
   default_action {
     type             = "forward"

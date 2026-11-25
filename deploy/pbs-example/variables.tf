@@ -39,6 +39,29 @@ variable "east_certificate_arn" {
   }
 }
 
+variable "east_client_ca_bundle_s3_bucket" {
+  description = "Optional S3 bucket containing the us-east-1 ALB client CA bundle. Set with east_client_ca_bundle_s3_key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.east_client_ca_bundle_s3_bucket == null) == (var.east_client_ca_bundle_s3_key == null)
+    error_message = "east_client_ca_bundle_s3_bucket and east_client_ca_bundle_s3_key must both be set or both be null."
+  }
+}
+
+variable "east_client_ca_bundle_s3_key" {
+  description = "S3 object key for the us-east-1 ALB client CA bundle. Use a new key for each bundle revision."
+  type        = string
+  default     = null
+}
+
+variable "east_connection_logs_bucket" {
+  description = "Optional existing us-east-1 S3 bucket for ALB connection logs. Null disables logging."
+  type        = string
+  default     = null
+}
+
 variable "east_secrets_kms_key_arn" {
   description = "Optional us-east-1 customer-managed KMS key ARN for bidder secrets. Null uses the regional Secrets Manager service key."
   type        = string
@@ -124,6 +147,29 @@ variable "west_certificate_arn" {
     condition     = can(regex("^arn:aws[a-z-]*:acm:us-west-2:[0-9]{12}:certificate/.+$", var.west_certificate_arn))
     error_message = "west_certificate_arn must be an ACM certificate ARN in us-west-2."
   }
+}
+
+variable "west_client_ca_bundle_s3_bucket" {
+  description = "Optional S3 bucket containing the us-west-2 ALB client CA bundle. Set with west_client_ca_bundle_s3_key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.west_client_ca_bundle_s3_bucket == null) == (var.west_client_ca_bundle_s3_key == null)
+    error_message = "west_client_ca_bundle_s3_bucket and west_client_ca_bundle_s3_key must both be set or both be null."
+  }
+}
+
+variable "west_client_ca_bundle_s3_key" {
+  description = "S3 object key for the us-west-2 ALB client CA bundle. Use a new key for each bundle revision."
+  type        = string
+  default     = null
+}
+
+variable "west_connection_logs_bucket" {
+  description = "Optional existing us-west-2 S3 bucket for ALB connection logs. Null disables logging."
+  type        = string
+  default     = null
 }
 
 variable "west_secrets_kms_key_arn" {

@@ -9,7 +9,8 @@ use validator::Validate;
 const LEGACY_PROVIDER_LIST_MESSAGE: &str = "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration";
 
 pub use crate::auction::plan::{
-    BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
+    BidderId, BidderRouteConfig, MtlsSlot, NotificationConfig, ProviderConfig, ProviderId,
+    RoutingMode,
 };
 
 /// Auction orchestration configuration.
@@ -97,6 +98,16 @@ pub struct AuctionConfig {
     /// deduplicated and serialized in sorted order so config hashes are stable.
     #[serde(default = "default_allowed_context_keys")]
     pub allowed_context_keys: BTreeSet<String>,
+
+    /// Client identity slot that providers with `mtls = true` present: `blue` (the default)
+    /// or `green`.
+    ///
+    /// Each slot is its own client identity with its own certificate, hosts and private-key
+    /// entries. Rotate by provisioning the idle slot, waiting for those entries to propagate,
+    /// then switching this field. The default stays omitted from serialized config blobs;
+    /// `green` is serialized and rejected by binaries that predate this field.
+    #[serde(default, skip_serializing_if = "MtlsSlot::is_default")]
+    pub mtls_slot: MtlsSlot,
 }
 
 impl Default for AuctionConfig {
@@ -112,6 +123,7 @@ impl Default for AuctionConfig {
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
             allowed_context_keys: BTreeSet::new(),
+            mtls_slot: MtlsSlot::default(),
         }
     }
 }
@@ -208,6 +220,7 @@ impl AuctionConfig {
                     id,
                     ProviderConfig {
                         allow_insecure_http: false,
+                        mtls: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "standard".to_string(),
                         endpoint: format!("https://{name}.example/openrtb2/auction"),

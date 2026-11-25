@@ -50,8 +50,8 @@ jobs:
       - name: Check Docker Compose prerequisite
         run: docker compose version
 
-      # These suites use mocked providers and plan mode. No AWS credentials,
-      # Terraform apply, image pulls, or container startup are needed.
+      # The Terraform suites use mocked providers, including the mTLS
+      # apply tests. No AWS credentials or real applies are needed.
       - name: Format and test Terraform root
         run: |
           terraform fmt -check -recursive deploy/pbs-example
@@ -66,7 +66,9 @@ jobs:
           terraform -chdir=deploy/pbs-example/modules/regional test -filter=tests/security_unit_test.tftest.hcl
           git diff --exit-code -- deploy/pbs-example/.terraform.lock.hcl deploy/pbs-example/modules/regional/.terraform.lock.hcl
 
-      - name: Check runtime inputs and smoke wiring without starting containers
+      - name: Check runtime inputs and development certificates without starting containers
         run: |
           bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-          env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs
+          bash -n deploy/pbs-example/scripts/make-dev-mtls-certs.sh
+          env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-smoke-runtime.mjs
+          env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-make-dev-mtls-certs.mjs

@@ -64,6 +64,7 @@ pub fn compile_auction_plan(
         bidders: settings.auction.bidders.clone(),
         mediator: settings.auction.mediator.clone(),
         request_signing: settings.request_signing.clone(),
+        mtls_slot: settings.auction.mtls_slot,
     })
     .map(|plan| plan.with_enabled(settings.auction.enabled))
 }
@@ -193,6 +194,7 @@ mod plan_sharing_tests {
             "aps-main".parse().expect("should parse APS provider ID"),
             ProviderConfig {
                 allow_insecure_http: false,
+                mtls: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

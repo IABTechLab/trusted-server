@@ -2760,16 +2760,17 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                                                                  |
-| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
-| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
-| `timeout_ms`           | Integer | `2000`             | Deadline for additional auction network waiting, measured from dispatch                                      |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
+| Field                  | Type    | Default            | Description                                                                                                                     |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                                                 |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                                                  |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                                    |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping)                    |
+| `timeout_ms`           | Integer | `2000`             | Deadline for additional auction network waiting, measured from dispatch                                                         |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                                      |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                                      |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                                                  |
+| `mtls_slot`            | String  | `"blue"`           | Client identity slot that `mtls` providers present, `blue` or `green`; see [Provider mTLS](./auction-orchestration.md#rotation) |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -2924,18 +2925,20 @@ endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
 
-| Provider field   | Required | Default         | Description                                                   |
-| ---------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                         |
-| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                         |
-| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment   |
-| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap      |
-| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
-| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
-| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
+| Provider field   | Required | Default         | Description                                                     |
+| ---------------- | -------- | --------------- | --------------------------------------------------------------- |
+| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                           |
+| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                           |
+| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment     |
+| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap        |
+| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles              |
+| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                      |
+| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization   |
+| `mtls`           | No       | `false`         | Present the active `mtls_slot` client certificate (Fastly only) |
 
 A local test bidder's `endpoint` may instead be plain HTTP to `127.0.0.1` or
-`[::1]`.
+`[::1]`. A provider with `mtls = true` needs an `https` endpoint; see
+[Provider mTLS](./auction-orchestration.md#provider-mtls).
 
 ### Profile configuration
 

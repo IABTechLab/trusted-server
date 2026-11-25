@@ -1488,6 +1488,7 @@ mod tests {
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
                             allow_insecure_http: false,
+                            mtls: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: PLANNED_ENDPOINT.to_string(),
@@ -1506,6 +1507,7 @@ mod tests {
                 config_store_id: "fictional-config-store".to_string(),
                 secret_store_id: "fictional-secret-store".to_string(),
             }),
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2003,6 +2005,7 @@ mod tests {
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
                             allow_insecure_http: false,
+                            mtls: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "prebid-server".to_string(),
                             endpoint: format!("https://{id}.example.test/openrtb"),
@@ -2017,6 +2020,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2040,6 +2044,7 @@ mod tests {
                         ProviderId::from_str(id).expect("should parse fictional provider ID"),
                         ProviderConfig {
                             allow_insecure_http: false,
+                            mtls: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "aps".to_string(),
                             endpoint: APS_ENDPOINT.to_string(),
@@ -2054,6 +2059,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         }
     }
 
@@ -2094,6 +2100,187 @@ mod tests {
         request
     }
 
+    /// Providers with `mtls = true` whose client identity `EdgeZero` refuses.
+    mod client_identity_failure_tests {
+        use super::*;
+
+        const SECURED_BIDDER: &str = "https://secured.example.test/openrtb";
+
+        /// One provider per `(id, endpoint, mtls)`.
+        fn identity_plan(providers: &[(&str, &str, bool)]) -> Arc<AuctionPlan> {
+            let mut config = planned_config(
+                &providers
+                    .iter()
+                    .map(|(id, _, _)| (*id, RoutingMode::AllEligible))
+                    .collect::<Vec<_>>(),
+                false,
+            );
+            for (id, endpoint, mtls) in providers {
+                let provider = config
+                    .providers
+                    .get_mut(&ProviderId::from_str(id).expect("should parse fictional provider ID"))
+                    .expect("should configure the provider");
+                provider.endpoint = (*endpoint).to_string();
+                provider.mtls = *mtls;
+            }
+            Arc::new(AuctionPlan::compile(config).expect("should compile the identity plan"))
+        }
+
+        fn error_type_by_provider(
+            result: &OrchestrationResult,
+        ) -> BTreeMap<&str, Option<serde_json::Value>> {
+            error_types(result).into_iter().collect()
+        }
+
+        fn requests_to(bidders: &ScriptedHttpClient, endpoint: &str) -> usize {
+            bidders
+                .requests()
+                .iter()
+                .filter(|request| request.uri == endpoint)
+                .count()
+        }
+
+        #[test]
+        fn undeclared_identity_fails_only_its_provider_before_any_request() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            bidders.respond_to(Method::POST, WINNING_BIDDER, bid_reply(2.0));
+            // A client without the manifest's identity policy refuses the identity in core.
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                identity_plan(&[
+                    ("secured", SECURED_BIDDER, true),
+                    ("winner", WINNING_BIDDER, false),
+                ]),
+                None,
+            );
+            let context = launch_context(&settings, &inbound, &services);
+
+            let result = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect("should complete the auction beside the identity failure");
+
+            assert_eq!(
+                error_type_by_provider(&result),
+                BTreeMap::from([
+                    ("secured", Some(serde_json::json!(ERROR_TYPE_TRANSPORT))),
+                    ("winner", None),
+                ]),
+                "should settle the refused identity as that provider's transport failure"
+            );
+            assert_eq!(
+                result
+                    .get_winning_bid("fictional-slot")
+                    .and_then(|bid| bid.price),
+                Some(2.0),
+                "should keep the other provider's bid"
+            );
+            assert_eq!(
+                requests_to(&bidders, SECURED_BIDDER),
+                0,
+                "should send nothing to the provider whose identity core refused"
+            );
+        }
+
+        #[test]
+        fn missing_identity_material_fails_only_its_provider_without_retry() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            let name = edgezero_core::outbound::ClientIdentityName::new(
+                crate::auction::plan::MtlsSlot::Blue.identity_name(),
+            )
+            .expect("should accept the identity name");
+            bidders.respond_to(
+                Method::POST,
+                SECURED_BIDDER,
+                ScriptedReply::error(EdgeError::client_identity(
+                    &name,
+                    edgezero_core::outbound::ClientIdentityError::MaterialMissing {
+                        which: edgezero_core::outbound::ClientIdentityMaterial::Key,
+                    },
+                )),
+            );
+            bidders.respond_to(Method::POST, WINNING_BIDDER, bid_reply(2.0));
+            let services = RuntimeServices {
+                outbound_client: bidders.http_client_with_manifest_identities(),
+                ..build_services_with_outbound_client(&bidders, &clock)
+            };
+            let orchestrator = AuctionOrchestrator::from_plan(
+                identity_plan(&[
+                    ("secured", SECURED_BIDDER, true),
+                    ("winner", WINNING_BIDDER, false),
+                ]),
+                None,
+            );
+            let context = launch_context(&settings, &inbound, &services);
+
+            let result = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect("should complete the auction beside the identity failure");
+
+            assert_eq!(
+                error_type_by_provider(&result),
+                BTreeMap::from([
+                    ("secured", Some(serde_json::json!(ERROR_TYPE_TRANSPORT))),
+                    ("winner", None),
+                ]),
+                "should settle missing material as that provider's transport failure"
+            );
+            assert_eq!(
+                result
+                    .get_winning_bid("fictional-slot")
+                    .and_then(|bid| bid.price),
+                Some(2.0),
+                "should keep the other provider's bid"
+            );
+            let secured = bidders
+                .requests()
+                .into_iter()
+                .filter(|request| request.uri == SECURED_BIDDER)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                secured
+                    .iter()
+                    .map(|request| request.client_identity.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![Some(crate::auction::plan::MtlsSlot::Blue.identity_name())],
+                "should try once with the identity and never retry without it"
+            );
+        }
+
+        #[test]
+        fn a_lone_identity_failure_completes_without_bids() {
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let clock = TestClock::new();
+            let bidders = ScriptedHttpClient::new(&clock);
+            let services = build_services_with_outbound_client(&bidders, &clock);
+            let orchestrator = AuctionOrchestrator::from_plan(
+                identity_plan(&[("secured", SECURED_BIDDER, true)]),
+                None,
+            );
+            let context = launch_context(&settings, &inbound, &services);
+
+            let result = clock
+                .drive(orchestrator.run_auction(&planned_request(), &context))
+                .expect("should complete, not fail as an all-launch failure");
+
+            assert_eq!(
+                error_type_by_provider(&result),
+                BTreeMap::from([("secured", Some(serde_json::json!(ERROR_TYPE_TRANSPORT)))]),
+                "should report the transport failure"
+            );
+            assert!(
+                result.get_winning_bid("fictional-slot").is_none(),
+                "should complete without a bid"
+            );
+        }
+    }
+
     /// Bidders and the mediator through `EdgeZero` batches on the scripted client.
     mod batch_tests {
         use super::*;
@@ -2132,6 +2319,7 @@ mod tests {
                                     .expect("should parse fictional provider ID"),
                                 ProviderConfig {
                                     allow_insecure_http: false,
+                                    mtls: false,
                                     protocol: "openrtb-2.6".to_string(),
                                     profile: "standard".to_string(),
                                     endpoint: (*endpoint).to_string(),
@@ -2146,6 +2334,7 @@ mod tests {
                     bidders: BTreeMap::new(),
                     mediator: None,
                     request_signing: None,
+                    mtls_slot: Default::default(),
                 })
                 .expect("should compile the batch plan"),
             )
