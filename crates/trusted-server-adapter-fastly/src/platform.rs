@@ -205,8 +205,21 @@ fn write_client(
 // ---------------------------------------------------------------------------
 
 /// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
-fn geo_from_fastly(geo: &Geo) -> GeoInfo {
-    GeoInfo {
+///
+/// Returns `None` unless the country belongs to the ISO-assigned catalogue in
+/// the pinned `EdgeZero` revision. This includes rejecting unassigned codes
+/// such as `XK`, aggregate codes such as `EU`/`AP`, and `A1`/`A2`/`O1`.
+/// Unknown-subdivision sentinels (`?`, `NO REGION`, and empty) and other values
+/// failing the pinned `EdgeZero` `SubdivisionCode` syntax check become an absent
+/// region. The valid country is retained, matching `GeoOutcome::platform`.
+/// This conversion does not consult consent configuration or choose jurisdiction.
+/// Valid SDK country and subdivision representations are preserved verbatim.
+fn geo_from_fastly(geo: &Geo) -> Option<GeoInfo> {
+    edgezero_core::geo::CountryCode::new(geo.country_code()).ok()?;
+    let region = geo
+        .region()
+        .filter(|region| edgezero_core::geo::SubdivisionCode::new(region).is_ok());
+    Some(GeoInfo {
         city: Some(geo.city().to_string()),
         country: geo.country_code().to_string(),
         continent: Some(format!("{:?}", geo.continent())),
@@ -215,9 +228,9 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
             longitude: geo.longitude(),
         }),
         metro_code: Some(geo.metro_code()),
-        region: geo.region().map(str::to_string),
+        region: region.map(str::to_string),
         asn: None,
-    }
+    })
 }
 
 /// The geo result the entry point looks up once for a request's resolved client IP.
@@ -262,7 +275,7 @@ impl RequestGeo {
             client_ip,
             geo: client_ip
                 .and_then(geo_lookup)
-                .map(|geo| geo_from_fastly(&geo)),
+                .and_then(|geo| geo_from_fastly(&geo)),
         }
     }
 

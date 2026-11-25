@@ -98,3 +98,118 @@ Safari cookie lifetime; these remain broader feature/runtime qualification.
 The production DynamoDB image fixture separately exercises a pending record
 write during SIGTERM. Later adapter integration remains separate from this
 Fastly/Axum application conformance.
+
+## Geo and consent conformance
+
+The shared location table is
+`trusted-server-core/src/test_support/fixtures/geo-consent.json`; its Cartesian
+product with eight consent signals, six entry points and new/returning readers
+runs through the application. It covers DE, GB, US-CA, US-WY, country-only US,
+JP, missing/invalid/partial geography, lowercase input, untrusted ingress,
+provider failure and native provider selection being off. The current configured
+country/state decision rules remain unchanged, including country-only US being
+non-regulated. Fastly admits only countries in the pinned EdgeZero ISO-assigned
+catalogue: unsupported codes become Unknown and fail closed, matching Axum,
+instead of reaching NonRegulated.
+
+```bash
+cargo test-axum --features geo-cloudfront geo_consent
+node scripts/test-geo-consent.mjs /path/to/isolated/viceroy
+node --test --test-timeout=60000 scripts/test-geo-consent.test.mjs
+```
+
+The Fastly launcher requires the Viceroy version pinned in `.tool-versions`. It
+resolves the repository from its own file location, so it can be invoked from
+another working directory. Timed-out commands and handled interruptions kill the
+child process group on POSIX systems, including descendants; launcher tests
+cover both living and exited parents. An optional second argument supplies an
+already-built test WASM binary. Otherwise it discovers the adapter test WASM
+artifact from Cargo JSON. In both modes it generates a temporary geolocation
+mapping from the shared table, disables default loopback geo, runs the real
+Fastly lookup and requires both exact test names to pass. These two runtime
+tests have an explicit `ignore` reason because an ordinary Cargo invocation has
+no mapping; the launcher runs them with `--ignored`, and the Fastly CI job runs
+the launcher. These synthetic Fastly requests have no peer IP; rejected
+forwarding therefore leaves no client IP and no location. This distinguishes
+rejection from an authenticated reader IP. Separate controls cover duplicate
+IP/auth headers, a malformed IP list, missing authentication and authenticated
+IPv6 with a forged forwarding header. Production falls back to the actual peer,
+which can have its own valid geography.
+
+The Axum matrix uses managed native ingress with protected CloudFront selected,
+the actual TS router/middleware/finalizer and request-derived runtime services.
+The test-only initializer binds a recording store and capturing HTTP transport;
+it never supplies jurisdiction, decoded consent or a fixed geo service. A
+supplied provider returning failure exercises the managed error projection;
+untrusted and unselected sources exercise their actual ingress outcomes. The
+separate `startup::managed_geo_consumers::geo_consent_runtime_axum` integration
+test starts the production Axum binary with disposable profiles and observes
+real HTTP bidder requests. CloudFront admission relies on the declared protected
+peer network; credential verification belongs to that protected ALB, not
+header-value matching inside Trusted Server.
+
+The assertions observe Set-Cookie, response geo headers and actual bidder JSON
+(country, subdivision, GDPR, GPP sections and US Privacy), after consuming the
+response body. New EC creation is limited to document/EC POST responses. Unknown
+geo never creates an EC, even with TCF Purpose 1, while that consent permits the
+auction. Returning ECs remain live with unknown geography. Withdrawal follows
+the existing jurisdiction-specific policy: GDPR TCF denial and applicable US
+opt-outs expire the cookie and tombstone its record; Unknown and NonRegulated
+retain it. EC GET is read-only and does not finalize withdrawal. Record liveness
+is the one internal observation: response cookie retention cannot prove whether
+a backend row was silently tombstoned.
+
+Axum normalizes valid lowercase country/subdivision input before consumers see
+it. Fastly preserves the SDK's representation for valid values, as
+`geo_from_fastly` does; both select the same jurisdiction for lowercase US/CA.
+Fastly rejects every country outside the pinned EdgeZero ISO-assigned catalogue
+at that conversion boundary, including XK, EU, AP, A1, A2 and O1.
+Fastly's unknown-subdivision sentinels (`?`, `NO REGION`, and empty) are treated
+as an absent region. Other malformed subdivisions also fail the pinned EdgeZero
+`SubdivisionCode` syntax check and are dropped while the valid country survives.
+The producer does not read consent configuration or choose a jurisdiction.
+Country-only US therefore remains NonRegulated under the existing configured
+rules, including when the SDK supplied a sentinel or malformed subdivision;
+TCF denial retains a returning EC there. A retained GDPR country such as DE
+still applies GDPR withdrawal. Absent subdivisions, syntax-valid `US/ZZ`, and
+valid SDK representations retain their existing behavior.
+
+This country-only projection matches EdgeZero's `GeoOutcome::platform`. Axum's
+protected CloudFront provider instead rejects the whole malformed assertion, so
+these DE and US cases remain Unknown on that path. The shared table records
+this producer difference explicitly. Fastly continues to use its local lookup.
+
+The mapped Fastly test also explicitly pins a known deferred exception: a
+no-location document whose origin supplies `x-geo-country: DE` and
+`x-geo-region: BE` currently retains those headers alongside
+`x-geo-info-available: false`. EC/auction assertions still require Unknown and
+no outbound device geo. This is the
+[#1532 deferral](https://github.com/IABTechLab/trusted-server/pull/1532#discussion_r4569600903),
+not an ignored failing test; a future header-clearing fix must update the
+passing current-behavior assertion deliberately. Repository browser/CMP/auction
+sources contain no consumer of these response geo headers; Didomi constructs
+outbound geo from the trusted service instead.
+
+To add an adapter, implement
+`trusted_server_core::test_support::geo_consent::Adapter`: send the raw request
+through real routing, ingress trust and finalization; consume the body; return
+the finalized status/headers and bidder bodies actually dispatched; expose an
+authoritative fixture-record liveness check. Support the table's producer states
+without injecting expected policy. Select the producer's expected projection,
+including casing and invalid-subdivision handling, and document genuinely
+unavailable states rather than silently skipping them. Producer expectation
+overrides apply only after the real exchange. Keep separate runtime acceptance
+for the shipping adapter/provider path.
+
+Evidence categories remain separate: upstream EdgeZero contract tests do not
+qualify this application; the shared matrix qualifies the TS request paths; the
+Viceroy mapping and production Axum process qualify local runtime integration.
+No live cloud deployment, vendor service or browser/CMP qualification is
+implied.
+
+API/KV timeouts are N/A for these tested producers: CloudFront resolves local
+request headers and Fastly uses a synchronous local host lookup. Axum `geo-kv`
+is untested; its API/KV failure and timeout behavior still needs coverage.
+Cloudflare and Spin adoption after EdgeZero #480/#486 and R3, running this suite
+there, API/KV failure/timeout cases, operator documentation and the decision on
+migrating Fastly to `ctx.geo()` remain #1518 follow-ups.
