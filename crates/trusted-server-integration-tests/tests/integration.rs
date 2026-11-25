@@ -2089,18 +2089,18 @@ fn spin_runtime_discovery_reads_signing_metadata_from_default() {
             let response =
                 reqwest::blocking::get(format!("{base_url}/.well-known/trusted-server.json"))
                     .expect("should request the discovery document");
-            let status = response.status().as_u16();
-            let body = response.text().expect("should read the discovery document");
             assert_eq!(
-                status, 200,
-                "Spin discovery should read signing metadata from `default`: {body}"
+                response.status().as_u16(),
+                200,
+                "Spin discovery should read signing metadata from `default`"
             );
-            let document: serde_json::Value =
-                serde_json::from_str(&body).expect("should return a JSON discovery document");
+            let document: serde_json::Value = response
+                .json()
+                .expect("should return a JSON discovery document");
             assert_eq!(
                 document["jwks"]["keys"][0]["kid"],
                 serde_json::json!("example-kid-a"),
-                "discovery should publish the active key seeded in `default`: {body}"
+                "discovery should publish the active key seeded in `default`: {document}"
             );
         },
     );
