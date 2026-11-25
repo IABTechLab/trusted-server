@@ -176,7 +176,7 @@ pub async fn dispatch_pull_sync(
         return;
     }
 
-    let live_snapshot = kv.load_snapshot(context.ec_id());
+    let live_snapshot = kv.load_snapshot(context.ec_id()).await;
     let Some(live_entry) = live_snapshot.entry_for(context.ec_id()) else {
         log::warn!(
             "Pull sync: skipping dispatch for '{}' because the live identity row could not be \
@@ -267,8 +267,9 @@ pub async fn dispatch_pull_sync(
         // Write back from the revalidated snapshot, not the request one: its
         // generation is current, so the first CAS attempt is not spent losing a
         // conflict against the read that authorized this dispatch.
-        let outcome =
-            kv.upsert_partner_ids_from_snapshot(context.ec_id(), &updates, live_snapshot.clone());
+        let outcome = kv
+            .upsert_partner_ids_from_snapshot(context.ec_id(), &updates, live_snapshot.clone())
+            .await;
         if matches!(outcome, EcKvSnapshot::Failed { .. }) {
             log::warn!(
                 "Pull sync: failed to persist partner updates for '{}'",
@@ -563,8 +564,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_pull_sync_context_returns_context_when_valid() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_returns_context_when_valid() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
@@ -572,7 +573,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id).await);
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
@@ -602,8 +603,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
         // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
         // writes and leaves partner slots empty. Pull sync must not read those
         // empty slots as eligible and disclose the EC ID to partners.
@@ -611,7 +612,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id).await);
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
         assert!(
@@ -627,8 +628,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
@@ -636,7 +637,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
-        let mut snapshot = seed_present_snapshot(&graph, &ec_id);
+        let mut snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
@@ -900,11 +901,14 @@ mod tests {
         format!("https://{source_domain}/sync?ec_id={}", snapshot_ec_id())
     }
 
-    fn seed_present_snapshot(graph: &KvIdentityGraph, ec_id: &str) -> EcKvSnapshot {
+    async fn seed_present_snapshot(graph: &KvIdentityGraph, ec_id: &str) -> EcKvSnapshot {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
-        graph.create(ec_id, &entry).expect("should seed live entry");
-        graph.load_snapshot(ec_id)
+        graph
+            .create(ec_id, &entry)
+            .await
+            .expect("should seed live entry");
+        graph.load_snapshot(ec_id).await
     }
 
     /// Runs pull sync to completion on `clock`, advancing it as the requests wait.
@@ -928,7 +932,53 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
+    fn dispatch_pull_sync_runs_inside_the_fastly_executor_boundary() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                    .expect("should build registry");
+            let graph = KvIdentityGraph::in_memory("pull_store");
+            let ec_id = snapshot_ec_id();
+            let snapshot = seed_present_snapshot(&graph, &ec_id).await;
+            let clock = TestClock::new();
+            let client = ScriptedHttpClient::new(&clock);
+            client.respond_to(
+                Method::GET,
+                &pull_url("alpha.example.com"),
+                ScriptedReply::status(StatusCode::OK).body(r#"{"uid":"synced-uid"}"#),
+            );
+            let context = PullSyncContext {
+                ec_id: ec_id.clone(),
+                snapshot,
+            };
+
+            dispatch_pull_sync(
+                &settings,
+                &graph,
+                &registry,
+                &AllowAllRateLimiter,
+                &context,
+                &client.http_client(),
+                &clock.monotonic_clock(),
+            )
+            .await;
+
+            assert_eq!(client.requests().len(), 1);
+            let (entry, _) = graph
+                .get(&ec_id)
+                .await
+                .expect("should read row")
+                .expect("row should exist");
+            assert_eq!(
+                entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+                Some("synced-uid"),
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
         let mut settings = create_test_settings();
         // Force one partner per concurrency batch so responses span batches.
         settings.ec.pull_sync_concurrency = 1;
@@ -940,7 +990,7 @@ mod tests {
 
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
 
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
@@ -961,6 +1011,7 @@ mod tests {
 
         let (entry, generation) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the entry");
         assert_eq!(
@@ -979,8 +1030,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_sends_each_partner_its_bearer_token_and_transport() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_sends_each_partner_its_bearer_token_and_transport() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -988,7 +1039,7 @@ mod tests {
                 .expect("should build pull registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client.respond_to(
@@ -1021,8 +1072,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn pull_sync_group_ends_at_fifteen_second_cutoff() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_group_ends_at_fifteen_second_cutoff() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 2;
         let registry = PartnerRegistry::from_config(&[
@@ -1032,7 +1083,7 @@ mod tests {
         .expect("should build pull registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let clock = TestClock::new();
         let started = clock.monotonic_clock().now();
         let client = ScriptedHttpClient::new(&clock);
@@ -1079,6 +1130,7 @@ mod tests {
         }
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the entry");
         assert_eq!(
@@ -1092,8 +1144,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pull_sync_failures_log_one_line_each() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_failures_log_one_line_each() {
         let mut settings = create_test_settings();
         // One partner per group, so the failing batch ends only its own group.
         settings.ec.pull_sync_concurrency = 1;
@@ -1107,7 +1159,7 @@ mod tests {
         .expect("should build pull registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client
@@ -1158,8 +1210,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pull_sync_group_failure_names_every_partner_of_the_group() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_sync_group_failure_names_every_partner_of_the_group() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 2;
         let registry = PartnerRegistry::from_config(&[
@@ -1169,7 +1221,7 @@ mod tests {
         .expect("should build pull registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client
@@ -1214,6 +1266,7 @@ mod tests {
         );
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the entry");
         assert_eq!(
@@ -1223,8 +1276,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_drops_a_response_over_the_pull_cap() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_drops_a_response_over_the_pull_cap() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1232,7 +1285,7 @@ mod tests {
                 .expect("should build pull registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         let oversized = format!(
@@ -1253,6 +1306,7 @@ mod tests {
 
         let (entry, generation) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the entry");
         assert!(
@@ -1262,8 +1316,8 @@ mod tests {
         assert_eq!(generation, 1, "should not write the row back");
     }
 
-    #[test]
-    fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry = PartnerRegistry::from_config(&[
@@ -1278,8 +1332,9 @@ mod tests {
                 &ec_id,
                 &KvEntry::minimal("alpha.example.com", "existing-alpha", 1_000),
             )
+            .await
             .expect("should seed partial entry");
-        let snapshot = graph.load_snapshot(&ec_id);
+        let snapshot = graph.load_snapshot(&ec_id).await;
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
         client.respond_to(
@@ -1306,6 +1361,7 @@ mod tests {
         );
         let (entry, generation) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the entry");
         assert_eq!(
@@ -1327,8 +1383,8 @@ mod tests {
         assert_eq!(generation, 2, "missing UID should use one bulk CAS write");
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_non_present_snapshots() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_non_present_snapshots() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1357,13 +1413,17 @@ mod tests {
 
         client.assert_no_requests();
         assert!(
-            graph.get(&ec_id).expect("should read store").is_none(),
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should read store")
+                .is_none(),
             "no snapshot state should create a missing root"
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_tombstone_snapshot() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_tombstone_snapshot() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1388,8 +1448,8 @@ mod tests {
         client.assert_no_requests();
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_dispatch_when_ec_is_tombstoned_after_snapshot_capture() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_dispatch_when_ec_is_tombstoned_after_snapshot_capture() {
         // The request snapshot authorized pull sync, then a concurrent request
         // completed a CMP withdrawal while the page response was in flight.
         // Pull sync runs post-send and discloses the raw `ec_id` to partners, so
@@ -1402,12 +1462,13 @@ mod tests {
                 .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
-        let snapshot = seed_present_snapshot(&graph, &ec_id);
+        let snapshot = seed_present_snapshot(&graph, &ec_id).await;
 
         // Concurrent withdrawal lands after the snapshot was captured.
         assert_eq!(
             graph
                 .write_withdrawal_tombstone(&ec_id, drop)
+                .await
                 .expect("should tombstone the row"),
             TombstoneOutcome::Written,
             "should tombstone the row the snapshot still reports as present"
@@ -1425,6 +1486,7 @@ mod tests {
         client.assert_no_requests();
         let (entry, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("should keep the tombstone");
         assert!(
@@ -1433,8 +1495,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_pull_sync_skips_revalidation_read_when_no_partner_is_eligible() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_pull_sync_skips_revalidation_read_when_no_partner_is_eligible() {
         // Every pull-enabled partner already has a UID in the request snapshot,
         // so there is nothing to dispatch. The revalidation read exists to
         // authorize outbound calls; with no calls to authorize it must not cost
@@ -1456,6 +1518,7 @@ mod tests {
         );
         graph
             .create(&ec_id, &entry)
+            .await
             .expect("should seed live entry");
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),

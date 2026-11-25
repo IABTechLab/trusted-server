@@ -504,7 +504,14 @@ fn finalize_response(
     }
 
     let state = ec_state.and_then(|mut ec_state| {
-        match apply_edgezero_ec_finalize(inputs.settings, &mut ec_state, response) {
+        // `EdgeZero` calls `finalize` synchronously after its dispatch executor
+        // has returned, and Fastly's KV SDK completes I/O through blocking
+        // hostcalls. Keep this bridge here, never in native or worker executors.
+        match futures::executor::block_on(apply_edgezero_ec_finalize(
+            inputs.settings,
+            &mut ec_state,
+            response,
+        )) {
             Ok(partner_registry) => Some(FinalizeState {
                 partner_registry,
                 ec_state,
@@ -635,7 +642,7 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-fn apply_edgezero_ec_finalize(
+async fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
@@ -654,7 +661,8 @@ fn apply_edgezero_ec_finalize(
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+    )
+    .await;
     Ok(partner_registry)
 }
 
