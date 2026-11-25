@@ -9,6 +9,7 @@ use edgezero_core::http::{Method, Request, StatusCode, header, request_builder};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use error_stack::Report;
 use futures::executor::block_on;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
@@ -18,7 +19,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::identity_conformance::{
     Adapter, ApiObservation, ApiRequest, Consent, Geo, Navigation, Observation, RecordingStore,
     Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
-    verify_failed_ec_creation, verify_http_contract,
+    verify_failed_ec_creation, verify_http_contract, verify_known_non_browser_navigation,
 };
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
@@ -213,6 +214,12 @@ impl AxumAdapter {
             InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
                 .expect("should validate fixture public origin"),
         ));
+        if api.is_some_and(|request| request.known_non_browser) {
+            request.extensions_mut().insert(DeviceSignals {
+                known_browser: Some(false),
+                ..DeviceSignals::derive(USER_AGENT, None, None)
+            });
+        }
         let response = block_on(router.oneshot(request)).expect("should dispatch the real router");
         let cache_control = response
             .headers()
@@ -275,6 +282,17 @@ fn identity_conformance_axum() {
         store: store.clone(),
     };
     verify_failed_ec_creation(&mut adapter, &store);
+}
+
+#[test]
+fn known_non_browser_navigation_axum() {
+    let store = RecordingStore::new(false);
+    verify_known_non_browser_navigation(
+        &mut AxumAdapter {
+            store: store.clone(),
+        },
+        &store,
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -651,8 +651,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
