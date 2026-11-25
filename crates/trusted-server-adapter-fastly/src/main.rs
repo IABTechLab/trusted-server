@@ -9,16 +9,17 @@ use edgezero_adapter_fastly::request::{
 };
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+#[cfg(test)]
+use edgezero_core::http::Request as HttpRequest;
+use edgezero_core::http::{Extensions, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+#[cfg(test)]
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
@@ -38,7 +39,7 @@ mod compat;
 #[cfg(test)]
 mod deadline_network;
 mod delivery;
-mod ec_kv;
+mod ec_record_store;
 mod esi_assembly;
 #[cfg(test)]
 mod identity_conformance;
@@ -54,8 +55,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
-    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+    load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
 use crate::middleware::{
@@ -379,10 +380,6 @@ fn serve(
         geo: request_geo.geo(),
         counters,
     };
-    // Identity lookups a navigation dispatches wait in a request-local slot
-    // until `finalize` collects them. Drop anything an earlier request on
-    // this sandbox left there, which cancels its requests.
-    drop(take_navigation_lookups());
     let delivery = with_finalization(&inputs, |finalize| {
         send_request_with_registries_and_hooks(
             &retained.app,
@@ -395,8 +392,6 @@ fn serve(
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
-    // A detached response never reaches `finalize`; release its lookups now.
-    drop(take_navigation_lookups());
 }
 
 /// Supplies the production finalization callback to a request lifecycle.
@@ -518,8 +513,8 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters. EC finalization first collects the identity lookups the
-/// navigation dispatched.
+/// sandbox counters. The handler has already collected the navigation's
+/// page-phase identity lookups into the EC context.
 ///
 /// Returns the inputs post-delivery work needs, pull sync and after-response
 /// lookups, or `None` when the response carries no EC state.
@@ -528,12 +523,6 @@ fn finalize_response(
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
     let settings = inputs.state.settings.as_ref();
-    // Identity lookups this request dispatched, taken whatever the response
-    // so none outlives it.
-    let NavigationLookups {
-        page: identity,
-        after_response,
-    } = take_navigation_lookups();
     // Trace and operational responses keep their exact hardened headers; no
     // finalizer touches them.
     if response
@@ -562,14 +551,14 @@ fn finalize_response(
         // `EdgeZero` calls `finalize` synchronously after its dispatch executor
         // has returned, and Fastly's KV SDK completes I/O through blocking
         // hostcalls. Keep this bridge here, never in native or worker executors.
-        // Identity lookups are collected inside it, so their wait never nests
-        // in the router's executor.
+        // The navigation's page-phase identity lookups were already collected
+        // by the handler into the EC context.
         futures::executor::block_on(apply_edgezero_ec_finalize(
             inputs.state,
             &mut ec_state,
-            identity,
             response,
         ));
+        let after_response = ec_state.after_response.take();
         FinalizeState {
             identity: Arc::clone(&inputs.state.identity),
             ec_state,
@@ -734,48 +723,24 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// Runs EC finalization for a routed response with the identity app's partner
 /// registry and record store.
 ///
-/// Collects `identity` lookups first, unless the response is a redirect,
-/// whose navigation writes nothing. The caller drives this future with the
-/// one `block_on` outside the router's executor.
+/// The navigation's page-phase lookup results are already on the EC context.
+/// The caller drives this future with the one `block_on` outside the
+/// router's executor.
 async fn apply_edgezero_ec_finalize(
     state: &AppState,
     ec_state: &mut EcFinalizeState,
-    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) {
-    // A redirect skips the write, so do not wait for lookups it would discard.
-    let identity = identity.filter(|_| {
-        let redirect = NavigationPermit::is_redirect(response.status());
-        if redirect {
-            log::debug!("Identity lookups dropped: redirect response skips the write");
-        }
-        !redirect
-    });
-    if let Some(IdentityLookups {
-        coordinator,
-        transport,
-        pending,
-    }) = identity
-    {
-        let results = coordinator.collect(&transport, pending).await;
-        ec_state.ec_context.set_lookup_results(results);
-    }
     let identity_app = &state.identity;
-    let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity_app.identity_graph()
-    } else {
-        None
-    };
-    ec_finalize_response(
-        identity_app.settings(),
-        &mut ec_state.ec_context,
-        finalize_kv_graph.as_ref(),
-        identity_app.partners(),
-        ec_state.eids_cookie.as_deref(),
-        &ec_state.sharedid,
-        response,
-    )
-    .await;
+    identity_app
+        .finalize(
+            &mut ec_state.ec_context,
+            ec_state.eids_cookie.as_deref(),
+            &ec_state.sharedid,
+            ec_state.use_finalize_kv,
+            response,
+        )
+        .await;
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -869,20 +834,6 @@ pub(crate) fn require_identity_graph(
     })
 }
 
-/// Extracts a named cookie value from the request's `Cookie` header.
-pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
-    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
 /// Derives device signals from TLS, H2, and UA request data.
 ///
 /// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
@@ -902,7 +853,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use base64::Engine as _;
-    use edgezero_adapter_fastly::request::FastlyService;
     use edgezero_core::app::App;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::context::RequestContext;
@@ -1254,12 +1204,15 @@ mod tests {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
 
-            let _delivery = FastlyService::new(&app).run_request_with_hooks_for_test(
-                req,
-                |_req, _extensions| {},
-                |_| (),
-                committed,
-            );
+            let _delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &app,
+                    TrustedServerApp::stores(),
+                    req,
+                    |_req, _extensions| {},
+                    |_| (),
+                    committed,
+                );
 
             // Admission may refuse an odd target before the hook runs, which
             // keeps it out of ordinary dispatch too.
@@ -1308,27 +1261,32 @@ mod tests {
                 counters: &counters,
             };
 
-            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
-                FastlyRequest::get("https://publisher.example.com/static/tsjs=tsjs-unified.min.js"),
-                |_req, extensions| {
-                    extensions.insert(ClientInfo::default());
-                    extensions.insert(RequestGeo::default());
-                },
-                |response: &mut HttpResponse| {
-                    statuses.push(response.status());
-                    finalize_response(response, &inputs)
-                },
-                |envelope| {
-                    if request == 0 {
-                        committed_then_failed(
-                            envelope,
-                            edgezero_adapter_fastly::delivery::DeliveryError::Transport,
-                        )
-                    } else {
-                        committed(envelope)
-                    }
-                },
-            );
+            let delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &retained.app,
+                    TrustedServerApp::stores(),
+                    FastlyRequest::get(
+                        "https://publisher.example.com/static/tsjs=tsjs-unified.min.js",
+                    ),
+                    |_req, extensions| {
+                        extensions.insert(ClientInfo::default());
+                        extensions.insert(RequestGeo::default());
+                    },
+                    |response: &mut HttpResponse| {
+                        statuses.push(response.status());
+                        finalize_response(response, &inputs)
+                    },
+                    |envelope| {
+                        if request == 0 {
+                            committed_then_failed(
+                                envelope,
+                                edgezero_adapter_fastly::delivery::DeliveryError::Transport,
+                            )
+                        } else {
+                            committed(envelope)
+                        }
+                    },
+                );
             handle_delivery(delivery, &counters, |_state| post_delivery += 1);
         }
 
@@ -1379,16 +1337,19 @@ mod tests {
             ),
         ] {
             let capture = LogCapture::start();
-            let delivery = FastlyService::new(&retained.app).run_request_with_hooks_for_test(
-                request,
-                |_req, extensions| {
-                    extensions.insert(per_request_synthesized_headers(&settings, None));
-                    extensions.insert(ClientInfo::default());
-                    extensions.insert(RequestGeo::default());
-                },
-                |response: &mut HttpResponse| finalize_response(response, &inputs),
-                committed,
-            );
+            let delivery =
+                edgezero_adapter_fastly::request::run_request_with_registries_and_hooks_for_test(
+                    &retained.app,
+                    TrustedServerApp::stores(),
+                    request,
+                    |_req, extensions| {
+                        extensions.insert(per_request_synthesized_headers(&settings, None));
+                        extensions.insert(ClientInfo::default());
+                        extensions.insert(RequestGeo::default());
+                    },
+                    |response: &mut HttpResponse| finalize_response(response, &inputs),
+                    committed,
+                );
             handle_delivery(delivery, &counters, |_state| {});
 
             let skipped = capture
@@ -1537,19 +1498,25 @@ mod tests {
         // A returning reader withdraws consent with GPC in a US state.
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let request = edgezero_core::http::request_builder()
+            .method(Method::GET)
             .uri("https://www.example.com/article")
+            .header("sec-fetch-dest", "document")
             .header("cookie", format!("ts-ec={ec_id}"))
             .header("sec-gpc", "1")
             .body(EdgeBody::empty())
             .expect("should build the reader request");
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");
+        ec_context.set_navigation_permit(
+            NavigationPermit::classify(&request).expect("should classify the document navigation"),
+        );
         let mut page = response_builder()
+            .header("content-type", "text/html; charset=utf-8")
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build the page response");
@@ -1558,6 +1525,7 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            after_response: None,
         });
 
         let state = finalize_response(&mut page, &inputs);
@@ -1586,8 +1554,8 @@ mod tests {
         );
         assert_eq!(
             page_header("cache-control").as_deref(),
-            Some("private, max-age=0"),
-            "should keep a cookie-bearing response out of shared caches"
+            Some("no-store, private"),
+            "should preserve terminal privacy for a core-generated identity expiry"
         );
 
         // An asset response keeps its protected cache policy and, being
@@ -1805,6 +1773,43 @@ mod tests {
         );
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
+    #[test]
+    fn fastly_graph_selection_selects_the_configured_record_store() {
+        fastly::init();
+        for storage in [
+            None,
+            Some(serde_json::json!({"store":"record_ec_fixture"})),
+            Some(serde_json::json!({"provider":"fastly","store":"record_ec_fixture"})),
+            Some(serde_json::json!({"provider":"records","store":"record_ec_fixture"})),
+        ] {
+            let mut settings = diagnostics_settings();
+            settings.ec.storage = storage
+                .map(|value| serde_json::from_value(value).expect("should parse record reference"));
+            if settings.ec.storage.is_none() {
+                settings.ec.ec_store = Some("record_ec_fixture".to_owned());
+            }
+            let store = crate::app::open_identity_record_store(&settings)
+                .expect("should open the selected record store")
+                .expect("should select a record store");
+            assert_eq!(
+                store.store_name(),
+                "record_ec_fixture",
+                "should open the store the settings select"
+            );
+        }
+        let mut settings = diagnostics_settings();
+        settings.ec.ec_store = None;
+        settings.ec.storage = None;
+        assert!(
+            crate::app::open_identity_record_store(&settings)
+                .expect("should accept settings without EC storage")
+                .is_none(),
+            "should open no store when none is selected"
+        );
+        // `ec_record_store` tests exercise the record lifecycle through the
+        // lazily opened store.
     }
 
     fn diagnostics_settings() -> Settings {

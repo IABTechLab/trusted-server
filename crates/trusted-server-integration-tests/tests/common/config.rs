@@ -120,6 +120,9 @@ fn app_config_envelope(
             "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    // This builder supplies native and Cloudflare fixtures. Fastly's generator
+    // reads the shared source separately and keeps its explicit binding.
+    table_mut(&mut table, "ec")?.remove("storage");
     customize(&mut table)?;
     let app_config: TrustedServerAppConfig =
         toml::Value::Table(table).try_into().map_err(|error| {
@@ -359,6 +362,52 @@ fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
+
+    #[test]
+    fn fastly_ec_fixture_selects_the_declared_logical_store() {
+        for config in [
+            APP_CONFIG,
+            include_str!("../../fixtures/configs/trusted-server.trace.toml"),
+            include_str!("../../fixtures/configs/trusted-server.trace-auth.toml"),
+        ] {
+            let settings = toml::from_str::<TrustedServerAppConfig>(config)
+                .expect("should parse the integration configuration")
+                .into_settings();
+            let selected = settings
+                .ec
+                .resolve_storage(EcRuntime::Fastly)
+                .expect("should resolve Fastly storage without provider preparation");
+            assert!(
+                matches!(
+                    selected,
+                    Some(
+                        EcStorageSelection::Fastly("trusted_server_kv")
+                            | EcStorageSelection::Records("trusted_server_kv")
+                    )
+                ),
+                "should select the logical record store declared by the Fastly application"
+            );
+        }
+    }
+
+    #[test]
+    fn fastly_ec_fixture_exposes_seeded_rows_under_the_logical_store() {
+        let template: toml::Value = toml::from_str(VICEROY_TEMPLATE)
+            .expect("should parse the integration Viceroy template");
+        let entries = template["local_server"]["kv_stores"]["trusted_server_kv"]
+            .as_array()
+            .expect("should expose the declared logical record store");
+        for (index, prefix) in ['a', 'b', 'c', 'd', 'e'].into_iter().enumerate() {
+            let key = format!("{}.test0{}", prefix.to_string().repeat(64), index + 1);
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["key"].as_str() == Some(&key)),
+                "should preserve the seeded EC row {key}"
+            );
+        }
+    }
 
     #[test]
     fn sigv4_asset_fixture_validates_both_signed_routes() {
@@ -428,6 +477,35 @@ mod tests {
             "should explicitly enable isolated trace fixture"
         );
     }
+    #[test]
+    fn native_and_cloudflare_fixtures_do_not_select_a_fastly_graph() {
+        let native = super::integration_app_config_envelope(8888)
+            .expect("should generate native fixture envelope");
+        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(&native).expect("should parse native envelope");
+        assert!(
+            envelope.data["ec"].get("storage").is_none(),
+            "should retain native unconfigured persistence"
+        );
+        for binding in [
+            super::cloudflare_config_json(8888),
+            super::cloudflare_auction_config_json(8888),
+        ] {
+            let binding: serde_json::Value =
+                serde_json::from_str(&binding.expect("should generate Cloudflare fixture"))
+                    .expect("should parse Cloudflare binding");
+            let encoded = binding[trusted_server_core::config_payload::CONFIG_BLOB_KEY]
+                .as_str()
+                .expect("should contain existing envelope");
+            let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+                serde_json::from_str(encoded).expect("should parse Cloudflare envelope");
+            assert!(
+                envelope.data["ec"].get("storage").is_none(),
+                "should retain Cloudflare unconfigured persistence"
+            );
+        }
+    }
+
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const LOGICAL_SECRET_STORE_ID: &str = "trusted_server_secrets";
@@ -560,9 +638,9 @@ mod tests {
             stores["counter_store"].is_array(),
             "fastly.toml should define counter_store for batch-sync rate limiting"
         );
-        let ec_entries = stores["ec_identity_store"]
+        let ec_entries = stores["trusted_server_kv"]
             .as_array()
-            .expect("fastly.toml should define ec_identity_store");
+            .expect("fastly.toml should expose EC under its declared logical store ID");
         assert!(
             ec_entries.iter().any(|entry| {
                 entry["key"].as_str()

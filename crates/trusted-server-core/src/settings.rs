@@ -811,6 +811,10 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
+    /// Explicit persistence provider or the Fastly store-only shorthand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<crate::ec::storage::EcStorage>,
+
     /// Maximum number of pull-sync lookups dispatched per navigation; 0
     /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
@@ -886,6 +890,7 @@ impl Default for Ec {
         Self {
             passphrase: Redacted::default(),
             ec_store: None,
+            storage: None,
             pull_sync_concurrency: 0,
             cluster_trust_threshold: 0,
             cluster_recheck_secs: 0,
@@ -3742,6 +3747,7 @@ impl Settings {
     /// opportunity slot is invalid, or if
     /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.ec.validate_storage()?;
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;

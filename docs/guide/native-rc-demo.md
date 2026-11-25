@@ -16,11 +16,11 @@ including reads and the guarded follow-up write. The remaining shutdown grace
 can cancel work sooner. Fastly retains its existing post-send gate and lookup
 budget.
 
-The current Axum adapter has no EC record store or page-write finalization, so
-normal requests cannot yet register identity follow-up work. A3 (#1575) supplies
-the shared runner and scheduling plumbing; production activation needs A2
-(#1574), and CI proof of pending record-write completion needs A8 (#1579).
-Controlled fixtures exercise eligible work without adding a production store.
+Consented navigations and EC route POSTs register follow-up work through the
+shared identity app only when finalize issued a follow-up write permit, so a
+skipped navigation never holds the shutdown drain. CI proof of a pending record
+write completing within the grace is tracked separately (#1579, implemented in
+#1654).
 
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
@@ -29,10 +29,29 @@ The adapter uses the workspace EdgeZero pin; see
 
 From the repository root, with `ts` built from this checkout:
 
+Copy `trusted-server.example.toml` to `trusted-server.toml`, then add the native
+provider to its existing storage table before publishing:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+EdgeZero environment overlays only replace existing TOML keys; an environment
+variable cannot add this missing `provider` key to the starter.
+
+The declared record store is prepared before TS reads `ec.storage`. Its local
+provider always needs a writable `EDGEZERO__ADAPTER__DATA_DIR`, including when
+the config omits identity storage. Keep the directory below for every local
+start. Remote-only record bindings do not require this local directory.
+
 ```sh
-cp trusted-server.example.toml trusted-server.toml
+set -a && source .env.dev && set +a
+export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
 ts config push --adapter axum --local --no-diff --yes
 EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
+EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero" \
 EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \
 EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)" \
 EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
@@ -66,14 +85,16 @@ flowchart TD
     F --> G[Stop admission and drain on shutdown]
 ```
 
-The declared identities are `trusted_server_config` and
-`trusted_server_secrets`. The configuration key is `trusted_server_config`.
-Required-provider and required-value failures prevent readiness. A provider
-preparation failure stops the process before it listens. A failure to read or
-verify the envelope, load a required secret, validate the runtime settings or
-build the application router installs the failure router instead: the process
-listens, `/health` stays `200`, and `/ready` and every supported route answer
-`503` under the
+The declared stores are `trusted_server_config`, `trusted_server_secrets` and
+`trusted_server_kv`. The record layout is declared before provider preparation;
+provider binding selection belongs to EdgeZero. The configuration key is
+`trusted_server_config`. Required-provider and required-value failures prevent
+readiness. A provider preparation failure, including the selected record
+provider, stops the process before it listens. A failure to read or verify the
+envelope, load a required secret, validate the runtime settings, bind the
+configured EC record store or build the application router installs the failure
+router instead: the process listens, `/health` stays `200`, and `/ready` and
+every supported route answer `503` under the
 [operational probe contract](./api-reference#operational-probe-contract). Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running
@@ -86,10 +107,10 @@ TS's runtime validation policy, not operator publication validation.
 
 Request-time store management writes, persistent signing-key management and
 automatic key rotation are unavailable. Unsupported configured consumers, such
-as enabled request signing, fail at startup. Axum has no Edge Cookie record
-store yet. Reader Geo defaults Off; the optional protected CloudFront selection
-below supplies country/subdivision facts without granting consent. An AWS
-region is not a visitor's geography.
+as enabled request signing, fail at startup. Native EC persistence uses the
+shared core record store. Reader Geo defaults Off; the optional protected
+CloudFront selection below supplies country/subdivision facts without granting
+consent. An AWS region is not a visitor's geography.
 
 ## Inputs
 
@@ -109,15 +130,16 @@ and digest. AppConfig Agent returns that envelope document itself. Secrets
 Manager returns each whole secret value, not a selected JSON field. Local
 publication does not publish to AWS.
 
-| Input                                       | Meaning                                       |
-| ------------------------------------------- | --------------------------------------------- |
-| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps |
-| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                |
-| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                   |
-| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                         |
-| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                      |
-| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings  |
-| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased            |
+| Input                                       | Meaning                                                   |
+| ------------------------------------------- | --------------------------------------------------------- |
+| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps             |
+| `EDGEZERO__ADAPTER__DATA_DIR`               | Writable directory for the declared local record provider |
+| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                            |
+| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                               |
+| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                                     |
+| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                                  |
+| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings              |
+| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased                        |
 
 Legacy `TRUSTED_SERVER_CONFIG_*`, `TRUSTED_SERVER_SECRET_*` and runtime
 `TRUSTED_SERVER__*` settings cannot rescue missing prepared inputs. Typed CLI

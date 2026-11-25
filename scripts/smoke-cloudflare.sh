@@ -48,7 +48,7 @@ CLOUDFLARE_BUILD_PATH=${CLOUDFLARE_BUILD_PATH:-$CLOUDFLARE_ROOT/build}
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 # The positive case uses the final listener in the case sequence.
-smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT"
+smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT" "$POSITIVE_PORT" "cloudflare"
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"

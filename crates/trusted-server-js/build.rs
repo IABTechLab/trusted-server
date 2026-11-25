@@ -1,3 +1,5 @@
+// Build inputs are outside the serving runtime environment policy.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![allow(
     clippy::expect_used,
     clippy::panic,

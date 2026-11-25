@@ -15,8 +15,12 @@ pub mod middleware;
 pub mod native_geo;
 /// Native request-scoped platform services.
 pub mod platform;
+mod record_ec;
 /// Prepared-store initialization and immutable native snapshots.
 pub mod startup;
 
-/// Bounded identity work released after response delivery.
-pub mod after_response;
+#[cfg(test)]
+mod identity_conformance;
+
+#[cfg(test)]
+mod after_response_drain_tests;

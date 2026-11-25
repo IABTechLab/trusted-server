@@ -64,46 +64,37 @@ See [Testing](../../TESTING.md) for the complete gate matrix and
 
 ## Identity conformance
 
-The reusable EC contract lives in core test support, with the current Fastly
-runner in `trusted-server-adapter-fastly/src/identity_conformance.rs`. Run from
-the repository root with the repository-pinned Rust, Node and Viceroy:
+The reusable EC contract lives in core test support. Fastly and Axum execute
+identical navigation and HTTP scenarios through their actual application
+routers. Run from the repository root with pinned Rust, Node and Viceroy:
 
 ```bash
 node --test scripts/test-identity-conformance.test.mjs
 node scripts/test-identity-conformance.mjs fastly
+node scripts/test-identity-conformance.mjs axum
 cargo test -p trusted-server-core --lib identity_conformance
 ```
 
-The launcher lists the required Fastly test before executing it and rejects
-zero-test success. Selecting `axum`, `cloudflare` or `spin` fails explicitly
-until its runner is available. Native core tests check the assertion contract;
-they do not claim Axum identity support.
+The launcher lists the adapter's exact test before executing it and rejects
+zero-test success. Cloudflare and Spin fail explicitly until their runners are
+available; their production startup rejects unsupported identity storage.
 
-The Fastly application test executes nine isolated scenarios: fresh creation,
-rejected writes, missing and failed geo, denied and absent GDPR consent,
-subresources, returning readers, and the current missing-browser-metadata gate.
-It uses the production native request read and `prepare`, the real request
-conversion, router, shared production finalization callback composition and
-consumed HTML response. The client IP, geo result, browser device signals,
-record storage and publisher origin are controlled test fixtures. Successful
-issuance requires the matching record before response release; failed writes
-must be observed before release. Refused scenarios must stop before any write
-is attempted. Returning scenarios apply cookie expiry rules and replay the
-resulting identity. Fastly's production geo lookup reports a failure as missing
-geo, so the failed-geo scenario uses a test-only failing lookup to check the
-shared contract that other platforms' error results must also preserve. The missing-metadata expectation describes
-the current pre-T12 policy and must change when #1592 permits absent JA4.
+The navigation scenarios cover record-before-cookie creation, rejected writes,
+missing/failed geography, denied/absent GDPR consent, subresources, returning
+readers and creation without trusted JA4. Platform client and location facts,
+record storage and the publisher origin are controlled fixtures; consent goes
+through real parsing and the finalized body is consumed before response release.
 
-The suite ends when the finalized response is delivered. Post-delivery work
-(queued telemetry and the after-response identity lookups, EC pull sync among
-them) does not run, so release-ordering assertions cover writes made during
-finalization only.
+The shared HTTP suite adds local identify/batch APIs with and without storage,
+auction body EIDs with bidding enabled or disabled, EC POST/GET, failed
+withdrawal reporting, SharedID restoration, mirror privacy, origin/payload
+validation, and cookie scope. A capturing publisher observes fallback controls
+and never receives partner requests. Core negative fixtures check that the
+assertions reject early-cookie issuance and broken returning-record behavior.
 
-This is application conformance, not fresh-browser qualification through an
-unmodified deployed artifact. Viceroy 0.21 does not expose JA4, so the current
-production browser gate prevents fresh issuance over ordinary local HTTP.
-The existing seeded Fastly runtime tests remain useful for their separate
-boundary. Startup capability rejection, removal of adapter-owned identity
-calls (#1600), Axum activation (#1574), later adapter integrations and deployed
-browser/provider qualification remain outstanding under #1586. Infrastructure
-delivery alone must not close that issue.
+The suite ends at response delivery. It does not qualify native enabled-provider
+scheduling, after-response task drain, live vendor APIs, CMP client ordering or
+Safari cookie lifetime; these remain broader feature/runtime qualification.
+The production DynamoDB image fixture separately exercises a pending record
+write during SIGTERM. Later adapter integration remains separate from this
+Fastly/Axum application conformance.

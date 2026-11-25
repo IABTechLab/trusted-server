@@ -108,3 +108,24 @@ or `.env`. Stop only owned processes and remove owned disposable resources.
 
 - Round 2 (fresh independent agent): no blocking findings. Added settings
   documentation for the Axum whole-task budget; all optional feedback resolved.
+
+## Reconciliation with #1646 (2026-11-25)
+
+#1646 landed its own shared runner first, so this PR keeps that one and drops
+its own: core `ec/app/lookups.rs` `AfterResponseLookups` with
+`IdentityApp::run_after_response_lookups`, scheduled by
+`IdentityApp::schedule_after_response` from Axum `dispatch_ec_route` and the
+shared EC route. The `ec::after_response` runner, `AfterResponseLookups::capture`
+and Axum's `after_response::schedule_lookups` described above were removed.
+`schedule_after_response` now checks `EcContext::has_after_response_permit()`
+before registering and returns whether it registered; a missing scheduler or a
+rejected registration is logged, not returned as an error. This PR's drain and
+registration tests now exercise that runner from
+`crates/trusted-server-adapter-axum/src/after_response_drain_tests.rs`.
+
+The base is now #1646 (A2), which supplies the Axum record store and issues
+production follow-up permits, so the "no EC record store" and "activation
+remains A2 #1574" statements above describe the earlier #1635 base. This PR's
+Cargo dev-dependency change was absorbed: #1646 already depends on
+`trusted-server-identity-providers` directly. CI proof of a pending record write
+is #1579, implemented in #1654.
