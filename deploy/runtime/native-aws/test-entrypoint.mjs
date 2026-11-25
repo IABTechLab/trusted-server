@@ -40,7 +40,7 @@ console.log(JSON.stringify({
   configDir: process.env.EDGEZERO__ADAPTER__CONFIG_DIR ?? null,
   dataDir: process.env.EDGEZERO__ADAPTER__DATA_DIR ?? null,
   bindingsEnv: process.env.TS_NATIVE_BINDINGS_TOML ?? null,
-  recordsEnabled: process.env.TS_EC_RECORDS_ENABLED ?? null,
+  recordsEnabled: process.env.TRUSTED_SERVER__EC_RECORDS_ENABLED ?? null,
   geoEnv: process.env.TS_NATIVE_GEO_PROFILE_TOML ?? null,
   geoFile: process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE ?? null,
   geoContents: process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE ? readFileSync(process.env.TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE, 'utf8') : null,
@@ -126,7 +126,9 @@ for (const declaration of [undefined, "false", "true"]) {
     const bindings =
       'version = 1\n[kv.trusted_server_kv]\nprovider = "aws-dynamodb-records"\nregion = "us-east-1"\ntable = "example-identities"\nnamespace = "example"\n';
     const env =
-      declaration === undefined ? {} : { TS_EC_RECORDS_ENABLED: declaration };
+      declaration === undefined
+        ? {}
+        : { TRUSTED_SERVER__EC_RECORDS_ENABLED: declaration };
     const result = await start(bindings, env).closed;
     assert.equal(result.code, 0, result.stderr);
     const observed = JSON.parse(result.stdout);
@@ -184,7 +186,12 @@ test("an explicitly empty or unpublishable Geo profile never launches the app", 
   }).closed;
   assert.notEqual(result.code, 0);
   assert.equal(result.stdout, "");
+  assert.match(
+    result.stderr,
+    /Native Geo profile path must not be a directory/,
+  );
   assert.doesNotMatch(result.stderr, /fictional profile sentinel/);
+  assert.deepEqual(await readdir(join(runtime, "native-geo.toml")), []);
   assert.deepEqual(await readdir(runtime), [
     "native-bindings.toml",
     "native-geo.toml",
@@ -260,8 +267,24 @@ test("failed publication does not launch the app or leave a temporary file", asy
   const result = await start("nonsecret sentinel").closed;
   assert.notEqual(result.code, 0);
   assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Native bindings path must not be a directory/);
   assert.doesNotMatch(result.stderr, /nonsecret sentinel/);
+  assert.deepEqual(await readdir(bindings), []);
   assert.deepEqual(await readdir(runtime), ["native-bindings.toml"]);
+});
+
+test("refuses a link to a directory without writing into the linked directory", async (t) => {
+  const { root, bindings, start } = await fixture(t);
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await symlink(outside, bindings);
+  const result = await start("nonsecret sentinel").closed;
+  assert.notEqual(result.code, 0);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Native bindings path must not be a directory/);
+  assert.doesNotMatch(result.stderr, /nonsecret sentinel/);
+  assert.deepEqual(await readdir(outside), []);
+  assert.equal((await lstat(bindings)).isSymbolicLink(), true);
 });
 
 test(

@@ -55,21 +55,21 @@ Native Axum adapter (native binary):
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                                    | Axum                                                                                                                                                                                               |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| KV store                                   | Generic platform KV unavailable; EC records use the prepared record capability                                                                                                                     |
-| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                        |
-| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                      |
-| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback   |
-| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                                |
-| Startup failure                            | Provider preparation failures exit before listening; application initialization failures, including EC record-store binding, serve the failure router (`/health` `200`, `/ready` and routes `503`) |
+| Feature                                    | Axum                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| KV store                                   | Generic platform KV unsupported (`KvError::Unavailable`); EC records use the prepared record capability                                                                                                                                                                                                                                                                                                                                                                                                |
+| Geo lookup                                 | Off by default; optional protected CloudFront geo supplies trusted location                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Config/secret-store writes                 | Return an error (read-only startup snapshots)                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Retired `/admin/keys` aliases, including trailing, descendant, and percent-encoded forms, are denied locally with 404 and are not proxied to the publisher fallback                                                                                                                                                                                                                                                                                                       |
+| Auction fan-out timing                     | Bidder requests run as an EdgeZero batch on a local task, so they leave at the next await instead of during batch setup, and their timing does not represent Fastly                                                                                                                                                                                                                                                                                                                                    |
+| Startup failure                            | A store-read, settings, application-state or EC record-store binding failure in the initializer keeps the process listening with the failure router: GET/HEAD `/health` answers `200`, and `/ready` and every supported route answer `503`. A failure before that router is installed still exits non-zero before listening, including EdgeZero provider preparation (such as a missing local config file), invalid config extraction limits, the hosting or Geo profile, ingress limits, and the bind |
 
 ### trusted-server-adapter-spin
 
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
+- Config backed by the `default` key-value label, secrets by Spin component variables, and runtime KV by the optional `trusted_server_runtime_kv` label
 - Outbound HTTP through EdgeZero's Spin client, which cannot override the
   `Host` authority, so Spin ignores `publisher.origin_host_header_override`
   with a warning
@@ -142,16 +142,19 @@ Data collection operations are subject to available consent signals (TCF v2 form
 
 ### Fastly KV Store
 
-Used for:
-
-- Counter storage
-- Domain mappings
-- Configuration cache
-- EC ID state
+Edge Cookie records use the KV Store that `[ec.storage]` selects, or the
+legacy `ec.ec_store`. Either must name a declared logical record store, and the
+example config selects `trusted_server_kv`. The separate
+`trusted_server_runtime_kv` store is wired for generic runtime KV, with no
+normal production consumer yet.
+Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
+and batch-sync counters use Edge Rate Limiting counters rather than KV.
 
 ### Data Persistence
 
-Page content and request bodies are processed in-flight and are not persisted. EC ID state and related metadata are stored in KV stores as configured.
+Request bodies are processed in-flight. EC state and related metadata use the
+configured identity KV Store. When shared-template caching is enabled, Fastly
+Core Cache can retain transformed HTML templates; this is separate from KV.
 
 ## Performance Characteristics
 
@@ -172,7 +175,7 @@ Page content and request bodies are processed in-flight and are not persisted. E
 | Adapter                             | Target                    | Use case                                                                                     |
 | ----------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------- |
 | `trusted-server-adapter-fastly`     | `wasm32-wasip1`           | Production on Fastly Compute                                                                 |
-| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Production on Cloudflare Workers                                                             |
+| `trusted-server-adapter-cloudflare` | `wasm32-unknown-unknown`  | Cloudflare Workers (development support; see adapter guide)                                  |
 | `trusted-server-adapter-spin`       | `wasm32-wasip1` component | Production on Fermyon Spin                                                                   |
 | `trusted-server-adapter-axum`       | native                    | Native production serving, local development and integration testing (see limitations above) |
 

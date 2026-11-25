@@ -8,7 +8,8 @@ The crate translates Worker requests and responses, registers the shared
 router, and implements Cloudflare-specific secret access. The current
 runtime does not open the KV config value written by `ts config push`; startup
 instead consumes the nested `TRUSTED_SERVER_CONFIG` variable bridge. It also
-has no request-time KV registry. Multi-provider auctions fan out as one
+has no request-time config store. Runtime KV is the `TRUSTED_SERVER_RUNTIME_KV`
+namespace binding, opened per request. Multi-provider auctions fan out as one
 EdgeZero request batch. Workers rewrites the inbound `Accept-Encoding`, so the
 publisher origin request decodes the origin body and serves identity bytes.
 Its `/health`, `/ready`, and startup-failure responses follow the shared

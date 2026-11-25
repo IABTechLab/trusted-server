@@ -202,7 +202,7 @@ impl ServerFixture {
             );
         }
         if let Some(value) = legacy {
-            command.env("TS_EC_DYNAMODB_ENABLED", value);
+            command.env("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", value);
         }
         self.child = Some(
             command
@@ -1185,6 +1185,22 @@ fn handwritten_store_metadata_matches_the_manifest() {
                 .filter_map(|(index, part)| (index % 2 == 1).then_some(part))
                 .collect()
         };
+        if kind == "kv" {
+            // The manifest declares every adapter's KV stores: Fastly and Spin's
+            // generic runtime store and the EC record store. Axum declares only
+            // the record store, so each of its KV IDs must be one the manifest
+            // declares.
+            let manifest_ids = quoted_values("ids");
+            assert!(
+                manifest_ids.contains(&default),
+                "should default to a KV store the manifest declares"
+            );
+            assert!(
+                ids.iter().all(|id| manifest_ids.contains(id)),
+                "should declare only KV stores the manifest declares: {ids:?}"
+            );
+            continue;
+        }
         assert_eq!(
             quoted_values("default"),
             vec![default],

@@ -91,16 +91,39 @@ for the shared assertions.
 ## Runtime boundaries
 
 Use the same store mapping and encoded variables in the deployment provider;
-empty variable defaults fail closed. Spin's request-time store registry is
-currently unwired, so EC KV lookup, request-signing key variables, and key
-rotation are unavailable. The read-only `/_ts/admin/eids` diagnostic remains
-available. Forwarded client-IP headers are sanitized, and Spin derives its
-runtime authority, scheme, and client-address headers in the innermost
-normalization layer.
+empty variable defaults fail closed.
 
-The health/startup CI matrix runs the production smoke with the pinned Spin
-runtime. Manual verification should also record the tested commit and exact
-tool versions.
+Request-time config comes from the `default` label that startup reads. Spin
+ignores the requested store name, so every request-time config read uses that
+label. That covers request-signing metadata (`current-kid`, `active-kids`, and
+one public JWK per `kid`) and DataDome IP CIDR bypass lists. Keep those keys
+distinct from each other and from `trusted_server_config`. Request-signing
+private keys are encoded component variables, such as
+`v_signing_x5fkeys_v_<encoded kid>` for store `signing_keys`.
+
+The generic runtime KV store is the `trusted_server_runtime_kv` label, which the
+component opens on first use. `spin.toml` does not grant it, so KV operations
+answer `KvError::OpenFailed` and every route is still served. To enable it,
+add the label to the component's `key_value_stores` and give it a backend in
+the runtime config. `ts provision --adapter spin` adds every KV and config
+label `edgezero.toml` declares, including `trusted_server_runtime_kv`, after which
+`spin up` needs runtime config for each of them. Never point
+`EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME` at `default`: generic KV
+writes would then share the label that holds the app config and signing
+metadata.
+
+EC lookup and key rotation remain unavailable. The read-only
+`/_ts/admin/eids` diagnostic remains available. Forwarded client-IP headers
+are sanitized, and Spin derives its runtime authority, scheme, and
+client-address headers in the innermost normalization layer. See the
+[store inventory](./edgezero#store-inventory) for every store each adapter
+reads.
+
+The integration CI installs the pinned Spin and runs the `spin_runtime_`
+tests against the production component, including discovery with signing
+metadata in `default`. The health/startup CI matrix runs the production smoke
+with the pinned Spin runtime. Manual verification should also record the
+tested commit and exact tool versions.
 
 Compare the [Fastly](./fastly), [Cloudflare](./cloudflare), and
 [Axum](./axum-dev) adapter journeys.

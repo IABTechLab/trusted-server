@@ -132,5 +132,14 @@ unsupported. It sanitizes forwarded client-IP headers but does not resolve
 `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
+The generic runtime KV store is unsupported: reads and writes return
+`KvError::Unavailable`, a warning is logged once per process, and publisher
+pages continue to be served. `trusted_server_kv` remains declared in the
+application manifest because identity storage needs it; identity records reach
+it through EdgeZero's prepared record service, not generic KV, and there is no
+adapter-local file store. Config and required secrets are loaded once at
+startup from prepared stores, independently of KV. See the
+[store inventory](./edgezero#store-inventory).
+
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.

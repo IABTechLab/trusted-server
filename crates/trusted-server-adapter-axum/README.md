@@ -8,10 +8,11 @@ record service for Edge Cookies, partner APIs and body EID persistence.
 The crate owns application route registration, middleware and immutable
 config/secret snapshots. EdgeZero owns native hosting, prepared providers,
 outbound HTTP, admission and shutdown. Generic platform KV operations remain
-unavailable; live identity records use the separate prepared record capability.
-The logical record store is declared unconditionally, so its local provider
-requires a writable `EDGEZERO__ADAPTER__DATA_DIR`. The adapter's `/health`, `/ready`,
-and startup-failure responses follow the shared
+unavailable (`KvError::Unavailable`), and there is no adapter-local KV store;
+live identity records use the separate prepared record capability. The logical
+record store is declared unconditionally, so its local provider requires a
+writable `EDGEZERO__ADAPTER__DATA_DIR`. Its `/health`, `/ready`, and
+startup-failure responses follow the shared
 [operational probe contract](../../docs/guide/api-reference.md#operational-probe-contract).
 
 Before listening, the native initializer reads the declared prepared stores,

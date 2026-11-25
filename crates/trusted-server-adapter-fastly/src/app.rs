@@ -109,10 +109,12 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::ENV_FASTLY_SERVICE_VERSION;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+pub(crate) use trusted_server_core::ec::app::AfterResponseLookups;
 #[cfg(test)]
 use trusted_server_core::ec::app::joined_cookie_header;
-pub(crate) use trusted_server_core::ec::app::{AfterResponseLookups, IdentityLookups};
-use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
+use trusted_server_core::ec::app::{
+    IdentityApp, IdentityPlatform, IdentityProviders, PageIdentityDispatch,
+};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::page_load::NavigationPermit;
@@ -129,7 +131,7 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::outbound::request_outbound_client;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, KvHandleStore, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -390,7 +392,7 @@ fn build_per_request_services(
         .secret_store(Arc::new(FastlyPlatformSecretStore::with_outbound_client(
             outbound_client.clone(),
         )))
-        .kv_store(Arc::clone(&state.default_kv_store))
+        .kv_store(request_kv_store(state, ctx))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
@@ -401,6 +403,28 @@ fn build_per_request_services(
         .geo(Arc::new(request_geo))
         .client_info(client_info)
         .build())
+}
+
+/// Logical ID of the generic runtime KV store.
+///
+/// It is distinct from `trusted_server_kv`, which is reserved for identity
+/// records, so generic KV writes never land in the identity store.
+pub(crate) const RUNTIME_KV_STORE_ID: &str = "trusted_server_runtime_kv";
+
+/// Returns the generic runtime KV store for one request.
+///
+/// `EdgeZero` registers the store [`TrustedServerApp::stores`] declares
+/// ([`RUNTIME_KV_STORE_ID`]) in every production request and opens the linked
+/// Fastly KV store on first use. The store is looked up by its ID, not as the
+/// registry default, so declaring another KV store cannot redirect it. A service without that store linked answers
+/// each KV operation with `KvError::OpenFailed`, and routes that do not use KV
+/// are unaffected. A request without a registry, which only test contexts
+/// build, uses [`AppState::default_kv_store`].
+fn request_kv_store(state: &AppState, ctx: &RequestContext) -> Arc<dyn PlatformKvStore> {
+    ctx.kv_store(RUNTIME_KV_STORE_ID).map_or_else(
+        || Arc::clone(&state.default_kv_store),
+        |handle| Arc::new(KvHandleStore::new(handle)) as Arc<dyn PlatformKvStore>,
+    )
 }
 
 /// Returns the methods supported by publisher fallback and startup responses.
@@ -458,15 +482,15 @@ fn prepare_after_response_lookups(
     )
 }
 
-async fn dispatch_identity_lookups(
+async fn prepare_identity_lookups(
     state: &AppState,
     services: &RuntimeServices,
     req: &Request,
     ec: &mut EcRequestState,
-) -> Option<IdentityLookups> {
+) -> Option<PageIdentityDispatch> {
     state
         .identity
-        .dispatch_identity_lookups(services, req, &mut ec.ec_context, ec.kv_graph.as_ref())
+        .prepare_identity_lookups(services, req, &mut ec.ec_context, ec.kv_graph.as_ref())
         .await
 }
 
@@ -885,12 +909,15 @@ async fn dispatch_fallback(
             .await;
         let is_publisher_navigation = ec.is_real_browser && ec.ec_context.has_navigation_permit();
 
-        // Identity lookups start before the origin fetch so they overlap it;
+        // Identity lookups run beside the origin fetch, joined with it below;
         // they are collected once the response status is known, before EC
-        // finalization.
-        if is_publisher_navigation {
-            page_lookups = dispatch_identity_lookups(state, services, &req, &mut ec).await;
-        }
+        // finalization. A hashed-email status call (spec §8.7) precedes them
+        // inside that join, so it never delays the origin fetch.
+        let page_identity = if is_publisher_navigation {
+            prepare_identity_lookups(state, services, &req, &mut ec).await
+        } else {
+            None
+        };
         // After-response providers only capture request signals here; they
         // are built and dispatched once the response has been sent.
         if is_publisher_navigation {
@@ -910,7 +937,13 @@ async fn dispatch_fallback(
             slots,
             registry: Some(state.identity.partners().as_ref()),
         };
-        match handle_publisher_request(
+        let start_identity = async {
+            match page_identity {
+                Some(dispatch) => Some(dispatch.start(&state.identity, services).await),
+                None => None,
+            }
+        };
+        let origin = handle_publisher_request(
             &state.settings,
             services,
             ec.kv_graph.as_ref(),
@@ -922,9 +955,10 @@ async fn dispatch_fallback(
                 input_cap: None,
                 response_decoding: ResponseDecoding::Original,
             },
-        )
-        .await
-        {
+        );
+        let (dispatched, origin) = futures::future::join(start_identity, origin).await;
+        page_lookups = dispatched;
+        match origin {
             Ok((pub_response, owner)) => {
                 // Origin start succeeded on the sole publisher-page
                 // path. Authorize orphan recovery only for real-browser
@@ -1402,8 +1436,8 @@ impl Hooks for TrustedServerApp {
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
             kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
+                default: RUNTIME_KV_STORE_ID,
+                ids: &[RUNTIME_KV_STORE_ID, "trusted_server_kv"],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1716,6 +1750,81 @@ mod tests {
         assert!(
             !services.outbound_client().proxy_marker_enabled(),
             "should turn the proxy marker off on the context client"
+        );
+    }
+
+    /// Builds a context whose `KvRegistry` holds the Fastly KV store linked
+    /// under the id [`TrustedServerApp::stores`] declares, as `EdgeZero`'s
+    /// dispatch registers it for a production request.
+    fn context_with_declared_kv_store(request: edgezero_core::http::Request) -> RequestContext {
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+        let store = edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+            .expect("should open the KV store fastly.toml links under the declared id");
+        let registry = edgezero_core::store_registry::KvRegistry::new(
+            std::collections::BTreeMap::from([(
+                declared.default.to_owned(),
+                edgezero_core::key_value_store::KvHandle::new(Arc::new(store)),
+            )]),
+            declared.default.to_owned(),
+        );
+        let mut request = request;
+        request.extensions_mut().insert(registry);
+        context_with_client(
+            request,
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        )
+    }
+
+    #[test]
+    fn per_request_services_write_through_to_the_declared_kv_store() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_declared_kv_store(empty_request(Method::GET, "/article"));
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("should declare the runtime KV store");
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        block_on(services.kv_store().put_bytes(
+            "per-request-services-write-through",
+            Bytes::from_static(b"example-value"),
+        ))
+        .expect("should write through the request's KV store");
+
+        let independent =
+            edgezero_adapter_fastly::key_value_store::FastlyKvStore::open(declared.default)
+                .expect("should reopen the linked KV store");
+        assert_eq!(
+            block_on(PlatformKvStore::get_bytes(
+                &independent,
+                "per-request-services-write-through"
+            ))
+            .expect("should read the linked KV store"),
+            Some(Bytes::from_static(b"example-value")),
+            "should persist the write in the store linked under `trusted_server_runtime_kv`"
+        );
+    }
+
+    #[test]
+    fn per_request_services_without_a_kv_registry_report_kv_unavailable() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            HttpClient::with_client(ScriptedHttpClient::forbidding()),
+        );
+
+        let services = build_per_request_services(&state, &context)
+            .expect("should build per-request services");
+        let result = block_on(services.kv_store().get_bytes("example-key"));
+
+        assert!(
+            matches!(
+                result,
+                Err(trusted_server_core::platform::KvError::Unavailable)
+            ),
+            "should fall back to the unavailable KV store, got {result:?}"
         );
     }
 
@@ -4631,6 +4740,8 @@ mod tests {
                 .method(Method::GET)
                 .uri("https://www.example.com/article")
                 .header(header::COOKIE, format!("ts-ec={}.test01", "a".repeat(64)))
+                .header(header::REFERER, "https://www.example.com/")
+                .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
                 .body(Body::empty())
                 .expect("should build request");
             req.extensions_mut().insert(DeviceSignals::derive(
@@ -4659,12 +4770,19 @@ mod tests {
         let bot = super::prepare_after_response_lookups(&state, &services, &req, &ec);
 
         assert!(
-            browser.is_some(),
-            "should prepare pull sync for a real browser"
-        );
-        assert!(
             bot.is_none(),
             "should never prepare pull sync for a client that fails the browser check"
+        );
+        let browser = browser.expect("should prepare pull sync for a real browser");
+        assert_eq!(
+            browser.referer.as_deref(),
+            Some("https://www.example.com/"),
+            "should capture the Referer for after-response providers"
+        );
+        assert_eq!(
+            browser.accept_language.as_deref(),
+            Some("en-US,en;q=0.9"),
+            "should capture the Accept-Language for after-response providers"
         );
     }
 

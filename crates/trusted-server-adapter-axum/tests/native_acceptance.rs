@@ -689,6 +689,13 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
         successful_body(response).len() > 100,
         "should serve embedded bundle, not an empty router"
     );
+    assert_eq!(
+        app.log()
+            .matches("generic runtime KV is unavailable (UnavailableKvStore)")
+            .count(),
+        1,
+        "should serve publisher and script requests while reporting unavailable KV once"
+    );
     app.assert_logs_hold_no_secrets();
 }
 
