@@ -11144,6 +11144,7 @@ mod tests {
         //! link; this tests that they connect.
 
         use super::*;
+        use crate::auction::test_support::{assert_no_user_eids, user_eids};
         use crate::platform::ClientInfo;
         use crate::test_support::tests::crate_test_settings_str;
         use std::collections::HashMap;
@@ -15404,13 +15405,10 @@ mod tests {
                         },
                         "should use this reader's identity and suppress it after withdrawal"
                     );
-                    let eids = &auction["user"]["ext"]["eids"];
                     if withdrawn {
-                        assert!(eids.is_null(), "should suppress withdrawn EIDs");
+                        assert_no_user_eids(&auction, "should suppress withdrawn EIDs");
                     } else {
-                        let eids = eids
-                            .as_array()
-                            .expect("should include consenting reader EIDs");
+                        let eids = user_eids(&auction, "should include consenting reader EIDs");
                         assert_eq!(eids.len(), 1, "should expose only the configured partner");
                         assert_eq!(
                             eids[0]["source"], "example.com",
