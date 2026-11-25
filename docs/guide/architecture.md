@@ -143,8 +143,8 @@ Data collection operations are subject to available consent signals (TCF v2 form
 ### Fastly KV Store
 
 Edge Cookie records use the KV Store that `[ec.storage]` selects, or the
-legacy `ec.ec_store`. Either must name a declared logical record store, and the
-example config selects `trusted_server_kv`. The separate
+legacy `ec.ec_store`. Either names the KV store's resource link on the Fastly
+service, and the example config selects `trusted_server_kv`. The separate
 `trusted_server_runtime_kv` store is wired for generic runtime KV, with no
 normal production consumer yet.
 Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
