@@ -199,7 +199,7 @@ impl IntegrationProxy for TestlightIntegration {
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint)
             .with_max_response_bytes(UPSTREAM_RTB_MAX_RESPONSE_BYTES);
-        proxy_config.forward_ec_id = false;
+        proxy_config = proxy_config.without_ec_id();
         proxy_config.body = Some(payload_bytes);
         proxy_config.stream_passthrough = true;
         proxy_config.headers.push((

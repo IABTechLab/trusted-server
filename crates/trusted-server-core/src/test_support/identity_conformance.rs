@@ -739,6 +739,8 @@ pub struct ApiRequest {
     pub origin_status: StatusCode,
     /// Publisher response type for fallback controls; empty omits the header.
     pub origin_content_type: &'static str,
+    /// Whether trusted device signals classify the client as a known non-browser.
+    pub known_non_browser: bool,
 }
 
 impl ApiRequest {
@@ -755,6 +757,7 @@ impl ApiRequest {
             auction_enabled: true,
             origin_status: StatusCode::OK,
             origin_content_type: "application/json",
+            known_non_browser: false,
         }
     }
 }
@@ -950,6 +953,133 @@ fn assert_ec_expired(response: &Observation) {
             .iter()
             .any(|cookie| cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0")),
         "should expire browser EC in the withdrawal response"
+    );
+}
+
+/// Verifies that a client refused creation never writes on a navigation.
+///
+/// A known non-browser returning with a live EC and browser EIDs gets no
+/// record write and no `SharedID`, while an allowed client with the same
+/// request writes both. The EC route GET restores the stored `SharedID` only
+/// for the allowed client. Consent withdrawal still tombstones for the refused
+/// client.
+///
+/// # Panics
+///
+/// Panics when a refused client writes, the allowed control does not, or the
+/// refused client's withdrawal does not tombstone.
+pub fn verify_known_non_browser_navigation(adapter: &mut impl Adapter, store: &RecordingStore) {
+    let graph = KvIdentityGraph::new(store.clone());
+    let identity = format!("{}.nb0001", "c".repeat(64));
+    let key = normalize_ec_id_for_kv(&identity);
+    let mut live = crate::ec::kv_types::KvEntry::new(
+        &crate::consent::types::ConsentContext::default(),
+        None,
+        100,
+        "example.com",
+    );
+    live.consent.ok = true;
+    block_on(graph.create(&key, &live)).expect("should seed a live returning identity");
+    let eids = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::json!([{"source":"body.example.com","uids":[{"id":"cookie-uid","atype":1}]}])
+            .to_string(),
+    );
+    let navigation = |known_non_browser: bool, consent: bool| {
+        let mut request = ApiRequest::new(http::Method::GET, "/article");
+        request.origin_content_type = "text/html";
+        request.known_non_browser = known_non_browser;
+        request.headers = vec![
+            ("sec-fetch-dest".to_owned(), "document".to_owned()),
+            ("sec-fetch-mode".to_owned(), "navigate".to_owned()),
+            ("accept".to_owned(), "text/html".to_owned()),
+            (
+                "cookie".to_owned(),
+                format!(
+                    "{}; ts-ec={identity}; ts-eids={eids}",
+                    tcf_consent_cookie(consent)
+                ),
+            ),
+        ];
+        request
+    };
+    let writes = |store: &RecordingStore| {
+        store
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Persisted(_) | Event::Rejected(_)))
+            .count()
+    };
+    let issues_sharedid = |response: &Observation| {
+        response
+            .cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("_pubcid=") && !cookie.contains("Max-Age=0"))
+    };
+
+    let before = block_on(graph.get(&key)).expect("should read the seeded identity");
+    let writes_before = writes(store);
+    let refused = adapter.exchange(&navigation(true, true));
+    assert_document(&refused.response);
+    assert_eq!(
+        writes(store),
+        writes_before,
+        "should not write for a known non-browser navigation"
+    );
+    assert_eq!(
+        block_on(graph.get(&key)).expect("should reread the identity"),
+        before,
+        "should leave a known non-browser's record unchanged"
+    );
+    assert!(
+        !issues_sharedid(&refused.response),
+        "should not issue SharedID to a known non-browser: {:?}",
+        refused.response.cookies
+    );
+
+    // The same request from an allowed client proves the EIDs and SharedID
+    // reach the write the refused client was denied.
+    let allowed = adapter.exchange(&navigation(false, true));
+    assert_document(&allowed.response);
+    assert!(
+        writes(store) > writes_before,
+        "should write for the allowed control"
+    );
+    assert!(
+        issues_sharedid(&allowed.response),
+        "should issue SharedID to the allowed control: {:?}",
+        allowed.response.cookies
+    );
+
+    // The EC route GET restores the stored SharedID only for an allowed client.
+    for (known_non_browser, restored) in [(true, false), (false, true)] {
+        let mut pixel = ApiRequest::new(http::Method::GET, "/_ts/api/v1/ec");
+        pixel.known_non_browser = known_non_browser;
+        pixel.headers.push((
+            "cookie".to_owned(),
+            format!("{}; ts-ec={identity}", tcf_consent_cookie(true)),
+        ));
+        let observed = adapter.exchange(&pixel);
+        assert_eq!(
+            observed.response.status,
+            StatusCode::NO_CONTENT,
+            "should answer the EC route GET"
+        );
+        assert_eq!(
+            issues_sharedid(&observed.response),
+            restored,
+            "should restore SharedID on EC GET only for an allowed client: {:?}",
+            observed.response.cookies
+        );
+    }
+
+    let withdrawn = adapter.exchange(&navigation(true, false));
+    assert_ec_expired(&withdrawn.response);
+    let (row, _) = block_on(graph.get(&key))
+        .expect("should read the withdrawal")
+        .expect("should retain the tombstone");
+    assert!(
+        !row.consent.ok,
+        "should tombstone a known non-browser's withdrawal"
     );
 }
 

@@ -719,6 +719,14 @@ impl EcContext {
         self.after_response_permit = AfterResponsePermitSlot(Some(permit));
     }
 
+    /// Whether finalize left a follow-up write permit for after-response work.
+    ///
+    /// A check only: the permit stays in place for the runner that takes it.
+    #[must_use]
+    pub fn has_after_response_permit(&self) -> bool {
+        self.after_response_permit.0.is_some()
+    }
+
     /// Takes the after-response permit; returns `None` when finalize did not
     /// confirm a navigation, or after the first call.
     pub fn take_after_response_permit(&mut self) -> Option<AfterResponseWrite> {
@@ -910,7 +918,8 @@ pub fn current_timestamp() -> u64 {
 ///
 /// Use this instead of [`current_timestamp`] when a fallback could authorize
 /// a time-bounded correctness decision.
-pub(crate) fn checked_current_timestamp() -> Option<u64> {
+#[must_use]
+pub fn checked_current_timestamp() -> Option<u64> {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())

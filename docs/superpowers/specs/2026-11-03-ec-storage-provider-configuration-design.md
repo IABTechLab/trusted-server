@@ -263,8 +263,9 @@ then remove the old selection path. There is no compatibility release or
 fallback reader that prepares a backend from legacy environment values.
 
 - Move the four non-secret selection/binding values into `ec.storage` in the
-  published envelope. Remove `TS_EC_DYNAMODB_ENABLED`, `REGION`, `TABLE` and
-  `NAMESPACE` from application deployment inputs after publication is prepared.
+  published envelope. Remove `TRUSTED_SERVER__EC_DYNAMODB_ENABLED` and the
+  `TS_EC_DYNAMODB_` `REGION`, `TABLE` and `NAMESPACE` values from application
+  deployment inputs after publication is prepared.
 - Replace Terraform's `runtime_environment` output in
   `deploy/examples/native-ec-dynamodb/outputs.tf` with a documented `ec_storage`
   configuration object for publication. This is an output-contract change;

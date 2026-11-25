@@ -41,7 +41,7 @@ With Docker available, use the host Node version pinned in `.tool-versions`:
 node scripts/test-native-container.mjs ts-native:local
 ```
 
-The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks startup rejection for invalid configuration and missing secrets, the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
+The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks that invalid configuration and missing secrets serve the failure router (`/health` `200`, `/ready` and routes `503`), the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
 
 The `Native container` workflow builds the local-provider image and runs this test on relevant pull requests or manual dispatch. It does not publish an image or deploy a service.
 

@@ -87,8 +87,9 @@ pub struct FinalizeRequest<'a> {
     /// The raw value of the `ts-eids` cookie, extracted from the request
     /// *before* routing consumes it.
     pub eids_cookie: Option<&'a str>,
-    /// The request's `SharedID` cookies; on a navigation the response writes
-    /// them back from the EC record under the `SharedID` consent rules.
+    /// The request's `SharedID` cookies. An opt-out drops every `SharedID`
+    /// update read from the request; on a navigation the response writes the
+    /// cookies back from the EC record under the `SharedID` consent rules.
     pub sharedid: &'a SharedIdRequest,
     /// The request time, read once per request and only for a navigation
     /// with an eligible response. The page-load write and the mirror use it.
