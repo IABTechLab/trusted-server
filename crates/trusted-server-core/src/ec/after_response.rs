@@ -5,14 +5,15 @@
 //! delays the page. Their validated results reach the row in one follow-up
 //! update, guarded by the row's current generation, and are served from the
 //! next page load. An update that loses its CAS is re-planned once against a
-//! fresh read, inside [`KvIdentityGraph::commit_after_response`]. Browser
+//! fresh read, in the store's bounded update that
+//! [`KvIdentityGraph::commit_after_response`] makes. Browser
 //! ingest never runs here: it belongs to the navigation's own write.
 
 use super::coordinator::results::LookupResults;
 use super::eid_types::UnixSeconds;
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::page_load::{AfterResponseRejection, AfterResponseWrite, Generation, RowChange};
+use super::page_load::{AfterResponseRejection, AfterResponseWrite, RowChange};
 use super::registry::PartnerRegistry;
 use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, current_timestamp, log_id};
@@ -120,9 +121,9 @@ async fn write_lookups(
         Err(AfterResponseRejection::Skipped(outcome)) => outcome,
         Err(AfterResponseRejection::Conflict) => AfterResponseOutcome::Conflict,
         Err(AfterResponseRejection::StaleRead) => AfterResponseOutcome::StaleRead,
-        Err(AfterResponseRejection::ReadFailed(report)) => {
+        Err(AfterResponseRejection::StoreFailed(report)) => {
             log::warn!(
-                "After-response lookups: reading the row of '{}' fails: {}",
+                "After-response lookups: the store fails for the row of '{}': {}",
                 log_id(ec_id),
                 report.current_context()
             );
@@ -149,7 +150,7 @@ fn plan_follow_up(
     registry: &PartnerRegistry,
     ec_id: &str,
     lookups: &LookupResults,
-) -> Result<(KvEntry, Generation), AfterResponseOutcome> {
+) -> Result<KvEntry, AfterResponseOutcome> {
     if !matches!(snapshot, EcKvSnapshot::Present { .. }) {
         log::info!(
             "After-response lookups: no row for '{}', skipping write",
@@ -173,14 +174,16 @@ fn plan_follow_up(
             _ => AfterResponseOutcome::NoRow,
         });
     };
-    let RowChange::Update { entry, expected } = change else {
+    // The store guards the write with the generation it read, which is the
+    // one this plan expects.
+    let RowChange::Update { entry, .. } = change else {
         log::warn!(
             "After-response lookups: unexpected row change for '{}', skipping write",
             log_id(ec_id)
         );
         return Err(AfterResponseOutcome::Failed);
     };
-    Ok((entry, expected))
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -190,10 +193,9 @@ mod tests {
         DropCounts, LookupStatus, OptOutMemory, ProviderLookup, SkipReason,
     };
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, SourceDomain, UidValue};
-    use crate::ec::kv::{MAX_AFTER_RESPONSE_ATTEMPTS, TombstoneOutcome};
     use crate::ec::kv_backend::EcKvStore;
     use crate::ec::kv_backend::test_support::{
-        ConflictInjectingEcKv, FailingEcKv, WriteFailingEcKv,
+        ConflictInjectingEcKv, FailingEcKv, InMemoryEcKv, WriteFailingEcKv,
     };
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
     use crate::settings::EcPartner;
@@ -203,7 +205,9 @@ mod tests {
     /// test can inspect it afterwards.
     async fn seeded_graph(store: &Arc<ConflictInjectingEcKv>) -> KvIdentityGraph {
         store.seed(EC_ID, &live_entry()).await;
-        KvIdentityGraph::from_shared(Arc::clone(store) as Arc<dyn EcKvStore>)
+        KvIdentityGraph::shared_with_record_update(
+            Arc::clone(store) as Arc<dyn EcKvStore + Send + Sync>
+        )
     }
 
     /// A store where `race` changes the row before each of the first
@@ -574,7 +578,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_read_reports_failed() {
         // Arrange
-        let graph = KvIdentityGraph::new(FailingEcKv::new("after-response-failing"));
+        let graph = KvIdentityGraph::with_record_update(FailingEcKv::new("after-response-failing"));
 
         // Act
         let (outcome, conflicts) = write_lookups(
@@ -603,7 +607,9 @@ mod tests {
             KvIdentityGraph::serialize_entry_for_test(&live_entry(), "write-failing-store")
                 .expect("should serialize the seeded row");
         store.seed(EC_ID, &body, &metadata).await;
-        let graph = KvIdentityGraph::from_shared(Arc::clone(&store) as Arc<dyn EcKvStore>);
+        let graph = KvIdentityGraph::shared_with_record_update(
+            Arc::clone(&store) as Arc<dyn EcKvStore + Send + Sync>
+        );
 
         // Act
         let (outcome, conflicts) = write_lookups(
@@ -690,100 +696,63 @@ mod tests {
         );
     }
 
-    /// A planner that always resends the update planned against `read`,
-    /// whatever the row now holds.
-    fn stale_plan(
-        read: Generation,
-    ) -> impl FnMut(&EcKvSnapshot) -> Result<(KvEntry, Generation), AfterResponseOutcome> {
-        move |_| Ok((live_entry(), read))
-    }
-
     #[tokio::test(flavor = "current_thread")]
-    async fn follow_up_write_conflicts_when_the_row_changed_after_its_read() {
-        // Arrange
-        let graph = KvIdentityGraph::in_memory("after-response-conflict");
+    async fn a_store_without_a_conditional_update_writes_last_write_wins() {
+        // Arrange: the store has no bounded conditional update.
+        let graph = KvIdentityGraph::new(InMemoryEcKv::new("last-write-wins-store"));
         graph
             .create(EC_ID, &live_entry())
             .await
             .expect("should seed row");
-        let read = graph.load_snapshot(EC_ID).await;
-        let expected = Generation::of(&read, EC_ID).expect("should read a generation");
-        graph
-            .upsert_partner_id(EC_ID, "browser.example.com", "b-2")
-            .await
-            .expect("should rewrite the row as another request would");
 
         // Act
-        let commit = graph
-            .commit_after_response(AfterResponseWrite::for_test(), EC_ID, stale_plan(expected))
-            .await;
+        let (outcome, conflicts) = write_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &found(EC_ID, "p-1"),
+        )
+        .await;
 
         // Assert
-        assert!(
-            matches!(commit.result, Err(AfterResponseRejection::Conflict)),
-            "should refuse a stale generation on every attempt"
-        );
         assert_eq!(
-            commit.conflicts, MAX_AFTER_RESPONSE_ATTEMPTS,
-            "should stop after the bounded attempts"
+            outcome,
+            AfterResponseOutcome::Written,
+            "should fall back to an unconditional overwrite"
         );
+        assert_eq!(conflicts, 0, "should count no conflict");
         assert_eq!(
-            stored_uid(&graph, "browser.example.com").await.as_deref(),
-            Some("b-2"),
-            "should keep the other request's write"
+            stored_uid(&graph, "ids.example.com").await.as_deref(),
+            Some("p-1"),
+            "should store the provider UID"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn follow_up_write_never_revives_a_row_withdrawn_after_its_read() {
-        // Arrange: scenario 23, the row is tombstoned between read and CAS.
-        // The first plan is made against the live row as read before the
-        // withdrawal, every later one against the row as re-read.
-        let graph = KvIdentityGraph::in_memory("after-response-withdrawn");
+    async fn the_last_write_wins_fallback_still_skips_a_withdrawn_row() {
+        // Arrange: a withdrawn row on a store without a conditional update.
+        let graph = KvIdentityGraph::new(InMemoryEcKv::new("last-write-wins-store"));
         graph
-            .create(EC_ID, &live_entry())
+            .create(EC_ID, &KvEntry::tombstone(1000))
             .await
-            .expect("should seed row");
-        let read = graph.load_snapshot(EC_ID).await;
-        assert_eq!(
-            graph
-                .write_withdrawal_tombstone(EC_ID, drop)
-                .await
-                .expect("should withdraw the row"),
-            TombstoneOutcome::Written,
-            "should tombstone the row"
-        );
-        let registry = registry();
-        let lookups = found(EC_ID, "p-1");
-        let mut plans = 0;
+            .expect("should seed the tombstone");
 
         // Act
-        let commit = graph
-            .commit_after_response(AfterResponseWrite::for_test(), EC_ID, |snapshot| {
-                plans += 1;
-                let planned_against = if plans == 1 { &read } else { snapshot };
-                plan_follow_up(planned_against, &registry, EC_ID, &lookups)
-            })
-            .await;
+        let (outcome, _conflicts) = write_lookups(
+            &graph,
+            AfterResponseWrite::for_test(),
+            &registry(),
+            EC_ID,
+            &found(EC_ID, "p-1"),
+        )
+        .await;
 
         // Assert
-        assert!(
-            matches!(
-                commit.result,
-                Err(AfterResponseRejection::Skipped(AfterResponseOutcome::NoRow))
-            ),
-            "should re-plan against the tombstone and skip it as no row, got {:?}",
-            commit.result
-        );
-        assert_eq!(commit.conflicts, 1, "should lose the first CAS only");
-        assert_eq!(plans, 2, "should plan once more against the re-read");
-        assert!(
-            graph
-                .load_snapshot(EC_ID)
-                .await
-                .entry_for(EC_ID)
-                .is_none_or(|entry| !entry.consent.ok),
-            "should leave the row withdrawn"
+        assert_eq!(
+            outcome,
+            AfterResponseOutcome::NoRow,
+            "should plan against the row it read and skip the tombstone"
         );
         assert!(
             stored_uid(&graph, "ids.example.com").await.is_none(),

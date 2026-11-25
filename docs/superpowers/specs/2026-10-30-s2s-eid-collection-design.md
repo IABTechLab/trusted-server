@@ -227,15 +227,19 @@ browser             TS (navigation)                          providers   KV
   phase skips the read and the write and logs `unchanged`. A remembered
   opt-out clears only sources the row still stores.
 - The write is a compare-and-swap on the generation read just before it. On
-  conflict `KvIdentityGraph` reads the row again and re-plans the update
-  against it once, never resending the stale plan: results superseded by a
-  provider opt-out recorded since dispatch are discarded, and a row missing or
-  withdrawn at the re-read is skipped. A row withdrawn and given consent again
-  before that read is not detected, on either attempt (#1664). The graph spends
-  the `AfterResponseWrite` permit before the first read and makes both
-  attempts under it; the permit never leaves the graph, a conflicting attempt
-  writes nothing, and the loop stops at the first write that lands, so at
-  most one follow-up update lands. If the retry also conflicts, the results
+  conflict the row is read again and the update re-planned against it once,
+  never resending the stale plan: results superseded by a provider opt-out
+  recorded since dispatch are discarded, and a row missing or withdrawn at the
+  re-read is skipped. A row withdrawn and given consent again before that read
+  is not detected, on either attempt (#1664). The bounded re-read, re-plan and
+  conditional write is EdgeZero's `RecordHandle::update`, which
+  `KvIdentityGraph` calls through `EcKvStore::update` with its own planner.
+  The graph spends the `AfterResponseWrite` permit before that call and makes
+  it once; the permit never leaves the graph, a conflicting attempt writes
+  nothing, and the loop stops at the first write that lands, so at most one
+  follow-up update lands. A store without that operation reports
+  `Unsupported`, and the graph falls back to last-write-wins: one read, one
+  plan and one unconditional overwrite. If the retry also conflicts, the results
   are dropped as `conflict`. The lost CAS proves the row exists at a newer
   generation, so a re-read that returns the generation that just lost or no
   row at all is a stale read of an eventually consistent store: no second

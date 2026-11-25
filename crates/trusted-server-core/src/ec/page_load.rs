@@ -9,10 +9,10 @@
 //! Two writes fall outside this rule. [`AfterResponseWrite`], confirmed
 //! alongside the page load's permit, allows one follow-up update after the
 //! response has been sent, carrying only the results of after-response
-//! identity lookups. The graph spends it once and makes every attempt under
-//! it, so at most one follow-up update lands. A consent withdrawal's
-//! tombstone is a privacy write on any request that carries the EC cookie,
-//! and takes no permit.
+//! identity lookups. The graph spends it once and makes its one bounded
+//! update under it, so at most one follow-up update lands. A consent
+//! withdrawal's tombstone is a privacy write on any request that carries the
+//! EC cookie, and takes no permit.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
@@ -106,7 +106,7 @@ impl PageLoadWrite {
 /// Issued only by [`NavigationPermit::confirm_with_after_response`] and
 /// consumed by [`KvIdentityGraph::commit_after_response`], which spends it
 /// before its first read, whether or not a write follows. That call's bounded
-/// loop re-reads and re-plans only after a write that lost its CAS and so
+/// update re-reads and re-plans only after a write that lost its CAS and so
 /// wrote nothing, and stops at the first write that lands, so at most one
 /// follow-up write lands. It is not `Clone`, so a navigation makes that call
 /// at most once.
@@ -152,9 +152,11 @@ pub enum AfterResponseRejection<S> {
     /// lost or no row at all, though the lost CAS proves the row exists at a
     /// newer generation, so the results are dropped without a second write.
     StaleRead,
-    /// Reading the row failed.
-    ReadFailed(Report<TrustedServerError>),
-    /// The store rejected the write, or it could not be serialized.
+    /// Reading or writing the row failed in the store's conditional update,
+    /// or the row as read could not be parsed. It was not retried.
+    StoreFailed(Report<TrustedServerError>),
+    /// The planned row could not be serialized, or the last-write-wins write
+    /// of a store without a conditional update failed.
     WriteFailed(Report<KvWriteError>),
 }
 

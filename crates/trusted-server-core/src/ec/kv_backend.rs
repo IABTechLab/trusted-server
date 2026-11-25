@@ -7,10 +7,13 @@
 //! `trusted-server-adapter-fastly`).
 //!
 //! This trait is intentionally narrow: lookup with a generation marker,
-//! conditional insert, strong prefix listing, and delete. Conditional writes are
-//! expressed through [`EcKvWriteMode`] so compare-and-swap loops stay in
-//! core while the platform supplies the actual precondition mechanics.
+//! conditional insert, a bounded conditional update, strong prefix listing,
+//! and delete. Conditional writes are expressed through [`EcKvWriteMode`] so
+//! compare-and-swap loops stay in core while the platform supplies the actual
+//! precondition mechanics; [`EcKvStore::update`]'s re-read and re-plan loop
+//! is `EdgeZero`'s.
 
+use std::num::NonZeroU8;
 use std::time::Duration;
 
 use error_stack::Report;
@@ -62,6 +65,55 @@ pub enum EcKvWriteOutcome {
     /// [`EcKvWriteMode::Add`], or generation mismatch for
     /// [`EcKvWriteMode::IfGenerationMatch`]).
     PreconditionFailed,
+}
+
+/// A replacement planned against the row [`EcKvStore::update`] read.
+#[derive(Debug, Clone)]
+pub struct EcKvReplacement {
+    /// Serialized entry body.
+    pub body: String,
+    /// Serialized entry metadata.
+    pub metadata: String,
+    /// Time-to-live for the written entry.
+    pub ttl: Duration,
+}
+
+/// The planner [`EcKvStore::update`] calls with the row as read, or `None`
+/// when the lookup missed. It returns the replacement to write, or `None` to
+/// leave the row unchanged.
+pub type EcKvPlan<'plan> = dyn FnMut(Option<&EcKvLookup>) -> Option<EcKvReplacement> + 'plan;
+
+/// How an [`EcKvStore::update`] ended when no read or write failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcKvUpdateOutcome {
+    /// Every attempt lost its precondition, so nothing was written.
+    Conflict,
+    /// The planner left the row unchanged.
+    Skipped,
+    /// A re-read after a lost precondition returned the rejected generation
+    /// or no row, so nothing was written.
+    StaleRead,
+    /// One replacement won its precondition and was written.
+    Written,
+}
+
+/// Why an [`EcKvStore::update`] did not finish.
+#[derive(Debug)]
+pub enum EcKvUpdateError {
+    /// The store has no bounded conditional update; the caller chooses a
+    /// fallback.
+    Unsupported,
+    /// A read or write failed. It was not retried.
+    Store(Report<TrustedServerError>),
+}
+
+/// The result of an [`EcKvStore::update`] and the conflicts it met.
+#[derive(Debug)]
+pub struct EcKvUpdate {
+    /// Precondition rejections, counted even when the update failed.
+    pub conflicts: u8,
+    /// The outcome, or why the update did not finish.
+    pub result: Result<EcKvUpdateOutcome, EcKvUpdateError>,
 }
 
 /// Raw KV store primitives backing the EC identity graph.
@@ -135,6 +187,31 @@ pub trait EcKvStore {
         write: EcKvWrite<'_>,
     ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>>;
 
+    /// Reads `key`, plans its replacement with `plan` and writes it
+    /// conditionally, re-reading and re-planning after a lost precondition
+    /// for at most `attempts` writes.
+    ///
+    /// Each write is guarded by the generation the attempt read, or creates
+    /// the key when the read missed, so a concurrent write is never
+    /// overwritten and at most one replacement lands. A re-read after a lost
+    /// precondition that returns the rejected generation or no row is stale
+    /// and ends the update. Read and write errors are not retried. The loop is
+    /// `EdgeZero`'s `RecordHandle::update`.
+    ///
+    /// The default reports [`EcKvUpdateError::Unsupported`] without I/O, for
+    /// a store that has no such operation.
+    async fn update(
+        &self,
+        _key: &str,
+        _attempts: NonZeroU8,
+        _plan: &mut EcKvPlan<'_>,
+    ) -> EcKvUpdate {
+        EcKvUpdate {
+            conflicts: 0,
+            result: Err(EcKvUpdateError::Unsupported),
+        }
+    }
+
     /// Lists keys sharing the given prefix from strongly consistent state.
     ///
     /// Returns one bounded page of at most `limit` keys, not an exhaustive scan.
@@ -186,12 +263,187 @@ pub trait EcKvStore {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::record_store::{
+        Record, RecordBinding, RecordGeneration, RecordLayout, RecordPartition, RecordWrite,
+        RecordWriteMode, RecordWriteOutcome,
+    };
 
     use super::*;
     use crate::ec::kv::KvIdentityGraph;
     use crate::ec::kv_types::KvEntry;
+    use crate::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
+
+    /// An `EdgeZero` record [`KvStore`] over an [`EcKvStore`] test double, so
+    /// [`RecordBackedEcKv`] runs `EdgeZero`'s own `RecordHandle::update` loop
+    /// against the double's reads and writes.
+    struct EcKvRecords(Arc<dyn EcKvStore + Send + Sync>);
+
+    #[async_trait::async_trait(?Send)]
+    impl KvStore for EcKvRecords {
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        fn record_binding(&self) -> Option<RecordBinding> {
+            Some(RecordBinding {
+                format: "ec-test".to_owned(),
+                layout: RecordLayout::new(EcRecordLayout).expect("should validate the EC layout"),
+                max_metadata_bytes: 64 * 1024,
+                scope: "test".to_owned(),
+            })
+        }
+
+        async fn record_lookup(
+            &self,
+            key: &str,
+            _partition: &RecordPartition,
+        ) -> Result<Option<Record>, KvError> {
+            let lookup = self.0.lookup(key).await.map_err(|_| KvError::Unavailable)?;
+            Ok(lookup.map(|lookup| Record {
+                body: Bytes::from(lookup.body),
+                generation: RecordGeneration::from_u64(lookup.generation),
+                metadata: lookup.metadata.map(|metadata| {
+                    String::from_utf8(metadata).expect("should hold UTF-8 metadata")
+                }),
+            }))
+        }
+
+        async fn record_insert(
+            &self,
+            key: &str,
+            _partition: &RecordPartition,
+            write: RecordWrite<'_>,
+        ) -> Result<RecordWriteOutcome, KvError> {
+            let mode = match write.mode {
+                RecordWriteMode::Add => EcKvWriteMode::Add,
+                RecordWriteMode::Overwrite => EcKvWriteMode::Overwrite,
+                RecordWriteMode::IfGenerationMatch(generation) => {
+                    EcKvWriteMode::IfGenerationMatch(generation.as_u64())
+                }
+            };
+            let outcome = self
+                .0
+                .insert(
+                    key,
+                    EcKvWrite {
+                        body: std::str::from_utf8(write.body).expect("should write a UTF-8 row"),
+                        metadata: write.metadata.unwrap_or_default(),
+                        ttl: write.ttl.unwrap_or(Duration::from_secs(60)),
+                        mode,
+                    },
+                )
+                .await
+                .map_err(|_| KvError::Unavailable)?;
+            Ok(match outcome {
+                EcKvWriteOutcome::Written => RecordWriteOutcome::Written,
+                EcKvWriteOutcome::PreconditionFailed => RecordWriteOutcome::PreconditionFailed,
+            })
+        }
+    }
+
+    /// [`EcKvStore`] wrapper that gives a test double the production
+    /// [`EcKvStore::update`]: [`RecordEcKvStore`] over `EdgeZero`'s
+    /// `RecordHandle::update`, reading and writing through the double. Every
+    /// other operation goes to the double directly.
+    pub(crate) struct RecordBackedEcKv {
+        inner: Arc<dyn EcKvStore + Send + Sync>,
+        records: RecordEcKvStore,
+    }
+
+    impl RecordBackedEcKv {
+        pub(crate) fn new(inner: Arc<dyn EcKvStore + Send + Sync>) -> Self {
+            let handle = KvHandle::new(Arc::new(EcKvRecords(Arc::clone(&inner))));
+            let records = RecordEcKvStore::new(inner.store_name().to_owned(), &handle)
+                .expect("should accept the EC record binding");
+            Self { inner, records }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for RecordBackedEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
+        }
+
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write).await
+        }
+
+        async fn update(
+            &self,
+            key: &str,
+            attempts: NonZeroU8,
+            plan: &mut EcKvPlan<'_>,
+        ) -> EcKvUpdate {
+            self.records.update(key, attempts, plan).await
+        }
+
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.

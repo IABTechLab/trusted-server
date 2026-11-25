@@ -11,6 +11,7 @@
 //! per-operation error handling policy in the spec §7.5.
 
 use std::fmt;
+use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,11 +20,14 @@ use error_stack::{Report, ResultExt};
 use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
-use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
+use super::kv_backend::{
+    EcKvLookup, EcKvReplacement, EcKvStore, EcKvUpdateError, EcKvUpdateOutcome, EcKvWrite,
+    EcKvWriteMode, EcKvWriteOutcome,
+};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
 use super::page_load::{
-    AfterResponseCommit, AfterResponseRejection, AfterResponseWrite, Generation, KvWriteError,
-    PageLoadWrite, RowChange,
+    AfterResponseCommit, AfterResponseRejection, AfterResponseWrite, KvWriteError, PageLoadWrite,
+    RowChange,
 };
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
@@ -36,7 +40,8 @@ pub const MAX_CREATE_ATTEMPTS: u32 = 5;
 
 /// Write attempts a navigation's follow-up update makes: the first, then one
 /// re-read and re-plan after a conflict.
-pub(super) const MAX_AFTER_RESPONSE_ATTEMPTS: u8 = 2;
+pub(super) const MAX_AFTER_RESPONSE_ATTEMPTS: NonZeroU8 =
+    NonZeroU8::new(2).expect("should be a nonzero attempt count");
 
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
@@ -292,6 +297,24 @@ impl KvIdentityGraph {
         })
     }
 
+    /// Builds the snapshot of `ec_id` from a raw `lookup`, or a missing one.
+    fn snapshot_of(
+        store_name: &str,
+        ec_id: &str,
+        lookup: Option<&EcKvLookup>,
+    ) -> Result<EcKvSnapshot, Report<TrustedServerError>> {
+        Ok(match lookup {
+            Some(lookup) => EcKvSnapshot::Present {
+                ec_id: ec_id.to_owned(),
+                entry: Box::new(Self::deserialize_entry(store_name, ec_id, &lookup.body)?),
+                generation: Some(lookup.generation),
+            },
+            None => EcKvSnapshot::Missing {
+                ec_id: ec_id.to_owned(),
+            },
+        })
+    }
+
     fn deserialize_entry(
         store_name: &str,
         ec_id: &str,
@@ -483,26 +506,30 @@ impl KvIdentityGraph {
 
     /// Applies a navigation's follow-up update after its response was sent.
     ///
-    /// Reads the row, asks `plan` for the update to make to it, and writes
-    /// that update only while the row is still at the generation `plan`
-    /// returns, so a concurrent write is never overwritten. When the write
-    /// loses its CAS it wrote nothing, so the row is read again and `plan`
-    /// asked again, for at most two attempts: a retry plans against every
-    /// write since and never resends a stale update. The lost CAS proves the
-    /// row exists at a newer generation, so a re-read that returns the
-    /// generation that just lost or no row at all is stale, as an eventually
-    /// consistent store can return; no further attempt is made and
-    /// [`AfterResponseRejection::StaleRead`] comes back. Store generations are
-    /// unique but not ordered, so an older generation cannot be told from a
-    /// newer one: it is planned against, and a write planned on it loses its
-    /// CAS. The `permit` is spent before the first read and every attempt
-    /// runs under it; only a write that wins its CAS lands, and the loop stops
-    /// at the first one, so at most one update lands. The permit never leaves
-    /// the graph.
+    /// Spends `permit`, then makes one [`EcKvStore::update`]: the store reads
+    /// the row, `plan` decides the update to make to it, and the store writes
+    /// that update only while the row is still at the generation it read, so a
+    /// concurrent write is never overwritten. A write that loses its CAS wrote
+    /// nothing, so the store reads the row and `plan` is asked again, for at
+    /// most [`MAX_AFTER_RESPONSE_ATTEMPTS`] writes: a retry plans against
+    /// every write since and never resends a stale update. A re-read that
+    /// returns the generation that just lost, or no row, is stale, as an
+    /// eventually consistent store can return; the store stops and
+    /// [`AfterResponseRejection::StaleRead`] comes back. That bounded loop is
+    /// `EdgeZero`'s; the graph keeps the permit and the plan, so at most one
+    /// update lands and the permit never leaves the graph.
+    ///
+    /// A store without a conditional update falls back to last-write-wins:
+    /// one read, one plan and one unconditional overwrite.
     ///
     /// `plan` returns `Err` with its reason when the row as read needs no
     /// write, such as a missing or withdrawn row; that reason comes back in
     /// [`AfterResponseRejection::Skipped`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store reports a skipped update that `plan` did not
+    /// decline, which no store does.
     ///
     /// # Performance
     ///
@@ -512,72 +539,93 @@ impl KvIdentityGraph {
         &self,
         permit: AfterResponseWrite,
         ec_id: &str,
-        mut plan: impl FnMut(&EcKvSnapshot) -> Result<(KvEntry, Generation), S>,
+        mut plan: impl FnMut(&EcKvSnapshot) -> Result<KvEntry, S>,
     ) -> AfterResponseCommit<S> {
         permit.spend();
-        let mut conflicts = 0;
-        let mut lost = None;
-        let result = loop {
-            let snapshot = match self.read_snapshot(ec_id).await {
+        let store_name = self.store_name();
+        let mut declined = None;
+        let mut plan_row = |lookup: Option<&EcKvLookup>| -> Option<EcKvReplacement> {
+            let snapshot = match Self::snapshot_of(store_name, ec_id, lookup) {
                 Ok(snapshot) => snapshot,
-                Err(report) => break Err(AfterResponseRejection::ReadFailed(report)),
+                Err(report) => {
+                    declined = Some(AfterResponseRejection::StoreFailed(report));
+                    return None;
+                }
             };
-            if let Some(lost) = lost {
-                let read = Generation::of(&snapshot, ec_id);
-                // A missing row counts as stale only while nothing hard-deletes
-                // rows: withdrawal writes a tombstone and `delete` has no
-                // production caller yet. Once the deferred data-deletion
-                // framework calls it, a row deleted after the lost CAS is
-                // reported here as `stale_read`, not `no_row`; nothing is
-                // written either way.
-                if read.is_none_or(|read| read == lost) {
-                    let found = if read.is_none() {
-                        "no row"
-                    } else {
-                        "the generation that lost its CAS"
-                    };
-                    log::warn!(
-                        "After-response re-read for '{}' is stale, returning {found}; \
-                         dropping results",
-                        log_id(ec_id)
-                    );
-                    break Err(AfterResponseRejection::StaleRead);
+            let entry = match plan(&snapshot) {
+                Ok(entry) => entry,
+                Err(reason) => {
+                    declined = Some(AfterResponseRejection::Skipped(reason));
+                    return None;
+                }
+            };
+            match Self::serialize_entry(&entry, store_name) {
+                Ok((body, metadata)) => Some(EcKvReplacement {
+                    body,
+                    metadata,
+                    ttl: ENTRY_TTL,
+                }),
+                Err(report) => {
+                    declined = Some(AfterResponseRejection::WriteFailed(
+                        report.change_context(KvWriteError::Store),
+                    ));
+                    None
                 }
             }
-            let (entry, expected) = match plan(&snapshot) {
-                Ok(planned) => planned,
-                Err(reason) => break Err(AfterResponseRejection::Skipped(reason)),
-            };
-            let written = self
-                .write_row(
-                    ec_id,
-                    &entry,
-                    ENTRY_TTL,
-                    EcKvWriteMode::IfGenerationMatch(expected.get()),
-                )
-                .await;
-            let report = match written {
-                Ok(()) => break Ok(()),
-                Err(report) => report,
-            };
-            if !matches!(report.current_context(), KvWriteError::Conflict) {
-                break Err(AfterResponseRejection::WriteFailed(report));
-            }
-            conflicts += 1;
-            if conflicts >= MAX_AFTER_RESPONSE_ATTEMPTS {
+        };
+        let update = self
+            .store
+            .update(ec_id, MAX_AFTER_RESPONSE_ATTEMPTS, &mut plan_row)
+            .await;
+        let result = match update.result {
+            Ok(EcKvUpdateOutcome::Written) => Ok(()),
+            Ok(EcKvUpdateOutcome::Skipped) => Err(declined
+                .take()
+                .expect("should record why the plan declined the row")),
+            Ok(EcKvUpdateOutcome::Conflict) => {
                 log::warn!(
-                    "After-response write for '{}' conflicts again, dropping results",
+                    "After-response write for '{}' conflicts on every attempt, dropping results",
                     log_id(ec_id)
                 );
-                break Err(AfterResponseRejection::Conflict);
+                Err(AfterResponseRejection::Conflict)
             }
-            log::info!(
-                "After-response write for '{}' conflicts, re-reading the row",
-                log_id(ec_id)
-            );
-            lost = Some(expected);
+            Ok(EcKvUpdateOutcome::StaleRead) => {
+                log::warn!(
+                    "After-response re-read for '{}' is stale, dropping results",
+                    log_id(ec_id)
+                );
+                Err(AfterResponseRejection::StaleRead)
+            }
+            Err(EcKvUpdateError::Store(report)) => Err(AfterResponseRejection::StoreFailed(report)),
+            Err(EcKvUpdateError::Unsupported) => self.overwrite_after_response(ec_id, plan).await,
         };
-        AfterResponseCommit { result, conflicts }
+        AfterResponseCommit {
+            result,
+            conflicts: update.conflicts,
+        }
+    }
+
+    /// Writes a follow-up update last-write-wins, for a store without a
+    /// conditional update: reads the row, plans once and overwrites it.
+    async fn overwrite_after_response<S>(
+        &self,
+        ec_id: &str,
+        mut plan: impl FnMut(&EcKvSnapshot) -> Result<KvEntry, S>,
+    ) -> Result<(), AfterResponseRejection<S>> {
+        log::info!(
+            "EC store '{}' has no conditional update; the after-response write for '{}' \
+             overwrites the row",
+            self.store_name(),
+            log_id(ec_id)
+        );
+        let snapshot = self
+            .read_snapshot(ec_id)
+            .await
+            .map_err(AfterResponseRejection::StoreFailed)?;
+        let entry = plan(&snapshot).map_err(AfterResponseRejection::Skipped)?;
+        self.write_row(ec_id, &entry, ENTRY_TTL, EcKvWriteMode::Overwrite)
+            .await
+            .map_err(AfterResponseRejection::WriteFailed)
     }
 
     /// Serializes `entry` and writes it with `mode`, mapping a failed
@@ -1459,10 +1507,25 @@ impl KvIdentityGraph {
 
 #[cfg(test)]
 impl KvIdentityGraph {
+    /// Test helper: a graph over `store` with the production conditional
+    /// update, `EdgeZero`'s `RecordHandle::update`, reading and writing
+    /// through `store`.
+    pub(crate) fn with_record_update(store: impl EcKvStore + Send + Sync + 'static) -> Self {
+        Self::shared_with_record_update(Arc::new(store))
+    }
+
+    /// Test helper: [`Self::with_record_update`] over a store the test keeps
+    /// a handle to.
+    pub(crate) fn shared_with_record_update(store: Arc<dyn EcKvStore + Send + Sync>) -> Self {
+        Self::new(super::kv_backend::test_support::RecordBackedEcKv::new(
+            store,
+        ))
+    }
+
     /// Test helper: a graph whose every store operation fails, mimicking a
     /// missing or unreachable platform store.
     pub(crate) fn failing(store_name: impl Into<String>) -> Self {
-        Self::new(super::kv_backend::test_support::FailingEcKv::new(
+        Self::with_record_update(super::kv_backend::test_support::FailingEcKv::new(
             store_name,
         ))
     }
@@ -1474,13 +1537,13 @@ impl KvIdentityGraph {
         let (body, meta) = Self::serialize_entry(entry, store.store_name())
             .expect("should serialize the seed row");
         store.seed(ec_id, &body, &meta).await;
-        Self::new(store)
+        Self::with_record_update(store)
     }
 
     /// Test helper: a graph backed by an in-memory store with generation
     /// tracking.
     pub(crate) fn in_memory(store_name: impl Into<String>) -> Self {
-        Self::new(super::kv_backend::test_support::InMemoryEcKv::new(
+        Self::with_record_update(super::kv_backend::test_support::InMemoryEcKv::new(
             store_name,
         ))
     }
@@ -1489,7 +1552,7 @@ impl KvIdentityGraph {
     /// key absent while the list API still sees it, mimicking an
     /// eventually-consistent edge data store.
     pub(crate) fn stale_lookup(store_name: impl Into<String>, stale_lookups: u32) -> Self {
-        Self::new(super::kv_backend::test_support::StaleLookupEcKv::new(
+        Self::with_record_update(super::kv_backend::test_support::StaleLookupEcKv::new(
             store_name,
             stale_lookups,
             false,
@@ -1502,7 +1565,7 @@ impl KvIdentityGraph {
         store_name: impl Into<String>,
         lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
-        Self::new(super::kv_backend::test_support::CountingEcKv::new(
+        Self::with_record_update(super::kv_backend::test_support::CountingEcKv::new(
             store_name, lookups,
         ))
     }
@@ -1510,7 +1573,7 @@ impl KvIdentityGraph {
     /// Test helper: a graph whose point reads always miss and whose list API
     /// errors, so absence can neither be observed nor proved.
     pub(crate) fn unprovable_absence(store_name: impl Into<String>) -> Self {
-        Self::new(super::kv_backend::test_support::StaleLookupEcKv::new(
+        Self::with_record_update(super::kv_backend::test_support::StaleLookupEcKv::new(
             store_name,
             u32::MAX,
             true,
