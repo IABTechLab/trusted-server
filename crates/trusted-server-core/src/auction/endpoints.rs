@@ -1365,8 +1365,15 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &crate::ec::sharedid::SharedIdRequest::with_value_for_test("shared-cookie-id"),
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &crate::ec::sharedid::SharedIdRequest::with_value_for_test(
+                    "shared-cookie-id",
+                ),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;
@@ -1476,8 +1483,14 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
-            &crate::ec::sharedid::SharedIdRequest::default(),
+            &crate::ec::finalize::FinalizeRequest {
+                // No `ts-eids` cookie on this request at all.
+                eids_cookie: None,
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
+            },
             &mut response,
         )
         .await;
@@ -1639,8 +1652,12 @@ mod tests {
             &mut context,
             Some(graph),
             registry,
-            Some(&cookie),
-            &crate::ec::sharedid::SharedIdRequest::default(),
+            // `/auction` is not a navigation, so it gets no request time.
+            &crate::ec::finalize::FinalizeRequest {
+                eids_cookie: Some(&cookie),
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                now: None,
+            },
             &mut response,
         )
         .await;
@@ -1805,8 +1822,12 @@ mod tests {
                 &mut context,
                 Some(&graph),
                 &registry,
-                Some(&cookie),
-                &crate::ec::sharedid::SharedIdRequest::default(),
+                // `/auction` is not a navigation, so it gets no request time.
+                &crate::ec::finalize::FinalizeRequest {
+                    eids_cookie: Some(&cookie),
+                    sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                    now: None,
+                },
                 &mut response,
             )
             .await;

@@ -213,7 +213,8 @@ impl IdentityApp {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        self.schedule_after_response(
+        // Registration failures are logged inside; the response is sent either way.
+        let _registered = self.schedule_after_response(
             identity.context,
             after_response,
             scheduler,

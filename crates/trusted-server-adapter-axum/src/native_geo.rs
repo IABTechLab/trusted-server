@@ -106,9 +106,27 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
-    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_profile_path_is_unavailable() {
+        let path = std::ffi::OsStr::from_bytes(b"/nonexistent/profile-\xff.toml");
+        temp_env::with_var(PROFILE_FILE_ENV, Some(path), || {
+            let error = load_selection().expect_err("should reject a non-Unicode profile path");
+            assert_eq!(
+                *error.current_context(),
+                NativeGeoProfileError::Unavailable,
+                "should report a non-Unicode profile path as unavailable"
+            );
+            assert!(
+                !kv_selected(),
+                "should not declare the Geo store while a profile is selected"
+            );
+        });
+    }
 
     const PROFILE: &str = r#"version = 1
 [geo]

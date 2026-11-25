@@ -1,3 +1,11 @@
+# Reference manifest for the Cloudflare adapter's store names. The Worker
+# runtime does not read this file: startup config comes from the
+# `TRUSTED_SERVER_CONFIG` variable in wrangler.toml, request-time config is
+# unsupported, and the runtime KV store is the `TRUSTED_SERVER_RUNTIME_KV` namespace
+# binding, which the Worker opens directly. See docs/guide/edgezero.md for the
+# full store inventory. tests/config_defaults.rs keeps the config ID aligned
+# with the runtime default.
+
 [app]
 name = "trusted-server"
 version = "0.1.0"
@@ -6,10 +14,10 @@ kind = "http"
 [adapters.cloudflare]
 
 [stores.kv]
-name = "trusted_server_kv"
+name = "trusted_server_runtime_kv"
 
 [stores.kv.adapters.cloudflare]
-name = "TRUSTED_SERVER_KV"
+name = "TRUSTED_SERVER_RUNTIME_KV"
 
 [stores.config]
 name = "trusted_server_config"
