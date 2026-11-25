@@ -13,6 +13,13 @@ if [ ! -d "$runtime_dir" ] || [ ! -w "$runtime_dir" ] || [ ! -x "$runtime_dir" ]
     exit 1
 fi
 
+# Plain mv moves the file into a directory at the target, and GNU mv -T is not
+# portable. Refuse a directory, or a link to one, before publishing.
+if [ -d "$runtime_dir/native-bindings.toml" ]; then
+    printf '%s\n' 'Native bindings path must not be a directory' >&2
+    exit 1
+fi
+
 umask 077
 temporary=$(mktemp "$runtime_dir/.native-bindings.XXXXXX")
 trap 'rm -f "$temporary"' 0
@@ -20,7 +27,7 @@ trap 'exit 1' 1 2 15
 # printf treats the entire input as data. Never source or evaluate these bytes.
 printf '%s' "$TS_NATIVE_BINDINGS_TOML" > "$temporary"
 chmod 0600 "$temporary"
-mv -fT -- "$temporary" "$runtime_dir/native-bindings.toml"
+mv -f -- "$temporary" "$runtime_dir/native-bindings.toml"
 trap - 0 1 2 15
 
 # An absent profile keeps Geo Off. An explicitly empty profile is an error,
@@ -30,12 +37,16 @@ if [ "${TS_NATIVE_GEO_PROFILE_TOML+x}" = x ]; then
         printf '%s\n' 'TS_NATIVE_GEO_PROFILE_TOML must not be empty' >&2
         exit 1
     fi
+    if [ -d "$runtime_dir/native-geo.toml" ]; then
+        printf '%s\n' 'Native Geo profile path must not be a directory' >&2
+        exit 1
+    fi
     temporary=$(mktemp "$runtime_dir/.native-geo.XXXXXX")
     trap 'rm -f "$temporary"' 0
     trap 'exit 1' 1 2 15
     printf '%s' "$TS_NATIVE_GEO_PROFILE_TOML" > "$temporary"
     chmod 0600 "$temporary"
-    mv -fT -- "$temporary" "$runtime_dir/native-geo.toml"
+    mv -f -- "$temporary" "$runtime_dir/native-geo.toml"
     trap - 0 1 2 15
     TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE="$runtime_dir/native-geo.toml"
     export TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE

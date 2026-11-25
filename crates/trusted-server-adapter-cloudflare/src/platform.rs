@@ -2,16 +2,16 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
-use bytes::Bytes;
-use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
-use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
+#[cfg(target_arch = "wasm32")]
+use edgezero_core::key_value_store::KvHandle;
 use error_stack::Report;
 use trusted_server_core::outbound::request_outbound_client;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::platform::KvHandleStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
+    ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformKvStore,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
@@ -54,87 +54,41 @@ impl PlatformSecretStore for NoopSecretStore {
 }
 
 // ---------------------------------------------------------------------------
-// edgezero handle adapters — no #[cfg] needed; platform-specific store
-// construction is handled by edgezero's run_app before we receive the ctx.
+// Runtime KV
 // ---------------------------------------------------------------------------
 
-/// Bridges edgezero's [`ConfigStoreHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_CONFIG` env-var binding) to [`PlatformConfigStore`].
+/// Workers KV namespace binding that backs the generic runtime KV store.
 ///
-/// Reads delegate through the handle. Writes are unsupported on all current
-/// adapter targets and return errors.
+/// It is the binding `wrangler.toml` declares and the reference
+/// `cloudflare.toml` maps to the logical ID `trusted_server_runtime_kv`. The Worker
+/// opens it directly rather than declaring the store to `EdgeZero`, which would
+/// look for a binding named after the logical ID unless every deployment set
+/// `EDGEZERO__STORES__KV__TRUSTED_SERVER_RUNTIME_KV__NAME`.
+pub const CLOUDFLARE_KV_BINDING: &str = "TRUSTED_SERVER_RUNTIME_KV";
+
+/// Opens the runtime KV store for one request from the Worker environment.
 ///
-/// Note: Cloudflare config is a single flat JSON env-var binding — all keys
-/// live in one namespace. The `store_name` argument is intentionally ignored;
-/// callers cannot route to a different store by passing a different name.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
+/// A Worker without the binding answers every KV operation with
+/// `KvError::Unavailable` and logs one warning per isolate; routes that do not
+/// use KV are unaffected.
+#[cfg(target_arch = "wasm32")]
+fn runtime_kv_store(env: &worker::Env) -> Arc<dyn PlatformKvStore> {
+    static MISSING_BINDING_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
-#[async_trait::async_trait(?Send)]
-impl PlatformConfigStore for ConfigStoreHandleAdapter {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        futures::executor::block_on(self.0.get(key))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("config store lookup failed: {e}"))
-            })?
-            .map(|value| String::from(value.as_str()))
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!("key not found: {key}"))
-            })
-    }
-
-    async fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
-    }
-
-    async fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
-    }
-}
-
-/// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
-///
-/// Delegates all operations through `KvHandle`'s raw-bytes API, which includes
-/// key/value validation before forwarding to the underlying store.
-///
-/// Note: key/value validation runs twice — once inside this `KvHandle` and once
-/// inside the `KvHandle` that `RuntimeServices::kv_handle()` constructs from
-/// this adapter. The overhead is negligible (string length checks only) and
-/// avoided by the fact that we reuse the already-opened `env.kv()` handle from
-/// `run_app` rather than opening a new one.
-struct KvHandleAdapter(KvHandle);
-
-#[async_trait::async_trait(?Send)]
-impl KvStore for KvHandleAdapter {
-    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
-        self.0.get_bytes(key).await
-    }
-
-    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        self.0.put_bytes(key, value).await
-    }
-
-    async fn put_bytes_with_ttl(
-        &self,
-        key: &str,
-        value: Bytes,
-        ttl: Duration,
-    ) -> Result<(), KvError> {
-        self.0.put_bytes_with_ttl(key, value, ttl).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        self.0.delete(key).await
-    }
-
-    async fn list_keys_page(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, KvError> {
-        self.0.list_keys_page(prefix, cursor, limit).await
+    match edgezero_adapter_cloudflare::key_value_store::CloudflareKvStore::from_env(
+        env,
+        CLOUDFLARE_KV_BINDING,
+    ) {
+        Ok(store) => Arc::new(KvHandleStore::new(KvHandle::new(Arc::new(store)))),
+        Err(error) => {
+            if !MISSING_BINDING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "Cloudflare runtime KV binding `{CLOUDFLARE_KV_BINDING}` is unavailable: {error}"
+                );
+            }
+            Arc::new(UnavailableKvStore)
+        }
     }
 }
 
@@ -190,12 +144,14 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// Config and KV are sourced from the edgezero handles that `run_app` injects
-/// before routing — via the `TRUSTED_SERVER_CONFIG` env-var binding and the
-/// `TRUSTED_SERVER_KV` KV namespace declared in `cloudflare.toml`. No
-/// platform-specific `#[cfg]` is required for these two stores.
+/// The Worker declares no stores to `EdgeZero`, so no request carries a store
+/// registry. Request-time config is unsupported: every config read fails, so
+/// request signing cannot read its metadata, discovery answers 500 and
+/// `/verify-signature` answers `verified: false`. Startup config comes from the
+/// `TRUSTED_SERVER_CONFIG` variable instead. The runtime KV store is the
+/// [`CLOUDFLARE_KV_BINDING`] namespace, opened from the Worker environment.
 ///
-/// Secrets still require direct `worker::Env` access because
+/// Secrets require direct `worker::Env` access because
 /// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
 /// is sync; the underlying `env.secret()` call is synchronous at the JS level.
 ///
@@ -216,31 +172,28 @@ pub fn build_runtime_services(
     let client_ip = extract_client_ip(ctx);
     let outbound_client = request_outbound_client(ctx)?;
 
-    // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
-    let config_store: Arc<dyn PlatformConfigStore> = ctx
-        .config_store_default()
-        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
-        .unwrap_or_else(|| Arc::new(NoopConfigStore));
+    let config_store: Arc<dyn PlatformConfigStore> = Arc::new(NoopConfigStore);
 
-    // KV: use the KvHandle injected by run_app — no #[cfg] needed.
-    let kv_store: Arc<dyn PlatformKvStore> = ctx
-        .kv_store_default()
-        .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
-        .unwrap_or_else(|| Arc::new(UnavailableKvStore));
-
-    // Secrets: still requires wasm32-specific env.secret() (async/sync mismatch).
+    // Secrets and KV need the wasm32-only Worker environment.
     #[cfg(target_arch = "wasm32")]
-    let secret_store: Arc<dyn PlatformSecretStore> = ctx
+    let cloudflare_env = ctx
         .extensions()
         .get::<edgezero_adapter_cloudflare::context::CloudflareRequestContext>()
-        .map(|cf_ctx| {
-            Arc::new(CloudflareSecretStoreAdapter {
-                env: cf_ctx.env().clone(),
-            }) as Arc<dyn PlatformSecretStore>
-        })
+        .map(|cf_ctx| cf_ctx.env().clone());
+    #[cfg(target_arch = "wasm32")]
+    let secret_store: Arc<dyn PlatformSecretStore> = cloudflare_env
+        .clone()
+        .map(|env| Arc::new(CloudflareSecretStoreAdapter { env }) as Arc<dyn PlatformSecretStore>)
         .unwrap_or_else(|| Arc::new(NoopSecretStore));
+    #[cfg(target_arch = "wasm32")]
+    let kv_store: Arc<dyn PlatformKvStore> = cloudflare_env
+        .as_ref()
+        .map(runtime_kv_store)
+        .unwrap_or_else(|| Arc::new(UnavailableKvStore));
     #[cfg(not(target_arch = "wasm32"))]
     let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
+    #[cfg(not(target_arch = "wasm32"))]
+    let kv_store: Arc<dyn PlatformKvStore> = Arc::new(UnavailableKvStore);
 
     // Geo: read Cloudflare-injected headers — no #[cfg] needed; headers are
     // simply absent on the native host target, producing Ok(None) from lookup().

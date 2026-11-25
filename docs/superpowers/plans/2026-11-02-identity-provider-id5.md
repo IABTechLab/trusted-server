@@ -12,22 +12,22 @@
 
 **Changes from the earlier ID5 plan (built on the old descriptor framework):**
 
-- No hashed email and no `pd` field: every source is `SourceInput::Anonymous`.
-- A reply's non-empty `signature` is kept as private refresh state, due a tenth of the TTL before the UIDs expire, and sent back as `s`, as Prebid's ID5 module does.
+- Every source is `SourceInput::Anonymous`. With the hashed-email capability enabled (`2026-11-25-identity-provider-hashed-email-capability.md`) and a hashed email for the request, the body also carries `pd`: padded URL-safe base64 of `1=<percent-encoded hashed email>` (partner-data key 1 is the SHA-256 email hash), as ID5's server-side fetch documentation requires.
+- A reply's non-empty `signature` is kept as private refresh state, due 8 hours after the reply, and sent back as `s`, as ID5's server-side fetch documentation asks.
 - Endpoint, sources and the TCF vendor ID come from the common provider config, not hard-coded defaults.
 - The legacy `universal_uid` fallback goes to the first configured source. An opted-out `universal_uid` of `0` is reported as `LookupOutcome::OptedOut`, detected on the reply as sent (not percent-decoded).
 
 ## Request
 
-- `POST <endpoint>/<partner_id>.json`, with `Content-Type: application/json` and `Origin: https://<publisher_domain>`.
-- Body, following ID5's server-side client (its Prebid Server module): `partner`, `provider` (`provider_name`, default the publisher domain), `domain` (the publisher domain), `origin = "trusted-server"`, `v` (the crate version), `ts` (RFC 3339), `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, and `ip` (IPv4) or `ipv6` (only when routable, see `common::is_routable_ip`).
-- Confirm the `ip` and `ua` field names with ID5 for each partner account.
+- `POST <endpoint>/<partner_id>.json`, with `Content-Type: application/json; charset=UTF-8` and `Origin: https://<publisher_domain>`.
+- Body, following ID5's server-side fetch documentation: `partner`, `provider` (`provider_name`, default the publisher domain), `o = "server-side-fetch-api"`, `u` (`https://<publisher_domain>`), `top = 1`, `v` (the crate version), `ts` (RFC 3339), `gdpr`, and when present `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ua`, `accept_language` (the visitor's `Accept-Language`), `ref` (the origin of the visitor's `Referer`), and `ipv4` or `ipv6` (only when routable, see `common::is_routable_ip`). `ClientSignals` carries the `Referer` and `Accept-Language` headers for this.
+- `pd` only with a hashed email (see above); a fetch without one is unchanged.
 
 ## Response
 
 - `204` is no match; another non-2xx status or an unparseable body is `ProviderError::InvalidResponse`.
 - `ids.<key>.eid` entries whose source is configured become `ProviderEid`s; every field, including `ext`, is borrowed from the body.
-- `cache_control.max_age_sec` becomes `ProviderExpiry::After` for every UID.
+- Every UID gets `ProviderExpiry::After(30 days)`, restarted by each reply; `cache_control` is ignored.
 - With no EID for the first source, a non-empty, non-`0` `universal_uid` becomes an EID with `atype = 1` and, when the reply has `ext.linkType`, UID `ext` `{"linkType": ...}`, as in the reference provider and Prebid.
 
 ## First-party cookie
@@ -36,7 +36,7 @@ ID5's source is provider-owned, so the browser `ts-eids` copy is dropped. Prebid
 
 - Setting `cookie_names` (default `["id5id"]`), tried in order.
 - `id5` declares the Lockr capability (see `2026-11-02-identity-provider-lockr-capability.md`): with `[settings.lockr] enabled = true`, the Lockr cookies (default `["id5id"]`) are read after `cookie_names` and before the lookup, with the same parser.
-- A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, `cache_control.max_age_sec` bounded). When the value was percent-encoded, entries, `ext` objects included, are copied out of the decoded text.
+- A value that is JSON after percent-decoding is parsed with the same code as a lookup response (lenient entries, opt-out `0` dropped, normalized sources, 30-day expiry). When the value was percent-encoded, entries, `ext` objects included, are copied out of the decoded text.
 - Any other value is a bare ID: one UID on the first source with `atype = 1` and the default TTL.
 - `signature` is never stored as a UID, only as refresh state. A cookie that yields no usable UID is ignored, and the lookup runs as usual; a kept UID skips the lookup.
 

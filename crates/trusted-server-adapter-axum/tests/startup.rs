@@ -68,6 +68,10 @@ async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_o
     server.assert_failed_before_listen("startup kv: trusted_server_kv: provider unavailable");
 }
 
+/// Local route that runs the response middleware without reaching an origin:
+/// the TSJS handler answers an unknown bundle hash with `404`.
+const GEO_ROUTE: &str = "/static/tsjs=0000000000000000";
+
 struct ServerFixture {
     root: PathBuf,
     addr: SocketAddr,
@@ -198,7 +202,7 @@ impl ServerFixture {
             );
         }
         if let Some(value) = legacy {
-            command.env("TS_EC_DYNAMODB_ENABLED", value);
+            command.env("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", value);
         }
         self.child = Some(
             command
@@ -260,15 +264,86 @@ impl ServerFixture {
         }
     }
 
+    /// Asserts that a caught initialization failure keeps the process
+    /// listening with the failure router: liveness stays `200`, while
+    /// readiness and an ordinary route answer the fixed `503`. Returns the
+    /// process output for further checks.
+    fn assert_serves_failure_router(&mut self, expected: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let health = loop {
+            if let Ok(response) = self.get("/health") {
+                break response;
+            }
+            let status = self
+                .child
+                .as_mut()
+                .expect("should own child")
+                .try_wait()
+                .expect("should poll production child");
+            assert!(
+                status.is_none(),
+                "should keep running after an initialization failure, exited with {status:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "should listen within the test bound"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            health.starts_with("HTTP/1.1 200") && health.ends_with("\r\n\r\nok"),
+            "should keep liveness up after an initialization failure: {health}"
+        );
+        for path in ["/ready", "/"] {
+            let response = self
+                .get(path)
+                .expect("should answer from the failure router");
+            assert!(
+                response.starts_with("HTTP/1.1 503")
+                    && response.ends_with("\r\n\r\nService Unavailable\n"),
+                "should answer {path} with the fixed unavailable response: {response}"
+            );
+        }
+        let mut child = self.child.take().expect("should own child");
+        assert!(
+            child
+                .try_wait()
+                .expect("should poll production child")
+                .is_none(),
+            "should keep serving the failure router"
+        );
+        child.kill().expect("should stop production child");
+        let output = child
+            .wait_with_output()
+            .expect("should collect startup diagnostics");
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains(expected),
+            "should explain startup failure: {diagnostic}"
+        );
+        assert_no_secrets(&diagnostic);
+        diagnostic
+    }
+
+    /// Waits for readiness, then returns the liveness response.
+    ///
+    /// Liveness stays `200` after a caught initialization failure, so only
+    /// readiness shows that initialization succeeded.
     fn wait_ready(&mut self) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok(response) = self.get("/health") {
+            if let Ok(response) = self.get("/ready") {
                 assert!(
                     response.starts_with("HTTP/1.1 200"),
-                    "should become healthy only after successful initialization: {response}"
+                    "should become ready only after successful initialization: {response}"
                 );
-                return response;
+                return self
+                    .get("/health")
+                    .expect("should answer liveness once ready");
             }
             let status = self
                 .child
@@ -379,12 +454,15 @@ fn obsolete_ec_environment_does_not_select_or_override_declared_storage() {
 }
 
 #[test]
-fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
+fn unsupported_ec_storage_serves_the_failure_router_and_uncompiled_providers_fail_before_listen() {
+    // EC storage the application rejects follows the shared startup-failure
+    // contract; only provider preparation, which EdgeZero runs before the
+    // initializer, stops the process before it listens.
     let mut server = ServerFixture::new(Some(&storage_envelope(
         json!({"provider":"fastly","store":"exact-binding"}),
     )));
     server.spawn(false, false);
-    server.assert_failed_before_listen("unsupported by the selected serving runtime");
+    server.assert_serves_failure_router("unsupported by the selected serving runtime");
 
     let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
     let mut server = ServerFixture::new(Some(&configured));
@@ -396,7 +474,7 @@ fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
         json!({"provider":"records","store":"undeclared-identity"}),
     )));
     server.spawn(false, false);
-    server.assert_failed_before_listen("configured EC record store is not prepared");
+    server.assert_serves_failure_router("configured EC record store is not prepared");
 
     for binding in [
         (!cfg!(feature="aws-dynamodb-ec")).then(|| json!({"provider":"aws-dynamodb-records","region":"us-east-1","table":"example-identity","namespace":"fixture"})),
@@ -456,11 +534,11 @@ fn missing_config_fails_before_listen_without_legacy_fallback() {
 }
 
 #[test]
-fn missing_secret_fails_before_listen_without_legacy_fallback() {
+fn missing_secret_serves_the_failure_router_without_legacy_fallback() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn(true, false);
     let diagnostic = server
-        .assert_failed_before_listen("required app-config secret at `ec.passphrase` is missing");
+        .assert_serves_failure_router("required app-config secret at `ec.passphrase` is missing");
     assert!(
         !diagnostic.contains("ec_key"),
         "should name the config path, never the reference key: {diagnostic}"
@@ -468,18 +546,18 @@ fn missing_secret_fails_before_listen_without_legacy_fallback() {
 }
 
 #[test]
-fn runtime_secret_validation_fails_before_listen() {
+fn runtime_secret_validation_serves_the_failure_router() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn(false, true);
-    server.assert_failed_before_listen("passphrase");
+    server.assert_serves_failure_router("passphrase");
 }
 
 #[test]
-fn tampered_envelope_fails_before_listen() {
+fn tampered_envelope_serves_the_failure_router() {
     let tampered = ENVELOPE.replace("f4dc0301", "00000000");
     let mut server = ServerFixture::new(Some(&tampered));
     server.spawn(false, false);
-    server.assert_failed_before_listen("integrity verification");
+    server.assert_serves_failure_router("integrity verification");
 }
 
 #[test]
@@ -489,7 +567,7 @@ fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_while_runni
     let health = server.wait_ready();
     assert!(
         health.to_ascii_lowercase().contains("x-ts-version:"),
-        "should serve health through the real middleware: {health}"
+        "should report the compiled version on the liveness probe: {health}"
     );
     let tsjs = server
         .get("/static/tsjs=0000000000000000")
@@ -510,9 +588,11 @@ fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_while_runni
         "invalid-changed-config",
     )
     .expect("should replace fixture publication input");
+    // Liveness stays up even after a failed initialization, so readiness
+    // shows that the initialized state is retained.
     assert!(
         server
-            .get("/health")
+            .get("/ready")
             .expect("should retain initialized state")
             .starts_with("HTTP/1.1 200"),
         "should keep serving the startup snapshot after the input changes"
@@ -547,19 +627,27 @@ fn compiled_out_geo_selection_fails_before_store_preparation_and_listen() {
 fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn_configured(false, false, Some(GEO_PROFILE));
-    let health = server.wait_ready();
+    server.wait_ready();
+    // Probes bypass the response middleware, so Geo headers are read from
+    // ordinary routes.
+    let initial = server
+        .get(GEO_ROUTE)
+        .expect("should reach the initial managed native route");
     assert!(
-        health
+        initial
             .to_ascii_lowercase()
             .contains("x-geo-info-available: false"),
-        "should report unavailable Geo on the initial health request without country headers"
+        "should report unavailable Geo on the initial request without country headers"
     );
     let headers = "CloudFront-Viewer-Country: us\r\nCloudFront-Viewer-Country-Region: ca\r\nx-origin-test-removal: fixture-origin-credential\r\n";
-    for (path, status) in [
-        ("/health", "200"),
-        ("/_ts/admin/ec", "401"),
-        ("/static/tsjs=0000000000000000", "404"),
-    ] {
+    let probe = server
+        .get_with_headers("/health", headers)
+        .expect("should reach the liveness probe");
+    assert!(
+        probe.starts_with("HTTP/1.1 200") && !probe.to_ascii_lowercase().contains("x-geo-"),
+        "should answer the liveness probe without Geo headers: {probe}"
+    );
+    for (path, status) in [("/_ts/admin/ec", "401"), (GEO_ROUTE, "404")] {
         let response = server
             .get_with_headers(path, headers)
             .expect("should reach managed native route");
@@ -595,7 +683,7 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
         }
     }
     let gb = server
-        .get_with_headers("/health", "CloudFront-Viewer-Country: GB\r\n")
+        .get_with_headers(GEO_ROUTE, "CloudFront-Viewer-Country: GB\r\n")
         .expect("should process another country");
     assert!(
         gb.to_ascii_lowercase().contains("x-geo-country: gb"),
@@ -612,8 +700,8 @@ fn managed_geo_is_partial_immutable_per_request_and_finalized_on_auth_errors() {
         "CloudFront-Viewer-Country-Region: CA\r\n",
     ] {
         let response = server
-            .get_with_headers("/health", headers)
-            .expect("should preserve health with unavailable geography");
+            .get_with_headers(GEO_ROUTE, headers)
+            .expect("should preserve the route with unavailable geography");
         assert!(
             response
                 .to_ascii_lowercase()
@@ -693,8 +781,8 @@ fn nonmatching_real_socket_peer_cannot_supply_geo() {
         Some(&GEO_PROFILE.replace("127.0.0.1/32", "192.0.2.1/32")),
     );
     server.wait_ready();
-    let response = server.get_with_headers("/health", "CloudFront-Viewer-Country: US\r\nCloudFront-Viewer-Country-Region: CA\r\nX-Forwarded-For: 192.0.2.1\r\n")
-        .expect("should reach health without trusting forged peer");
+    let response = server.get_with_headers(GEO_ROUTE, "CloudFront-Viewer-Country: US\r\nCloudFront-Viewer-Country-Region: CA\r\nX-Forwarded-For: 192.0.2.1\r\n")
+        .expect("should reach the route without trusting forged peer");
     assert!(
         response
             .to_ascii_lowercase()
@@ -724,8 +812,12 @@ fn legacy_live_framing_headers_load_without_reapplying_operator_push_rules() {
         .expect("should serialize a correctly hashed existing live fixture");
     let mut server = ServerFixture::new(Some(&envelope));
     server.spawn(false, false);
-    let health = server.wait_ready();
-    let headers = health.to_ascii_lowercase();
+    server.wait_ready();
+    // Probes bypass configured response headers, so an ordinary route carries them.
+    let response = server
+        .get(GEO_ROUTE)
+        .expect("should reach an ordinary route");
+    let headers = response.to_ascii_lowercase();
     assert!(
         headers.contains("x-example: preserved"),
         "should preserve safe existing runtime headers"
@@ -1093,6 +1185,22 @@ fn handwritten_store_metadata_matches_the_manifest() {
                 .filter_map(|(index, part)| (index % 2 == 1).then_some(part))
                 .collect()
         };
+        if kind == "kv" {
+            // The manifest declares every adapter's KV stores: Fastly and Spin's
+            // generic runtime store and the EC record store. Axum declares only
+            // the record store, so each of its KV IDs must be one the manifest
+            // declares.
+            let manifest_ids = quoted_values("ids");
+            assert!(
+                manifest_ids.contains(&default),
+                "should default to a KV store the manifest declares"
+            );
+            assert!(
+                ids.iter().all(|id| manifest_ids.contains(id)),
+                "should declare only KV stores the manifest declares: {ids:?}"
+            );
+            continue;
+        }
         assert_eq!(
             quoted_values("default"),
             vec![default],

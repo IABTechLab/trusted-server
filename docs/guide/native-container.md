@@ -41,7 +41,7 @@ With Docker available, use the host Node version pinned in `.tool-versions`:
 node scripts/test-native-container.mjs ts-native:local
 ```
 
-The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks startup rejection for invalid configuration and missing secrets, the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
+The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks that invalid configuration and missing secrets serve the failure router (`/health` `200`, `/ready` and routes `503`), the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
 
 The missing-secret container uses a temporary seccomp profile that makes `bind` and `listen` fail with EPERM. It must still exit non-zero with both `Trusted Server initialization failed` and `is missing in trusted_server_secrets` in its log. Port probes and the absence of a ready lifecycle event are additional checks. A listener failure before secret validation cannot substitute for the required missing-secret diagnostic.
 
