@@ -15352,8 +15352,13 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
-                        &crate::ec::sharedid::SharedIdRequest::default(),
+                        &crate::ec::finalize::FinalizeRequest {
+                            eids_cookie: None,
+                            sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
+                            now: Some(crate::ec::eid_types::UnixSeconds::new(
+                                crate::ec::current_timestamp(),
+                            )),
+                        },
                         &mut response,
                     )
                     .await;

@@ -158,6 +158,28 @@ pull_sync_concurrency = 3
 # Provider-specific settings, parsed by the provider kind.
 # [ec.identity_providers.settings]
 #
+# Hashed-email capability (id5 and liveramp only): sends a signed-in
+# visitor's hashed email, read from your status endpoint below at `path` (jq
+# syntax limited to `.key`, `."quoted key"` and `[index]`). Trusted Server
+# calls the endpoint with the visitor's whole Cookie header, at most
+# once per collection phase and only when such a provider has a source
+# without a live ID. Return the value the vendor expects (lowercase hex SHA-256 of the
+# normalised email); it is sent as returned and never stored or logged.
+# The call runs beside the origin fetch and shares the phase's identity
+# budget with the lookups, so `timeout_ms` (default 100) must be below
+# `identity_budget_ms`. The call is a GET by default. An endpoint that needs
+# a POST, a body or an extra header can set `method`, `body` (POST only, sent
+# as is, as application/json unless a content-type header says otherwise) and
+# `headers`, each a fixed value or `{ cookie = "name" }` for the value of the
+# visitor's cookie `name`; without that cookie no call is made.
+# [ec.hashed_email]
+# endpoint = "https://www.example.com/api/user/status"
+# timeout_ms = 100
+# method = "POST"
+# body = "{}"
+# [ec.hashed_email.headers]
+# x-session = { cookie = "session" }
+#
 # ID5 (kind "id5"): anonymous lookup, no secrets. The first source receives
 # the legacy `universal_uid`. Use the endpoint and sources ID5 gives you.
 # Before any lookup it reads the first-party cookies in `cookie_names`, in
@@ -190,6 +212,10 @@ pull_sync_concurrency = 3
 # [ec.identity_providers.settings.lockr]
 # enabled = true
 # cookie_names = ["example_lockr_id5"]
+# Optional: send the hashed email as ID5 partner data (`pd`).
+# [ec.identity_providers.settings.hashed_email]
+# enabled = true
+# path = ".user.sha256"
 #
 # LiveIntent (kind "liveintent"): no hashed email, no secrets. Sends the
 # visitor's first-party LiveIntent cookie (the first present one of
@@ -230,14 +256,12 @@ pull_sync_concurrency = 3
 # identityLink module stores in `idl_env`, and keeps it for 15 days. Takes
 # exactly one source; use the one LiveRamp gives you. Supports the Lockr
 # capability. Optional server lookup: with an `endpoint` (LiveRamp's ATS
-# envelope API, `/api/identity/v2/envelope`), a visitor without an envelope
-# cookie is looked up by Custom ID: the full EC ID, sent as
-# `<custom_id_namespace>:<id>` with the visitor IP and consent. LiveRamp must
-# enable Custom ID for `placement_id` and approve the publisher origin; both
-# settings are required with an endpoint. LiveRamp resolves a Custom ID only
-# through a mapping file the publisher sends it, tying each ID to a hashed
-# email; without one the lookup finds nothing. Trusted Server itself sends no
-# login or hashed email.
+# envelope API, `/api/identity/v2/envelope`), `placement_id` and the
+# hashed-email capability, a signed-in visitor without a live envelope is
+# looked up by hashed email (`it=4`) with the visitor IP and consent, and the
+# envelope is refreshed every `refresh_interval_secs` (default 1800) at
+# `<endpoint>/refresh` without the hashed email. LiveRamp must approve the
+# publisher origin for the placement. The EC ID is never sent.
 # [[ec.identity_providers]]
 # id = "liveramp"
 # kind = "liveramp"
@@ -249,7 +273,10 @@ pull_sync_concurrency = 3
 # [ec.identity_providers.settings]
 # cookie_names = ["_lr_env", "idl_env"]
 # placement_id = 14
-# custom_id_namespace = "ana-example"
+# refresh_interval_secs = 1800
+# [ec.identity_providers.settings.hashed_email]
+# enabled = true
+# path = ".user.sha256"
 # [ec.identity_providers.settings.lockr]
 # enabled = true
 # cookie_names = ["example_lockr_lr_env"]

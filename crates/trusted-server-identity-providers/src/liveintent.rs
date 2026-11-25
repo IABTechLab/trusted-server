@@ -541,6 +541,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &due,
@@ -583,6 +585,8 @@ mod tests {
             client: ClientSignals {
                 ip: Some("11.22.33.44".parse().expect("should parse ip")),
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &due[..1],
@@ -788,6 +792,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &due,
@@ -917,6 +923,8 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             due_sources: &due,
