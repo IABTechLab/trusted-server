@@ -24,14 +24,14 @@ build = """
 
     [local_server.kv_stores]
         record_ec_fixture = []
-        [[local_server.kv_stores.counter_store]]
+        # Generic runtime KV, linked under the logical ID `trusted_server_runtime_kv`
+        # that `edgezero.toml` and the adapter's `Hooks::stores()` declare.
+        [[local_server.kv_stores.trusted_server_runtime_kv]]
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.creative_store]]
-            key = "placeholder"
-            data = "placeholder"
-
+        # EC records, linked under the logical record store ID `trusted_server_kv`
+        # that `[ec.storage]` in trusted-server.example.toml selects.
         [[local_server.kv_stores.trusted_server_kv]]
             key = "placeholder"
             data = "placeholder"

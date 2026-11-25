@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "geo-cloudfront")]
+use base64::Engine as _;
 use edgezero_core::blob_envelope::BlobEnvelope;
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
@@ -27,7 +29,7 @@ use trusted_server_core::test_support::nextjs_auction;
 #[path = "support/celld.rs"]
 mod celld_fixture;
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::engine::general_purpose::STANDARD;
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
 use trusted_server_core::ec::kv_backend::{
     EcKvStore as _, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
@@ -302,6 +304,15 @@ impl Prepared {
         trusted_proxy: bool,
         geo_profile: Option<&std::path::Path>,
     ) -> Running {
+        self.spawn_with_geo_options(trusted_proxy, geo_profile, false)
+    }
+
+    fn spawn_with_geo_options(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+        cloudfront: bool,
+    ) -> Running {
         let port = reserve_port()
             .local_addr()
             .expect("should read reserved port")
@@ -369,6 +380,15 @@ impl Prepared {
         if let Some(profile) = geo_profile {
             command.env("TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE", profile);
         }
+        if cloudfront {
+            command
+                .env("EDGEZERO__ADAPTER__GEO__PROVIDER", "cloudfront")
+                .env("EDGEZERO__ADAPTER__GEO__ALB_PEER_CIDRS", "127.0.0.1/32")
+                .env(
+                    "EDGEZERO__ADAPTER__GEO__ORIGIN_CREDENTIAL_HEADER_NAME",
+                    "x-origin-synthetic-fixture",
+                );
+        }
         Running {
             child: command
                 .spawn()
@@ -406,9 +426,11 @@ impl Running {
                 "should not exit before readiness: {}",
                 self.log()
             );
-            if let Ok(response) = client.get(format!("{}/health", self.base_url())).send()
+            // Liveness stays up after a caught initialization failure, so only
+            // readiness shows that the application router is installed.
+            if let Ok(response) = client.get(format!("{}/ready", self.base_url())).send()
                 && response.status().as_u16() == 200
-                && response.text().is_ok_and(|body| body == "ok")
+                && response.text().is_ok_and(|body| body == "ready")
             {
                 return;
             }
@@ -416,9 +438,62 @@ impl Running {
         }
         assert!(
             Instant::now() < deadline,
-            "should reach exact HTTP 200 health body ok: {}",
+            "should reach exact HTTP 200 ready body ready: {}",
             self.log()
         );
+    }
+
+    /// Asserts that a caught initialization failure serves the failure
+    /// router: liveness stays `200`, while readiness and the publisher page
+    /// answer the fixed `503`. Returns the log for further checks.
+    fn unavailable(&mut self, diagnostic: &str) -> String {
+        let client = client();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                self.child
+                    .try_wait()
+                    .expect("should poll child exit")
+                    .is_none(),
+                "should keep serving after an initialization failure: {}",
+                self.log()
+            );
+            if let Ok(response) = client.get(format!("{}/health", self.base_url())).send()
+                && response.status().as_u16() == 200
+                && response.text().is_ok_and(|body| body == "ok")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "should keep liveness up after an initialization failure: {}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for path in ["/ready", "/"] {
+            let response = client
+                .get(format!("{}{path}", self.base_url()))
+                .send()
+                .expect("should answer from the failure router");
+            assert_eq!(
+                response.status().as_u16(),
+                503,
+                "should answer {path} with the fixed unavailable status"
+            );
+            assert_eq!(
+                response.text().expect("should read the unavailable body"),
+                "Service Unavailable\n",
+                "should answer {path} with the fixed unavailable body"
+            );
+        }
+        let log = self.log();
+        assert!(
+            log.contains(diagnostic),
+            "should report {diagnostic}: {log}"
+        );
+        assert_no_secrets(&log);
+        log
     }
 
     fn rejected(&mut self, diagnostic: &str) -> String {
@@ -634,17 +709,27 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
         successful_body(response).len() > 100,
         "should serve embedded bundle, not an empty router"
     );
+    assert_eq!(
+        app.log()
+            .matches("generic runtime KV is unavailable (UnavailableKvStore)")
+            .count(),
+        1,
+        "should serve publisher and script requests while reporting unavailable KV once"
+    );
     app.assert_logs_hold_no_secrets();
 }
 
 #[test]
-fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
+fn missing_prepared_store_exits_and_invalid_inputs_serve_the_failure_router() {
     let origin = origin::Origin::start("unused");
     let fixture = Prepared::new(&origin.base_url);
+    // Store preparation runs before the initializer, so it still stops startup.
     fs::remove_file(fixture.config_path()).expect("should remove required config snapshot");
     fixture.spawn(false).rejected("required snapshot missing");
     fs::write(fixture.config_path(), "{}").expect("should publish empty config map");
-    fixture.spawn(false).rejected("config envelope is missing");
+    fixture
+        .spawn(false)
+        .unavailable("config envelope is missing");
     fixture.publish();
     let references = [
         ("native_admin", "`handlers[0].password`"),
@@ -657,7 +742,7 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
         incomplete.secrets.remove(key);
         let log = incomplete
             .spawn(false)
-            .rejected("required app-config secret at ");
+            .unavailable("required app-config secret at ");
         assert!(
             log.contains(path),
             "should name the config path {path} of the missing secret: {log}"
@@ -682,14 +767,14 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
     invalid.publish();
     invalid
         .spawn(false)
-        .rejected("Trusted Server initialization failed");
+        .unavailable("Trusted Server initialization failed");
     let mut invalid = Prepared::new(&origin.base_url);
     invalid
         .secrets
         .insert("native_ec".to_owned(), SHORT_EC_PASSPHRASE.to_owned());
     invalid
         .spawn(false)
-        .rejected("Trusted Server initialization failed");
+        .unavailable("Trusted Server initialization failed");
 }
 
 #[test]
@@ -1218,5 +1303,159 @@ fn real_nextjs_action_and_api_after_truncated_post() {
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("should parse real API response"),
         json!({"native": "real-nextjs-api"})
+    );
+}
+
+#[cfg(feature = "geo-cloudfront")]
+#[test]
+fn prepared_provider_opt_out_filters_cookie_and_body_on_repeated_visits() {
+    let origin = origin::Origin::start("provider-opt-out");
+    let mut prepared = Prepared::new(&origin.base_url);
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.data["ec"]["partners"] =
+        json!([{"name":"SharedID fixture","source_domain":"pubcid.org","bidstream_enabled":true}]);
+    prepared.data["ec"]["identity_providers"] = json!([{"id":"sharedid","kind":"sharedid"}]);
+    prepared.data["auction"] = json!({"enabled":true,"providers":{"fixture":{"protocol":"openrtb-2.6","profile":"standard","endpoint":format!("{}/bid", origin.base_url),"routing":"all_eligible"}}});
+    prepared.publish();
+    let mut running = prepared.spawn_with_geo_options(true, None, true);
+    running.ready();
+    let client = client();
+    let ingress = |request: reqwest::blocking::RequestBuilder| {
+        request
+            .header("host", "publisher.example.com")
+            .header(
+                "forwarded",
+                "for=198.51.100.24;proto=https;host=publisher.example.com",
+            )
+            .header("cloudfront-viewer-country", "AU")
+            .header("x-origin-synthetic-fixture", "synthetic-fixture-only")
+    };
+    let navigate = |cookies: &str| {
+        ingress(client.get(format!("{}/article", running.base_url())))
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", cookies)
+            .send()
+            .expect("should navigate through prepared production startup")
+    };
+    let issued = navigate("_pubcid=11111111-1111-4111-8111-111111111111");
+    assert_eq!(issued.status().as_u16(), 200, "should reach publisher");
+    let ec = issued
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.strip_prefix("ts-ec=").map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .expect("should contain EC")
+                    .to_owned()
+            })
+        })
+        .expect("should issue EC using prepared persistent records and protected country");
+    let auction = |cookie: &str, body_eids: Option<Value>| {
+        let before = origin
+            .received
+            .lock()
+            .expect("should lock captures")
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .count();
+        let mut body = json!({"adUnits":[{"code":"fixture-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]});
+        if let Some(eids) = body_eids {
+            body["eids"] = eids;
+        }
+        let response = ingress(client.post(format!("{}/auction", running.base_url())))
+            .header("referer", "https://publisher.example.com/article")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", cookie)
+            .json(&body)
+            .send()
+            .expect("should dispatch real auction");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return auction response"
+        );
+        let received = origin.received.lock().expect("should lock captures");
+        let bids: Vec<_> = received
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .collect();
+        assert_eq!(
+            bids.len(),
+            before + 1,
+            "should capture one actual bidder request"
+        );
+        let payload: Value = serde_json::from_slice(&bids.last().expect("should capture bid").body)
+            .expect("should decode bidder request");
+        payload["user"]["eids"].clone()
+    };
+    let cookie = format!("ts-ec={ec}");
+    assert!(
+        auction(&cookie, None)
+            .as_array()
+            .expect("should deliver provider EID")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"),
+        "should prove positive provider delivery"
+    );
+    let opted_out = format!("{cookie}; _pubcid_optout=1");
+    assert_eq!(
+        navigate(&opted_out).status().as_u16(),
+        200,
+        "should apply provider cookie opt-out"
+    );
+    let forged = json!([{ "source":"pubcid.org","uids":[{"id":"forged-client-copy","atype":1}] },{ "source":"other.example.com","uids":[{"id":"unrelated-client","atype":1}] }]);
+    for _ in 0..2 {
+        assert_eq!(
+            navigate(&opted_out).status().as_u16(),
+            200,
+            "should keep repeated visits working"
+        );
+        for from_cookie in [false, true] {
+            let cookies = if from_cookie {
+                format!(
+                    "{opted_out}; ts-eids={}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&forged).expect("should encode EIDs"))
+                )
+            } else {
+                opted_out.clone()
+            };
+            let delivered = auction(&cookies, (!from_cookie).then(|| forged.clone()));
+            let sources: Vec<_> = delivered
+                .as_array()
+                .expect("should retain unrelated EID")
+                .iter()
+                .filter_map(|eid| eid["source"].as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["other.example.com"],
+                "should suppress owned browser and client EIDs on every visit"
+            );
+        }
+    }
+    assert_eq!(
+        navigate(&format!(
+            "{cookie}; _pubcid=22222222-2222-4222-8222-222222222222"
+        ))
+        .status()
+        .as_u16(),
+        200,
+        "should opt back in through provider cookie"
+    );
+    let restored = auction(&cookie, None);
+    assert!(
+        restored
+            .as_array()
+            .expect("should restore provider delivery")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"
+                && eid["uids"][0]["id"] == "22222222-2222-4222-8222-222222222222"),
+        "should restore provider EID after opt-back-in"
     );
 }

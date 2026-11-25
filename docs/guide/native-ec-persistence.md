@@ -32,7 +32,7 @@ provider = "records"
 store = "trusted_server_kv"
 ```
 
-A configured record reference must already have the declared layout and capability before initialization. An undeclared store ID or raw binding is an error, not permission to construct a provider late. Obsolete `TS_EC_RECORDS_ENABLED` and `TS_EC_DYNAMODB_ENABLED` switches are no longer read; migrate to the declared logical store and EdgeZero binding. Omitting `ec.storage` leaves identity without a graph, while the declared provider is still prepared. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
+A configured record reference must already have the declared layout and capability before initialization. An undeclared store ID or raw binding is an error, not permission to construct a provider late. Obsolete `TRUSTED_SERVER__EC_RECORDS_ENABLED` and `TRUSTED_SERVER__EC_DYNAMODB_ENABLED` switches are no longer read; migrate to the declared logical store and EdgeZero binding. Omitting `ec.storage` leaves identity without a graph, while the declared provider is still prepared. Omitted-provider and `provider="fastly"` compatibility references remain Fastly-only; Cloudflare and Spin reject unsupported EC storage during initialization.
 
 Add this KV entry to the native store-bindings TOML already used for the application's config and secret stores:
 
@@ -78,7 +78,7 @@ Provider preparation and runtime operations use EdgeZero's bounded, single-attem
 
 ## Eligibility and route boundaries
 
-Persistence does not grant consent. Native eligibility uses trusted client metadata, consent and the shared navigation policy. Missing JA4 does not block creation; no User-Agent-only gate or fabricated TLS signal is used. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
+Persistence does not grant consent. Native eligibility uses trusted client metadata, consent and the shared navigation policy. Under the default `ec.browser_gate = "lenient"`, missing JA4 does not block creation; no User-Agent-only gate or fabricated TLS signal is used. Health checks, static assets, preflights and rejected authentication must not mint identities. Missing qualifying consent remains blocking. Synthetic local fixtures are not real publisher CMP acceptance.
 
 Identify does not create identities. A withdrawal on an identity lifecycle request remains writable for privacy-hardened clients and tombstones the record. Identity cookie writes are restricted to eligible HTML navigation or EC-route responses, including method-neutral HTML error documents and cached-document `304` responses without Content-Type. Explicit withdrawal is the privacy exception: the same response expires the browser EC cookie regardless of method, status or content type, including on API responses. Finalization is awaited before committing response headers.
 

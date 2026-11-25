@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use edgezero_core::body::Body;
 use edgezero_core::http::{Method, Request, StatusCode, header, request_builder};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ja4::Ja4Source;
 use error_stack::Report;
 use futures::executor::block_on;
-use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::http_util::RuntimeRequestOrigin;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
@@ -21,6 +21,9 @@ use trusted_server_core::test_support::identity_conformance::{
     Scenario, configure_http_fixture, tcf_consent_cookie, verify_api_identity_expiries,
     verify_failed_ec_creation, verify_http_contract, verify_known_non_browser_navigation,
 };
+use trusted_server_core::test_support::ja4::{
+    CHROME_USER_AGENT, PYTHON_JA4, captured_ja4, insert_ja4,
+};
 use trusted_server_core::test_support::scripted_client::{
     ScriptedHttpClient, ScriptedReply, TestClock,
 };
@@ -29,8 +32,6 @@ use crate::app::TrustedServerApp;
 
 const DOCUMENT: &str = "<html><head></head><body>Example article</body></html>";
 const ORIGIN: &str = "https://origin.example.com/article";
-const USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36";
 
 struct UnusedStores;
 #[async_trait(?Send)]
@@ -179,8 +180,6 @@ impl AxumAdapter {
             cookies.push(format!("ts-ec={identity}"));
         }
         let document = navigation.destination == "document";
-        // Native has no trusted JA4. Every scenario exercises the shared
-        // missing-JA4 policy with a trusted IP and real parsed consent.
         let request: Request = request_builder()
             .method(Method::GET)
             .uri("https://publisher.example.com/article")
@@ -190,7 +189,7 @@ impl AxumAdapter {
                 if document { "navigate" } else { "no-cors" },
             )
             .header(header::ACCEPT, if document { "text/html" } else { "*/*" })
-            .header(header::USER_AGENT, USER_AGENT)
+            .header(header::USER_AGENT, navigation.user_agent)
             .header(header::COOKIE, cookies.join("; "))
             .body(Body::empty())
             .expect("should build conformance navigation");
@@ -198,7 +197,7 @@ impl AxumAdapter {
             let mut builder = request_builder()
                 .method(api.method.clone())
                 .uri(format!("https://publisher.example.com{}", api.path))
-                .header(header::USER_AGENT, USER_AGENT);
+                .header(header::USER_AGENT, navigation.user_agent);
             for (name, value) in &api.headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
@@ -208,17 +207,25 @@ impl AxumAdapter {
         } else {
             request
         };
-        // This router seam bypasses native ingress; supply only its validated
-        // public origin, without inventing TLS or JA4 fingerprints.
+        // This router seam bypasses native ingress; supply its validated
+        // public origin and, where the scenario has one, the JA4 a trusted
+        // proxy header gives `ctx.ja4()`.
         request.extensions_mut().insert(RuntimeRequestOrigin::new(
             InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
                 .expect("should validate fixture public origin"),
         ));
-        if api.is_some_and(|request| request.known_non_browser) {
-            request.extensions_mut().insert(DeviceSignals {
-                known_browser: Some(false),
-                ..DeviceSignals::derive(USER_AGENT, None, None)
-            });
+        // A known non-browser API client sends a browser User-Agent over a
+        // non-browser TLS stack, whose trusted JA4 the shared gate refuses.
+        let ja4 = if api.is_some_and(|request| request.known_non_browser) {
+            Some(PYTHON_JA4)
+        } else {
+            navigation.ja4
+        };
+        if let Some(ja4) = ja4 {
+            insert_ja4(
+                request.extensions_mut(),
+                captured_ja4(ja4, Ja4Source::TrustedProxyHeader),
+            );
         }
         let response = block_on(router.oneshot(request)).expect("should dispatch the real router");
         let cache_control = response
@@ -347,7 +354,7 @@ fn redirect_cancels_page_lookups_without_waiting() {
         .uri("https://publisher.example.com/article")
         .header("sec-fetch-dest", "document")
         .header("sec-fetch-mode", "navigate")
-        .header(header::USER_AGENT, USER_AGENT)
+        .header(header::USER_AGENT, CHROME_USER_AGENT)
         .header(header::COOKIE, "us_privacy=1YNN")
         .body(Body::empty())
         .expect("should build navigation");

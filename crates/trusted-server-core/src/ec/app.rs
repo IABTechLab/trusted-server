@@ -13,7 +13,9 @@
 
 mod lookups;
 
-pub use lookups::{AfterResponseLookups, IdentityLookups, joined_cookie_header};
+pub use lookups::{
+    AfterResponseLookups, IdentityLookups, PageIdentityDispatch, joined_cookie_header,
+};
 mod lifecycle;
 mod route;
 #[cfg(test)]

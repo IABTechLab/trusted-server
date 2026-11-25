@@ -15,6 +15,7 @@ use edgezero_core::http::{
     HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
 };
 use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::ja4::Ja4Source;
 use edgezero_core::outbound::{ResponseDecoding, ResponseMode};
 use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
@@ -22,6 +23,9 @@ use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::constants::TS_GIT_VERSION;
 use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, PYTHON_JA4, captured_ja4, insert_ja4,
+};
 use trusted_server_core::test_support::publisher_input_cap::{self, Served};
 use trusted_server_core::test_support::scripted_client::{
     RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
@@ -64,6 +68,68 @@ fn test_settings() -> Settings {
         "#,
     )
     .expect("should parse route test settings")
+}
+
+/// Cloudflare has no request-time config store, so request signing cannot read
+/// its metadata. This pins the documented results. The host and wasm builds
+/// both use the no-op config store, so this exercises the Worker's config
+/// path; it passes on the base revision too, because that path is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_signing_routes_report_unsupported_signing_metadata() {
+    let discovery = route(
+        test_router(),
+        request_builder()
+            .method("GET")
+            .uri("/.well-known/trusted-server.json")
+            .body(Body::empty())
+            .expect("should build discovery request"),
+    )
+    .await;
+    let verify = route(
+        test_router(),
+        request_builder()
+            .method("POST")
+            .uri("/verify-signature")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "payload": "example-payload",
+                    "signature": "ZXhhbXBsZS1zaWduYXR1cmU",
+                    "kid": "example-kid",
+                })
+                .to_string(),
+            ))
+            .expect("should build verify request"),
+    )
+    .await;
+
+    assert_eq!(
+        discovery.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "discovery should answer the shared 500 without signing metadata"
+    );
+    assert_eq!(
+        verify.status(),
+        StatusCode::OK,
+        "verification should answer 200 with an unverified result"
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &verify
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the verify response"),
+    )
+    .expect("should return a JSON verify response");
+    assert_eq!(
+        body["verified"],
+        serde_json::json!(false),
+        "verification should report an unverified signature: {body}"
+    );
+    assert_eq!(
+        body["error"],
+        serde_json::json!("internal verification error"),
+        "verification should report the metadata read failure: {body}"
+    );
 }
 
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
@@ -120,19 +186,42 @@ fn make_router() -> RouterService {
         .expect("should build router from test settings")
 }
 
-#[test]
-fn routes_report_missing_worker_config_as_internal_error() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_serve_the_failure_router_without_a_worker_config() {
     // Host targets have no Worker config binding, so startup fails and
-    // `routes()` returns the error EdgeZero answers with.
-    let Err(error) = TrustedServerApp::routes() else {
-        panic!("should fail startup without a Worker config binding");
-    };
+    // `routes()` serves the failure router instead of failing assembly.
+    let router =
+        TrustedServerApp::routes().expect("should serve the failure router when startup fails");
 
-    assert_eq!(
-        error.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "should map the configuration error to a 500"
-    );
+    for (path, status, body) in [
+        ("/health", StatusCode::OK, "ok"),
+        (
+            "/ready",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable\n",
+        ),
+        (
+            "/",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable\n",
+        ),
+    ] {
+        let response = route(
+            router.clone(),
+            request_builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("should build request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), status, "should answer {path}");
+        assert_eq!(
+            response.into_body().into_bytes().as_deref(),
+            Some(body.as_bytes()),
+            "should answer {path} with the fixed body"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,4 +1282,37 @@ async fn identify_and_batch_sync_answer_other_methods_405_locally() {
         "should answer every other method on the partner API paths with 405: {cases:?}"
     );
     origin.assert_no_requests();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ec_route_creates_no_record_whatever_the_bot_management_ja4() {
+    // EdgeZero captures `cf.botManagement.ja4` as a runtime TLS JA4, but
+    // Cloudflare binds no EC record store yet, so the EC route answers 501
+    // before reading identity: neither a contradicting nor a matching JA4
+    // reaches the ID-7 rule, and no EC cookie is issued.
+    for ja4 in [CHROMIUM_JA4, PYTHON_JA4] {
+        let mut req = request_builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.example.com/_ts/api/v1/ec")
+            .header(header::ORIGIN, "https://test-publisher.example.com")
+            .header(header::USER_AGENT, CHROME_USER_AGENT)
+            .body(Body::empty())
+            .expect("should build EC request");
+        insert_ja4(
+            req.extensions_mut(),
+            captured_ja4(ja4, Ja4Source::RuntimeTls),
+        );
+
+        let resp = route(test_router(), req).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store for JA4 {ja4:?}"
+        );
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "should issue no identity cookie for JA4 {ja4:?}"
+        );
+    }
 }

@@ -20,6 +20,10 @@ use crate::ec::kv_backend::test_support::InMemoryEcKv;
 use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 use crate::error::TrustedServerError;
+use crate::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
+    SAFARI_USER_AGENT,
+};
 
 /// An observed persistence or response-release boundary in a conformance run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +213,10 @@ pub struct Navigation {
     pub ec_cookie: Option<String>,
     /// The platform's location result.
     pub geo: Geo,
-    /// Whether to supply trusted JA4 metadata where the adapter exposes it.
-    pub browser: bool,
+    /// The `User-Agent` header.
+    pub user_agent: &'static str,
+    /// The trusted JA4 the runner supplies, or `None` for no trusted JA4.
+    pub ja4: Option<&'static str>,
     /// Fetch destination; a script is deliberately ineligible for creation.
     pub destination: &'static str,
 }
@@ -221,7 +227,8 @@ impl Default for Navigation {
             consent: Consent::Granted,
             ec_cookie: None,
             geo: Geo::Gdpr,
-            browser: true,
+            user_agent: CHROME_USER_AGENT,
+            ja4: Some(CHROMIUM_JA4),
             destination: "document",
         }
     }
@@ -276,11 +283,20 @@ pub enum Scenario {
     Returning,
     /// Missing trusted JA4 permits creation with consent and a trusted IP.
     MissingTrustedJa4,
+    /// A browser User-Agent with a non-browser trusted JA4 prevents creation.
+    ContradictingJa4,
+    /// A browser User-Agent with another browser engine's trusted JA4
+    /// prevents creation.
+    BrowserEngineMismatch,
+    /// A current Firefox with its own trusted JA4 creates an identity.
+    CurrentFirefox,
+    /// A current Safari with its own trusted JA4 creates an identity.
+    CurrentSafari,
 }
 
 impl Scenario {
     /// Navigation scenarios shared by all supported identity adapters.
-    pub const NAVIGATION_SCENARIOS: [Self; 9] = [
+    pub const NAVIGATION_SCENARIOS: [Self; 13] = [
         Self::Fresh,
         Self::WriteFailure,
         Self::UnknownGeo,
@@ -290,6 +306,10 @@ impl Scenario {
         Self::Subresource,
         Self::Returning,
         Self::MissingTrustedJa4,
+        Self::ContradictingJa4,
+        Self::BrowserEngineMismatch,
+        Self::CurrentFirefox,
+        Self::CurrentSafari,
     ];
 
     /// Executes the scenario and checks the response against authoritative storage.
@@ -320,13 +340,31 @@ impl Scenario {
             Self::DeniedConsent => request.consent = Consent::Denied,
             Self::MissingConsent => request.consent = Consent::Missing,
             Self::Subresource => request.destination = "script",
-            Self::MissingTrustedJa4 => request.browser = false,
+            Self::MissingTrustedJa4 => request.ja4 = None,
+            Self::ContradictingJa4 => request.ja4 = Some(PYTHON_JA4),
+            Self::BrowserEngineMismatch => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(CHROMIUM_JA4);
+            }
+            Self::CurrentFirefox => {
+                request.user_agent = FIREFOX_USER_AGENT;
+                request.ja4 = Some(FIREFOX_JA4);
+            }
+            Self::CurrentSafari => {
+                request.user_agent = SAFARI_USER_AGENT;
+                request.ja4 = Some(SAFARI_JA4);
+            }
             _ => {}
         }
         let response = adapter.navigate(&request);
         assert_document(&response);
         match self {
-            Self::WriteFailure | Self::DeniedConsent | Self::MissingConsent | Self::Subresource => {
+            Self::WriteFailure
+            | Self::DeniedConsent
+            | Self::MissingConsent
+            | Self::Subresource
+            | Self::ContradictingJa4
+            | Self::BrowserEngineMismatch => {
                 assert!(
                     ec_cookies(&response).is_empty(),
                     "should not issue or delete an EC for a fresh denied request in {self:?}"
@@ -339,7 +377,7 @@ impl Scenario {
                 );
                 if self != Self::WriteFailure {
                     // These scenarios share Fresh's successful setup and change
-                    // one input, so its gate must refuse before any write; a
+                    // only request inputs, so its gate must refuse before any write; a
                     // creation attempt that merely failed would not satisfy it.
                     assert!(
                         !store
@@ -1560,8 +1598,19 @@ pub fn verify_http_contract(adapter: &mut impl Adapter, store: &RecordingStore) 
     let mirrored = adapter.exchange(&post);
     let mirror: serde_json::Value =
         serde_json::from_slice(&mirrored.response.body).expect("should decode mirror-only EC JSON");
+    let mut eids = mirror["eids"].clone();
+    let exp = eids[0]["uids"][0]
+        .as_object_mut()
+        .and_then(|uid| uid.remove("exp"))
+        .and_then(|exp| exp.as_u64())
+        .expect("should give a UID without stated expiry a numeric exp");
+    let now = now_deciseconds() / 10;
+    assert!(
+        exp > now && exp <= now + 30 * 24 * 60 * 60,
+        "should mirror a UID without stated expiry with an expiry within 30 days: exp={exp}, now={now}"
+    );
     assert_eq!(
-        mirror["eids"],
+        eids,
         serde_json::json!([{"source":"mirror.example.com","uids":[{"id":"allowed-mirror-id","atype":1}]}]),
         "should expose only the live mirrored provider UID"
     );

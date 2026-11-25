@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use edgezero_core::http::{Method, Request, Response, StatusCode, header};
+use edgezero_core::ingress::RequestIngress;
+use edgezero_core::ja4::CapturedJa4;
 use error_stack::Report;
 
 use super::IdentityApp;
@@ -12,13 +14,14 @@ use crate::constants::{
 use crate::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use crate::ec::consent::ec_consent_withdrawn;
 use crate::ec::device::DeviceSignals;
-use crate::ec::finalize::ec_finalize_response;
+use crate::ec::eid_types::UnixSeconds;
+use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_backend::EcKvStore;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::SharedIdRequest;
-use crate::ec::{EcContext, EidSyncSource};
+use crate::ec::{EcContext, EidSyncSource, checked_current_timestamp};
 use crate::error::{TrustedServerError, http_error};
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
@@ -32,7 +35,8 @@ pub struct IdentityRequest {
     pub context: EcContext,
     /// The app's shared record service, if configured.
     pub graph: Option<KvIdentityGraph>,
-    /// Whether available trusted device signals allow creation.
+    /// Whether available trusted device signals allow creation under
+    /// `[ec].browser_gate`.
     pub creation_allowed: bool,
     /// Browser EIDs captured before routing consumes the request.
     pub eids_cookie: Option<String>,
@@ -50,8 +54,14 @@ impl IdentityApp {
 
     /// Reads consent, identity and trusted platform signals once for a request.
     ///
-    /// Missing JA4 never prevents creation. User-Agent is analytics metadata,
-    /// not an independent authorization gate.
+    /// Device signals are derived here for every request, with JA4 only from
+    /// `EdgeZero`'s request ingress, the source of `ctx.ja4()`.
+    /// `[ec].browser_gate` decides whether the signals allow creation. Both
+    /// rules refuse a trusted JA4 whose TLS client family contradicts the
+    /// User-Agent's browser family, unless `[ec].ja4_contradiction_exempt`
+    /// exempts that contradiction; a missing or unrecognized JA4 never does.
+    /// `strict` also requires a JA4 class and a recognized User-Agent
+    /// platform.
     ///
     /// # Errors
     ///
@@ -70,23 +80,28 @@ impl IdentityApp {
             });
         let mut context =
             EcContext::read_from_request_with_geo(&self.settings, request, services, geo.as_ref())?;
-        let signals = request
-            .extensions()
-            .get::<DeviceSignals>()
-            .cloned()
-            .unwrap_or_else(|| {
-                let user_agent = request
-                    .headers()
-                    .get(header::USER_AGENT)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                DeviceSignals::derive(
-                    user_agent,
-                    services.client_info().tls_ja4.as_deref(),
-                    services.client_info().h2_fingerprint.as_deref(),
-                )
-            });
-        let creation_allowed = signals.known_browser != Some(false);
+        let user_agent = request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let signals = DeviceSignals::derive_with_tls_rule(
+            user_agent,
+            trusted_ja4(request),
+            services.client_info().h2_fingerprint.as_deref(),
+            self.settings.ec.ja4_contradiction_exempt,
+        );
+        let creation_allowed = signals.allows_creation(self.settings.ec.browser_gate);
+        if !creation_allowed {
+            log::debug!(
+                "Browser gate {:?} blocks EC creation (ja4={:?}, platform={:?}, known_browser={:?}, ja4_contradiction={})",
+                self.settings.ec.browser_gate,
+                signals.ja4_class,
+                signals.platform_class,
+                signals.known_browser,
+                signals.ja4_contradiction,
+            );
+        }
         context.set_device_signals(signals);
         Ok(IdentityRequest {
             context,
@@ -145,6 +160,9 @@ impl IdentityApp {
     /// Core-generated EC, configured `SharedID` and mirror expiries may accompany
     /// every finalized response (S2S design §10, WB-1). Origin identity cookies
     /// are filtered first on ineligible responses; every expiry remains private.
+    ///
+    /// Reads the clock at most once, and only for a navigation with an
+    /// eligible, non-redirect response.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -177,13 +195,23 @@ impl IdentityApp {
             self.filter_ineligible_identity_cookies(response, false);
         }
         let graph = self.identity_graph().filter(|_| use_store);
+        // Only a navigation with an eligible response uses the request time,
+        // so other responses never read the clock or log its failure.
+        let now = (context.has_navigation_permit()
+            && !NavigationPermit::is_redirect(response.status()))
+        .then(checked_current_timestamp)
+        .flatten()
+        .map(UnixSeconds::new);
         ec_finalize_response(
             &self.settings,
             context,
             graph.as_ref(),
             &self.partners,
-            eids_cookie,
-            sharedid,
+            &FinalizeRequest {
+                eids_cookie,
+                sharedid,
+                now,
+            },
             response,
         )
         .await;
@@ -373,6 +401,16 @@ impl IdentityApp {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EcRouteResponse;
 
+/// The JA4 `EdgeZero` captured for this request, as `ctx.ja4()` reads it.
+///
+/// Absent, missing, malformed or unexposed JA4 reads as `None`.
+fn trusted_ja4(request: &Request) -> Option<&str> {
+    match request.extensions().get::<RequestIngress>()?.ja4()? {
+        CapturedJa4::Captured { fingerprint, .. } => Some(fingerprint.as_str()),
+        CapturedJa4::Unavailable(_) => None,
+    }
+}
+
 fn cookie_value(request: &Request, name: &str) -> Option<String> {
     request
         .headers()
@@ -414,19 +452,27 @@ impl IdentityApp {
     /// Registers shared follow-up identity work with the runtime's drained task API.
     ///
     /// Outbound futures are created inside the task's fresh outbound scope.
+    ///
+    /// Registers nothing when there is no work or finalize issued no follow-up
+    /// permit, so a skipped navigation never holds the shutdown drain. The
+    /// permit stays in `context` for [`Self::run_after_response_lookups`].
+    ///
+    /// Returns whether a task was registered. A missing scheduler or a rejected
+    /// registration is logged and drops the work without running it.
+    #[must_use = "returns whether follow-up work was registered; failures are already logged"]
     pub fn schedule_after_response(
         self: &Arc<Self>,
         mut context: EcContext,
         work: Option<super::AfterResponseLookups>,
         scheduler: Option<edgezero_core::after_response::AfterResponseHandle>,
         client: edgezero_core::outbound::HttpClient,
-    ) {
-        if work.is_none() {
-            return;
+    ) -> bool {
+        if work.is_none() || !context.has_after_response_permit() {
+            return false;
         }
         let Some(scheduler) = scheduler else {
             log::error!("Identity follow-up requires the runtime after-response capability");
-            return;
+            return false;
         };
         let app = Arc::clone(self);
         let budget =
@@ -436,7 +482,9 @@ impl IdentityApp {
                 .await;
         }) {
             log::error!("Identity follow-up registration fails: {error}");
+            return false;
         }
+        true
     }
 }
 
@@ -444,10 +492,18 @@ impl IdentityApp {
 mod tests {
     use super::cookie_value;
     use crate::ec::app::{IdentityApp, IdentityPlatform};
+    use crate::ec::device::DeviceSignals;
     use crate::ec::{EcContext, EidSyncSource};
-    use crate::settings::ProxyAssetRoute;
+    use crate::platform::test_support::noop_services;
+    use crate::platform::{ClientInfo, RuntimeServices};
+    use crate::settings::{BrowserGate, Ja4ContradictionExempt, ProxyAssetRoute};
+    use crate::test_support::ja4::{
+        CHROME_USER_AGENT, CHROMIUM_JA4, FIREFOX_JA4, FIREFOX_USER_AGENT, PYTHON_JA4, SAFARI_JA4,
+        SAFARI_USER_AGENT, UNLISTED_JA4, captured_ja4, insert_ja4,
+    };
     use crate::test_support::tests::create_test_settings;
-    use edgezero_core::http::{Request, header};
+    use edgezero_core::http::{HeaderValue, Request, header};
+    use edgezero_core::ja4::{CapturedJa4, Ja4Source, Ja4Unavailable};
     use futures::executor::block_on;
     use std::sync::Arc;
 
@@ -649,6 +705,258 @@ mod tests {
                 "should exclude only actual GET/HEAD asset routes"
             );
         }
+    }
+
+    #[test]
+    fn read_request_applies_the_configured_browser_gate() {
+        for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+            assert_eq!(
+                creation_allowed(
+                    gate,
+                    Ja4ContradictionExempt::Off,
+                    &noop_services(),
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Example/1.0",
+                    None,
+                ),
+                allowed,
+                "should apply the {gate:?} rule to a browser without JA4"
+            );
+        }
+    }
+
+    /// Reads a request with `user_agent` and the ingress JA4 claim `ja4`
+    /// under `gate` and `exempt`, as the shared app does for every adapter.
+    fn creation_allowed(
+        gate: BrowserGate,
+        exempt: Ja4ContradictionExempt,
+        services: &RuntimeServices,
+        user_agent: &str,
+        ja4: Option<CapturedJa4>,
+    ) -> bool {
+        let mut settings = create_test_settings();
+        settings.ec.browser_gate = gate;
+        settings.ec.ja4_contradiction_exempt = exempt;
+        let app = IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+            .expect("should build identity app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(user_agent).expect("should encode User-Agent"),
+        );
+        if let Some(ja4) = ja4 {
+            insert_ja4(request.extensions_mut(), ja4);
+        }
+        app.read_request(services, &request)
+            .expect("should read identity request")
+            .creation_allowed
+    }
+
+    fn captured(ja4: &str) -> Option<CapturedJa4> {
+        Some(captured_ja4(ja4, Ja4Source::RuntimeTls))
+    }
+
+    #[test]
+    fn read_request_refuses_a_trusted_ja4_that_contradicts_the_user_agent() {
+        for (user_agent, ja4) in [
+            (CHROME_USER_AGENT, PYTHON_JA4),
+            (FIREFOX_USER_AGENT, PYTHON_JA4),
+            (SAFARI_USER_AGENT, PYTHON_JA4),
+            (FIREFOX_USER_AGENT, CHROMIUM_JA4),
+            (SAFARI_USER_AGENT, CHROMIUM_JA4),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    !creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    "should refuse {user_agent:?} with a contradicting JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_honours_ja4_contradiction_exempt() {
+        for (exempt, non_browser_allowed, engine_mismatch_allowed) in [
+            (Ja4ContradictionExempt::Off, false, false),
+            (Ja4ContradictionExempt::NonBrowser, true, false),
+            (Ja4ContradictionExempt::All, true, true),
+        ] {
+            for (user_agent, ja4, allowed) in [
+                (CHROME_USER_AGENT, PYTHON_JA4, non_browser_allowed),
+                (FIREFOX_USER_AGENT, CHROMIUM_JA4, engine_mismatch_allowed),
+            ] {
+                assert_eq!(
+                    creation_allowed(
+                        BrowserGate::Lenient,
+                        exempt,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    allowed,
+                    "should apply {exempt:?} to {user_agent:?} with {ja4:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_creates_for_current_browser_ja4s() {
+        for (user_agent, ja4) in [
+            (CHROME_USER_AGENT, CHROMIUM_JA4),
+            (FIREFOX_USER_AGENT, FIREFOX_JA4),
+            (SAFARI_USER_AGENT, SAFARI_JA4),
+            (CHROME_USER_AGENT, UNLISTED_JA4),
+        ] {
+            for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+                assert!(
+                    creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        user_agent,
+                        captured(ja4),
+                    ),
+                    "should allow {user_agent:?} with JA4 {ja4:?} under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_does_not_refuse_a_request_without_trusted_ja4() {
+        for ja4 in [
+            None,
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::NotExposed)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Missing)),
+            Some(CapturedJa4::Unavailable(Ja4Unavailable::Malformed)),
+        ] {
+            assert!(
+                creation_allowed(
+                    BrowserGate::Lenient,
+                    Ja4ContradictionExempt::Off,
+                    &noop_services(),
+                    CHROME_USER_AGENT,
+                    ja4,
+                ),
+                "should not refuse a browser for lacking trusted JA4"
+            );
+        }
+    }
+
+    #[test]
+    fn read_request_treats_a_ja4_edgezero_rejects_as_absent() {
+        // EdgeZero's strict parser discards these runtime values as
+        // `Malformed`: section 1 of the Chromium row alone, and that row's
+        // fingerprint in upper case.
+        for value in ["t13d1516h2", "T13D1516H2_8DAAF6152771_02713D6AF862"] {
+            let ja4 = CapturedJa4::from_runtime_tls(Some(value));
+            assert_eq!(
+                ja4,
+                CapturedJa4::Unavailable(Ja4Unavailable::Malformed),
+                "should be rejected by EdgeZero's parser: {value:?}"
+            );
+
+            let app = IdentityApp::build(
+                Arc::new(create_test_settings()),
+                IdentityPlatform::default(),
+            )
+            .expect("should build identity app");
+            let mut request = Request::default();
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(CHROME_USER_AGENT),
+            );
+            insert_ja4(request.extensions_mut(), ja4.clone());
+            let identity = app
+                .read_request(&noop_services(), &request)
+                .expect("should read identity request");
+            let signals = identity
+                .context
+                .device_signals()
+                .expect("should derive device signals");
+            assert_eq!(
+                signals.ja4_class, None,
+                "should keep no JA4 class from a rejected value {value:?}"
+            );
+            assert!(
+                !signals.ja4_contradiction,
+                "should not treat a rejected value {value:?} as a contradiction"
+            );
+
+            for (gate, allowed) in [(BrowserGate::Lenient, true), (BrowserGate::Strict, false)] {
+                assert_eq!(
+                    creation_allowed(
+                        gate,
+                        Ja4ContradictionExempt::Off,
+                        &noop_services(),
+                        CHROME_USER_AGENT,
+                        Some(ja4.clone()),
+                    ),
+                    allowed,
+                    "should treat a rejected value {value:?} as no JA4 under {gate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_request_takes_ja4_only_from_edgezero_ingress() {
+        let services = RuntimeServices {
+            client_info: ClientInfo {
+                tls_ja4: Some(PYTHON_JA4.to_owned()),
+                ..ClientInfo::default()
+            },
+            ..noop_services()
+        };
+
+        assert!(
+            creation_allowed(
+                BrowserGate::Lenient,
+                Ja4ContradictionExempt::Off,
+                &services,
+                CHROME_USER_AGENT,
+                None,
+            ),
+            "should ignore a JA4 that did not come through EdgeZero's ingress"
+        );
+    }
+
+    #[test]
+    fn read_request_derives_signals_despite_a_device_signals_extension() {
+        let app = IdentityApp::build(
+            Arc::new(create_test_settings()),
+            IdentityPlatform::default(),
+        )
+        .expect("should build identity app");
+        let mut request = Request::default();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(CHROME_USER_AGENT),
+        );
+        insert_ja4(
+            request.extensions_mut(),
+            captured_ja4(PYTHON_JA4, Ja4Source::RuntimeTls),
+        );
+        request.extensions_mut().insert(DeviceSignals::derive(
+            CHROME_USER_AGENT,
+            Some(CHROMIUM_JA4),
+            None,
+        ));
+
+        let identity = app
+            .read_request(&noop_services(), &request)
+            .expect("should read identity request");
+
+        assert!(
+            !identity.creation_allowed,
+            "should derive from the ingress JA4, not trust signals a caller supplied"
+        );
     }
 
     #[test]

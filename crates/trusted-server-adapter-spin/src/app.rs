@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
@@ -28,6 +28,9 @@ use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
+};
 use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, HttpClient, RuntimeServices};
@@ -55,15 +58,19 @@ use crate::middleware::{
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
+use crate::platform::{
+    ConfigStoreHandleAdapter, SPIN_DEFAULT_CONFIG_LABEL, SpinSecretStoreAdapter,
+};
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
-/// Spin auto-provides this key-value store label without runtime configuration.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
+/// Logical ID, and default Spin label, of the generic runtime KV store.
+///
+/// It matches the KV store `edgezero.toml` declares. Its label must never be
+/// `default`, which holds the app config and request-signing metadata.
+pub const SPIN_KV_STORE_ID: &str = "trusted_server_runtime_kv";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -88,7 +95,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_LABEL);
     let config_key = default_config_key();
     // `for_label` defers open failures to the first read, which the
     // read error branch below reports.
@@ -139,6 +146,7 @@ fn build_state_with_services(
     settings
         .ec
         .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Spin)?;
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -372,20 +380,6 @@ pub(crate) fn normalize_spin_request(req: &mut RequestParts) {
 // Health probe
 // ---------------------------------------------------------------------------
 
-/// Builds the `GET /health` liveness response (`200 ok`, `text/plain`).
-///
-/// Mirrors the Fastly entry point and Axum adapter so deployments reusing
-/// Trusted Server health probes see identical behaviour on Spin. Served only
-/// once application state is built, so a startup failure answers 503 here too.
-/// Spin's platform-provided `/.well-known/spin/health` is left untouched.
-fn health_response() -> Response {
-    let mut resp = Response::new(edgezero_core::body::Body::from("ok"));
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-    resp
-}
-
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
@@ -456,6 +450,27 @@ fn legacy_admin_alias_denied() -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Startup error fallback
+// ---------------------------------------------------------------------------
+
+/// Returns a [`RouterService`] with liveness/readiness probes and generic
+/// 503 Service Unavailable responses on ordinary routes. The startup error is logged but not echoed in the
+/// response body so that deployment state is not leaked to anonymous callers.
+fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.method());
+        async move { Ok::<Response, EdgeError>(response) }
+    };
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
+    }
+    router.build()
+}
+
+// ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
@@ -472,15 +487,35 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> Result<RouterService, EdgeError> {
-        // Every startup failure answers 503 with a generic message, so the
-        // report never reaches an anonymous caller. It is logged at error,
-        // which `EdgeZero`'s managed backend writes to the component's stderr.
-        let state = build_state().map_err(|report| {
-            log::error!("{report:?}");
-            EdgeError::service_unavailable("Service Unavailable")
-        })?;
+        // A startup failure serves the failure router rather than failing
+        // assembly, so liveness stays up and readiness and every supported
+        // route answer the fixed unavailable response. The report never
+        // reaches an anonymous caller. It is logged at error, which
+        // `EdgeZero`'s managed backend writes to the component's stderr.
+        Ok(match build_state() {
+            Ok(state) => router_builder(&state).build(),
+            Err(report) => {
+                log::error!("{report:?}");
+                startup_error_router(&report)
+            }
+        })
+    }
 
-        Ok(router_builder(&state).build())
+    /// Declares only the generic runtime KV store.
+    ///
+    /// `EdgeZero` opens the `trusted_server_runtime_kv` label on first use, so a
+    /// component without that label still serves every route. Config and
+    /// secrets are not declared: startup and request-time config read the
+    /// `default` label directly, and secrets come from component variables.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: SPIN_KV_STORE_ID,
+                ids: &[SPIN_KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 
@@ -705,8 +740,9 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             async move {
                 let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
+                let ec = build_ec_context(&s.settings, &services, &req);
                 Ok::<Response, EdgeError>(
-                    handle_first_party_proxy(&s.settings, &services, req)
+                    handle_first_party_proxy(&s.settings, &services, &ec, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )
@@ -868,10 +904,13 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
 
         let trace_state = Arc::clone(&state);
         let mut builder = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(move |request| trace_metadata(&trace_state, request)),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(move |request| trace_metadata(&trace_state, request)),
+                ))),
+            ))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
@@ -893,11 +932,6 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             ec_state.services_for_request(context)
         });
         builder = builder
-            // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
-            // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
-            .get("/health", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(health_response())
-            })
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
@@ -1536,20 +1570,41 @@ mod tests {
 
     #[test]
     fn routes_answer_startup_failure_with_generic_service_unavailable() {
-        let Err(error) = TrustedServerApp::routes() else {
-            panic!("should fail startup without the production config store");
-        };
+        // Host targets have no production config store, so startup fails and
+        // `routes()` serves the failure router instead of failing assembly.
+        let router =
+            TrustedServerApp::routes().expect("should serve the failure router when startup fails");
 
-        assert_eq!(
-            error.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "should answer 503 for every startup failure"
-        );
-        assert_eq!(
-            error.message(),
-            "Service Unavailable",
-            "should not echo the startup report to callers"
-        );
+        for (path, status, body) in [
+            ("/health", StatusCode::OK, "ok"),
+            (
+                "/ready",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable\n",
+            ),
+            (
+                "/",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable\n",
+            ),
+        ] {
+            let response = futures::executor::block_on(
+                router.clone().oneshot(
+                    edgezero_core::http::request_builder()
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build request"),
+                ),
+            )
+            .expect("should route startup-failure request");
+
+            assert_eq!(response.status(), status, "should answer {path}");
+            assert_eq!(
+                response.into_body().into_bytes().as_deref(),
+                Some(body.as_bytes()),
+                "should not echo the startup report to callers on {path}"
+            );
+        }
     }
 }
 #[cfg(test)]
@@ -1831,5 +1886,85 @@ mod trace_dispatch_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }
