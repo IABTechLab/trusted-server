@@ -7,15 +7,15 @@ config that `ts config push` writes into KV to the nested
 
 ## Support status
 
-| Adapter      | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------------ | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | --------------------- |
-| `cloudflare` | development    | absent | `500`          | no             | multiple         | outermost sanitize         | none                  |
+| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
+| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
 
-This row is the canonical status summary. Cloudflare has no
-`/health` route and supports multiple auction providers. When startup fails,
-every route answers with EdgeZero's JSON error body at the startup error's
-status. That is normally 500; a KV store error answers 503, an auction, proxy,
-or integration error 502, and a bad-request error 400.
+This row is the canonical status summary. Cloudflare supports multiple auction
+providers. GET/HEAD `/health` and `/ready` are local probes after Worker and SDK
+application dispatch begins. Caught initialization failures preserve liveness
+and make readiness and ordinary routes unavailable. See the
+[operational response contract](./api-reference#operational-probe-contract).
 
 EdgeZero's Cloudflare `run_app` installs the log backend, and Trusted Server
 installs none of its own. Records go to the Workers console, which `wrangler
@@ -33,8 +33,9 @@ Install the Wrangler version pinned in `.tool-versions`, then run:
 ```
 
 The smoke refuses an absent pin or a different Wrangler executable. It creates
-an isolated Worker manifest, maps the EdgeZero config store to
-`TRUSTED_SERVER_KV`, and runs `ts config push --adapter cloudflare --local`.
+an isolated Worker manifest, copies the tool version declarations into its
+temporary workspace so Node and Wrangler shims retain their selected versions,
+maps the EdgeZero config store to `TRUSTED_SERVER_RUNTIME_KV`, and runs `ts config push --adapter cloudflare --local`.
 It reads `trusted_server_config` back with `wrangler kv key get` using both the
 explicit binding and local mode. The returned envelope becomes the string
 value of `app_config` in a JSON object; that outer JSON is assigned to the
@@ -44,7 +45,7 @@ the current startup reader.
 The generated local Wrangler files define `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
-secret. Each case requires a 500 response and verifies the exact missing
+secret. Each case requires a 503 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher
 request must return 200, include the stub-origin sentinel, rewrite its origin
 URL to the Worker listener, and omit the original URL.
@@ -52,6 +53,14 @@ URL to the Worker listener, and omit the original URL.
 The exit trap stops Wrangler and the stub origin and removes the isolated KV,
 generated Wrangler manifests, response captures, and logs. It does not modify
 the checked-in manifests.
+
+The smoke also checks malformed envelopes and invalid settings in a valid
+config envelope, fixed GET/HEAD probe responses, anonymous probes under a
+catch-all auth rule, and an ordinary protected-route challenge. Positive starts
+wait for `/ready`; negative starts wait for liveness or transport. Probe calls
+must leave origin counters unchanged; the final publisher control must reach
+the origin. See the [operational response contract](./api-reference#operational-probe-contract)
+for the shared assertions.
 
 ## Configure a deployed Worker
 
@@ -63,10 +72,31 @@ handler_password`, `wrangler secret put publisher_proxy_secret`, and `wrangler
 secret put ec_passphrase`; do not commit them to a Wrangler manifest. Deploy
 only after all four bindings are present.
 
-A successful `ts config push` alone does not configure this runtime: the
-Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time
-store registries are also unwired, so EC KV lookup and key rotation are not
-available. The read-only `/_ts/admin/eids` diagnostic remains available.
+A successful `ts config push` alone does not configure this runtime: startup
+reads only the `TRUSTED_SERVER_CONFIG` variable, never a KV namespace. Push
+deployment config to a namespace other than `TRUSTED_SERVER_RUNTIME_KV`, which holds
+runtime KV data. The local smoke's isolated namespace is removed when it
+exits.
+
+## Runtime stores
+
+- **Generic runtime KV.** The Worker opens the `TRUSTED_SERVER_RUNTIME_KV` namespace
+  binding for each request and hands it to features through
+  `RuntimeServices::kv_store()`. Without the binding, KV operations answer
+  `KvError::Unavailable`, a warning is logged once per isolate, and every
+  route is still served.
+- **Request-time config is unsupported.** Request signing therefore cannot
+  read its metadata: `/.well-known/trusted-server.json` answers the shared
+  `500`, `/verify-signature` answers `200` with `verified: false`, and a Worker
+  started with `request_signing.enabled = true` cannot sign outbound auction
+  requests. DataDome IP CIDR bypass lists from a config store are unavailable
+  too.
+- **EC lookup and key rotation are unsupported.** They need the EC record
+  store and the key-management stores, which this adapter does not provide.
+  The read-only `/_ts/admin/eids` diagnostic remains available.
+
+See the [store inventory](./edgezero#store-inventory) for every store each
+adapter reads.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 

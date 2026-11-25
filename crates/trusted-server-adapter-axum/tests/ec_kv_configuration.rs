@@ -19,7 +19,7 @@ fn ec_kv_configuration_is_process_isolated() {
             .env("AWS_EC2_METADATA_DISABLED", "true");
         if case != "absent" {
             command.env(
-                "TS_EC_RECORDS_ENABLED",
+                "TRUSTED_SERVER__EC_RECORDS_ENABLED",
                 match case {
                     "empty" => "",
                     "uppercase" => "TRUE",
@@ -81,7 +81,7 @@ fn legacy_ec_selection_is_rejected_in_isolated_processes() {
             .args(["--exact", "legacy_ec_selection_subprocess", "--nocapture"])
             .env_clear()
             .env("TS_EC_LEGACY_CASE", "selected")
-            .env("TS_EC_DYNAMODB_ENABLED", value)
+            .env("TRUSTED_SERVER__EC_DYNAMODB_ENABLED", value)
             .env("TS_EC_DYNAMODB_LOCAL_ENDPOINT", "private-unused-value")
             .output()
             .expect("should run migration test");
@@ -102,7 +102,7 @@ fn legacy_ec_selection_subprocess() {
         .expect_err("should reject obsolete provider selection");
     let detail = format!("{error:?}");
     assert!(
-        detail.contains("TS_EC_RECORDS_ENABLED"),
+        detail.contains("TRUSTED_SERVER__EC_RECORDS_ENABLED"),
         "should name the early record declaration"
     );
     assert!(

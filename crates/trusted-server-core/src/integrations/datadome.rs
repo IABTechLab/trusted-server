@@ -489,7 +489,7 @@ impl DataDomeIntegration {
     }
 
     fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
-        if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
+        if crate::runtime_env!(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
             return None;
         }
 
