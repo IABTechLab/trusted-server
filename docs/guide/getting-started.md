@@ -116,11 +116,17 @@ export EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
 export EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)"
 
 # Build and start the server in the same shell.
-cargo run -p trusted-server-adapter-axum
+ts serve --adapter axum
 ```
 
+`ts serve --adapter axum` runs the serve command in the selected `edgezero.toml`
+with the exported environment. The repository manifest runs
+`cargo run -p trusted-server-adapter-axum`, which is also a supported equivalent
+in this shell. Serve does not push config, set the prepared-store directories,
+load `.env` files, or generate secrets; the preceding steps supply those inputs.
+
 The server will be available at `http://localhost:8787`. To use a different port,
-set `EDGEZERO__ADAPTER__PORT=<port>` before `cargo run` and set
+set `EDGEZERO__ADAPTER__PORT=<port>` before `ts serve` and set
 `TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:<port>` before
 `ts config push` so rewritten creative URLs use the same listener.
 

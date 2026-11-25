@@ -66,6 +66,7 @@ EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
   ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 
 # Run Axum dev server (native — no Viceroy)
+# Prepare config and secrets first: docs/guide/getting-started.md, Option B.
 cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
