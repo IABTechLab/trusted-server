@@ -1465,9 +1465,15 @@ fn handwritten_store_metadata_matches_the_manifest() {
                 manifest_ids.contains(&default),
                 "should default to a KV store the manifest declares"
             );
-            assert!(
-                ids.iter().all(|id| manifest_ids.contains(id)),
-                "should declare only KV stores the manifest declares: {ids:?}"
+            let undeclared: Vec<&str> = ids
+                .iter()
+                .copied()
+                .filter(|id| !manifest_ids.contains(id))
+                .collect();
+            assert_eq!(
+                undeclared,
+                Vec::<&str>::new(),
+                "should declare only KV stores the manifest declares"
             );
             continue;
         }
