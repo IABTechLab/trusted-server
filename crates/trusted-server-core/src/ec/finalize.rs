@@ -1116,12 +1116,14 @@ mod tests {
         ec_context.set_recovery_eligible(true);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+            source: Some("id5-sync.com".to_owned()),
+            uids: Some(vec![Uid {
                 id: "ID5_should_not_persist".to_owned(),
                 atype: Some(1),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -1518,20 +1520,24 @@ mod tests {
         );
         ec_context.set_client_eids(vec![
             Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+                source: Some("id5-sync.com".to_owned()),
+                uids: Some(vec![Uid {
                     id: "ID5_from_body".to_owned(),
                     atype: Some(1),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+                source: Some("liveramp.com".to_owned()),
+                uids: Some(vec![Uid {
                     id: "LR_from_body".to_owned(),
                     atype: Some(3),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
         ]);
         let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
@@ -1596,12 +1602,14 @@ mod tests {
         });
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
         ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+            source: Some("id5-sync.com".to_owned()),
+            uids: Some(vec![Uid {
                 id: "ID5_should_not_persist".to_owned(),
                 atype: Some(1),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");

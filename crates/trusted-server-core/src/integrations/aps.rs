@@ -43,8 +43,8 @@ use crate::integrations::{
 use crate::openrtb::ToExt;
 #[cfg(test)]
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
-    UserExt, to_openrtb_i32,
+    Banner, Device, Format, Geo, Imp, JsonField, OpenRtbRequest, Publisher, Regs, RegsExt, Site,
+    User, UserExt, regs_extension, request_extension, to_openrtb_i32, user_extension,
 };
 #[cfg(test)]
 use crate::platform::PlatformHttpRequest;
@@ -1006,15 +1006,16 @@ impl ApsAuctionProvider {
         };
         Some(Regs {
             coppa: None,
-            gdpr: Some(consent.gdpr_applies),
+            gdpr: Some(i32::from(consent.gdpr_applies)),
             us_privacy: ext.us_privacy.clone(),
             gpp: ext.gpp.clone(),
             gpp_sid: ext
                 .gpp_sid
                 .as_ref()
-                .map(|ids| ids.iter().map(|id| i32::from(*id)).collect())
-                .unwrap_or_default(),
-            ext: ext.to_ext(),
+                .map(|ids| ids.iter().map(|id| i32::from(*id)).collect::<Vec<_>>())
+                .filter(|ids| !ids.is_empty()),
+            ext: ext.to_ext().map(regs_extension),
+            ..Default::default()
         })
     }
 
@@ -1094,27 +1095,30 @@ impl ApsAuctionProvider {
                     .iter()
                     .filter(|format| format.media_type == MediaType::Banner)
                     .filter_map(|format| {
+                        let width = to_openrtb_i32(format.width, "format.w", &slot_context);
+                        let height = to_openrtb_i32(format.height, "format.h", &slot_context);
                         Some(Format {
-                            w: to_openrtb_i32(format.width, "format.w", &slot_context),
-                            h: to_openrtb_i32(format.height, "format.h", &slot_context),
+                            w: width?,
+                            h: height?,
                             ..Default::default()
                         })
-                        .filter(|format| format.w.is_some() && format.h.is_some())
                     })
                     .collect();
                 let first = formats.first()?;
                 Some(Imp {
-                    id: Some(slot.id.clone()),
+                    id: slot.id.clone(),
                     banner: Some(Banner {
                         format: formats.clone(),
-                        w: first.w,
-                        h: first.h,
-                        topframe: Some(false),
+                        w: Some(first.w),
+                        h: Some(first.h),
+                        other: [("topframe".to_string(), Json::from(0))]
+                            .into_iter()
+                            .collect(),
                         ..Default::default()
                     }),
                     bidfloor: slot.floor_price,
                     bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_string()),
-                    secure: Some(true),
+                    secure: Some(1),
                     ..Default::default()
                 })
             })
@@ -1130,7 +1134,8 @@ impl ApsAuctionProvider {
                 consented_providers_settings: None,
                 eids: request.user.eids.clone(),
             }
-            .to_ext(),
+            .to_ext()
+            .map(user_extension),
             ..Default::default()
         });
 
@@ -1144,20 +1149,30 @@ impl ApsAuctionProvider {
                 ip: device.ip.clone(),
                 geo: device.geo.as_ref().map(|geo| Geo {
                     country: Some(geo.country.clone()),
-                    region: geo.region.clone(),
-                    city: Some(geo.city.clone()),
-                    metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
-                    r#type: Some(2),
+                    other: [
+                        ("type", Some(Json::from(2))),
+                        ("city", Some(Json::String(geo.city.clone()))),
+                        ("region", geo.region.clone().map(Json::String)),
+                        (
+                            "metro",
+                            (geo.metro_code > 0).then(|| Json::String(geo.metro_code.to_string())),
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
+                    .collect(),
                     ..Default::default()
                 }),
-                dnt,
-                language: language.clone(),
+                dnt: dnt.map(i32::from),
+                language: language
+                    .clone()
+                    .map_or(JsonField::Missing, JsonField::Value),
                 ..Default::default()
             })
             .or_else(|| {
                 (dnt.is_some() || language.is_some()).then_some(Device {
-                    dnt,
-                    language,
+                    dnt: dnt.map(i32::from),
+                    language: language.map_or(JsonField::Missing, JsonField::Value),
                     ..Default::default()
                 })
             });
@@ -1175,12 +1190,11 @@ impl ApsAuctionProvider {
         let (site_domain, page) = self.inventory_site_identity(&request.publisher.domain, page);
 
         OpenRtbRequest {
-            id: Some(request.id.clone()),
+            id: request.id.clone(),
             imp,
             site: Some(Site {
                 domain: Some(site_domain.clone()),
                 page: Some(page),
-                r#ref: None,
                 publisher: Some(Publisher {
                     domain: Some(site_domain),
                     ..Default::default()
@@ -1190,7 +1204,7 @@ impl ApsAuctionProvider {
             user,
             device,
             regs: Self::build_regs(consent),
-            tmax: to_openrtb_i32(context.timeout_ms, "tmax", "APS request"),
+            tmax: to_openrtb_i32(context.timeout_ms, "tmax", "APS request").map(i64::from),
             cur: vec![DEFAULT_CURRENCY.to_string()],
             ext: ApsRequestExt {
                 account: &self.config.account_id,
@@ -1199,7 +1213,8 @@ impl ApsAuctionProvider {
                     version: APS_SDK_VERSION,
                 },
             }
-            .to_ext(),
+            .to_ext()
+            .map(request_extension),
             ..Default::default()
         }
     }
@@ -2408,8 +2423,8 @@ mod tests {
             "should ignore shared trustedServer bidder parameters"
         );
         assert_eq!(
-            serde_json::to_string(&openrtb).expect("should serialize APS request"),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+            serde_json::to_value(&openrtb).expect("should serialize APS request"),
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#.parse::<Json>().expect("should parse pinned APS fixture"),
             "should preserve the complete APS wire shape without a signing extension"
         );
     }

@@ -16457,11 +16457,19 @@ mod tests {
                             .expect("should include consenting reader EIDs");
                         assert_eq!(eids.len(), 1, "should expose only the configured partner");
                         assert_eq!(
-                            eids[0].source, "example.com",
+                            eids[0]
+                                .source
+                                .as_deref()
+                                .expect("should contain normalized source"),
+                            "example.com",
                             "should use the registered source"
                         );
                         assert_eq!(
-                            eids[0].uids[0].id,
+                            eids[0]
+                                .uids
+                                .as_ref()
+                                .expect("should contain normalized UIDs")[0]
+                                .id,
                             format!("partner-reader-{index}"),
                             "should use this reader's partner identity on cold and warm requests"
                         );

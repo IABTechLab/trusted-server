@@ -10,6 +10,7 @@ use crate::auction::plan::ProviderPlan;
 use crate::auction::routing::ProviderAuctionInput;
 use crate::auction::types::AuctionResponse;
 use crate::error::TrustedServerError;
+use crate::openrtb::OpenRtbRequest;
 use crate::platform::{PlatformBackend, PlatformHttpClient, PlatformHttpRequest};
 
 const MAX_STANDARD_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -21,7 +22,7 @@ const MAX_STANDARD_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(super) async fn execute_standard_fixture(
     provider: &ProviderPlan,
     input: &ProviderAuctionInput,
-    request: &trusted_server_openrtb::BidRequest,
+    request: &OpenRtbRequest,
     backend: &dyn PlatformBackend,
     http_client: &dyn PlatformHttpClient,
 ) -> Result<AuctionResponse, Report<TrustedServerError>> {

@@ -314,7 +314,10 @@ fn language_limits_are_profile_specific() {
             Some(language),
         );
         assert_eq!(
-            request.device.and_then(|device| device.language).as_deref(),
+            request
+                .device
+                .and_then(|device| device.language.as_ref().cloned())
+                .as_deref(),
             expected
         );
     }
@@ -331,7 +334,10 @@ fn language_limits_are_profile_specific() {
             Some("en-US,en;q=0.9"),
         );
         assert_eq!(
-            request.device.and_then(|device| device.language).as_deref(),
+            request
+                .device
+                .and_then(|device| device.language.as_ref().cloned())
+                .as_deref(),
             Some("en")
         );
     }
@@ -806,8 +812,8 @@ fn pbs_driver_exact_golden_preserves_profile_policy() {
         OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
     };
     assert_eq!(
-        serde_json::to_string(&request).expect("should serialize PBS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+        serde_json::to_value(&request).expect("should serialize PBS driver request"),
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#.parse::<Value>().expect("should parse pinned PBS driver fixture"),
         "should preserve PBS parity differences"
     );
 }
@@ -865,8 +871,8 @@ fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
 fn aps_driver_exact_golden_preserves_profile_policy() {
     let request = build("aps", json!({"account_id": "example-account-id"}), None);
     assert_eq!(
-        serde_json::to_string(&request).expect("should serialize APS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+        serde_json::to_value(&request).expect("should serialize APS driver request"),
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#.parse::<Value>().expect("should parse pinned APS driver fixture"),
         "should preserve APS parity differences"
     );
 }
@@ -919,7 +925,21 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
 }
 
 #[test]
-fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
+fn openrtb_shared_types_preserves_signing_payload_bytes() {
+    let payload = finalization(None)
+        .signing_params
+        .build_payload("fictional-kid")
+        .expect("should build canonical signing payload");
+
+    assert_eq!(
+        payload.as_bytes(),
+        br#"{"version":"1.1","kid":"fictional-kid","host":"publisher.example","scheme":"https","id":"fictional-auction","ts":1706900000}"#,
+        "should preserve exact signing bytes independently of request field ordering"
+    );
+}
+
+#[test]
+fn signed_profiles_and_unsigned_standard_have_complete_json_goldens() {
     let signer = deterministic_signer();
     let cases = [
         (
@@ -940,21 +960,21 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
     ];
     for (profile, config, expected) in cases {
         assert_eq!(
-            serde_json::to_string(&build(profile, config, Some(&signer)))
+            serde_json::to_value(build(profile, config, Some(&signer)))
                 .expect("should serialize signed request"),
-            expected,
-            "{profile} signed wire fixture should stay exact"
+            serde_json::from_str::<Value>(expected).expect("should parse signed baseline fixture"),
+            "should preserve every {profile} signed wire field"
         );
     }
 
     assert_eq!(
-        serde_json::to_string(&build(
+        serde_json::to_value(build(
             "standard",
             json!({"request_ext": {"fictional": true}}),
             None,
         ))
         .expect("should serialize unsigned standard request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#,
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#.parse::<Value>().expect("should parse unsigned baseline fixture"),
         "unsigned standard wire fixture should stay exact"
     );
 }

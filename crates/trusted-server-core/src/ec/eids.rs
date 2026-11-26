@@ -65,12 +65,14 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
         .map(|item| Eid {
-            source: item.source_domain.clone(),
-            uids: vec![Uid {
+            source: Some(item.source_domain.clone()),
+            uids: Some(vec![Uid {
                 id: item.uid.clone(),
                 atype: Some(item.openrtb_atype),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         })
         .collect()
 }
@@ -168,6 +170,31 @@ mod tests {
     }
 
     #[test]
+    fn openrtb_shared_types_preserves_eid_header_json_bytes() {
+        let eids = [Eid {
+            source: Some("identity.example".to_string()),
+            uids: Some(vec![Uid {
+                id: "fictional-uid".to_string(),
+                atype: Some(1),
+                ext: (Some(serde_json::json!({"z": 2, "a": 1})))
+                    .as_ref()
+                    .and_then(crate::openrtb::uid_extension),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }];
+
+        let (encoded, truncated) = encode_eids_header(&eids).expect("should encode identity");
+
+        assert!(!truncated, "should retain the complete valid identity");
+        assert_eq!(
+            BASE64.decode(encoded).expect("should decode identity header"),
+            br#"[{"source":"identity.example","uids":[{"id":"fictional-uid","atype":1,"ext":{"a":1,"z":2}}]}]"#,
+            "should preserve exact JSON bytes and canonical extension object ordering"
+        );
+    }
+
+    #[test]
     fn resolve_partner_ids_sorts_by_source_domain() {
         let partners = vec![
             make_test_partner("zeta.example.com"),
@@ -226,16 +253,75 @@ mod tests {
         let eids = to_eids(&resolved);
 
         assert_eq!(eids.len(), 3, "should produce one EID per resolved partner");
-        assert_eq!(eids[0].source, "liveramp.com");
-        assert_eq!(eids[0].uids[0].id, "LR_xyz");
-        assert_eq!(eids[0].uids[0].atype, Some(3));
-        assert_eq!(eids[1].source, "id5-sync.com");
-        assert_eq!(eids[1].uids[0].id, "ID5_abc");
-        assert_eq!(eids[1].uids[0].atype, Some(1));
-        assert_eq!(eids[2].source, "google.com", "should preserve PAIR source");
-        assert_eq!(eids[2].uids[0].id, "pair-id", "should preserve PAIR ID");
         assert_eq!(
-            eids[2].uids[0].atype,
+            eids[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "liveramp.com"
+        );
+        assert_eq!(
+            eids[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "LR_xyz"
+        );
+        assert_eq!(
+            eids[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
+            Some(3)
+        );
+        assert_eq!(
+            eids[1]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "id5-sync.com"
+        );
+        assert_eq!(
+            eids[1]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "ID5_abc"
+        );
+        assert_eq!(
+            eids[1]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
+            Some(1)
+        );
+        assert_eq!(
+            eids[2]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "google.com",
+            "should preserve PAIR source"
+        );
+        assert_eq!(
+            eids[2]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "pair-id",
+            "should preserve PAIR ID"
+        );
+        assert_eq!(
+            eids[2]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(571187),
             "should preserve PAIR vendor-specific atype"
         );

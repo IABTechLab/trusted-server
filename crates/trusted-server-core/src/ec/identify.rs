@@ -125,12 +125,14 @@ pub fn handle_identify(
     }
 
     let eid = uid.as_ref().map(|u| Eid {
-        source: partner.source_domain.clone(),
-        uids: vec![Uid {
+        source: Some(partner.source_domain.clone()),
+        uids: Some(vec![Uid {
             id: u.clone(),
             atype: Some(partner.openrtb_atype),
             ext: None,
-        }],
+            ..Default::default()
+        }]),
+        ..Default::default()
     });
 
     let body = IdentifyResponse {

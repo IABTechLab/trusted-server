@@ -40,6 +40,7 @@ anyhow = "1"
 assert_cmd = "2"
 async-stream = "0.3"
 async-trait = "0.1"
+auctioneer-openrtb = { git = "https://github.com/IABTechLab/auctioneer", rev = "05f2a56e9555be9c46a789c868100e37162abe5b" }
 axum = "0.8"
 base64 = "0.22"
 brotli = "8.0"
