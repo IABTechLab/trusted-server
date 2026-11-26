@@ -26,22 +26,40 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `d063a8e7` (`d063a8e7f83f691186ab6010ac36893c48c14212`), the
-`rc/identity` commit on 2026-11-25 (IABTechLab/edgezero#495). It takes
-EdgeZero main's Fastly SDK 0.13.3 upgrade (EdgeZero 529, 531 and 534: the
-Fastly SDK and `log-fastly` at 0.13.3, Viceroy 0.22.0 and the Fastly CLI at
-17.2.0) through PR 275, now at `dbe90854`, which also moves its exact pins to
-`fastly` 0.13.3 and `url` 2.5.9, and through every pull request stacked on it.
-Since `9d02d7b3` the branch also merged EdgeZero 509's new after-response
+The cut now pins `459bd27d` (`459bd27d2a26bfa0eb030891978d9a5d346e8673`), the
+`rc/identity` commit later on 2026-11-25 (IABTechLab/edgezero#495). PR 275 is
+now at `0e2a58ae`, three commits after `dbe90854`: the Viceroy readiness
+repair installs `wasm32-unknown-unknown` before it builds, the repair makes
+conditional KV inserts atomic, and the Fastly batch cutoff test advances its
+clock when its request arms its own deadline. The branch carries those through
+every pull request stacked on PR 275, with test fixes in the stack (port
+reservations held or respawned in the Axum production hosting, diagnostics and
+geo hosting tests, the AWS emulator and records proofs publishing their
+readiness markers by rename, rustfmt-clean imports in the generated CLI, and
+the store crates' portable builds allowed in the Geo platform graphs), and
+merges EdgeZero 536 (IABTechLab/edgezero#535). That adds
+`RecordHandle::update`, a bounded record update that reads a record, asks a
+planner for its replacement and writes it with `IfGenerationMatch`, or
+`Add` after a miss, and rereads and replans after a lost precondition, up to a
+caller-supplied number of attempts. The Trusted Server build needs no code
+change, and only the ten EdgeZero package sources change in `Cargo.lock`.
+
+The previous pin, `d063a8e7` (`d063a8e7f83f691186ab6010ac36893c48c14212`), was
+the `rc/identity` commit earlier on 2026-11-25. It took EdgeZero main's Fastly
+SDK 0.13.3 upgrade (EdgeZero 529, 531 and 534: the Fastly SDK and
+`log-fastly` at 0.13.3, Viceroy 0.22.0 and the Fastly CLI at 17.2.0) through
+PR 275, then at `dbe90854`, which also moved its exact pins to `fastly` 0.13.3
+and `url` 2.5.9, and through every pull request stacked on it. Since
+`9d02d7b3` the branch had also merged EdgeZero 509's new after-response
 tests, EdgeZero 519's macOS test fixture fixes, EdgeZero main's docs eslint
 bump, EdgeZero 522 (portable Fastly record providers) and EdgeZero 524
 (outbound mTLS client identities). Trusted Server `main` took the same SDK
-upgrade in #1671. The Trusted Server build needs no code change. In
-`Cargo.lock` the EdgeZero package sources move, the Fastly crates move to
+upgrade in #1671. The Trusted Server build needed no code change. In
+`Cargo.lock` the EdgeZero package sources moved, the Fastly crates moved to
 0.13.3 and `url` to 2.5.9 as on `main`, and EdgeZero's optional AWS store
-dependencies are recorded but not built.
+dependencies were recorded but not built.
 
-The previous pin, `9d02d7b3` (`9d02d7b3185b49e81d9ac972ca3feef932ed848a`), was
+The pin before that, `9d02d7b3` (`9d02d7b3185b49e81d9ac972ca3feef932ed848a`), was
 the `rc/identity` commit on 2026-11-18. PR 275 stayed at `ea2549fb`. On top of
 `f84ffbbb` the branch merged EdgeZero 502 (geo through
 `ctx.geo()` on every adapter, and Axum geo bound from the manifest), the line
@@ -54,7 +72,7 @@ error). These added APIs the server-side identity work uses; the Trusted Server
 build needed no code change, and only the ten EdgeZero package sources changed
 in `Cargo.lock`.
 
-The pin before that, `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`), was
+Before that, `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`) was
 the `rc/identity` commit on 2026-11-17. It merges the
 same stack refreshed to PR 275's head `ea2549fb`, 16 fix and docs commits after
 `b65e7144` inside EdgeZero (Fastly response handles and progress wakers,
@@ -139,8 +157,8 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452`, `5c32ae61`, `10166628`, `3d92ee38`, `f84ffbbb` and `9d02d7b3` are
-earlier pins of the cut, `d063a8e7` is the cut's pin (of the files cited at
+`737f8452`, `5c32ae61`, `10166628`, `3d92ee38`, `f84ffbbb`, `9d02d7b3` and
+`d063a8e7` are earlier pins of the cut, `459bd27d` is the cut's pin (of the files cited at
 `5c32ae61`, `lifecycle.rs` differs there, and so does the Fastly
 `config_store.rs`, where EdgeZero 522 makes two helpers crate-visible and adds
 a bindings reader after the cited lines; of the files cited at `3d92ee38`,
@@ -276,7 +294,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `d063a8e7` at the 2026-11-25 repin. The cut repins
+which carries PR 275's head: `459bd27d` at the later 2026-11-25 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
