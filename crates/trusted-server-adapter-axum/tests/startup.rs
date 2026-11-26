@@ -1187,9 +1187,9 @@ mod managed_geo_consumers {
     #[test]
     fn geo_consent_runtime_axum() {
         let upstream = LocalUpstream::start();
-        let mut trusted = ServerFixture::new(Some(&envelope(&upstream)));
-        trusted.spawn_configured(false, false, Some(GEO_PROFILE));
-        trusted.wait_ready();
+        let mut accepted = ServerFixture::new(Some(&envelope(&upstream)));
+        accepted.spawn_configured(false, false, Some(GEO_PROFILE));
+        accepted.wait_ready();
         let mut untrusted = ServerFixture::new(Some(&envelope(&upstream)));
         untrusted.spawn_configured(
             false,
@@ -1211,7 +1211,7 @@ mod managed_geo_consumers {
             let server = match location.source {
                 geo_consent::Source::Untrusted => &untrusted,
                 geo_consent::Source::Unselected => &unselected,
-                _ => &trusted,
+                _ => &accepted,
             };
             for signal in [
                 geo_consent::Signal::None,
@@ -1306,7 +1306,7 @@ mod managed_geo_consumers {
                 }
             }
         }
-        for server in [&mut trusted, &mut untrusted, &mut unselected] {
+        for server in [&mut accepted, &mut untrusted, &mut unselected] {
             server.assert_logs_hold_no_secrets();
         }
     }
