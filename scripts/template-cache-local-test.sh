@@ -218,7 +218,34 @@ bidder.serve_forever()
 PYEOF
 python3 "$WORK/origin.py" > "$WORK/origin.log" 2>&1 &
 ORIGIN_PID=$!
-sleep 1
+
+# Wait for both listeners before sending measured requests. HTTPServer can
+# perform a reverse lookup between bind and listen, so a fixed sleep races
+# startup. TCP probes leave the HTTP request and origin-fetch counters intact.
+if ! python3 - "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
+import socket
+import sys
+import time
+
+pending = {int(port) for port in sys.argv[1:]}
+deadline = time.monotonic() + 60
+while pending:
+    for port in tuple(pending):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                pass
+        except OSError:
+            continue
+        pending.remove(port)
+    if pending:
+        if time.monotonic() >= deadline:
+            raise SystemExit("Fixture origin and bidder did not become ready within 60 seconds")
+        time.sleep(0.1)
+PYEOF
+then
+  tail -20 "$WORK/origin.log" >&2
+  exit 1
+fi
 
 info "Generating stub config (mode: $MODE)"
 python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$CONFIG_MODE" \
