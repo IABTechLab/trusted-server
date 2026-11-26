@@ -1,14 +1,32 @@
-//! Smoke tests for the Cloudflare adapter route wiring.
+//! Route tests for the Cloudflare adapter.
 //!
-//! Runs on the host target (no Workers runtime). Verifies that
-//! `TrustedServerApp::routes()` builds without panicking. Does not exercise
-//! the platform layer or outbound network calls.
+//! Runs on the host target (no Workers runtime). Covers route registration,
+//! middleware, auth, and the publisher origin's input cap and decoding. Every
+//! outbound call goes through a scripted client, so nothing reaches the
+//! network.
 
-use edgezero_core::app::Hooks as _;
-use edgezero_core::http::{Request, Response, request_builder};
+// Test crates may buffer bodies with `Body::into_bytes`.
+#![allow(clippy::disallowed_methods)]
+
+use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
+use edgezero_core::app::{App, Hooks as _};
+use edgezero_core::body::Body;
+use edgezero_core::http::{
+    HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+};
+use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
+use edgezero_core::outbound::{ResponseDecoding, ResponseMode};
+use edgezero_core::response_egress_framing::ResponseEgressFramingMode;
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
+use trusted_server_core::constants::TS_GIT_VERSION;
+use trusted_server_core::platform::HttpClient;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::publisher_input_cap::{self, Served};
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
+use trusted_server_core::test_support::{gzip, insert_outbound_client};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -22,7 +40,13 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// The settings [`test_router`] builds its router from.
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -39,10 +63,7 @@ fn test_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
@@ -54,7 +75,13 @@ fn registered_routes() -> Vec<(String, String)> {
         .collect()
 }
 
-async fn route(router: RouterService, req: Request) -> Response {
+async fn route(router: RouterService, mut req: Request) -> Response {
+    // `oneshot` skips `EdgeZero`'s request conversion, which installs the
+    // adapter's default client, so install one that fails every request.
+    insert_outbound_client(
+        &mut req,
+        HttpClient::with_client(ScriptedHttpClient::forbidding()),
+    );
     router.oneshot(req).await.expect("should route request")
 }
 
@@ -67,9 +94,8 @@ fn assert_route_registered(method: &str, path: &str) {
 }
 
 /// Build a router from explicit test settings so routes resolve to their real
-/// handlers instead of the `startup_error_router` fallback. The settings baked
-/// into the binary carry placeholder secrets that `get_settings()` rejects,
-/// which would otherwise turn every route into a startup error page.
+/// handlers. The settings baked into the binary carry placeholder secrets that
+/// `get_settings()` rejects, which would otherwise fail startup.
 fn make_router() -> RouterService {
     let settings = trusted_server_core::settings::Settings::from_toml(
         r#"
@@ -95,10 +121,140 @@ fn make_router() -> RouterService {
 }
 
 #[test]
-fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
-    let _router = TrustedServerApp::routes();
+fn routes_report_missing_worker_config_as_internal_error() {
+    // Host targets have no Worker config binding, so startup fails and
+    // `routes()` returns the error EdgeZero answers with.
+    let Err(error) = TrustedServerApp::routes() else {
+        panic!("should fail startup without a Worker config binding");
+    };
+
+    assert_eq!(
+        error.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should map the configuration error to a 500"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Synthesized headers on EdgeZero's canonical responses
+// ---------------------------------------------------------------------------
+
+/// Dispatches one request through the app `run_app` assembles, so the
+/// policies `TrustedServerApp::configure` installs apply, and returns the
+/// response head as egress would write it.
+async fn dispatch_through_app(method: Method, target: &str) -> Response {
+    let app = App::from_router::<TrustedServerApp>(test_router(), CLOUDFLARE_PLATFORM)
+        .expect("should assemble the app with its edge policies");
+    let request = request_builder()
+        .method(method)
+        .uri(target)
+        .body(Body::empty())
+        .expect("should build request");
+    let outcome = app
+        .dispatch_ingress(
+            request,
+            app.monotonic_now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        )
+        .await
+        .expect("should admit the request");
+    let envelope = match outcome {
+        IngressDispatchOutcome::Response(envelope) => Some(envelope),
+        _ => None,
+    }
+    .expect("should answer with a response");
+    let (prepared, _policy, mut attempt, clock) = envelope
+        .begin(ResponseEgressFramingMode::ExplicitBufferedLength)
+        .map_err(|_failure| "response egress failed before conversion")
+        .expect("should begin response egress");
+    assert!(attempt.begin_writing(), "should start writing the response");
+    assert!(
+        attempt.complete(clock.now()),
+        "should complete the response"
+    );
+    prepared.into_response()
+}
+
+/// Returns the git version compiled into this build.
+///
+/// # Panics
+///
+/// Panics when the build has none, so a version assertion cannot pass on an
+/// absent header.
+fn compiled_git_version() -> &'static str {
+    TS_GIT_VERSION.expect("should compile a git version into the test build")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_not_found_carries_x_ts_version() {
+    // The publisher fallback claims every origin-form path, so only an
+    // asterisk-form target has no route and gets EdgeZero's canonical 404.
+    let response = dispatch_through_app(Method::OPTIONS, "*").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "should answer an unrouted target with the canonical 404"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the canonical 404"
+    );
+}
+
+/// A handler `Err` still passes through the finalize middleware.
+///
+/// `dispatch_ingress` installs no outbound client, so the auction handler
+/// fails before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_error_carries_x_ts_version() {
+    let response = dispatch_through_app(Method::POST, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "should answer the failed Cloudflare handler with 500"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the handler error response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_method_not_allowed_carries_allow_and_x_ts_version() {
+    let response = dispatch_through_app(Method::TRACE, "/auction").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "should answer an unrouted method on a known path with the canonical 405"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|value| value.to_str().ok()),
+        Some("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"),
+        "should list the path's methods in sorted order"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(compiled_git_version()),
+        "should add the compiled-in git version to the canonical 405"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -686,14 +842,12 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    use std::sync::Arc;
-
     use trusted_server_core::test_support::nextjs_auction;
 
-    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let client = nextjs_auction::NextJsAuctionOrigin::default();
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),
-        nextjs_auction::services(Arc::clone(&client)),
+        nextjs_auction::services(&client),
     )
     .expect("should build router with fixture services");
 
@@ -744,5 +898,182 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
     assert!(
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Publisher origin through EdgeZero's client
+// ---------------------------------------------------------------------------
+
+/// Origin of the route test settings.
+const ORIGIN: &str = "https://origin.test-publisher.example.com";
+
+/// Cloudflare's origin input cap with the default 16 MiB `max_buffered_body_bytes`.
+const CLOUDFLARE_INPUT_CAP: usize = 10 * 1024 * 1024;
+
+/// Sends `req` through `router` with `origin` as the request's outbound client.
+async fn route_to_origin(
+    router: RouterService,
+    mut req: Request,
+    origin: &ScriptedHttpClient,
+) -> Response {
+    insert_outbound_client(&mut req, HttpClient::with_client(origin.clone()));
+    router.oneshot(req).await.expect("should route request")
+}
+
+/// A publisher GET for `path` on the test publisher host.
+fn publisher_get(path: &str) -> Request {
+    request_builder()
+        .method(Method::GET)
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header(header::HOST, "test-publisher.example.com")
+        .body(Body::empty())
+        .expect("should build publisher request")
+}
+
+/// An identity HTML document exactly `len` bytes long.
+fn html_document(len: usize) -> Vec<u8> {
+    let mut document = b"<html><body>".to_vec();
+    document.resize(len - b"</body></html>".len(), b'a');
+    document.extend_from_slice(b"</body></html>");
+    document
+}
+
+/// A 200 gzip origin reply carrying `body` with `content_type`.
+fn gzip_origin_reply(content_type: &str, body: &[u8]) -> ScriptedReply {
+    ScriptedReply::status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-encoding", "gzip")
+        .body(gzip(body))
+}
+
+/// Sends a publisher GET for `path` that accepts gzip through `router`, with
+/// `origin` as its outbound client.
+async fn fetch_publisher(router: RouterService, origin: &ScriptedHttpClient, path: &str) -> Served {
+    let mut request = publisher_get(path);
+    request
+        .headers_mut()
+        .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    Served::from_router_response(route_to_origin(router, request, origin).await)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_input_cap_matrix_cloudflare() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+
+    publisher_input_cap::assert_input_cap_matrix(
+        &origin,
+        CLOUDFLARE_INPUT_CAP,
+        ResponseDecoding::Decode,
+        |path| fetch_publisher(test_router(), &origin, path),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn processed_output_keeps_its_own_bound_cloudflare() {
+    let mut settings = test_settings();
+    settings.publisher.max_buffered_body_bytes = publisher_input_cap::OUTPUT_BOUND_BYTES;
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+
+    publisher_input_cap::assert_output_bound(&origin, |path| {
+        fetch_publisher(
+            TrustedServerApp::routes_with_settings(settings.clone())
+                .expect("should build router from output-bound settings"),
+            &origin,
+            path,
+        )
+    })
+    .await;
+}
+
+/// Serves `path` from a gzip origin to a client that sends no `Accept-Encoding`.
+async fn fetch_gzip_origin(path: &str, content_type: &str, body: &[u8]) -> (Response, Vec<u8>) {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}{path}"),
+        gzip_origin_reply(content_type, body),
+    );
+    let request = publisher_get(path);
+    assert!(
+        !request.headers().contains_key(header::ACCEPT_ENCODING),
+        "should send no Accept-Encoding"
+    );
+    let mut response = route_to_origin(test_router(), request, &origin).await;
+    let served = std::mem::replace(response.body_mut(), Body::empty())
+        .into_bytes()
+        .expect("should buffer the served body");
+    (response, served.to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_origin_html_reaches_a_client_without_accept_encoding_as_identity_cloudflare() {
+    let page = b"<html><head><title>Example</title></head><body><p>example</p></body></html>";
+
+    let (response, served) =
+        fetch_gzip_origin("/gzip-page", "text/html; charset=utf-8", page).await;
+
+    assert_eq!(
+        (
+            response.status(),
+            response.headers().get(header::CONTENT_ENCODING)
+        ),
+        (StatusCode::OK, None),
+        "should serve the processed page as identity"
+    );
+    let html = String::from_utf8(served).expect("should serve UTF-8 HTML");
+    assert!(
+        html.contains("/static/tsjs=") && html.contains("<p>example</p>"),
+        "should serve the decoded page with the TSJS tag: {html}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_origin_raw_body_reaches_a_client_without_accept_encoding_as_identity_cloudflare() {
+    let bytes = b"example raw origin bytes";
+
+    let (response, served) =
+        fetch_gzip_origin("/asset.bin", "application/octet-stream", bytes).await;
+
+    assert_eq!(
+        (
+            response.status(),
+            response.headers().get(header::CONTENT_ENCODING),
+            served.as_slice()
+        ),
+        (StatusCode::OK, None, bytes.as_slice()),
+        "should relay the raw body decoded, as identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publisher_origin_streams_its_decoded_response_under_the_input_cap_cloudflare() {
+    let origin = ScriptedHttpClient::new(&TestClock::new());
+    origin.respond_to(
+        Method::GET,
+        &format!("{ORIGIN}/page"),
+        gzip_origin_reply("text/html", &html_document(64)),
+    );
+
+    let response = route_to_origin(test_router(), publisher_get("/page"), &origin).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "should serve the page");
+    let requests = origin.requests();
+    let [forwarded] = requests.as_slice() else {
+        panic!("should send one origin request, got {requests:?}");
+    };
+    assert_eq!(
+        (
+            forwarded.response_mode,
+            forwarded.response_decoding,
+            forwarded.max_encoded_response_bytes,
+        ),
+        (
+            ResponseMode::Streamed,
+            ResponseDecoding::Decode,
+            Some(u64::try_from(CLOUDFLARE_INPUT_CAP).expect("should fit the cap in u64")),
+        ),
+        "should stream the decoded origin response and cap its encoded bytes"
     );
 }

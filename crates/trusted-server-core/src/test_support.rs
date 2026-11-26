@@ -1,11 +1,203 @@
 #[cfg(test)]
-pub(crate) mod logging;
+pub(crate) mod body_read;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod logging;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod publisher_input_cap;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod scripted_client;
+
+#[cfg(any(test, feature = "test-utils"))]
+use std::io::Write as _;
+
+#[cfg(any(test, feature = "test-utils"))]
+use edgezero_core::http::Request;
+
+#[cfg(any(test, feature = "test-utils"))]
+use crate::platform::HttpClient;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::{
+    error::TrustedServerError,
+    redacted::Redacted,
+    s3_sigv4::{self, S3Credentials},
+};
+#[cfg(any(test, feature = "test-utils"))]
+use error_stack::Report;
+#[cfg(any(test, feature = "test-utils"))]
+use http::{HeaderMap, HeaderValue, Method, header};
+
+/// Inserts `client` into `request`'s extensions, where `ctx.http_client()` reads it.
+///
+/// [`RouterService::oneshot`](edgezero_core::router::RouterService::oneshot) skips the
+/// adapter's request conversion, which is what installs a default client, so a `oneshot`
+/// route test calls this before dispatch. Pass a client built with
+/// [`HttpClient::with_client`], which keeps the default proxy marker, so the adapter's own
+/// `.with_proxy_marker(false)` stays observable.
+///
+/// # Examples
+///
+/// ```ignore
+/// insert_outbound_client(
+///     &mut request,
+///     HttpClient::with_client(ScriptedHttpClient::forbidding()),
+/// );
+/// let response = router.oneshot(request).await?;
+/// ```
+#[cfg(any(test, feature = "test-utils"))]
+pub fn insert_outbound_client(request: &mut Request, client: HttpClient) {
+    request.extensions_mut().insert(client);
+}
+
+/// Returns `bytes` gzip-encoded, for an origin fixture that serves a gzip body.
+///
+/// # Examples
+///
+/// ```ignore
+/// let body = gzip(b"<html></html>");
+/// assert_eq!(&body[..2], &[0x1f, 0x8b]);
+/// ```
+///
+/// # Panics
+///
+/// Panics if in-memory gzip encoding fails.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("should encode the gzip fixture");
+    encoder.finish().expect("should finish the gzip fixture")
+}
+
+/// Recomputes the S3 `SigV4` `Authorization` value for a request an origin received.
+///
+/// An origin stub passes the method, the `Host`, request target, and `x-amz-date` it
+/// received, and the route's region and credentials. The result equals the request's
+/// `Authorization` only when Trusted Server signed exactly that `Host`, path, and query.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when
+/// `amz_date` is not a `SigV4` timestamp or the received values cannot be signed.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn s3_sigv4_authorization(
+    method: &Method,
+    host: &str,
+    request_target: &str,
+    amz_date: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let invalid = |message: String| Report::new(TrustedServerError::Proxy { message });
+    let signed_at = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| invalid(format!("invalid x-amz-date `{amz_date}`")))?
+        .and_utc();
+    let url = url::Url::parse(&format!("https://{host}{request_target}"))
+        .map_err(|_| invalid(format!("invalid received target `{host}{request_target}`")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_str(host)
+            .map_err(|_| invalid(format!("invalid received Host `{host}`")))?,
+    );
+    s3_sigv4::sign_headers(
+        method,
+        &url,
+        &mut headers,
+        region,
+        &S3Credentials {
+            access_key_id: access_key_id.to_owned(),
+            secret_access_key: Redacted::new(secret_access_key.to_owned()),
+            session_token: None,
+        },
+        std::time::SystemTime::from(signed_at),
+    )?;
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("signer set no Authorization header".to_owned()))
+}
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::RequestParts;
+    use edgezero_core::router::{PreDispatchHook, RouterService};
+    use http::{Request, Response};
+
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
     use crate::settings::Settings;
+
+    /// Run `edit` against the head of `request` and return its result.
+    ///
+    /// The body is left in place. This lets tests apply a head-only helper,
+    /// such as forwarder preparation or basic auth, to a whole request.
+    pub fn with_request_parts<T>(
+        request: &mut Request<Body>,
+        edit: impl FnOnce(&mut RequestParts) -> T,
+    ) -> T {
+        let (mut parts, body) = std::mem::take(request).into_parts();
+        let result = edit(&mut parts);
+        *request = Request::from_parts(parts, body);
+        result
+    }
+
+    /// Drive `hook` through a router and report the outcome.
+    ///
+    /// The route matches every path for the request's method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the router's response when the hook answers instead of
+    /// continuing. `Ok` carries the request the route received, with the hook's
+    /// head and the buffered body bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the router cannot render its response.
+    pub async fn run_pre_dispatch_hook<H: PreDispatchHook>(
+        hook: H,
+        request: Request<Body>,
+    ) -> Result<Request<Body>, Response<Body>> {
+        let received: Arc<Mutex<Option<(RequestParts, Bytes)>>> = Arc::default();
+        let sink = Arc::clone(&received);
+        let record = move |context: RequestContext| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = context.body_bytes(usize::MAX).await?;
+                let (parts, _) = context.into_request()?.into_parts();
+                *sink.lock().expect("should lock the recorded request") = Some((parts, body));
+                Ok::<_, EdgeError>(Response::new(Body::empty()))
+            }
+        };
+        let method = request.method().clone();
+        let router = RouterService::builder()
+            .pre_dispatch_hook(hook)
+            .route("/", method.clone(), record.clone())
+            .route("/{*rest}", method, record)
+            .build();
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("should render the router response");
+        let recorded = received
+            .lock()
+            .expect("should lock the recorded request")
+            .take();
+        match recorded {
+            Some((parts, body)) => Ok(Request::from_parts(parts, Body::from(body))),
+            None => Err(response),
+        }
+    }
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {
@@ -104,30 +296,30 @@ pub mod tests {
 /// drive byte-identical input.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod nextjs_auction {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::IpAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use error_stack::Report;
-    use flate2::{read::GzDecoder, write::GzEncoder};
+    use flate2::read::GzDecoder;
+    use http::{Method, StatusCode};
 
     use crate::geo::GeoInfo;
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+        ClientInfo, PlatformConfigStore, PlatformError, PlatformGeo, PlatformSecretStore,
         RuntimeServices, StoreId, StoreName, UnavailableKvStore,
     };
     use crate::settings::Settings;
+    use crate::test_support::scripted_client::{ScriptedHttpClient, ScriptedReply, TestClock};
 
     /// Publisher host the fixture settings serve.
     pub const PUBLISHER_HOST: &str = "test-publisher.example.com";
     /// Upstream host the fixture origin answers for.
     pub const ORIGIN_HOST: &str = "origin.test-publisher.example.com";
-    /// Auction endpoint host the fixture bidder answers for.
-    pub const AUCTION_HOST: &str = "auction.example.com";
+    /// Bid endpoint of the fixture auction provider, where its scripted bidder answers.
+    pub const AUCTION_ENDPOINT: &str = "https://auction.example.com/bid";
 
     /// Settings that enable the Next.js integration and a single auction provider.
     ///
@@ -169,7 +361,7 @@ pub mod nextjs_auction {
         settings.auction.providers = serde_json::from_value(serde_json::json!({
             "fixture": {
                 "protocol": "openrtb-2.6",
-                "endpoint": "https://auction.example.com/bid",
+                "endpoint": AUCTION_ENDPOINT,
                 "routing": "all_eligible",
                 "timeout_ms": 5000
             }
@@ -354,145 +546,111 @@ pub mod nextjs_auction {
         );
     }
 
-    /// Upstream that serves [`origin_html`] and one deterministic bid.
-    #[derive(Default)]
+    /// Publisher origin that serves [`origin_html`], with a scripted bidder that
+    /// answers every bid request at [`AUCTION_ENDPOINT`] with one deterministic bid.
+    ///
+    /// Both answer through one scripted client: every GET to [`ORIGIN_HOST`] gets the
+    /// page, whatever its path. [`services`] sends the publisher origin and the
+    /// auction through it and reads time from the clock its replies arrive on.
     pub struct NextJsAuctionOrigin {
-        auction_requests: AtomicUsize,
-        html_response: Option<Vec<u8>>,
-        gzip: bool,
-        streaming: bool,
+        clock: TestClock,
+        client: ScriptedHttpClient,
+        auction_requests: Arc<AtomicUsize>,
+    }
+
+    impl Default for NextJsAuctionOrigin {
+        fn default() -> Self {
+            Self::serving(Bytes::from(origin_html()), false, false)
+        }
+    }
+
+    /// Queues the fixture bid for the next bid request `bidder` receives.
+    fn queue_fixture_bid(bidder: &ScriptedHttpClient) {
+        let bid = serde_json::json!({
+            "id": "fixture-auction",
+            "seatbid": [{"seat": "example", "bid": [{
+                "id": "fixture-bid", "impid": "fixture-slot", "price": 1.25,
+                "adm": "<div>fixture-creative</div>", "w": 300, "h": 250,
+                "crid": "example-creative", "adomain": ["advertiser.example.com"]
+            }]}]
+        });
+        bidder.respond_to(
+            Method::POST,
+            AUCTION_ENDPOINT,
+            ScriptedReply::status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(bid.to_string()),
+        );
+    }
+
+    /// The origin's answer to one page request: `html`, gzip-coded when `gzip`, and
+    /// delivered in 97-byte chunks when `chunked`.
+    fn origin_reply(html: &Bytes, gzip: bool, chunked: bool) -> ScriptedReply {
+        let mut reply = ScriptedReply::status(StatusCode::OK).header("content-type", "text/html");
+        if gzip {
+            reply = reply.header("content-encoding", "gzip");
+        }
+        if chunked {
+            reply.chunks(html.chunks(97).map(Bytes::copy_from_slice).collect())
+        } else {
+            reply.body(html.clone())
+        }
     }
 
     impl NextJsAuctionOrigin {
         /// Serve canned HTML instead of the default fixture, optionally gzip-encoded
-        /// and streamed in small chunks. The default fixture remains unchanged.
+        /// and delivered in small chunks. The default fixture remains unchanged.
         ///
         /// # Panics
         ///
         /// Panics if in-memory gzip encoding fails.
         #[must_use]
-        pub fn with_html_response(html: &str, gzip: bool, streaming: bool) -> Self {
+        pub fn with_html_response(html: &str, gzip: bool, chunked: bool) -> Self {
             let bytes = if gzip {
-                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder
-                    .write_all(html.as_bytes())
-                    .expect("should encode fixture gzip");
-                encoder.finish().expect("should finish fixture gzip")
+                super::gzip(html.as_bytes())
             } else {
                 html.as_bytes().to_vec()
             };
+            Self::serving(Bytes::from(bytes), gzip, chunked)
+        }
+
+        fn serving(html: Bytes, gzip: bool, chunked: bool) -> Self {
+            let clock = TestClock::new();
+            let auction_requests = Arc::new(AtomicUsize::new(0));
+            let script = ScriptedHttpClient::new(&clock);
+            let rearm = script.clone();
+            let counted = Arc::clone(&auction_requests);
+            // The scripted client spends each reply on one request, so each request
+            // queues its own answer as it is recorded, before its reply is taken.
+            let client = script.with_request_observer(move |request| {
+                if request.method == Method::POST && request.uri == AUCTION_ENDPOINT {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    queue_fixture_bid(&rearm);
+                } else if request.method == Method::GET && request.uri.host() == Some(ORIGIN_HOST) {
+                    rearm.respond_to(
+                        Method::GET,
+                        &request.uri.to_string(),
+                        origin_reply(&html, gzip, chunked),
+                    );
+                }
+            });
+            queue_fixture_bid(&client);
             Self {
-                html_response: Some(bytes),
-                gzip,
-                streaming,
-                ..Self::default()
+                clock,
+                client,
+                auction_requests,
             }
         }
 
-        /// Number of auction requests this fixture has answered.
+        /// Number of bid requests the fixture bidder has received.
         #[must_use]
         pub fn auction_requests(&self) -> usize {
             self.auction_requests.load(Ordering::SeqCst)
         }
 
-        /// Forget the recorded auction requests.
+        /// Forget the recorded bid requests.
         pub fn reset_auction_requests(&self) {
             self.auction_requests.store(0, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for NextJsAuctionOrigin {
-        fn supports_streaming_responses(&self) -> bool {
-            self.streaming
-        }
-
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let (content_type, body) = match request.request.uri().host() {
-                Some(ORIGIN_HOST) => ("text/html", origin_html()),
-                Some(AUCTION_HOST) => {
-                    self.auction_requests.fetch_add(1, Ordering::SeqCst);
-                    (
-                        "application/json",
-                        serde_json::json!({
-                            "id": "fixture-auction",
-                            "seatbid": [{"seat": "example", "bid": [{
-                                "id": "fixture-bid", "impid": "fixture-slot", "price": 1.25,
-                                "adm": "<div>fixture-creative</div>", "w": 300, "h": 250,
-                                "crid": "example-creative", "adomain": ["advertiser.example.com"]
-                            }]}]
-                        })
-                        .to_string(),
-                    )
-                }
-                host => {
-                    return Err(Report::new(PlatformError::HttpClient)
-                        .attach(format!("unexpected fixture upstream: {host:?}")));
-                }
-            };
-            let canned_origin =
-                request.request.uri().host() == Some(ORIGIN_HOST) && self.html_response.is_some();
-            let bytes = if canned_origin {
-                self.html_response
-                    .as_ref()
-                    .expect("should have canned response")
-                    .clone()
-            } else {
-                body.into_bytes()
-            };
-            let mut response = http::Response::builder()
-                .status(200)
-                .header("content-type", content_type);
-            if canned_origin && self.gzip {
-                response = response.header("content-encoding", "gzip");
-            }
-            let body = if request.stream_response && self.streaming {
-                let chunks: Vec<Bytes> = bytes.chunks(97).map(Bytes::copy_from_slice).collect();
-                edgezero_core::body::Body::stream(futures::stream::iter(chunks))
-            } else {
-                edgezero_core::body::Body::from(bytes)
-            };
-            Ok(PlatformResponse::new(
-                response
-                    .body(body)
-                    .expect("should build deterministic upstream response"),
-            )
-            .with_backend_name(request.backend_name))
-        }
-
-        async fn send_async(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            let backend = request.backend_name.clone();
-            Ok(PlatformPendingRequest::new(request).with_backend_name(backend))
-        }
-
-        async fn select_until(
-            &self,
-            pending_requests: Vec<PlatformPendingRequest>,
-            _deadline: web_time::Instant,
-        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-            // All fixture responses are deterministic and already available.
-            self.select(pending_requests).await.map(Some)
-        }
-
-        async fn select(
-            &self,
-            mut pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            let request = pending_requests
-                .remove(0)
-                .downcast::<PlatformHttpRequest>()
-                .expect("should recover fixture pending request");
-            Ok(PlatformSelectResult {
-                ready: self.send(request).await,
-                remaining: pending_requests,
-                failed_backend_name: None,
-            })
         }
     }
 
@@ -518,85 +676,81 @@ pub mod nextjs_auction {
 
     struct FixtureStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for FixtureStore {
         fn get(
             &self,
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<String, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn put(
+        async fn put(
             &self,
             _store_id: &StoreId,
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::ConfigStore))
         }
 
-        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::ConfigStore))
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for FixtureStore {
         fn get_bytes(
             &self,
             _store_name: &StoreName,
             _key: &str,
         ) -> Result<Vec<u8>, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
+            Err(Report::new(PlatformError::SecretStore))
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    impl PlatformBackend for FixtureStore {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
-        fn predict_name(
+        async fn delete(
             &self,
-            _spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok("fixture-backend".to_owned())
-        }
-
-        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            Ok("fixture-backend".to_owned())
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
         }
     }
 
-    /// Runtime services wired to `client`, with every other platform capability
-    /// stubbed out.
+    /// Runtime services wired to `client`, with its scripted origin and bidder as the
+    /// outbound client and every other platform capability stubbed out.
     #[must_use]
-    pub fn services(client: Arc<NextJsAuctionOrigin>) -> RuntimeServices {
-        services_with_http_client(client)
+    pub fn services(client: &NextJsAuctionOrigin) -> RuntimeServices {
+        services_with_outbound_client(&client.client, &client.clock)
     }
 
-    /// Build fixture runtime services with a custom asynchronous upstream.
+    /// Fixture runtime services whose outbound requests go to `client`, on `clock`.
     #[must_use]
-    pub fn services_with_http_client(client: Arc<dyn PlatformHttpClient>) -> RuntimeServices {
+    pub fn services_with_outbound_client(
+        client: &ScriptedHttpClient,
+        clock: &TestClock,
+    ) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(FixtureStore))
             .secret_store(Arc::new(FixtureStore))
             .kv_store(Arc::new(UnavailableKvStore))
-            .backend(Arc::new(FixtureStore))
-            .http_client(client)
+            .outbound_client(client.http_client())
+            .clock(clock.monotonic_clock())
             .geo(Arc::new(FixtureGeo))
             .client_info(ClientInfo::default())
             .build()

@@ -3,7 +3,8 @@ main = "build/index.js"
 compatibility_date = "2024-09-23"
 # Keep in sync with wrangler.toml. `cache_option_enabled` is required for the
 # outbound `CacheMode::NoStore` cache bypass under this compatibility date.
-compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
+# `enable_weak_ref` and `enable_request_signal` are required by EdgeZero.
+compatibility_flags = ["nodejs_compat", "cache_option_enabled", "enable_weak_ref", "enable_request_signal"]
 # No [build] section — bundle is pre-built in CI; wrangler dev must not rebuild.
 
 [[kv_namespaces]]

@@ -50,7 +50,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy --version 0.21.0 --locked --force
+cargo install viceroy --version 0.22.0 --locked --force
 ```
 
 Create and push the starter config, then start the local Fastly simulator:
@@ -103,7 +103,7 @@ cargo run -p trusted-server-adapter-axum
 ```
 
 The server will be available at `http://localhost:8787`. To use a different port,
-set `PORT=<port>` before `cargo run` and set
+set `EDGEZERO__ADAPTER__PORT=<port>` before `cargo run` and set
 `TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:<port>` before
 `ts config push` so rewritten creative URLs use the same listener.
 
@@ -201,10 +201,9 @@ ts config validate
 ts config push --adapter fastly
 ```
 
-This command performs target-independent plan validation. Each adapter performs
-mandatory target-aware fan-out and backend-name validation at startup. The
-EdgeZero callback needed for target-aware pre-write push validation is not yet
-available in this tree, so startup remains the final target gate.
+This command performs target-independent plan validation. Fastly startup also
+checks that an enabled auction fits its bound of 160 provider backends; push
+does not run that check.
 
 Restart or redeploy instances after secret rotation. See
 [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.

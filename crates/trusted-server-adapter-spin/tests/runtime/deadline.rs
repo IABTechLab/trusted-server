@@ -1,14 +1,31 @@
-//! Local runtime fixture exercising the production HTTP client implementation.
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[path = "../../src/platform.rs"]
-mod platform;
+//! Local runtime fixture exercising `EdgeZero`'s Spin HTTP client.
+//!
+//! `scripts/test-worker-auction-deadlines.mjs` calls it with a delayed
+//! upstream. It starts one buffered request in a batch, sleeps for the
+//! simulated publisher work, then collects the batch at the auction cutoff.
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use std::time::Duration;
+
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::platform::{PlatformHttpClient as _, PlatformHttpRequest};
+use edgezero_adapter_spin::outbound::SpinOutboundClient;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::error::EdgeError;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::http::Method;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::outbound::{
+    HttpClient, OutboundBatchTermination, OutboundCachePolicy, OutboundCollectedSlot,
+    ResponseDecoding,
+};
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::time::Deadline;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::outbound::{BUFFERED_TIMEOUT, buffered, outbound_request};
+
+/// Response cap the script's oversized upstream exceeds by one byte.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+const RESPONSE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[spin_sdk::http_service]
@@ -20,9 +37,7 @@ async fn handle(request: spin_sdk::http::Request) -> Result<String, spin_sdk::ht
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-async fn exercise(
-    uri: &str,
-) -> Result<String, error_stack::Report<trusted_server_core::platform::PlatformError>> {
+async fn exercise(uri: &str) -> Result<String, EdgeError> {
     let parameter = |name: &str| {
         uri.split_once('?').and_then(|(_, query)| {
             query
@@ -41,40 +56,44 @@ async fn exercise(
         .expect("should supply origin delay")
         .parse()
         .expect("should parse origin delay");
-    let client = platform::SpinPlatformHttpClient;
-    let request = edgezero_core::http::request_builder()
-        .uri(upstream)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should construct fixture request");
+    let client = HttpClient::with_client(SpinOutboundClient::new());
+    let request = buffered(
+        outbound_request(Method::GET, upstream)?,
+        BUFFERED_TIMEOUT,
+        RESPONSE_CAP_BYTES,
+        ResponseDecoding::Decode,
+    )
+    .cache_policy(OutboundCachePolicy::Bypass);
     let started = web_time::Instant::now();
-    let pending = client
-        .send_async(PlatformHttpRequest::new(request, "fixture"))
-        .await?;
+    let batch = client.start_batch_until(
+        vec![request],
+        Deadline::after(Duration::from_millis(budget_ms)),
+    );
     spin_sdk::time::sleep(Duration::from_millis(origin_ms)).await;
-    let collected = client
-        .select_until(vec![pending], started + Duration::from_millis(budget_ms))
-        .await?;
-    let status = match collected {
-        Some(result) => match result.ready {
+    let (slots, termination) = batch
+        .collect()
+        .await
+        .map_err(|failure| failure.into_parts().0)?
+        .into_parts();
+    let status = match (slots.into_iter().next(), termination) {
+        (Some(OutboundCollectedSlot::Resolved(result)), _) => match result.outcome {
             Ok(response) => {
                 assert_eq!(
-                    response.response.body().as_bytes(),
+                    response.body().as_bytes(),
                     Some(b"okay".as_slice()),
                     "should retain the complete nonempty upstream body"
                 );
                 "complete"
             }
-            Err(error) if format!("{error:?}").contains("length limit exceeded") => {
-                assert_eq!(
-                    result.failed_backend_name.as_deref(),
-                    Some("fixture"),
-                    "should attribute oversized response to its provider"
-                );
-                "oversized"
-            }
+            Err(EdgeError::ResponseTooLarge { .. }) => "oversized",
             Err(error) => return Err(error),
         },
-        None => "timeout",
+        (Some(OutboundCollectedSlot::Unresolved), OutboundBatchTermination::Cutoff) => "timeout",
+        (slot, termination) => {
+            return Err(EdgeError::internal(std::io::Error::other(format!(
+                "unexpected batch outcome {slot:?} with {termination:?}"
+            ))));
+        }
     };
     Ok(format!("{status}:{}", started.elapsed().as_millis()))
 }
