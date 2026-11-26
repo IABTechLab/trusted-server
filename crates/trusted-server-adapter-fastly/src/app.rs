@@ -238,21 +238,6 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     mut settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    if let Some(selection) = settings
-        .ec
-        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Fastly)?
-    {
-        let (trusted_server_core::ec::storage::EcStorageSelection::Fastly(id)
-        | trusted_server_core::ec::storage::EcStorageSelection::Records(id)) = selection;
-        if !TrustedServerApp::stores()
-            .kv
-            .is_some_and(|metadata| metadata.ids.contains(&id))
-        {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "EC storage must reference a declared logical record store ID".to_owned(),
-            }));
-        }
-    }
     settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     validate_fastly_backend_bound(&plan)?;
@@ -1985,18 +1970,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_validates_record_references_against_declared_logical_ids() {
-        let mut settings = test_settings();
-        settings.ec.ec_store = Some("unregistered-physical-name".to_owned());
-        assert!(
-            build_state_from_settings(settings.clone()).is_err(),
-            "should reject undeclared routing before serving a request"
-        );
-        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
-        assert!(
-            build_state_from_settings(settings).is_ok(),
-            "should validate the declared reference without provider I/O"
-        );
+    fn startup_accepts_any_fastly_ec_store_link_name() {
+        // The EC store opens by its Fastly resource-link name on the first EC
+        // operation, so startup accepts a deployment's existing link name as
+        // well as the logical `trusted_server_kv` link.
+        for name in ["ec_id_store", "trusted_server_kv"] {
+            let mut settings = test_settings();
+            settings.ec.ec_store = Some(name.to_owned());
+            assert!(
+                build_state_from_settings(settings).is_ok(),
+                "should build app state for EC store link `{name}` without opening it"
+            );
+        }
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
