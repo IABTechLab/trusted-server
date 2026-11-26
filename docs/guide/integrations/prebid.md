@@ -681,6 +681,13 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
+EIDs that a publisher or an identity SDK sets directly with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })` are not User ID Module
+output, so `pbjs.getUserIdsAsEids()` does not return them. The shim also reads
+`ortb2.user.ext.eids` from the Prebid config and appends those EIDs after the
+User ID Module ones. A source present in both is forwarded once with its uids
+merged, and a uid already seen for that source is skipped.
+
 User ID submodule inclusion comes from `bundle.modules.user_id`. The available
 modules and default preset are checked in at
 `crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`.
@@ -868,9 +875,12 @@ page or auction. When available, the opaque value follows the standard path:
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
    Server as `user.eids`.
 4. The browser also persists the opaque value in the bounded `ts-eids` cookie.
-   The next top-level page navigation ingests it into an EC/KV partner
+   A later eligible document navigation or EC POST ingests it into an EC/KV partner
    configured with `source_domain = "liveramp.com"`, when that partner UID is
-   not already stored. `/auction` and `GET /_ts/page-bids` never write KV.
+   not already stored. `/auction` also saves explicit body EIDs into an existing
+   live EC record under the same consent, ownership and fill-missing rules,
+   including when bidding is disabled. It never creates or revives a record and
+   emits no identity cookie. `GET /_ts/page-bids` does not write identity records.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -954,11 +964,11 @@ not passed by this implementation.
 
 Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` and the `ortb2.user.ext.eids` Prebid config in the browser and sent in the `/auction` request body.
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.
-5. On the next top-level page navigation, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the SharedID cookie named by the `sharedId` entry's `storage.name`. The `/auction` request-body EIDs go to bidders on that request only and are never stored, so ingestion is limited by the size-capped `ts-eids` cookie.
+5. Explicit `/auction` body EIDs can fill missing partner UIDs in an existing live EC record under consent, ownership and opt-out rules, including when bidding is disabled. The operation never creates or revives an identity. Cookie ingestion occurs on an eligible document navigation or admitted EC POST, reading `ts-eids` and then the SharedID cookie named by the `sharedId` entry's `storage.name`. Auction cookie fallback remains read-only.
 
 The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
@@ -982,7 +992,7 @@ sequenceDiagram
     T->>P: OpenRTB request\nuser.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
-    Note over B,K: /auction writes nothing to KV; ts-eids and sharedId\nare ingested on the next top-level navigation
+    Note over B,K: /auction may save explicit body EIDs to an existing live row;\nts-eids and sharedId cookie ingestion waits for a document navigation or EC POST
 ```
 
 ### Merge and deduplication rules

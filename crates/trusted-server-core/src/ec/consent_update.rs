@@ -46,6 +46,11 @@ fn response(status: StatusCode) -> Response<EdgeBody> {
     response
 }
 
+/// Requires authoritative withdrawal failures to be reported to this caller.
+pub(crate) fn require_reconciliation(response: &mut Response<EdgeBody>) {
+    response.extensions_mut().insert(ConsentUpdateResponse);
+}
+
 /// Marks an accepted consent update whose finalization could not confirm revocation.
 /// Ordinary publisher/error responses retain their existing status semantics.
 pub(crate) fn mark_reconciliation_failed(response: &mut Response<EdgeBody>) {
@@ -58,7 +63,7 @@ pub(crate) fn mark_reconciliation_failed(response: &mut Response<EdgeBody>) {
     }
 }
 
-fn same_origin(services: &RuntimeServices, req: &Request<EdgeBody>) -> bool {
+pub(super) fn same_origin(services: &RuntimeServices, req: &Request<EdgeBody>) -> bool {
     let Some(origin) = req
         .headers()
         .get(header::ORIGIN)
@@ -195,7 +200,7 @@ pub fn handle_consent_update(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     });
-    response.extensions_mut().insert(ConsentUpdateResponse);
+    require_reconciliation(&mut response);
     response
 }
 
@@ -203,8 +208,10 @@ pub fn handle_consent_update(
 mod tests {
     use super::*;
     use crate::consent::{ConsentContext, jurisdiction::Jurisdiction};
+    use crate::ec::eid_types::UnixSeconds;
+    use crate::ec::finalize::FinalizeRequest;
     use crate::ec::{
-        EcContext, finalize::ec_finalize_response, registry::PartnerRegistry,
+        EcContext, current_timestamp, finalize::ec_finalize_response, registry::PartnerRegistry,
         sharedid::SharedIdRequest,
     };
     use crate::http_util::RuntimeRequestOrigin;
@@ -400,8 +407,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -436,8 +446,11 @@ mod tests {
             &mut original,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut Response::new(EdgeBody::empty()),
         )
         .await;
@@ -473,8 +486,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -512,8 +528,11 @@ mod tests {
             &mut late,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;
@@ -596,8 +615,11 @@ mod tests {
             &mut ec,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
-            &SharedIdRequest::default(),
+            &FinalizeRequest {
+                eids_cookie: None,
+                sharedid: &SharedIdRequest::default(),
+                now: Some(UnixSeconds::new(current_timestamp())),
+            },
             &mut response,
         )
         .await;

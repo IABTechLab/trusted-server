@@ -169,8 +169,8 @@ run "prepared_record_binding" {
 
   assert {
     condition = (
-      local.application_environment.TS_EC_RECORDS_ENABLED == "true" &&
-      !contains(keys(local.application_environment), "TS_EC_DYNAMODB_ENABLED") &&
+      local.application_environment.TRUSTED_SERVER__EC_RECORDS_ENABLED == "true" &&
+      !contains(keys(local.application_environment), "TRUSTED_SERVER__EC_DYNAMODB_ENABLED") &&
       strcontains(local.native_bindings, "[kv.trusted_server_kv]\nprovider = \"aws-dynamodb-records\"\nregion = \"eu-west-2\"\ntable = \"example-retained-ec\"\nnamespace = \"example-staging\"") &&
       local.envelope_valid
     )

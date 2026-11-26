@@ -209,47 +209,74 @@ http.createServer((req, res) => {
       '-ec',
       'set -a; . /run/secrets/local.env; exec /usr/local/bin/app'
     )
-    // Fast startup rejection can remove Docker's active port mapping before inspect.
+    // A provider-preparation exit can remove Docker's port mapping before inspect.
     return { name, endpoint: `http://127.0.0.1:${hostPort}` }
   }
   const state = async (name) =>
     JSON.parse(await docker('inspect', '--format={{json .State}}', name))
-  for (const [label, data, secretText] of [
-    ['invalid-envelope', 'invalid', secrets],
-    ['missing-secret', envelope(fixture), ''],
+  for (const [label, data, secretText, diagnostic] of [
+    [
+      'invalid-envelope',
+      'invalid',
+      secrets,
+      /failed to parse Trusted Server app-config blob envelope/,
+    ],
+    [
+      'missing-secret',
+      envelope(fixture),
+      '',
+      /required app-config secret at .* is missing/,
+    ],
   ]) {
     const app = await launch(label, data, secretText)
+    // #1142 health contract: invalid application inputs keep the process
+    // listening with the failure router. Liveness stays up, while readiness
+    // and every route answer the fixed unavailable response.
     await bounded(
       async () => {
-        // A response of any status is a failure, not readiness.
-        let response
-        try {
-          response = await request(app.endpoint, '/health')
-        } catch {
-          /* Connection refusal is expected. */
-        }
-        assert(!response, `${label} must not listen`)
         const current = await state(app.name)
-        if (current.Running) return false
-        assert.notEqual(current.ExitCode, 0)
-        assert.equal(current.OOMKilled, false)
+        assert(current.Running, `${label} must keep serving the failure router`)
+        let health
+        try {
+          health = await request(app.endpoint, '/health')
+        } catch {
+          return false
+        }
+        assert.equal(health.status, 200, `${label} liveness must stay up`)
+        assert.equal(health.body, 'ok', `${label} liveness body`)
         return true
       },
       15000,
-      `${label} startup rejection deadline`
+      `${label} failure router deadline`
     )
+    for (const path of ['/ready', '/']) {
+      const response = await request(app.endpoint, path)
+      assert.equal(
+        response.status,
+        503,
+        `${label} must answer ${path} with the unavailable response`
+      )
+      assert.equal(
+        response.body,
+        'Service Unavailable\n',
+        `${label} must not disclose the failure on ${path}`
+      )
+    }
+    assert((await state(app.name)).Running, `${label} must keep running`)
     const logs = await docker('logs', app.name)
     assert.match(
       logs,
       /Trusted Server initialization failed/,
       'must reject application inputs, not fail the launcher'
     )
-    assert.doesNotMatch(
-      logs,
-      /phase=ready/,
-      'invalid inputs must never reach readiness'
+    assert.match(logs, diagnostic, `${label} must report its own cause`)
+    const failed = logs.indexOf('Trusted Server initialization failed')
+    const ready = logs.indexOf('phase=ready')
+    assert(
+      ready === -1 || failed < ready,
+      `${label} must fail initialization before the listener is ready`
     )
-    console.log(`PASS ${label} fails before listen`)
+    console.log(`PASS ${label} serves the failure router`)
     console.log(logs)
   }
   const app = await launch('valid', envelope(fixture), secrets)
@@ -264,7 +291,9 @@ http.createServer((req, res) => {
       }
       assert.equal(result.status, 200)
       assert.equal(result.body, 'ok')
-      assert.equal(result.headers.get('x-container-snapshot'), 'synthetic')
+      // Operational probes skip finalization (#1142), so the envelope's
+      // configured response headers never reach /health.
+      assert.equal(result.headers.get('x-container-snapshot'), null)
       return true
     },
     15000,
@@ -274,6 +303,8 @@ http.createServer((req, res) => {
   const page = await request(app.endpoint, '/')
   assert.equal(page.status, 200)
   assert.match(page.body, /container-fixture/)
+  // The finalized page proves the envelope snapshot was loaded.
+  assert.equal(page.headers.get('x-container-snapshot'), 'synthetic')
   const jsPath = page.body.match(/\/static\/tsjs=[^"'\s<>]+/)?.[0]
   assert(jsPath, 'page must inject actual TSJS URL')
   const js = await request(app.endpoint, jsPath)

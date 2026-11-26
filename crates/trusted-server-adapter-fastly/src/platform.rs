@@ -227,6 +227,8 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
 /// one host geo lookup however many steps use geo.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RequestGeo {
+    #[cfg(test)]
+    fail_lookup: bool,
     client_ip: Option<IpAddr>,
     geo: Option<GeoInfo>,
 }
@@ -235,12 +237,28 @@ impl RequestGeo {
     /// Holds `geo` as the lookup result for `client_ip`.
     #[cfg(test)]
     pub(crate) fn new(client_ip: Option<IpAddr>, geo: Option<GeoInfo>) -> Self {
-        Self { client_ip, geo }
+        Self {
+            client_ip,
+            geo,
+            fail_lookup: false,
+        }
+    }
+
+    /// Simulates a failed platform lookup without changing production geo handling.
+    #[cfg(test)]
+    pub(crate) fn failing(client_ip: Option<IpAddr>) -> Self {
+        Self {
+            client_ip,
+            geo: None,
+            fail_lookup: true,
+        }
     }
 
     /// Looks up `client_ip` once with Fastly's geo database.
     pub(crate) fn lookup_once(client_ip: Option<IpAddr>) -> Self {
         Self {
+            #[cfg(test)]
+            fail_lookup: false,
             client_ip,
             geo: client_ip
                 .and_then(geo_lookup)
@@ -266,6 +284,10 @@ impl PlatformGeo for RequestGeo {
     /// Any other IP gets `Ok(None)`: there is no data for an IP this request
     /// did not resolve.
     fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        #[cfg(test)]
+        if self.fail_lookup {
+            return Err(Report::new(PlatformError::Geo));
+        }
         if client_ip == self.client_ip {
             Ok(self.geo.clone())
         } else {
@@ -340,8 +362,8 @@ pub fn client_info_from_request(req: &Request, client_ip: Option<IpAddr>) -> Cli
             .map(str::to_string),
         tls_ja4: req.get_tls_ja4().map(str::to_string),
         h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
-        server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
-        server_region: std::env::var("FASTLY_REGION").ok(),
+        server_hostname: trusted_server_core::runtime_env!("FASTLY_HOSTNAME").ok(),
+        server_region: trusted_server_core::runtime_env!("FASTLY_REGION").ok(),
     }
 }
 

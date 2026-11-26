@@ -1,12 +1,69 @@
-# Native prepared startup
+# Axum production startup
 
-The native adapter uses the workspace EdgeZero pin,
-`e9a22a709e6eb9eeb106b96c44b3d5ef8dae2599`, EdgeZero's `rc/identity` commit
-`9d02d7b3` with pull request 536 merged; see [the pinned version](./edgezero#pinned-version). It retains PR
-#1506's direct outbound API and current-main application behavior. Historical
-demo results do not qualify this combination.
+The Axum binary loads its config and secrets once, before it listens, from
+stores that EdgeZero prepares: local files for development, or AWS AppConfig
+and Secrets Manager in production. A store the selected provider cannot prepare
+stops the process with a non-zero exit before the port opens. A missing or
+invalid config value or secret leaves the process listening with the failure
+router: `/health` stays `200`, and `/ready` and every route answer `503`. On
+SIGTERM the server stops accepting connections and finishes in-flight requests
+and registered after-response tasks within one configured grace. Requests and
+tasks share that deadline; a task does not get a second grace period.
 
-## Prepared startup
+Identity tasks use `ec.identity_after_response_budget_ms` (default 2000 ms)
+as a whole-task limit on Axum, starting after response-body release and
+including reads and the guarded follow-up write. The remaining shutdown grace
+can cancel work sooner. Fastly retains its existing post-send gate and lookup
+budget.
+
+Consented navigations and EC route POSTs register follow-up work through the
+shared identity app only when finalize issued a follow-up write permit, so a
+skipped navigation never holds the shutdown drain. CI proof of a pending record
+write completing within the grace is tracked separately (#1579, implemented in
+#1654).
+
+The adapter uses the workspace EdgeZero pin; see
+[the pinned version](./edgezero#pinned-version).
+
+## Run locally
+
+From the repository root, with `ts` built from this checkout:
+
+Copy `trusted-server.example.toml` to `trusted-server.toml`, then add the native
+provider to its existing storage table before publishing:
+
+```toml
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
+```
+
+EdgeZero environment overlays only replace existing TOML keys; an environment
+variable cannot add this missing `provider` key to the starter.
+
+The declared record store is prepared before TS reads `ec.storage`. Its local
+provider always needs a writable `EDGEZERO__ADAPTER__DATA_DIR`, including when
+the config omits identity storage. Keep the directory below for every local
+start. Remote-only record bindings do not require this local directory.
+
+```sh
+set -a && source .env.dev && set +a
+export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
+ts config push --adapter axum --local --no-diff --yes
+EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero" \
+EDGEZERO__ADAPTER__DATA_DIR="$PWD/.edgezero" \
+EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)" \
+EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)" \
+EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)" \
+  cargo run -p trusted-server-adapter-axum
+```
+
+Leave one secret variable out to see startup fail: the process listens with the
+failure router, `/ready` answers `503`, and the error log names the config field
+of the missing secret. [Getting started](./getting-started) covers the
+development overlay and port settings.
+
+## Startup sequence
 
 The binary is `trusted-server-axum` in package
 `trusted-server-adapter-axum`. EdgeZero owns provider preparation, the production
@@ -21,14 +78,24 @@ flowchart TD
     D --> E[Install immutable snapshots and application router]
     E --> F[Listen]
     B --> X[Fail before listening]
-    C --> X
-    D --> X
+    C --> Y[Install the failure router]
+    D --> Y
+    E --> Y
+    Y --> F
     F --> G[Stop admission and drain on shutdown]
 ```
 
-The declared identities are `trusted_server_config` and
-`trusted_server_secrets`. The configuration key is `trusted_server_config`.
-Required-provider and required-value failures prevent readiness. Startup bounds
+The declared stores are `trusted_server_config`, `trusted_server_secrets` and
+`trusted_server_kv`. The record layout is declared before provider preparation;
+provider binding selection belongs to EdgeZero. The configuration key is
+`trusted_server_config`. Required-provider and required-value failures prevent
+readiness. A provider preparation failure, including the selected record
+provider, stops the process before it listens. A failure to read or verify the
+envelope, load a required secret, validate the runtime settings, bind the
+configured EC record store or build the application router installs the failure
+router instead: the process listens, `/health` stays `200`, and `/ready` and
+every supported route answer `503` under the
+[operational probe contract](./api-reference#operational-probe-contract). Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running
 snapshots are immutable. Restart to adopt changed configuration or secrets.
@@ -39,12 +106,13 @@ validation and publication still reject those entries. The native loader uses
 TS's runtime validation policy, not operator publication validation.
 
 Request-time store management writes, persistent signing-key management and
-automatic key rotation are unavailable. Unsupported configured consumers fail
-at startup. Native EC persistence remains separate. Reader Geo defaults Off;
-the optional protected CloudFront selection below supplies country/subdivision
-facts without granting consent. An AWS region is not visitor geography.
+automatic key rotation are unavailable. Unsupported configured consumers, such
+as enabled request signing, fail at startup. Native EC persistence uses the
+shared core record store. Reader Geo defaults Off; the optional protected
+CloudFront selection below supplies country/subdivision facts without granting
+consent. An AWS region is not a visitor's geography.
 
-## Prepare local inputs
+## Inputs
 
 Use a disposable project directory containing `edgezero.toml` and an ordinary
 `trusted-server.toml`. Keep secret references in config and private inputs
@@ -62,15 +130,16 @@ and digest. AppConfig Agent returns that envelope document itself. Secrets
 Manager returns each whole secret value, not a selected JSON field. Local
 publication does not publish to AWS.
 
-| Input                                       | Meaning                                       |
-| ------------------------------------------- | --------------------------------------------- |
-| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps |
-| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                |
-| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                   |
-| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                         |
-| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                      |
-| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings  |
-| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased            |
+| Input                                       | Meaning                                                   |
+| ------------------------------------------- | --------------------------------------------------------- |
+| `EDGEZERO__ADAPTER__CONFIG_DIR`             | Directory containing local configuration maps             |
+| `EDGEZERO__ADAPTER__DATA_DIR`               | Writable directory for the declared local record provider |
+| `EDGEZERO__ADAPTER__HOST`                   | Listen address                                            |
+| `EDGEZERO__ADAPTER__PORT`                   | Listen port                                               |
+| `EDGEZERO__ADAPTER__SHUTDOWN_GRACE_SECONDS` | In-flight drain grace                                     |
+| `EDGEZERO__ADAPTER__INGRESS__*`             | Framework ingress limits                                  |
+| `EDGEZERO__STORE_BINDINGS_FILE`             | Runtime-only provider selection and mappings              |
+| `EDGEZERO__SECRETS__<KEY>`                  | Local secret value, key uppercased                        |
 
 Legacy `TRUSTED_SERVER_CONFIG_*`, `TRUSTED_SERVER_SECRET_*` and runtime
 `TRUSTED_SERVER__*` settings cannot rescue missing prepared inputs. Typed CLI
@@ -78,7 +147,8 @@ configuration overlays remain part of config publication.
 
 Native features `aws-appconfig-agent` and `aws-secrets-manager` independently
 enable EdgeZero providers and default off. CLI features do not enable server
-providers. This startup unit provisions nothing.
+providers. The server creates no AWS resources; provision the AppConfig
+profile and secrets before starting it.
 
 ## Optional protected native Geo
 
@@ -155,7 +225,7 @@ HTTP bridge, pending/select compatibility layer or fallback transport.
 ```sh
 cargo test --locked -p trusted-server-adapter-axum --all-features
 cargo test --locked -p trusted-server-core --lib
-node --test scripts/tests/test-native-providers.test.mjs
+node --test 'scripts/tests/*.test.mjs'
 ```
 
 Process tests use synthetic envelopes, secrets and local origins. They cover
@@ -167,8 +237,9 @@ The ignored real Next.js test requires its local fixture and
 `NATIVE_NEXTJS_ORIGIN`. See the native test fixture README. An ignored result is
 not a pass.
 
-Provider acceptance requires an explicitly built binary and disposable local
-AppConfig Agent and Moto fixtures:
+Provider acceptance needs Docker, a binary built with both provider features,
+and disposable local AppConfig Agent and Moto (an AWS mock) containers. CI runs
+only the helper unit tests above; run the full check locally:
 
 ```sh
 cargo build --locked -p trusted-server-adapter-axum \

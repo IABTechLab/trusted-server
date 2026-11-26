@@ -9,27 +9,29 @@ use edgezero_adapter_fastly::request::{
 };
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+#[cfg(test)]
+use edgezero_core::http::Request as HttpRequest;
+use edgezero_core::http::{Extensions, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::constants::HEADER_X_TS_VERSION;
-use trusted_server_core::ec::coordinator::IdentityCoordinator as _;
-use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+#[cfg(test)]
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::health::{
+    OperationalResponse, Probe, StartupState, classify_probe, probe_response,
+    startup_unavailable_response,
+};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::ClientInfo;
 use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
-use trusted_server_core::version_header::git_version_header_value;
 
 mod app;
 mod compat;
@@ -38,18 +40,22 @@ mod deadline_network;
 mod delivery;
 mod ec_record_store;
 mod esi_assembly;
+#[cfg(test)]
+mod identity_conformance;
 mod management_api;
 mod middleware;
 mod platform;
 mod post_delivery;
+#[cfg(test)]
+mod proxy_policy_runtime;
 mod rate_limiter;
 mod sandbox;
 mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, IdentityLookups, NavigationLookups, RuntimeStoreConfig,
-    TrustedServerApp, assemble_app, load_settings_from_config_store, take_navigation_lookups,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, assemble_app,
+    load_settings_from_config_store,
 };
 use crate::delivery::handle_delivery;
 use crate::middleware::{
@@ -69,16 +75,28 @@ use crate::tinybird::TelemetryQueue;
 use crate::sandbox::RetirementCounters;
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        let mut response = FastlyResponse::from_status(200).with_body_text_plain("ok");
-        // Compiled-in constant: keeps the probe free of settings and app construction.
-        if let Some(version) = git_version_header_value() {
-            response.set_header(HEADER_X_TS_VERSION, version);
-        }
-        return Some(response);
-    }
+    (classify_probe(req.get_method(), req.get_path()) == Some(Probe::Liveness)).then(|| {
+        native_operational_response(&probe_response(
+            req.get_method(),
+            Probe::Liveness,
+            StartupState::Ready,
+        ))
+    })
+}
 
-    None
+/// Converts a fixed operational response into the SDK response that sends it natively.
+///
+/// Operational responses never reach `EdgeZero`'s egress, so their contract
+/// headers and fixed body bytes are copied as they are. They never stream.
+fn native_operational_response(response: &HttpResponse) -> FastlyResponse {
+    let mut native = FastlyResponse::from_status(response.status().as_u16());
+    for (name, value) in response.headers() {
+        native.append_header(name.as_str(), value.as_bytes());
+    }
+    if let Some(body) = response.body().as_bytes().filter(|body| !body.is_empty()) {
+        native.set_body(body.to_vec());
+    }
+    native
 }
 
 /// Entry point for the Fastly Compute program.
@@ -188,6 +206,8 @@ fn serve_loop(_limits: crate::sandbox::SandboxLimits, _startup: StartupDiagnosti
 /// the sandbox's retained app and sent through `EdgeZero`, which owns the
 /// response; [`handle_delivery`] then decides whether anything is left to do,
 /// and [`log_outbound_observation`] logs the request's backend registrations.
+/// Readiness, and a failed assembly on a publisher fallback method, are
+/// answered natively by [`initialize_dispatch`] instead.
 ///
 /// Every non-panicking path through this function must answer exactly once.
 /// In a reused sandbox the SDK refuses to wait for the next request until the
@@ -271,13 +291,20 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // counters short-circuits, so none of those pays for construction.
     // `initialize` retains only success and returns the error unchanged, so a
     // transient config-store failure answers this request and the next
-    // callback retries assembly.
-    let assembled = sandbox.initialize(|| {
+    // callback retries assembly. Readiness and a failed assembly on a
+    // supported method answer with fixed operational responses instead.
+    let assembled = match initialize_dispatch(sandbox, req.get_method(), req.get_path(), || {
         assemble_app(
             load_settings_from_config_store(&RuntimeStoreConfig::logical()),
             &LogContext::new(ordinal, &request_id),
         )
-    });
+    }) {
+        ApplicationDispatch::Operational(response) => {
+            native_operational_response(&response).send_to_client();
+            return;
+        }
+        ApplicationDispatch::Ordinary(assembled) => assembled,
+    };
     let counters = SandboxCounters::capture(sandbox, ordinal, &request_id);
     match assembled.and_then(|()| retained_app(sandbox)) {
         Ok(retained) => serve(req, retained, &counters, trace_path),
@@ -352,32 +379,36 @@ fn serve(
         geo: request_geo.geo(),
         counters,
     };
-    // Identity lookups a navigation dispatches wait in a request-local slot
-    // until `finalize` collects them. Drop anything an earlier request on
-    // this sandbox left there, which cancels its requests.
-    drop(take_navigation_lookups());
-    let delivery = send_request_with_registries_and_hooks(
-        &retained.app,
-        TrustedServerApp::stores(),
-        req,
-        prepare,
-        |response: &mut HttpResponse| finalize_response(response, &inputs),
-    );
+    let delivery = with_finalization(&inputs, |finalize| {
+        send_request_with_registries_and_hooks(
+            &retained.app,
+            TrustedServerApp::stores(),
+            req,
+            prepare,
+            finalize,
+        )
+    });
     handle_delivery(delivery, counters, |finalized| {
         run_post_delivery(finalized, &queue, settings, &counters.log_context());
     });
-    // A detached response never reaches `finalize`; release its lookups now.
-    drop(take_navigation_lookups());
+}
+
+/// Supplies the production finalization callback to a request lifecycle.
+fn with_finalization<T>(
+    inputs: &FinalizeInputs<'_>,
+    send: impl FnOnce(&mut dyn FnMut(&mut HttpResponse) -> Option<FinalizeState>) -> T,
+) -> T {
+    send(&mut |response| finalize_response(response, inputs))
 }
 
 /// What the native work reads from the SDK client request before `EdgeZero` converts it.
 ///
 /// Only the client request exposes the trusted forwarder, the resolved client
-/// IP, TLS metadata, and device signals.
+/// IP and TLS metadata. EC device signals read JA4 from `EdgeZero`'s request
+/// ingress instead.
 struct ClientRequestValues {
     forwarder: ForwarderPreparation,
     client_info: ClientInfo,
-    device_signals: Option<DeviceSignals>,
     /// The geo lookup for `client_info`'s client IP.
     request_geo: RequestGeo,
 }
@@ -385,8 +416,7 @@ struct ClientRequestValues {
 impl ClientRequestValues {
     /// Reads the client request's values and sanitizes `req` for dispatch.
     ///
-    /// A trace path keeps its forwarded and TLS headers, and reads no device
-    /// signals.
+    /// A trace path keeps its forwarded and TLS headers.
     fn read(req: &mut FastlyRequest, settings: &Settings, trace_path: bool) -> Self {
         let trusted_client_ip = settings.trusted_client_ip.as_ref();
 
@@ -433,9 +463,8 @@ impl ClientRequestValues {
 
         // These accessors only return real values on the client request, so they
         // are read here and carried in the request extensions for
-        // build_per_request_services and EC bot classification.
+        // build_per_request_services.
         let client_info = client_info_from_request(req, resolved_client_ip);
-        let device_signals = (!trace_path).then(|| derive_device_signals(req));
         // The request's one geo lookup, for the resolved client IP. The
         // synthesized headers, `finalize`, the finalize middleware, the trace
         // metadata and the per-request services all read it.
@@ -443,7 +472,6 @@ impl ClientRequestValues {
         Self {
             forwarder,
             client_info,
-            device_signals,
             request_geo,
         }
     }
@@ -451,9 +479,6 @@ impl ClientRequestValues {
     /// Moves the values into `extensions`, with `queue` and the request's synthesized headers.
     fn prepare(self, extensions: &mut Extensions, settings: &Settings, queue: &TelemetryQueue) {
         extensions.insert(self.forwarder);
-        if let Some(device_signals) = self.device_signals {
-            extensions.insert(device_signals);
-        }
         extensions.insert(self.client_info);
         extensions.insert(queue.clone());
         extensions.insert(per_request_synthesized_headers(
@@ -481,8 +506,8 @@ struct FinalizeInputs<'a> {
 /// response is returned untouched. Otherwise it applies the finalize headers
 /// unless the middleware already did, the asset cache policy, EC
 /// finalization, the terminal privacy effects, and, with metrics enabled, the
-/// sandbox counters. EC finalization first collects the identity lookups the
-/// navigation dispatched.
+/// sandbox counters. The handler has already collected the navigation's
+/// page-phase identity lookups into the EC context.
 ///
 /// Returns the inputs post-delivery work needs, pull sync and after-response
 /// lookups, or `None` when the response carries no EC state.
@@ -491,17 +516,13 @@ fn finalize_response(
     inputs: &FinalizeInputs<'_>,
 ) -> Option<FinalizeState> {
     let settings = inputs.state.settings.as_ref();
-    // Identity lookups this request dispatched, taken whatever the response
-    // so none outlives it.
-    let NavigationLookups {
-        page: identity,
-        after_response,
-    } = take_navigation_lookups();
-    // Trace responses keep their exact hardened headers; no finalizer touches them.
+    // Trace and operational responses keep their exact hardened headers; no
+    // finalizer touches them.
     if response
         .extensions()
         .get::<TraceTerminalResponse>()
         .is_some()
+        || response.extensions().get::<OperationalResponse>().is_some()
     {
         return None;
     }
@@ -523,14 +544,14 @@ fn finalize_response(
         // `EdgeZero` calls `finalize` synchronously after its dispatch executor
         // has returned, and Fastly's KV SDK completes I/O through blocking
         // hostcalls. Keep this bridge here, never in native or worker executors.
-        // Identity lookups are collected inside it, so their wait never nests
-        // in the router's executor.
+        // The navigation's page-phase identity lookups were already collected
+        // by the handler into the EC context.
         futures::executor::block_on(apply_edgezero_ec_finalize(
             inputs.state,
             &mut ec_state,
-            identity,
             response,
         ));
+        let after_response = ec_state.after_response.take();
         FinalizeState {
             identity: Arc::clone(&inputs.state.identity),
             ec_state,
@@ -543,6 +564,44 @@ fn finalize_response(
         attach_sandbox_counters(response, inputs.counters);
     }
     state
+}
+
+/// What the entry point does with a request once initialization has run.
+enum ApplicationDispatch {
+    /// A fixed operational response, sent natively without the application.
+    Operational(HttpResponse),
+    /// Ordinary handling, with the initialization result.
+    Ordinary(Result<(), EdgeError>),
+}
+
+/// Initializes the sandbox's application, then answers readiness and failed startup locally.
+///
+/// `GET` and `HEAD` `/ready` report whether this sandbox now retains an
+/// application and never dispatch. A failed initialization answers every
+/// publisher fallback method with the fixed unavailable response, whatever the
+/// error's status; other methods keep `EdgeZero`'s assembly-error response.
+/// `initialize` still discards the failure, so the next callback retries.
+fn initialize_dispatch(
+    sandbox: &mut Sandbox,
+    method: &edgezero_core::http::Method,
+    path: &str,
+    build: impl FnOnce() -> Result<RetainedApp, EdgeError>,
+) -> ApplicationDispatch {
+    let readiness = classify_probe(method, path) == Some(Probe::Readiness);
+    match sandbox.initialize(build) {
+        Ok(()) if readiness => ApplicationDispatch::Operational(probe_response(
+            method,
+            Probe::Readiness,
+            StartupState::Ready,
+        )),
+        Err(error) if readiness || app::publisher_fallback_methods().contains(method) => {
+            // The client sees only the fixed response, so the error that
+            // `EdgeZero`'s assembly-error response would have logged is logged here.
+            log::error!("application assembly failed: {error:?}");
+            ApplicationDispatch::Operational(startup_unavailable_response(method))
+        }
+        assembled => ApplicationDispatch::Ordinary(assembled),
+    }
 }
 
 /// Builds the counters snapshot response.
@@ -657,48 +716,24 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// Runs EC finalization for a routed response with the identity app's partner
 /// registry and record store.
 ///
-/// Collects `identity` lookups first, unless the response is a redirect,
-/// whose navigation writes nothing. The caller drives this future with the
-/// one `block_on` outside the router's executor.
+/// The navigation's page-phase lookup results are already on the EC context.
+/// The caller drives this future with the one `block_on` outside the
+/// router's executor.
 async fn apply_edgezero_ec_finalize(
     state: &AppState,
     ec_state: &mut EcFinalizeState,
-    identity: Option<IdentityLookups>,
     response: &mut HttpResponse,
 ) {
-    // A redirect skips the write, so do not wait for lookups it would discard.
-    let identity = identity.filter(|_| {
-        let redirect = NavigationPermit::is_redirect(response.status());
-        if redirect {
-            log::debug!("Identity lookups dropped: redirect response skips the write");
-        }
-        !redirect
-    });
-    if let Some(IdentityLookups {
-        coordinator,
-        transport,
-        pending,
-    }) = identity
-    {
-        let results = coordinator.collect(&transport, pending).await;
-        ec_state.ec_context.set_lookup_results(results);
-    }
     let identity_app = &state.identity;
-    let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity_app.identity_graph()
-    } else {
-        None
-    };
-    ec_finalize_response(
-        identity_app.settings(),
-        &mut ec_state.ec_context,
-        finalize_kv_graph.as_ref(),
-        identity_app.partners(),
-        ec_state.eids_cookie.as_deref(),
-        &ec_state.sharedid,
-        response,
-    )
-    .await;
+    identity_app
+        .finalize(
+            &mut ec_state.ec_context,
+            ec_state.eids_cookie.as_deref(),
+            &ec_state.sharedid,
+            ec_state.use_finalize_kv,
+            response,
+        )
+        .await;
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -792,32 +827,6 @@ pub(crate) fn require_identity_graph(
     })
 }
 
-/// Extracts a named cookie value from the request's `Cookie` header.
-pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
-    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
-/// Derives device signals from TLS, H2, and UA request data.
-///
-/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
-/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
-    let ua = req.get_header_str("user-agent").unwrap_or("");
-    let ja4 = req.get_tls_ja4();
-    let h2_fp = req.get_client_h2_fingerprint();
-
-    DeviceSignals::derive(ua, ja4, h2_fp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,9 +845,11 @@ mod tests {
     };
     use edgezero_core::pre_dispatch::PreDispatchRequest;
     use edgezero_core::router::{PreDispatchHook, RouterService};
+    use error_stack::Report;
     use fastly::mime;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use trusted_server_core::error::{TrustedServerError, startup_error};
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::TrustedClientIpConfig;
@@ -1468,19 +1479,25 @@ mod tests {
         // A returning reader withdraws consent with GPC in a US state.
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let request = edgezero_core::http::request_builder()
+            .method(Method::GET)
             .uri("https://www.example.com/article")
+            .header("sec-fetch-dest", "document")
             .header("cookie", format!("ts-ec={ec_id}"))
             .header("sec-gpc", "1")
             .body(EdgeBody::empty())
             .expect("should build the reader request");
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");
+        ec_context.set_navigation_permit(
+            NavigationPermit::classify(&request).expect("should classify the document navigation"),
+        );
         let mut page = response_builder()
+            .header("content-type", "text/html; charset=utf-8")
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build the page response");
@@ -1489,6 +1506,7 @@ mod tests {
             use_finalize_kv: false,
             eids_cookie: None,
             sharedid: trusted_server_core::ec::sharedid::SharedIdRequest::default(),
+            after_response: None,
         });
 
         let state = finalize_response(&mut page, &inputs);
@@ -1517,8 +1535,8 @@ mod tests {
         );
         assert_eq!(
             page_header("cache-control").as_deref(),
-            Some("private, max-age=0"),
-            "should keep a cookie-bearing response out of shared caches"
+            Some("no-store, private"),
+            "should preserve terminal privacy for a core-generated identity expiry"
         );
 
         // An asset response keeps its protected cache policy and, being
@@ -1988,6 +2006,174 @@ mod tests {
         assert!(
             body.contains("ch-platform: not sent"),
             "should include sec-ch-ua-platform fallback"
+        );
+    }
+
+    #[test]
+    fn native_head_health_is_local_and_uncacheable() {
+        let request = FastlyRequest::head("https://example.com/health?probe=1");
+        let mut response = health_response(&request).expect("should answer HEAD health locally");
+        assert_eq!(
+            response.get_status().as_u16(),
+            200,
+            "should report liveness"
+        );
+        assert_eq!(
+            response.get_header_str("cache-control"),
+            Some("no-store"),
+            "should prevent caching"
+        );
+        assert!(
+            response.get_header("x-ts-fastly-version").is_none(),
+            "should omit runtime version"
+        );
+        assert!(
+            response.take_body_bytes().is_empty(),
+            "should send no HEAD body"
+        );
+    }
+
+    #[test]
+    fn operational_responses_bypass_finalize_and_filter_effects() {
+        let mut settings = test_settings();
+        settings.response_headers.insert(
+            "Cache-Control".to_string(),
+            "public, max-age=3600".to_string(),
+        );
+        settings
+            .response_headers
+            .insert("Set-Cookie".to_string(), "fictional=value".to_string());
+        settings.debug.sandbox_metrics_enabled = true;
+        let state = app_state(&settings);
+        let counters = counters();
+        for mut response in [
+            probe_response(&Method::GET, Probe::Readiness, StartupState::Ready),
+            startup_unavailable_response(&Method::GET),
+        ] {
+            response.extensions_mut().insert(RequestFilterEffects {
+                request_headers: Vec::new(),
+                response_headers: vec![
+                    HeaderMutation::set("cache-control", "public"),
+                    HeaderMutation::append("set-cookie", "fictional=effect"),
+                ],
+            });
+            let headers = response.headers().clone();
+
+            let finalized = finalize_response(
+                &mut response,
+                &FinalizeInputs {
+                    state: &state,
+                    geo: None,
+                    counters: &counters,
+                },
+            );
+
+            assert!(finalized.is_none(), "should hand no EC state on");
+            assert_eq!(
+                response.headers(),
+                &headers,
+                "should preserve terminal operational headers"
+            );
+        }
+    }
+
+    /// A caught startup failure of the named kind, as `assemble_app` returns it.
+    fn startup_failure(kind: &str) -> EdgeError {
+        let error = match kind {
+            "configuration" => TrustedServerError::Configuration {
+                message: "fictional-startup-detail".to_string(),
+            },
+            "bad_request" => TrustedServerError::BadRequest {
+                message: "fictional-startup-detail".to_string(),
+            },
+            _ => TrustedServerError::KvStore {
+                store_name: "fictional-store".to_string(),
+                message: "fictional-startup-detail".to_string(),
+            },
+        };
+        startup_error(&Report::new(error).attach("fictional-attachment"))
+    }
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        for kind in ["configuration", "bad_request", "kv_store"] {
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                    let request = FastlyRequest::new(
+                        Method::from_bytes(method.as_bytes()).expect("should parse method"),
+                        format!("https://example.com{path}"),
+                    );
+                    let mut sandbox = crate::sandbox::Sandbox::default();
+                    let mut response = health_response(&request).unwrap_or_else(|| {
+                        match initialize_dispatch(
+                            &mut sandbox,
+                            request.get_method(),
+                            request.get_path(),
+                            || Err(startup_failure(kind)),
+                        ) {
+                            ApplicationDispatch::Operational(response) => {
+                                native_operational_response(&response)
+                            }
+                            ApplicationDispatch::Ordinary(_) => {
+                                panic!("should answer {method} {path} locally")
+                            }
+                        }
+                    });
+                    let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                    assert_eq!(
+                        response.get_status().as_u16(),
+                        if live { 200 } else { 503 },
+                        "should classify {method} {path}"
+                    );
+                    assert_eq!(
+                        response.get_header_str("cache-control"),
+                        Some("no-store"),
+                        "should prevent startup caching"
+                    );
+                    assert_eq!(
+                        response.get_header_str("content-type"),
+                        Some(if live {
+                            "text/plain"
+                        } else {
+                            "text/plain; charset=utf-8"
+                        }),
+                        "should preserve startup content type"
+                    );
+                    for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                        assert!(response.get_header(name).is_none(), "should omit {name}");
+                    }
+                    let expected: &[u8] = if method == "HEAD" {
+                        b""
+                    } else if live {
+                        b"ok"
+                    } else {
+                        b"Service Unavailable\n"
+                    };
+                    assert_eq!(
+                        response.take_body_bytes(),
+                        expected,
+                        "should emit exact safe body for {method} {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_startup_keeps_the_assembly_error_for_unsupported_methods() {
+        let mut sandbox = crate::sandbox::Sandbox::default();
+
+        let dispatch = initialize_dispatch(&mut sandbox, &Method::TRACE, "/", || {
+            Err(startup_failure("configuration"))
+        });
+
+        let ApplicationDispatch::Ordinary(Err(error)) = dispatch else {
+            panic!("should leave an unsupported method to the assembly-error response");
+        };
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should keep the startup failure's own status"
         );
     }
 }

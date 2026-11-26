@@ -260,29 +260,42 @@ pub trait EcKvStore {
     async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex};
+    #[cfg(test)]
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[cfg(test)]
     use bytes::Bytes;
+    #[cfg(test)]
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    #[cfg(test)]
     use edgezero_core::record_store::{
         Record, RecordBinding, RecordGeneration, RecordLayout, RecordPartition, RecordWrite,
         RecordWriteMode, RecordWriteOutcome,
     };
 
     use super::*;
+    #[cfg(test)]
     use crate::ec::kv::KvIdentityGraph;
+    #[cfg(test)]
     use crate::ec::kv_types::KvEntry;
+    #[cfg(test)]
     use crate::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 
     /// An `EdgeZero` record [`KvStore`] over an [`EcKvStore`] test double, so
     /// [`RecordBackedEcKv`] runs `EdgeZero`'s own `RecordHandle::update` loop
     /// against the double's reads and writes.
+    #[cfg(test)]
     struct EcKvRecords(Arc<dyn EcKvStore + Send + Sync>);
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl KvStore for EcKvRecords {
         async fn delete(&self, _key: &str) -> Result<(), KvError> {
@@ -376,11 +389,13 @@ pub(crate) mod test_support {
     /// [`EcKvStore::update`]: [`RecordEcKvStore`] over `EdgeZero`'s
     /// `RecordHandle::update`, reading and writing through the double. Every
     /// other operation goes to the double directly.
+    #[cfg(test)]
     pub(crate) struct RecordBackedEcKv {
         inner: Arc<dyn EcKvStore + Send + Sync>,
         records: RecordEcKvStore,
     }
 
+    #[cfg(test)]
     impl RecordBackedEcKv {
         pub(crate) fn new(inner: Arc<dyn EcKvStore + Send + Sync>) -> Self {
             let handle = KvHandle::new(Arc::new(EcKvRecords(Arc::clone(&inner))));
@@ -390,6 +405,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for RecordBackedEcKv {
         fn store_name(&self) -> &str {
@@ -447,11 +463,13 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.
+    #[cfg(test)]
     pub(crate) struct WriteFailingEcKv {
         inner: InMemoryEcKv,
         inserts: AtomicU32,
     }
 
+    #[cfg(test)]
     impl WriteFailingEcKv {
         pub(crate) fn new() -> Self {
             Self {
@@ -482,6 +500,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for WriteFailingEcKv {
         fn store_name(&self) -> &str {
@@ -525,6 +544,7 @@ pub(crate) mod test_support {
     }
 
     /// A change another writer makes to a stored row.
+    #[cfg(test)]
     type Race = Box<dyn Fn(&mut KvEntry) + Send + Sync>;
 
     /// [`EcKvStore`] wrapper that injects generation conflicts: the first
@@ -536,6 +556,7 @@ pub(crate) mod test_support {
     /// [`KvIdentityGraph::serialize_entry_for_test`] so its metadata is real, and the
     /// row's generation moves on. Without one, the row and its generation stay
     /// as they were, as when the conflicting read was stale.
+    #[cfg(test)]
     pub(crate) struct ConflictInjectingEcKv {
         inner: InMemoryEcKv,
         conflicts_remaining: AtomicU32,
@@ -545,6 +566,7 @@ pub(crate) mod test_support {
         conflicted: AtomicBool,
     }
 
+    #[cfg(test)]
     impl ConflictInjectingEcKv {
         /// A store whose first `conflicts` conditional writes conflict without
         /// the row changing.
@@ -651,6 +673,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for ConflictInjectingEcKv {
         fn store_name(&self) -> &str {
@@ -706,11 +729,13 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
     /// so tests can prove exactly how many reads a flow performs.
+    #[cfg(test)]
     pub(crate) struct CountingEcKv {
         inner: InMemoryEcKv,
         lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[cfg(test)]
     impl CountingEcKv {
         pub(crate) fn new(
             name: impl Into<String>,
@@ -723,6 +748,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for CountingEcKv {
         fn store_name(&self) -> &str {
@@ -763,6 +789,75 @@ pub(crate) mod test_support {
         }
     }
 
+    /// [`EcKvStore`] wrapper that counts conditional write attempts, optionally conflicting once.
+    #[cfg(test)]
+    pub(crate) struct ConditionalWriteCountingEcKv {
+        inner: InMemoryEcKv,
+        conflict_first: bool,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(test)]
+    impl ConditionalWriteCountingEcKv {
+        pub(crate) fn new(
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            conflict_first: bool,
+        ) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("conditional-write-count"),
+                conflict_first,
+                writes,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[async_trait::async_trait(?Send)]
+    impl EcKvStore for ConditionalWriteCountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
+        }
+
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                let attempt = self
+                    .writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.conflict_first && attempt == 0 {
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write).await
+        }
+
+        async fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
+        }
+    }
+
     /// [`EcKvStore`] wrapper that models an eventually-consistent point read.
     ///
     /// The first `stale_lookups` calls to [`EcKvStore::lookup`] report the key
@@ -772,12 +867,14 @@ pub(crate) mod test_support {
     ///
     /// With `list_fails` set, the list API errors instead, modelling a store
     /// that can neither find the key nor prove it absent.
+    #[cfg(test)]
     pub(crate) struct StaleLookupEcKv {
         inner: InMemoryEcKv,
         stale_lookups_remaining: Mutex<u32>,
         list_fails: bool,
     }
 
+    #[cfg(test)]
     impl StaleLookupEcKv {
         pub(crate) fn new(name: impl Into<String>, stale_lookups: u32, list_fails: bool) -> Self {
             Self {
@@ -788,6 +885,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for StaleLookupEcKv {
         fn store_name(&self) -> &str {
@@ -948,10 +1046,12 @@ pub(crate) mod test_support {
 
     /// [`EcKvStore`] that fails every operation, mimicking a missing or
     /// unreachable platform store.
+    #[cfg(test)]
     pub(crate) struct FailingEcKv {
         name: String,
     }
 
+    #[cfg(test)]
     impl FailingEcKv {
         pub(crate) fn new(name: impl Into<String>) -> Self {
             Self { name: name.into() }
@@ -965,6 +1065,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(test)]
     #[async_trait::async_trait(?Send)]
     impl EcKvStore for FailingEcKv {
         fn store_name(&self) -> &str {

@@ -16,12 +16,16 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | exit 1         | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | no             | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
+
+All adapters serve GET/HEAD `/health` and `/ready`. Liveness covers both
+initialized and failed-startup states; readiness shows each state separately. See the [operational response contract](#operational-probe-contract)
+for exact responses and timing limits.
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -37,13 +41,14 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/ec`                       | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/api/v1/identify`                 | `OPTIONS`                                                  | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
@@ -57,22 +62,30 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/proxy`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/sign`                    | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/health`                              | `GET`                                                      | literal        | `always`                              | real                  | real                  | —                     | real                  |
+| normal  | `/health`                              | `GET`, `HEAD`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/ready`                               | `GET`, `HEAD`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/static/tsjs=<file>`                  | `GET`                                                      | template       | `path.starts_with(/static/tsjs=)`     | real                  | real                  | real                  | real                  |
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
-| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | exits with status `1` | startup error (`500`) | startup error (`503`) |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | exits with status `1` | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | exits with status `1` | startup error (`500`) | startup error (`503`) |
+| startup | `/health`                              | `GET`, `HEAD`                                              | literal        | `startup_error`                       | real (`200`)          | real (`200`)          | real (`200`)          | real (`200`)          |
+| startup | `/ready`                               | `GET`, `HEAD`                                              | literal        | `startup_error`                       | unavailable (`503`)   | unavailable (`503`)   | unavailable (`503`)   | unavailable (`503`)   |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`503`) | startup error (`503`) | startup error (`503`) | startup error (`503`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`503`) | startup error (`503`) | startup error (`503`) | startup error (`503`) |
 
-`real`, `unsupported`, `guarded`, `publisher fallback`, `startup error`, and
-`exits with status 1` are distinct observable dispositions. An em dash means
-that the adapter has no local route; the publisher fallback can therefore
-receive that path. The startup rows show what each path answers when app assembly fails,
-in place of every normal route. Fastly answers `/health` before it assembles
-the app, and Axum exits with status 1 before it listens.
+`real`, `unsupported`, `guarded`, `publisher fallback`, `unavailable`, and
+`startup error` are distinct observable dispositions. On Cloudflare,
+`/.well-known/trusted-server.json` and `/verify-signature` are routed, but the
+Worker has no request-time config store for signing metadata: discovery
+answers the shared `500` and `/verify-signature` answers `200` with
+`verified: false`. An em dash means that the adapter has no local route; the
+publisher fallback can therefore receive that path. The startup rows show what
+each path answers when startup fails, in place of every normal route. Axum,
+Cloudflare, and Spin serve a separate failure router. Fastly answers `/health`
+before it assembles the app and the other startup rows at its entry point; a
+method outside the listed seven gets EdgeZero's JSON error at the failure's
+status, normally `500`.
 
 ## Contract conventions
 
@@ -81,7 +94,8 @@ status behavior, cache and CORS behavior, configuration gates, rate limiting,
 and an example or an explicit not-applicable value.
 
 `Auth: none` means that the endpoint has no built-in authentication. An
-operator can still wrap any path with a `[[handlers]]` Basic-auth rule. Unless
+operator can wrap ordinary paths with a `[[handlers]]` Basic-auth rule; operational
+probes bypass those rules. Unless
 an endpoint says otherwise, it has no endpoint-specific CORS policy and no
 in-process rate limiter. Responses still pass through the adapter's standard
 response finalizer. Upstream proxies can preserve selected upstream headers;
@@ -90,9 +104,11 @@ that is not a blanket CORS grant.
 There is no repository-wide error body schema. Some handlers return structured
 JSON, some return an empty body, and shared adapter errors are plain text with
 safe client-facing messages. EdgeZero's own errors, such as a canonical 404 or
-405, a 414 or 431 head-limit rejection, a 400 for ambiguous request framing, or
-a startup failure, are JSON with redacted text. Treat the status and body
-documented for each endpoint as authoritative.
+405, a 414 or 431 head-limit rejection, or a 400 for ambiguous request framing,
+are JSON with redacted text. A startup failure answers the fixed plain-text
+response of the [operational response contract](#operational-probe-contract);
+only a Fastly method outside the publisher fallback set gets EdgeZero's JSON.
+Treat the status and body documented for each endpoint as authoritative.
 
 An endpoint that reads a request body returns `413` when the declared or
 received length passes its cap, and `408` when the body is still unread 30 s
@@ -318,6 +334,67 @@ Partners are configured statically in `[[ec.partners]]` and loaded into an in-me
 
 ---
 
+### GET, POST /\_ts/api/v1/ec
+
+The shared identity app serves this endpoint on Fastly and Axum. It is always
+answered locally and uses the configured record service. Without application
+identity storage it returns `501`. Every response is private and `no-store`.
+
+A same-origin `POST` accepts a JSON snapshot with optional `tcString`,
+`gppString` and `applicableSections` fields. `tcString` follows the IAB
+`__tcfapi` name; `tcfString` and other unknown fields are rejected. A posted
+string replaces its matching request cookie (`euconsent-v2` or `__gpp`).
+Omitted fields retain their matching request cookies, including `__gpp_sid`
+when sections are omitted. Present fields must have the declared string or
+array type; null is rejected. Posted
+`applicableSections` replaces `__gpp_sid`; an empty array clears that hint.
+Sections default to empty when neither a posted array nor a request cookie
+exists. Missing consent still stays denied where required.
+
+Posted strings must use the client's cookie-safe alphabets: `[A-Za-z0-9._-]+`
+for TCF and `[A-Za-z0-9._~=-]+` for GPP. The complete string is validated before
+reconstructing request cookies, including any TCF supplementary segments.
+
+The body limit is 16 KiB. TCF strings have an effective 4 KiB decoder limit;
+GPP strings are limited to 8 KiB. A posted sections array accepts at most
+32 integer IDs, each in `1..=65535`. The browser client must match this cap.
+Malformed snapshots return `400`, oversized bodies `413`, and missing or
+cross-site `Origin` returns `403` before record or provider work.
+
+The shared request/response fixture is
+`crates/trusted-server-js/lib/test/fixtures/ec-route-contract.json`; Axum and
+Fastly conformance tests POST each case through their real routes. An empty
+client snapshot makes no call; the fixture also covers a server-only `{}` POST.
+The `window.__tsjs_prebid.ecRoute` injection is still owed by the browser
+consent script work in #1622; this PR supplies the server contract.
+
+With consent and no EC, the app creates the record before setting `ts-ec`.
+SharedID and mirror cookies follow their existing consent, configuration and
+opt-out rules. A storage failure never issues an unbacked identity. A withdrawal
+tombstones the existing record and expires identity cookies on this response.
+If authoritative withdrawal cannot be persisted, it returns `503` while still
+clearing the browser identity, so the caller can retry reconciliation.
+The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
+excluding expired, non-mirrored and vendor-denied IDs. When the response builds
+the mirror, the JSON is that value, the same as the `__Host-ts-eids-mirror`
+cookie it sets or keeps unchanged. It lists no EIDs when the response expires
+the mirror, or leaves it untouched because the record or the clock could not
+be read; the server never echoes a mirror it could not rebuild, so in that case
+the JSON does not match the cookie the browser keeps. When the SharedID storage
+type is `cookie`, the reader has not set `_pubcid_optout` and Purpose 4 allows
+EIDs, the JSON also carries `"sharedId"`: the SharedID this response sets or the
+browser already holds. Otherwise the field is absent.
+
+`GET` returns an empty `204` and can restore an existing SharedID cookie from
+its record only when current EC and EID permission both allow. It never
+creates an EC, changes consent or runs providers. A denied GET emits no identity
+cookies and leaves the stored record unchanged; consent reconciliation and
+withdrawal use POST. Other methods return `405` with `Allow: GET, POST`.
+Browser CMP capture and ordered client consent updates are qualified separately
+from this server contract.
+
+---
+
 ### GET /\_ts/api/v1/identify
 
 Returns EC identity plus the authenticated partner's UID and EID for the current user.
@@ -336,9 +413,10 @@ below `[publisher].domain` receive reflected credentialed CORS for
 The endpoint requires the EC store and a statically configured
 `[[ec.partners]]` token. Without an EC store, `GET` returns
 `501 {"error":"ec_store_not_configured"}` locally, after the same origin
-policy (`403` for a denied origin, reflected CORS for an allowed one). Only
-Fastly has an EC store today, so Axum, Cloudflare and Spin always answer `501`
-to `GET`; their `OPTIONS` preflight is still answered locally. Every other
+policy (`403` for a denied origin, reflected CORS for an allowed one).
+Fastly and Axum use the shared identity app when a record store is configured.
+Cloudflare and Spin reject unsupported storage configuration and answer `501`
+to `GET`; `OPTIONS` preflight is still answered locally. Every other
 method returns `405` with `Allow: GET, OPTIONS`. No request on this path is
 proxied to the publisher origin.
 
@@ -385,8 +463,8 @@ same result), or `kv_unavailable`. Authentication failure returns `401 {"error":
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
 or CORS headers. It requires the EC KV store; without one it returns
-`501 {"error":"ec_store_not_configured"}` locally. Only Fastly has an EC store
-today, so Axum, Cloudflare and Spin always answer `501`. Every method other
+`501 {"error":"ec_store_not_configured"}` locally. Fastly and Axum execute
+batch sync through the shared record store; Cloudflare and Spin answer `501`. Every method other
 than `POST` returns `405 {"error":"method_not_allowed"}` with `Allow: POST`. No
 request on this path is proxied to the publisher origin.
 
@@ -896,7 +974,7 @@ The examples below use fictional IDs and values only.
 
 Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
 
-This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+Fastly and Axum implement this lookup through the shared record service when identity storage is configured. Without a record service, the route returns `501 Not Implemented`, as it does on Cloudflare and Spin.
 
 **Response fields:**
 
@@ -980,20 +1058,76 @@ https://edge.example.com/admin/keys/rotate` must not reach the origin.
 
 ## Operational and fallback endpoints
 
-### GET /health
+### Operational probe contract
 
-**Contract:** Auth: none. Request and JSON schema: not applicable. Fastly,
-Axum, and Spin return `200 text/plain` with `ok`; Cloudflare has no local health
-route. Fastly short-circuits before application construction, so it stays
-live while startup fails, but not when EdgeZero's managed logger fails to
-install: EdgeZero then answers every route with its JSON `500`, `/health`
-included (see the
-[Fastly guide](/guide/fastly#when-the-logger-fails-to-install)). Spin answers `503` on `/health` while startup fails,
-like every other route. The route has no configuration gate, dedicated cache or CORS
-policy, or rate limiter. Example: `curl -fsS https://edge.example.com/health`.
+GET and HEAD `/health` report liveness. GET and HEAD `/ready` report whether
+this instance initialized the application. Use `/ready` for load-balancer
+admission and deployment checks. This is the normative operational response
+contract for every adapter. Bodies are exact UTF-8 bytes; `\n` is one newline.
 
-This is liveness, not readiness: a `200` does not prove that configuration,
-stores, publisher proxying, or integrations are usable.
+| Adapter    | State                 | GET `/health` | GET `/ready`                   | Ordinary supported routes      |
+| ---------- | --------------------- | ------------- | ------------------------------ | ------------------------------ |
+| Fastly     | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Fastly     | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Axum       | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Axum       | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Cloudflare | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Cloudflare | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Spin       | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Spin       | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+
+HEAD returns the corresponding GET status and contract headers with an empty
+body. Only exact paths match, ignoring the query: `/health?check=1` is a probe;
+`/health/`, `/ready/`, nested paths, and differently cased paths use ordinary
+routing. Other methods on these paths retain ordinary routing. Failed-startup
+ordinary routes cover GET, POST, HEAD, OPTIONS, PUT, PATCH, and DELETE on `/`
+and nested paths. Unsupported methods retain router behavior on Axum,
+Cloudflare, and Spin, and EdgeZero's assembly-error response on Fastly.
+
+Successful probes use `Content-Type: text/plain`. Unavailable readiness and
+ordinary startup failures use `Content-Type: text/plain; charset=utf-8`.
+All these fixed responses use `Cache-Control: no-store`, include the compiled
+`x-ts-version` when available, and omit `Set-Cookie`, `WWW-Authenticate`, and
+`Retry-After`. Transport-generated headers can differ. Probes omit Fastly
+runtime/environment and geo headers, including `x-ts-fastly-version`.
+
+Probes have no configuration gate, CORS policy, or rate limiter. They bypass
+Basic authentication, configured response headers, trace capture, EC processing,
+integrations, and publisher forwarding. They do not consume caller credentials
+or reflect request data. Startup failures disclose only the fixed unavailable
+body and optional compiled version; detailed reports remain in server logs.
+Errors after successful initialization retain their existing status mapping.
+
+Readiness uses existing settings loading, secret resolution, target validation,
+auction construction, and integration-registry construction. It does not poll
+origins, bidders, identity stores, or other request-time dependencies. It
+represents the selected instance's configuration snapshot, not the latest
+external configuration, another instance, or guaranteed publisher success.
+
+| Adapter    | Timing and boundary                                                                                                                                                                                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fastly     | Liveness answers before settings and app construction. Readiness follows ordinary initialization, including required configuration-store access; failed initialization remains retryable.                                                                                                                    |
+| Axum       | App or failure-router construction completes before the listener binds; probes answer after that selection. A failure before that selection, including provider preparation, config extraction limits, the hosting or Geo profile, ingress limits, or the bind, exits before listening, so no probe answers. |
+| Cloudflare | Probes answer after Worker and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                                |
+| Spin       | Probes answer after component and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                             |
+
+No response is promised when a runtime cannot start, imports fail, a listener
+cannot bind, execution traps or hangs, conversion fails before dispatch, or the
+SDK fails outside caught application initialization. On Fastly, liveness runs
+after EdgeZero installs its managed logger: when the logger fails to install,
+EdgeZero answers every route with its JSON `500`, `/health` included (see the
+[Fastly guide](/guide/fastly#when-the-logger-fails-to-install)). Spin's
+`/.well-known/spin/health` is a separate platform endpoint.
+
+Examples: `curl -fsS https://edge.example.com/health` and
+`curl -fsS https://edge.example.com/ready`; use `curl -I` for HEAD.
+
+**Migration:** Reserve GET/HEAD `/ready` on every adapter and GET/HEAD `/health`
+on Cloudflare before upgrading publishers that own those paths. Move application
+admission checks from `/health` to `/ready`: Axum liveness now remains green on
+caught startup failure. Catch-all auth rules no longer challenge either probe.
+Update monitors expecting startup `500` or other error-derived statuses to
+expect `503`. Keep a separate publisher request in deployment verification.
 
 ### GET /\_ts/debug/ja4
 
@@ -1036,10 +1170,10 @@ returns `413`. A `GET` or `HEAD` that carries body bytes returns `400`, and so
 does a forward the origin request cannot carry, such as a target with a
 fragment or a backslash, or a malformed `Connection` header.
 
-When startup fails, Fastly and Cloudflare answer both fallback shapes and all
-seven methods with EdgeZero's JSON error at the startup failure's status,
-normally `500`; Spin answers a generic `503`; Axum exits at startup and serves
-nothing. Only the health behavior shown in the table survives.
+When caught application initialization fails, every adapter returns the fixed
+`503` response on both fallback shapes and all seven supported methods.
+Liveness stays `200`; readiness returns `503`. See the
+[operational response contract](#operational-probe-contract).
 
 ---
 

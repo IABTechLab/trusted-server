@@ -31,7 +31,7 @@ docker build \
   -t ts-native:aws .
 ```
 
-`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a connector does not select it. For EC, set `TS_EC_RECORDS_ENABLED=true` at boot to declare the layout before preparation, select the connector in `EDGEZERO__STORE_BINDINGS_FILE`, and reference logical `trusted_server_kv` with `ec.storage.provider="records"` in published application configuration. A separate boot profile selects protected CloudFront Geo. Credentials and provider settings are runtime inputs, never image build arguments. See [Native EC persistence](./native-ec-persistence.md). The local-provider smoke below does not validate AWS access.
+`NATIVE_FEATURES` accepts an empty value or a comma-separated selection of `aws-appconfig-agent`, `aws-secrets-manager`, `aws-dynamodb-ec`, `celld-ec` and `geo-cloudfront`. Compiling a connector does not select it. The EC record layout and logical `trusted_server_kv` store are always declared. Select the connector in `EDGEZERO__STORE_BINDINGS_FILE` and reference that logical store with `ec.storage.provider="records"` in published application configuration. Without a remote binding, EdgeZero prepares its local record provider, so `/data` must remain writable even when identity storage is omitted from application configuration. A separate boot profile selects protected CloudFront Geo. Credentials and provider settings are runtime inputs, never image build arguments. See [Native EC persistence](./native-ec-persistence.md). The local-provider smoke below does not validate AWS access.
 
 ## Local smoke test
 
@@ -41,7 +41,7 @@ With Docker available, use the host Node version pinned in `.tool-versions`:
 node scripts/test-native-container.mjs ts-native:local
 ```
 
-The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks startup rejection for invalid configuration and missing secrets, the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
+The test creates a private Docker network, a synthetic publisher origin and temporary local configuration. It checks that invalid configuration and missing secrets serve the failure router (`/health` `200`, `/ready` and routes `503`), the published listener, HTML rewriting, embedded JS, non-root execution, CA roots, writable mounts and SIGTERM draining with a request in flight. Fixtures use only `example.com` identities and synthetic secrets. The test removes its containers, network and temporary files on completion.
 
 The `Native container` workflow builds the local-provider image and runs this test on relevant pull requests or manual dispatch. It does not publish an image or deploy a service.
 

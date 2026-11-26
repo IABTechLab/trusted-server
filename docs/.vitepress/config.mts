@@ -140,7 +140,11 @@ export default withMermaid(
           text: 'Deployment',
           items: [
             { text: 'Fastly', link: '/guide/fastly' },
-            { text: 'Axum Development', link: '/guide/axum-dev' },
+            { text: 'Axum', link: '/guide/axum-dev' },
+            {
+              text: 'Axum Production Startup',
+              link: '/guide/native-rc-demo',
+            },
             { text: 'Cloudflare Workers', link: '/guide/cloudflare' },
             { text: 'Fermyon Spin', link: '/guide/spin' },
           ],

@@ -67,19 +67,19 @@ impl RuntimeEnvironment for CloudflareWorkers {
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         self.spawn_with_readiness(|base_url| {
-            super::wait_for_ready(base_url, self.health_check_path(), true)
+            super::wait_for_ready(base_url, self.health_check_path(), false)
         })
     }
 
     fn health_check_path(&self) -> &str {
-        "/.well-known/trusted-server.json"
+        "/ready"
     }
 }
 
 impl CloudflareWorkers {
-    /// Start an isolated fixture with an explicit authenticated readiness probe.
+    /// Start an isolated fixture with an explicit readiness probe.
     ///
-    /// The standard [`RuntimeEnvironment::spawn`] retains its original readiness check.
+    /// The standard [`RuntimeEnvironment::spawn`] uses the local `/ready` probe.
     ///
     /// # Errors
     ///
@@ -113,7 +113,7 @@ impl CloudflareWorkers {
     ///
     /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
     /// written or `wrangler dev` cannot be started, and
-    /// [`TestError::RuntimeNotReady`] if the health check times out.
+    /// [`TestError::RuntimeNotReady`] if the readiness check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
         let public_origin = format!("http://127.0.0.1:{port}");
@@ -121,7 +121,7 @@ impl CloudflareWorkers {
         let wrangler_dir = self.wrangler_dir();
         let config = write_generated_ci_config(&wrangler_dir, &config_json)?;
         self.spawn_wrangler(&wrangler_dir, &config, port, |base_url| {
-            super::wait_for_ready(base_url, self.health_check_path(), true)
+            super::wait_for_ready(base_url, self.health_check_path(), false)
         })
     }
 

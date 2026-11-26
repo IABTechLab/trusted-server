@@ -18,3 +18,9 @@ pub mod platform;
 mod record_ec;
 /// Prepared-store initialization and immutable native snapshots.
 pub mod startup;
+
+#[cfg(test)]
+mod identity_conformance;
+
+#[cfg(test)]
+mod after_response_drain_tests;

@@ -10,7 +10,9 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command fastly
-smoke_require_command python3
+VICEROY_BINARY=${VICEROY_BINARY_PATH:-$(command -v viceroy || true)}
+[ -x "$VICEROY_BINARY" ] || smoke_die "Viceroy executable not found: $VICEROY_BINARY"
+smoke_require_python
 smoke_require_command pgrep
 
 WORKSPACE=$(smoke_make_workspace fastly)
@@ -26,6 +28,7 @@ APP_PID=""
 cleanup() {
     smoke_stop_process "$APP_PID"
     smoke_stop_process "$ORIGIN_PID"
+    smoke_preserve_artifacts "$WORKSPACE"
     smoke_remove_workspace "$WORKSPACE"
 }
 trap cleanup EXIT INT TERM
@@ -57,8 +60,8 @@ ln -s "$REPO_ROOT/crates" "$FASTLY_PROJECT/crates"
 
 smoke_resolve_ts_binary "$REPO_ROOT"
 WASM_BINARY=${WASM_BINARY_PATH:-$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm}
-if [ ! -f "$WASM_BINARY" ]; then
-    cargo build \
+if [ -z "${WASM_BINARY_PATH:-}" ]; then
+    cargo build --locked \
         --manifest-path "$REPO_ROOT/Cargo.toml" \
         --package trusted-server-adapter-fastly \
         --release \
@@ -85,6 +88,7 @@ run_case() {
     fastly compute serve \
         --dir "$FASTLY_PROJECT" \
         --file "$WASM_BINARY" \
+        --viceroy-path "$VICEROY_BINARY" \
         --addr "127.0.0.1:$port" >"$log_path" 2>&1 &
     APP_PID=$!
 
@@ -92,6 +96,23 @@ run_case() {
         smoke_wait_http "http://127.0.0.1:$port/health" "200" \
             "$WORKSPACE/$case_name-health.body" \
             "$WORKSPACE/$case_name-health.headers"
+    fi
+    local startup_state=ready
+    [ "$expected_status" != 503 ] || startup_state=unavailable
+    smoke_wait_http "http://127.0.0.1:$port/health" 200 \
+        "$WORKSPACE/$case_name-live.body" "$WORKSPACE/$case_name-live.headers"
+    if [ "$startup_state" = ready ]; then
+        smoke_wait_http "http://127.0.0.1:$port/ready" 200 \
+            "$WORKSPACE/$case_name-ready-wait.body" "$WORKSPACE/$case_name-ready-wait.headers"
+    fi
+    smoke_assert_operational "http://127.0.0.1:$port" "$startup_state" "$WORKSPACE/$case_name"
+    local origin_before
+    origin_before=$(smoke_origin_count "$WORKSPACE")
+    local SMOKE_AUTHENTICATE=false
+    if [ "$case_name" = hostile ]; then
+        smoke_wait_http "http://127.0.0.1:$port/private" 401 \
+            "$WORKSPACE/$case_name-auth.body" "$WORKSPACE/$case_name-auth.headers"
+        SMOKE_AUTHENTICATE=true
     fi
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
@@ -101,10 +122,13 @@ run_case() {
     APP_PID=""
 
     if [ -n "$expected_diagnostic" ]; then
+        smoke_assert_unavailable_body "$body_path"
         smoke_assert_failure "$expected_status" "$expected_diagnostic" "$log_path"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
+        [ "$(smoke_origin_count "$WORKSPACE")" -gt "$origin_before" ] || smoke_die "publisher control never reached origin"
     fi
+    echo "fastly startup case passed: $case_name"
 }
 
 write_without_secret() {
@@ -138,19 +162,6 @@ write_without_secret() {
     ' "$source" >"$destination"
 }
 
-run_case missing-config "$BASE_PORT" 500 \
-    "key 'trusted_server_config' not found in config store 'trusted_server_config'"
-
-(
-    cd "$FASTLY_PROJECT"
-    "$SMOKE_TS_BIN" config push \
-        --adapter fastly \
-        --local \
-        --manifest "$EDGEZERO_MANIFEST" \
-        --app-config "$SMOKE_APP_CONFIG" \
-        --yes \
-        --no-diff
-)
 cat >>"$FASTLY_MANIFEST" <<EOF
 
 [[local_server.secret_stores.trusted_server_secrets]]
@@ -165,18 +176,59 @@ data = "$SMOKE_PROXY_VALUE"
 key = "ec_passphrase"
 data = "$SMOKE_EC_VALUE"
 EOF
+
+run_case missing-config "$BASE_PORT" 503 \
+    "key 'trusted_server_config' not found in config store 'trusted_server_config'"
+
+(
+    cd "$FASTLY_PROJECT"
+    "$SMOKE_TS_BIN" config push \
+        --adapter fastly \
+        --local \
+        --manifest "$EDGEZERO_MANIFEST" \
+        --app-config "$SMOKE_APP_CONFIG" \
+        --yes \
+        --no-diff
+)
+
 CONFIGURED_FASTLY="$WORKSPACE/fastly.toml.configured"
 cp "$FASTLY_MANIFEST" "$CONFIGURED_FASTLY"
 
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" handler_password
-run_case missing-handler "$((BASE_PORT + 1))" 500 \
+run_case missing-handler "$((BASE_PORT + 1))" 503 \
     "failed to resolve secret reference at \`handlers[0].password\`"
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" publisher_proxy_secret
-run_case missing-proxy "$((BASE_PORT + 2))" 500 \
+run_case missing-proxy "$((BASE_PORT + 2))" 503 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" ec_passphrase
-run_case missing-ec "$((BASE_PORT + 3))" 500 \
+run_case missing-ec "$((BASE_PORT + 3))" 503 \
     "failed to resolve secret reference at \`ec.passphrase\`"
+
+# Mutate the config store only after the strict CLI push has succeeded.
+ENVELOPE=$(python3 - "$CONFIGURED_FASTLY" <<'PYREAD'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as source:
+    print(tomllib.load(source)['local_server']['config_stores']['trusted_server_config']['contents']['trusted_server_config'])
+PYREAD
+)
+write_runtime_envelope() {
+    SMOKE_ENVELOPE="$1" python3 - "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" <<'PYWRITE'
+import json, os, pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+source, count = re.subn(r'(?m)^(\s*trusted_server_config\s*=).*$', lambda match: match[1] + ' ' + json.dumps(os.environ['SMOKE_ENVELOPE']), source)
+assert count == 1, f'expected exactly one config-store value, found {count}'
+pathlib.Path(sys.argv[2]).write_text(source)
+PYWRITE
+}
+INVALID_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" invalid)
+HOSTILE_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" hostile)
+write_runtime_envelope '{'
+run_case malformed-envelope "$((BASE_PORT + 5))" 503 \
+    'failed to parse Trusted Server app-config blob envelope'
+write_runtime_envelope "$INVALID_ENVELOPE"
+run_case invalid-settings "$((BASE_PORT + 6))" 503 'invalid_publisher_domain'
+write_runtime_envelope "$HOSTILE_ENVELOPE"
+run_case hostile "$POSITIVE_PORT" 200
 
 cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
 run_case positive "$POSITIVE_PORT" 200

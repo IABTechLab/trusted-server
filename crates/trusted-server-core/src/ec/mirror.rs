@@ -14,6 +14,19 @@ use crate::ec::registry::PartnerRegistry;
 /// Largest encoded mirror value.
 pub const MAX_MIRROR_BYTES: usize = 3584;
 
+/// Seconds in a day; the cap on a mirrored UID's `exp` counts from the
+/// start of the current UTC day.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Longest a mirrored UID stays valid on the page, counted from the start of
+/// the current UTC day: 30 days (WB-4).
+const MIRROR_MAX_EXPIRY_SECS: u64 = 30 * SECONDS_PER_DAY;
+
+/// How close a carried mirror UID's `exp` may come before the mirror is
+/// re-set with the current `exp`: 7 days. Until then an otherwise unchanged
+/// mirror is kept, so a returning reader gets no `Set-Cookie` for it.
+const MIRROR_REFRESH_WINDOW_SECS: u64 = 7 * SECONDS_PER_DAY;
+
 /// What to do with the mirror cookie on this response.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MirrorCookie {
@@ -23,15 +36,25 @@ pub enum MirrorCookie {
     Expire,
 }
 
-/// An encoded mirror value within [`MAX_MIRROR_BYTES`].
+/// An encoded mirror value within [`MAX_MIRROR_BYTES`], with the JSON it
+/// encodes.
 #[derive(Debug, PartialEq, Eq)]
-pub struct MirrorValue(String);
+pub struct MirrorValue {
+    json: String,
+    encoded: String,
+}
 
 impl MirrorValue {
     /// The encoded cookie value.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.encoded
+    }
+
+    /// The JSON `{"v":1,"eids":[...]}` the cookie value encodes.
+    #[must_use]
+    pub fn json(&self) -> &str {
+        &self.json
     }
 }
 
@@ -40,9 +63,15 @@ impl MirrorValue {
 /// Holds live, provider-written UIDs of partners with both
 /// `bidstream_enabled` and `mirror_enabled` while no TCF vendor gating the
 /// source is denied consent, no provider excludes it where GDPR applies for
-/// this visitor and no provider's cookies on this request record an opt-out
-/// for it, in partner config order, as unpadded base64url JSON
-/// `{"v":1,"eids":[...]}`. UIDs that would push the value past
+/// this visitor, no enabled owner of it or its `SharedID` alias has an active
+/// opt-out in the row and no provider's cookies on this request record an
+/// opt-out for it, in partner config order, as unpadded base64url JSON
+/// `{"v":1,"eids":[...]}`. Every UID carries `exp`: its stated expiry,
+/// capped at the start of `now`'s UTC day plus 30 days, or that cap when it
+/// states none. Every mirrored UID therefore expires within 30 days (WB-4).
+/// A value built from an unchanged row changes at most once per UTC day;
+/// [`current_carried_mirror`] keeps the carried cookie across those changes
+/// until a UID nears its `exp`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
 /// persistence, the row is missing or withdrawn, or nothing qualifies.
@@ -63,18 +92,22 @@ pub fn build_mirror(
     let Some(row) = row.filter(|row| row.consent.ok && mirror_consent(consent)) else {
         return MirrorCookie::Expire;
     };
+    let max_exp = max_exp(now);
     let mut mirror = MirrorBuilder::default();
     // A partner opts in with `mirror_enabled`, and a UID never reaches the
     // page while a TCF vendor gating its source (that of any configured
     // provider claiming it, enabled or disabled) is denied consent, or while
     // a provider excludes its source where GDPR applies, as it never reaches
-    // the bidstream (`KvEntry::live_eids`). Nor while the provider's cookies
-    // on this request record an opt-out the row may not reflect yet.
+    // the bidstream (`KvEntry::live_eids`). Nor while any enabled owner of
+    // the source has an active opt-out in the row, even when another owner
+    // wrote the UID, nor while the provider's cookies on this request record
+    // an opt-out the row may not reflect yet.
     for partner in partners.in_config_order().filter(|partner| {
         partner.bidstream_enabled
             && partner.mirror_enabled
             && !partner.owner_vendor_consent_denied(consent)
             && !partner.excluded_for(consent)
+            && !partners.source_owner_opted_out(&partner.source_domain, row, now)
             && !ec_context.source_opted_out_in_cookies(&partner.source_domain)
     }) {
         let Some(record) = row.ids.get(&partner.source_domain) else {
@@ -89,7 +122,7 @@ pub fn build_mirror(
                 .uids()
                 .iter()
                 .filter(|uid| uid.owner().is_some() && uid.is_live(now))
-                .map(|uid| serde_json::to_string(&uid_json(uid)));
+                .map(|uid| serde_json::to_string(&uid_json(uid, max_exp)));
             mirror.push_eid(source, eid_header(source, eid), uids);
         }
     }
@@ -101,12 +134,64 @@ pub fn build_mirror(
         return MirrorCookie::Expire;
     }
     json.push_str(JSON_SUFFIX);
-    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json);
     debug_assert!(
-        value.len() <= MAX_MIRROR_BYTES,
+        encoded.len() <= MAX_MIRROR_BYTES,
         "should respect the size cap"
     );
-    MirrorCookie::Set(MirrorValue(value))
+    MirrorCookie::Set(MirrorValue { json, encoded })
+}
+
+/// Returns the carried mirror when it still serves the reader as `rebuilt`
+/// would, so the response need not re-set it.
+///
+/// The carried value must decode to the same EIDs and UIDs as `rebuilt`, in
+/// the same order, apart from `exp`. Each carried UID's `exp` must equal the
+/// rebuilt one, or be no later than it (so it stays within the cap and any
+/// shortened stated expiry) and at least [`MIRROR_REFRESH_WINDOW_SECS`] after
+/// `now`. Every kept UID therefore still expires within 30 days (WB-4), and
+/// an unchanged returning reader gets a mirror `Set-Cookie` only when a UID
+/// nears its `exp`. Returns `None` when the carried value does not qualify or
+/// does not decode as a mirror.
+#[must_use]
+pub(crate) fn current_carried_mirror(
+    carried: &str,
+    rebuilt: &MirrorValue,
+    now: UnixSeconds,
+) -> Option<MirrorValue> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(carried)
+        .ok()?;
+    let json = String::from_utf8(bytes).ok()?;
+    let mut carried_exps = Vec::new();
+    let mut rebuilt_exps = Vec::new();
+    let carried_uids = without_exps(serde_json::from_str(&json).ok()?, &mut carried_exps)?;
+    let rebuilt_uids = without_exps(serde_json::from_str(&rebuilt.json).ok()?, &mut rebuilt_exps)?;
+    let refresh_at = now.get().saturating_add(MIRROR_REFRESH_WINDOW_SECS);
+    let current = carried_uids == rebuilt_uids
+        && carried_exps.len() == rebuilt_exps.len()
+        && carried_exps
+            .iter()
+            .zip(&rebuilt_exps)
+            .all(|(carried, rebuilt)| {
+                carried == rebuilt || (refresh_at <= *carried && carried <= rebuilt)
+            });
+    current.then(|| MirrorValue {
+        json,
+        encoded: carried.to_owned(),
+    })
+}
+
+/// Removes every UID's `exp` from a mirror JSON value, appending each to
+/// `exps` in order. Returns `None` when the value is not a mirror or a UID
+/// has no integer `exp`.
+fn without_exps(mut value: Value, exps: &mut Vec<u64>) -> Option<Value> {
+    for eid in value.get_mut("eids")?.as_array_mut()? {
+        for uid in eid.get_mut("uids")?.as_array_mut()? {
+            exps.push(uid.as_object_mut()?.remove("exp")?.as_u64()?);
+        }
+    }
+    Some(value)
 }
 
 /// Accumulates the mirror JSON, tracking its encoded size so each part is
@@ -241,16 +326,26 @@ fn eid_json(source: &str, eid: &KvEid) -> Value {
     Value::Object(object)
 }
 
-fn uid_json(uid: &KvUid) -> Value {
+/// The latest mirror `exp`: the start of `now`'s UTC day plus
+/// [`MIRROR_MAX_EXPIRY_SECS`], so at most 30 days ahead and stable within
+/// the day.
+fn max_exp(now: UnixSeconds) -> UnixSeconds {
+    let day_start = now.get() - now.get() % SECONDS_PER_DAY;
+    UnixSeconds::new(day_start).saturating_add_secs(MIRROR_MAX_EXPIRY_SECS)
+}
+
+fn uid_json(uid: &KvUid, max_exp: UnixSeconds) -> Value {
     let mut object = Map::new();
     object.insert("id".to_owned(), Value::from(uid.id().as_str()));
     object.insert("atype".to_owned(), Value::from(uid.atype().get()));
     if let Some(ext) = uid.ext() {
         object.insert("ext".to_owned(), ext.to_value());
     }
-    if let Expiry::At(at) = uid.expiry() {
-        object.insert("exp".to_owned(), Value::from(at.get()));
-    }
+    let exp = match uid.expiry() {
+        Expiry::At(at) => at.min(max_exp),
+        Expiry::Never => max_exp,
+    };
+    object.insert("exp".to_owned(), Value::from(exp.get()));
     Value::Object(object)
 }
 
@@ -337,6 +432,247 @@ mod tests {
             json!({ "v": 1, "eids": [{ "source": "ids.example.com", "uids": [{ "id": "live", "atype": 1, "exp": 2000 }] }] }),
             "should hold only the live UID with its exp"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(value.json()).expect("should parse the JSON"),
+            decode(&value),
+            "should carry the JSON the cookie value encodes"
+        );
+    }
+
+    #[test]
+    fn caps_a_uid_without_stated_expiry_at_thirty_days_from_the_utc_day_start() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let now = UnixSeconds::new(day_start + 13 * 60 * 60);
+        let entry = row(vec![uid("never", Expiry::Never)]);
+
+        // Act
+        let MirrorCookie::Set(value) =
+            build_mirror(Some(&entry), &context(granting()), &partners(true), now)
+        else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        let exp = decode(&value)["eids"][0]["uids"][0]["exp"]
+            .as_u64()
+            .expect("should carry a numeric exp");
+        assert_eq!(
+            exp,
+            day_start + MIRROR_MAX_EXPIRY_SECS,
+            "should expire 30 days after the start of the current UTC day"
+        );
+        assert!(
+            exp > now.get() && exp <= now.get() + MIRROR_MAX_EXPIRY_SECS,
+            "should expire within 30 days of now"
+        );
+    }
+
+    #[test]
+    fn caps_a_stated_expiry_at_thirty_days_from_the_utc_day_start() {
+        // Arrange: a provider-stated expiry 40 days out, past the 30-day cap,
+        // and one 10 days out, within it.
+        let day_start = 1_767_225_600;
+        let now = UnixSeconds::new(day_start + 13 * 60 * 60);
+        let far = now.saturating_add_secs(40 * SECONDS_PER_DAY);
+        let near = now.saturating_add_secs(10 * SECONDS_PER_DAY);
+        let entry = row(vec![
+            uid("far", Expiry::At(far)),
+            uid("near", Expiry::At(near)),
+        ]);
+
+        // Act
+        let MirrorCookie::Set(value) =
+            build_mirror(Some(&entry), &context(granting()), &partners(true), now)
+        else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        let mirror = decode(&value);
+        let uids = &mirror["eids"][0]["uids"];
+        assert_eq!(
+            uids[0]["exp"].as_u64(),
+            Some(day_start + MIRROR_MAX_EXPIRY_SECS),
+            "should cap a stated expiry past 30 days at the start of the UTC day plus 30 days"
+        );
+        assert_eq!(
+            uids[1]["exp"].as_u64(),
+            Some(near.get()),
+            "should keep a stated expiry within the cap"
+        );
+    }
+
+    #[test]
+    fn added_exp_drops_a_uid_that_fit_the_budget_without_it() {
+        // Arrange: four equal UIDs whose mirror JSON fits the budget without
+        // `exp`, but not with the 17 bytes `,"exp":<10 digits>` adds to each.
+        let ids: Vec<String> = (0..4).map(|i| format!("{i}{}", "x".repeat(629))).collect();
+        let without_exp = json!({ "v": 1, "eids": [{
+            "source": "ids.example.com",
+            "uids": ids.iter().map(|id| json!({ "id": id, "atype": 1 })).collect::<Vec<_>>()
+        }] })
+        .to_string();
+        assert!(
+            encoded_len(without_exp.len()) <= MAX_MIRROR_BYTES,
+            "should fit all four UIDs without exp"
+        );
+        let entry = row(ids.iter().map(|id| uid(id, Expiry::Never)).collect());
+
+        // Act
+        let MirrorCookie::Set(value) = build_mirror(
+            Some(&entry),
+            &context(granting()),
+            &partners(true),
+            UnixSeconds::new(1_767_225_600),
+        ) else {
+            panic!("should set the mirror");
+        };
+
+        // Assert
+        assert!(
+            value.as_str().len() <= MAX_MIRROR_BYTES,
+            "should fit the size limit"
+        );
+        let kept: Vec<_> = decode(&value)["eids"][0]["uids"]
+            .as_array()
+            .expect("should hold uids")
+            .iter()
+            .map(|uid| uid["id"].as_str().expect("should carry an id").to_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            ids[..3],
+            "should drop the UID that no longer fits once each UID carries exp"
+        );
+    }
+
+    #[test]
+    fn uid_without_stated_expiry_keeps_its_exp_within_a_utc_day_and_moves_on_the_next() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let build = |now: u64| {
+            build_mirror(
+                Some(&entry),
+                &context(granting()),
+                &partners(true),
+                UnixSeconds::new(now),
+            )
+        };
+
+        // Act
+        let morning = build(day_start + 60);
+        let evening = build(day_start + SECONDS_PER_DAY - 1);
+        let next_day = build(day_start + SECONDS_PER_DAY);
+
+        // Assert
+        assert_eq!(
+            morning, evening,
+            "should build the same mirror throughout one UTC day"
+        );
+        assert_ne!(
+            evening, next_day,
+            "should move the exp forward on the next UTC day"
+        );
+    }
+
+    fn built_at(entry: &KvEntry, now: u64) -> MirrorValue {
+        match build_mirror(
+            Some(entry),
+            &context(granting()),
+            &partners(true),
+            UnixSeconds::new(now),
+        ) {
+            MirrorCookie::Set(value) => value,
+            MirrorCookie::Expire => panic!("should build a mirror"),
+        }
+    }
+
+    #[test]
+    fn keeps_a_carried_mirror_whose_earlier_exp_is_not_yet_near() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let carried = built_at(&entry, day_start + 60);
+        let now = day_start + 22 * SECONDS_PER_DAY + 60;
+        let rebuilt = built_at(&entry, now);
+        assert_ne!(carried, rebuilt, "should move the rebuilt exp forward");
+
+        // Act
+        let kept = current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now));
+
+        // Assert
+        assert_eq!(
+            kept.as_ref(),
+            Some(&carried),
+            "should keep the carried value and its JSON"
+        );
+    }
+
+    #[test]
+    fn refreshes_a_carried_mirror_whose_exp_is_within_seven_days() {
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let carried = built_at(&entry, day_start + 60);
+        let now = day_start + 23 * SECONDS_PER_DAY + 61;
+        let rebuilt = built_at(&entry, now);
+
+        assert_eq!(
+            current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now)),
+            None,
+            "should re-set a mirror whose exp is within 7 days"
+        );
+    }
+
+    #[test]
+    fn refreshes_a_carried_mirror_whose_uids_or_stated_expiry_changed() {
+        let day_start = 1_767_225_600;
+        let now = day_start + SECONDS_PER_DAY;
+        let carried = built_at(&row(vec![uid("never", Expiry::Never)]), day_start + 60);
+        let cases = [
+            (row(vec![uid("other", Expiry::Never)]), "a different UID"),
+            (
+                row(vec![
+                    uid("never", Expiry::Never),
+                    uid("added", Expiry::Never),
+                ]),
+                "an added UID",
+            ),
+            (
+                row(vec![uid(
+                    "never",
+                    Expiry::At(UnixSeconds::new(day_start + 20 * SECONDS_PER_DAY)),
+                )]),
+                "a stated expiry earlier than the carried exp",
+            ),
+        ];
+
+        for (entry, case) in cases {
+            let rebuilt = built_at(&entry, now);
+            assert_eq!(
+                current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now)),
+                None,
+                "should re-set the mirror for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn refreshes_a_carried_value_that_is_not_a_mirror() {
+        let day_start = 1_767_225_600;
+        let rebuilt = built_at(&row(vec![uid("never", Expiry::Never)]), day_start);
+        let without_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"never","atype":1}]}]}"#,
+        );
+
+        for carried in ["not base64!", "e30", without_exp.as_str()] {
+            assert_eq!(
+                current_carried_mirror(carried, &rebuilt, UnixSeconds::new(day_start)),
+                None,
+                "should re-set a carried value that does not decode as a mirror: {carried}"
+            );
+        }
     }
 
     #[test]
@@ -556,6 +892,66 @@ mod tests {
     }
 
     #[test]
+    fn withholds_uids_while_another_owner_remembers_an_opt_out() {
+        // Arrange: providers `a` and `b` both own the source. `a` has a
+        // remembered opt-out until 2000, then `b` wrote a UID.
+        let mut ec = crate::test_support::tests::create_test_settings().ec;
+        ec.partners = vec![
+            serde_json::from_value(json!({
+                "name": "ids", "source_domain": "ids.example.com",
+                "bidstream_enabled": true, "mirror_enabled": true
+            }))
+            .expect("should build partner"),
+        ];
+        ec.identity_providers = ["a", "b"]
+            .map(|id| {
+                toml::from_str(&format!(
+                    "id = \"{id}\"\nkind = \"k\"\nendpoint = \"https://ids.example.com/\"\nsources = [\"ids.example.com\"]"
+                ))
+                .expect("should parse provider")
+            })
+            .to_vec();
+        let registry = PartnerRegistry::from_ec_with_kinds(&ec, |kind| kind == "k")
+            .expect("should build registry");
+        let mut entry = row(vec![KvUid::new(
+            UidValue::try_from("from-b").expect("should build"),
+            AgentType::try_from(1).expect("should build"),
+            None,
+            Some(ProviderId::new("b")),
+            Expiry::Never,
+        )]);
+        entry.opt_outs.insert(ProviderId::new("a"), 2000);
+        let consent = granting();
+        let ec_context = context(granting());
+        let (active, lapsed) = (UnixSeconds::new(1000), UnixSeconds::new(2000));
+
+        // Act
+        let withheld = build_mirror(Some(&entry), &ec_context, &registry, active);
+        let kept = build_mirror(Some(&entry), &ec_context, &registry, lapsed);
+
+        // Assert
+        assert_eq!(
+            entry.live_eids(&registry, &consent, active).count(),
+            0,
+            "should withhold the source from the bidstream while `a` is opted out"
+        );
+        assert_eq!(
+            withheld,
+            MirrorCookie::Expire,
+            "should not mirror `b`'s UID while `a` has an active opt-out, as the bidstream does not"
+        );
+        assert_eq!(
+            entry.live_eids(&registry, &consent, lapsed).count(),
+            1,
+            "should send the source once `a`'s opt-out lapses"
+        );
+        assert!(
+            matches!(kept, MirrorCookie::Set(_)),
+            "should mirror `b`'s UID once `a`'s opt-out lapses"
+        );
+    }
+
+    #[test]
     fn does_not_mirror_browser_ingested_uid_of_pull_sync_source() {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
@@ -628,8 +1024,8 @@ mod tests {
         assert_eq!(
             decode(&value),
             json!({ "v": 1, "eids": [
-                { "source": "ids.example.com", "uids": [{ "id": "a", "atype": 1 }] },
-                { "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1 }] }
+                { "source": "ids.example.com", "uids": [{ "id": "a", "atype": 1, "exp": 2_592_000 }] },
+                { "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1, "exp": 2_592_000 }] }
             ] }),
             "should join EIDs into valid JSON"
         );

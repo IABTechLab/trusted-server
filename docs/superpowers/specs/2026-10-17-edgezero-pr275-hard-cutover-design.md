@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-17, rewritten 2026-11-05, updated 2026-11-06, 2026-11-07,
 2026-11-08, 2026-11-11, 2026-11-12, 2026-11-13, 2026-11-14, 2026-11-16,
-2026-11-17 and 2026-11-18
+2026-11-17, 2026-11-18 and 2026-11-25
 
 **Status:** Approved at `85f5ca3d9`, with the corrections the implementation
 found folded in since. The [Review log](#review-log) has eleven agent review
@@ -26,20 +26,53 @@ and follows its head through EdgeZero's `rc/identity` integration branch, and
 `5ea8d93c`, and the 2026-11-08 revision rechecked at `5ea8d93c` only the facts
 the answers rely on.
 
-The cut now pins `9d02d7b3` (`9d02d7b3185b49e81d9ac972ca3feef932ed848a`), the
-`rc/identity` commit on 2026-11-18 (IABTechLab/edgezero#495). PR 275 stays at
-`ea2549fb`. On top of `f84ffbbb` the branch merges EdgeZero 502 (geo through
+The cut now pins `459bd27d` (`459bd27d2a26bfa0eb030891978d9a5d346e8673`), the
+`rc/identity` commit later on 2026-11-25 (IABTechLab/edgezero#495). PR 275 is
+now at `0e2a58ae`, three commits after `dbe90854`: the Viceroy readiness
+repair installs `wasm32-unknown-unknown` before it builds, the repair makes
+conditional KV inserts atomic, and the Fastly batch cutoff test advances its
+clock when its request arms its own deadline. The branch carries those through
+every pull request stacked on PR 275, with test fixes in the stack (port
+reservations held or respawned in the Axum production hosting, diagnostics and
+geo hosting tests, the AWS emulator and records proofs publishing their
+readiness markers by rename, rustfmt-clean imports in the generated CLI, and
+the store crates' portable builds allowed in the Geo platform graphs), and
+merges EdgeZero 536 (IABTechLab/edgezero#535). That adds
+`RecordHandle::update`, a bounded record update that reads a record, asks a
+planner for its replacement and writes it with `IfGenerationMatch`, or
+`Add` after a miss, and rereads and replans after a lost precondition, up to a
+caller-supplied number of attempts. The Trusted Server build needs no code
+change, and only the ten EdgeZero package sources change in `Cargo.lock`.
+
+The previous pin, `d063a8e7` (`d063a8e7f83f691186ab6010ac36893c48c14212`), was
+the `rc/identity` commit earlier on 2026-11-25. It took EdgeZero main's Fastly
+SDK 0.13.3 upgrade (EdgeZero 529, 531 and 534: the Fastly SDK and
+`log-fastly` at 0.13.3, Viceroy 0.22.0 and the Fastly CLI at 17.2.0) through
+PR 275, then at `dbe90854`, which also moved its exact pins to `fastly` 0.13.3
+and `url` 2.5.9, and through every pull request stacked on it. Since
+`9d02d7b3` the branch had also merged EdgeZero 509's new after-response
+tests, EdgeZero 519's macOS test fixture fixes, EdgeZero main's docs eslint
+bump, EdgeZero 522 (portable Fastly record providers) and EdgeZero 524
+(outbound mTLS client identities). Trusted Server `main` took the same SDK
+upgrade in #1671. The Trusted Server build needed no code change. In
+`Cargo.lock` the EdgeZero package sources moved, the Fastly crates moved to
+0.13.3 and `url` to 2.5.9 as on `main`, and EdgeZero's optional AWS store
+dependencies were recorded but not built.
+
+The pin before that, `9d02d7b3` (`9d02d7b3185b49e81d9ac972ca3feef932ed848a`), was
+the `rc/identity` commit on 2026-11-18. PR 275 stayed at `ea2549fb`. On top of
+`f84ffbbb` the branch merged EdgeZero 502 (geo through
 `ctx.geo()` on every adapter, and Axum geo bound from the manifest), the line
 EdgeZero 510, 454, 514 and 517 (the `KvStore` record contract with DynamoDB and
 celld providers on Axum, KV-backed geo, Cloudflare and Spin geo, and the
 portable ClientInfo contract, which also refactors EdgeZero 469's JA4
 selection), and the line EdgeZero 509, 512 and 515 (bounded work after the
 response on Fastly and Axum, Cloudflare `waitUntil`, and Spin's capability
-error). These add APIs the server-side identity work uses; the Trusted Server
-build needs no code change, and only the ten EdgeZero package sources change
+error). These added APIs the server-side identity work uses; the Trusted Server
+build needed no code change, and only the ten EdgeZero package sources changed
 in `Cargo.lock`.
 
-The previous pin, `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`), was
+Before that, `f84ffbbb` (`f84ffbbbdda9cfecfa4c606dc5bc69281c70dac4`) was
 the `rc/identity` commit on 2026-11-17. It merges the
 same stack refreshed to PR 275's head `ea2549fb`, 16 fix and docs commits after
 `b65e7144` inside EdgeZero (Fastly response handles and progress wakers,
@@ -124,12 +157,15 @@ Citations: `crates/...:<line>` is Trusted Server at `51730bdaf`, and
 `ts@<rev>:crates/...:<line>` is Trusted Server at `<rev>`, for code the cut
 adds. `edgezero:<path>:<line>` is EdgeZero at H, and `edgezero@<rev>:` is
 EdgeZero at `<rev>`: `5ea8d93c` is PR 275's head on 2026-11-08, `14a6ca8b`,
-`737f8452`, `5c32ae61`, `10166628`, `3d92ee38` and `f84ffbbb` are earlier
-pins of the cut, `9d02d7b3` is the cut's pin (of the files cited at
-`5c32ae61`, only `lifecycle.rs` differs there; of the files cited at
-`3d92ee38`, only `edgezero-core`'s `manifest.rs` differs, where EdgeZero 502's
-geo placement validator moves the cited Fastly logging check), and `v0.0.11`
-is the base's pin. Dates are US Pacific time
+`737f8452`, `5c32ae61`, `10166628`, `3d92ee38`, `f84ffbbb`, `9d02d7b3` and
+`d063a8e7` are earlier pins of the cut, `459bd27d` is the cut's pin (of the files cited at
+`5c32ae61`, `lifecycle.rs` differs there, and so does the Fastly
+`config_store.rs`, where EdgeZero 522 makes two helpers crate-visible and adds
+a bindings reader after the cited lines; of the files cited at `3d92ee38`,
+only `edgezero-core`'s `manifest.rs` differs, where EdgeZero 502's geo
+placement validator moves the cited Fastly logging check and EdgeZero 522 and
+524 add record-provider bindings and client identities), and `v0.0.11` is the
+base's pin. Dates are US Pacific time
 (UTC-8). In UTC, `5c32ae61`, PR 275's head late on 2026-11-13, is dated
 2026-11-14.
 
@@ -258,7 +294,7 @@ decision sits in the section that implements it.
 **Pin.** The six EdgeZero crates move from `tag = "v0.0.11"` to a `rev` on the
 same `IABTechLab/edgezero` git source. Features and `default-features` stay as
 they are. The rev is a commit of EdgeZero's `rc/identity` integration branch,
-which carries PR 275's head: `9d02d7b3` at the 2026-11-18 repin. The cut repins
+which carries PR 275's head: `459bd27d` at the later 2026-11-25 repin. The cut repins
 it when the branch moves. At merge, `main` pins the branch commit the cut was
 last rebased onto (D5).
 
@@ -2742,10 +2778,11 @@ route tests, the whole parity suite, and the CLI proxy test move to
 - `./scripts/integration-tests-browser.sh`, with loopback bidders.
 - `scripts/smoke-fastly.sh`, `scripts/smoke-axum.sh`,
   `scripts/smoke-cloudflare.sh`, and `scripts/smoke-spin.sh`, with the
-  `smoke-axum.sh` change in section 7. `smoke-cloudflare.sh` is a known
-  failure: it exits 1 with `smoke: missing Wrangler pin in .tool-versions`.
-  `.tool-versions` pins no Wrangler, and `main`'s has no Wrangler line either
-  (Follow-ups, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
+  `smoke-axum.sh` change in section 7. `.tool-versions` pins Wrangler 4.83.0,
+  shared by the Cloudflare integration jobs. The Cloudflare first-success smoke
+  passes locally with this version: all four missing-binding controls return
+  HTTP 500 with the expected diagnostics, and the configured publisher request
+  returns HTTP 200 with the origin sentinel and rewritten asset URL (#1610).
 - **Fastly response diff.** A script under `scripts/` sends a fixed request list
   to a `main` build and to the branch build, both under Viceroy. It diffs
   status, headers, and a body hash. The list covers a publisher page, `HEAD` and
@@ -2857,8 +2894,6 @@ old layer. That transient dual path exists only inside the pull request.
 - Moving the pin from the `rc/identity` commit to an EdgeZero release tag once
   PR 275 merges (D5).
 - Spin on `wasm32-wasip2`.
-- A Wrangler pin in `.tool-versions`, so `scripts/smoke-cloudflare.sh` can
-  run (Runtime, [#1610](https://github.com/IABTechLab/trusted-server/issues/1610)).
 - The rest of #1505: Auctioneer as an in-process auction provider.
 
 ## Maintainer answers

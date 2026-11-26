@@ -866,11 +866,11 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The shared record service holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. `ec.storage` names a declared logical store; EdgeZero bindings select its provider. The legacy `ec_store` spelling is Fastly-only. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence. See [Native EC persistence](./native-ec-persistence) for provider bindings and startup requirements.
 
 ### Migrating from `consent_store`
 
-The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return adapter-specific 5xx startup-error responses until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading and prevent normal application state from being built. This is not partial consent degradation: user routes return the shared `503` startup-error response until the field is removed. Run `ts config validate` before `ts config push` to catch the stale field before deployment.
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
@@ -879,17 +879,49 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                               | Type           | Required | Description                                                             |
-| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)      |
-| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                          | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                  |
-| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                  |
-| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
+| Field                               | Type           | Required | Description                                                                           |
+| ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                 |
+| `ec_store`                          | String or null | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
+| `storage`                           | Table          | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                                   |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
+| `partners`                          | Array          | No       | Static partner registry entries                                                       |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
+| `browser_gate`                      | String         | No       | Device-signal rule for EC creation: `lenient` (default) or `strict` (see below)       |
+| `ja4_contradiction_exempt`          | String         | No       | Contradictions that do not block EC creation: `off` (default), `non_browser` or `all` |
+
+`browser_gate` decides which clients may create an Edge Cookie from their trusted
+device signals. Consent and the navigation policy apply under both rules.
+
+- `lenient` (default) blocks only known non-browsers: clients whose trusted
+  JA4 names a TLS client family that contradicts the User-Agent's browser
+  family, such as a Chrome User-Agent over Python's TLS stack (see
+  [Edge Cookies](/guide/edge-cookies#request-lifecycle)). A client without
+  trusted JA4, such as one behind a proxy or on a runtime that supplies none,
+  or with a JA4 the rule does not recognize, stays eligible for EC creation.
+- `strict` also requires a JA4 class and a recognized User-Agent platform. A
+  client without trusted JA4 creates no EC. That includes a JA4 the runtime
+  returns but EdgeZero rejects as malformed, such as section 1 alone, which
+  counts as no JA4 under both rules. `strict` blocks everything `lenient`
+  blocks.
+
+`ja4_contradiction_exempt` names the JA4 contradictions that stop blocking
+creation under either rule:
+
+- `off` (default) exempts nothing: every contradiction blocks.
+- `non_browser` exempts a non-browser TLS stack (the rule lists only Python's
+  default TLS context) behind a browser User-Agent. Use it when readers reach the site through a TLS-intercepting
+  proxy, which replaces their JA4 with its own. A User-Agent of one browser
+  engine over another engine's TLS stack still blocks.
+- `all` exempts every contradiction, which turns the JA4 rule off.
+
+An unknown value fails config loading. The rule runs on Fastly and on Axum
+with a trusted JA4 proxy header. Cloudflare creates no ECs yet, so both keys
+have no effect there.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -905,7 +937,10 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 ```toml
 [ec]
 passphrase = "ec_passphrase"
-ec_store = "ec_identity_store"
+
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -920,15 +955,17 @@ bidstream_enabled = true
 
 ```bash
 TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
-TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
+TRUSTED_SERVER__EC__STORAGE__PROVIDER=records
+TRUSTED_SERVER__EC__STORAGE__STORE=trusted_server_kv
 ```
 
 ### Identity providers
 
 `[[ec.identity_providers]]` entries collect a visitor's IDs from the vendor's
-first-party cookies or a provider's server on publisher page navigations. Lookups start before the origin fetch,
-share the `identity_budget_ms` budget, and are collected before the response is
-finalized. Results go into the navigation's single EC row write. A lookup that
+first-party cookies or a provider's server on eligible publisher document
+navigations and admitted EC POSTs. On publisher navigations, lookups run beside
+the origin fetch. Lookups share the `identity_budget_ms` budget and are collected
+before finalization. Results go into that request's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
 Lookups run only when consent allows EID persistence, and, when
@@ -939,7 +976,7 @@ providers whose requests do not carry the EC ID (each provider kind declares
 this) run against the row the navigation creates, whose consent gates them, and
 their results go into the write that creates the row. If that create fails or
 loses to another writer, their results are dropped. Providers that send the EC
-ID, and `after_response` lookups, wait for the next navigation. The page's own
+ID, and `after_response` lookups, wait for a later eligible request. The page's own
 auction starts before lookups are collected, so it never carries provider IDs
 for a newly minted EC; they reach auctions from the next page load. The same vendor consent gates
 egress of the provider's `sources`, even while the provider is disabled: while
@@ -951,12 +988,12 @@ stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
 the EID-persistence purposes alone, so set it for any provider that has a TCF
 vendor ID.
 
-Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
-build every enabled provider and reject one whose `kind` or `settings` is
-invalid. `ts config validate` is adapter-agnostic. `ts config push` and
-`ts config diff` reject enabled providers for targets other than Fastly: the
-Axum, Cloudflare and Spin adapters refuse to start when an enabled provider is
-configured. On Fastly, invalid enabled provider configuration, such as a `kind`
+Identity providers run through the shared application on Fastly and Axum.
+`ts config validate`, `push` and `diff` build every enabled provider and reject
+one whose `kind` or `settings` is invalid. `ts config validate` is
+adapter-agnostic. `ts config push` and `ts config diff` reject enabled providers
+for Cloudflare and Spin, whose adapters refuse to start with one configured.
+On Fastly and Axum, invalid enabled provider configuration, such as a `kind`
 this build does not include or `settings` its kind rejects, prevents
 application startup; providers are not silently disabled for individual
 requests. Lookups always verify the provider's TLS
@@ -965,7 +1002,13 @@ certificate, whatever `proxy.certificate_check` says.
 A provider owns its `sources`: its results replace whatever the row holds for
 them, and batch sync rejects them. Browser-resolved IDs
 (`ts-eids` and the SharedID cookie) are never stored for an owned source, so a source a
-provider cleared on an opt-out is not refilled from the browser.
+provider cleared on an opt-out is not refilled from the browser. Legacy single-UID
+records in provider-owned sources expire immediately on reads. Provider-written
+IDs retain their per-UID expiry, and unowned records retain their existing
+behavior. Active remembered provider opt-outs also suppress client copies from
+`ts-eids` and the `/auction` body in direct, initial-page and page-bids auctions.
+Client EIDs cannot clear that memory. A missing, failed or mismatched row snapshot
+retains existing degraded behavior because it establishes no active opt-out.
 
 When a provider reports an opt-out, its sources are cleared. An opt-out the
 vendor's server reports is also remembered in the row for 30 days, and the
@@ -1032,14 +1075,14 @@ token = "example_provider_token"
 ```
 
 `collect = "after_response"` lookups run after the response is sent, within
-`identity_after_response_budget_ms`, and only when `ec_store` is configured,
-the response is not a redirect, the navigation's own write succeeded (or had
-nothing to change), the row is live, and the EC was not minted on this
-navigation; a row recovered from an orphaned cookie gets a newly minted EC, so
-its lookups wait for the next navigation. They also run behind an error
-response, including a `502` that Trusted Server generates when the origin is
-unreachable. Their results reach the row in a follow-up write. Providers run
-only on Fastly.
+`identity_after_response_budget_ms`, with a configured record service and an
+eligible HTML document navigation or admitted EC POST. Navigation eligibility is method-neutral and includes HTML error documents and cached-document `304` responses without Content-Type. The request's
+own write must have succeeded (or had nothing to change), the row must be live,
+and the EC must not have been minted on this request. A row recovered from an
+orphaned cookie gets a newly minted EC, so its lookups wait for a later request.
+Redirect statuses 301, 302, 303, 307 and 308 do not authorize follow-up writes. Non-HTML responses other than cached-document `304` also lose the navigation permit; HTML error documents retain it. Results reach the row in a conditional follow-up
+write. Providers run on Fastly and Axum; Axum registers this work with EdgeZero's
+bounded, shutdown-drained after-response API.
 
 ::: warning Rate limit granularity
 `rate_limit_per_hour` is counted per EC hash, which is derived from the client
@@ -1071,8 +1114,9 @@ rewrites the row.
 `ts config validate`, `ts config push` and `ts config diff` also build every
 enabled provider of a registered kind, so a provider-specific setting error
 (for example a `liveramp` `endpoint` without `placement_id` and
-`custom_id_namespace`) fails the command before deploy. On Fastly the same
-error would prevent application startup.
+`hashed_email`, or a `hashed_email` table without `[ec.hashed_email]`) fails
+the command before deploy. On Fastly and Axum the same error prevents
+application startup.
 
 #### Provider kinds
 
@@ -1080,26 +1124,22 @@ This build includes the kinds below. Use the endpoint, sources and TCF vendor
 ID each vendor gives you; `trusted-server.example.toml` has a commented example
 of each.
 
-| `kind`       | Server call                                 | First page view    | Default `cookie_names`      | Lockr | `atype` | Kept for                                                      |
-| ------------ | ------------------------------------------- | ------------------ | --------------------------- | ----- | ------- | ------------------------------------------------------------- |
-| `id5`        | Fetch (`/gs/v2`) when no cookie holds an ID | Yes                | `id5id`                     | Yes   | 1       | Reply's `cache_control.max_age_sec`, else 24 hours (1 h–30 d) |
-| `liveintent` | Identity exchange                           | Yes                | `_lc2_fpi` (sent as `duid`) | No    | 3       | Reply's `Expires`, else 24 hours (1 h–30 d)                   |
-| `liveramp`   | Optional envelope lookup by Custom ID       | Without `endpoint` | `_lr_env`, `idl_env`        | Yes   | 3       | 15 days                                                       |
-| `connectid`  | None                                        | Yes                | `connectId`                 | No    | 3       | Cookie's `lastSynced` + `ttl`, at most 14 days                |
-| `uid2`       | Optional token refresh                      | Yes                | `__uid2_advertising_token`  | Yes   | 3       | Token's `identity_expires`, else 24 hours                     |
-| `sharedid`   | None                                        | Yes                | `_sharedid`, `_pubcid`      | No    | 1       | 24 hours; a generated ID 30 days                              |
-| `criteo`     | None                                        | Yes                | `cto_bidid`                 | No    | 1       | 24 hours                                                      |
-| `unifiedid`  | None                                        | Yes                | `pbjs-unifiedid`            | No    | 1       | 24 hours                                                      |
+| `kind`       | Server call                                               | Hashed email | Default `cookie_names`      | Lockr | `atype` | Kept for                                                                  |
+| ------------ | --------------------------------------------------------- | ------------ | --------------------------- | ----- | ------- | ------------------------------------------------------------------------- |
+| `id5`        | Fetch (`/gs/v2`) when no cookie holds an ID               | Yes (`pd`)   | `id5id`                     | Yes   | 1       | 30 days from each reply, refreshed after 8 hours; bare cookie ID 24 hours |
+| `liveintent` | Identity exchange                                         | No           | `_lc2_fpi` (sent as `duid`) | No    | 3       | Reply's `Expires`, else 24 hours (1 h–30 d)                               |
+| `liveramp`   | Optional envelope lookup by hashed email, and its refresh | Yes (`it=4`) | `_lr_env`, `idl_env`        | Yes   | 3       | 15 days                                                                   |
+| `connectid`  | None                                                      | No           | `connectId`                 | No    | 3       | Cookie's `lastSynced` + `ttl`, at most 14 days                            |
+| `uid2`       | Optional token refresh                                    | No           | `__uid2_advertising_token`  | Yes   | 3       | Token's `identity_expires`, else 24 hours                                 |
+| `sharedid`   | None                                                      | No           | `_sharedid`, `_pubcid`      | No    | 1       | 24 hours; a generated ID 30 days                                          |
+| `criteo`     | None                                                      | No           | `cto_bidid`                 | No    | 1       | 24 hours                                                                  |
+| `unifiedid`  | None                                                      | No           | `pbjs-unifiedid`            | No    | 1       | 24 hours                                                                  |
 
 **First page view.** Every kind runs on the navigation that mints the EC,
 within `identity_budget_ms`, and its results go into the write that creates the
-row, as long as it does not send the EC ID to the vendor. The one exception is
-`liveramp` with an `endpoint`: its envelope lookup sends the EC ID as its
-Custom ID, so it is not run until the next navigation, even for its cookie
-reads. Without an `endpoint`, `liveramp` only reads cookies and runs on the
-first page view like the others. Partner pull sync (an `[[ec.partners]]` entry
-with `pull_sync_enabled`) sends the EC ID to the partner, so it also waits for
-the next navigation. Kinds without a server call read their
+row, because none sends the EC ID to the vendor. Partner pull sync (an
+`[[ec.partners]]` entry with `pull_sync_enabled`) sends the EC ID to the
+partner, so it waits for the next navigation. Kinds without a server call read their
 first-party cookie, so on the first page view their IDs come only from that
 cookie. In practice the first page's own auction carries no provider IDs;
 they reach bid requests from the next page load.
@@ -1112,8 +1152,56 @@ so enabling Lockr with the defaults reads no extra cookie: set `cookie_names`
 to the key configured in Lockr when it differs. The other kinds reject that
 table.
 
+**Hashed email.** The `id5` and `liveramp` kinds accept
+`[ec.identity_providers.settings.hashed_email]` (`enabled`, `path`) to send a
+signed-in visitor's hashed email. Trusted Server gets it from the publisher
+endpoint in `[ec.hashed_email]`:
+
+```toml
+[ec.hashed_email]
+# Your endpoint; it receives the visitor's whole Cookie header.
+endpoint = "https://www.example.com/api/user/status"
+# Optional cutoff, 1–1000 ms (default 100); below the phase's identity budget.
+timeout_ms = 100
+# Optional: "GET" (default) or "POST".
+# method = "POST"
+# Optional, POST only: sent as is, as application/json unless a
+# content-type header below says otherwise.
+# body = "{}"
+# Optional extra headers: a fixed value, or the value of one of the
+# visitor's cookies (unquoted).
+# [ec.hashed_email.headers]
+# x-session = { cookie = "session" }
+```
+
+An endpoint that authenticates with a header rather than the `Cookie` header
+can take that header from a cookie. When the named cookie is missing, the
+visitor cannot be signed in, so Trusted Server makes no call. `headers` cannot
+set `Cookie`, `Host`, `Content-Length` or `Transfer-Encoding`, and `body` is
+rejected without `method = "POST"`.
+
+Trusted Server calls it at most once per collection phase (`page` and
+`after_response` providers each make their own call), and only when an enabled
+provider has a source with no live ID (a refresh never calls it) and the
+request carries cookies. Each provider reads the string at its own `path` in
+the JSON reply. A path uses jq path syntax limited to `.key`, `."quoted key"`
+and `[index]`, for example `.user.hashes.sha256`. The value is sent as
+returned: return what the vendor expects, for LiveRamp and ID5 the lowercase
+hex SHA-256 of the normalised email. A non-`2xx` reply, a timeout, a body that
+is not JSON or a missing path means no hashed email: a `liveramp` lookup is
+skipped and an `id5` fetch is sent without one. The hashed email is used for
+that request only; it is never stored in KV, cookies, headers or logs. The
+call and the lookups after it run beside the origin fetch and share the
+phase's identity budget (`identity_budget_ms`, or
+`identity_after_response_budget_ms`): the lookups get what the call left, so
+the call never delays the origin fetch or extends the deadline. `timeout_ms`
+must therefore be below the budget of each phase with a provider that enables
+the capability, or validation fails. A sign-out or account change is not noticed while a stored ID
+is live. The other kinds reject the table, and a provider that enables it
+without `[ec.hashed_email]` fails validation.
+
 **Opt-out.** An `id5` cookie or fetch reply whose ID is `0`, a `liveramp`
-lookup answered `204`, a `uid2` `optout` identity or refresh reply, and
+envelope lookup answered `204`, a `uid2` `optout` identity or refresh reply, and
 SharedID's `_pubcid_optout` cookie report an opt-out: the provider's stored
 UIDs are removed. Yahoo keeps the ConnectID opt-out in local storage, which the
 server cannot see, so a `connectId` cookie left after an opt-out is still read
@@ -1126,17 +1214,22 @@ resolves nor keeps the `uid2` attribute (`uidapi.com`).
 ##### `id5`
 
 Settings: `partner_id` (required), `provider_name` (default the publisher
-domain), `cookie_names`, `lockr`. When no ID5 cookie holds a usable ID, it
-posts to ID5's server-side fetch endpoint (`/gs/v2`) with `partner`,
-`provider`, `domain` (the publisher domain), `origin` (`trusted-server`), `v`
-(the Trusted Server version; ID5 rejects a fetch without it), `gdpr`,
-`gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid` (comma-joined), `ts`,
-`ua`, the client IP in `ip` or `ipv6` (routable addresses only), and `s`, the
-signature of the previous reply. The EC ID is never sent. A reply's `ids` are
-stored as given; a legacy `universal_uid` goes to the first configured source.
-The reply's signature is kept privately and the IDs are refreshed a tenth of
-their TTL before they expire. A cookie holding a fetch reply or a bare ID is
-used instead of a fetch.
+domain), `cookie_names`, `lockr`, `hashed_email`. When no ID5 cookie holds a usable ID, it
+posts to ID5's server-side fetch endpoint (`/gs/v2`), as ID5's server-side
+fetch documentation describes, with `partner`, `provider`, `o`
+(`server-side-fetch-api`), `u` (`https://` and the publisher domain), `top`
+(1), `v` (the Trusted Server version; ID5 rejects a fetch without it),
+`gdpr`, `gdpr_consent`, `us_privacy`, `gpp_string`, `gpp_sid`
+(comma-joined), `ts`, `ua`, `accept_language`, `ref` (the origin of the
+visitor's `Referer`), the client IP in `ipv4` or `ipv6` (routable addresses
+only), and `s`, the signature of the previous reply. The EC ID is never sent.
+A reply's `ids` are stored as given; a legacy `universal_uid` goes to the
+first configured source. As ID5 asks, the IDs are kept for 30 days from each
+reply, and the reply's signature is kept privately and used to refresh them
+after 8 hours; a reply's `cache_control` is ignored. A cookie holding a fetch
+reply or a bare ID is used instead of a fetch. With a hashed email the fetch also carries `pd`, the
+padded URL-safe base64 of `1=<percent-encoded hashed email>`, as ID5's
+server-side fetch documentation requires.
 
 ##### `liveintent`
 
@@ -1150,14 +1243,20 @@ returns only `nonId`. Its Trade Desk ID (`thetradedesk`) is stored with
 
 ##### `liveramp`
 
-Settings: `cookie_names`, `placement_id`, `custom_id_namespace`, `lockr`.
+Settings: `cookie_names`, `placement_id`, `hashed_email`,
+`refresh_interval_secs` (default 1800, 60 up to below 15 days), `lockr`.
 Reads the RampID envelope from `_lr_env` (LiveRamp ATS) or `idl_env`
 (Prebid's identityLink). With an `endpoint` (LiveRamp's
-`/api/identity/v2/envelope`), a visitor without an envelope cookie is looked
-up by Custom ID: the full EC ID as `<custom_id_namespace>:<id>`, with the
-placement ID, consent and visitor IP. Both settings are required with an
-endpoint. LiveRamp resolves a Custom ID only through a mapping file the
-publisher sends it; Trusted Server sends no login or hashed email.
+`/api/identity/v2/envelope`), which needs `placement_id` and `hashed_email`,
+a signed-in visitor without a live envelope is looked up by hashed email
+(`it=4`), with the placement ID, consent and visitor IP; a visitor without a
+hashed email is not looked up. An envelope obtained this way is refreshed
+every `refresh_interval_secs` at `<endpoint>/refresh` (`it=19`), which needs
+no hashed email; envelopes read from cookies are left to ATS. If the refresh
+API rejects an envelope (`204`), it is kept for one more interval without
+refresh, after which the visitor is looked up by hashed email again. LiveRamp must
+approve the publisher origin for the placement. The EC ID is never sent. The
+earlier Custom ID lookup and its `custom_id_namespace` setting are removed.
 
 ##### `connectid`, `sharedid`, `criteo`, `unifiedid`
 
@@ -1202,24 +1301,25 @@ token is kept privately and the token is refreshed server side from
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. Set `consent_store` to a
-KV store name only when consent should persist with the EC identity graph.
+signals. It does not create a second consent database. The removed
+`consent_store` field is rejected; omit it. Minimal consent metadata and
+withdrawal state belong to the one EC record service, while each request's
+consent decision comes from its live signals.
 
 ### `[consent]`
 
-| Field                                          | Type           | Default                     | Contract                                                    |
-| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
-| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
-| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
-| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
-| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
-| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
-| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
-| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
-| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
-| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
-| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+| Field                                          | Type          | Default                     | Contract                                                    |
+| ---------------------------------------------- | ------------- | --------------------------- | ----------------------------------------------------------- |
+| `mode`                                         | String        | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
+| `check_expiration`                             | Boolean       | `true`                      | Check TCF timestamps                                        |
+| `max_consent_age_days`                         | Integer       | `395`                       | Clamped to `1..=3650`                                       |
+| `gdpr.applies_in`                              | Array[String] | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
+| `us_states.privacy_states`                     | Array[String] | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
+| `us_privacy_defaults.notice_given`             | Boolean       | `true`                      | Publisher policy used for GPC-only requests                 |
+| `us_privacy_defaults.lspa_covered`             | Boolean       | `false`                     | Publisher LSPA posture                                      |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean       | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
+| `conflict_resolution.mode`                     | String        | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
+| `conflict_resolution.freshness_threshold_days` | Integer       | `30`                        | Age difference required by `newest`                         |
 
 In `proxy` mode Trusted Server does not decode the TC string, so it cannot
 confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
@@ -1662,8 +1762,10 @@ Matches:
   wildcard IP address all match real URL hosts and are not flagged.
 - `include_domains` controls which asset URLs are newly rewritten or signed. It
   is not enforced when a proxy URL is fetched: a proxy URL issued before a host
-  was removed from the list (for example, in a cached creative) still forwards
-  the EC ID to that host, subject only to `proxy.allowed_domains`.
+  was removed from the list (for example, in a cached creative) can still fetch
+  that host, subject to `proxy.allowed_domains`. EC disclosure is independently
+  evaluated against the current `proxy.identity_endpoints` and request consent
+  on every fetch and redirect; old signatures do not preserve a removed grant.
 
 ::: tip
 When both `include_domains` and `proxy.allowed_domains` are set, keep every
@@ -1719,11 +1821,12 @@ Controls first-party proxy security settings and path-based asset routes.
 
 ### `[proxy]`
 
-| Field               | Type          | Required             | Description                                                 |
-| ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
-| `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
-| `certificate_check` | Boolean       | No (default: `true`) | Must be `true`; origin TLS is always verified               |
-| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
+| Field                | Type          | Required             | Description                                                           |
+| -------------------- | ------------- | -------------------- | --------------------------------------------------------------------- |
+| `allowed_domains`    | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects           |
+| `certificate_check`  | Boolean       | No (default: `true`) | Must be `true`; outbound TLS is always verified                       |
+| `identity_endpoints` | Array[Table]  | No (default: `[]`)   | Explicit creative-proxy HTTPS origin/path EC grants; empty denies all |
+| `asset_routes`       | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins                  |
 
 **Example**:
 
@@ -1780,16 +1883,111 @@ See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage deta
 
 #### `certificate_check`
 
-**Purpose**: None to configure. Every adapter always verifies origin TLS.
+**Purpose**: None to configure. Every adapter always verifies TLS on every
+outbound HTTPS request: the publisher origin, asset routes and redirects,
+integrations, auction providers, and identity providers, EC pull sync among
+them.
 
 **Default**: `true`
 
 `ts config validate` and `ts config push` reject `certificate_check = false`. A
 live config that still sets it keeps loading: settings load logs a warning,
-ignores the setting, and origin TLS stays verified. Remove the setting before
+ignores the setting, and TLS stays verified. Remove the setting before
 the next push. An origin whose certificate fails verification fails the
 request with the route's 502. For local development, serve the origin over
 plain HTTP instead of with a self-signed certificate.
+
+### `[[proxy.identity_endpoints]]`
+
+Explicitly authorize creative-proxy EC disclosure to selected HTTPS origin/path
+pairs. The default is empty and denies identity everywhere. This is independent
+of `allowed_domains`, whose empty list permits valid hosts: a grant never widens
+fetch permission, enables CORS, or enables identity on managed integration assets.
+
+```toml
+# DEFAULT OFF: leave absent until destinations are reviewed and approved.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
+```
+
+| Field         | Validation and matching                                                                             |
+| ------------- | --------------------------------------------------------------------------------------------------- |
+| `id`          | Unique, 1–64 ASCII letters, digits, underscore, or hyphen; used in diagnostics                      |
+| `origin`      | Absolute HTTPS DNS origin, optional nonzero port, no credentials, query, fragment, or non-root path |
+| `path_exact`  | Exact case-sensitive path; mutually exclusive with `path_prefix`                                    |
+| `path_prefix` | `/` or a path ending in `/`; mutually exclusive with `path_exact`                                   |
+
+Origins reject IP literals, wildcards, non-ASCII input, trailing dots, and empty
+labels; use punycode for internationalized names. Host case and explicit `:443`
+normalize to the same origin; another port differs. A root slash normalizes away.
+Paths begin with `/` and reject percent escapes, backslashes, whitespace/control
+characters, query/fragment delimiters, and literal `.`/`..` segments.
+`/events/` matches `/events/a`, but not `/events` or `/events-other/a`.
+Queries do not participate: paths serving both assets and query-selected events
+must be separated before granting identity.
+
+Duplicate normalized selectors are invalid, even with different IDs. Overlaps
+are allowed: exact wins, otherwise the longest prefix wins, independently of
+entry order. Invalid entries fail settings load and `ts config validate`.
+
+Matching uses the authenticated reconstructed target's serialized path; percent
+escapes remaining there withhold identity. Earlier signing may already have
+normalized encoded dot segments or backslashes. On redirects, the raw Location
+path is also checked for percent escapes/backslashes before resolution; query
+escapes alone do not disqualify a path. This policy describes the actual
+reconstructed destination, not unavailable original pre-sign text.
+
+Every hop removes reserved `ts-ec` query pairs, including carried signed values
+and redirect echoes, then appends one canonical existing cookie EC only when
+both the destination and request qualify. Raw `x-ts-ec` is ignored and missing
+identity is never generated. Consent must be unexpired, GPC absent, and both
+existing jurisdiction-based EC creation and EID persistence decisions affirmative;
+when TCF applies this includes effective Purpose 1 and Purpose 4 after signal
+conflict handling. Existing adapter withdrawal/marker finalization is preserved.
+A vendor signature covering a stripped EC value may break.
+
+Matching endpoints always use upstream cache bypass and make the entire response
+chain private/no-store, even without EC. Unmatched resources use platform-default
+caching and preserve origin policy and `Vary`; public caching is not guaranteed.
+Creative sends use fixed `TrustedServer/1.0` UA, valid client Accept/Language, and
+supported normalized encoding only, with no browser cookies, authorization,
+referrer, or client IP. Terminal 3xx responses carrying Location fail with 502.
+Click behavior is unchanged. See [First-Party Proxy](/guide/first-party-proxy)
+for execution, response protections, and the separate future #982 capability.
+
+Inspect inventory samples without fetching or changing config:
+
+```bash
+ts config proxy explain https://measurement.example.com/events/impression --json --app-config trusted-server.toml --manifest edgezero.toml --no-env
+```
+
+Explain uses the runtime evaluator and existing app-config selection/environment
+overlay semantics. Without `--app-config`, `<app.name>.toml` resolves beside the
+manifest; `--no-env` skips overlays. It takes no EC/consent input; conditional
+eligibility is not proof of reader consent. Allowed and blocked decisions exit
+0; invalid URL/configuration exits nonzero. Neither explain nor audit creates
+identity grants automatically.
+
+**Upgrade:** empty lists are omitted from stored JSON; older binaries reject
+nonempty endpoint configuration. Deploy compatible binaries first, then validate
+and publish rules. Old configs on new binaries immediately get default-off
+identity and new header/redirect behavior. The transition withholds identity;
+use a separately configured blue/green service if that gap is unacceptable.
+
+**Rollback:** publish an old-compatible config without this field before rolling
+back binaries. The old binary restores old forwarding/header behavior, a privacy
+regression requiring an operator decision. Existing signed URLs reaching TS use
+current rules, including after rule removal. Purge relevant shared-cache entries
+where stale responses could skip evaluation; already cached browser responses
+cannot be recalled. Bound rollout expectations by TTLs or use a separately
+reviewed signed-URL version/cache-busting transition.
 
 ### `[[proxy.asset_routes]]`
 
