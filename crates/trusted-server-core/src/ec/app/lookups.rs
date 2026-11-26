@@ -360,15 +360,8 @@ impl IdentityApp {
             return;
         }
         let results = lookups.coordinator.collect(&transport, pending).await;
-        let outcome = commit_after_response_lookups(
-            &graph,
-            permit,
-            self.partners(),
-            &lookups.ec_id,
-            &results,
-        )
-        .await;
-        log::info!("After-response lookups: write outcome={outcome}");
+        commit_after_response_lookups(&graph, permit, self.partners(), &lookups.ec_id, &results)
+            .await;
     }
 }
 

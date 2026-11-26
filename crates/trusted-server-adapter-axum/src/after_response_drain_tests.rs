@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +37,8 @@ use trusted_server_core::ec::current_timestamp;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use trusted_server_core::ec::kv_backend::{
-    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    EcKvLookup, EcKvPlan, EcKvStore, EcKvUpdate, EcKvUpdateError, EcKvUpdateOutcome, EcKvWrite,
+    EcKvWriteMode, EcKvWriteOutcome,
 };
 use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
@@ -183,6 +185,67 @@ impl EcKvStore for FixtureStore {
                 .expect("should record guarded update");
         }
         Ok(EcKvWriteOutcome::Written)
+    }
+
+    // The follow-up write goes through update. Keep it on this fixture's own
+    // guarded insert, where its markers and held write live, with EdgeZero's
+    // RecordHandle::update contract: read, plan, write under the read
+    // generation, and re-read after a lost precondition.
+    async fn update(&self, key: &str, attempts: NonZeroU8, plan: &mut EcKvPlan<'_>) -> EcKvUpdate {
+        let mut conflicts = 0_u8;
+        let mut rejected: Option<Option<u64>> = None;
+        for _ in 0..attempts.get() {
+            let current = match self.lookup(key).await {
+                Ok(current) => current,
+                Err(error) => {
+                    return EcKvUpdate {
+                        conflicts,
+                        result: Err(EcKvUpdateError::Store(error)),
+                    };
+                }
+            };
+            let read = current.as_ref().map(|row| row.generation);
+            if rejected.is_some_and(|lost| read.is_none() || read == lost) {
+                return EcKvUpdate {
+                    conflicts,
+                    result: Ok(EcKvUpdateOutcome::StaleRead),
+                };
+            }
+            let Some(replacement) = plan(current.as_ref()) else {
+                return EcKvUpdate {
+                    conflicts,
+                    result: Ok(EcKvUpdateOutcome::Skipped),
+                };
+            };
+            let write = EcKvWrite {
+                body: &replacement.body,
+                metadata: &replacement.metadata,
+                ttl: replacement.ttl,
+                mode: read.map_or(EcKvWriteMode::Add, EcKvWriteMode::IfGenerationMatch),
+            };
+            match self.insert(key, write).await {
+                Ok(EcKvWriteOutcome::Written) => {
+                    return EcKvUpdate {
+                        conflicts,
+                        result: Ok(EcKvUpdateOutcome::Written),
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    conflicts = conflicts.saturating_add(1);
+                    rejected = Some(read);
+                }
+                Err(error) => {
+                    return EcKvUpdate {
+                        conflicts,
+                        result: Err(EcKvUpdateError::Store(error)),
+                    };
+                }
+            }
+        }
+        EcKvUpdate {
+            conflicts,
+            result: Ok(EcKvUpdateOutcome::Conflict),
+        }
     }
 
     async fn list_keys_with_prefix(

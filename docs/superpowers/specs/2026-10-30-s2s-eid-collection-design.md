@@ -227,8 +227,28 @@ browser             TS (navigation)                          providers   KV
   phase skips the read and the write and logs `unchanged`. A remembered
   opt-out clears only sources the row still stores.
 - The write is a compare-and-swap on the generation read just before it. On
-  conflict the results are dropped; the source stays due and is retried on the
-  next navigation.
+  conflict the row is read again and the update re-planned against it once,
+  never resending the stale plan: results superseded by a provider opt-out
+  recorded since dispatch are discarded, and a row missing or withdrawn at the
+  re-read is skipped. A row withdrawn and given consent again before that read
+  is not detected, on either attempt (#1664). The bounded re-read, re-plan and
+  conditional write is EdgeZero's `RecordHandle::update`, which
+  `KvIdentityGraph` calls through `EcKvStore::update` with its own planner.
+  The graph spends the `AfterResponseWrite` permit before that call and makes
+  it once; the permit never leaves the graph, a conflicting attempt writes
+  nothing, and the loop stops at the first write that lands, so at most one
+  follow-up update lands. A store without that operation reports
+  `Unsupported`, and the graph falls back to last-write-wins: one read, one
+  plan and one unconditional overwrite. If the retry also conflicts, the results
+  are dropped as `conflict`. The lost CAS proves the row exists at a newer
+  generation, so a re-read that returns the generation that just lost or no
+  row at all is a stale read of an eventually consistent store: no second
+  write is made and the results are dropped as `stale_read`. Generations are
+  unique but not ordered, so an older generation cannot be detected; a write
+  planned on one loses its CAS. In each case the source stays due and is
+  retried on the next navigation. `no_row` means only a missing or withdrawn
+  row at the first read, or a row withdrawn at the re-read, and a failed read
+  is reported as `failed`.
 - Results are not mirrored in the already-sent response. They are served from
   KV from the next page load. A browser fallback UID for an owned source is
   replaced by the provider's UID, as in §8.3.
@@ -1519,6 +1539,8 @@ pub struct PageLoadWrite(());
 //     -> Option<(PageLoadWrite, AfterResponseWrite)>;
 
 /// Proof for the one follow-up update; consumed by `commit_after_response_lookups`.
+/// The graph spends it before its first read and makes the retry after a
+/// conflict under it; at most one follow-up write lands.
 #[derive(Debug)]
 pub struct AfterResponseWrite(());
 
@@ -1581,7 +1603,9 @@ PR5 removes it.
 | All providers fail                                  | The write proceeds if browser ingest changed anything; otherwise no write.                                                 |
 | Coordinator budget exceeded                         | Late responses dropped; the response is never held past the budget.                                                        |
 | After-response row missing, withdrawn or EC changed | Nothing written (`no_row`); results dropped.                                                                               |
-| After-response write conflict                       | Results dropped; the source stays due and is retried on the next navigation. The sent response is unaffected.              |
+| After-response row read or write fails              | Nothing written (`failed`); results dropped. A store error is not retried.                                                 |
+| After-response write conflict                       | One re-read and re-plan; if that conflicts too, results dropped and the source stays due. The sent response is unaffected. |
+| After-response re-read is stale                     | No second write (`stale_read`): the re-read returned the lost generation or no row. Results dropped; the source stays due. |
 
 Failed lookups are retried only by a later navigation where the source is
 still due.
@@ -1770,9 +1794,10 @@ Per provider and navigation, one outcome: `found`, `no_match`, `timeout`,
 outcome label in PR A: a skipped write is logged with its error (a conflict,
 an existing row or a store error), and an update without a generation is
 logged as `no_generation`. A navigation that runs the after-response phase
-(§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`
-or `failed`. The outcome log holds the provider ID, the outcome and the kept
-and dropped totals; other logs hold the EC ID only in its existing truncated
+(§5.2.1) logs one write outcome: `written`, `unchanged`, `no_row`, `conflict`,
+`stale_read` or `failed`, with `conflicts`, the number of its attempts (0–2)
+that lost their CAS. The outcome log holds the provider ID, the outcome and
+the kept and dropped totals; other logs hold the EC ID only in its existing truncated
 form. Raw UIDs, EID values and encrypted envelopes are never logged. The
 hashed-email call (§8.7) logs one debug line per navigation that makes it,
 with the reply status or the transport error only; the hashed email and the
@@ -1933,8 +1958,11 @@ request the units are separate, ordered commits so they stay reviewable.
     them.
 23. **After-response on a withdrawn or changed row.** The row is tombstoned,
     or written by another request, between the page write and B's result. →
-    No row is created or revived; on a generation conflict B's results are
-    dropped and B is asked again on the next navigation.
+    No row is created or revived; on a generation conflict the row is read
+    again and B's results re-planned against it once, so a tombstoned row is
+    skipped; if the retry also conflicts (`conflict`), or the re-read returns
+    the generation that lost or no row (`stale_read`), B's results are dropped
+    without a second write and B is asked again on the next navigation.
 24. **Provider refresh.** A provider-written UID is live until 5000 and holds
     refresh state with `from` 900; the navigation is at 1000 and the request carries no usable vendor
     cookie. → The source is

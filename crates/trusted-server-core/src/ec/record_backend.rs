@@ -4,18 +4,23 @@
 //! graph retains entry validation and caller-specific conflict/recovery policy.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU8;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::key_value_store::{KvError, KvHandle};
 use edgezero_core::record_store::{
-    RecordGeneration, RecordHandle, RecordKeyLayout, RecordLayout, RecordWrite, RecordWriteMode,
-    RecordWriteOutcome,
+    Record, RecordGeneration, RecordHandle, RecordKeyLayout, RecordLayout, RecordReplacement,
+    RecordUpdateOutcome, RecordWrite, RecordWriteMode, RecordWriteOutcome,
 };
 use error_stack::Report;
 
 use super::kv::WITHDRAWAL_MARKER_PREFIX;
-use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
+use super::kv_backend::{
+    EcKvLookup, EcKvPlan, EcKvStore, EcKvUpdate, EcKvUpdateError, EcKvUpdateOutcome, EcKvWrite,
+    EcKvWriteMode, EcKvWriteOutcome,
+};
 use crate::error::TrustedServerError;
 
 /// Stable placement for EC roots and withdrawal-completion markers.
@@ -113,13 +118,7 @@ impl EcKvStore for RecordEcKvStore {
         self.records
             .lookup(key)
             .await
-            .map(|record| {
-                record.map(|value| EcKvLookup {
-                    body: value.body.to_vec(),
-                    metadata: value.metadata.map(String::into_bytes),
-                    generation: value.generation.as_u64(),
-                })
-            })
+            .map(|record| record.as_ref().map(ec_lookup))
             .map_err(|error| store_error(&self.store_name, &error))
     }
 
@@ -158,6 +157,36 @@ impl EcKvStore for RecordEcKvStore {
                 RecordWriteOutcome::PreconditionFailed => EcKvWriteOutcome::PreconditionFailed,
             })
             .map_err(|error| store_error(&self.store_name, &error))
+    }
+
+    async fn update(&self, key: &str, attempts: NonZeroU8, plan: &mut EcKvPlan<'_>) -> EcKvUpdate {
+        let update = self
+            .records
+            .update(key, attempts, |current: Option<&Record>| {
+                plan(current.map(ec_lookup).as_ref())
+                    .map(|replacement| RecordReplacement {
+                        body: Bytes::from(replacement.body),
+                        metadata: Some(replacement.metadata),
+                        ttl: Some(replacement.ttl),
+                    })
+                    .ok_or(())
+            })
+            .await;
+        let result = match update.result {
+            Ok(RecordUpdateOutcome::Written) => Ok(EcKvUpdateOutcome::Written),
+            Ok(RecordUpdateOutcome::Skipped(())) => Ok(EcKvUpdateOutcome::Skipped),
+            Ok(RecordUpdateOutcome::Conflict) => Ok(EcKvUpdateOutcome::Conflict),
+            Ok(RecordUpdateOutcome::StaleRead) => Ok(EcKvUpdateOutcome::StaleRead),
+            Err(KvError::Unsupported { .. }) => Err(EcKvUpdateError::Unsupported),
+            Err(error) => Err(EcKvUpdateError::Store(store_error(
+                &self.store_name,
+                &error,
+            ))),
+        };
+        EcKvUpdate {
+            conflicts: update.conflicts,
+            result,
+        }
     }
 
     async fn list_keys_with_prefix(
@@ -316,6 +345,16 @@ impl EcKvStore for LazyRecordEcKvStore {
         self.store()?.insert(key, write).await
     }
 
+    async fn update(&self, key: &str, attempts: NonZeroU8, plan: &mut EcKvPlan<'_>) -> EcKvUpdate {
+        match self.store() {
+            Ok(store) => store.update(key, attempts, plan).await,
+            Err(report) => EcKvUpdate {
+                conflicts: 0,
+                result: Err(EcKvUpdateError::Store(report)),
+            },
+        }
+    }
+
     async fn list_keys_with_prefix(
         &self,
         prefix: &str,
@@ -334,6 +373,14 @@ impl EcKvStore for LazyRecordEcKvStore {
 
     async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
         self.store()?.delete(key).await
+    }
+}
+
+fn ec_lookup(record: &Record) -> EcKvLookup {
+    EcKvLookup {
+        body: record.body.to_vec(),
+        metadata: record.metadata.clone().map(String::into_bytes),
+        generation: record.generation.as_u64(),
     }
 }
 
