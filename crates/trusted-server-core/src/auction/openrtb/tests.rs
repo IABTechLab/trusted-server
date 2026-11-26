@@ -1053,6 +1053,115 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
 }
 
 #[test]
+fn openrtb_shared_types_preserves_configured_standard_extensions() {
+    for prebid in [
+        json!(null),
+        json!(false),
+        json!(17),
+        json!("opaque"),
+        json!(["opaque"]),
+        json!({"custom": "opaque"}),
+    ] {
+        let request_ext = json!({"prebid": prebid, "custom": {"enabled": true}});
+        let imp_ext = json!({"prebid": prebid, "custom": [null, "value"]});
+        let request = build(
+            "standard",
+            json!({"request_ext": request_ext, "imp_ext": imp_ext}),
+            None,
+        );
+
+        let wire = serde_json::to_value(&request).expect("should serialize standard request");
+
+        assert_eq!(
+            wire.get("ext"),
+            Some(&request_ext),
+            "should preserve configured request extensions for prebid={prebid}"
+        );
+        let impressions = wire["imp"].as_array().expect("should emit impressions");
+        assert!(!impressions.is_empty(), "should retain a valid impression");
+        for impression in impressions {
+            assert_eq!(
+                impression.get("ext"),
+                Some(&imp_ext),
+                "should preserve configured impression extensions for prebid={prebid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn openrtb_shared_types_preserves_valid_sibling_without_bid_id() {
+    let (_plan, routed, _request) = standard_fixture();
+    for id in [None, Some(json!(null)), Some(json!("")), Some(json!(42))] {
+        let mut valid = json!({
+            "impid": "fictional-slot",
+            "price": 1.5,
+            "adm": "<div>Fictional ad</div>",
+            "w": 300.0,
+            "h": null,
+            "adomain": ["advertiser.example"],
+            "nurl": "https://notifications.example/win",
+            "burl": "https://notifications.example/bill",
+            "adid": "fictional-ad",
+            "crid": "fictional-creative",
+            "ext": {"unknown": {"private": "do-not-forward"}}
+        });
+        if let Some(id) = &id {
+            valid["id"] = id.clone();
+        }
+        let wire = json!({"id": "unrelated-response", "seatbid": [{
+            "seat": "fictional-seat",
+            "bid": [valid, {"id": "malformed", "impid": "fictional-slot", "price": "invalid"}]
+        }]});
+
+        let response =
+            extract_standard_response("fictional-provider", &routed.inputs()[0], &wire, 9);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Success,
+            "should admit valid bid for id={id:?}"
+        );
+        assert_eq!(
+            response.bids.len(),
+            1,
+            "should retain only the valid sibling for id={id:?}"
+        );
+        assert_eq!(
+            response.bids[0].returned_seat.as_deref(),
+            Some("fictional-seat"),
+            "should retain the upstream seat independently of serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&response.bids[0]).expect("should serialize admitted bid"),
+            json!({
+                "slot_id": "fictional-slot",
+                "price": 1.5,
+                "currency": "USD",
+                "creative": "<div>Fictional ad</div>",
+                "adomain": ["advertiser.example"],
+                "bidder": "fictional-seat",
+                "width": 300,
+                "height": 250,
+                "nurl": "https://notifications.example/win",
+                "burl": "https://notifications.example/bill",
+                "ad_id": "fictional-ad",
+                "creative_id": "fictional-creative",
+                "cache_id": null,
+                "cache_host": null,
+                "cache_path": null,
+                "metadata": {}
+            }),
+            "should preserve the complete admitted projection without inventing an ID or forwarding extensions"
+        );
+        assert_eq!(
+            response.metadata["response_admission"]["rejected_bid_count"], 1,
+            "should account for the malformed sibling"
+        );
+    }
+}
+
+#[test]
 fn standard_response_extraction_isolates_malformed_siblings_and_ignores_response_id() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(

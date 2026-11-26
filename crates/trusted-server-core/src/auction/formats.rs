@@ -1268,6 +1268,86 @@ mod tests {
     }
 
     #[test]
+    fn openrtb_shared_types_preserves_direct_response_wire() {
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = false;
+        settings.auction.rewrite_clicks = Some(false);
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "fictional-bidder", Some(2.75));
+        bid.bid_id = None;
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, true)
+            .expect("should convert populated direct response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
+        assert_eq!(
+            response.headers().get(&HEADER_X_TS_EC_CONSENT),
+            Some(&HeaderValue::from_static("ok")),
+            "should preserve consent header"
+        );
+        assert_eq!(
+            response_json(response),
+            json!({
+                "id": "auction-1",
+                "seatbid": [{
+                    "seat": "fictional-bidder",
+                    "bid": [{
+                        "id": "fictional-bidder-div-gpt-top",
+                        "impid": "div-gpt-top",
+                        "price": 2.75,
+                        "adm": "<div>Ad</div>",
+                        "crid": "fictional-bidder-creative",
+                        "w": 300,
+                        "h": 250,
+                        "adomain": ["advertiser.example.com"]
+                    }]
+                }],
+                "ext": {"orchestrator": {
+                    "strategy": "parallel_only",
+                    "providers": 1,
+                    "total_bids": 1,
+                    "time_ms": 50,
+                    "provider_details": [{
+                        "name": "prebid",
+                        "status": "success",
+                        "bid_count": 1,
+                        "bidders": ["fictional-bidder"],
+                        "time_ms": 42
+                    }]
+                }}
+            }),
+            "should preserve full direct output, including omitted currency and existing output ID fallback"
+        );
+    }
+
+    #[test]
+    fn openrtb_shared_types_preserves_empty_direct_response_wire() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert empty direct response");
+
+        assert_eq!(
+            response_json(response),
+            json!({
+                "id": "auction-1",
+                "ext": {"orchestrator": {
+                    "strategy": "parallel_only",
+                    "providers": 0,
+                    "total_bids": 0,
+                    "time_ms": 10,
+                    "provider_details": []
+                }}
+            }),
+            "should omit empty seatbids and absent currency without adding no-bid defaults"
+        );
+    }
+
+    #[test]
     fn convert_to_openrtb_response_serializes_winning_bid_and_orchestrator_ext() {
         let settings = make_settings();
         let auction_request = make_auction_request();
