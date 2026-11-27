@@ -22,10 +22,12 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::sharedid::SharedIdStorage;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
+use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
@@ -3869,6 +3871,7 @@ impl Settings {
             handler.prepare_runtime()?;
         }
 
+        let sharedid_storage = self.sharedid_storage();
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3881,11 +3884,18 @@ impl Settings {
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
-            co.validate_runtime().map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("Invalid creative opportunity slot config: {err}"),
+            co.validate_runtime()
+                .and_then(|()| {
+                    crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
+                        co.template_cache_key_cookies(),
+                        sharedid_storage.cookie_name(),
+                    )
                 })
-            })?;
+                .map_err(|err| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("Invalid creative opportunity slot config: {err}"),
+                    })
+                })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -4235,6 +4245,27 @@ impl Settings {
         T: IntegrationConfig,
     {
         self.integrations.get_typed(integration_id)
+    }
+
+    /// Returns where Prebid keeps the `SharedID`, from the `sharedId` entry
+    /// of `integrations.prebid.managed_user_ids`.
+    ///
+    /// Parses the Prebid configuration on every call, so callers on a hot
+    /// path resolve it once at startup. An unreadable Prebid configuration
+    /// counts as [`SharedIdStorage::Unconfigured`].
+    #[must_use]
+    pub fn sharedid_storage(&self) -> SharedIdStorage {
+        match self.integration_config::<PrebidIntegrationConfig>("prebid") {
+            Ok(prebid) => SharedIdStorage::from_managed_user_ids(
+                prebid
+                    .as_ref()
+                    .map_or(&[][..], |prebid| prebid.managed_user_ids.as_slice()),
+            ),
+            Err(report) => {
+                log::warn!("SharedID: Prebid config unreadable: {report}");
+                SharedIdStorage::Unconfigured
+            }
+        }
     }
 }
 

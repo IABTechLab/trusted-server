@@ -508,7 +508,11 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::AdminEidsLookup => {
                         let partner_registry = PartnerRegistry::from_ec(&state.settings.ec)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
+                        handle_admin_eids_lookup(
+                            &partner_registry,
+                            state.settings.sharedid_storage().cookie_name(),
+                            &req,
+                        )
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Identify => answer_identify_locally(&state.settings, &req),

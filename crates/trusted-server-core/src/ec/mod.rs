@@ -59,6 +59,7 @@ pub mod prebid_eids;
 pub mod provider;
 pub mod rate_limiter;
 pub mod registry;
+pub mod sharedid;
 pub mod write_plan;
 
 /// Characters of an identifier kept when redacting it for a log.
@@ -1070,7 +1071,7 @@ mod tests {
             &registry::PartnerRegistry::empty(),
             &crate::ec::finalize::FinalizeRequest {
                 eids_cookie: None,
-                sharedid_cookie: None,
+                sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
                 now: Some(crate::ec::eid_types::UnixSeconds::new(
                     crate::ec::current_timestamp(),
                 )),

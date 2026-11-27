@@ -609,8 +609,13 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request()?;
-                let result = PartnerRegistry::from_ec(&s.settings.ec)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
+                let result = PartnerRegistry::from_ec(&s.settings.ec).and_then(|registry| {
+                    handle_admin_eids_lookup(
+                        &registry,
+                        s.settings.sharedid_storage().cookie_name(),
+                        &req,
+                    )
+                });
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }
         };
