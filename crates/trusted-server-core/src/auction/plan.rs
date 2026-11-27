@@ -190,7 +190,10 @@ pub struct AuctionPlanConfig {
     /// Auction-wide logical timeout.
     pub timeout_ms: u32,
     /// Operator-defined provider instances.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::auction_config_types::deserialize_provider_map"
+    )]
     pub providers: BTreeMap<ProviderId, ProviderConfig>,
     /// Client bidder-to-provider routes.
     #[serde(default)]
