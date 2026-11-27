@@ -275,14 +275,13 @@ pub fn build_runtime_services(
 ///
 /// `cf-ipcountry` is available on all plans. `cf-ipcity`, `cf-ipcontinent`,
 /// `cf-iplatitude`, and `cf-iplongitude` require an Enterprise plan. Absent or
-/// unparseable values default to empty strings or `0.0`. Country code `XX`
-/// (Cloudflare's "unknown" sentinel) is treated as absent.
+/// unparseable values are absent. Coordinates are available only when both
+/// values parse. Country code `XX` is treated as absent.
 struct CloudflareGeo {
     country: String,
-    city: String,
-    continent: String,
-    latitude: f64,
-    longitude: f64,
+    city: Option<String>,
+    continent: Option<String>,
+    coordinates: Option<trusted_server_core::platform::GeoCoordinates>,
 }
 
 impl PlatformGeo for CloudflareGeo {
@@ -294,9 +293,8 @@ impl PlatformGeo for CloudflareGeo {
             city: self.city.clone(),
             country: self.country.clone(),
             continent: self.continent.clone(),
-            latitude: self.latitude,
-            longitude: self.longitude,
-            metro_code: 0,
+            coordinates: self.coordinates,
+            metro_code: None,
             region: None,
             asn: None,
         }))
@@ -314,29 +312,32 @@ fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
     let city = headers
         .get("cf-ipcity")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let continent = headers
         .get("cf-ipcontinent")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let latitude = headers
         .get("cf-iplatitude")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
+        .and_then(|s| s.parse::<f64>().ok());
     let longitude = headers
         .get("cf-iplongitude")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
+        .and_then(|s| s.parse::<f64>().ok());
+    let coordinates = latitude.zip(longitude).map(|(latitude, longitude)| {
+        trusted_server_core::platform::GeoCoordinates {
+            latitude,
+            longitude,
+        }
+    });
     CloudflareGeo {
         country,
         city,
         continent,
-        latitude,
-        longitude,
+        coordinates,
     }
 }
 
@@ -391,6 +392,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
+    use trusted_server_core::consent::jurisdiction::{Jurisdiction, detect_jurisdiction};
+    use trusted_server_core::consent::{
+        ConsentContext, allows_ec_creation, consent_allows_server_side_auction,
+    };
+    use trusted_server_core::consent_config::ConsentConfig;
 
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
@@ -615,15 +621,133 @@ mod tests {
             .expect("should perform geo lookup")
             .expect("should return GeoInfo when country is set");
         assert_eq!(info.country, "US", "should populate country");
-        assert_eq!(info.city, "New York", "should populate city");
-        assert_eq!(info.continent, "NA", "should populate continent");
-        assert!(
-            (info.latitude - 40.71).abs() < 0.01,
-            "should populate latitude"
+        assert_eq!(
+            info.city.as_deref(),
+            Some("New York"),
+            "should populate city"
         );
-        assert!(
-            (info.longitude - (-74.01)).abs() < 0.01,
-            "should populate longitude"
+        assert_eq!(
+            info.continent.as_deref(),
+            Some("NA"),
+            "should populate continent"
         );
+        let coordinates = info.coordinates.expect("should populate coordinate pair");
+        assert_eq!(
+            coordinates.latitude, 40.71,
+            "should retain the supplied cf-iplatitude value"
+        );
+        assert_eq!(
+            coordinates.longitude, -74.01,
+            "should retain the supplied cf-iplongitude value"
+        );
+    }
+
+    #[test]
+    fn build_geo_country_projection_preserves_core_consent_policy() {
+        let config = ConsentConfig::default();
+        let expected = vec![
+            (Some("US"), Jurisdiction::NonRegulated, true, true),
+            (Some("XK"), Jurisdiction::NonRegulated, true, true),
+            (Some("T1"), Jurisdiction::NonRegulated, true, true),
+            (Some("JP"), Jurisdiction::NonRegulated, true, true),
+            (Some("DE"), Jurisdiction::Gdpr, false, false),
+            (Some("GB"), Jurisdiction::Gdpr, false, false),
+            (Some("XX"), Jurisdiction::Unknown, false, false),
+            (None, Jurisdiction::Unknown, false, false),
+        ];
+        let actual: Vec<_> = expected
+            .iter()
+            .map(|(country, _, _, _)| {
+                let ctx = match country {
+                    Some(country) => make_ctx_with_header("cf-ipcountry", country),
+                    None => make_ctx_without_header(),
+                };
+                let geo = build_geo(&ctx)
+                    .lookup(None)
+                    .expect("should project Cloudflare country into Core GeoInfo");
+                if let Some(geo) = &geo {
+                    assert_eq!(
+                        geo,
+                        &GeoInfo::country_region(&geo.country, None),
+                        "should preserve country-only Cloudflare geography without inventing detail"
+                    );
+                }
+                let consent = ConsentContext {
+                    jurisdiction: detect_jurisdiction(geo.as_ref(), &config),
+                    ..ConsentContext::default()
+                };
+                assert!(
+                    consent.tcf.is_none() && !consent.gdpr_applies,
+                    "should not synthesize a TCF signal from Cloudflare geography"
+                );
+                (
+                    *country,
+                    consent.jurisdiction.clone(),
+                    consent_allows_server_side_auction(&consent),
+                    allows_ec_creation(&consent),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "should retain baseline jurisdiction, auction admission and EC creation policy for Cloudflare countries"
+        );
+    }
+
+    #[test]
+    fn build_geo_country_only_does_not_invent_detail() {
+        let ctx = make_ctx_with_header("cf-ipcountry", "US");
+        let info = build_geo(&ctx)
+            .lookup(None)
+            .expect("should look up geo")
+            .expect("should have country");
+        assert_eq!(
+            info,
+            GeoInfo::country_region("US", None),
+            "should project a country-only US header without inventing optional Geo detail"
+        );
+    }
+
+    #[test]
+    fn build_geo_requires_both_parseable_coordinates_and_preserves_zero() {
+        for (latitude, longitude, has_coordinates) in [
+            (None, None, false),
+            (Some("0"), None, false),
+            (None, Some("0"), false),
+            (Some("bad"), Some("0"), false),
+            (Some("0"), Some("bad"), false),
+            (Some("0"), Some("0"), true),
+        ] {
+            let mut builder = request_builder()
+                .uri("https://example.com/")
+                .header("cf-ipcountry", "US");
+            if let Some(value) = latitude {
+                builder = builder.header("cf-iplatitude", value);
+            }
+            if let Some(value) = longitude {
+                builder = builder.header("cf-iplongitude", value);
+            }
+            let request = builder
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let ctx = RequestContext::new(request, PathParams::default());
+            let info = build_geo(&ctx)
+                .lookup(None)
+                .expect("should look up geo")
+                .expect("should have country");
+            assert_eq!(
+                info.coordinates.is_some(),
+                has_coordinates,
+                "should require both parseable coordinates for latitude {latitude:?} and longitude {longitude:?}"
+            );
+            if has_coordinates {
+                assert_eq!(
+                    info.coordinates_string().as_deref(),
+                    Some("0,0"),
+                    "should preserve supplied zero coordinates for latitude {latitude:?} and longitude {longitude:?}"
+                );
+            }
+        }
     }
 }
