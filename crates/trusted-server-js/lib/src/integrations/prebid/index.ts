@@ -175,8 +175,6 @@ const MANAGED_USER_IDS_SET_CONFIG_SENTINEL = '__tsManagedUserIdsSetConfigInstall
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
-  /** Integration behavior. Defaults to auction. */
-  mode?: 'auction' | 'identity';
   /** Auction endpoint path. Defaults to '/auction'. */
   endpoint?: string;
   /** Server-side bid timeout in milliseconds. Defaults to 1000. */
@@ -190,6 +188,10 @@ export interface PrebidNpmConfig {
  * Set by the Rust IntegrationHeadInjector from trusted-server.toml values.
  */
 interface InjectedPrebidConfig {
+  /**
+   * Integration behavior. Defaults to auction. Server-owned: the self-install
+   * and the GPT refresh handler both read it here, so it is not a JS override.
+   */
   mode?: 'auction' | 'identity';
   accountId?: string;
   timeout?: number;
@@ -2042,6 +2044,9 @@ function installApsBidResponseRegistry(): void {
  * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
  * 2. `config` argument — explicit overrides from the publisher's JS
  *
+ * The mode comes only from `window.__tsjs_prebid`. The module-load refresh
+ * handler decision reads the same value, so the two cannot disagree.
+ *
  * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
  * repeat calls (double script inclusion, a bundle that still carries a
  * baked-in shim) a no-op instead of installing either mode twice.
@@ -2071,7 +2076,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   warnedMissingUserIdManifest = false;
   const injected = getInjectedConfig();
   const merged: PrebidNpmConfig = {
-    mode: config?.mode ?? injected?.mode,
     endpoint: config?.endpoint,
     timeout: config?.timeout ?? injected?.timeout,
     debug: config?.debug ?? injected?.debug,
@@ -2375,7 +2379,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     }
   }
 
-  if (merged.mode === 'identity') {
+  if (injected?.mode === 'identity') {
     const originalRequestBids = pbjs.requestBids;
     pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
       trySeedManagedUserIds?.();

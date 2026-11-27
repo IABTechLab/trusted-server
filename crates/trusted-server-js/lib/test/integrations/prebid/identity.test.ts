@@ -497,3 +497,44 @@ describe('identity-only Prebid integration', () => {
     expect(() => prebid.requestBids()).toThrow(failure);
   });
 });
+
+describe('server-owned Prebid mode', () => {
+  // A stable pubads object, unlike the shared fixture, so a wrapped refresh
+  // stays observable after the module's self-initialization.
+  let pubads: { refresh: unknown; __tsRefreshWrapped?: boolean };
+  let publisherRefresh: ReturnType<typeof vi.fn>;
+
+  async function selfInitialize(mode: 'auction' | 'identity') {
+    window.dispatchEvent(new PageTransitionEvent('pagehide'));
+    delete page.__tsjsPrebidShimInstalled;
+    vi.resetModules();
+    prebid = mockPrebid();
+    original = prebid.requestBids;
+    page.pbjs = prebid;
+    page.__tsjs_prebid = { mode };
+    publisherRefresh = vi.fn();
+    pubads = { refresh: publisherRefresh };
+    page.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+    return (await import('../../../src/integrations/prebid/index')).installPrebidNpm;
+  }
+
+  it('installs the GPT refresh handler for server-selected auction mode', async () => {
+    await selfInitialize('auction');
+    expect(pubads.__tsRefreshWrapped).toBe(true);
+    expect(pubads.refresh).not.toBe(publisherRefresh);
+  });
+
+  it('leaves GPT refresh untouched for server-selected identity mode', async () => {
+    await selfInitialize('identity');
+    expect(pubads.__tsRefreshWrapped).toBeUndefined();
+    expect(pubads.refresh).toBe(publisherRefresh);
+  });
+
+  it('ignores a mode passed through the JS config', async () => {
+    const reinstall = await selfInitialize('auction');
+    prebid.registerBidAdapter.mockClear();
+    delete page.__tsjsPrebidShimInstalled;
+    reinstall({ mode: 'identity' } as Parameters<typeof reinstall>[0]);
+    expect(prebid.registerBidAdapter).toHaveBeenCalled();
+  });
+});
