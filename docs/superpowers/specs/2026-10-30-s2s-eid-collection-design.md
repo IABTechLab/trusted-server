@@ -52,13 +52,12 @@ server-side collection, and both feed the same consent-gated KV row.
   source that requires a hashed email is skipped before any call, as in V1.
 - Proxying vendor identity JavaScript through TS.
 - Concrete vendor implementations (each gets its own spec, see §13.2 F1).
-- Adapters other than Fastly. Identity providers remain Fastly-only;
-  Cloudflare and Spin get this design when EC identity is ported to them.
-  Native (Axum) EC persistence, added separately, refuses to start with an
-  enabled provider. From #1566 up, native and Fastly EC follow the shared
-  async EC rules instead of this design's minting, collision and withdrawal
-  rules (§12.3 "EC minting" and "Withdrawal"); the single page-load write and
-  "backing row before cookie" still hold.
+- Cloudflare and Spin provider execution remains out of scope. Fastly and
+  Axum use the shared core identity app, including record persistence,
+  page-phase collection and after-response follow-up writes. Broader native
+  provider qualification remains #1581. Shared minting, collision and
+  withdrawal rules apply (§12.3); the single page-load write and backing row
+  before cookie still hold.
 - Cross-browser linking.
 - Vendor segment products and ad-server targeting.
 - Batch sync and admin write paths, except how batch sync treats a
@@ -80,7 +79,7 @@ These were agreed before drafting and are binding on the rest of the spec.
 
 | #   | Topic                     | Decision                                                                                                                                                                                                                                                                                                   |
 | --- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | Which request may write   | Only the top-level document navigation. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV, except that `/auction` saves its body EIDs to a live row (§5.4).                                                                                                                       |
+| D1  | Which request may write   | Eligible document navigations and admitted EC POSTs. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV, except that `/auction` saves its body EIDs to a live row (§5.4).                                                                                                          |
 | D2  | Provider timing           | Provider requests start when the navigation starts, run concurrently with the origin fetch, and are collected within a shared total budget of about 200 ms. Their results join the navigation's write.                                                                                                     |
 | D3  | Which navigations look up | Any navigation where an enabled provider has a due source (missing or expired UID). No-match results are not cached in V1.                                                                                                                                                                                 |
 | D4  | Failed write              | Not retried in that page load. KV and the mirror cookie stay unchanged. A new EC is not issued if its row was not created. The next navigation is a new page load and may write.                                                                                                                           |
@@ -102,14 +101,13 @@ These were agreed before drafting and are binding on the rest of the spec.
 
 Reviewers should check these; each follows from a decision above.
 
-- **Navigation test (D1).** A request is a page-load navigation when it is a
-  `GET` on the publisher-proxy route with `Sec-Fetch-Dest: document` and
-  `Sec-Fetch-Mode: navigate`, and its `Sec-Purpose` header, if any, has no
-  `prefetch` token. Requests without Fetch Metadata never write. A navigation
-  whose final response is a 301, 302, 303, 307 or 308 redirect does not write;
-  the redirect target is the page load. A `304` keeps the permit. This is stricter than the existing `is_navigation_request`
-  (which falls back to `Accept: text/html`); that helper keeps its other uses,
-  and the write permit uses the stricter test.
+- **Navigation test (D1).** Fastly and Axum use the shared method-neutral
+  publisher document policy: `Sec-Fetch-Dest: document`, or HTML `Accept`
+  when Fetch Metadata is absent, excluding prefetches and prerenders.
+  Positive identity output requires a nonredirect HTML/XHTML response or
+  document `304`; admitted same-origin EC POSTs have their own permit.
+  GET/HEAD asset-only proxy routes retain their no-identity-lifecycle contract.
+  Redirects drop dispatched page lookups without waiting on either adapter.
 - **Integration-proxy EC minting stops (D1).** Integration-proxy requests can no
   longer create a KV row, so they no longer mint a new EC. Today a new EC is
   only issued when its row exists, so this keeps that invariant.
@@ -119,15 +117,16 @@ Reviewers should check these; each follows from a decision above.
   cookie's EC ID and the active EC ID (when they differ), using a bounded CAS
   retry and, when a store listing proves the key exists, an unconditional
   tombstone. It serves no IDs and expires the mirror cookie, and it expires the
-  EC cookie only when every tombstone succeeded, so a failed write is retried on
-  the next request instead of orphaning the row. Deferring the tombstone to the
+  EC cookie immediately even if a tombstone fails. A failed authoritative
+  withdrawal is logged and the consent-update response reports 503. Deferring the tombstone to the
   next navigation would leave a withdrawn visitor's row live for as long as they
   only make non-navigation requests, which privacy does not allow.
 - **One owner per source (D8).** Config validation rejects two enabled providers
   claiming the same source, so "the owning provider" of a source is always
   unambiguous.
-- **No retry loops on the navigation write (D4).** Existing loops on this path
-  (EC-ID collision on create, orphan recovery) become a single attempt.
+- **No CAS retry loops on the navigation write (D4).** A changed row is not
+  overwritten by retrying a stale update. Create collisions and orphan recovery
+  may generate a fresh EC up to five times within the shared page-load operation.
 
 ## 4. Terms
 
@@ -238,9 +237,10 @@ browser             TS (navigation)                          providers   KV
 - Cost: the instance stays busy after the response for up to the
   after-response budget, which lowers per-instance throughput when sandboxes
   are reused. Keep the budget no larger than the slowest provider needs.
-- Only the Fastly adapter runs identity providers (§2.2). Other adapters
-  refuse to start with an enabled provider. Axum's after-response follow-up
-  writes (ID-5) are deferred to #1581.
+- Fastly and Axum run identity providers through the shared core app (§2.2).
+  Axum schedules bounded after-response work and drains it during shutdown;
+  broader provider qualification remains #1581. Cloudflare and Spin reject
+  enabled providers.
 - Cookie reads and generated IDs of an after-response provider also land only
   in the follow-up write, so cookie-only providers should stay `page`.
 
@@ -266,9 +266,11 @@ EIDs in the `/auction` body go to bidders on that request and are saved to the
 row under browser-ingest rules. They fill only partner UIDs the row lacks, never
 a provider-owned source, and only when consent allows EID persistence and the
 SharedID opt-out is absent. The save is one conditional write of its own
-(`KvIdentityGraph::commit_auction_ingest`), made only to a live row the request
+(`KvIdentityGraph::commit_auction_body`, called by the shared auction endpoint), made only to a live row the request
 read and only when something is missing; it never creates or recovers a row,
-and a conflict drops the EIDs without a retry. This does not break "a page load
+and a conflict drops the EIDs without a retry. Persistence happens before
+bidder dispatch, including when bidding is disabled; finalization never
+repeats the body write. This does not break "a page load
 writes the record once": `/auction` is not a page load, holds no page-load
 permit, and the navigation's own write is unchanged. The `/auction` request's
 `ts-eids` and `sharedId` cookies are still left to the next navigation.
@@ -1060,8 +1062,9 @@ unresolved as `Timeout` (every unresolved slot of a failed batch as `Send`). It
 adds no timing logic of its own. Dropping the pending batch cancels every lookup
 still in flight. On a navigation the request's own client starts the batch
 during routing; the batch stays bound to the serving callback's outbound scope
-and the handler gathers it once the response status is known, before the
-response reaches `finalize`. The batch is not `Send`, so only the gathered
+and the handler calls the shared `IdentityApp` collector once the response
+status is known, before the response reaches `finalize`. Redirects drop
+pending page lookups without waiting on both Fastly and Axum. The batch is not `Send`, so only the gathered
 results travel on, on the EC context. After-response lookups use the post-delivery
 client and clock.
 
@@ -1613,8 +1616,14 @@ still due.
 - **Set only on navigations (WB-1).** Identity cookies (`ts-ec`, `ts-eids`, the
   mirror) are set only on navigation and EC route responses, never on
   `/auction`, page-bids, asset or other API responses. Expiring one
-  (`Max-Age=0`, for a withdrawal or a mirror revocation) is allowed on any
-  response.
+  is allowed on any response already participating in identity finalization.
+  Only core-generated expiry cookies (`Max-Age=0` or a past expiry) survive
+  there, for `ts-ec`, the configured SharedID cookie and its `_cst` companion,
+  and `__Host-ts-eids-mirror`. Origin-supplied identity cookies are filtered;
+  positive identity cookies remain prohibited off eligible responses. Every
+  deletion response passes `enforce_set_cookie_cache_privacy` and remains
+  private without shared-cache directives. Asset-only streaming routes retain
+  their existing no-identity-lifecycle contract.
 - **Expired** (`Max-Age=0`) only when the request carried it: on any response
   where EID consent is absent or withdrawn, whatever happened to the KV write;
   on a navigation whose mirror would be empty, including one whose row is
@@ -1764,32 +1773,28 @@ reply body are never logged.
 
 PR A changes behaviour that operators and integrators can observe:
 
-- **EC minting.** A new EC is minted, and its row written, only on a
-  top-level publisher navigation: a `GET` with `Sec-Fetch-Dest: document`,
-  `Sec-Fetch-Mode: navigate`, no `prefetch` in `Sec-Purpose`, and a response
-  that is not a 301, 302, 303, 307 or 308 redirect. Clients without Fetch
-  Metadata get no EC, and integration proxies no longer mint one. From #1566
-  up the shared async EC rules apply instead: an EC is minted on any browser
-  document navigation (`Sec-Fetch-Dest: document`, or an `Accept` header
-  naming `text/html` without Fetch Metadata; Axum also requires `GET`), and
-  an ID collision on create or orphan recovery retries with a fresh ID, up to
-  five attempts, inside the navigation's one write.
+- **EC minting.** Fastly and Axum use the shared method-neutral browser
+  document policy: `Sec-Fetch-Dest: document`, or HTML `Accept` when Fetch
+  Metadata is absent, with prefetches and prerenders excluded. Positive
+  identity output requires a nonredirect HTML/XHTML response, a document
+  `304`, or an admitted EC POST. GET/HEAD asset proxy routes do not mint.
+  An ID collision on create or orphan recovery retries with a fresh ID,
+  up to five attempts, inside the navigation's one write.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
   until a later navigation finds its row. With an EC KV store, an EC goes to
   bidders as `user.id` only when the request read a consented row for it
-  (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
+  (#1549); without one (including Cloudflare and Spin) the consented EC is still sent.
 - **Browser EIDs.** Neither `/auction` nor page-bids writes `ts-eids` or
-  `sharedId`; the next navigation ingests those cookies. `/auction` still
+  `sharedId`; the next eligible document navigation or admitted EC POST
+  ingests those cookies. `/auction` still
   stores its body EIDs, as on main, filling missing partner UIDs of a live row
   in one conditional write (§5.4).
-- **Withdrawal.** The EC cookie is expired only once every tombstone is
-  written or the row is proven absent; while a tombstone fails, the cookie is
-  kept so the next request retries. On main the cookie was expired first.
-  From #1566 up the shared async EC rule applies instead: an explicit
-  withdrawal expires the cookie even when a tombstone fails, and the failure
-  is logged and marks the consent-update response failed (503).
-- **Vendor consent.** On Fastly, a provider's `tcf_vendor_id` gates every ID
+- **Withdrawal.** An explicit withdrawal expires the EC cookie on every
+  finalized response even when a tombstone fails. The failure is logged and
+  marks the consent-update response failed (503). Core-generated mirror and
+  configured SharedID revocation deletions follow WB-1 (§10).
+- **Vendor consent.** On Fastly and Axum, a provider's `tcf_vendor_id` gates every ID
   of its sources at egress, browser-supplied ones included, and keeps doing so
   while the provider is disabled (§8.6).
 - **Row size cap.** Rows are capped at 16 KiB (`MAX_ENTRY_BYTES`). Batch sync
@@ -2046,7 +2051,8 @@ combinations and adapter differences, on the tree after round 5's fix.
   partner; the page that sends it controls the request anyway.
 - Non-blocking, no change: only the Fastly adapter builds the registry with
   provider ownership and vendor gates (§12.3 "On Fastly"); per-adapter deploy
-  validation stays with #1552.
+  validation stays with #1552. Superseded by the shared Fastly/Axum identity
+  app, which now builds ownership and vendor gates for both adapters.
 
 ### Round 7 (2026-11-12, PR #1488 at 5d22274c1, Claude Code (Opus 5.5) review agent)
 
@@ -2117,4 +2123,5 @@ combinations, adapter differences and privacy leaks.
   expiring the mirror on every response; and the bot gate on pull sync.
 - Non-blocking, no change: pull sync and provider-written mirror contents
   exist only on Fastly; other adapters build the mirror from rows without
-  provider UIDs, so it stays unset there (§12.3 "On Fastly").
+  provider UIDs, so it stays unset there (§12.3 "On Fastly"). Superseded by
+  the shared Fastly/Axum identity app; both now support provider-written mirrors.

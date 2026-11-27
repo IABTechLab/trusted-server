@@ -8,7 +8,8 @@
 //!
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
 //!    when none exists and consent allows it. This is called only for
-//!    publisher navigations — never in integration proxies or read-only
+//!    publisher navigations or admitted EC POSTs — never in integration
+//!    proxies or read-only
 //!    endpoints like `/_ts/api/v1/identify`. The new row is written by the
 //!    navigation's single page-load write in finalize ([`page_load`]).
 //!
@@ -329,9 +330,9 @@ pub struct EcContext {
     recovery_eligible: bool,
     /// EIDs the route resolved from the current request: the `/auction` JSON
     /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
+    /// request-local identity consumers. Navigation finalization may ingest
+    /// these EIDs; explicit auction body persistence belongs to the shared
+    /// endpoint, independently of cookie fallback.
     client_eids: Option<Vec<Eid>>,
     /// Whether the request carried the retired pull-sync marker cookie.
     pull_marker_present: bool,
@@ -614,7 +615,8 @@ impl EcContext {
     }
 
     /// Records the current request's own EIDs (e.g. an `/auction` body) for
-    /// use by response finalization's KV ingestion.
+    /// request-local identity use. The auction endpoint persists its explicit
+    /// body separately; finalization never repeats that write.
     pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
         self.client_eids = Some(eids);
     }
@@ -679,6 +681,9 @@ impl EcContext {
     }
 
     /// Whether this request still holds its page-load write permit.
+    ///
+    /// Adapters use this shared decision to dispatch page providers and permit
+    /// orphan recovery before response finalization consumes the permit.
     #[must_use]
     pub fn has_navigation_permit(&self) -> bool {
         self.navigation_permit.0.is_some()

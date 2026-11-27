@@ -108,11 +108,11 @@ flowchart TD
 
 `POST /_ts/consent` requires a matching same-origin `Origin`. It accepts a bounded JSON snapshot containing `gppString` and `applicableSections`, not identity or partner credentials. Each request carries its own decision so a later cookie update cannot replace an intervening opt-out. It preserves other privacy inputs, including GPC. Missing GPP state is not fabricated into an opt-out or permission grant.
 
-The endpoint never creates or recovers identities, ingests EIDs, or restores a revoked row. Creation remains on eligible publisher navigation after consent cookies are available. This keeps an older grant response from recreating identity after withdrawal. Explicit withdrawal follows the existing server jurisdiction/consent policy and expires the HttpOnly EC cookie while tombstoning its stored identity.
+The endpoint never creates or recovers identities, ingests EIDs, or restores a revoked row. Creation occurs on eligible publisher navigation or an admitted EC POST after consent is available. This keeps an older grant response from recreating identity after withdrawal. Explicit withdrawal follows the existing server jurisdiction/consent policy and tombstones its stored identity. This compatibility endpoint does not issue identities. Explicit withdrawal expires the HttpOnly EC cookie on the same response as reconciliation, including when the tombstone write fails; it does not wait for a later document response.
 
 Only `204` confirms processing; generic publisher `200` responses do not. Store absence or a failed withdrawal write returns `503`. Responses are private and no-store. Fastly uses its EC identity graph; native reconciliation requires native EC persistence. Adapters without an identity graph reserve the path and report failure rather than forwarding its payload to the publisher. Network failures are reported without logging consent values and can retry on a later CMP or focus event.
 
-Deploy the server endpoint and persistence support before enabling capture. Reload already-open pages to load the new observer. Validate actual CMP readiness, same-tab opt-out, EC expiry, and the backing tombstone before treating withdrawal as verified.
+Deploy the server endpoint and persistence support before enabling capture. Reload already-open pages to load the new observer. Validate actual CMP readiness, same-tab opt-out, the backing tombstone, and EC expiry on the reconciliation response before treating withdrawal as verified.
 
 ## Cookie Forwarding and Caching
 

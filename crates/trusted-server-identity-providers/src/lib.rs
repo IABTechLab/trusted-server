@@ -343,6 +343,36 @@ fn build_phase_coordinator(
         .map(Some)
 }
 
+/// Builds provider coordinators shared by serving adapters.
+///
+/// # Errors
+///
+/// Returns a configuration error when an enabled provider cannot be constructed.
+pub fn identity_providers(
+    settings: &Settings,
+) -> Result<trusted_server_core::ec::app::IdentityProviders, Report<TrustedServerError>> {
+    let partners = Arc::new(partner_registry(&settings.ec)?);
+    let page = build_coordinator_with(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    let after_response = build_after_response_coordinator(settings, Arc::clone(&partners))
+        .map_err(|error| {
+            error.change_context(TrustedServerError::Configuration {
+                message: "identity provider configuration is invalid".to_owned(),
+            })
+        })?
+        .map(Arc::new);
+    Ok(trusted_server_core::ec::app::IdentityProviders {
+        partners,
+        page,
+        after_response,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

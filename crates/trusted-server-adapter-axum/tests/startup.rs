@@ -26,10 +26,6 @@ const EC_PASSPHRASE: &str = "native-fixture-passphrase-32-bytes-minimum";
 const SHORT_EC_PASSPHRASE: &str = "short-ec-fixture";
 const LEGACY_PREFIX: &str = "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_";
 
-/// Local route that runs the response middleware without reaching an origin:
-/// the TSJS handler answers an unknown bundle hash with `404`.
-const GEO_ROUTE: &str = "/static/tsjs=0000000000000000";
-
 #[cfg(feature = "celld-ec")]
 #[path = "support/celld.rs"]
 mod celld_fixture;
@@ -71,6 +67,10 @@ async fn real_celld_provider_prepares_from_published_envelope_and_fails_closed_o
     server.spawn(false, false);
     server.assert_failed_before_listen("startup kv: trusted_server_kv: provider unavailable");
 }
+
+/// Local route that runs the response middleware without reaching an origin:
+/// the TSJS handler answers an unknown bundle hash with `404`.
+const GEO_ROUTE: &str = "/static/tsjs=0000000000000000";
 
 struct ServerFixture {
     root: PathBuf,
@@ -168,6 +168,7 @@ impl ServerFixture {
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &self.root)
+            .env("EDGEZERO__ADAPTER__DATA_DIR", &self.root)
             .env("EDGEZERO__SECRETS__PROXY_KEY", PROXY_SECRET)
             .env("EDGEZERO__SECRETS__ADMIN_KEY", ADMIN_PASSWORD)
             // Valid legacy inputs: a fallback to them would let a missing
@@ -183,9 +184,7 @@ impl ServerFixture {
             .stderr(Stdio::piped());
         let bindings = self.root.join("record-bindings.toml");
         if bindings.is_file() {
-            command
-                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings)
-                .env("TRUSTED_SERVER__EC_RECORDS_ENABLED", "true");
+            command.env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
         }
         if let Some(profile) = profile {
             let path = self.root.join("native-geo.toml");
@@ -444,17 +443,21 @@ fn storage_envelope(storage: serde_json::Value) -> String {
 }
 
 #[test]
-fn active_legacy_ec_environment_cannot_disable_or_override_published_storage() {
+fn obsolete_ec_environment_does_not_select_or_override_declared_storage() {
     let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
     for envelope in [ENVELOPE, configured.as_str()] {
         let mut server = ServerFixture::new(Some(envelope));
         server.spawn_inputs(false, false, None, Some("true"));
-        server.assert_failed_before_listen("TRUSTED_SERVER__EC_DYNAMODB_ENABLED is obsolete");
+        server.wait_ready();
+        server.assert_logs_hold_no_secrets();
     }
 }
 
 #[test]
-fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
+fn unsupported_ec_storage_serves_the_failure_router_and_uncompiled_providers_fail_before_listen() {
+    // EC storage the application rejects follows the shared startup-failure
+    // contract; only provider preparation, which EdgeZero runs before the
+    // initializer, stops the process before it listens.
     let mut server = ServerFixture::new(Some(&storage_envelope(
         json!({"provider":"fastly","store":"exact-binding"}),
     )));
@@ -463,6 +466,13 @@ fn explicit_unsupported_and_uncompiled_ec_providers_fail_before_listen() {
 
     let configured = storage_envelope(json!({"provider":"records","store":"trusted_server_kv"}));
     let mut server = ServerFixture::new(Some(&configured));
+    server.spawn(false, false);
+    server.wait_ready();
+    server.assert_logs_hold_no_secrets();
+
+    let mut server = ServerFixture::new(Some(&storage_envelope(
+        json!({"provider":"records","store":"undeclared-identity"}),
+    )));
     server.spawn(false, false);
     server.assert_serves_failure_router("configured EC record store is not prepared");
 
@@ -486,6 +496,33 @@ fn selected_celld_captures_only_its_explicit_bootstrap_reference_before_network(
     server.record_binding(json!({"provider":"celld-records","endpoint":"https://127.0.0.1:7780","store":"identity","access":{"mode":"authenticated","token_env":"FIXTURE_MISSING_CELLD_TOKEN"}}));
     server.spawn(false, false);
     server.assert_failed_before_listen("celld token: configured value absent");
+}
+
+#[test]
+fn local_records_require_data_dir_even_without_identity_storage() {
+    // ENVELOPE deliberately omits ec.storage: declarations prepare before app config loads.
+    let mut server = ServerFixture::new(Some(ENVELOPE));
+    server.child = Some(
+        Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
+            .env_clear()
+            .env("EDGEZERO__LOGGING__LEVEL", "info")
+            .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
+            .env("EDGEZERO__ADAPTER__PORT", server.addr.port().to_string())
+            .env("EDGEZERO__ADAPTER__CONFIG_DIR", &server.root)
+            .env("EDGEZERO__SECRETS__PROXY_KEY", PROXY_SECRET)
+            .env("EDGEZERO__SECRETS__ADMIN_KEY", ADMIN_PASSWORD)
+            .env("EDGEZERO__SECRETS__EC_KEY", EC_PASSPHRASE)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("should spawn native startup without a data directory"),
+    );
+    server.assert_failed_before_listen("DATA_DIR: required for declared stores");
+
+    // The same no-identity config starts once its local provider has a writable root.
+    server.spawn(false, false);
+    server.wait_ready();
+    server.assert_logs_hold_no_secrets();
 }
 
 #[test]
@@ -1124,7 +1161,11 @@ mod managed_geo_consumers {
 fn handwritten_store_metadata_matches_the_manifest() {
     let manifest = include_str!("../../../edgezero.toml");
     let stores = TrustedServerApp::stores();
-    for (kind, metadata) in [("config", stores.config), ("secrets", stores.secrets)] {
+    for (kind, metadata) in [
+        ("config", stores.config),
+        ("secrets", stores.secrets),
+        ("kv", stores.kv),
+    ] {
         let StoreMetadata { default, ids } =
             metadata.expect("should declare required native store");
         let section = manifest
@@ -1144,6 +1185,28 @@ fn handwritten_store_metadata_matches_the_manifest() {
                 .filter_map(|(index, part)| (index % 2 == 1).then_some(part))
                 .collect()
         };
+        if kind == "kv" {
+            // The manifest declares every adapter's KV stores: Fastly and Spin's
+            // generic runtime store and the EC record store. Axum declares only
+            // the record store, so each of its KV IDs must be one the manifest
+            // declares.
+            let manifest_ids = quoted_values("ids");
+            assert!(
+                manifest_ids.contains(&default),
+                "should default to a KV store the manifest declares"
+            );
+            let undeclared: Vec<&str> = ids
+                .iter()
+                .copied()
+                .filter(|id| !manifest_ids.contains(id))
+                .collect();
+            assert_eq!(
+                undeclared,
+                Vec::<&str>::new(),
+                "should declare only KV stores the manifest declares"
+            );
+            continue;
+        }
         assert_eq!(
             quoted_values("default"),
             vec![default],
@@ -1165,7 +1228,4 @@ fn handwritten_store_metadata_matches_the_manifest() {
         DEFAULT_SECRET_STORE_ID,
         "should default to the core secret store id"
     );
-    assert!(stores.kv.is_none(), "should not prepare unused generic KV");
-    // The portable manifest may declare KV for other adapters. Native startup
-    // selects only its handwritten config/secret metadata above.
 }

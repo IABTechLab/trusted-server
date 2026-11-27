@@ -508,12 +508,6 @@ async fn missing_consent_unknown_geo_storage_failure_and_non_navigation_do_not_m
         "image".parse().expect("should set subresource destination"),
     );
     assert!(ec_cookie(&call(&app, asset).await).is_none());
-    let mut bot = request(Method::GET, "/article", None);
-    bot.headers_mut().insert(
-        header::USER_AGENT,
-        "curl/8.0".parse().expect("should set bot UA"),
-    );
-    assert!(ec_cookie(&call(&app, bot).await).is_none());
     let mut identify = request(Method::GET, "/_ts/api/v1/identify", None);
     identify.headers_mut().insert(
         header::AUTHORIZATION,
@@ -760,5 +754,227 @@ async fn graph_cluster_count_uses_a_complete_record_partition() {
             .expect("should query the complete IP partition"),
         2,
         "should exclude completion markers"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_app_batch_sync_updates_the_navigation_record() {
+    let store = Store::default();
+    let app = allowed_router(store.clone());
+    let issued = call(&app, request(Method::GET, "/article", None)).await;
+    let ec = ec_cookie(&issued).expect("should create a navigation identity");
+    let mut sync = request(Method::POST, "/_ts/api/v1/batch-sync", None);
+    sync.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer native-fixture-partner-token-32-bytes-minimum"
+            .parse()
+            .expect("should set partner token"),
+    );
+    *sync.body_mut() = Body::from(
+        serde_json::to_vec(&json!({"mappings":[{
+            "ec_id":ec,"partner_uid":"batch-local-uid","timestamp":1
+        }]}))
+        .expect("should encode batch"),
+    );
+    let response = call(&app, sync).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "should execute batch sync locally with the shared store"
+    );
+    assert!(
+        ec_cookie(&response).is_none(),
+        "should keep partner API cookie-free"
+    );
+    let stored = store
+        .lookup(&ec)
+        .await
+        .expect("should read store")
+        .expect("should retain navigation record");
+    let row: serde_json::Value =
+        serde_json::from_slice(&stored.body).expect("should decode record");
+    assert_eq!(
+        row["ids"]["partner.example.com"]["uid"], "batch-local-uid",
+        "should update the same authoritative record"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_creation_without_ja4_does_not_require_a_browser_user_agent() {
+    let store = Store::default();
+    let app = allowed_router(store.clone());
+    let mut navigation = request(Method::GET, "/article", None);
+    navigation.headers_mut().remove(header::USER_AGENT);
+    let response = call(&app, navigation).await;
+    let ec = ec_cookie(&response).expect("should issue identity when trusted JA4 is absent");
+    assert!(
+        store
+            .lookup(&ec)
+            .await
+            .expect("should read store")
+            .is_some(),
+        "should persist before issuance"
+    );
+}
+
+fn ec_post(cookie: Option<&str>) -> Request {
+    let mut req = request(Method::POST, "/_ts/api/v1/ec", cookie);
+    req.headers_mut().insert(
+        header::ORIGIN,
+        "http://test-publisher.example.com"
+            .parse()
+            .expect("should set same origin"),
+    );
+    *req.body_mut() =
+        Body::from(serde_json::to_vec(&json!({})).expect("should encode consent snapshot"));
+    req
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ec_route_creates_record_and_rejects_cross_origin_before_writes() {
+    let store = Store::default();
+    let app = allowed_router(store.clone());
+    let created = call(&app, ec_post(None)).await;
+    assert_eq!(created.status(), 200, "should answer the EC POST locally");
+    let ec = ec_cookie(&created).expect("should issue EC on its own response");
+    assert!(
+        store
+            .lookup(&ec)
+            .await
+            .expect("should read store")
+            .is_some(),
+        "should create backing row before response"
+    );
+    assert_eq!(
+        created
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .expect("should disable caching"),
+        "no-store, private",
+        "should keep EC response private"
+    );
+    let mut invalid = ec_post(None);
+    invalid.headers_mut().insert(
+        header::ORIGIN,
+        "https://other.example.com"
+            .parse()
+            .expect("should set cross origin"),
+    );
+    let denied = call(&app, invalid).await;
+    assert_eq!(denied.status(), 403, "should reject cross-origin minting");
+    assert!(
+        ec_cookie(&denied).is_none(),
+        "should not issue on rejection"
+    );
+    let get = call(&app, request(Method::GET, "/_ts/api/v1/ec", None)).await;
+    assert_eq!(get.status(), 204, "should answer GET without minting");
+    assert!(ec_cookie(&get).is_none(), "should never mint on pixel GET");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn identify_withdrawal_tombstones_and_expires_browser_ec() {
+    let store = Store::default();
+    let created = call(
+        &allowed_router(store.clone()),
+        request(Method::GET, "/article", None),
+    )
+    .await;
+    let ec = ec_cookie(&created).expect("should create live record");
+    let app = router(
+        store.clone(),
+        Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
+    );
+    let mut identify = request(
+        Method::GET,
+        "/_ts/api/v1/identify",
+        Some(&format!("ts-ec={ec}")),
+    );
+    identify
+        .headers_mut()
+        .insert("sec-gpc", "1".parse().expect("should request withdrawal"));
+    identify.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer native-fixture-partner-token-32-bytes-minimum"
+            .parse()
+            .expect("should authenticate partner"),
+    );
+    let denied = call(&app, identify).await;
+    assert_eq!(
+        denied.status(),
+        403,
+        "should refuse withdrawn identity lookup"
+    );
+    let cookies: Vec<_> = denied
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .collect();
+    assert_eq!(
+        cookies.len(),
+        1,
+        "should emit only EC withdrawal deletion on identify"
+    );
+    let deletion = cookies[0].to_str().expect("should decode EC deletion");
+    assert!(
+        deletion.starts_with("ts-ec=;") && deletion.contains("Max-Age=0"),
+        "should expire browser EC on the tombstoning response"
+    );
+    let row: serde_json::Value = serde_json::from_slice(
+        &store
+            .lookup(&ec)
+            .await
+            .expect("should read store")
+            .expect("should retain withdrawal record")
+            .body,
+    )
+    .expect("should decode record");
+    assert_eq!(
+        row["consent"]["ok"], false,
+        "should tombstone withdrawal on identify"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ec_withdrawal_storage_failure_is_not_acknowledged_as_success() {
+    let store = Store::default();
+    let created = call(
+        &allowed_router(store.clone()),
+        request(Method::GET, "/article", None),
+    )
+    .await;
+    let ec = ec_cookie(&created).expect("should create live record");
+    let app = router(
+        store.clone(),
+        Some(GeoInfo::country_region("US", Some("TN".to_owned()))),
+    );
+    store.fail_writes.store(true, Ordering::SeqCst);
+    let mut withdrawal = ec_post(Some(&format!("ts-ec={ec}")));
+    withdrawal.headers_mut().insert(
+        "sec-gpc",
+        "1".parse().expect("should request genuine withdrawal"),
+    );
+    let response = call(&app, withdrawal).await;
+    assert_eq!(
+        response.status(),
+        503,
+        "should report that authoritative withdrawal could not be persisted"
+    );
+    assert_eq!(
+        ec_cookie(&response).as_deref(),
+        Some(""),
+        "should still expire the browser identity on the EC response"
+    );
+    let row: serde_json::Value = serde_json::from_slice(
+        &store
+            .lookup(&ec)
+            .await
+            .expect("should read store")
+            .expect("should retain original record")
+            .body,
+    )
+    .expect("should decode record");
+    assert_eq!(
+        row["consent"]["ok"], true,
+        "should prove the failed store left a live authoritative row"
     );
 }

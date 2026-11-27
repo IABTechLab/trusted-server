@@ -8,42 +8,16 @@ use trusted_server_core::ec::record_backend::{EcRecordLayout, RecordEcKvStore};
 
 pub(crate) const STORE_ID: &str = "trusted_server_kv";
 
-fn declared() -> Result<bool, EdgeError> {
-    match trusted_server_core::runtime_env!("TRUSTED_SERVER__EC_DYNAMODB_ENABLED") {
-        Err(std::env::VarError::NotPresent) => {}
-        Ok(value) if value == "false" => {}
-        _ => {
-            return Err(EdgeError::validation(
-                "legacy TRUSTED_SERVER__EC_DYNAMODB_ENABLED is obsolete; declare TRUSTED_SERVER__EC_RECORDS_ENABLED and select an EdgeZero record binding",
-            ));
-        }
-    }
-    match trusted_server_core::runtime_env!("TRUSTED_SERVER__EC_RECORDS_ENABLED") {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok(value) if value == "false" => Ok(false),
-        Ok(value) if value == "true" => Ok(true),
-        _ => Err(EdgeError::validation(
-            "invalid TRUSTED_SERVER__EC_RECORDS_ENABLED declaration",
-        )),
-    }
-}
-
 pub(crate) fn configure(app: &mut App) -> Result<(), EdgeError> {
-    if declared().inspect_err(|error| log::error!("native EC declaration failed: {error}"))? {
-        app.require_record_store(STORE_ID, EcRecordLayout)
-            .map_err(|_| EdgeError::validation("invalid native EC record declaration"))?;
-    }
-    Ok(())
+    app.require_record_store(STORE_ID, EcRecordLayout)
+        .map_err(|_| EdgeError::validation("invalid native EC record declaration"))
 }
 
-pub(crate) fn metadata() -> Option<StoreMetadata> {
-    declared()
-        .ok()
-        .filter(|enabled| *enabled)
-        .map(|_| StoreMetadata {
-            default: STORE_ID,
-            ids: &[STORE_ID],
-        })
+pub(crate) fn metadata() -> StoreMetadata {
+    StoreMetadata {
+        default: STORE_ID,
+        ids: &[STORE_ID],
+    }
 }
 
 pub(crate) fn acquire(

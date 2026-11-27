@@ -91,6 +91,7 @@ run_case() {
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
     local config_dir="$WORKSPACE/$case_name-config"
+    # The declared local record provider needs a root even without ec.storage.
     local data_dir="$WORKSPACE/$case_name-data"
     mkdir -p "$config_dir" "$data_dir"
     config_dir=$(cd "$config_dir" && pwd -P)

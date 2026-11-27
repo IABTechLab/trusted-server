@@ -77,11 +77,12 @@ the feature that depends on it reports its own error.
 | Deprecated `secret_store` selectors                                                    | App config                                                                                                                                       | Superseded by `trusted_server_secrets`                        | Not read                                                                                          | Not read                                                                                                            | Not read                                                                                            | Not read                                                                                                         |
 | Deprecated `auction.creative_store`                                                    | App config                                                                                                                                       | Superseded; creatives are delivered inline                    | Not read                                                                                          | Not read                                                                                                            | Not read                                                                                            | Not read                                                                                                         |
 
-Axum declares config and secrets in `Hooks::stores()`; it does not register
-runtime KV. Its `axum.toml` contains application and logging metadata, with no
-store declarations. Identity records will use a separate logical store,
-`trusted_server_kv`, with Axum support deferred to #1587 (shared backend over
-EdgeZero `KvStore`) then #1574 (Axum identity). This generic KV wiring does not migrate the
+Axum declares config and secrets in `Hooks::stores()`, and declares
+`trusted_server_kv` with the shared EC record layout for identity records;
+generic runtime KV stays unavailable. Its `axum.toml` contains application and
+logging metadata, with no store declarations. Identity records reach
+`trusted_server_kv` through #1587 (shared backend over EdgeZero `KvStore`) and
+#1574 (Axum identity). This generic KV wiring does not migrate the
 existing Fastly identity record backend. Axum snapshot writes fail; publish
 prepared inputs and restart to change config or secrets.
 

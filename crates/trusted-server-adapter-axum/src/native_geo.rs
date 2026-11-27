@@ -3,10 +3,11 @@
 //! An explicit legacy TS boot profile overrides EdgeZero's native Geo settings.
 //! When absent, EdgeZero resolves the provider before listening.
 
-use std::env::VarError;
 use std::fs;
 
-use edgezero_adapter_axum::geo::{NativeGeoSelection, ProtectedCloudFrontAlb};
+use edgezero_adapter_axum::dev_server::AxumRunOptions;
+use edgezero_adapter_axum::geo::{NativeGeoCapability, NativeGeoSelection, ProtectedCloudFrontAlb};
+use edgezero_core::geo::GeoProviderId;
 use error_stack::Report;
 use serde::Deserialize;
 
@@ -18,12 +19,18 @@ pub(crate) const GEO_STORE_ID: &str = "geo_index";
 /// Declare the Geo store only for deployments selecting KV Geo through native settings.
 pub(crate) fn kv_selected() -> bool {
     cfg!(feature = "geo-kv")
-        && matches!(
-            trusted_server_core::runtime_env!(PROFILE_FILE_ENV),
-            Err(VarError::NotPresent)
-        )
-        && trusted_server_core::runtime_env!("EDGEZERO__ADAPTER__GEO__PROVIDER").as_deref()
-            == Ok("kv")
+        && trusted_server_core::runtime_env!(PROFILE_FILE_ENV, os).is_none()
+        && AxumRunOptions::from_env()
+            .ok()
+            .and_then(|options| {
+                options
+                    .geo_capability_for::<crate::app::TrustedServerApp>()
+                    .ok()
+            })
+            .is_some_and(|capability| {
+                matches!(capability, NativeGeoCapability::Selected { provider, .. }
+                    if provider == GeoProviderId::kv())
+            })
 }
 
 /// Safe startup categories that never retain profile bytes or policy inputs.
@@ -69,13 +76,8 @@ enum GeoSelection {
 /// # Errors
 /// Returns a bounded category without the file path, input bytes, CIDRs or name.
 pub fn load_selection() -> Result<Option<NativeGeoSelection>, Report<NativeGeoProfileError>> {
-    let path = match trusted_server_core::runtime_env!(PROFILE_FILE_ENV) {
-        Ok(path) => path,
-        Err(VarError::NotPresent) => return Ok(None),
-        // A path that is not Unicode cannot name a readable profile.
-        Err(VarError::NotUnicode(_)) => {
-            return Err(Report::new(NativeGeoProfileError::Unavailable));
-        }
+    let Some(path) = trusted_server_core::runtime_env!(PROFILE_FILE_ENV, os) else {
+        return Ok(None);
     };
     let bytes =
         fs::read_to_string(path).map_err(|_| Report::new(NativeGeoProfileError::Unavailable))?;
@@ -102,10 +104,9 @@ fn parse_selection(bytes: &str) -> Result<NativeGeoSelection, Report<NativeGeoPr
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt as _;
-
-    use edgezero_adapter_axum::dev_server::AxumRunOptions;
-    use edgezero_adapter_axum::geo::NativeGeoCapability;
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
     use super::*;
 
@@ -142,6 +143,27 @@ origin_credential_header_name = "x-origin-fixture-private-name"
                     .expect("should retain absent selection")
                     .is_none(),
                 "should let EdgeZero select Geo when no profile is selected"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_profile_preserves_non_unicode_path_input() {
+        let directory = tempfile::tempdir().expect("should create profile directory");
+        let path = directory.path().join(OsString::from_vec(vec![0xff]));
+        temp_env::with_var(PROFILE_FILE_ENV, Some(path.as_os_str()), || {
+            assert_eq!(
+                trusted_server_core::runtime_env!(PROFILE_FILE_ENV, os).as_deref(),
+                Some(path.as_os_str()),
+                "should preserve the original OS-string path"
+            );
+            let error = load_selection()
+                .expect_err("should reject an unavailable selected path without falling back");
+            assert_eq!(
+                *error.current_context(),
+                NativeGeoProfileError::Unavailable,
+                "should treat the input as a selected path"
             );
         });
     }

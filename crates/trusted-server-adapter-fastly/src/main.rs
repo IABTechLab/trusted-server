@@ -9,17 +9,17 @@ use edgezero_adapter_fastly::request::{
 };
 use edgezero_core::app::Hooks as _;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Extensions, Request as HttpRequest, Response as HttpResponse};
+#[cfg(test)]
+use edgezero_core::http::Request as HttpRequest;
+use edgezero_core::http::{Extensions, Response as HttpResponse};
 use edgezero_core::logging::ManagedLoggerError;
 use edgezero_core::time::MonotonicClock;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::ec::checked_current_timestamp;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::eid_types::UnixSeconds;
-use trusted_server_core::ec::finalize::{FinalizeRequest, ec_finalize_response};
+#[cfg(test)]
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::geo::GeoInfo;
@@ -732,31 +732,15 @@ async fn apply_edgezero_ec_finalize(
     response: &mut HttpResponse,
 ) {
     let identity_app = &state.identity;
-    let finalize_kv_graph = if ec_state.use_finalize_kv {
-        identity_app.identity_graph()
-    } else {
-        None
-    };
-    // Only a navigation with an eligible response uses the request time, so
-    // other responses never read the clock or log its failure.
-    let now = (ec_state.ec_context.has_navigation_permit()
-        && !NavigationPermit::is_redirect(response.status()))
-    .then(checked_current_timestamp)
-    .flatten()
-    .map(UnixSeconds::new);
-    ec_finalize_response(
-        identity_app.settings(),
-        &mut ec_state.ec_context,
-        finalize_kv_graph.as_ref(),
-        identity_app.partners(),
-        &FinalizeRequest {
-            eids_cookie: ec_state.eids_cookie.as_deref(),
-            sharedid: &ec_state.sharedid,
-            now,
-        },
-        response,
-    )
-    .await;
+    identity_app
+        .finalize(
+            &mut ec_state.ec_context,
+            ec_state.eids_cookie.as_deref(),
+            &ec_state.sharedid,
+            ec_state.use_finalize_kv,
+            response,
+        )
+        .await;
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -848,20 +832,6 @@ pub(crate) fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })
-}
-
-/// Extracts a named cookie value from the request's `Cookie` header.
-pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
-    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
 }
 
 /// Derives device signals from TLS, H2, and UA request data.
@@ -1528,19 +1498,25 @@ mod tests {
         // A returning reader withdraws consent with GPC in a US state.
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let request = edgezero_core::http::request_builder()
+            .method(Method::GET)
             .uri("https://www.example.com/article")
+            .header("sec-fetch-dest", "document")
             .header("cookie", format!("ts-ec={ec_id}"))
             .header("sec-gpc", "1")
             .body(EdgeBody::empty())
             .expect("should build the reader request");
-        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+        let mut ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
             &settings,
             &request,
             &crate::tinybird::tests::test_services(&ScriptedHttpClient::forbidding()),
             Some(&geo),
         )
         .expect("should read the EC context");
+        ec_context.set_navigation_permit(
+            NavigationPermit::classify(&request).expect("should classify the document navigation"),
+        );
         let mut page = response_builder()
+            .header("content-type", "text/html; charset=utf-8")
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build the page response");
@@ -1578,8 +1554,8 @@ mod tests {
         );
         assert_eq!(
             page_header("cache-control").as_deref(),
-            Some("private, max-age=0"),
-            "should keep a cookie-bearing response out of shared caches"
+            Some("no-store, private"),
+            "should preserve terminal privacy for a core-generated identity expiry"
         );
 
         // An asset response keeps its protected cache policy and, being

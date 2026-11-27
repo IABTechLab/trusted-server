@@ -866,7 +866,7 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The shared record service holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. `ec.storage` names a declared logical store; EdgeZero bindings select its provider. The legacy `ec_store` spelling is Fastly-only. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence. See [Native EC persistence](./native-ec-persistence) for provider bindings and startup requirements.
 
 ### Migrating from `consent_store`
 
@@ -879,17 +879,18 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                               | Type           | Required | Description                                                             |
-| ----------------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                          | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)      |
-| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                          | Array          | No       | Static partner registry entries                                         |
-| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                  |
-| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                  |
-| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                              |
+| Field                               | Type           | Required | Description                                                                           |
+| ----------------------------------- | -------------- | -------- | ------------------------------------------------------------------------------------- |
+| `passphrase`                        | String         | Yes      | Publisher passphrase used as HMAC key                                                 |
+| `ec_store`                          | String or null | No       | Legacy Fastly-only logical record-store reference; cannot be combined with `storage`  |
+| `storage`                           | Table          | No       | Explicit `provider = "records"` and declared logical `store` for Fastly/Axum identity |
+| `pull_sync_concurrency`             | Integer        | No       | Maximum pull-sync lookups dispatched per navigation (0 = no limit)                    |
+| `cluster_trust_threshold`           | Integer        | No       | Cluster size threshold for identity trust decisions                                   |
+| `cluster_recheck_secs`              | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps               |
+| `partners`                          | Array          | No       | Static partner registry entries                                                       |
+| `identity_budget_ms`                | Integer        | No       | Shared identity lookup budget, 1–1000 ms (default 200)                                |
+| `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
+| `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -905,7 +906,10 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 ```toml
 [ec]
 passphrase = "ec_passphrase"
-ec_store = "ec_identity_store"
+
+[ec.storage]
+provider = "records"
+store = "trusted_server_kv"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -920,15 +924,17 @@ bidstream_enabled = true
 
 ```bash
 TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
-TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
+TRUSTED_SERVER__EC__STORAGE__PROVIDER=records
+TRUSTED_SERVER__EC__STORAGE__STORE=trusted_server_kv
 ```
 
 ### Identity providers
 
 `[[ec.identity_providers]]` entries collect a visitor's IDs from the vendor's
-first-party cookies or a provider's server on publisher page navigations. Lookups run beside the origin fetch,
-share the `identity_budget_ms` budget, and are collected before the response is
-finalized. Results go into the navigation's single EC row write. A lookup that
+first-party cookies or a provider's server on eligible publisher document
+navigations and admitted EC POSTs. On publisher navigations, lookups run beside
+the origin fetch. Lookups share the `identity_budget_ms` budget and are collected
+before finalization. Results go into that request's single EC row write. A lookup that
 times out or fails leaves the row unchanged.
 
 Lookups run only when consent allows EID persistence, and, when
@@ -939,7 +945,7 @@ providers whose requests do not carry the EC ID (each provider kind declares
 this) run against the row the navigation creates, whose consent gates them, and
 their results go into the write that creates the row. If that create fails or
 loses to another writer, their results are dropped. Providers that send the EC
-ID, and `after_response` lookups, wait for the next navigation. The page's own
+ID, and `after_response` lookups, wait for a later eligible request. The page's own
 auction starts before lookups are collected, so it never carries provider IDs
 for a newly minted EC; they reach auctions from the next page load. The same vendor consent gates
 egress of the provider's `sources`, even while the provider is disabled: while
@@ -951,12 +957,12 @@ stored UIDs may still be live. Without `tcf_vendor_id`, a provider is gated by
 the EID-persistence purposes alone, so set it for any provider that has a TCF
 vendor ID.
 
-Identity providers run only on Fastly. `ts config validate`, `push` and `diff`
-build every enabled provider and reject one whose `kind` or `settings` is
-invalid. `ts config validate` is adapter-agnostic. `ts config push` and
-`ts config diff` reject enabled providers for targets other than Fastly: the
-Axum, Cloudflare and Spin adapters refuse to start when an enabled provider is
-configured. On Fastly, invalid enabled provider configuration, such as a `kind`
+Identity providers run through the shared application on Fastly and Axum.
+`ts config validate`, `push` and `diff` build every enabled provider and reject
+one whose `kind` or `settings` is invalid. `ts config validate` is
+adapter-agnostic. `ts config push` and `ts config diff` reject enabled providers
+for Cloudflare and Spin, whose adapters refuse to start with one configured.
+On Fastly and Axum, invalid enabled provider configuration, such as a `kind`
 this build does not include or `settings` its kind rejects, prevents
 application startup; providers are not silently disabled for individual
 requests. Lookups always verify the provider's TLS
@@ -1032,14 +1038,14 @@ token = "example_provider_token"
 ```
 
 `collect = "after_response"` lookups run after the response is sent, within
-`identity_after_response_budget_ms`, and only when `ec_store` is configured,
-the response is not a redirect, the navigation's own write succeeded (or had
-nothing to change), the row is live, and the EC was not minted on this
-navigation; a row recovered from an orphaned cookie gets a newly minted EC, so
-its lookups wait for the next navigation. They also run behind an error
-response, including a `502` that Trusted Server generates when the origin is
-unreachable. Their results reach the row in a follow-up write. Providers run
-only on Fastly.
+`identity_after_response_budget_ms`, with a configured record service and an
+eligible HTML document navigation or admitted EC POST. Navigation eligibility is method-neutral and includes HTML error documents and cached-document `304` responses without Content-Type. The request's
+own write must have succeeded (or had nothing to change), the row must be live,
+and the EC must not have been minted on this request. A row recovered from an
+orphaned cookie gets a newly minted EC, so its lookups wait for a later request.
+Redirect statuses 301, 302, 303, 307 and 308 do not authorize follow-up writes. Non-HTML responses other than cached-document `304` also lose the navigation permit; HTML error documents retain it. Results reach the row in a conditional follow-up
+write. Providers run on Fastly and Axum; Axum registers this work with EdgeZero's
+bounded, shutdown-drained after-response API.
 
 ::: warning Rate limit granularity
 `rate_limit_per_hour` is counted per EC hash, which is derived from the client
@@ -1072,8 +1078,8 @@ rewrites the row.
 enabled provider of a registered kind, so a provider-specific setting error
 (for example a `liveramp` `endpoint` without `placement_id` and
 `hashed_email`, or a `hashed_email` table without `[ec.hashed_email]`) fails
-the command before deploy. On Fastly the same
-error would prevent application startup.
+the command before deploy. On Fastly and Axum the same error prevents
+application startup.
 
 #### Provider kinds
 
@@ -1258,24 +1264,25 @@ token is kept privately and the token is refreshed server side from
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. Set `consent_store` to a
-KV store name only when consent should persist with the EC identity graph.
+signals. It does not create a second consent database. The removed
+`consent_store` field is rejected; omit it. Minimal consent metadata and
+withdrawal state belong to the one EC record service, while each request's
+consent decision comes from its live signals.
 
 ### `[consent]`
 
-| Field                                          | Type           | Default                     | Contract                                                    |
-| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
-| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
-| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
-| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
-| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
-| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
-| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
-| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
-| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
-| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
-| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+| Field                                          | Type          | Default                     | Contract                                                    |
+| ---------------------------------------------- | ------------- | --------------------------- | ----------------------------------------------------------- |
+| `mode`                                         | String        | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
+| `check_expiration`                             | Boolean       | `true`                      | Check TCF timestamps                                        |
+| `max_consent_age_days`                         | Integer       | `395`                       | Clamped to `1..=3650`                                       |
+| `gdpr.applies_in`                              | Array[String] | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
+| `us_states.privacy_states`                     | Array[String] | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
+| `us_privacy_defaults.notice_given`             | Boolean       | `true`                      | Publisher policy used for GPC-only requests                 |
+| `us_privacy_defaults.lspa_covered`             | Boolean       | `false`                     | Publisher LSPA posture                                      |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean       | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
+| `conflict_resolution.mode`                     | String        | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
+| `conflict_resolution.freshness_threshold_days` | Integer       | `30`                        | Age difference required by `newest`                         |
 
 In `proxy` mode Trusted Server does not decode the TC string, so it cannot
 confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:

@@ -18,10 +18,14 @@ use error_stack::{Report, ResultExt};
 
 use crate::error::TrustedServerError;
 
+use super::coordinator::results::LookupResults;
+use super::eid_types::UnixSeconds;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork, MAX_ENTRY_BYTES};
 use super::page_load::{AfterResponseWrite, Generation, KvWriteError, PageLoadWrite, RowChange};
+use super::registry::PartnerRegistry;
+use super::write_plan::{WritePlanInput, plan_write};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -486,31 +490,43 @@ impl KvIdentityGraph {
         .await
     }
 
-    /// Applies an `/auction` request's browser-ingest update to a live row.
+    /// Saves auction body EIDs to an existing live record using its read generation.
     ///
-    /// `/auction` is not a page load and holds no [`PageLoadWrite`], so its
-    /// body EIDs are saved by this separate write: one attempt that replaces
-    /// the row only while it is still at `expected`. It never creates a row,
-    /// so an `/auction` request cannot mint or recover an identity.
+    /// Updates follow the same fill-missing, ownership and size rules as navigation
+    /// ingestion. The caller must first apply identity, EID and vendor consent and
+    /// browser opt-outs. Missing rows and tombstones are never created or revived.
+    /// A conflicting write is not retried, preserving a concurrent withdrawal.
     ///
     /// # Errors
     ///
-    /// Returns [`KvWriteError::Conflict`] when the row changed since it was
-    /// read, or [`KvWriteError::Store`] on a serialization or store failure,
-    /// including a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
-    pub async fn commit_auction_ingest(
+    /// Returns [`KvWriteError::Conflict`] if the record changed after `snapshot`,
+    /// or [`KvWriteError::Store`] for serialization or storage errors.
+    pub(crate) async fn commit_auction_body(
         &self,
         ec_id: &str,
-        entry: &KvEntry,
-        expected: Generation,
-    ) -> Result<(), Report<KvWriteError>> {
+        snapshot: &EcKvSnapshot,
+        updates: &[PartnerIdUpdate],
+        registry: &PartnerRegistry,
+    ) -> Result<Option<KvEntry>, Report<KvWriteError>> {
+        let Some(RowChange::Update { entry, expected }) = plan_write(&WritePlanInput {
+            ec_id,
+            snapshot,
+            new_entry: None,
+            browser_ingest: updates,
+            lookups: &LookupResults::default(),
+            registry,
+            now: UnixSeconds::new(current_timestamp()),
+        }) else {
+            return Ok(None);
+        };
         self.write_row(
             ec_id,
-            entry,
+            &entry,
             ENTRY_TTL,
             EcKvWriteMode::IfGenerationMatch(expected.get()),
         )
-        .await
+        .await?;
+        Ok(Some(entry))
     }
 
     /// Serializes `entry` and writes it with `mode`, mapping a failed
@@ -1458,6 +1474,106 @@ mod tests {
     use crate::ec::eid_types::{AgentType, EidFields, Expiry, ProviderId, UidValue, UnixSeconds};
     use crate::ec::kv_backend::test_support::{InMemoryEcKv, WriteFailingEcKv};
     use crate::ec::kv_types::{KvEid, KvUid};
+
+    fn auction_body_registry() -> PartnerRegistry {
+        let partner = serde_json::from_value(serde_json::json!({
+            "name": "Example partner", "source_domain": "ids.example.com", "bidstream_enabled": true
+        }))
+        .expect("should parse fictional partner");
+        PartnerRegistry::from_config(&[partner]).expect("should build partner registry")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auction_body_commit_never_retries_a_concurrent_withdrawal_or_deletion() {
+        let ec_id = snapshot_ec_id();
+        let registry = auction_body_registry();
+        let updates = [PartnerIdUpdate::new("ids.example.com", "body-uid")];
+        for deleted in [false, true] {
+            let graph = KvIdentityGraph::in_memory("auction-conflict");
+            graph
+                .create(&ec_id, &live_entry())
+                .await
+                .expect("should seed live row");
+            let snapshot = graph.load_snapshot(&ec_id).await;
+            if deleted {
+                graph
+                    .delete(&ec_id)
+                    .await
+                    .expect("should concurrently delete row");
+            } else {
+                assert_eq!(
+                    graph
+                        .write_withdrawal_tombstone(&ec_id, drop)
+                        .await
+                        .expect("should concurrently withdraw consent"),
+                    TombstoneOutcome::Written,
+                    "should persist the concurrent withdrawal"
+                );
+            }
+            let before = graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect concurrent result");
+            let error = graph
+                .commit_auction_body(&ec_id, &snapshot, &updates, &registry)
+                .await
+                .expect_err("should reject stale body update");
+            assert!(
+                matches!(error.current_context(), KvWriteError::Conflict),
+                "should surface the failed conditional write"
+            );
+            assert_eq!(
+                graph.get(&ec_id).await.expect("should inspect final row"),
+                before,
+                "should preserve concurrent withdrawal or deletion"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auction_body_commit_refuses_unbound_or_generationless_snapshots() {
+        let ec_id = snapshot_ec_id();
+        let graph = KvIdentityGraph::in_memory("auction-snapshot");
+        graph
+            .create(&ec_id, &live_entry())
+            .await
+            .expect("should seed live row");
+        let before = graph.get(&ec_id).await.expect("should inspect initial row");
+        let registry = auction_body_registry();
+        let updates = [PartnerIdUpdate::new("ids.example.com", "body-uid")];
+        for snapshot in [
+            EcKvSnapshot::Present {
+                ec_id: "another-identity".to_owned(),
+                entry: Box::new(live_entry()),
+                generation: Some(1),
+            },
+            EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(live_entry()),
+                generation: None,
+            },
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+        ] {
+            assert!(
+                graph
+                    .commit_auction_body(&ec_id, &snapshot, &updates, &registry)
+                    .await
+                    .expect("should skip unsafe snapshot")
+                    .is_none(),
+                "should refuse an unsafe snapshot without writing"
+            );
+        }
+        assert_eq!(
+            graph
+                .get(&ec_id)
+                .await
+                .expect("should inspect unchanged row"),
+            before,
+            "should leave authoritative row unchanged"
+        );
+    }
 
     struct DelayedLocalEcKv {
         inner: InMemoryEcKv,

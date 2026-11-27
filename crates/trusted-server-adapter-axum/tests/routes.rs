@@ -263,6 +263,8 @@ fn axum_main_serves_the_failure_router_when_settings_fail() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_trusted-server-axum"))
         .env_clear()
         .env("EDGEZERO__ADAPTER__CONFIG_DIR", workspace.path())
+        // Prepare the declared local record store before exercising blob validation.
+        .env("EDGEZERO__ADAPTER__DATA_DIR", workspace.path())
         .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
         .env("EDGEZERO__ADAPTER__PORT", port.to_string())
         .env("EDGEZERO__LOGGING__LEVEL", "info")

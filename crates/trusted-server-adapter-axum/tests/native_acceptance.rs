@@ -359,9 +359,7 @@ impl Prepared {
         }
         let bindings = root.join("native-bindings.toml");
         if bindings.is_file() {
-            command
-                .env("TRUSTED_SERVER__EC_RECORDS_ENABLED", "true")
-                .env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
+            command.env("EDGEZERO__STORE_BINDINGS_FILE", bindings);
         }
         if trusted_proxy {
             command

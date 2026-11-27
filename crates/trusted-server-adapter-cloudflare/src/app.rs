@@ -11,7 +11,7 @@ use edgezero_core::http::{
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -23,8 +23,6 @@ use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
-use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
-use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -514,14 +512,8 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 // Reserve this path without an identity graph; never forward
                 // consent snapshots or acknowledge an unpersisted revocation.
                 return Ok(
-                    match trusted_server_core::ec::consent_update::prepare_consent_update(
-                        &services, req,
-                    )
-                    .await
-                    {
-                        Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(
-                            &req, None,
-                        ),
+                    match IdentityApp::prepare_consent_update(&services, req).await {
+                        Ok(req) => state.identity.consent_update(&req),
                         Err(response) => *response,
                     },
                 );
@@ -636,6 +628,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // The core identity app registers `GET` on the admin EC and EIDs
         // lookups; without a record store, admin EC lookup answers 501.
         router = state.identity.mount(router);
+        let ec_state = Arc::clone(&state);
+        router = state.identity.mount_ec_route(router, move |context| {
+            ec_state.services_for_request(context)
+        });
         router = router
             .get(
                 "/.well-known/trusted-server.json",
@@ -675,8 +671,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
@@ -771,10 +766,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // adapter has no EC record store, so identify and batch sync answer 501
         // and any other method answers 405.
         let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
-            answer_identify_locally(&s.settings, &req)
+            s.identity.unavailable_identify(&req)
         });
-        let batch_sync = make_handler(Arc::clone(&state), |_s, _services, req| async move {
-            Ok(answer_batch_sync_locally(&req))
+        let batch_sync = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            Ok(s.identity.batch_sync(req).await)
         });
         for method in publisher_fallback_methods() {
             router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());

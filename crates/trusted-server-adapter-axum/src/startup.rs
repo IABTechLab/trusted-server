@@ -171,10 +171,10 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 /// The framework retains ownership of the App, clock, policies, listener,
 /// readiness, and signal/drain lifecycle. Selected-provider preparation, which
 /// the framework runs before this initializer, still fails startup. A failure
-/// here to read the prepared stores, validate the settings or build the
-/// application state installs the failure router instead, so liveness stays up
-/// while `/ready` and every supported route answer the fixed unavailable
-/// response.
+/// here to read the prepared stores, validate the settings, build the
+/// application state or bind the configured EC record store installs the
+/// failure router instead, so liveness stays up while `/ready` and every
+/// supported route answer the fixed unavailable response.
 ///
 /// # Errors
 /// Returns an error when the application's config extraction limits are
@@ -203,6 +203,9 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
 /// # Errors
 /// Returns an error for missing bindings/values, bounded-read failures, invalid
 /// envelopes or runtime settings, unsupported store consumers, or invalid plans.
+/// It also returns an error when the configured EC record store is not
+/// prepared or cannot meet the record contract, so those failures install the
+/// failure router too.
 ///
 /// # Panics
 /// Panics if newly constructed application state unexpectedly has another owner.

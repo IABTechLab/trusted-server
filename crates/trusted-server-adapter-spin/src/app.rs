@@ -16,7 +16,7 @@ use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use edgezero_core::outbound::ResponseDecoding;
 use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -26,8 +26,6 @@ use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
 use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
-use trusted_server_core::ec::batch_sync::answer_batch_sync_locally;
-use trusted_server_core::ec::identify::answer_identify_locally;
 use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
 use trusted_server_core::error::{TrustedServerError, http_error};
 use trusted_server_core::health::{
@@ -645,13 +643,19 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             async move {
                 let req = ctx.into_request()?;
                 Ok::<Response, EdgeError>(
-                    answer_identify_locally(&s.settings, &req).unwrap_or_else(|e| http_error(&e)),
+                    s.identity
+                        .unavailable_identify(&req)
+                        .unwrap_or_else(|e| http_error(&e)),
                 )
             }
         };
-        let batch_sync_handler = |ctx: RequestContext| async move {
-            let req = ctx.into_request()?;
-            Ok::<Response, EdgeError>(answer_batch_sync_locally(&req))
+        let batch_state = Arc::clone(&state);
+        let batch_sync_handler = move |ctx: RequestContext| {
+            let state = Arc::clone(&batch_state);
+            async move {
+                let req = ctx.into_request()?;
+                Ok::<Response, EdgeError>(state.identity.batch_sync(req).await)
+            }
         };
 
         // /auction
@@ -682,8 +686,7 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
@@ -807,14 +810,8 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 // Reserve this path without an identity graph; never forward
                 // consent snapshots or acknowledge an unpersisted revocation.
                 return Ok(
-                    match trusted_server_core::ec::consent_update::prepare_consent_update(
-                        &services, req,
-                    )
-                    .await
-                    {
-                        Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(
-                            &req, None,
-                        ),
+                    match IdentityApp::prepare_consent_update(&services, req).await {
+                        Ok(req) => state.identity.consent_update(&req),
                         Err(response) => *response,
                     },
                 );
@@ -930,6 +927,10 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
         // The core identity app registers `GET` on the admin EC and EIDs
         // lookups; without a record store, admin EC lookup answers 501.
         builder = state.identity.mount(builder);
+        let ec_state = Arc::clone(&state);
+        builder = state.identity.mount_ec_route(builder, move |context| {
+            ec_state.services_for_request(context)
+        });
         builder = builder
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
@@ -978,7 +979,11 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
                 method.clone(),
                 identify_handler.clone(),
             );
-            builder = builder.route("/_ts/api/v1/batch-sync", method.clone(), batch_sync_handler);
+            builder = builder.route(
+                "/_ts/api/v1/batch-sync",
+                method.clone(),
+                batch_sync_handler.clone(),
+            );
         }
 
         for method in LEGACY_ADMIN_DENY_METHODS {

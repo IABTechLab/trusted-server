@@ -13,6 +13,7 @@ on:
       - .cargo/**
       - crates/trusted-server-adapter-axum/**
       - crates/trusted-server-core/**
+      - crates/trusted-server-identity-providers/**
       - crates/trusted-server-js/**
       - crates/trusted-server-openrtb*/**
       - scripts/test-native-container.mjs
@@ -42,7 +43,7 @@ jobs:
           node-version: ${{ steps.node.outputs.version }}
       - name: Build local-provider image
         run: docker build --build-arg TRUSTED_SERVER__GIT_VERSION="${{ github.sha }}" -t ts-rc-local:test .
-      - name: Check real TS routes, startup rejection and drain
+      - name: Check real TS routes, failure router and drain
         run: node scripts/test-native-container.mjs ts-rc-local:test
 
   record-provider-image:
