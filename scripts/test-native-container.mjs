@@ -270,8 +270,14 @@ http.createServer((req, res) => {
       'must reject application inputs, not fail the launcher'
     )
     assert.match(logs, diagnostic, `${label} must report its own cause`)
+    if (label === 'missing-secret')
+      assert.match(
+        logs,
+        /is missing in trusted_server_secrets/,
+        'must reject a missing secret from the prepared secret store'
+      )
     const failed = logs.indexOf('Trusted Server initialization failed')
-    const ready = logs.indexOf('phase=ready')
+    const ready = logs.search(/\bevent=lifecycle\b[^\n]*\bphase=ready\b/)
     assert(
       ready === -1 || failed < ready,
       `${label} must fail initialization before the listener is ready`
