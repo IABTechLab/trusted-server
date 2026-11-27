@@ -33,7 +33,7 @@ use super::registry::PartnerRegistry;
 ///
 /// Panics if response builder produces an invalid status or body, which cannot
 /// happen with the hardcoded values used here.
-pub fn handle_identify(
+pub async fn handle_identify(
     settings: &Settings,
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
@@ -80,7 +80,7 @@ pub fn handle_identify(
     let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
 
-    match kv.get(ec_id) {
+    match kv.get(ec_id).await {
         Ok(Some((entry, generation))) => {
             if !entry.consent.ok {
                 // Tombstone entries preserve the withdrawal signal for 24 hours.
@@ -97,7 +97,7 @@ pub fn handle_identify(
 
                 // Evaluate cluster size lazily for identify responses. Existing
                 // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
+                match kv.evaluate_cluster(ec_id, &entry, generation).await {
                     Ok(size) => {
                         cluster_size = size;
                     }
@@ -659,8 +659,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_identify_rejects_missing_bearer_token() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_rejects_missing_bearer_token() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let registry = PartnerRegistry::empty();
@@ -672,6 +672,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct unauthorized response");
 
         assert_eq!(
@@ -699,8 +700,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_identify_rejects_invalid_bearer_token() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -714,6 +715,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct unauthorized response");
 
         assert_eq!(
@@ -724,8 +726,8 @@ mod tests {
         assert_no_store(&response);
     }
 
-    #[test]
-    fn handle_identify_denied_consent_returns_403() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_denied_consent_returns_403() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -739,6 +741,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::Unknown, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct denied response");
 
         assert_eq!(
@@ -758,8 +761,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_identify_without_ec_returns_204() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -773,6 +776,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct no-content response");
 
         assert_eq!(
@@ -783,8 +787,8 @@ mod tests {
         assert_no_store(&response);
     }
 
-    #[test]
-    fn handle_identify_kv_failure_sets_degraded_true() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -799,6 +803,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct degraded identify response");
 
         assert_eq!(
@@ -836,8 +841,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_identify_denies_mismatched_browser_origin() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_denies_mismatched_browser_origin() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -852,6 +857,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct forbidden response");
 
         assert_eq!(
@@ -862,8 +868,8 @@ mod tests {
         assert_no_store(&response);
     }
 
-    #[test]
-    fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
@@ -878,6 +884,7 @@ mod tests {
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .await
             .expect("should construct no-content response with CORS headers");
 
         assert_eq!(

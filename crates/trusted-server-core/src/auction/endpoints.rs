@@ -345,7 +345,7 @@ pub async fn handle_auction(
     // present registry: without one, `resolve_auction_eids` yields no
     // server-side EIDs, so the snapshot would be an unused billable KV read.
     let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
-        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id).await,
         _ => EcKvSnapshot::NotRead,
     };
     // Hand the loaded row to the request context so response finalization —
@@ -821,7 +821,10 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
-        graph.create(&ec_id, &live).expect("should seed live row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
         lookups.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
@@ -874,7 +877,8 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+        )
+        .await;
 
         assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
@@ -883,6 +887,7 @@ mod tests {
         );
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("row should exist");
         assert_eq!(
@@ -915,7 +920,10 @@ mod tests {
         let ec_id = format!("{}.eidbdy", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
-        graph.create(&ec_id, &live).expect("should seed live row");
+        graph
+            .create(&ec_id, &live)
+            .await
+            .expect("should seed live row");
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
@@ -969,10 +977,12 @@ mod tests {
             None, // No `ts-eids` cookie on this request at all.
             None,
             &mut response,
-        );
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
+            .await
             .expect("should read store")
             .expect("row should exist");
         assert_eq!(
