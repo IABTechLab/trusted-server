@@ -23,7 +23,7 @@ Each region has two AZs, one EC2 host per AZ, a public ALB, and one NAT gateway 
 
 ## Safe local walkthrough
 
-These commands do not contact AWS. They require the pinned Terraform, Rust, and Node.js toolchains and Docker with the Compose plugin. The Node.js check uses only built-in modules; no npm install is needed. On Apple Silicon macOS, replace `cargo run_cli_linux` with `cargo run_cli_macos`. Other hosts can use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`.
+These commands do not contact AWS. They require the pinned Terraform, Rust, and Node.js toolchains and Docker with the Compose plugin. The Node.js tests use only built-in modules; no npm install is needed. The development certificate test also needs OpenSSL. On Apple Silicon macOS, replace `cargo run_cli_linux` with `cargo run_cli_macos`. Other hosts can use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`.
 
 ```bash
 terraform fmt -check -recursive deploy/pbs-example
@@ -41,12 +41,14 @@ docker compose \
   -f deploy/pbs-example/runtime/compose.yaml \
   config --quiet
 bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs
+bash -n deploy/pbs-example/scripts/make-dev-mtls-certs.sh
+env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-smoke-runtime.mjs
+env -u NODE_OPTIONS -u NODE_PATH node --test deploy/pbs-example/scripts/test-make-dev-mtls-certs.mjs
 ```
 
-The `PBS example checks` GitHub Actions workflow runs Terraform formatting, both readonly-lock initializations, validation, and both mocked test suites. It also checks JSON, shell syntax, and Compose wiring. Changes to this example, `.tool-versions`, or the workflow trigger it. CI reads the Node.js version from `.tool-versions` and checks Docker Compose availability. The wiring command clears inherited Node.js preload options and module paths, and the script passes only `PATH` and `HOME` plus its explicit test inputs to subprocesses. It also parses `runtime/secret-bindings.example.json`. The CLI test suite separately loads and checks the committed deployment descriptor and its referenced inputs on every PR. The example owner must still run the descriptor command above when adapting inputs.
+The `PBS example checks` GitHub Actions workflow runs Terraform formatting, both readonly-lock initializations, validation, and both mocked test suites. It also checks JSON, shell syntax, Compose wiring, and development certificates. Changes to this example, `.tool-versions`, or the workflow trigger it. CI reads the Node.js version from `.tool-versions` and checks Docker Compose availability. Both Node.js commands clear inherited preload options and module paths. The tests pass only `PATH` and `HOME` plus explicit test inputs to subprocesses. The wiring test also parses `runtime/secret-bindings.example.json`. The CLI test suite separately loads and checks the committed deployment descriptor and its referenced inputs on every PR. The example owner must still run the descriptor command above when adapting inputs.
 
-The Terraform tests use mocked AWS providers and explicit plan mode. The deployment descriptor and binding file contain fictional account, profile, secret, instance, and adapter identifiers for local validation only. Their pinned image digest identifies the upstream PBS Go v4.7.0 release, not a fictional image; preserve it unless deliberately selecting and verifying another release, and keep both files' image references identical. The wiring test renders Compose JSON and exercises the smoke script with fake lifecycle and health commands. It verifies the deployment all-interface binding, smoke-only loopback binding, and forced dummy input selectors without starting containers.
+The Terraform tests mock AWS, including the apply tests that turn mTLS on and back off. The deployment descriptor and binding file contain fictional account, profile, secret, instance, and adapter identifiers for local validation only. Their pinned image digest identifies the upstream PBS Go v4.7.0 release, not a fictional image; preserve it unless deliberately selecting and verifying another release, and keep both files' image references identical. The wiring test renders Compose JSON and exercises the smoke script with fake lifecycle and health commands. It verifies the deployment all-interface binding, smoke-only loopback binding, and forced dummy input selectors without starting containers.
 
 A separately approved `deploy/pbs-example/scripts/smoke-runtime.sh` run pulls and starts the pinned image with dummy values on loopback, checks `/status` and startup-log redaction, and sends no auction request. Static rendering and fake-command checks are not runtime startup evidence.
 
@@ -59,6 +61,26 @@ A separately approved `deploy/pbs-example/scripts/smoke-runtime.sh` run pulls an
 5. Run the local checks above.
 6. Obtain separate authorization for AWS identity checks, Terraform plan, apply, and secret writes.
 7. Follow `RUNBOOK.md` for the reviewed plan and apply process.
+
+## Optional ALB mutual TLS
+
+The regional HTTPS listeners use their existing public ACM certificates and Trusted Server CIDR allowlist. Client certificate verification is off by default. Enable it in a region by setting that region's `east_client_ca_bundle_s3_bucket` and `east_client_ca_bundle_s3_key` inputs or the corresponding `west_` pair. Leave both inputs null to turn verify mode off and remove the trust store. Terraform now manages the listener's verification mode and the load balancer's connection logs in every region, so applying this version turns off either setting if someone enabled it outside Terraform.
+
+The PBS operator owns a private CA and keeps its key offline. The Trusted Server operator generates a key and sends a signing request to the CA owner. The CA issues a client certificate with the `clientAuth` extended key usage and about a one-year lifetime. Put the issued certificate in Fastly's Config Store and the key in its Secret Store. Put only the public CA bundle in S3 and pass Terraform its bucket and key, never private keys.
+
+A bundle contains one or more PEM CA certificates with no blank lines. Grant the Terraform principal `s3:GetObject` on the bundle and upload each revision to a new key, such as `client-ca/bundle-v2.pem`. Overwriting an object at the same key does not update the trust store.
+
+The optional `east_connection_logs_bucket` and `west_connection_logs_bucket` inputs work independently of mTLS. Create each bucket in the ALB's region with SSE-S3. Its policy must let `logdelivery.elasticloadbalancing.amazonaws.com` put objects under `AWSLogs/<account-id>/`. The `tls_verify_status` field shows whether the handshake succeeded and why a certificate was rejected.
+
+Follow the [mTLS runbook](RUNBOOK.md#optional-alb-mutual-tls) to roll out one region at a time, rotate certificates or CAs, and turn off verification before withdrawing the client identity. Verify mode requires a client certificate on every request through the HTTPS listener, including `/status`. The target group's HTTP health check is unchanged.
+
+To generate throwaway certificates for development, run:
+
+```bash
+deploy/pbs-example/scripts/make-dev-mtls-certs.sh
+```
+
+The script writes `ca.pem`, `ca.key`, `client.pem`, `client.key`, and `ca-bundle.pem` in the ignored `deploy/pbs-example/.dev-mtls/` directory. Pass an empty output directory as an argument to write them elsewhere. Do not use these keys or certificates in production.
 
 ## Generating real CLI inputs after apply
 

@@ -44,6 +44,7 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
             provider_id.clone(),
             ProviderConfig {
                 allow_insecure_http: false,
+                mtls: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: profile.to_string(),
                 endpoint: endpoint.to_string(),
@@ -69,6 +70,7 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
         },
         mediator: None,
         request_signing: None,
+        mtls_slot: Default::default(),
     }
 }
 
@@ -1505,6 +1507,16 @@ async fn execute_through_provider(
     routed: &RoutedAuction,
     reply: ScriptedReply,
 ) -> (AuctionResponse, ScriptedHttpClient) {
+    execute_through_provider_with(plan, routed, reply, ScriptedHttpClient::http_client).await
+}
+
+/// [`execute_through_provider`] through the facade `facade` builds over the scripted client.
+async fn execute_through_provider_with(
+    plan: &AuctionPlan,
+    routed: &RoutedAuction,
+    reply: ScriptedReply,
+    facade: impl FnOnce(&ScriptedHttpClient) -> edgezero_core::outbound::HttpClient,
+) -> (AuctionResponse, ScriptedHttpClient) {
     let provider_plan = plan.providers()[0].clone();
     let provider = GenericOpenRtbProvider::new(provider_plan.clone());
     let client = ScriptedHttpClient::new(&TestClock::new());
@@ -1518,8 +1530,7 @@ async fn execute_through_provider(
     else {
         panic!("should build an unsent provider request");
     };
-    let response = client
-        .http_client()
+    let response = facade(&client)
         .send(request)
         .await
         .expect("should answer the provider request");
@@ -1528,6 +1539,120 @@ async fn execute_through_provider(
         .await
         .expect("should parse the provider response");
     (parsed, client)
+}
+
+/// The standard fixture plan with its provider's `mtls` set to `mtls`.
+fn standard_fixture_with_mtls(mtls: bool) -> (AuctionPlan, RoutedAuction) {
+    let (plan, _routed, _request) = standard_fixture();
+    let mut raw = config(
+        "standard",
+        json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
+    );
+    let provider_id = ProviderId::from_str("fictional-provider").expect("should parse provider");
+    let provider = raw
+        .providers
+        .get_mut(&provider_id)
+        .expect("should find provider");
+    provider.routing = RoutingMode::Explicit;
+    provider.mtls = mtls;
+    raw.bidders.insert(
+        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderRouteConfig {
+            provider: provider_id,
+        },
+    );
+    let secured = AuctionPlan::compile(raw).expect("should compile the mtls fixture plan");
+    assert_eq!(
+        secured.providers()[0].endpoint,
+        plan.providers()[0].endpoint,
+        "should differ from the standard fixture only in mtls"
+    );
+    let inbound = Request::builder()
+        .uri("https://publisher.example/auction")
+        .body(EdgeBody::empty())
+        .expect("should build inbound request");
+    let routed = route_auction(canonical_parity_auction_request(), &inbound, &secured, None);
+    (secured, routed)
+}
+
+fn bid_reply() -> ScriptedReply {
+    ScriptedReply::status(StatusCode::OK).body(
+        serde_json::to_vec(&json!({"seatbid":[{"seat":"fictional-seat","bid":[
+            {"id":"good","impid":"fictional-slot","price":1.25,"adm":"<div>fictional</div>","w":300,"h":250}
+        ]}]}))
+        .expect("should serialize response"),
+    )
+}
+
+#[test]
+fn mtls_provider_presents_the_auction_identity_and_changes_nothing_else() {
+    futures::executor::block_on(async {
+        let (plain_plan, plain_routed) = standard_fixture_with_mtls(false);
+        let (plain, plain_client) = execute_through_provider_with(
+            &plain_plan,
+            &plain_routed,
+            bid_reply(),
+            ScriptedHttpClient::http_client_with_manifest_identities,
+        )
+        .await;
+        let (secured_plan, secured_routed) = standard_fixture_with_mtls(true);
+        let (secured, secured_client) = execute_through_provider_with(
+            &secured_plan,
+            &secured_routed,
+            bid_reply(),
+            ScriptedHttpClient::http_client_with_manifest_identities,
+        )
+        .await;
+
+        let plain_sent = plain_client.requests();
+        let secured_sent = secured_client.requests();
+        assert_eq!(
+            (plain_sent.len(), secured_sent.len()),
+            (1, 1),
+            "should send one request each"
+        );
+        assert_eq!(
+            plain_sent[0].client_identity, None,
+            "should present no identity without mtls"
+        );
+        assert_eq!(
+            secured_sent[0].client_identity.as_deref(),
+            Some(crate::auction::plan::MtlsSlot::Blue.identity_name()),
+            "should present the auction identity with mtls"
+        );
+        let (plain_request, secured_request) = (&plain_sent[0], &secured_sent[0]);
+        assert_eq!(
+            (
+                &secured_request.method,
+                &secured_request.uri,
+                &secured_request.headers,
+                &secured_request.body,
+                &secured_request.timeout,
+                &secured_request.cache_policy,
+                &secured_request.max_decoded_response_bytes,
+            ),
+            (
+                &plain_request.method,
+                &plain_request.uri,
+                &plain_request.headers,
+                &plain_request.body,
+                &plain_request.timeout,
+                &plain_request.cache_policy,
+                &plain_request.max_decoded_response_bytes,
+            ),
+            "should change nothing else about the request"
+        );
+        assert_eq!(
+            (
+                &secured.status,
+                secured.bids.len(),
+                secured.provider.as_str()
+            ),
+            (&plain.status, plain.bids.len(), plain.provider.as_str()),
+            "should parse and attribute the response as without mtls"
+        );
+        assert_eq!(secured.status, BidStatus::Success);
+    });
 }
 
 #[test]

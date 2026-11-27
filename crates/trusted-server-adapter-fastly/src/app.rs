@@ -1788,6 +1788,16 @@ impl Hooks for TrustedServerApp {
         edgezero_core::logging_config!("../../edgezero.toml", adapter)
     }
 
+    /// Returns the repository's `edgezero.toml`, baked at build time.
+    ///
+    /// [`App::from_router`] builds the outbound client-identity policy from this hook, so
+    /// auction providers with `mtls = true` can present the `auction-providers` identity. The
+    /// trait default reports no manifest, which would leave that policy empty. On Fastly the
+    /// policy is the only runtime reader of the hook.
+    fn manifest() -> edgezero_core::manifest::BakedManifest {
+        trusted_server_core::edgezero_manifest::baked_edgezero_manifest()
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
@@ -1971,6 +1981,30 @@ mod tests {
             assert!(
                 build_state_from_settings(settings).is_ok(),
                 "should build app state for EC store link `{name}` without opening it"
+            );
+        }
+    }
+
+    #[test]
+    fn assembled_app_accepts_mtls_and_declares_both_auction_client_identity_slots() {
+        let mut settings = test_settings();
+        let (id, provider) = trusted_server_core::test_support::fixtures::mtls_auction_provider();
+        settings.auction.providers.insert(id, provider);
+
+        let retained = assemble_app(Ok(settings), &"")
+            .unwrap_or_else(|_| panic!("should assemble the Fastly app with an mtls provider"));
+
+        for slot in trusted_server_core::auction::plan::MtlsSlot::ALL {
+            let name = edgezero_core::outbound::ClientIdentityName::new(slot.identity_name())
+                .expect("should accept the identity name");
+            assert!(
+                retained
+                    .app
+                    .client_identity_policy()
+                    .identity(&name)
+                    .is_some(),
+                "should attach the manifest's {} identity to the assembled app",
+                slot.identity_name()
             );
         }
     }
@@ -2629,6 +2663,7 @@ mod tests {
                         .expect("should parse provider ID"),
                     trusted_server_core::auction::ProviderConfig {
                         allow_insecure_http: false,
+                        mtls: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: "standard".to_string(),
                         endpoint: format!("https://bid.example:{}/openrtb", 9000 + index),
@@ -2687,6 +2722,7 @@ mod tests {
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
                 allow_insecure_http: false,
+                mtls: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),

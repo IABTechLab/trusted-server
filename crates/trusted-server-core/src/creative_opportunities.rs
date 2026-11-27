@@ -2353,6 +2353,7 @@ mod tests {
                 ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
                 ProviderConfig {
                     allow_insecure_http: false,
+                    mtls: false,
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example.test/openrtb".to_string(),
@@ -2365,6 +2366,7 @@ mod tests {
             bidders: BTreeMap::new(),
             mediator: None,
             request_signing: None,
+            mtls_slot: Default::default(),
         })
         .expect("should compile plan");
         let auction_request = AuctionRequest {

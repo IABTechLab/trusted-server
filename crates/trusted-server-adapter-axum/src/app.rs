@@ -104,6 +104,7 @@ fn build_state_with_services(
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
+    trusted_server_core::auction::plan::reject_auction_mtls(&plan, "Axum")?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
     let partners = PartnerRegistry::from_config(&settings.ec.partners)?;
@@ -1066,6 +1067,24 @@ mod trace_dispatch_tests {
     use trusted_server_core::redacted::Redacted;
     use trusted_server_core::settings::{TrustedClientIpConfig, TrustedForwarderConfig};
     use trusted_server_core::trace::TraceTerminalResponse;
+
+    #[test]
+    fn mtls_auction_provider_fails_startup() {
+        let mut settings = trace_settings(false);
+        let (id, provider) = trusted_server_core::test_support::fixtures::mtls_auction_provider();
+        settings.auction.providers.insert(id, provider);
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an mtls auction provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-mtls")
+                && message.contains("Axum adapter cannot present client certificates"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     #[test]
     fn enabled_identity_provider_fails_startup() {

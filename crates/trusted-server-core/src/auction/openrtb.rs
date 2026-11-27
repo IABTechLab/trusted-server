@@ -980,6 +980,7 @@ mod routing_metadata_tests {
                     provider_id.clone(),
                     ProviderConfig {
                         allow_insecure_http: false,
+                        mtls: false,
                         protocol: "openrtb-2.6".to_string(),
                         profile: profile.to_string(),
                         endpoint: if profile == "aps" {
@@ -1001,6 +1002,7 @@ mod routing_metadata_tests {
                 )]),
                 mediator: None,
                 request_signing: None,
+                mtls_slot: Default::default(),
             })
             .expect("should compile profile plan");
             let inbound = http::Request::new(edgezero_core::body::Body::empty());
