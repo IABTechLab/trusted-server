@@ -523,10 +523,24 @@ pub struct PrebidBundleModulesConfig {
     pub analytics: Option<Vec<String>>,
 }
 
+/// Browser behavior installed by the Prebid integration.
+#[derive(Debug, Default, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrebidMode {
+    /// Install the Trusted Server bidder and publisher auction integration.
+    #[default]
+    Auction,
+    /// Capture native IDs and merge the server mirror into publisher auctions.
+    Identity,
+}
+
 /// Browser-only Prebid integration settings.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidIntegrationConfig {
+    /// Browser integration mode; defaults to [`PrebidMode::Auction`].
+    #[serde(default)]
+    pub mode: PrebidMode,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -573,6 +587,7 @@ pub struct PrebidIntegrationConfig {
 impl Default for PrebidIntegrationConfig {
     fn default() -> Self {
         Self {
+            mode: PrebidMode::default(),
             enabled: default_enabled(),
             account_id: None,
             timeout_ms: default_timeout_ms(),
@@ -599,6 +614,7 @@ impl IntegrationConfig for PrebidIntegrationConfig {
 impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
     fn from(config: &LegacyPrebidServerConfig) -> Self {
         Self {
+            mode: PrebidMode::default(),
             enabled: config.enabled,
             account_id: config.account_id.clone(),
             timeout_ms: config.timeout_ms,
@@ -1496,6 +1512,24 @@ impl IntegrationHeadInjector for PrebidIntegration {
         PREBID_INTEGRATION_ID
     }
 
+    fn head_inserts_with_ec_route(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        ec_route_available: bool,
+    ) -> Vec<String> {
+        let mut inserts = self.head_inserts(ctx);
+        if self.config.mode == PrebidMode::Identity && ec_route_available {
+            inserts.insert(
+                1,
+                format!(
+                    r#"<script>window.__tsjs_prebid.ecRoute="{}";</script>"#,
+                    crate::ec::app::EC_PATH,
+                ),
+            );
+        }
+        inserts
+    }
+
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         if let Some(inserts) = &self.planned_head_inserts {
             return inserts.clone();
@@ -1574,6 +1608,7 @@ impl<'a> From<&'a PrebidManagedUserIdConfig> for InjectedManagedUserId<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InjectedPrebidClientConfig<'a> {
+    mode: PrebidMode,
     account_id: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     managed_user_ids: Vec<InjectedManagedUserId<'a>>,
@@ -1592,6 +1627,7 @@ struct InjectedPrebidClientConfig<'a> {
 impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
     fn from(config: &'a PrebidIntegrationConfig) -> Self {
         Self {
+            mode: config.mode,
             account_id: config.account_id.as_deref().unwrap_or_default(),
             managed_user_ids: config
                 .managed_user_ids
@@ -3726,6 +3762,8 @@ mod tests {
     };
 
     use crate::consent::{ConsentContext, ConsentSource};
+    use crate::ec::app::{IdentityApp, IdentityPlatform};
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::geo::GeoInfo;
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
@@ -4200,6 +4238,88 @@ server_url = "https://prebid.example/openrtb2/auction"
             config.excluded_gam_ad_unit_path_suffixes.is_empty(),
             "should default to no refresh-auction exclusions"
         );
+    }
+
+    #[test]
+    fn ec_route_injection_requires_identity_mode_and_a_bound_record_store() {
+        for mode in ["identity", "auction"] {
+            for (sourcepoint_enabled, rewrite_sdk) in [
+                (None, true),
+                (Some(false), true),
+                (Some(true), true),
+                (Some(true), false),
+            ] {
+                let mut settings = make_settings();
+                if let Some(enabled) = sourcepoint_enabled {
+                    settings
+                        .integrations
+                        .insert_config(
+                            "sourcepoint",
+                            &json!({
+                                "enabled": enabled, "rewrite_sdk": rewrite_sdk,
+                            }),
+                        )
+                        .expect("should configure Sourcepoint consent synchronization");
+                }
+                settings
+                    .integrations
+                    .insert_config(
+                        PREBID_INTEGRATION_ID,
+                        &json!({
+                            "enabled": true,
+                            "mode": mode,
+                            "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                        }),
+                    )
+                    .expect("should configure Prebid mode");
+                let plan = Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                );
+                let mut registry = IntegrationRegistry::with_plan(&settings, plan)
+                    .expect("should build integration registry");
+                let mut identity =
+                    IdentityApp::build(Arc::new(settings), IdentityPlatform::default())
+                        .expect("should build unsupported identity app");
+                let document_state = IntegrationDocumentState::default();
+                let context = IntegrationHtmlContext {
+                    request_host: "pub.example",
+                    request_scheme: "https",
+                    origin_host: "origin.example",
+                    document_state: &document_state,
+                };
+                registry.set_identity_app(&identity);
+                assert!(
+                    !registry.head_inserts(&context).join("").contains("ecRoute"),
+                    "should omit route when the app returns 501, even in identity mode"
+                );
+                Arc::get_mut(&mut identity)
+                    .expect("should own identity app")
+                    .bind_record_store(Arc::new(InMemoryEcKv::new("prebid-injection")));
+                registry.set_identity_app(&identity);
+                let inserts = registry.head_inserts(&context);
+                let route = inserts.iter().position(|insert| insert.contains("ecRoute"));
+                assert_eq!(
+                    route.is_some(),
+                    mode == "identity" && sourcepoint_enabled != Some(true),
+                    "should inject only identity mode with a real bound store and no Sourcepoint writer"
+                );
+                if let Some(index) = route {
+                    assert!(
+                        index > 0 && inserts[0].contains("window.__tsjs_prebid="),
+                        "should create the config before assigning its EC route"
+                    );
+                    assert!(
+                        inserts[index].contains("/_ts/api/v1/ec"),
+                        "should inject the mounted same-origin route path"
+                    );
+                    assert!(
+                        inserts[index + 1].contains("src="),
+                        "should assign the route before loading the external bundle"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5404,6 +5524,33 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn browser_mode_defaults_and_validates() {
+        let config: PrebidIntegrationConfig =
+            serde_json::from_value(json!({})).expect("should parse default browser config");
+        assert_eq!(
+            config.mode,
+            PrebidMode::Auction,
+            "should default to auction mode"
+        );
+        let config: PrebidIntegrationConfig = serde_json::from_value(json!({"mode": "identity"}))
+            .expect("should parse identity mode");
+        assert_eq!(
+            config.mode,
+            PrebidMode::Identity,
+            "should select identity mode"
+        );
+        assert!(
+            serde_json::from_value::<PrebidIntegrationConfig>(json!({"mode": "other"})).is_err(),
+            "should reject an unknown mode"
+        );
+        let payload = serialize_injected_prebid_config(&InjectedPrebidClientConfig::from(&config));
+        assert!(
+            payload.contains(r#""mode":"identity""#),
+            "should inject identity mode"
+        );
+    }
+
+    #[test]
     fn head_injector_emits_config_script() {
         let integration = PrebidIntegration::new(base_config());
         let document_state = IntegrationDocumentState::default();
@@ -5589,6 +5736,7 @@ external_bundle_sri = "sha384-AAAA"
         let integration = PrebidIntegration::new(base_config());
         let mut browser_config = PrebidIntegrationConfig::default();
         browser_config.account_id = Some("browser-account".to_string());
+        browser_config.mode = PrebidMode::Identity;
         browser_config.timeout_ms = 1750;
         browser_config.debug = false;
         let plan = AuctionPlan::compile(AuctionPlanConfig {
@@ -5645,6 +5793,10 @@ external_bundle_sri = "sha384-AAAA"
         let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
         let script = &inserts[0];
 
+        assert!(
+            script.contains(r#""mode":"identity""#),
+            "should inject planned browser mode"
+        );
         assert!(script.contains(r#""timeout":1750,"debug":false"#));
         assert!(
             script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),

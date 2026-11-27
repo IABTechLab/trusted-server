@@ -1,7 +1,7 @@
 import { log } from '../../core/log';
+import { GppConsentCapture, isCookieSafeGppString, type GppWindow } from '../../shared/gpp_capture';
 
 import { ConsentSync } from './consent_sync';
-import { GppConsentCapture, isCookieSafeGppString, type GppWindow } from './gpp_capture';
 import { installSourcepointGuard } from './script_guard';
 import { installSourcepointTcfMirror } from './tcf_mirror';
 

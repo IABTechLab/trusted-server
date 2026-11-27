@@ -117,6 +117,7 @@ impl AppState {
         Arc::get_mut(&mut self.identity)
             .expect("should uniquely own the initializing identity app")
             .bind_record_store(Arc::new(store));
+        Arc::make_mut(&mut self.registry).set_identity_app(&self.identity);
     }
 
     fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {

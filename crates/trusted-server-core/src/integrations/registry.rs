@@ -10,6 +10,7 @@ use matchit::Router;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
+use crate::ec::app::IdentityApp;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
@@ -600,6 +601,25 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
+    /// Returns head snippets with the page's EC consent-reporting eligibility.
+    ///
+    /// Reporting needs a mounted record-backed route and no other enabled
+    /// consent writer. Integrations that do not report consent retain their
+    /// ordinary snippets.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let inserts = injector.head_inserts_with_ec_route(&context, true);
+    /// ```
+    fn head_inserts_with_ec_route(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        _ec_route_available: bool,
+    ) -> Vec<String> {
+        self.head_inserts(ctx)
+    }
+
     /// Return attributes to add to the publisher TSJS bundle tag.
     fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -798,6 +818,7 @@ pub struct ProxyDispatchInput<'a> {
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+    ec_route_available: bool,
 }
 
 impl IntegrationRegistry {
@@ -918,9 +939,24 @@ impl IntegrationRegistry {
         let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
+            ec_route_available: false,
         };
         registry.ensure_async_html_finish_allowed(settings)?;
         Ok(registry)
+    }
+
+    /// Updates browser EC route availability from the mounted identity app.
+    ///
+    /// Call after binding the record store and before sharing the registry.
+    /// Without a graph the EC route returns 501 and browser reporting stays off.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// registry.set_identity_app(&identity);
+    /// ```
+    pub fn set_identity_app(&mut self, identity: &IdentityApp) {
+        self.ec_route_available = identity.identity_graph().is_some();
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1138,6 +1174,7 @@ impl IntegrationRegistry {
                 ..Default::default()
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1145,8 +1182,12 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = Vec::new();
+        // Sourcepoint owns consent synchronization even when SDK rewriting is off.
+        // Keep one server-selected writer rather than racing independent queues.
+        let ec_reporting_available =
+            self.ec_route_available && !self.integration_enabled("sourcepoint");
         for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts(ctx);
+            let mut next = injector.head_inserts_with_ec_route(ctx, ec_reporting_available);
             if !next.is_empty() {
                 inserts.append(&mut next);
             }
@@ -1289,6 +1330,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1318,6 +1360,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1348,6 +1391,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1374,6 +1418,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1440,6 +1485,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 }

@@ -1,4 +1,4 @@
-import { log } from '../../core/log';
+import { log } from '../core/log';
 
 export interface GppConsent {
   gppString: string;
@@ -151,7 +151,7 @@ export class GppConsentCapture {
     } catch {
       this.unsubscribe();
       this.onUnavailable();
-      log.warn('sourcepoint: GPP event subscription failed');
+      log.warn('consent: GPP event subscription failed');
     }
   }
 
@@ -194,7 +194,7 @@ export class GppConsentCapture {
       }
     } catch {
       this.onUnavailable();
-      log.warn('sourcepoint: GPP state read failed');
+      log.warn('consent: GPP state read failed');
     }
   }
 
@@ -221,7 +221,7 @@ export class GppConsentCapture {
       try {
         this.api.call(this.target, 'removeEventListener', () => {}, this.listenerId);
       } catch {
-        log.warn('sourcepoint: GPP listener cleanup failed');
+        log.warn('consent: GPP listener cleanup failed');
       }
     }
     this.listenerId = undefined;

@@ -229,11 +229,12 @@ pub(crate) fn build_state_from_settings(
     // they warn here, once per sandbox.
     warn_unsynthesizable_operator_response_headers(&settings);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
-    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let mut registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
     let settings = Arc::new(settings);
     let identity = build_identity_app(Arc::clone(&settings))?;
+    registry.set_identity_app(&identity);
 
     Ok(Arc::new(AppState {
         settings,
