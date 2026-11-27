@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "geo-cloudfront")]
+use base64::Engine as _;
 use edgezero_core::blob_envelope::BlobEnvelope;
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
@@ -27,7 +29,7 @@ use trusted_server_core::test_support::nextjs_auction;
 #[path = "support/celld.rs"]
 mod celld_fixture;
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::engine::general_purpose::STANDARD;
 #[cfg(all(feature = "celld-ec", feature = "geo-cloudfront"))]
 use trusted_server_core::ec::kv_backend::{
     EcKvStore as _, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
@@ -302,6 +304,15 @@ impl Prepared {
         trusted_proxy: bool,
         geo_profile: Option<&std::path::Path>,
     ) -> Running {
+        self.spawn_with_geo_options(trusted_proxy, geo_profile, false)
+    }
+
+    fn spawn_with_geo_options(
+        &self,
+        trusted_proxy: bool,
+        geo_profile: Option<&std::path::Path>,
+        cloudfront: bool,
+    ) -> Running {
         let port = reserve_port()
             .local_addr()
             .expect("should read reserved port")
@@ -368,6 +379,15 @@ impl Prepared {
         }
         if let Some(profile) = geo_profile {
             command.env("TRUSTED_SERVER__NATIVE_GEO_PROFILE_FILE", profile);
+        }
+        if cloudfront {
+            command
+                .env("EDGEZERO__ADAPTER__GEO__PROVIDER", "cloudfront")
+                .env("EDGEZERO__ADAPTER__GEO__ALB_PEER_CIDRS", "127.0.0.1/32")
+                .env(
+                    "EDGEZERO__ADAPTER__GEO__ORIGIN_CREDENTIAL_HEADER_NAME",
+                    "x-origin-synthetic-fixture",
+                );
         }
         Running {
             child: command
@@ -1283,5 +1303,159 @@ fn real_nextjs_action_and_api_after_truncated_post() {
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("should parse real API response"),
         json!({"native": "real-nextjs-api"})
+    );
+}
+
+#[cfg(feature = "geo-cloudfront")]
+#[test]
+fn prepared_provider_opt_out_filters_cookie_and_body_on_repeated_visits() {
+    let origin = origin::Origin::start("provider-opt-out");
+    let mut prepared = Prepared::new(&origin.base_url);
+    prepared.data["ec"]["storage"] = json!({"provider":"records","store":"trusted_server_kv"});
+    prepared.data["ec"]["partners"] =
+        json!([{"name":"SharedID fixture","source_domain":"pubcid.org","bidstream_enabled":true}]);
+    prepared.data["ec"]["identity_providers"] = json!([{"id":"sharedid","kind":"sharedid"}]);
+    prepared.data["auction"] = json!({"enabled":true,"providers":{"fixture":{"protocol":"openrtb-2.6","profile":"standard","endpoint":format!("{}/bid", origin.base_url),"routing":"all_eligible"}}});
+    prepared.publish();
+    let mut running = prepared.spawn_with_geo_options(true, None, true);
+    running.ready();
+    let client = client();
+    let ingress = |request: reqwest::blocking::RequestBuilder| {
+        request
+            .header("host", "publisher.example.com")
+            .header(
+                "forwarded",
+                "for=198.51.100.24;proto=https;host=publisher.example.com",
+            )
+            .header("cloudfront-viewer-country", "AU")
+            .header("x-origin-synthetic-fixture", "synthetic-fixture-only")
+    };
+    let navigate = |cookies: &str| {
+        ingress(client.get(format!("{}/article", running.base_url())))
+            .header("accept", "text/html")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", cookies)
+            .send()
+            .expect("should navigate through prepared production startup")
+    };
+    let issued = navigate("_pubcid=11111111-1111-4111-8111-111111111111");
+    assert_eq!(issued.status().as_u16(), 200, "should reach publisher");
+    let ec = issued
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.strip_prefix("ts-ec=").map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .expect("should contain EC")
+                    .to_owned()
+            })
+        })
+        .expect("should issue EC using prepared persistent records and protected country");
+    let auction = |cookie: &str, body_eids: Option<Value>| {
+        let before = origin
+            .received
+            .lock()
+            .expect("should lock captures")
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .count();
+        let mut body = json!({"adUnits":[{"code":"fixture-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]});
+        if let Some(eids) = body_eids {
+            body["eids"] = eids;
+        }
+        let response = ingress(client.post(format!("{}/auction", running.base_url())))
+            .header("referer", "https://publisher.example.com/article")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", cookie)
+            .json(&body)
+            .send()
+            .expect("should dispatch real auction");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return auction response"
+        );
+        let received = origin.received.lock().expect("should lock captures");
+        let bids: Vec<_> = received
+            .iter()
+            .filter(|received| received.path == "/bid")
+            .collect();
+        assert_eq!(
+            bids.len(),
+            before + 1,
+            "should capture one actual bidder request"
+        );
+        let payload: Value = serde_json::from_slice(&bids.last().expect("should capture bid").body)
+            .expect("should decode bidder request");
+        payload["user"]["eids"].clone()
+    };
+    let cookie = format!("ts-ec={ec}");
+    assert!(
+        auction(&cookie, None)
+            .as_array()
+            .expect("should deliver provider EID")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"),
+        "should prove positive provider delivery"
+    );
+    let opted_out = format!("{cookie}; _pubcid_optout=1");
+    assert_eq!(
+        navigate(&opted_out).status().as_u16(),
+        200,
+        "should apply provider cookie opt-out"
+    );
+    let forged = json!([{ "source":"pubcid.org","uids":[{"id":"forged-client-copy","atype":1}] },{ "source":"other.example.com","uids":[{"id":"unrelated-client","atype":1}] }]);
+    for _ in 0..2 {
+        assert_eq!(
+            navigate(&opted_out).status().as_u16(),
+            200,
+            "should keep repeated visits working"
+        );
+        for from_cookie in [false, true] {
+            let cookies = if from_cookie {
+                format!(
+                    "{opted_out}; ts-eids={}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&forged).expect("should encode EIDs"))
+                )
+            } else {
+                opted_out.clone()
+            };
+            let delivered = auction(&cookies, (!from_cookie).then(|| forged.clone()));
+            let sources: Vec<_> = delivered
+                .as_array()
+                .expect("should retain unrelated EID")
+                .iter()
+                .filter_map(|eid| eid["source"].as_str())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["other.example.com"],
+                "should suppress owned browser and client EIDs on every visit"
+            );
+        }
+    }
+    assert_eq!(
+        navigate(&format!(
+            "{cookie}; _pubcid=22222222-2222-4222-8222-222222222222"
+        ))
+        .status()
+        .as_u16(),
+        200,
+        "should opt back in through provider cookie"
+    );
+    let restored = auction(&cookie, None);
+    assert!(
+        restored
+            .as_array()
+            .expect("should restore provider delivery")
+            .iter()
+            .any(|eid| eid["source"] == "pubcid.org"
+                && eid["uids"][0]["id"] == "22222222-2222-4222-8222-222222222222"),
+        "should restore provider EID after opt-back-in"
     );
 }

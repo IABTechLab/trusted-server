@@ -428,19 +428,27 @@ impl IdentityApp {
     /// Registers shared follow-up identity work with the runtime's drained task API.
     ///
     /// Outbound futures are created inside the task's fresh outbound scope.
+    ///
+    /// Registers nothing when there is no work or finalize issued no follow-up
+    /// permit, so a skipped navigation never holds the shutdown drain. The
+    /// permit stays in `context` for [`Self::run_after_response_lookups`].
+    ///
+    /// Returns whether a task was registered. A missing scheduler or a rejected
+    /// registration is logged and drops the work without running it.
+    #[must_use = "returns whether follow-up work was registered; failures are already logged"]
     pub fn schedule_after_response(
         self: &Arc<Self>,
         mut context: EcContext,
         work: Option<super::AfterResponseLookups>,
         scheduler: Option<edgezero_core::after_response::AfterResponseHandle>,
         client: edgezero_core::outbound::HttpClient,
-    ) {
-        if work.is_none() {
-            return;
+    ) -> bool {
+        if work.is_none() || !context.has_after_response_permit() {
+            return false;
         }
         let Some(scheduler) = scheduler else {
             log::error!("Identity follow-up requires the runtime after-response capability");
-            return;
+            return false;
         };
         let app = Arc::clone(self);
         let budget =
@@ -450,7 +458,9 @@ impl IdentityApp {
                 .await;
         }) {
             log::error!("Identity follow-up registration fails: {error}");
+            return false;
         }
+        true
     }
 }
 

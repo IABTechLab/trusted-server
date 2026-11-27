@@ -99,11 +99,16 @@ pub async fn handle_identify(
                 let now = UnixSeconds::new(current_timestamp());
                 let vendor_denied = partner.owner_vendor_consent_denied(ec_context.consent())
                     || partner.excluded_for(ec_context.consent())
-                    || ec_context.source_opted_out_in_cookies(&partner.source_domain);
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain)
+                    || registry.source_owner_opted_out(&partner.source_domain, &entry, now);
                 eid = entry
                     .ids
                     .get(&partner.source_domain)
-                    .filter(|_| !vendor_denied)
+                    .filter(|record| {
+                        !vendor_denied
+                            && (!registry.source_has_enabled_provider_owner(&partner.source_domain)
+                                || record.is_provider_written())
+                    })
                     .and_then(|record| {
                         source_views(&partner.source_domain, record, partner.openrtb_atype, now)
                             .next()
@@ -1018,12 +1023,21 @@ mod tests {
         consent: ConsentContext,
         cookie_opted_out_sources: &[&str],
     ) -> serde_json::Value {
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert("ssp.example.com".to_owned(), record);
+        identify_entry_body_with(&entry, registry, consent, cookie_opted_out_sources).await
+    }
+
+    async fn identify_entry_body_with(
+        entry: &KvEntry,
+        registry: &PartnerRegistry,
+        consent: ConsentContext,
+        cookie_opted_out_sources: &[&str],
+    ) -> serde_json::Value {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::in_memory("identify_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
-        entry.ids.insert("ssp.example.com".to_owned(), record);
-        kv.create(&ec_id, &entry)
+        kv.create(&ec_id, entry)
             .await
             .expect("should seed KV entry");
         let req = Request::builder()
@@ -1049,6 +1063,50 @@ mod tests {
             &response.into_body().into_bytes().unwrap_or_default(),
         )
         .expect("should decode identify response JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_identify_withholds_owned_legacy_and_opted_out_provider_records() {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        settings.ec.identity_providers =
+            vec![toml::from_str(
+            "id = \"example-provider\"\nkind = \"example\"\nsources = [\"ssp.example.com\"]",
+        ).expect("should parse provider")];
+        let registry = PartnerRegistry::from_ec_with_kinds(&settings.ec, |_| true)
+            .expect("should build registry");
+        let consent = || ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+
+        let legacy = identify_body_with(KvPartnerId::single("legacy"), &registry, consent()).await;
+        assert!(
+            legacy.get("uid").is_none() && legacy.get("eid").is_none(),
+            "should withhold legacy records after provider ownership begins"
+        );
+
+        let live =
+            identify_body_with(provider_record("live", Expiry::Never), &registry, consent()).await;
+        assert_eq!(
+            live["uid"], "live",
+            "should preserve the live provider record"
+        );
+
+        let mut entry = KvEntry::minimal("ssp.example.com", "unused", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            provider_record("live", Expiry::Never),
+        );
+        entry
+            .opt_outs
+            .insert(ProviderId::new("example-provider"), u64::MAX);
+        let opted_out = identify_entry_body_with(&entry, &registry, consent(), &[]).await;
+        assert!(
+            opted_out.get("uid").is_none() && opted_out.get("eid").is_none(),
+            "should withhold provider records while their owner's opt-out is active"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

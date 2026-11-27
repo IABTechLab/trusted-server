@@ -78,8 +78,7 @@ async fn post_delivery_work(
             mut ec_state,
             after_response,
         } = state;
-        run_after_response_lookups(&mut ec_state, after_response, &identity, settings, client)
-            .await;
+        run_after_response_lookups(&mut ec_state, after_response, &identity, client).await;
     }
 }
 
@@ -93,7 +92,6 @@ pub(crate) async fn run_after_response_lookups(
     ec_state: &mut EcFinalizeState,
     lookups: Option<AfterResponseLookups>,
     identity: &IdentityApp,
-    _settings: &Settings,
     client: &HttpClient,
 ) {
     identity

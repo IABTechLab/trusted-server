@@ -3835,7 +3835,6 @@ mod tests {
                 ec_state,
                 lookups,
                 &fixture.state.identity,
-                &fixture.state.settings,
                 &fixture.client.http_client(),
             ));
     }

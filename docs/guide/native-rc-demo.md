@@ -7,7 +7,20 @@ stops the process with a non-zero exit before the port opens. A missing or
 invalid config value or secret leaves the process listening with the failure
 router: `/health` stays `200`, and `/ready` and every route answer `503`. On
 SIGTERM the server stops accepting connections and finishes in-flight requests
-within a configured grace.
+and registered after-response tasks within one configured grace. Requests and
+tasks share that deadline; a task does not get a second grace period.
+
+Identity tasks use `ec.identity_after_response_budget_ms` (default 2000 ms)
+as a whole-task limit on Axum, starting after response-body release and
+including reads and the guarded follow-up write. The remaining shutdown grace
+can cancel work sooner. Fastly retains its existing post-send gate and lookup
+budget.
+
+Consented navigations and EC route POSTs register follow-up work through the
+shared identity app only when finalize issued a follow-up write permit, so a
+skipped navigation never holds the shutdown drain. CI proof of a pending record
+write completing within the grace is tracked separately (#1579, implemented in
+#1654).
 
 The adapter uses the workspace EdgeZero pin; see
 [the pinned version](./edgezero#pinned-version).
