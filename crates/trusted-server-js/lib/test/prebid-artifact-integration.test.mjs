@@ -1648,6 +1648,39 @@ describe('pinned Prebid public targeting contract', () => {
     }
   });
 
+  it.each(['adid_exampleClient', 'pb_exampleClient'])(
+    'refuses ambiguous native custom bases for local seat %s while preserving foreign targeting',
+    async (localSeat) => {
+      const page = targetingPage({
+        settings: {
+          [localSeat]: { adserverTargeting: [{ key: 'hb', val: 'example-custom-value' }] },
+        },
+        client: { cpm: 0.99 },
+        clientCode: 'exampleClient',
+        respond: () => {
+          const body = serverResponse(price, { hb_pb: '8.88' });
+          body.seatbid[0].seat = localSeat;
+          return body;
+        },
+      });
+      try {
+        await page.auction();
+        expect(page.bids().find((bid) => bid.adapterCode === 'trustedServer').cpm).toBeLessThan(0);
+        const clientId = page.bids().find((bid) => bid.bidderCode === 'exampleClient').adId;
+        const target = page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+        expect(target).toMatchObject({ hb_pb: '0.90', hb_adid: clientId });
+        await page.target();
+        const values = Object.values(page.slots[0].values).flat();
+        expect(values).toContain('0.90');
+        expect(values).toContain(clientId);
+        expect(values).not.toContain('8.88');
+        expect(values).not.toContain('example-custom-value');
+      } finally {
+        page.close();
+      }
+    }
+  );
+
   it.each([
     ['low', '1.00'],
     ['medium', '1.20'],

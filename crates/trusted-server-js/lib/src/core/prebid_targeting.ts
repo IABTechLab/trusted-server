@@ -78,6 +78,16 @@ function selectedValues(value: unknown): Record<string, string> | undefined {
   return Object.fromEntries(entries) as Record<string, string>;
 }
 
+function hasAmbiguousNativeKeys(targeting: Targeting): boolean {
+  const keys = new Set(Object.keys(targeting));
+  for (const key of keys) {
+    for (let index = key.indexOf('_'); index >= 0; index = key.indexOf('_', index + 1)) {
+      if (keys.has(key.slice(0, index))) return true;
+    }
+  }
+  return false;
+}
+
 function sameValues(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
@@ -191,6 +201,9 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
       function compatible(bid: NativeBid, record: BoundTargeting): boolean {
         if (
           record.refused ||
+          // A custom base such as hb can collide with standard suffixed keys.
+          // Their ownership cannot be separated after native flattening.
+          hasAmbiguousNativeKeys(record.nativeTargeting) ||
           unsupportedOverflow ||
           unsupportedUnits.has(bid.adUnitCode) ||
           record.generation !== (api.navGeneration ?? 0) ||
