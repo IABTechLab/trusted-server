@@ -1,4 +1,5 @@
-// Prebid.js bundle with a custom "trustedServer" bid adapter that routes all
+// Prebid.js integration with auction (default) and identity-only modes.
+// Auction mode registers a custom "trustedServer" bid adapter that routes
 // bid requests through the Trusted Server /auction orchestrator endpoint.
 //
 // Instead of using prebidServerBidAdapter (which sends OpenRTB directly to PBS),
@@ -8,8 +9,9 @@
 //   3. Parses the OpenRTB seatbid response via core/auction
 //   4. Maps parsed AuctionBids into Prebid bid response objects
 //
-// The shim on requestBids injects "trustedServer" into every ad unit so all
-// bids flow through the orchestrator.
+// In auction mode, the requestBids shim adds "trustedServer" to every ad unit.
+// Identity mode instead merges the server EID mirror into publisher auctions
+// and captures native IDs without changing bidders or GPT refresh.
 
 import type _pbjsDefault from 'prebid.js';
 
@@ -30,6 +32,8 @@ import type { AuctionSlot, TsjsApi } from '../../core/types';
 import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace/runtime';
 import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
+import { mergeIdentityMirror } from './identity';
+import { installNativeIdCapture } from './native_capture';
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
   userIdConfigNameAliases,
@@ -184,6 +188,11 @@ export interface PrebidNpmConfig {
  * Set by the Rust IntegrationHeadInjector from trusted-server.toml values.
  */
 interface InjectedPrebidConfig {
+  /**
+   * Integration behavior. Defaults to auction. Server-owned: the self-install
+   * and the GPT refresh handler both read it here, so it is not a JS override.
+   */
+  mode?: 'auction' | 'identity';
   accountId?: string;
   timeout?: number;
   debug?: boolean;
@@ -1965,20 +1974,6 @@ function collectAuctionEids(): AuctionEid[] | undefined {
   return eids.length > 0 ? eids : undefined;
 }
 
-/**
- * Install the Prebid integration.
- *
- * Registers the "trustedServer" bid adapter and shims `requestBids` so every
- * ad unit is also bid on by that adapter, routing through /auction.
- *
- * Config resolution (values from later sources override earlier ones):
- * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
- * 2. `config` argument — explicit overrides from the publisher's JS
- *
- * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
- * repeat calls (double script inclusion, a bundle that still carries a
- * baked-in shim) a no-op instead of a double adapter registration.
- */
 function apsRendererCarrier(bid: Record<string, unknown>): unknown {
   const renderer = bid[APS_RENDERER_FIELD];
   if (renderer != null) return renderer;
@@ -2038,11 +2033,29 @@ function installApsBidResponseRegistry(): void {
   prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
 }
 
+/**
+ * Install the Prebid integration.
+ *
+ * Auction mode registers the "trustedServer" bid adapter and adds it to
+ * publisher auctions. Identity mode merges mirrored EIDs into request-local
+ * first-party data and captures native IDs without installing auction hooks.
+ *
+ * Config resolution (values from later sources override earlier ones):
+ * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
+ * 2. `config` argument — explicit overrides from the publisher's JS
+ *
+ * The mode comes only from `window.__tsjs_prebid`. The module-load refresh
+ * handler decision reads the same value, so the two cannot disagree.
+ *
+ * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
+ * repeat calls (double script inclusion, a bundle that still carries a
+ * baked-in shim) a no-op instead of installing either mode twice.
+ */
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   // The prebid integration requires the external Prebid.js bundle
   // (integrations.prebid.external_bundle_url). When it failed to load (network
   // error, SRI mismatch) window.pbjs is still the head-injected stub with no
-  // API — installing the adapter is impossible, so bail out loudly.
+  // API — installing the integration is impossible, so bail out loudly.
   if (!hasPrebidJsApi()) {
     log.error(
       '[tsjs-prebid] window.pbjs is missing the required Prebid.js API — the external ' +
@@ -2061,28 +2074,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   }
 
   warnedMissingUserIdManifest = false;
-  publisherAdUnitSnapshots = new Map();
-  pendingPublisherBids = new Map();
-  pendingPublisherCodes = new Map();
-  pendingPublisherRegistrationId = 0;
-  activePublisherRegistrationId = undefined;
-  activePublisherFirstImpressionTokens = undefined;
-  publisherFirstImpressionTokens = new Map();
-  syntheticRefreshAdUnits = new WeakSet();
-
-  const prebidWithRemoveAdUnit = pbjs as unknown as PrebidWithRemoveAdUnit;
-  if (!prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped) {
-    const originalRemoveAdUnit = prebidWithRemoveAdUnit.removeAdUnit;
-    if (typeof originalRemoveAdUnit === 'function') {
-      prebidWithRemoveAdUnit.removeAdUnit = function (adUnitCode?: string | string[]) {
-        const result = originalRemoveAdUnit.call(this, adUnitCode);
-        removePublisherState(adUnitCode);
-        return result;
-      };
-      prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped = true;
-    }
-  }
-
   const injected = getInjectedConfig();
   const merged: PrebidNpmConfig = {
     endpoint: config?.endpoint,
@@ -2385,6 +2376,51 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       // later configuration and auction calls recheck without treating absence
       // as consent.
       retireLateTcfWatch = watchForLateTcfApi(trySeedManagedUserIds);
+    }
+  }
+
+  if (injected?.mode === 'identity') {
+    const originalRequestBids = pbjs.requestBids;
+    pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
+      trySeedManagedUserIds?.();
+      recordUserIdModuleDiagnostics();
+      const opts = { ...(requestObj ?? {}) };
+      const ortb2 = mergeIdentityMirror(opts.ortb2, () => pbjs.getConfig('ortb2'));
+      if (ortb2 !== opts.ortb2) opts.ortb2 = ortb2 as typeof opts.ortb2;
+      const originalBidsBack = opts.bidsBackHandler;
+      opts.bidsBackHandler = function (...args: unknown[]) {
+        syncPrebidEidsCookie(true);
+        if (typeof originalBidsBack === 'function') {
+          return originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
+        }
+      };
+      return originalRequestBids.call(this, opts);
+    };
+    pbjs.processQueue();
+    installNativeIdCapture(() => syncPrebidEidsCookie(true));
+    recordUserIdModuleDiagnostics();
+    return pbjs;
+  }
+
+  publisherAdUnitSnapshots = new Map();
+  pendingPublisherBids = new Map();
+  pendingPublisherCodes = new Map();
+  pendingPublisherRegistrationId = 0;
+  activePublisherRegistrationId = undefined;
+  activePublisherFirstImpressionTokens = undefined;
+  publisherFirstImpressionTokens = new Map();
+  syntheticRefreshAdUnits = new WeakSet();
+
+  const prebidWithRemoveAdUnit = pbjs as unknown as PrebidWithRemoveAdUnit;
+  if (!prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped) {
+    const originalRemoveAdUnit = prebidWithRemoveAdUnit.removeAdUnit;
+    if (typeof originalRemoveAdUnit === 'function') {
+      prebidWithRemoveAdUnit.removeAdUnit = function (adUnitCode?: string | string[]) {
+        const result = originalRemoveAdUnit.call(this, adUnitCode);
+        removePublisherState(adUnitCode);
+        return result;
+      };
+      prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped = true;
     }
   }
 
@@ -3108,32 +3144,48 @@ function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<s
   );
 }
 
+let nativeCaptureFailureWarned = false;
+
 /**
  * Collects EIDs from Prebid's User ID Module and `ortb2.user.ext.eids` config
  * and writes them as a base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for
  * backend ingestion and auction fallback on later requests.
  */
-function syncPrebidEidsCookie(): void {
+function syncPrebidEidsCookie(onlyChanges = false): void {
+  const currentValue = (): string | undefined =>
+    document.cookie
+      .split('; ')
+      .find((part) => part.startsWith(`${EID_COOKIE_NAME}=`))
+      ?.slice(EID_COOKIE_NAME.length + 1);
+  const clearStale = (): void => {
+    if (!onlyChanges || currentValue() !== undefined) clearPrebidEidsCookie();
+  };
   try {
     const eids = collectAuctionEids();
-    if (!eids) {
-      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
-      clearPrebidEidsCookie();
-      return;
-    }
-
-    const payload = fitAuctionEidsToCookie(eids);
+    const payload = eids ? fitAuctionEidsToCookie(eids) : undefined;
     if (!payload) {
-      clearPrebidEidsCookie();
+      clearStale();
+      nativeCaptureFailureWarned = false;
       return;
     }
-
     const encoded = btoa(JSON.stringify(payload));
-    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
-
-    log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
+    if (!onlyChanges || encoded !== currentValue()) {
+      document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+      log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
+    }
+    nativeCaptureFailureWarned = false;
   } catch (err) {
-    log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+    if (!onlyChanges || !nativeCaptureFailureWarned) {
+      log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+    }
+    if (onlyChanges) {
+      nativeCaptureFailureWarned = true;
+      try {
+        clearStale();
+      } catch {
+        // Browsers that block cookie access may also reject stale-cookie cleanup.
+      }
+    }
   }
 }
 
@@ -3145,7 +3197,7 @@ if (typeof window !== 'undefined') {
   // would clear TS-applied GPT targeting on every publisher refresh and then
   // fail to run the replacement auction — leave GPT untouched instead.
   if (hasPrebidJsApi()) {
-    installRefreshHandler();
+    if (getInjectedConfig()?.mode !== 'identity') installRefreshHandler();
     // The slim-Prebid lazy loader appends this bundle from a window.load
     // handler, so `load` may already have fired by the time this code runs —
     // waiting for it again would skip user ID setup entirely on that path.

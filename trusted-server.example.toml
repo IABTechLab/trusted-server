@@ -779,6 +779,8 @@ auction_timeout_ms = 500
 # [proxy].allowed_domains. Kept active but disabled.
 [integrations.prebid]
 enabled = false
+# Use "identity" to capture and merge IDs without the browser auction shim.
+mode = "auction"
 timeout_ms = 1000
 debug = false
 client_side_bidders = []          # bidders running via native Prebid.js adapters

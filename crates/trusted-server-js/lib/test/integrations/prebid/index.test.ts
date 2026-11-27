@@ -3335,6 +3335,26 @@ describe('prebid/installPrebidNpm', () => {
       expect(hasTsBidder).toBe(true);
     });
 
+    it('keeps auction capture callback-driven and refreshes an unchanged cookie', () => {
+      const timer = vi.spyOn(globalThis, 'setInterval');
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'native.example', uids: [{ id: 'auction-native', atype: 1 }] },
+      ]);
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      const pbjs = installPrebidNpm();
+      expect(timer).not.toHaveBeenCalled();
+      const request = () => pbjs.requestBids({ adUnits: [] } as unknown as RequestBidsArg);
+      request();
+      const value = document.cookie;
+      const write = vi.spyOn(document, 'cookie', 'set');
+      request();
+      expect(document.cookie).toBe(value);
+      expect(write).toHaveBeenCalledWith(expect.stringContaining('ts-eids='));
+      expect(write).toHaveBeenCalledWith(expect.stringContaining('Max-Age=86400'));
+    });
+
     it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
