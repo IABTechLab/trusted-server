@@ -29,6 +29,7 @@ use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
 use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
+use crate::proxy_policy::{CompiledProxyPolicy, ProxyIdentityEndpoint};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -2364,6 +2365,18 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
+    /// Explicit creative identity destination grants; empty denies disclosure.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
+    pub identity_endpoints: Vec<ProxyIdentityEndpoint>,
+    /// Prepared immutable identity policy. Rebuild through [`Self::prepare_runtime`]
+    /// after changing endpoint configuration and before routing requests.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub compiled_identity_policy: CompiledProxyPolicy,
     /// Must be true. TLS is always verified on every outbound HTTPS request.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
@@ -2400,6 +2413,8 @@ fn is_admin_placeholder_password(password: &str) -> bool {
 impl Default for Proxy {
     fn default() -> Self {
         Self {
+            identity_endpoints: Vec::new(),
+            compiled_identity_policy: CompiledProxyPolicy::default(),
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
@@ -2468,13 +2483,22 @@ impl Proxy {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any configured asset route is invalid.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if an asset route or identity endpoint is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.compiled_identity_policy = CompiledProxyPolicy::compile(&self.identity_endpoints)?;
         for route in &self.asset_routes {
             route.prepare_runtime()?;
         }
 
         Ok(())
+    }
+
+    /// Return the immutable identity policy prepared for this configuration.
+    ///
+    /// Call [`Self::prepare_runtime`] after any programmatic endpoint changes.
+    #[must_use]
+    pub fn identity_policy(&self) -> &CompiledProxyPolicy {
+        &self.compiled_identity_policy
     }
 
     /// Resolve the longest matching asset route for the given request path.
@@ -8965,6 +8989,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8985,6 +9010,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -9000,6 +9026,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -9015,6 +9042,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -9029,6 +9057,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -9047,6 +9076,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -9071,6 +9101,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
 
@@ -9795,6 +9826,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -9823,6 +9855,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -10039,6 +10072,87 @@ source_domain = "partner.example.com"
 
     /// Helper that returns a settings TOML string WITHOUT any admin handler,
     /// for tests that need to verify uncovered-admin-endpoint behaviour.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyProxyReader {
+        #[serde(rename = "certificate_check")]
+        _certificate_check: bool,
+        #[serde(rename = "allowed_domains")]
+        _allowed_domains: Vec<String>,
+        #[serde(rename = "asset_routes")]
+        _asset_routes: Vec<ProxyAssetRoute>,
+    }
+
+    #[test]
+    fn proxy_identity_policy_is_prepared_and_never_serialized() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"https://example.com:443/","path_exact":"/event"}]
+        })).expect("should deserialize endpoint config");
+        proxy
+            .prepare_runtime()
+            .expect("should prepare immutable identity policy");
+        let target = Url::parse("https://example.com/event").expect("should parse target");
+        assert_eq!(
+            proxy
+                .identity_policy()
+                .matching_endpoint(&target)
+                .map(|rule| rule.id.as_str()),
+            Some("event"),
+            "should compile endpoint during runtime preparation"
+        );
+        let serialized = serde_json::to_value(&proxy).expect("should serialize proxy");
+        assert!(
+            serialized.get("compiled_identity_policy").is_none(),
+            "should omit runtime policy from stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(serialized)
+            .expect_err("should reject recipient grants in the older deny-unknown-fields reader");
+        proxy.identity_endpoints.clear();
+        proxy
+            .prepare_runtime()
+            .expect("should recompile changed configuration");
+        assert!(
+            proxy.identity_policy().matching_endpoint(&target).is_none(),
+            "should replace previous compiled rules after mutation"
+        );
+        let empty = serde_json::to_value(&proxy).expect("should serialize empty policy");
+        assert!(
+            empty.get("identity_endpoints").is_none(),
+            "should omit default-empty rules for compatible stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(empty)
+            .expect("should preserve default configuration readability for the older reader");
+    }
+
+    #[test]
+    fn proxy_identity_policy_rejects_invalid_runtime_configuration() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"http://example.com","path_exact":"/event"}]
+        })).expect("should deserialize structurally valid endpoint");
+        assert!(
+            proxy.prepare_runtime().is_err(),
+            "should reject invalid origin during runtime preparation"
+        );
+    }
+
+    #[test]
+    fn proxy_identity_endpoints_accept_sequence_and_map_overlays() {
+        for endpoints in [
+            serde_json::json!([{"id":"event","origin":"https://example.com","path_exact":"/event"}]),
+            serde_json::json!({"0":{"id":"event","origin":"https://example.com","path_exact":"/event"}}),
+        ] {
+            let proxy: Proxy =
+                serde_json::from_value(serde_json::json!({"identity_endpoints":endpoints}))
+                    .expect("should accept typed identity endpoint configuration");
+            assert_eq!(
+                serde_json::to_value(proxy).expect("should serialize proxy")["identity_endpoints"]
+                    [0]["id"],
+                "event",
+                "should preserve endpoint rule"
+            );
+        }
+    }
+
     fn settings_str_without_admin_handler() -> String {
         r#"
             [[handlers]]

@@ -141,6 +141,7 @@ fn build_state_with_services(
     settings
         .publisher
         .drop_origin_host_header_override_for_spin();
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
@@ -712,8 +713,9 @@ fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
             async move {
                 let services = s.services_for_request(&ctx)?;
                 let req = ctx.into_request()?;
+                let ec = build_ec_context(&s.settings, &services, &req);
                 Ok::<Response, EdgeError>(
-                    handle_first_party_proxy(&s.settings, &services, req)
+                    handle_first_party_proxy(&s.settings, &services, &ec, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )

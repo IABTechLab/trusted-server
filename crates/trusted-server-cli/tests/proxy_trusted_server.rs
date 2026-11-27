@@ -93,6 +93,8 @@ struct Fixture {
     // Held for its lifetime: dropping it shuts the listener down.
     _server: AxumTestServer,
     origin_headers: Arc<Mutex<Vec<HeaderMap>>>,
+    origin_uris: Arc<Mutex<Vec<String>>>,
+    origin_url: String,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -114,11 +116,14 @@ async fn start_fixture(trust: bool) -> Fixture {
     );
     let headers = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&headers);
+    let uris = Arc::new(Mutex::new(Vec::new()));
+    let recorded_uris = Arc::clone(&uris);
     let html =
         format!("<html><head></head><body><a href=\"{origin_url}/next\">next</a></body></html>");
     let origin_task = tokio::spawn(async move {
         while let Ok((stream, _)) = origin.accept().await {
             let recorded = Arc::clone(&recorded);
+            let recorded_uris = Arc::clone(&recorded_uris);
             let html = html.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<hyper::body::Incoming>| {
@@ -126,8 +131,23 @@ async fn start_fixture(trust: bool) -> Fixture {
                         .lock()
                         .expect("should record publisher-bound headers")
                         .push(request.headers().clone());
+                    recorded_uris
+                        .lock()
+                        .expect("should record origin URI")
+                        .push(request.uri().to_string());
+                    let asset = request.uri().path() == "/proxy-resource";
                     let html = html.clone();
                     async move {
+                        if asset {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header(header::CONTENT_TYPE, "image/png")
+                                    .header(header::CACHE_CONTROL, "public, max-age=300")
+                                    .header(header::ETAG, "origin-asset")
+                                    .body(Full::new(Bytes::from_static(b"asset-bytes")))
+                                    .expect("should serve static resource"),
+                            );
+                        }
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -148,6 +168,8 @@ async fn start_fixture(trust: bool) -> Fixture {
         addr: server.address(),
         _server: server,
         origin_headers: headers,
+        origin_uris: uris,
+        origin_url,
         tasks: vec![origin_task],
     }
 }
@@ -581,5 +603,96 @@ async fn real_publisher_rewrites_public_port_and_strips_forwarding_credentials()
     assert_eq!(
         value["base"], "https://cdn.example.com/asset.js",
         "should use public HTTPS for protocol-relative signing over plaintext ingress"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_policy_cli_transport_preserves_static_fetch_and_cache_headers() {
+    let mut fixture = start_fixture(true).await;
+    let mut browser = browser(&mut fixture, true, true, true).await;
+    let target = format!("{}/proxy-resource?version=1", fixture.origin_url);
+    let sign_query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("url", &target)
+        .finish();
+    let request = Request::builder()
+        .uri(format!("/first-party/sign?{sign_query}"))
+        .header(header::HOST, PUBLIC_AUTHORITY)
+        .body(Full::new(Bytes::new()))
+        .expect("should build real signing request");
+    let (status, _, body) = send(&mut browser, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "should sign the actual fixture origin"
+    );
+    let href = serde_json::from_slice::<serde_json::Value>(&body)
+        .expect("should decode signed URL")["href"]
+        .as_str()
+        .expect("should return href")
+        .to_owned();
+    let href = url::Url::parse(&href).expect("should parse absolute proxy href");
+    let path = format!(
+        "{}?{}",
+        href.path(),
+        href.query().expect("should contain signed parameters")
+    );
+    let expiry = href
+        .query_pairs()
+        .find(|(key, _)| key == "tsexp")
+        .map(|(_, value)| value.into_owned())
+        .expect("should retain real signer expiry");
+    let expected_origin = format!("/proxy-resource?version=1&tsexp={expiry}");
+    let direct = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build direct client");
+    for prefix in ["a", "b"] {
+        let identity = format!("{}.Ab1234", prefix.repeat(64));
+        assert!(
+            trusted_server_core::ec::is_valid_ec_id(&identity),
+            "should seed canonical reader cookies"
+        );
+        let cookie = format!("ts-ec={identity}");
+        let request = Request::builder()
+            .uri(&path)
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .header(header::COOKIE, &cookie)
+            .body(Full::new(Bytes::new()))
+            .expect("should build browser resource request");
+        let (status, proxied_headers, bytes) = send(&mut browser, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "should serve resource through CLI transport"
+        );
+        assert_eq!(bytes, "asset-bytes", "should preserve asset bytes");
+        let response = direct
+            .get(format!("http://{}{path}", fixture.addr))
+            .header(header::HOST, PUBLIC_AUTHORITY)
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .expect("should request TS directly");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve resource directly"
+        );
+        for name in [header::CACHE_CONTROL, header::ETAG, header::CONTENT_TYPE] {
+            assert_eq!(
+                proxied_headers.get(&name),
+                response.headers().get(&name),
+                "should preserve runtime resource headers for {name}"
+            );
+        }
+    }
+    let observed = fixture
+        .origin_uris
+        .lock()
+        .expect("should inspect actual origin URIs");
+    assert_eq!(
+        observed.as_slice(),
+        vec![expected_origin; 4],
+        "should use the same identity-free upstream URL directly and through CLI for both readers"
     );
 }

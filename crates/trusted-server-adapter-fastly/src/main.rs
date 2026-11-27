@@ -48,6 +48,8 @@ mod management_api;
 mod middleware;
 mod platform;
 mod post_delivery;
+#[cfg(test)]
+mod proxy_policy_runtime;
 mod rate_limiter;
 mod sandbox;
 mod template_cache;
