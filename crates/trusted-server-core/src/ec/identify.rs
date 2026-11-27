@@ -6,7 +6,7 @@
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderValue};
-use http::{Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use url::Url;
 
 use super::auth::authenticate_bearer;
@@ -41,14 +41,7 @@ pub fn handle_identify(
     ec_context: &EcContext,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let allowed_origin = match classify_origin(req, settings) {
-        CorsDecision::Denied => {
-            return Ok(apply_identify_cache_headers(
-                Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(EdgeBody::empty())
-                    .expect("should build forbidden response"),
-            ));
-        }
+        CorsDecision::Denied => return Ok(identify_origin_denied()),
         CorsDecision::NoOrigin => None,
         CorsDecision::Allowed(origin) => Some(origin),
     };
@@ -180,6 +173,89 @@ pub fn cors_preflight_identify(
     };
 
     Ok(apply_identify_cache_headers(response))
+}
+
+/// Builds the local `501 Not Implemented` response for `GET /_ts/api/v1/identify`
+/// on a deployment without an EC record store.
+///
+/// Adapters return this instead of proxying the request to the publisher
+/// origin, so a partner's Bearer token never leaves Trusted Server. The same
+/// origin policy as [`handle_identify`] applies first: a denied browser origin
+/// receives `403`, and an allowed one receives reflected CORS headers so it can
+/// read the `501`.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn identify_not_supported(settings: &Settings, req: &Request<EdgeBody>) -> Response<EdgeBody> {
+    let allowed_origin = match classify_origin(req, settings) {
+        CorsDecision::Denied => return identify_origin_denied(),
+        CorsDecision::NoOrigin => None,
+        CorsDecision::Allowed(origin) => Some(origin),
+    };
+    let body = serde_json::json!({ "error": "ec_store_not_configured" });
+    let response = apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build identify not-supported response"),
+    );
+    apply_cors_headers_if_allowed(response, allowed_origin.as_deref())
+}
+
+/// Builds the local `405 Method Not Allowed` response for a method other than
+/// `GET` or `OPTIONS` on `/_ts/api/v1/identify`.
+///
+/// Adapters claim every method on the identify path and answer the others
+/// with this response, so no request on the path reaches the publisher origin.
+///
+/// # Panics
+///
+/// Panics if the response builder rejects the hardcoded status or headers,
+/// which cannot happen.
+#[must_use]
+pub fn identify_method_not_allowed() -> Response<EdgeBody> {
+    let body = serde_json::json!({ "error": "method_not_allowed" });
+    apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ALLOW, "GET, OPTIONS")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build identify method-not-allowed response"),
+    )
+}
+
+/// Answers an identify request locally, without the EC record store.
+///
+/// `OPTIONS` runs [`cors_preflight_identify`], `GET` returns
+/// [`identify_not_supported`], and every other method returns
+/// [`identify_method_not_allowed`].
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when preflight response construction fails.
+pub fn answer_identify_locally(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    match *req.method() {
+        Method::OPTIONS => cors_preflight_identify(settings, req),
+        Method::GET => Ok(identify_not_supported(settings, req)),
+        _ => Ok(identify_method_not_allowed()),
+    }
+}
+
+fn identify_origin_denied() -> Response<EdgeBody> {
+    apply_identify_cache_headers(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(EdgeBody::empty())
+            .expect("should build forbidden response"),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -349,6 +425,127 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store"),
             "identify responses should not be cached"
+        );
+    }
+
+    fn local_identify_request(method: &str, origin: Option<&str>) -> Request<EdgeBody> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("https://edge.publisher.example.com/_ts/api/v1/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build local identify request")
+    }
+
+    fn local_identify_settings() -> Settings {
+        let mut settings = create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings
+    }
+
+    #[test]
+    fn identify_not_supported_reflects_allowed_origin_on_501() {
+        let settings = local_identify_settings();
+        let req = local_identify_request("GET", Some("https://www.publisher.example.com"));
+
+        let response = identify_not_supported(&settings, &req);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 to an allowed browser origin"
+        );
+        assert_no_store(&response);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://www.publisher.example.com"),
+            "should reflect the allowed origin so the browser can read the 501"
+        );
+    }
+
+    #[test]
+    fn identify_not_supported_denies_mismatched_origin() {
+        let settings = local_identify_settings();
+        let req = local_identify_request("GET", Some("https://evil.example"));
+
+        let response = identify_not_supported(&settings, &req);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should apply the identify origin policy before the 501"
+        );
+        assert_no_store(&response);
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "should not reflect a denied origin"
+        );
+    }
+
+    #[test]
+    fn answer_identify_locally_dispatches_by_method() {
+        let settings = local_identify_settings();
+
+        let get = answer_identify_locally(&settings, &local_identify_request("GET", None))
+            .expect("should answer GET locally");
+        let options = answer_identify_locally(&settings, &local_identify_request("OPTIONS", None))
+            .expect("should answer OPTIONS locally");
+
+        assert_eq!(get.status(), StatusCode::NOT_IMPLEMENTED, "GET should 501");
+        assert_eq!(options.status(), StatusCode::OK, "OPTIONS should preflight");
+        for method in ["HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+            let response =
+                answer_identify_locally(&settings, &local_identify_request(method, None))
+                    .expect("should answer unsupported method locally");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} identify should answer 405"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET, OPTIONS"),
+                "{method} identify should advertise the allowed methods"
+            );
+            assert_no_store(&response);
+        }
+    }
+
+    #[test]
+    fn identify_not_supported_returns_uncached_501() {
+        let settings = local_identify_settings();
+        let response = identify_not_supported(&settings, &local_identify_request("GET", None));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should answer 501 without a record store"
+        );
+        assert_no_store(&response);
+        let body: serde_json::Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer body"),
+        )
+        .expect("should return a JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "ec_store_not_configured" }),
+            "should name the missing record store"
         );
     }
 
