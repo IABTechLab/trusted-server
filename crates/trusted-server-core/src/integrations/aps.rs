@@ -1894,6 +1894,20 @@ pub fn register_for_plan(
     if !plan.has_profile(APS_INTEGRATION_ID) {
         return Ok(None);
     }
+    register_renderer(settings).map(Some)
+}
+
+/// Register APS creative delivery independently of the bidding implementation.
+///
+/// The caller selects this capability from its admitted delivery requirements.
+/// Registration does not create an APS auction provider or send bidder requests.
+///
+/// # Errors
+///
+/// Returns an error when APS browser configuration is invalid.
+pub(crate) fn register_renderer(
+    settings: &Settings,
+) -> Result<IntegrationRegistration, Report<TrustedServerError>> {
     let rendering_mode = settings
         .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
         .map(|config| config.rendering_mode)
@@ -1907,7 +1921,7 @@ pub fn register_for_plan(
     } else {
         registration
     };
-    Ok(Some(registration.build()))
+    Ok(registration.build())
 }
 
 /// Register the APS auction provider when enabled.
@@ -3252,6 +3266,57 @@ mod tests {
                 "disabled or absent browser config should not select publisher-native rendering"
             );
         }
+    }
+
+    #[test]
+    fn aps_renderer_registration_is_independent_of_remote_profile() {
+        let settings = create_test_settings();
+        let plan = crate::auction::AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 1_000,
+            ..AuctionPlanConfig::default()
+        })
+        .expect("should compile a plan without remote APS demand");
+
+        assert!(
+            !plan.has_profile(APS_INTEGRATION_ID),
+            "should have no remote APS profile"
+        );
+        assert!(
+            register_for_plan(&settings, &plan)
+                .expect("should inspect remote renderer requirements")
+                .is_none(),
+            "should not enable the legacy profile implicitly"
+        );
+        let registration = register_renderer(&settings)
+            .expect("should register delivery without a remote APS provider");
+
+        assert_eq!(
+            registration.proxies.len(),
+            1,
+            "should register the static renderer route"
+        );
+        let routes = registration.proxies[0].routes();
+        assert_eq!(routes.len(), 1, "should expose only the renderer endpoint");
+        assert_eq!(
+            routes[0].method,
+            Method::GET,
+            "should serve renderer markup with GET"
+        );
+        assert_eq!(
+            routes[0].path, APS_RENDERER_ROUTE,
+            "should use the existing renderer URL"
+        );
+        assert_eq!(
+            registration.head_injectors.len(),
+            1,
+            "should register renderer ownership metadata"
+        );
+        assert!(
+            registration.head_injectors[0]
+                .tsjs_script_tag_attributes()
+                .is_empty(),
+            "should retain trusted-server rendering when browser configuration is absent"
+        );
     }
 
     #[test]
