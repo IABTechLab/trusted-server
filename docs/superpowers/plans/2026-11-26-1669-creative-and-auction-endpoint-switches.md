@@ -16,9 +16,9 @@
   - status `404`;
   - body exactly `This endpoint is turned off`;
   - `Content-Type: text/plain; charset=utf-8`;
-  - `Cache-Control: no-store`.
+  - `Cache-Control: no-store, private`.
 
-  Handlers return it as `Ok`, never `Err`.
+  Handlers return it as `Ok`, never `Err`. Apply the cache policy with `crate::response_privacy::enforce_terminal_private_cache_privacy`, which also inserts the `TerminalPrivateResponse` marker. Fastly's send boundary uses that marker to restore `no-store, private` after late request-filter header changes.
 
 - **Logging:** exactly one `log::debug!` line per turned-off request, naming the endpoint path and the switch. Nothing at `warn` or `error`.
 - **Which switch each endpoint reads:**
@@ -33,7 +33,9 @@
 
   For `/auction`: production sets the orchestrator's flag from `[auction].enabled` (`compile_auction_plan` calls `with_enabled`). Core tests build the orchestrator separately from `create_test_settings()`, whose `[auction].enabled` is `false`.
 
-- **Check first:** the check is the handler's first statement. It runs before the `Content-Length` check, the body read, signature validation, trace capture and telemetry.
+- **Check first:** the check is the handler's first statement. It runs before the handler's `Content-Length` check, before the handler reads or parses the body, and before signature validation, trace capture and telemetry.
+  - EdgeZero ingress buffers request bodies before routing, and Fastly and Axum answer `500` when that conversion fails. That is out of scope.
+- **Fastly request filters keep precedence:** integration filters such as DataDome run before route dispatch. A filter that answers first, with a challenge, `429` or redirect, keeps that answer. Do not move the check ahead of the filters.
 - **Methods:** only primary methods change: `GET /first-party/proxy`, `GET` and `POST /first-party/sign`, `GET /first-party/click`, `GET` and `POST /first-party/proxy-rebuild`, and `POST /auction`. Every other method keeps going to the publisher fallback.
 - **Scope limits:**
   - no new configuration keys;
@@ -53,7 +55,7 @@
 2. **Malformed or oversized input reaches a turned-off endpoint:** invalid JSON to `/first-party/sign`, or invalid JSON or an over-limit `Content-Length` to `/auction`. The turned-off `404` comes back, not `400`, `413` or `502`. Covered in Tasks 1 and 2.
 3. **A GPT refresh while the auction is off.** The synthetic refresh ad units reach Prebid with no `trustedServer` bid, and their client-side bids are kept. Covered in Task 4.
 4. **An ad unit whose only bid is a `trustedServer` bid the publisher configured,** with the auction off. The unit reaches Prebid with an empty `bids` array and nothing throws. Covered in Task 4.
-5. **Adapter middleware rewrites headers on the turned-off response.** `Cache-Control: no-store` and the exact body survive to the adapter boundary on all four adapters. Covered in Task 3.
+5. **A late `Cache-Control` change on Fastly.** An allowed DataDome verdict sets `Cache-Control` after normal middleware. The turned-off response still leaves with `no-store, private`. Covered by `late_filter_effects_cannot_make_a_turned_off_response_public` in Task 3. The route tests in Task 3 also check the body and header at each adapter's router boundary.
 
 ---
 
@@ -72,8 +74,11 @@
 
 - Produces:
   - `pub const ENDPOINT_TURNED_OFF_BODY: &str = "This endpoint is turned off";` in `trusted_server_core::http_util`, with a doc comment. Adapter and parity tests import it.
-  - `pub(crate) fn endpoint_turned_off_response(endpoint: &str, switch: &str) -> Response<EdgeBody>` in `http_util.rs`. It writes the debug line and builds the response from Global Constraints.
-  - `pub(crate) fn assert_endpoint_turned_off(response: Response<EdgeBody>, label: &str)` in `test_support::tests`. It asserts the status, the exact body, `Content-Type` and `Cache-Control`, and puts `label` in every message.
+  - `pub fn endpoint_turned_off_response(endpoint: &str, switch: &str) -> Response<EdgeBody>` in `http_util.rs`, with a doc comment. It writes the debug line and builds the response from Global Constraints, including the terminal-private marker.
+    - It is `pub` so the Fastly send-boundary test in Task 3 can build one, as it already does with `publisher::page_bids_preflight_denied`.
+  - `pub(crate) fn assert_endpoint_turned_off(response: Response<EdgeBody>, label: &str)` in `test_support::tests`. It puts `label` in every message and asserts:
+    - the status, the exact body, `Content-Type` and `Cache-Control: no-store, private`;
+    - that the `TerminalPrivateResponse` extension is present.
 
 - [ ] **Step 1: Write the failing tests in the `proxy.rs` test module**
 
@@ -119,7 +124,7 @@ fn turned_off_creative_endpoints_ignore_valid_signatures() {
   Expected: the build fails because `assert_endpoint_turned_off` and `ENDPOINT_TURNED_OFF_BODY` do not exist.
 
 - [ ] **Step 3: Implement the helper and the four gates**
-  - Add the constant, the helper and the test helper from Interfaces.
+  - Add the constant, the helper and the test helper from Interfaces. The helper builds the response, then calls `crate::response_privacy::enforce_terminal_private_cache_privacy` on it.
   - Each handler's first statement, before anything it reads from `req`:
 
     ```rust
@@ -210,6 +215,7 @@ git commit -m "Answer POST /auction with a local 404 when the auction is off"
 **Files:**
 
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`, in the `tests` module (`test_settings` at `:1512`, `test_router` at `:1558`, `route` at `:1508`).
+- Modify: `crates/trusted-server-adapter-fastly/src/main.rs`, in the tests next to `late_filter_effects_cannot_make_a_page_bids_response_public` (`:1361`).
 - Modify: `crates/trusted-server-adapter-axum/tests/routes.rs` (`test_settings` at `:23`).
 - Modify: `crates/trusted-server-adapter-cloudflare/tests/routes.rs` (`test_router` at `:24`).
 - Modify: `crates/trusted-server-adapter-spin/tests/routes.rs` (`test_router` at `:23`).
@@ -266,8 +272,13 @@ const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
 // For each request, labelled "{method} {path}":
 //   status == 404
 //   body == ENDPOINT_TURNED_OFF_BODY
-//   cache-control == "no-store"
+//   cache-control == "no-store, private"
 ```
+
+- **Fastly send boundary:** add `late_filter_effects_cannot_make_a_turned_off_response_public` to `main.rs`, modelled on `late_filter_effects_cannot_make_a_page_bids_response_public`.
+  - Build the response with `trusted_server_core::http_util::endpoint_turned_off_response("/auction", "auction.enabled")`.
+  - Apply `RequestFilterEffects` that set `cache-control: public, s-maxage=3600`, `surrogate-control: max-age=3600` and `cdn-cache-control: public, max-age=3600`, through `apply_terminal_response_effects`.
+  - Assert: `cache-control` is `no-store, private`, `surrogate-control` and `cdn-cache-control` are absent, and the body is unchanged.
 
 - **Parity:** add `turned_off_endpoints_parity`.
   - Add `turned_off_settings()` and turn `axum_router`, `cf_router` and `spin_router` into `*_router_with(settings: Settings)` wrappers. Keep the existing zero-argument names calling them with `test_settings()`.
@@ -286,7 +297,7 @@ const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/tests/routes.rs crates/trusted-server-integration-tests/tests/parity.rs
+git add crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-fastly/src/main.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/tests/routes.rs crates/trusted-server-integration-tests/tests/parity.rs
 git commit -m "Cover turned-off creative and auction endpoints on every adapter"
 ```
 
@@ -332,10 +343,18 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
       - configs `{ serverSideBidders: ['appnexus'] }` and `{ auctionEnabled: true, serverSideBidders: ['appnexus'] }`;
       - unit bids `[{ bidder: 'appnexus', params: { placementId: 1 } }]`;
       - expect `bids.map((bid) => bid.bidder)` to equal `['trustedServer']`.
+    - **`treats an empty adUnitCodes list as every global ad unit`.** Pinned Prebid's `filterAdUnits` selects every ad unit for `adUnitCodes: []`. The shim selects none today. Set `mockPbjs.adUnits` and call `pbjs.requestBids({ adUnitCodes: [] })`, then check two cases:
+      - **Auction on:** config `{ serverSideBidders: ['appnexus'] }` and a global unit with `[{ bidder: 'appnexus', params: { placementId: 1 } }]`. Expect `['trustedServer']`.
+      - **Auction off:** config `{ auctionEnabled: false, serverSideBidders: [] }` and a global unit with `[{ bidder: 'trustedServer', params: {} }, { bidder: 'exampleBidder', params: {} }]`. Expect `[{ bidder: 'exampleBidder', params: {} }]`.
+    - **`drops the trustedServer bid from adUnitCodes-selected global units when the auction is off`:**
+      - global units `div-selected` and `div-other`, each with `[{ bidder: 'trustedServer', params: {} }]`;
+      - call `requestBids({ adUnitCodes: ['div-selected'] })`;
+      - expect `div-selected` to end with `[]` and `div-other` to be untouched.
   - Add one test to `prebid/installRefreshHandler`, modelled on `includes every browser-owned bidder in refresh ad units` (`:3611`):
     - **`refresh auctions with the auction off request no trustedServer bid`:**
-      - config `{ auctionEnabled: false, serverSideBidders: [], clientSideBidders: ['rubicon'] }`;
-      - expect the refresh ad units passed to `mockRequestBids` to carry no `trustedServer` bid and to keep the `rubicon` bid.
+      - The describe's `beforeEach` points `mockPbjs.requestBids` straight at `mockRequestBids`, and the model test installs only `installRefreshHandler()`. Neither runs the shim.
+      - So set `testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [], clientSideBidders: ['rubicon'] }`, then call `installPrebidNpm()`, then `installRefreshHandler(750)`, then `pubads.refresh()`.
+      - Expect the refresh ad units passed to `mockRequestBids` to carry no `trustedServer` bid and to keep the `rubicon` bid.
 
 - [ ] **Step 3: Run the tests and see them fail**
 
@@ -343,7 +362,8 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
 
   Expected:
   - the Rust assertions fail;
-  - the four `auction is off` Vitest tests fail because the bids still contain `trustedServer`;
+  - every test that turns the auction off fails, because the bids still contain `trustedServer`;
+  - both cases of the empty-`adUnitCodes` test fail, because the shim selects no units;
   - the absent-or-true test passes.
 
 - [ ] **Step 4: Implement**
@@ -356,6 +376,7 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
     - add `auctionEnabled?: boolean` to `InjectedPrebidConfig`, with the doc comment "False when `[auction].enabled` is off. Absent means on.";
     - add `injectedAuctionEnabled`.
     - In the `requestBids` wrapper, read it once before the ad-unit loop.
+    - Make `requestedAdUnitCodes` `undefined` when `opts.adUnitCodes` is an empty array, so an empty list selects every global unit, as Prebid's `filterAdUnits` does. A non-empty list keeps today's string filter.
     - When it is `false`, do this inside the loop right after `unit.bids` is ensured to be an array: set `unit.bids` to the bids whose `bidder` is not `ADAPTER_CODE`, then `continue`. The publisher snapshot capture above that point stays as it is.
     - Refresh units pass through the same wrapper (`pbjs.requestBids` at `:2942`), so the refresh path needs no separate change.
 
@@ -383,23 +404,31 @@ git commit -m "Stop the Prebid shim calling /auction while the auction is off"
   - the Route availability table at `:33`, the Predicate column of the five rows;
   - the sections `POST /auction` (`:168`), `GET /first-party/proxy` (`:428`), `GET /first-party/click` (`:486`), `GET/POST /first-party/sign` (`:526`), `POST /first-party/proxy-rebuild` (`:586`) and `GET /first-party/proxy-rebuild` (`:635`).
 - Modify: `docs/guide/configuration.md`, wherever it describes `rewrite_creatives`, `rewrite_clicks` or `[auction].enabled`.
+- Modify: `docs/guide/auction-orchestration.md:682-684`, which says `/first-party/proxy` HTML and CSS are "rewritten independently of `rewrite_creatives`".
 - Modify: `docs/guide/integrations/prebid.md`, near `:163`.
+- Modify: `docs/guide/integrations/datadome.md:175`, "Auction traffic at `/auction` is protected by default".
 - Modify: `TESTING.md:113-128`, the "Disabled auction" section.
-- Modify: `CHANGELOG.md`, `## [Unreleased]` → `### Changed`.
+- Modify: `CHANGELOG.md`, `## [Unreleased]` → `### Changed` and `### Fixed`.
 
 - [ ] **Step 1: Edit the docs**
   - **Route availability Predicate values**, in the tester-cookie rows' format:
     - `settings.auction.rewrite_creatives` for `/first-party/proxy` and `/first-party/sign`;
     - `settings.auction.rewrites_auction_clicks()` for `/first-party/click` and `/first-party/proxy-rebuild`;
     - `settings.auction.enabled` for `/auction`.
-  - **Each endpoint section:** add a line saying it returns `404` with `Cache-Control: no-store` while its switch is off.
+  - **Each endpoint section:** add a line saying it returns `404` with `Cache-Control: no-store, private` while its switch is off.
   - **`POST /auction`:** replace the disabled no-bid description at `:182`. Consent denial keeps the no-bid form.
   - **`creative-processing.md` and `configuration.md`:**
     - proxied HTML and CSS are rewritten only while `/first-party/proxy` is on;
     - warn that creatives already on a page stop loading proxied assets, or stop redirecting clicks, once the matching switch is turned off.
-  - **`prebid.md`:** while the auction is off, the shim sends no `trustedServer` bid and every other bidder runs as before.
+  - **`auction-orchestration.md`:** proxy processing needs `rewrite_creatives = true`, and is still independent of `[auction].enabled`. An explicit `rewrite_clicks` still changes its link wrapping.
+  - **`prebid.md`:**
+    - while the auction is off, the shim sends no `trustedServer` bid and every other bidder runs as before;
+    - `adUnitCodes: []` selects every global ad unit, as in Prebid.
+  - **`datadome.md`:** while the auction is off, a protected `/auction` request still goes through protection first. A challenge or block answers before the turned-off `404`.
   - **`TESTING.md`:** `POST /auction` returns the turned-off `404` (status, body, `Cache-Control`). It reads no body and emits no telemetry, and the old log line is gone.
-  - **`CHANGELOG.md`:** add one `**Breaking:**` entry under Changed covering the five endpoints and their switches, the Prebid shim change, and the reversal of #1234's "routed and ungated" click endpoints.
+  - **`CHANGELOG.md`:**
+    - add one `**Breaking:**` entry under Changed covering the five endpoints and their switches, the Prebid shim change, and the reversal of #1234's "routed and ungated" click endpoints;
+    - add an entry under Fixed: the Prebid shim treats `adUnitCodes: []` as every global ad unit, matching Prebid.
 
 - [ ] **Step 2: Check formatting**
 
@@ -430,19 +459,22 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"
 cargo test -p trusted-server-core --test template_build_digest && cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings
 scripts/lint-wasm-clock.sh
+shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh
 node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs
 node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare && node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"
+cargo clippy --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare -- -D warnings
 cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin && node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"
+cargo clippy --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin -- -D warnings
+node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh
 CARGO_TARGET_DIR="$TMPDIR/ts-cli-target" cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/^host: //p')" --bin ts -- dev lint domains --changed-vs origin/main
 ```
 
 Expected:
 
 - Every command exits `0`.
+- These are all 16 gates in `AGENTS.md` → CI Gates. The deadline fixtures also get their own Clippy runs, as `worker-auction-deadlines.yml` does, because the WASM Clippy aliases do not cover the `deadline-runtime` examples.
 - The domain lint reads committed lines only, so run it after the Task 5 commit.
-- The deadline fixtures are included because they drive `handle_auction` and the Fastly adapter, which Tasks 2 and 3 change.
-- The docs-proposal scripts and release producer checks are left out; nothing here reaches their files.
 
 CI's integration-tests workflow also runs the browser suite. It uses `trusted-server.integration.toml`, where the auction is off, and `trusted-server.trace.toml`, which sets `rewrite_creatives = false`.
 

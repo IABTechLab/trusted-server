@@ -37,7 +37,7 @@ No other feature emits them. The public `rewrite_creative_html` and `rewrite_inl
 The change fails, even if each endpoint stops working, when:
 
 - a turned-off request reaches the publisher origin;
-- a turned-off request produces a `5xx` or an `error`-level log line;
+- a turned-off request that reaches Trusted Server's router produces a `5xx` or an `error`-level log line;
 - the adapters disagree on the response;
 - a default configuration loses a creative endpoint;
 - a page served with the auction off sends `POST /auction` from Prebid.
@@ -68,12 +68,24 @@ The [#1234 design](2026-10-07-1234-creative-click-rewrite-switch-design.md) kept
 
 - Status `404` with a short plain-text body, returned as `Ok`, never `Err`. An `Err` becomes a `502` and an `error` log line on every adapter (see #1394).
 - Not `403`. The creative runtime treats a `403` from `/first-party/sign` as "blocked" and drops the element; on a `404` it loads the original URL, which is the right result with rewriting off.
-- `Cache-Control: no-store`, so a cached `404` cannot outlive turning the switch back on. This is a design call, open to review.
+- `Cache-Control: no-store, private`, so a cached `404` cannot outlive turning the switch back on. This is a design call, open to review.
+- The policy is applied through Trusted Server's terminal-private policy (`response_privacy::enforce_terminal_private_cache_privacy`), which also marks the response with `TerminalPrivateResponse`. Fastly applies late request-filter header changes after normal middleware (an allowed DataDome verdict can set `Cache-Control`), then restores `no-store, private` only on marked responses. Without the marker the `404` could leave Fastly cacheable.
 - One `debug`-level log line naming the endpoint and the switch.
 
 ### Check before any work
 
-Each handler checks its switch first: before reading the body, validating a signature, building an auction request, capturing a trace or emitting telemetry. For `POST /auction` this replaces today's disabled branch in `handle_auction` (`auction/endpoints.rs`), which returns an empty OpenRTB response, records a skipped trace and emits an `auction_disabled` telemetry event.
+Each handler checks its switch as its first statement. That is before it reads or parses the body, validates a signature, builds an auction request, captures a trace or emits telemetry. For `POST /auction` this replaces today's disabled branch in `handle_auction` (`auction/endpoints.rs`), which returns an empty OpenRTB response, records a skipped trace and emits an `auction_disabled` telemetry event.
+
+The guarantee starts at the handler. At the pinned EdgeZero tag, adapter ingress buffers request bodies before routing on every route: Fastly, Cloudflare and Spin always, and Axum for JSON bodies. Fastly and Axum answer `500` when that conversion fails. This happens before a route is chosen, today and after this change. Moving it would be an EdgeZero change, so it is out of scope.
+
+### Fastly request filters keep precedence
+
+On Fastly, integration request filters run before route dispatch. DataDome protects `/auction` by default. After its outbound verdict call it can answer with a challenge: `403`, `429` or a redirect. That answer keeps precedence over the turned-off `404`, for two reasons:
+
+- The filter decides for every protected path before any route is chosen.
+- Moving the switch check ahead of the filters would need Fastly dispatch code.
+
+So on a DataDome-protected Fastly service, a turned-off `/auction` can still cost one verdict call per request. Only pages cached before the switch-off still make that request. `/first-party/` is excluded from DataDome by default. This is a design call, open to review.
 
 On Fastly, the adapter's `/auction` arm tags the request for EID syncing before it calls `handle_auction`, and the shared response finalization runs after the handler returns. A turned-off `/auction` can therefore still record the browser's `ts-eids` cookie EIDs to KV, as today's disabled branch does. Stopping that would need Fastly adapter code, so this design keeps it. The other adapters pass no KV graph. This is a design call, open to review.
 
@@ -83,6 +95,7 @@ On Fastly, the adapter's `/auction` arm tags the request for EID syncing before 
 - An empty `serverSideBidders` is not the signal. It is built from the plan's bidder routes, so on its own it does not say whether the auction runs.
 - When the flag says off, the shim leaves no `trustedServer` bid in any ad unit: it adds none and drops one the publisher configured, so Prebid builds no request for it. The publisher's other bids run as they do today.
 - A config without the flag means the auction is on, so a page without it behaves as today.
+- The shim treats an empty `adUnitCodes` list as every global ad unit, as Prebid does (`filterAdUnits` in `prebid.ts`). Today it selects none. With the auction off, that would leave a publisher-configured `trustedServer` bid in place, and Prebid would still call `/auction`. The change also aligns the auction-on case with Prebid's selection.
 - Pages cached before the switch was turned off still call `/auction` and get the `404` until they expire.
 
 ## Approaches considered
@@ -106,6 +119,8 @@ For the Prebid caller, the two other options were rejected:
 
 - **Docs that state the opposite today:**
   - `docs/guide/creative-processing.md` says proxied HTML and CSS "are rewritten independently of the auction setting", and that "`/first-party/sign` itself is not gated by `rewrite_creatives`".
+  - `docs/guide/auction-orchestration.md` says HTML and CSS returned by `/first-party/proxy` are "rewritten independently of `rewrite_creatives`". It should say proxy processing needs `rewrite_creatives = true`, and is still independent of `[auction].enabled`.
+  - `docs/guide/integrations/datadome.md`, which should say that a protected `/auction` still goes through protection first while the auction is off.
   - The `rewrite_proxied_html` doc comment in `creative.rs` says proxied HTML is rewritten "regardless of `rewrite_creatives`".
   - `docs/guide/configuration.md` and `docs/guide/api-reference.md` wherever they describe these endpoints, the two creative switches or a disabled auction.
   - `TESTING.md`'s "Disabled auction" section, which describes the no-bid response, the `auction_disabled` telemetry event and the log line.
@@ -115,15 +130,24 @@ For the Prebid caller, the two other options were rejected:
   - `proxy.rs`: the test that proxies HTML with `rewrite_creatives = false`.
   - `auction/endpoints.rs`: `disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work` asserts the disabled branch's `200` and `auction_disabled` telemetry, so a turned-off test replaces it. `trace_auction_api_frozen_disabled_capture_delivers_private_evidence` and `trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active` use a disabled auction only to reach a skipped trace. They move to an enabled auction with consent denied, whose branch in `handle_auction` also finishes the trace as skipped with `policy_skipped`, so their assertions stay. An enabled auction with no provider would not keep them, because only the disabled and consent-denied branches finish a trace with `policy_skipped`.
   - Route and parity tests that use "not `404`" to mean "routed", among them `auction_not_challenged_by_auth_parity` in `crates/trusted-server-integration-tests/tests/parity.rs`. `/auction` is off under a default config, so these need a config with the auction on.
-- **`CHANGELOG.md`:** a **Breaking:** entry under Changed covering the five endpoints, the Prebid shim no longer calling `/auction` while the auction is off, and the reversal of #1234's routing.
+- **`CHANGELOG.md`:**
+  - a **Breaking:** entry under Changed covering the five endpoints, the Prebid shim no longer calling `/auction` while the auction is off, and the reversal of #1234's routing;
+  - a Fixed entry for `adUnitCodes: []` selecting every global ad unit.
 
 ## Acceptance criteria
 
 - [ ] With `rewrite_creatives = false` and `rewrite_clicks` unset, all four creative endpoints return the turned-off `404` on their primary methods, on every adapter. Nothing reaches the publisher origin, and nothing is logged at `error` level.
 - [ ] With `rewrite_creatives = false` and `rewrite_clicks = true`, `/first-party/click` and `/first-party/proxy-rebuild` work, and `/first-party/proxy` and `/first-party/sign` return the turned-off `404`.
 - [ ] With `rewrite_creatives = true` and `rewrite_clicks = false`, `/first-party/proxy` and `/first-party/sign` work, and `/first-party/click` and `/first-party/proxy-rebuild` return the turned-off `404`.
-- [ ] With `[auction].enabled = false`, `POST /auction` returns the turned-off `404` on every adapter without reading the body, capturing a trace or emitting telemetry, and the creative endpoints follow only their own switches.
-- [ ] With `[auction].enabled = false`, the injected Prebid config says the auction is off, and `pbjs.requestBids` sends no `POST /auction` and leaves no `trustedServer` bid in the ad units, including one the publisher configured. The publisher's other bids still run. With the auction on, or with no flag in the config, the shim behaves as today. Rust tests cover the injected flag, and Vitest covers both shim states.
+- [ ] With `[auction].enabled = false`, `POST /auction` returns the turned-off `404` on every adapter, and the creative endpoints follow only their own switches.
+  - The handler does not parse the body, capture a trace or emit telemetry. EdgeZero's ingress buffering before routing is outside this guarantee.
+  - A Fastly request filter that answers first, such as a DataDome challenge, keeps precedence.
+- [ ] On Fastly, a late request-filter `Cache-Control` change cannot make a turned-off response cacheable. It leaves with `Cache-Control: no-store, private`.
+- [ ] With `[auction].enabled = false`, the injected Prebid config says the auction is off, and `pbjs.requestBids` sends no `POST /auction`.
+  - It leaves no `trustedServer` bid in the ad units, including one the publisher configured, for explicit ad units, `adUnitCodes` selections and `adUnitCodes: []`.
+  - The publisher's other bids still run.
+  - With the auction on, or with no flag in the config, the shim behaves as today, except that `adUnitCodes: []` now selects every global ad unit.
+  - Rust tests cover the injected flag, and Vitest covers both shim states.
 - [ ] The defaults (`rewrite_creatives = true`, `rewrite_clicks` unset) keep all four creative endpoints working.
 - [ ] Core tests cover each switch combination for each endpoint, and the route tests in the Fastly, Axum, Cloudflare and Spin adapters cover the turned-off case.
 - [ ] The docs and `CHANGELOG.md` changes above land, including the warning that creatives already on a page stop working after a switch is turned off.
