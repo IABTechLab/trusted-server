@@ -1,5 +1,7 @@
 //! Per-provider outcomes of one navigation's lookups.
 
+use std::collections::BTreeMap;
+
 use crate::ec::eid_types::{EidValidationError, ProviderId, SourceDomain};
 use crate::ec::kv_types::KvEid;
 
@@ -66,6 +68,9 @@ pub enum SkipReason {
     /// An opt-out remembered in the row has not lapsed; the provider's
     /// stored UIDs are removed.
     OptedOut,
+    /// Every source of the provider is excluded where GDPR applies; the
+    /// provider's stored UIDs are removed.
+    Region,
 }
 
 /// One outcome per provider per navigation.
@@ -115,10 +120,25 @@ impl LookupStatus {
             Self::Skipped(SkipReason::NotDue) => "skipped_not_due",
             Self::Skipped(SkipReason::Input) => "skipped_input",
             Self::Skipped(SkipReason::RateLimited) => "skipped_rate_limited",
+            Self::Skipped(SkipReason::Region) => "skipped_region",
             Self::Skipped(SkipReason::Destination) => "destination_rejected",
             Self::Skipped(SkipReason::OptedOut) => "skipped_opted_out",
         }
     }
+}
+
+/// What a lookup does to the provider's remembered opt-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptOutMemory {
+    /// Leaves it as it is.
+    #[default]
+    Unchanged,
+    /// Remembers an opt-out the vendor's server reported, so the vendor is
+    /// not called again for the memory period.
+    Remember,
+    /// Forgets it: the vendor's cookies hold an ID again, so the visitor
+    /// opted back in.
+    Forget,
 }
 
 /// One provider's outcome and validated entries.
@@ -131,8 +151,11 @@ pub struct ProviderLookup {
     /// Validated entries per returned source; empty unless `Found`.
     pub entries: Vec<(SourceDomain, Vec<KvEid>)>,
     /// Sources whose stored records are removed, because the user opted
-    /// out of the provider; empty unless `OptedOut` or `Skipped(OptedOut)`.
+    /// out of the provider or GDPR excludes them; empty unless `OptedOut`,
+    /// `Skipped(OptedOut)` or `Skipped(Region)`, or a source is excluded.
     pub cleared: Vec<SourceDomain>,
+    /// What this lookup does to the provider's remembered opt-out.
+    pub opt_out: OptOutMemory,
 }
 
 /// Validated results of one navigation's lookups.
@@ -141,6 +164,11 @@ pub struct LookupResults {
     /// EC ID the lookups were made for; `None` when nothing was looked up.
     ec_id: Option<String>,
     lookups: Vec<ProviderLookup>,
+    /// The row's revocations when the lookups were dispatched.
+    revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each looked-up provider at dispatch, kept
+    /// with an opt-out its server reports.
+    known_uids: BTreeMap<ProviderId, Vec<String>>,
 }
 
 impl LookupResults {
@@ -151,7 +179,43 @@ impl LookupResults {
         Self {
             ec_id: Some(ec_id.to_owned()),
             lookups,
+            revocations: BTreeMap::new(),
+            known_uids: BTreeMap::new(),
         }
+    }
+
+    /// Records the hashes of the UIDs known for each looked-up provider at
+    /// dispatch: its cookies' and the row's.
+    ///
+    /// This is a setter rather than a builder because static analysis treats
+    /// the value a UID-named call returns as sensitive, and the write planner
+    /// logs the provider IDs it reads from these results.
+    pub fn set_known_uids(&mut self, known_uids: BTreeMap<ProviderId, Vec<String>>) {
+        self.known_uids = known_uids;
+    }
+
+    /// Hashes of the UIDs known for `provider` when its lookup was
+    /// dispatched; an opt-out its server reports is remembered with them.
+    #[must_use]
+    pub fn known_uids(&self, provider: &ProviderId) -> &[String] {
+        self.known_uids.get(provider).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the row's revocations as the lookups' dispatch saw them.
+    #[must_use]
+    pub fn dispatched_with(mut self, revocations: BTreeMap<ProviderId, u64>) -> Self {
+        self.revocations = revocations;
+        self
+    }
+
+    /// The revocation of `provider` the row held when its lookup was
+    /// dispatched.
+    ///
+    /// A row holding a different one has seen a newer opt-out since, so the
+    /// lookup's result is stale.
+    #[must_use]
+    pub fn revocation_at_dispatch(&self, provider: &ProviderId) -> Option<u64> {
+        self.revocations.get(provider).copied()
     }
 
     /// Whether these results were looked up for `ec_id`.

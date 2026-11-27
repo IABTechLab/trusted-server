@@ -5725,7 +5725,7 @@ fn apply_auction_eids_and_device(
     let client_eids = drop_vendor_denied_client_eids(
         client_eids,
         targeting.partner_registry,
-        targeting.ec_context.consent(),
+        targeting.ec_context,
     );
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());

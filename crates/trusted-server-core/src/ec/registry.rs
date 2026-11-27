@@ -9,6 +9,7 @@ use std::num::NonZeroU16;
 
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, tcf_vendor_consent_denied};
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
@@ -56,6 +57,10 @@ pub struct PartnerConfig {
     /// claim this source. Its UIDs leave the server only while every one of
     /// these vendors has consent.
     pub owner_tcf_vendor_ids: Vec<NonZeroU16>,
+    /// Whether a configured provider, enabled or disabled, excludes this
+    /// source where GDPR applies. Its UIDs then never leave the server for a
+    /// visitor whose jurisdiction is GDPR.
+    pub excluded_where_gdpr_applies: bool,
 }
 
 impl PartnerConfig {
@@ -66,6 +71,13 @@ impl PartnerConfig {
         self.owner_tcf_vendor_ids
             .iter()
             .any(|vendor| tcf_vendor_consent_denied(consent, *vendor))
+    }
+
+    /// Whether this source's UIDs are withheld because a provider excludes it
+    /// and the visitor's jurisdiction is GDPR.
+    #[must_use]
+    pub fn excluded_for(&self, consent: &ConsentContext) -> bool {
+        self.excluded_where_gdpr_applies && matches!(consent.jurisdiction, Jurisdiction::Gdpr)
     }
 }
 
@@ -337,6 +349,23 @@ impl PartnerRegistry {
         }
     }
 
+    /// Marks `source` as excluded where GDPR applies, so its stored UIDs are
+    /// withheld from egress for a visitor whose jurisdiction is GDPR.
+    ///
+    /// Returns `false` when the source has no `[[ec.partners]]` entry.
+    pub fn exclude_where_gdpr_applies(&mut self, source: &str) -> bool {
+        let Ok(normalized) = normalize_partner_source_domain(source) else {
+            return false;
+        };
+        match self.by_source_domain.get_mut(&normalized) {
+            Some(partner) => {
+                partner.excluded_where_gdpr_applies = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether an enabled identity provider owns `source`.
     #[must_use]
     pub fn is_provider_owned(&self, source: &str) -> bool {
@@ -421,6 +450,7 @@ fn build_partner_config(
         ts_pull_token: partner.ts_pull_token.clone(),
         provider_owned: false,
         owner_tcf_vendor_ids: Vec::new(),
+        excluded_where_gdpr_applies: false,
     }
 }
 

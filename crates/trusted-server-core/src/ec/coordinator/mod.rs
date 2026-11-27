@@ -8,44 +8,53 @@ pub mod results;
 pub mod transport;
 mod validate;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 use std::time::Duration;
 
 use error_stack::Report;
+use web_time::Instant;
 
-use self::results::{LookupResults, LookupStatus, ProviderLookup, SkipReason};
+use self::results::{LookupResults, LookupStatus, OptOutMemory, ProviderLookup, SkipReason};
 use self::transport::{LookupTransport, ProviderIndex, Tagged, TransportError, TransportResponse};
 use self::validate::{ValidatedEntries, ValidationPolicy, validate};
 use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{allows_eid_persistence, tcf_vendor_consent_denied};
 use crate::ec::EcKvSnapshot;
 use crate::ec::consent::ec_consent_granted;
-use crate::ec::eid_types::{ProviderId, SourceDomain, UnixSeconds};
+use crate::ec::eid_types::{EidFields, Expiry, ProviderId, SourceDomain, UnixSeconds};
 use crate::ec::generation::ec_hash;
-use crate::ec::kv_types::KvEntry;
+use crate::ec::kv_types::{KvEid, KvEntry, KvUid, opt_out_uid_hash};
 use crate::ec::provider::{
-    ClientSignals, IdentityProvider, LookupInput, LookupOutcome, OwnedEntries, ProviderConfigError,
-    ProviderEid, ProviderResponse, SourceInput, destination_allowed, parse_sources,
-    validate_enabled_configs,
+    ClientSignals, CookieRead, HashedEmail, IdentityProvider, LookupInput, LookupOutcome,
+    OwnedEntries, ProviderConfigError, ProviderEid, ProviderRequest, ProviderResponse,
+    RequestCookies, SourceInput, destination_allowed, parse_sources, validate_enabled_configs,
 };
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::registry::PartnerRegistry;
 
-use crate::settings::IdentityProviderConfig;
+use crate::settings::{
+    HashedEmailHeader, HashedEmailMethod, HashedEmailSource, IdentityProviderConfig,
+};
 
 /// Coordinates server-side identity lookups for one navigation.
 ///
 /// Implementations own eligibility, consent, destination checks, the shared
-/// time budget and validation. Providers never see KV, cookies, HTTP or the
-/// clock. Implementations never write KV: they return validated
-/// [`LookupResults`]; the caller plans the row change with
-/// [`crate::ec::write_plan::plan_write`] and spends the
+/// time budget and validation. Providers never see KV, HTTP or the clock,
+/// and see cookies only as [`RequestCookies`]. Implementations never write
+/// KV: they return validated [`LookupResults`]; the caller plans the row
+/// change with [`crate::ec::write_plan::plan_write`] and spends the
 /// [`crate::ec::page_load::PageLoadWrite`] permit.
 #[allow(async_fn_in_trait)]
 pub trait IdentityCoordinator {
-    /// Starts lookups for every eligible provider without waiting.
+    /// Starts lookups for every eligible provider without waiting for them.
+    ///
+    /// When a provider would use a hashed email, it first awaits the one
+    /// publisher status call (spec §8.7), at most its `timeout_ms`. The call
+    /// and the lookups share the coordinator's budget: lookups get what the
+    /// call left. Callers run this beside the origin fetch, not before it.
     ///
     /// Returns empty pending lookups when no provider is enabled; skipped
     /// providers are recorded and reported by [`Self::collect`].
@@ -82,6 +91,8 @@ pub struct LookupContext<'a> {
     pub client: ClientSignals<'a>,
     /// Publisher domain.
     pub publisher_domain: &'a str,
+    /// Request cookies, read by providers that use first-party cookies.
+    pub cookies: RequestCookies<'a>,
     /// Existing EC rate limiter, used only for `rate_limit_per_hour`.
     pub rate_limiter: &'a dyn RateLimiter,
     /// Request time.
@@ -106,8 +117,17 @@ pub struct PendingLookups<Pending> {
     early: Vec<Tagged<LookupStatus>>,
     /// Providers whose IDs were generated at dispatch, validated.
     generated: Vec<Tagged<ProviderLookup>>,
+    /// Sources each provider may not collect or keep where GDPR applies.
+    excluded: Vec<Tagged<Vec<SourceDomain>>>,
     /// Provider state to hand back with each in-flight request's response.
     contexts: Vec<Tagged<String>>,
+    /// Providers whose IDs were read from first-party cookies, validated.
+    from_cookies: Vec<Tagged<ProviderLookup>>,
+    /// The row's revocations at dispatch, so a result a newer opt-out
+    /// superseded is discarded at the write.
+    revocations: BTreeMap<ProviderId, u64>,
+    /// Hashes of the UIDs known for each provider sent a request.
+    known_uids: Vec<Tagged<Vec<String>>>,
 }
 
 impl<Pending> Default for PendingLookups<Pending> {
@@ -119,7 +139,11 @@ impl<Pending> Default for PendingLookups<Pending> {
             now: UnixSeconds::new(0),
             early: Vec::new(),
             generated: Vec::new(),
+            excluded: Vec::new(),
             contexts: Vec::new(),
+            from_cookies: Vec::new(),
+            revocations: BTreeMap::new(),
+            known_uids: Vec::new(),
         }
     }
 }
@@ -130,6 +154,7 @@ impl<Pending> std::fmt::Debug for PendingLookups<Pending> {
             .field("requests", &self.started)
             .field("early", &self.early.len())
             .field("generated", &self.generated.len())
+            .field("from_cookies", &self.from_cookies.len())
             .finish_non_exhaustive()
     }
 }
@@ -138,7 +163,10 @@ impl<Pending> PendingLookups<Pending> {
     /// Whether nothing was dispatched, generated or skipped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.started == 0 && self.early.is_empty() && self.generated.is_empty()
+        self.started == 0
+            && self.early.is_empty()
+            && self.generated.is_empty()
+            && self.from_cookies.is_empty()
     }
 }
 
@@ -182,6 +210,33 @@ pub struct ProviderCoordinator<P = Box<dyn IdentityProvider>> {
     /// Partner config: `openrtb_atype` for validation.
     partners: Arc<PartnerRegistry>,
     budget: Duration,
+    /// The publisher's hashed-email status endpoint (spec §8.7).
+    hashed_email: Option<StatusEndpoint>,
+}
+
+/// The validated `[ec.hashed_email]` endpoint.
+struct StatusEndpoint {
+    url: url::Url,
+    timeout: Duration,
+    method: http::Method,
+    body: bytes::Bytes,
+    headers: Box<[(http::HeaderName, StatusHeader)]>,
+}
+
+/// A validated extra header of the status call.
+enum StatusHeader {
+    Value(http::HeaderValue),
+    Cookie(Box<str>),
+}
+
+/// A provider that passed eligibility, consent, cookie and opt-out checks
+/// and still has due sources, before its request is built.
+struct Prepared {
+    provider: ProviderIndex,
+    due: Vec<SourceDomain>,
+    /// Due sources that need a hashed email: dropped when none arrives.
+    held: Vec<SourceDomain>,
+    cookie_uids: Vec<String>,
 }
 
 impl<P: IdentityProvider> ProviderCoordinator<P> {
@@ -223,7 +278,102 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             providers,
             partners,
             budget,
+            hashed_email: None,
         })
+    }
+
+    /// Sets the publisher endpoint that returns a signed-in visitor's hashed
+    /// email (`[ec.hashed_email]`, spec §8.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderConfigError::Invalid`] when `source`'s endpoint is
+    /// not `https` with a host, when a registered provider reads a hashed
+    /// email and `source` is `None`, or when such a provider is registered
+    /// and `source`'s `timeout_ms` is not below this coordinator's budget,
+    /// which the status call shares with the lookups.
+    pub fn with_hashed_email_source(
+        mut self,
+        source: Option<&HashedEmailSource>,
+    ) -> Result<Self, Report<ProviderConfigError>> {
+        let Some(source) = source else {
+            if let Some(registered) = self
+                .providers
+                .iter()
+                .find(|registered| registered.provider.hashed_email_path().is_some())
+            {
+                return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                    "provider `{}` enables hashed_email but [ec.hashed_email] is not configured",
+                    registered.id
+                )));
+            }
+            self.hashed_email = None;
+            return Ok(self);
+        };
+        let url = source.endpoint_url().ok_or_else(|| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach("ec.hashed_email.endpoint must be an https URL with a host")
+        })?;
+        if let Some(message) = source.request_error() {
+            return Err(Report::new(ProviderConfigError::Invalid)
+                .attach(format!("ec.hashed_email: {message}")));
+        }
+        let timeout = Duration::from_millis(source.timeout_ms);
+        if timeout >= self.budget
+            && let Some(registered) = self
+                .providers
+                .iter()
+                .find(|registered| registered.provider.hashed_email_path().is_some())
+        {
+            return Err(Report::new(ProviderConfigError::Invalid).attach(format!(
+                "ec.hashed_email.timeout_ms ({} ms) must be below the identity budget ({} ms) \
+                 that provider `{}` shares with the status call",
+                source.timeout_ms,
+                self.budget.as_millis(),
+                registered.id
+            )));
+        }
+        let invalid_header = |name: &str| {
+            Report::new(ProviderConfigError::Invalid)
+                .attach(format!("ec.hashed_email: header `{name}` is invalid"))
+        };
+        let headers = source
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let header_name =
+                    http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+                        .map_err(|_| invalid_header(name))?;
+                let value = match value {
+                    HashedEmailHeader::Value(value) => {
+                        let mut value =
+                            http::HeaderValue::from_str(value).map_err(|_| invalid_header(name))?;
+                        value.set_sensitive(true);
+                        StatusHeader::Value(value)
+                    }
+                    HashedEmailHeader::Cookie { cookie } => {
+                        StatusHeader::Cookie(Box::from(cookie.trim()))
+                    }
+                };
+                Ok((header_name, value))
+            })
+            .collect::<Result<Box<[_]>, Report<ProviderConfigError>>>()?;
+        let body = source
+            .body
+            .as_ref()
+            .map_or_else(bytes::Bytes::new, |body| bytes::Bytes::from(body.clone()));
+        let method = match source.method {
+            HashedEmailMethod::Get => http::Method::GET,
+            HashedEmailMethod::Post => http::Method::POST,
+        };
+        self.hashed_email = Some(StatusEndpoint {
+            url,
+            timeout,
+            method,
+            body,
+            headers,
+        });
+        Ok(self)
     }
 
     fn register(
@@ -265,6 +415,40 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         self.providers.is_empty()
     }
 
+    /// Sources of every provider whose first-party cookies record an
+    /// opt-out.
+    ///
+    /// Read on every request before any identity egress, so an opt-out
+    /// applies to the request it arrives on, not only to the navigation write
+    /// that later clears the row. Only cookies are read: no lookup is made.
+    #[must_use]
+    pub fn cookie_opted_out_sources(&self, cookies: RequestCookies<'_>) -> Vec<SourceDomain> {
+        self.providers
+            .iter()
+            .filter(|registered| {
+                matches!(
+                    registered.provider.read_request_cookies(cookies),
+                    CookieRead::OptedOut
+                )
+            })
+            .flat_map(|registered| registered.policy.sources.iter().cloned())
+            .collect()
+    }
+
+    /// Whether `source` holds a UID of this provider whose refresh is due.
+    fn refresh_due(
+        registered: &Registered<P>,
+        entry: Option<&KvEntry>,
+        source: &SourceDomain,
+        now: UnixSeconds,
+    ) -> bool {
+        entry
+            .and_then(|entry| entry.ids.get(source.as_str()))
+            .is_some_and(|record| {
+                record.is_provider_written() && record.refresh_due_for(&registered.id, now)
+            })
+    }
+
     /// Whether the row holds a live provider-written UID for `source`.
     fn holds_live_uid(entry: Option<&KvEntry>, source: &str, now: UnixSeconds) -> bool {
         entry
@@ -273,15 +457,16 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
     }
 
     /// Claimed sources lacking a live provider-written UID (a browser
-    /// fallback does not count), minus sources needing input V1
-    /// never has; the flag reports whether any source was removed for input.
+    /// fallback does not count), in source order, and the subset of them
+    /// that needs a hashed email (spec §8.7). A refresh-due source never
+    /// needs one.
     fn due_sources(
         registered: &Registered<P>,
         entry: Option<&KvEntry>,
         now: UnixSeconds,
-    ) -> (Vec<SourceDomain>, bool) {
+    ) -> (Vec<SourceDomain>, Vec<SourceDomain>) {
         let capabilities = registered.provider.capabilities();
-        let mut input_blocked = false;
+        let mut held = Vec::new();
         let mut due = Vec::new();
         for source in &registered.policy.sources {
             let record = entry
@@ -302,12 +487,153 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 .find(|capability| capability.source == *source)
                 .is_some_and(|capability| capability.input != SourceInput::Anonymous);
             if needs_input {
-                input_blocked = true;
-                continue;
+                held.push(source.clone());
             }
             due.push(source.clone());
         }
-        (due, input_blocked)
+        (due, held)
+    }
+
+    /// Whether a prepared provider would use a hashed email on this
+    /// navigation: it reads one and has a due source that is not merely
+    /// refresh-due.
+    fn wants_hashed_email(
+        &self,
+        prepared: &Prepared,
+        entry: Option<&KvEntry>,
+        now: UnixSeconds,
+    ) -> bool {
+        let registered = &self.providers[prepared.provider.get()];
+        registered.provider.hashed_email_path().is_some()
+            && prepared
+                .due
+                .iter()
+                .any(|source| !Self::refresh_due(registered, entry, source, now))
+    }
+
+    /// Calls the publisher's status endpoint once and returns its JSON body,
+    /// or `None` when it gives no usable reply (spec §8.7).
+    ///
+    /// The call uses the configured method and body and carries the
+    /// visitor's whole `Cookie` header and the configured headers; a request
+    /// without cookies, or without a cookie a header is taken from, cannot be
+    /// signed in, so it makes no call. Neither the body nor any hashed email
+    /// is logged.
+    async fn hashed_email_status<T: LookupTransport>(
+        &self,
+        transport: &T,
+        cookies: RequestCookies<'_>,
+        tag: ProviderIndex,
+    ) -> Option<serde_json::Value> {
+        let endpoint = self.hashed_email.as_ref()?;
+        let cookie_header = cookies.header().trim();
+        if cookie_header.is_empty() {
+            log::debug!("Identity lookup: hashed email status skipped: no cookies");
+            return None;
+        }
+        let Ok(mut cookie) = http::HeaderValue::from_str(cookie_header) else {
+            log::debug!("Identity lookup: hashed email status skipped: invalid Cookie header");
+            return None;
+        };
+        cookie.set_sensitive(true);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        if !endpoint.body.is_empty() {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+        }
+        headers.insert(http::header::COOKIE, cookie);
+        for (name, value) in &endpoint.headers {
+            let value = match value {
+                StatusHeader::Value(value) => value.clone(),
+                StatusHeader::Cookie(cookie_name) => {
+                    // Without the cookie the visitor cannot be signed in.
+                    let Some(found) = cookies.get(cookie_name) else {
+                        log::debug!(
+                            "Identity lookup: hashed email status skipped: no `{cookie_name}` cookie"
+                        );
+                        return None;
+                    };
+                    let Ok(mut found) = http::HeaderValue::from_str(found) else {
+                        log::debug!(
+                            "Identity lookup: hashed email status skipped: `{cookie_name}` cookie is not a valid header value"
+                        );
+                        return None;
+                    };
+                    found.set_sensitive(true);
+                    found
+                }
+            };
+            headers.insert(name.clone(), value);
+        }
+        let request = ProviderRequest {
+            method: endpoint.method.clone(),
+            url: endpoint.url.clone(),
+            headers,
+            body: endpoint.body.clone(),
+            context: None,
+        };
+        let in_flight = transport.start(
+            vec![Tagged {
+                provider: tag,
+                value: request,
+            }],
+            endpoint.timeout,
+        );
+        let response = transport.gather(in_flight).await.into_iter().next()?.value;
+        match response {
+            Ok(response) if response.status.is_success() => {
+                match serde_json::from_slice(&response.body) {
+                    Ok(body) => {
+                        log::debug!(
+                            "Identity lookup: hashed email status status={}",
+                            response.status
+                        );
+                        Some(body)
+                    }
+                    Err(_) => {
+                        log::debug!("Identity lookup: hashed email status reply is not JSON");
+                        None
+                    }
+                }
+            }
+            Ok(response) => {
+                log::debug!(
+                    "Identity lookup: hashed email status status={}",
+                    response.status
+                );
+                None
+            }
+            Err(report) => {
+                log::debug!(
+                    "Identity lookup: hashed email status failed: {}",
+                    report.current_context()
+                );
+                None
+            }
+        }
+    }
+
+    /// The provider's sources it may not collect or keep for this request:
+    /// those it excludes where GDPR applies, when the visitor's jurisdiction
+    /// is GDPR. A TCF string alone does not decide this, because some CMPs
+    /// set one for every visitor.
+    fn excluded_sources(registered: &Registered<P>, consent: &ConsentContext) -> Vec<SourceDomain> {
+        if !matches!(consent.jurisdiction, Jurisdiction::Gdpr) {
+            return Vec::new();
+        }
+        registered
+            .policy
+            .sources
+            .iter()
+            .filter(|source| registered.provider.excluded_where_gdpr_applies(source))
+            .cloned()
+            .collect()
     }
 
     /// Whether the provider's hourly limit is reached. Limiter errors fail
@@ -340,7 +666,10 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
         entries: ValidatedEntries,
     ) -> ProviderLookup {
         let registered = &self.providers[provider.get()];
-        let cleared = if status == LookupStatus::OptedOut {
+        let cleared = if matches!(
+            status,
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::Region)
+        ) {
             registered.policy.sources.to_vec()
         } else {
             Vec::new()
@@ -350,6 +679,7 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
             status,
             entries,
             cleared,
+            opt_out: OptOutMemory::Unchanged,
         }
     }
 
@@ -377,10 +707,9 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, status, Vec::new());
             }
         };
-        if matches!(
-            response.status,
-            http::StatusCode::NOT_FOUND | http::StatusCode::NO_CONTENT
-        ) {
+        // Only 404 is a match-free reply for every provider; a 204 reaches
+        // the provider, because some vendors use it to report an opt-out.
+        if response.status == http::StatusCode::NOT_FOUND {
             return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
         }
         if !response.status.is_success() {
@@ -402,7 +731,13 @@ impl<P: IdentityProvider> ProviderCoordinator<P> {
                 return self.lookup(provider, LookupStatus::NoMatch, Vec::new());
             }
             Ok(LookupOutcome::OptedOut) => {
-                return self.lookup(provider, LookupStatus::OptedOut, Vec::new());
+                // Only an opt-out the vendor's server reports is remembered:
+                // it spares the vendor further calls. Cookie opt-outs are
+                // re-read on every navigation instead.
+                return ProviderLookup {
+                    opt_out: OptOutMemory::Remember,
+                    ..self.lookup(provider, LookupStatus::OptedOut, Vec::new())
+                };
             }
             Err(report) => {
                 log::debug!(
@@ -476,10 +811,14 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             .minted_entry
             .filter(|_| matches!(lookup.snapshot, EcKvSnapshot::Missing { .. }));
         let entry = stored.or(minted);
+        pending.revocations = entry
+            .map(|entry| entry.revocations.clone())
+            .unwrap_or_default();
         let consented = ec_consent_granted(lookup.consent)
             && allows_eid_persistence(lookup.consent)
             && entry.is_some_and(|entry| entry.consent.ok);
         let mut requests = Vec::new();
+        let mut prepared = Vec::new();
         for (index, registered) in self.providers.iter().enumerate() {
             let provider = ProviderIndex::new(index);
             let skip = |reason| Tagged {
@@ -498,10 +837,126 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 pending.early.push(skip(SkipReason::Consent));
                 continue;
             }
+            let excluded = Self::excluded_sources(registered, lookup.consent);
+            if !excluded.is_empty() {
+                if excluded.len() == registered.policy.sources.len() {
+                    pending.early.push(skip(SkipReason::Region));
+                    continue;
+                }
+                pending.excluded.push(Tagged {
+                    provider,
+                    value: excluded.clone(),
+                });
+            }
+            let remembered_opt_out =
+                entry.filter(|entry| entry.opted_out(&registered.id, lookup.now));
+            let mut opted_back_in = false;
+            let mut cookie_uids = Vec::new();
+            let (mut due, mut held) = Self::due_sources(registered, entry, lookup.now);
+            let input_blocked = !held.is_empty();
+            due.retain(|source| !excluded.contains(source));
+            held.retain(|source| due.contains(source));
+            // Without a hashed-email endpoint, or for a provider that reads
+            // no hashed email, a source that needs one is never looked up.
+            if self.hashed_email.is_none() || registered.provider.hashed_email_path().is_none() {
+                due.retain(|source| !held.contains(source));
+                held.clear();
+            }
+            // The vendor's own first-party cookies are read on every
+            // navigation, so an opt-out or a changed ID is noticed while the
+            // sources still hold live UIDs. Their IDs stand in for a lookup.
+            match registered.provider.read_request_cookies(
+                lookup
+                    .cookies
+                    .at(lookup.now)
+                    .where_gdpr_applies(lookup.consent.gdpr_applies),
+            ) {
+                CookieRead::OptedOut => {
+                    log::debug!(
+                        "Identity lookup: provider={} opted out in its cookies",
+                        registered.id
+                    );
+                    pending.early.push(Tagged {
+                        provider,
+                        value: LookupStatus::OptedOut,
+                    });
+                    continue;
+                }
+                CookieRead::Found(eids) => {
+                    let mut found = self.validated(provider, eids, lookup.now);
+                    cookie_uids = uid_hashes(found.entries.iter().flat_map(|(_, eids)| eids));
+                    // Cookies that repeat only UIDs known when the vendor's
+                    // server reported the remembered opt-out show no renewed
+                    // identity: a server refresh never rewrites them.
+                    let repeats_opted_out = remembered_opt_out.is_some_and(|entry| {
+                        entry.repeats_opted_out_uids(&registered.id, &cookie_uids)
+                    });
+                    if repeats_opted_out {
+                        log::debug!(
+                            "Identity lookup: provider={} cookies repeat the opted-out IDs",
+                            registered.id
+                        );
+                        found.status = LookupStatus::NoMatch;
+                    }
+                    // A cookie older than a server-side refresh does not
+                    // roll the refreshed UID back.
+                    if registered.provider.keeps_fresher_stored_uids() {
+                        found.entries.retain(|(source, eids)| {
+                            !stored_outlives_cookie(entry, source, eids, lookup.now)
+                        });
+                        recount_found(&mut found);
+                    }
+                    if matches!(found.status, LookupStatus::Found { .. }) {
+                        // An ID in the vendor's cookies means the visitor
+                        // opted back in, so a remembered opt-out is
+                        // forgotten.
+                        if remembered_opt_out.is_some() {
+                            opted_back_in = true;
+                            found.opt_out = OptOutMemory::Forget;
+                        }
+                        // Only the sources the cookies filled are spared a
+                        // lookup; the provider's other due sources are
+                        // still looked up.
+                        // A refresh-due source whose cookie only repeats the
+                        // held UID stays due, so its refresh still runs before
+                        // the UID expires.
+                        due.retain(|source| {
+                            found
+                                .entries
+                                .iter()
+                                .find(|(filled, _)| filled == source)
+                                .is_none_or(|(_, eids)| {
+                                    Self::refresh_due(registered, entry, source, lookup.now)
+                                        && holds_same_uids_for(entry, source, eids, lookup.now)
+                                })
+                        });
+                        // A source whose cookie repeats the held UIDs is not
+                        // rewritten: its relative expiry would cause a write
+                        // on every navigation, and a failed lookup for a
+                        // still-due source would replace the held record and
+                        // its refresh state.
+                        found.entries.retain(|(source, eids)| {
+                            !holds_same_uids_for(entry, source, eids, lookup.now)
+                        });
+                        recount_found(&mut found);
+                        if !found.entries.is_empty() || opted_back_in {
+                            pending.from_cookies.push(Tagged {
+                                provider,
+                                value: found,
+                            });
+                            if due.is_empty() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                CookieRead::Absent => {}
+            }
             // A remembered opt-out keeps the provider from being called until
-            // it lapses. It clears only sources the row still stores, so once
-            // they are gone the after-response path skips its re-read.
-            if let Some(entry) = entry.filter(|entry| entry.opted_out(&registered.id, lookup.now)) {
+            // it lapses, unless its cookies hold an ID again. It clears only
+            // sources the row still stores, so once they are gone the
+            // after-response path skips its re-read.
+            if let Some(entry) = remembered_opt_out.filter(|_| !opted_back_in) {
                 pending.generated.push(Tagged {
                     provider,
                     value: ProviderLookup {
@@ -515,11 +970,11 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                             .filter(|source| entry.ids.contains_key(source.as_str()))
                             .cloned()
                             .collect(),
+                        opt_out: OptOutMemory::Unchanged,
                     },
                 });
                 continue;
             }
-            let (due, input_blocked) = Self::due_sources(registered, entry, lookup.now);
             if due.is_empty() {
                 pending.early.push(skip(if input_blocked {
                     SkipReason::Input
@@ -528,6 +983,56 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 }));
                 continue;
             }
+            // Cookies may have filled a source that needed a hashed email.
+            held.retain(|source| due.contains(source));
+            prepared.push(Prepared {
+                provider,
+                due,
+                held,
+                cookie_uids,
+            });
+        }
+        // The status endpoint is called at most once, before any lookup is
+        // built, and only when a provider would use its answer. Its time
+        // comes out of the lookups' budget, so the phase keeps one deadline.
+        let (status, spent) = match prepared
+            .iter()
+            .find(|prepared| self.wants_hashed_email(prepared, entry, lookup.now))
+        {
+            Some(first) => {
+                let started = Instant::now();
+                let status = self
+                    .hashed_email_status(transport, lookup.cookies, first.provider)
+                    .await;
+                (status, started.elapsed())
+            }
+            None => (None, Duration::ZERO),
+        };
+        for Prepared {
+            provider,
+            mut due,
+            held,
+            cookie_uids,
+        } in prepared
+        {
+            let registered = &self.providers[provider.get()];
+            let skip = |reason| Tagged {
+                provider,
+                value: LookupStatus::Skipped(reason),
+            };
+            let hashed_email = registered
+                .provider
+                .hashed_email_path()
+                .zip(status.as_ref())
+                .and_then(|(path, body)| path.read(body))
+                .and_then(HashedEmail::new);
+            if hashed_email.is_none() && !held.is_empty() {
+                due.retain(|source| !held.contains(source));
+                if due.is_empty() {
+                    pending.early.push(skip(SkipReason::Input));
+                    continue;
+                }
+            }
             let input = LookupInput {
                 ec_id: lookup.ec_id,
                 consent: lookup.consent,
@@ -535,7 +1040,12 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                 publisher_domain: lookup.publisher_domain,
                 due_sources: &due,
                 current: OwnedEntries::new(entry, &registered.policy.sources, &registered.id),
-                hashed_email: None,
+                cookies: lookup
+                    .cookies
+                    .at(lookup.now)
+                    .where_gdpr_applies(lookup.consent.gdpr_applies),
+                now: lookup.now,
+                hashed_email: hashed_email.as_ref(),
             };
             if let Some(mut eids) = registered.provider.generate(&input) {
                 // Only a due source without a live UID may take a generated
@@ -554,10 +1064,8 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     continue;
                 }
             }
-            if Self::rate_limited(registered, lookup) {
-                pending.early.push(skip(SkipReason::RateLimited));
-                continue;
-            }
+            // The request is built before the rate limit is checked, so a
+            // provider that makes no lookup spends none of its budget.
             let mut request = match registered.provider.build_request(&input) {
                 Ok(request) => request,
                 Err(report) => {
@@ -573,6 +1081,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
                     continue;
                 }
             };
+            if Self::rate_limited(registered, lookup) {
+                pending.early.push(skip(SkipReason::RateLimited));
+                continue;
+            }
             if !destination_allowed(&request.url, &registered.policy.allowed_domains) {
                 pending.early.push(skip(SkipReason::Destination));
                 continue;
@@ -580,6 +1092,10 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             if let Some(value) = request.context.take() {
                 pending.contexts.push(Tagged { provider, value });
             }
+            pending.known_uids.push(Tagged {
+                provider,
+                value: known_uid_hashes(entry, &registered.policy.sources, cookie_uids),
+            });
             requests.push(Tagged {
                 provider,
                 value: request,
@@ -589,7 +1105,7 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         // under one cutoff.
         if !requests.is_empty() {
             pending.started = requests.len();
-            pending.in_flight = Some(transport.start(requests, self.budget));
+            pending.in_flight = Some(transport.start(requests, self.budget.saturating_sub(spent)));
         }
         pending
     }
@@ -606,7 +1122,11 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
             now,
             early,
             generated,
+            excluded,
             contexts,
+            from_cookies,
+            revocations,
+            known_uids,
         } = pending;
         let responses = match in_flight {
             Some(in_flight) => transport.gather(in_flight).await,
@@ -617,22 +1137,249 @@ impl<P: IdentityProvider> IdentityCoordinator for ProviderCoordinator<P> {
         for Tagged { provider, value } in early {
             slots[provider.get()] = Some(self.lookup(provider, value, Vec::new()));
         }
-        for Tagged { provider, value } in generated {
-            slots[provider.get()] = Some(value);
+        // A provider's cookie result replaces its early skip, and its later
+        // lookup or generated result is merged into the cookie result.
+        let mut filled: Vec<Option<ProviderLookup>> =
+            (0..self.providers.len()).map(|_| None).collect();
+        for Tagged { provider, value } in from_cookies.into_iter().chain(generated) {
+            let slot = &mut filled[provider.get()];
+            *slot = Some(match slot.take() {
+                Some(earlier) => merge_lookups(earlier, value),
+                None => value,
+            });
         }
         for Tagged { provider, value } in responses {
             let context = contexts
                 .iter()
                 .find(|tagged| tagged.provider == provider)
                 .map(|tagged| tagged.value.as_str());
-            slots[provider.get()] = Some(self.interpret(provider, value, context, now));
+            let later = self.interpret(provider, value, context, now);
+            let slot = &mut filled[provider.get()];
+            *slot = Some(match slot.take() {
+                Some(earlier) => merge_lookups(earlier, later),
+                None => later,
+            });
+        }
+        for (slot, value) in slots.iter_mut().zip(filled) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+        for Tagged { provider, value } in excluded {
+            if let Some(lookup) = slots[provider.get()].as_mut() {
+                exclude_sources(lookup, value);
+            }
         }
         let lookups: Vec<ProviderLookup> = slots.into_iter().flatten().collect();
         for lookup in &lookups {
             log_outcome(lookup);
         }
-        LookupResults::new(&ec_id, lookups)
+        let known_uids = known_uids
+            .into_iter()
+            .map(|Tagged { provider, value }| (self.providers[provider.get()].id.clone(), value))
+            .collect();
+        let mut results = LookupResults::new(&ec_id, lookups).dispatched_with(revocations);
+        results.set_known_uids(known_uids);
+        results
     }
+}
+
+/// Hashes of the UIDs in `eids`, without duplicates.
+fn uid_hashes<'eid>(eids: impl Iterator<Item = &'eid KvEid>) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for uid in eids.flat_map(KvEid::uids) {
+        let hash = opt_out_uid_hash(uid.id().as_str());
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// Hashes of the UIDs known for a provider at dispatch: those its cookies
+/// held and those the row stores for its sources.
+fn known_uid_hashes(
+    entry: Option<&KvEntry>,
+    sources: &[SourceDomain],
+    mut hashes: Vec<String>,
+) -> Vec<String> {
+    let records = sources
+        .iter()
+        .filter_map(|source| entry.and_then(|entry| entry.ids.get(source.as_str())));
+    for record in records {
+        let stored = if record.is_provider_written() {
+            uid_hashes(record.eids().iter())
+        } else if record.uid.is_empty() {
+            Vec::new()
+        } else {
+            vec![opt_out_uid_hash(&record.uid)]
+        };
+        for hash in stored {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+    }
+    hashes
+}
+
+/// Drops `sources` from a provider's result and removes them from the row.
+fn exclude_sources(lookup: &mut ProviderLookup, sources: Vec<SourceDomain>) {
+    lookup
+        .entries
+        .retain(|(source, _)| !sources.contains(source));
+    recount_found(lookup);
+    for source in sources {
+        if !lookup.cleared.contains(&source) {
+            lookup.cleared.push(source);
+        }
+    }
+}
+
+/// Merges a provider's cookie result with its later lookup or generated
+/// result for the sources the cookies did not fill.
+///
+/// An opt-out wins; otherwise the found entries of both are kept, and a
+/// later result that found nothing leaves the cookie result.
+fn merge_lookups(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
+    // A server opt-out is remembered over anything; otherwise the cookies'
+    // opt-back-in is kept.
+    let opt_out = match (earlier.opt_out, later.opt_out) {
+        (_, OptOutMemory::Remember) => OptOutMemory::Remember,
+        (OptOutMemory::Forget, _) => OptOutMemory::Forget,
+        (_, memory) => memory,
+    };
+    ProviderLookup {
+        opt_out,
+        ..merge_entries(earlier, later)
+    }
+}
+
+/// Merges the statuses and entries of [`merge_lookups`].
+fn merge_entries(earlier: ProviderLookup, later: ProviderLookup) -> ProviderLookup {
+    let LookupStatus::Found { dropped, .. } = later.status else {
+        return if matches!(
+            later.status,
+            LookupStatus::OptedOut | LookupStatus::Skipped(SkipReason::OptedOut)
+        ) || !matches!(earlier.status, LookupStatus::Found { .. })
+        {
+            later
+        } else {
+            earlier
+        };
+    };
+    if !matches!(earlier.status, LookupStatus::Found { .. }) {
+        return later;
+    }
+    let mut entries = later.entries;
+    for (source, eids) in earlier.entries {
+        if entries.iter().all(|(held, _)| *held != source) {
+            entries.push((source, eids));
+        }
+    }
+    let merged = entries
+        .iter()
+        .flat_map(|(_, eids)| eids)
+        .map(|eid| eid.uids().len())
+        .sum::<usize>();
+    ProviderLookup {
+        status: LookupStatus::Found {
+            kept: u16::try_from(merged).unwrap_or(u16::MAX),
+            dropped,
+        },
+        entries,
+        ..later
+    }
+}
+
+/// Recounts the UIDs a found result keeps after some of its entries were
+/// dropped; a result left with none becomes `NoMatch`.
+fn recount_found(lookup: &mut ProviderLookup) {
+    if let LookupStatus::Found { kept, .. } = &mut lookup.status {
+        let remaining = lookup
+            .entries
+            .iter()
+            .flat_map(|(_, eids)| eids)
+            .map(|eid| eid.uids().len())
+            .sum::<usize>();
+        *kept = u16::try_from(remaining).unwrap_or(u16::MAX);
+        if remaining == 0 {
+            lookup.status = LookupStatus::NoMatch;
+        }
+    }
+}
+
+/// Whether the row holds a live UID for `source` whose absolute expiry is
+/// later than that of every UID in `eids`, so the cookie is older than the
+/// stored record.
+fn stored_outlives_cookie(
+    entry: Option<&KvEntry>,
+    source: &SourceDomain,
+    eids: &[KvEid],
+    now: UnixSeconds,
+) -> bool {
+    let Some(record) = entry.and_then(|entry| entry.ids.get(source.as_str())) else {
+        return false;
+    };
+    let Some(stored_until) = record
+        .eids()
+        .iter()
+        .flat_map(KvEid::uids)
+        .filter(|uid| uid.is_live(now))
+        .filter_map(|uid| match uid.expiry() {
+            Expiry::At(at) => Some(at),
+            Expiry::Never => None,
+        })
+        .max()
+    else {
+        return false;
+    };
+    eids.iter()
+        .flat_map(KvEid::uids)
+        .all(|uid| match uid.expiry() {
+            Expiry::At(at) => at < stored_until,
+            Expiry::Never => false,
+        })
+}
+
+/// Whether the row holds exactly the live UIDs in `eids` for `source`.
+///
+/// UIDs are compared by ID, agent type, `ext` and their EID-level fields;
+/// only expiry and refresh state are ignored, so a cookie that changes any
+/// stored field is still written.
+fn holds_same_uids_for(
+    entry: Option<&KvEntry>,
+    source: &SourceDomain,
+    eids: &[KvEid],
+    now: UnixSeconds,
+) -> bool {
+    let Some(record) = entry.and_then(|entry| entry.ids.get(source.as_str())) else {
+        return false;
+    };
+    let held: Vec<(&EidFields, &KvUid)> = record
+        .eids()
+        .iter()
+        .flat_map(|eid| eid.uids().iter().map(move |uid| (eid.fields(), uid)))
+        .filter(|(_, uid)| uid.is_live(now))
+        .collect();
+    let read: Vec<(&EidFields, &KvUid)> = eids
+        .iter()
+        .flat_map(|eid| eid.uids().iter().map(move |uid| (eid.fields(), uid)))
+        .collect();
+    let same = |(left_fields, left): &(&EidFields, &KvUid),
+                (right_fields, right): &(&EidFields, &KvUid)| {
+        left_fields == right_fields
+            && left.id() == right.id()
+            && left.atype() == right.atype()
+            && left.ext() == right.ext()
+    };
+    held.len() == read.len()
+        && read
+            .iter()
+            .all(|read_uid| held.iter().any(|held_uid| same(held_uid, read_uid)))
+        && held
+            .iter()
+            .all(|held_uid| read.iter().any(|read_uid| same(held_uid, read_uid)))
 }
 
 fn log_outcome(lookup: &ProviderLookup) {
@@ -640,6 +1387,14 @@ fn log_outcome(lookup: &ProviderLookup) {
         LookupStatus::Found { kept, dropped } => (kept, dropped.total()),
         _ => (0, 0),
     };
+    if let LookupStatus::HttpError(status) = lookup.status {
+        log::info!(
+            "Identity lookup: provider={} outcome={} status={status}",
+            lookup.provider,
+            lookup.status.metric_name()
+        );
+        return;
+    }
     log::info!(
         "Identity lookup: provider={} outcome={} kept={kept} dropped={dropped}",
         lookup.provider,
@@ -650,9 +1405,9 @@ fn log_outcome(lookup: &ProviderLookup) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::TcfConsent;
-    use crate::ec::eid_types::{AgentType, EidFields, Expiry, UidValue};
+    use crate::ec::coordinator::results::DropCounts;
+    use crate::ec::eid_types::{AgentType, UidValue};
     use crate::ec::kv::KvIdentityGraph;
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvRefresh, KvUid};
     use crate::ec::provider::{
@@ -662,7 +1417,7 @@ mod tests {
     use crate::error::TrustedServerError;
     use crate::settings::EcPartner;
     use std::borrow::Cow;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::num::NonZeroUsize;
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -672,7 +1427,9 @@ mod tests {
     /// Context the echo provider sets on its request and expects back.
     const ECHO_CONTEXT: &str = "echo-context";
 
-    struct EchoProvider(ProviderCapabilities);
+    /// Echoes the response body as one UID; when the cookie name is set, also
+    /// reads that cookie as one UID.
+    struct EchoProvider(ProviderCapabilities, Option<&'static str>);
 
     impl IdentityProvider for EchoProvider {
         fn capabilities(&self) -> &ProviderCapabilities {
@@ -703,6 +1460,10 @@ mod tests {
             if response.context != Some(ECHO_CONTEXT) {
                 return Err(Report::new(ProviderError::InvalidResponse));
             }
+            // Like LiveRamp, the echo vendor reports an opt-out with a 204.
+            if response.status == http::StatusCode::NO_CONTENT {
+                return Ok(LookupOutcome::OptedOut);
+            }
             let id = std::str::from_utf8(response.body)
                 .map_err(|_| Report::new(ProviderError::InvalidResponse))?;
             if id == "optout" {
@@ -723,49 +1484,122 @@ mod tests {
                 }],
             }]))
         }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            let Some(id) = self.1.and_then(|name| cookies.get(name)) else {
+                return CookieRead::Absent;
+            };
+            if id == "optout" {
+                return CookieRead::OptedOut;
+            }
+            CookieRead::Found(vec![ProviderEid {
+                source: Cow::Borrowed("ids.example.com"),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+                uids: vec![ProviderUid {
+                    id: Cow::Borrowed(id),
+                    atype: None,
+                    ext: None,
+                    expiry: ProviderExpiry::At(UnixSeconds::new(5000)),
+                    refresh: None,
+                }],
+            }])
+        }
     }
 
+    /// The hashed-email status endpoint the tests configure.
+    const STATUS_URL: &str = "https://status.example.com/user";
+
     /// Answers every request with a canned result, recording the URLs sent.
+    /// Requests to [`STATUS_URL`] get the status reply instead.
     struct CannedTransport {
         reply: Reply,
+        status: Reply,
         sent: RefCell<Vec<String>>,
+        /// The `Cookie` header and cutoff of each status call.
+        status_calls: RefCell<Vec<(Option<String>, Duration)>>,
+        /// The method, headers and body of each status call.
+        status_requests: RefCell<Vec<(http::Method, http::HeaderMap, bytes::Bytes)>>,
+        /// The cutoff of each lookup batch.
+        lookup_budgets: RefCell<Vec<Duration>>,
+        /// How long the status reply takes to arrive.
+        status_delay: Duration,
     }
 
     impl CannedTransport {
         fn new(reply: Reply) -> Self {
+            Self::with_status(reply, not_found_reply)
+        }
+
+        fn with_status(reply: Reply, status: Reply) -> Self {
             Self {
                 reply,
+                status,
                 sent: RefCell::default(),
+                status_calls: RefCell::default(),
+                status_requests: RefCell::default(),
+                lookup_budgets: RefCell::default(),
+                status_delay: Duration::ZERO,
             }
         }
     }
 
     impl LookupTransport for CannedTransport {
-        type Pending = Vec<ProviderIndex>;
+        type Pending = Vec<(ProviderIndex, bool)>;
 
         fn start(
             &self,
             requests: Vec<Tagged<ProviderRequest>>,
-            _budget: Duration,
-        ) -> Vec<ProviderIndex> {
+            budget: Duration,
+        ) -> Vec<(ProviderIndex, bool)> {
+            if requests
+                .first()
+                .is_some_and(|request| request.value.url.as_str() != STATUS_URL)
+            {
+                self.lookup_budgets.borrow_mut().push(budget);
+            }
             requests
                 .into_iter()
                 .map(|Tagged { provider, value }| {
+                    let is_status = value.url.as_str() == STATUS_URL;
+                    if is_status {
+                        let cookie = value
+                            .headers
+                            .get(http::header::COOKIE)
+                            .and_then(|cookie| cookie.to_str().ok())
+                            .map(str::to_owned);
+                        self.status_calls.borrow_mut().push((cookie, budget));
+                        self.status_requests.borrow_mut().push((
+                            value.method.clone(),
+                            value.headers.clone(),
+                            value.body.clone(),
+                        ));
+                    }
                     self.sent.borrow_mut().push(value.url.to_string());
-                    provider
+                    (provider, is_status)
                 })
                 .collect()
         }
 
         async fn gather(
             &self,
-            pending: Vec<ProviderIndex>,
+            pending: Vec<(ProviderIndex, bool)>,
         ) -> Vec<Tagged<Result<TransportResponse, Report<TransportError>>>> {
             pending
                 .into_iter()
-                .map(|provider| Tagged {
+                .map(|(provider, is_status)| Tagged {
                     provider,
-                    value: (self.reply)(),
+                    value: if is_status {
+                        std::thread::sleep(self.status_delay);
+                        (self.status)()
+                    } else {
+                        (self.reply)()
+                    },
                 })
                 .collect()
         }
@@ -827,22 +1661,29 @@ mod tests {
     }
 
     fn echo_provider(input: SourceInput) -> EchoProvider {
-        EchoProvider(ProviderCapabilities {
-            sources: Box::new([SourceCapability {
-                source: SourceDomain::try_from("ids.example.com").expect("should parse"),
-                input,
-            }]),
-            shape: EidShape {
-                max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
-                max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
-                eid_level_fields: EidLevelFields::Preserved,
-            },
-        })
+        cookie_provider(input, None)
     }
 
-    fn coordinator_with(
-        registered: RegisteredProvider<EchoProvider>,
-    ) -> ProviderCoordinator<EchoProvider> {
+    fn cookie_provider(input: SourceInput, cookie: Option<&'static str>) -> EchoProvider {
+        EchoProvider(
+            ProviderCapabilities {
+                sources: Box::new([SourceCapability {
+                    source: SourceDomain::try_from("ids.example.com").expect("should parse"),
+                    input,
+                }]),
+                shape: EidShape {
+                    max_eids: NonZeroUsize::new(4).expect("should be non-zero"),
+                    max_uids_per_eid: NonZeroUsize::new(4).expect("should be non-zero"),
+                    eid_level_fields: EidLevelFields::Preserved,
+                },
+            },
+            cookie,
+        )
+    }
+
+    fn coordinator_with<P: IdentityProvider>(
+        registered: RegisteredProvider<P>,
+    ) -> ProviderCoordinator<P> {
         ProviderCoordinator::new(vec![registered], partners(), Duration::from_millis(200))
             .expect("should build coordinator")
     }
@@ -885,6 +1726,24 @@ mod tests {
         consent: &ConsentContext,
         limiter: &dyn RateLimiter,
     ) -> LookupResults {
+        run_with_cookies(
+            coordinator,
+            transport,
+            snapshot,
+            consent,
+            limiter,
+            "vendor_id=c-1",
+        )
+    }
+
+    fn run_with_cookies<P: IdentityProvider>(
+        coordinator: &ProviderCoordinator<P>,
+        transport: &CannedTransport,
+        snapshot: &EcKvSnapshot,
+        consent: &ConsentContext,
+        limiter: &dyn RateLimiter,
+        cookies: &str,
+    ) -> LookupResults {
         let context = LookupContext {
             ec_id: EC_ID,
             snapshot,
@@ -893,8 +1752,11 @@ mod tests {
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
+            cookies: RequestCookies::new(cookies),
             rate_limiter: limiter,
             now: UnixSeconds::new(1000),
         };
@@ -1020,10 +1882,13 @@ mod tests {
             ec_id: EC_ID,
             snapshot: &snapshot,
             minted_entry: Some(minted),
+            cookies: RequestCookies::new(""),
             consent: &consent,
             client: ClientSignals {
                 ip: None,
                 user_agent: None,
+                referer: None,
+                accept_language: None,
             },
             publisher_domain: "www.example.com",
             rate_limiter: &limiter,
@@ -1103,7 +1968,7 @@ mod tests {
     fn provider_record(id: &str) -> KvPartnerId {
         let uid = KvUid::new(
             UidValue::try_from(id).expect("should build uid"),
-            AgentType::try_from(1).expect("should build atype"),
+            AgentType::try_from(3).expect("should build atype"),
             None,
             Some(ProviderId::new("example-provider")),
             Expiry::Never,
@@ -1327,6 +2192,101 @@ mod tests {
         );
     }
 
+    /// An echo provider whose IDs are not offered where GDPR applies.
+    struct OutsideGdprProvider(EchoProvider);
+
+    impl IdentityProvider for OutsideGdprProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn excluded_where_gdpr_applies(&self, _source: &SourceDomain) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_provider_outside_gdpr_regions_is_skipped_where_gdpr_applies() {
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                OutsideGdprProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+
+        let gdpr = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
+        let outside = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = gdpr.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::Skipped(SkipReason::Region),
+            "should neither read cookies nor look up where GDPR applies"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should remove the stored UIDs where GDPR applies"
+        );
+        assert!(
+            matches!(only_status(&outside), LookupStatus::Found { .. }),
+            "should read the cookie where GDPR does not apply"
+        );
+    }
+
+    #[test]
+    fn a_tcf_string_alone_does_not_exclude_a_provider_outside_gdpr() {
+        // Arrange: a CMP that sets a TCF string for a US visitor.
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config(""),
+                OutsideGdprProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            ..tcf_consent(vec![])
+        };
+
+        // Act
+        let results = run(&coordinator, &transport, &live_row(), &consent);
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should collect where only a TCF string is present"
+        );
+    }
+
     #[test]
     fn hashed_email_sources_are_skipped_for_input() {
         let coordinator = coordinator_with(RegisteredProvider::new(
@@ -1342,6 +2302,666 @@ mod tests {
             LookupStatus::Skipped(SkipReason::Input),
             "should skip sources needing hashed email"
         );
+    }
+
+    /// An echo provider that reads a hashed email at `.hem` and sends the
+    /// value it got as the `hem` query parameter.
+    struct HashedEmailProvider(EchoProvider, Option<crate::ec::provider::HashedEmailPath>);
+
+    impl IdentityProvider for HashedEmailProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            let mut request = self.0.build_request(lookup)?;
+            request.url.query_pairs_mut().append_pair(
+                "hem",
+                lookup.hashed_email.map_or("none", HashedEmail::as_str),
+            );
+            Ok(request)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn hashed_email_path(&self) -> Option<&crate::ec::provider::HashedEmailPath> {
+            self.1.as_ref()
+        }
+    }
+
+    fn hashed_email_provider(input: SourceInput, path: &str) -> HashedEmailProvider {
+        HashedEmailProvider(
+            echo_provider(input),
+            Some(crate::ec::provider::HashedEmailPath::parse(path).expect("should parse the path")),
+        )
+    }
+
+    fn status_source() -> HashedEmailSource {
+        HashedEmailSource {
+            endpoint: STATUS_URL.to_owned(),
+            timeout_ms: 150,
+            method: HashedEmailMethod::Get,
+            body: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// A `POST` status call whose `x-session` header comes from the
+    /// `session` cookie, as a publisher's profile endpoint may require.
+    fn post_status_source() -> HashedEmailSource {
+        HashedEmailSource {
+            method: HashedEmailMethod::Post,
+            body: Some("{}".to_owned()),
+            headers: BTreeMap::from([
+                (
+                    "X-Session".to_owned(),
+                    HashedEmailHeader::Cookie {
+                        cookie: "session".to_owned(),
+                    },
+                ),
+                (
+                    "x-requested-with".to_owned(),
+                    HashedEmailHeader::Value("XMLHttpRequest".to_owned()),
+                ),
+            ]),
+            ..status_source()
+        }
+    }
+
+    fn hashed_email_coordinator(input: SourceInput) -> ProviderCoordinator<HashedEmailProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(input, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint")
+    }
+
+    fn status_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(
+            http::StatusCode::OK,
+            br#"{"hem":"h-1","other":"h-2"}"#,
+        ))
+    }
+
+    fn status_without_path() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, br#"{"signed_in":false}"#))
+    }
+
+    fn status_not_json() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, b"<html>"))
+    }
+
+    fn status_unauthorized() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::UNAUTHORIZED, br#"{"hem":"h-1"}"#))
+    }
+
+    fn status_empty_value() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::OK, br#"{"hem":""}"#))
+    }
+
+    const LOOKUP_WITH_HEM: &str = "https://ids.example.com/lookup?due=1&hem=h-1";
+    const LOOKUP_WITHOUT_HEM: &str = "https://ids.example.com/lookup?due=1&hem=none";
+
+    #[test]
+    fn a_status_hashed_email_makes_a_hashed_email_source_due() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1; other=o-1",
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up the source with the hashed email"
+        );
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![STATUS_URL.to_owned(), LOOKUP_WITH_HEM.to_owned()],
+            "should call the status endpoint first, then look up with its value"
+        );
+        assert_eq!(
+            *transport.status_calls.borrow(),
+            vec![(
+                Some("session=s-1; other=o-1".to_owned()),
+                Duration::from_millis(150)
+            )],
+            "should forward the whole Cookie header with the status timeout"
+        );
+    }
+
+    fn post_hashed_email_coordinator() -> ProviderCoordinator<HashedEmailProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&post_status_source()))
+        .expect("should accept a POST status endpoint")
+    }
+
+    #[test]
+    fn a_post_status_call_sends_its_body_and_a_header_from_a_cookie() {
+        // Arrange
+        let coordinator = post_hashed_email_coordinator();
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=\"s-1|abc\"; other=o-1",
+        );
+
+        // Assert
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should look up the source with the hashed email"
+        );
+        let requests = transport.status_requests.borrow();
+        let [(method, headers, body)] = requests.as_slice() else {
+            panic!("should make one status call, made {}", requests.len());
+        };
+        assert_eq!(*method, http::Method::POST, "should POST");
+        assert_eq!(body.as_ref(), b"{}", "should send the configured body");
+        let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        assert_eq!(
+            header("x-session"),
+            Some("s-1|abc"),
+            "should send the unquoted session cookie as x-session"
+        );
+        assert!(
+            headers
+                .get("x-session")
+                .is_some_and(http::HeaderValue::is_sensitive),
+            "should mark the cookie value sensitive"
+        );
+        assert_eq!(
+            header("x-requested-with"),
+            Some("XMLHttpRequest"),
+            "should send the fixed header"
+        );
+        assert_eq!(
+            header("content-type"),
+            Some("application/json"),
+            "should send the body as JSON"
+        );
+        assert_eq!(
+            header("cookie"),
+            Some("session=\"s-1|abc\"; other=o-1"),
+            "should still forward the whole Cookie header"
+        );
+    }
+
+    #[test]
+    fn a_status_call_needing_a_missing_cookie_is_not_made() {
+        // Arrange
+        let coordinator = post_hashed_email_coordinator();
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "other=o-1",
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source needing a hashed email"
+        );
+        assert!(
+            transport.status_requests.borrow().is_empty(),
+            "should make no status call without the session cookie"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_get_status_call_sends_no_body() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        let requests = transport.status_requests.borrow();
+        let [(method, headers, body)] = requests.as_slice() else {
+            panic!("should make one status call, made {}", requests.len());
+        };
+        assert_eq!(*method, http::Method::GET, "should GET by default");
+        assert!(body.is_empty(), "should send no body");
+        assert!(
+            headers.get(http::header::CONTENT_TYPE).is_none(),
+            "should send no content type without a body"
+        );
+    }
+
+    #[test]
+    fn no_usable_status_reply_skips_a_hashed_email_source_for_input() {
+        for status in [
+            status_without_path as Reply,
+            status_not_json,
+            status_unauthorized,
+            status_empty_value,
+            timeout_reply,
+            server_error_reply,
+        ] {
+            let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+            let transport = CannedTransport::with_status(ok_reply, status);
+
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &live_row(),
+                &granting(),
+                &Limiter(false),
+                "session=s-1",
+            );
+
+            assert_eq!(
+                only_status(&results),
+                LookupStatus::Skipped(SkipReason::Input),
+                "should skip the source without a hashed email"
+            );
+            assert_eq!(
+                *transport.sent.borrow(),
+                vec![STATUS_URL.to_owned()],
+                "should make only the status call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_without_cookies_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_due_refresh_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { .. }),
+            "should refresh the held UID"
+        );
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![LOOKUP_WITHOUT_HEM.to_owned()],
+            "should refresh without calling the status endpoint"
+        );
+    }
+
+    #[test]
+    fn a_live_source_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(4000)),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should not be due"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_anonymous_source_is_looked_up_with_or_without_a_hashed_email() {
+        for (status, expected) in [
+            (status_reply as Reply, LOOKUP_WITH_HEM),
+            (status_unauthorized, LOOKUP_WITHOUT_HEM),
+        ] {
+            let coordinator = hashed_email_coordinator(SourceInput::Anonymous);
+            let transport = CannedTransport::with_status(ok_reply, status);
+
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &live_row(),
+                &granting(),
+                &Limiter(false),
+                "session=s-1",
+            );
+
+            assert!(
+                matches!(only_status(&results), LookupStatus::Found { .. }),
+                "should look up the anonymous source"
+            );
+            assert_eq!(
+                *transport.sent.borrow(),
+                vec![STATUS_URL.to_owned(), expected.to_owned()],
+                "should add the hashed email only when there is one"
+            );
+        }
+    }
+
+    #[test]
+    fn consent_failure_makes_no_status_call() {
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &ConsentContext {
+                jurisdiction: Jurisdiction::Gdpr,
+                gdpr_applies: true,
+                ..Default::default()
+            },
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should not call the status endpoint without consent"
+        );
+    }
+
+    #[test]
+    fn two_providers_share_one_status_call_and_read_their_own_paths() {
+        // Arrange
+        let partner = |source: &str| -> EcPartner {
+            serde_json::from_value(serde_json::json!({
+                "name": source, "source_domain": source, "bidstream_enabled": true
+            }))
+            .expect("should build partner")
+        };
+        let partners = Arc::new(
+            PartnerRegistry::from_config(&[
+                partner("ids.example.com"),
+                partner("other.example.com"),
+            ])
+            .expect("should build registry"),
+        );
+        let mut second = echo_provider(SourceInput::HashedEmail);
+        second.0.sources = Box::new([SourceCapability {
+            source: SourceDomain::try_from("other.example.com").expect("should parse"),
+            input: SourceInput::HashedEmail,
+        }]);
+        let second_config: IdentityProviderConfig = toml::from_str(
+            "id = \"second-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"other.example.com\"]",
+        )
+        .expect("should parse config");
+        let coordinator = ProviderCoordinator::new(
+            vec![
+                RegisteredProvider::new(
+                    provider_config(""),
+                    hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+                ),
+                RegisteredProvider::new(
+                    second_config,
+                    HashedEmailProvider(
+                        second,
+                        Some(
+                            crate::ec::provider::HashedEmailPath::parse(".other")
+                                .expect("should parse the path"),
+                        ),
+                    ),
+                ),
+            ],
+            partners,
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![
+                STATUS_URL.to_owned(),
+                LOOKUP_WITH_HEM.to_owned(),
+                "https://ids.example.com/lookup?due=1&hem=h-2".to_owned(),
+            ],
+            "should call the status endpoint once and give each provider its own value"
+        );
+    }
+
+    #[test]
+    fn hashed_email_source_settings_are_checked() {
+        let with_path = || {
+            coordinator_with(RegisteredProvider::new(
+                provider_config(""),
+                hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+            ))
+        };
+
+        let missing = with_path()
+            .with_hashed_email_source(None)
+            .err()
+            .expect("should reject a provider path without the status endpoint");
+        let insecure = with_path()
+            .with_hashed_email_source(Some(&HashedEmailSource {
+                endpoint: "http://status.example.com/user".to_owned(),
+                ..status_source()
+            }))
+            .err()
+            .expect("should reject a non-https status endpoint");
+
+        assert!(
+            format!("{missing:?}").contains("[ec.hashed_email] is not configured"),
+            "should name the missing endpoint: {missing:?}"
+        );
+        assert!(
+            matches!(insecure.current_context(), ProviderConfigError::Invalid),
+            "should report invalid config"
+        );
+        let get_with_body = with_path()
+            .with_hashed_email_source(Some(&HashedEmailSource {
+                body: Some("{}".to_owned()),
+                ..status_source()
+            }))
+            .err()
+            .expect("should reject a body without POST");
+        assert!(
+            format!("{get_with_body:?}").contains("body is only sent with method"),
+            "should explain the rejected body: {get_with_body:?}"
+        );
+        coordinator("")
+            .with_hashed_email_source(None)
+            .expect("should accept no endpoint when no provider reads one");
+    }
+
+    #[test]
+    fn the_status_timeout_must_leave_room_in_the_budget() {
+        // Arrange: the coordinators' budget is 200 ms.
+        let at_budget = HashedEmailSource {
+            timeout_ms: 200,
+            ..status_source()
+        };
+
+        // Act
+        let error = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            hashed_email_provider(SourceInput::HashedEmail, ".hem"),
+        ))
+        .with_hashed_email_source(Some(&at_budget))
+        .err()
+        .expect("should reject a status timeout that fills the budget");
+
+        // Assert
+        assert!(
+            format!("{error:?}").contains("must be below the identity budget (200 ms)"),
+            "should name the budget: {error:?}"
+        );
+        coordinator("")
+            .with_hashed_email_source(Some(&at_budget))
+            .expect("should accept any timeout when no provider reads a hashed email");
+    }
+
+    #[test]
+    fn lookups_get_the_budget_the_status_call_left() {
+        // Arrange
+        let coordinator = hashed_email_coordinator(SourceInput::HashedEmail);
+        let transport = CannedTransport {
+            status_delay: Duration::from_millis(60),
+            ..CannedTransport::with_status(ok_reply, status_reply)
+        };
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        let budgets = transport.lookup_budgets.borrow();
+        assert_eq!(budgets.len(), 1, "should start one lookup batch");
+        assert!(
+            budgets[0] <= Duration::from_millis(140),
+            "should take the status call's time out of the 200 ms budget: {:?}",
+            budgets[0]
+        );
+    }
+
+    #[test]
+    fn lookups_keep_the_whole_budget_without_a_status_call() {
+        // Arrange: a provider without a hashed-email path never wants one.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            echo_provider(SourceInput::Anonymous),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport {
+            status_delay: Duration::from_millis(60),
+            ..CannedTransport::with_status(ok_reply, status_reply)
+        };
+
+        // Act
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        // Assert
+        assert!(
+            transport.status_calls.borrow().is_empty(),
+            "should make no status call"
+        );
+        assert_eq!(
+            *transport.lookup_budgets.borrow(),
+            vec![Duration::from_millis(200)],
+            "should give the lookups the whole budget"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_a_path_never_gets_a_status_call() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            echo_provider(SourceInput::HashedEmail),
+        ))
+        .with_hashed_email_source(Some(&status_source()))
+        .expect("should accept the status endpoint");
+        let transport = CannedTransport::with_status(ok_reply, status_reply);
+
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "session=s-1",
+        );
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Input),
+            "should skip the source needing input"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
     }
 
     #[test]
@@ -1421,6 +3041,167 @@ mod tests {
     }
 
     #[test]
+    fn first_party_cookie_id_replaces_the_lookup() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should keep the cookie UID"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0].id().as_str(),
+            "c-1",
+            "should store the cookie value"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    fn cookie_coordinator() -> ProviderCoordinator<EchoProvider> {
+        coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ))
+    }
+
+    fn held_snapshot(id: &str) -> EcKvSnapshot {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+            .ids
+            .insert("ids.example.com".to_owned(), provider_record(id));
+        seeded_snapshot(&entry)
+    }
+
+    #[test]
+    fn cookie_opted_out_sources_lists_only_providers_whose_cookies_opt_out() {
+        // Arrange
+        let coordinator = cookie_coordinator();
+
+        // Act
+        let opted_out =
+            coordinator.cookie_opted_out_sources(RequestCookies::new("other=1; vendor_id=optout"));
+        let holding_id = coordinator.cookie_opted_out_sources(RequestCookies::new("vendor_id=c-1"));
+        let without_cookie = coordinator.cookie_opted_out_sources(RequestCookies::new(""));
+
+        // Assert
+        assert_eq!(
+            opted_out,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should list the sources of the provider whose cookies opt out"
+        );
+        assert!(
+            holding_id.is_empty() && without_cookie.is_empty(),
+            "should list nothing when the cookies hold an ID or are absent"
+        );
+    }
+
+    #[test]
+    fn cookie_opt_out_skips_the_lookup_and_clears_the_sources() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        for snapshot in [live_row(), held_snapshot("p-1")] {
+            let results = run_with_cookies(
+                &coordinator,
+                &transport,
+                &snapshot,
+                &granting(),
+                &Limiter(false),
+                "vendor_id=optout",
+            );
+
+            let lookup = results.iter().next().expect("should report the provider");
+            assert_eq!(
+                lookup.status,
+                LookupStatus::OptedOut,
+                "should skip for the opt-out"
+            );
+            assert_eq!(
+                lookup.cleared,
+                [SourceDomain::try_from("ids.example.com").expect("should parse")],
+                "should clear the provider's sources"
+            );
+        }
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn changed_cookie_replaces_a_held_live_uid() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &held_snapshot("p-1"), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should read the changed cookie although the source is not due"
+        );
+        assert_eq!(
+            lookup.entries[0].1[0].uids()[0].id().as_str(),
+            "c-1",
+            "should store the new cookie value"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn unchanged_cookie_for_a_held_uid_is_not_rewritten() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &held_snapshot("c-1"), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should skip a cookie repeating the held UID"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send no lookup");
+    }
+
+    #[test]
+    fn missing_or_invalid_cookie_falls_back_to_the_lookup() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("absent")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should use the lookup"
+        );
+        assert_eq!(transport.sent.borrow().len(), 1, "should send the lookup");
+    }
+
+    #[test]
+    fn cookie_is_not_read_without_consent() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("tcf_vendor_id = 9999"),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::Consent),
+            "should skip for consent"
+        );
+    }
+
+    #[test]
     fn disabled_provider_is_not_registered() {
         let coordinator = coordinator("enabled = false");
 
@@ -1430,7 +3211,7 @@ mod tests {
     #[test]
     fn endpoint_outside_allowlist_is_rejected_at_build() {
         let mut config = provider_config("");
-        config.endpoint = "https://other.example.com/".to_owned();
+        config.endpoint = Some("https://other.example.com/".to_owned());
 
         let error = ProviderCoordinator::new(
             vec![RegisteredProvider::new(
@@ -1451,10 +3232,13 @@ mod tests {
 
     #[test]
     fn source_outside_capabilities_is_rejected_at_build() {
-        let provider = EchoProvider(ProviderCapabilities {
-            sources: Box::new([]),
-            ..echo_provider(SourceInput::Anonymous).0
-        });
+        let provider = EchoProvider(
+            ProviderCapabilities {
+                sources: Box::new([]),
+                ..echo_provider(SourceInput::Anonymous).0
+            },
+            None,
+        );
 
         let error = ProviderCoordinator::new(
             vec![RegisteredProvider::new(provider_config(""), provider)],
@@ -1477,7 +3261,7 @@ mod tests {
     fn refreshable_record_owned_by(owner: &str, from: u64) -> KvPartnerId {
         let uid = KvUid::new(
             UidValue::try_from("p-1").expect("should build uid"),
-            AgentType::try_from(1).expect("should build atype"),
+            AgentType::try_from(3).expect("should build atype"),
             None,
             Some(ProviderId::new(owner)),
             Expiry::At(UnixSeconds::new(5000)),
@@ -1520,6 +3304,119 @@ mod tests {
     }
 
     #[test]
+    fn a_due_refresh_runs_while_the_cookie_repeats_the_held_uid() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+
+        assert_eq!(
+            transport.sent.borrow().len(),
+            1,
+            "should send the refresh although the cookie holds the same UID"
+        );
+    }
+
+    #[test]
+    fn a_newer_cookie_uid_replaces_a_refresh() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+
+        run_with_cookies(
+            &coordinator,
+            &transport,
+            &snapshot_holding(refreshable_record(900)),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-2",
+        );
+
+        assert!(
+            transport.sent.borrow().is_empty(),
+            "should take the newer cookie UID instead of refreshing"
+        );
+    }
+
+    fn found_lookup(source: &str, id: &str) -> ProviderLookup {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        ProviderLookup {
+            provider: ProviderId::new("example-provider"),
+            status: LookupStatus::Found {
+                kept: 1,
+                dropped: DropCounts::default(),
+            },
+            entries: vec![(
+                SourceDomain::try_from(source).expect("should build source"),
+                vec![KvEid::new(EidFields::default(), vec![uid])],
+            )],
+            cleared: Vec::new(),
+            opt_out: OptOutMemory::Unchanged,
+        }
+    }
+
+    fn status_lookup(status: LookupStatus) -> ProviderLookup {
+        ProviderLookup {
+            provider: ProviderId::new("example-provider"),
+            status,
+            entries: Vec::new(),
+            cleared: Vec::new(),
+            opt_out: OptOutMemory::Unchanged,
+        }
+    }
+
+    #[test]
+    fn merging_keeps_cookie_ids_when_the_lookup_fails_and_lets_an_opt_out_win() {
+        for failed in [
+            LookupStatus::Timeout,
+            LookupStatus::HttpError(http::StatusCode::BAD_GATEWAY),
+        ] {
+            let merged = merge_lookups(found_lookup("a.example.com", "c-1"), status_lookup(failed));
+            assert!(
+                matches!(merged.status, LookupStatus::Found { kept: 1, .. }),
+                "should keep the cookie IDs when the lookup fails"
+            );
+        }
+
+        let merged = merge_lookups(
+            found_lookup("a.example.com", "c-1"),
+            status_lookup(LookupStatus::OptedOut),
+        );
+
+        assert_eq!(
+            merged.status,
+            LookupStatus::OptedOut,
+            "should let a lookup opt-out win over cookie IDs"
+        );
+    }
+
+    #[test]
+    fn merging_combines_cookie_and_lookup_sources() {
+        let merged = merge_lookups(
+            found_lookup("a.example.com", "c-1"),
+            found_lookup("b.example.com", "l-1"),
+        );
+
+        assert!(
+            matches!(merged.status, LookupStatus::Found { kept: 2, .. }),
+            "should count both sources"
+        );
+        assert_eq!(merged.entries.len(), 2, "should keep both sources");
+    }
+
+    #[test]
     fn a_future_refresh_leaves_the_source_held() {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(ok_reply);
@@ -1537,6 +3434,171 @@ mod tests {
             "should not refresh before the refresh time"
         );
         assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_cookie_id_clears_a_remembered_opt_out() {
+        // Arrange: the opt-out is remembered for 29 more days, and the
+        // vendor's cookie holds an ID again.
+        let coordinator = cookie_coordinator();
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.opt_outs.insert(
+            ProviderId::new("example-provider"),
+            1000 + 29 * 24 * 60 * 60,
+        );
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run_with_cookies(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-1",
+        );
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 1, .. }),
+            "should store the cookie ID despite the remembered opt-out"
+        );
+        assert_eq!(
+            lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the remembered opt-out"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn an_unchanged_cookie_keeps_a_server_opt_out_until_a_renewed_id_arrives() {
+        // Arrange: the held UID's refresh is due and the cookie repeats it;
+        // the vendor's server answers the refresh with an opt-out.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let provider = ProviderId::new("example-provider");
+        let first_snapshot = snapshot_holding(refreshable_record(900));
+        let first = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(optout_reply),
+            &first_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&first_snapshot, &first)
+        else {
+            panic!("should plan the opt-out write")
+        };
+        assert!(
+            entry.opted_out(&provider, UnixSeconds::new(1000))
+                && !entry.ids.contains_key("ids.example.com"),
+            "should remember the server opt-out and clear the source"
+        );
+        let second_snapshot = seeded_snapshot(&entry);
+
+        // Act: the next navigation sends the same cookie, then a later one a
+        // renewed ID.
+        let unchanged_transport = CannedTransport::new(ok_reply);
+        let unchanged = run_with_cookies(
+            &coordinator,
+            &unchanged_transport,
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=p-1",
+        );
+        let renewed = run_with_cookies(
+            &coordinator,
+            &CannedTransport::new(ok_reply),
+            &second_snapshot,
+            &granting(),
+            &Limiter(false),
+            "vendor_id=c-renewed",
+        );
+
+        // Assert
+        let unchanged_lookup = unchanged.iter().next().expect("should report the provider");
+        assert_eq!(
+            unchanged_lookup.status,
+            LookupStatus::Skipped(SkipReason::OptedOut),
+            "should keep skipping the provider for an unchanged cookie"
+        );
+        assert_eq!(
+            unchanged_lookup.opt_out,
+            OptOutMemory::Unchanged,
+            "should not forget the server opt-out for an unchanged cookie"
+        );
+        assert!(
+            planned_change(&second_snapshot, &unchanged).is_none(),
+            "should neither restore the opted-out UID nor write"
+        );
+        assert!(
+            unchanged_transport.sent.borrow().is_empty(),
+            "should not call the opted-out provider"
+        );
+        let renewed_lookup = renewed.iter().next().expect("should report the provider");
+        assert_eq!(
+            renewed_lookup.opt_out,
+            OptOutMemory::Forget,
+            "should forget the opt-out for a renewed cookie ID"
+        );
+        let Some(crate::ec::page_load::RowChange::Update { entry, .. }) =
+            planned_change(&second_snapshot, &renewed)
+        else {
+            panic!("should plan the opt-back-in write")
+        };
+        assert_eq!(
+            entry.ids["ids.example.com"].uid, "c-renewed",
+            "should store the renewed cookie ID"
+        );
+        assert!(
+            !entry.opted_out(&provider, UnixSeconds::new(1000)) && entry.opt_out_uids.is_empty(),
+            "should forget the opt-out and its UID hashes"
+        );
+    }
+
+    #[test]
+    fn only_a_vendor_server_opt_out_is_remembered() {
+        let cookie_only = cookie_coordinator();
+        let cookie = run_with_cookies(
+            &cookie_only,
+            &CannedTransport::new(ok_reply),
+            &live_row(),
+            &granting(),
+            &Limiter(false),
+            "vendor_id=optout",
+        );
+        let server = run(
+            &coordinator(""),
+            &CannedTransport::new(optout_reply),
+            &live_row(),
+            &granting(),
+        );
+
+        let memory = |results: &LookupResults| {
+            results
+                .iter()
+                .next()
+                .expect("should report the provider")
+                .opt_out
+        };
+        assert_eq!(
+            memory(&cookie),
+            OptOutMemory::Unchanged,
+            "should not remember a cookie opt-out"
+        );
+        assert_eq!(
+            memory(&server),
+            OptOutMemory::Remember,
+            "should remember a vendor server's opt-out"
+        );
     }
 
     #[test]
@@ -1652,6 +3714,32 @@ mod tests {
     }
 
     #[test]
+    fn results_carry_the_revocations_the_dispatch_saw() {
+        // Arrange
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(ok_reply);
+        let provider = ProviderId::new("example-provider");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.revocations.insert(provider.clone(), 900);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &seeded_snapshot(&entry),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            results.revocation_at_dispatch(&provider),
+            Some(900),
+            "should hand the dispatch's revocations to the write"
+        );
+    }
+
+    #[test]
     fn an_opted_out_reply_clears_the_sources() {
         let coordinator = coordinator("");
         let transport = CannedTransport::new(optout_reply);
@@ -1668,6 +3756,44 @@ mod tests {
             lookup.cleared,
             [SourceDomain::try_from("ids.example.com").expect("should parse")],
             "should clear the provider's sources"
+        );
+    }
+
+    fn no_content_reply() -> Result<TransportResponse, Report<TransportError>> {
+        Ok(reply(http::StatusCode::NO_CONTENT, b""))
+    }
+
+    #[test]
+    fn a_204_reply_reaches_the_provider() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(no_content_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        let lookup = results.iter().next().expect("should report the provider");
+        assert_eq!(
+            lookup.status,
+            LookupStatus::OptedOut,
+            "should report the opt-out the provider reads from a 204"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should clear the provider's sources"
+        );
+    }
+
+    #[test]
+    fn a_404_reply_is_no_match_without_parsing() {
+        let coordinator = coordinator("");
+        let transport = CannedTransport::new(not_found_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::NoMatch,
+            "should report a 404 as no match"
         );
     }
 
@@ -1853,6 +3979,470 @@ mod tests {
             only_status(&results),
             LookupStatus::Skipped(SkipReason::NotDue),
             "should keep the held ID"
+        );
+    }
+
+    /// An echo provider that makes no lookup.
+    struct NoLookupProvider(EchoProvider);
+
+    impl IdentityProvider for NoLookupProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            _lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            Err(Report::new(ProviderError::Request))
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+    }
+
+    /// A limiter that counts the checks it is asked for.
+    #[derive(Default)]
+    struct CountingLimiter(Cell<u32>);
+
+    impl RateLimiter for CountingLimiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            self.0.set(self.0.get() + 1);
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn a_provider_making_no_lookup_spends_no_rate_limit() {
+        let coordinator = ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                provider_config("rate_limit_per_hour = 1"),
+                NoLookupProvider(echo_provider(SourceInput::Anonymous)),
+            )],
+            partners(),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator");
+        let transport = CannedTransport::new(ok_reply);
+        let limiter = CountingLimiter::default();
+
+        let results = run_with(&coordinator, &transport, &live_row(), &granting(), &limiter);
+
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::RequestFailed,
+            "should report a provider that builds no request"
+        );
+        assert_eq!(limiter.0.get(), 0, "should not check the rate limit");
+    }
+
+    const SECOND_SOURCE: &str = "ids-b.example.com";
+
+    /// A two-source provider: its cookie fills the first source and its
+    /// lookup the second.
+    struct TwoSourceProvider(EchoProvider);
+
+    impl IdentityProvider for TwoSourceProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            let mut outcome = self.0.parse_response(response)?;
+            if let LookupOutcome::Found(eids) = &mut outcome {
+                for eid in eids {
+                    eid.source = Cow::Borrowed(SECOND_SOURCE);
+                }
+            }
+            Ok(outcome)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+    }
+
+    fn two_source_coordinator<P: IdentityProvider>(
+        wrap: impl FnOnce(TwoSourceProvider) -> P,
+    ) -> ProviderCoordinator<P> {
+        let mut provider = cookie_provider(SourceInput::Anonymous, Some("vendor_id"));
+        provider.0.sources = Box::new([
+            SourceCapability {
+                source: SourceDomain::try_from("ids.example.com").expect("should parse"),
+                input: SourceInput::Anonymous,
+            },
+            SourceCapability {
+                source: SourceDomain::try_from(SECOND_SOURCE).expect("should parse"),
+                input: SourceInput::Anonymous,
+            },
+        ]);
+        let config: IdentityProviderConfig = toml::from_str(&format!(
+            "id = \"example-provider\"\nkind = \"echo\"\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\", \"{SECOND_SOURCE}\"]\nrate_limit_per_hour = 1\n"
+        ))
+        .expect("should parse config");
+        let partners: Vec<EcPartner> = ["ids.example.com", SECOND_SOURCE]
+            .into_iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        ProviderCoordinator::new(
+            vec![RegisteredProvider::new(
+                config,
+                wrap(TwoSourceProvider(provider)),
+            )],
+            Arc::new(PartnerRegistry::from_config(&partners).expect("should build registry")),
+            Duration::from_millis(200),
+        )
+        .expect("should build coordinator")
+    }
+
+    #[test]
+    fn a_cookie_spares_only_the_sources_it_fills() {
+        let coordinator = two_source_coordinator(|provider| provider);
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(&coordinator, &transport, &live_row(), &granting());
+
+        assert_eq!(
+            *transport.sent.borrow(),
+            ["https://ids.example.com/lookup?due=1"],
+            "should look up only the source the cookie did not fill"
+        );
+        let lookup = results.iter().next().expect("should report the provider");
+        assert!(
+            matches!(lookup.status, LookupStatus::Found { kept: 2, .. }),
+            "should keep the cookie and lookup UIDs"
+        );
+        let mut sources: Vec<&str> = lookup
+            .entries
+            .iter()
+            .map(|(source, _)| source.as_str())
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            ["ids-b.example.com", "ids.example.com"],
+            "should store both sources"
+        );
+    }
+
+    /// Plans the row change a navigation's results make, as finalize does.
+    fn planned_change(
+        snapshot: &EcKvSnapshot,
+        results: &LookupResults,
+    ) -> Option<crate::ec::page_load::RowChange> {
+        let partners: Vec<EcPartner> = ["ids.example.com", SECOND_SOURCE]
+            .into_iter()
+            .map(|source| {
+                serde_json::from_value(serde_json::json!({
+                    "name": source, "source_domain": source, "bidstream_enabled": true
+                }))
+                .expect("should build partner")
+            })
+            .collect();
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        crate::ec::write_plan::plan_write(&crate::ec::write_plan::WritePlanInput {
+            ec_id: EC_ID,
+            snapshot,
+            new_entry: None,
+            browser_ingest: &[],
+            lookups: results,
+            registry: &registry,
+            now: UnixSeconds::new(1000),
+        })
+    }
+
+    /// Outcomes of a lookup that stores nothing, with a label for messages.
+    fn failed_outcomes() -> [(&'static str, Reply, bool); 5] {
+        [
+            ("404", not_found_reply, false),
+            ("timeout", timeout_reply, false),
+            ("502", server_error_reply, false),
+            ("invalid", invalid_reply, false),
+            ("rate-limited", ok_reply, true),
+        ]
+    }
+
+    #[test]
+    fn an_unchanged_cookie_is_not_rewritten_while_another_source_is_due() {
+        // Arrange: the row holds the cookie's UID; the second source is due.
+        let coordinator = two_source_coordinator(|provider| provider);
+        let snapshot = held_snapshot("c-1");
+
+        for (label, reply, limited) in failed_outcomes() {
+            for cookies in ["vendor_id=c-1", ""] {
+                let transport = CannedTransport::new(reply);
+
+                // Act
+                let results = run_with_cookies(
+                    &coordinator,
+                    &transport,
+                    &snapshot,
+                    &granting(),
+                    &Limiter(limited),
+                    cookies,
+                );
+
+                // Assert
+                assert!(
+                    planned_change(&snapshot, &results).is_none(),
+                    "should plan no write for {label} with cookies `{cookies}`: {:?}",
+                    only_status(&results)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_held_refresh_state() {
+        // Arrange: the held UID's refresh is due and the cookie repeats it.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config("rate_limit_per_hour = 1"),
+            cookie_provider(SourceInput::Anonymous, Some("vendor_id")),
+        ));
+        let snapshot = snapshot_holding(refreshable_record(900));
+
+        for (label, reply, limited) in failed_outcomes() {
+            for cookies in ["vendor_id=p-1", ""] {
+                let transport = CannedTransport::new(reply);
+
+                // Act
+                let results = run_with_cookies(
+                    &coordinator,
+                    &transport,
+                    &snapshot,
+                    &granting(),
+                    &Limiter(limited),
+                    cookies,
+                );
+
+                // Assert
+                let lookup = results.iter().next().expect("should report the provider");
+                assert!(
+                    lookup.entries.is_empty(),
+                    "should not replace the held record after {label}: {:?}",
+                    lookup.status
+                );
+                assert!(
+                    planned_change(&snapshot, &results).is_none(),
+                    "should plan no write that drops the refresh state for {label} with cookies `{cookies}`"
+                );
+            }
+        }
+    }
+
+    /// A cookie provider that keeps a stored UID outliving the cookie's.
+    struct RefreshingCookieProvider(EchoProvider);
+
+    impl IdentityProvider for RefreshingCookieProvider {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn keeps_fresher_stored_uids(&self) -> bool {
+            true
+        }
+    }
+
+    fn record_until(id: &str, until: u64) -> KvPartnerId {
+        let uid = KvUid::new(
+            UidValue::try_from(id).expect("should build uid"),
+            AgentType::try_from(3).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::At(UnixSeconds::new(until)),
+        );
+        KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record")
+    }
+
+    #[test]
+    fn an_older_cookie_does_not_roll_back_a_refreshed_uid() {
+        // Arrange: the cookie's UID expires at 5000; a refresh stored one
+        // living until 6000.
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            RefreshingCookieProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record_until("p-2", 6000)),
+            &granting(),
+        );
+
+        // Assert
+        assert_eq!(
+            only_status(&results),
+            LookupStatus::Skipped(SkipReason::NotDue),
+            "should keep the refreshed UID over the older cookie"
+        );
+        assert!(transport.sent.borrow().is_empty(), "should send nothing");
+    }
+
+    #[test]
+    fn a_newer_cookie_replaces_an_older_stored_uid() {
+        let coordinator = coordinator_with(RegisteredProvider::new(
+            provider_config(""),
+            RefreshingCookieProvider(cookie_provider(SourceInput::Anonymous, Some("vendor_id"))),
+        ));
+        let transport = CannedTransport::new(ok_reply);
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record_until("p-2", 4000)),
+            &granting(),
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should take the cookie UID that outlives the stored one"
+        );
+    }
+
+    #[test]
+    fn a_cookie_changing_only_the_agent_type_is_rewritten() {
+        let coordinator = cookie_coordinator();
+        let transport = CannedTransport::new(ok_reply);
+        let uid = KvUid::new(
+            UidValue::try_from("c-1").expect("should build uid"),
+            AgentType::try_from(1).expect("should build atype"),
+            None,
+            Some(ProviderId::new("example-provider")),
+            Expiry::Never,
+        );
+        let record = KvPartnerId::from_eids(
+            vec![KvEid::new(EidFields::default(), vec![uid])],
+            UnixSeconds::new(1000),
+        )
+        .expect("should build provider record");
+
+        let results = run(
+            &coordinator,
+            &transport,
+            &snapshot_holding(record),
+            &granting(),
+        );
+
+        assert!(
+            matches!(only_status(&results), LookupStatus::Found { kept: 1, .. }),
+            "should store a cookie UID whose agent type changed"
+        );
+    }
+
+    /// A two-source provider whose cookie source is excluded where GDPR
+    /// applies.
+    struct CookieSourceExcluded(TwoSourceProvider);
+
+    impl IdentityProvider for CookieSourceExcluded {
+        fn capabilities(&self) -> &ProviderCapabilities {
+            self.0.capabilities()
+        }
+
+        fn build_request(
+            &self,
+            lookup: &LookupInput<'_>,
+        ) -> Result<ProviderRequest, Report<ProviderError>> {
+            self.0.build_request(lookup)
+        }
+
+        fn parse_response<'body>(
+            &self,
+            response: ProviderResponse<'body>,
+        ) -> Result<LookupOutcome<'body>, Report<ProviderError>> {
+            self.0.parse_response(response)
+        }
+
+        fn read_request_cookies<'cookie>(
+            &self,
+            cookies: RequestCookies<'cookie>,
+        ) -> CookieRead<'cookie> {
+            self.0.read_request_cookies(cookies)
+        }
+
+        fn excluded_where_gdpr_applies(&self, source: &SourceDomain) -> bool {
+            source.as_str() == "ids.example.com"
+        }
+    }
+
+    #[test]
+    fn an_excluded_source_is_neither_collected_nor_kept_where_gdpr_applies() {
+        // Arrange
+        let coordinator = two_source_coordinator(CookieSourceExcluded);
+        let transport = CannedTransport::new(ok_reply);
+
+        // Act
+        let results = run(&coordinator, &transport, &live_row(), &tcf_consent(vec![]));
+
+        // Assert
+        let lookup = results.iter().next().expect("should report the provider");
+        let sources: Vec<&str> = lookup
+            .entries
+            .iter()
+            .map(|(source, _)| source.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            [SECOND_SOURCE],
+            "should keep only the source that is not excluded"
+        );
+        assert_eq!(
+            lookup.cleared,
+            [SourceDomain::try_from("ids.example.com").expect("should parse")],
+            "should remove the excluded source from the row"
         );
     }
 }

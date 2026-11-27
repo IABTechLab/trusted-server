@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
@@ -642,8 +642,11 @@ impl EcPartner {
 }
 
 /// One `[[ec.identity_providers]]` entry.
+///
+/// A `sharedid` provider with no `sources` claims `pubcid.org`, the source
+/// Prebid sends `SharedID` under.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct IdentityProviderConfig {
     /// Unique provider ID; recorded as the owner of the UIDs it writes.
     pub id: String,
@@ -656,7 +659,11 @@ pub struct IdentityProviderConfig {
     )]
     pub enabled: bool,
     /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
-    pub endpoint: String,
+    ///
+    /// Optional for kinds that only read first-party cookies; kinds that
+    /// make lookups reject a missing endpoint when they are built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Exact hosts the coordinator may call for this provider.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
@@ -686,6 +693,28 @@ pub struct IdentityProviderConfig {
     #[serde(default)]
     pub settings: serde_json::Map<String, JsonValue>,
 }
+
+impl<'de> Deserialize<'de> for IdentityProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut config = Self::deserialize(deserializer)?;
+        if config.kind == SHAREDID_PROVIDER_KIND && config.sources.is_empty() {
+            config.sources = vec![SHAREDID_DEFAULT_SOURCE.to_owned()];
+        }
+        Ok(config)
+    }
+}
+
+impl Serialize for IdentityProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// Provider kind of Prebid's `SharedID`.
+const SHAREDID_PROVIDER_KIND: &str = "sharedid";
+
+/// Source a `sharedid` provider claims when none is configured.
+pub const SHAREDID_DEFAULT_SOURCE: &str = "pubcid.org";
 
 impl IdentityProviderConfig {
     const fn default_enabled() -> bool {
@@ -723,6 +752,141 @@ pub struct ProviderSecrets {
     /// Secret Store key whose value is the provider's token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<Redacted<String>>,
+}
+
+/// The publisher endpoint that returns a signed-in visitor's hashed email
+/// (`[ec.hashed_email]`, spec §8.7).
+///
+/// Identity providers with the hashed-email capability read their value
+/// from its JSON response at their own path.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_hashed_email_request, skip_on_field_errors = false))]
+pub struct HashedEmailSource {
+    /// Status endpoint; must be `https` with a host. Called with `method`,
+    /// the visitor's whole `Cookie` header and the configured `headers`.
+    #[validate(custom(function = HashedEmailSource::validate_endpoint))]
+    pub endpoint: String,
+    /// HTTP method of the status call, `GET` (default) or `POST`.
+    #[serde(default)]
+    pub method: HashedEmailMethod,
+    /// Request body, sent as is; only with `POST`. Without a configured
+    /// `content-type` header it is sent as `application/json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Extra request headers by name: a fixed value, or `{ cookie = "name" }`
+    /// for the value of the visitor's cookie `name` (unquoted). Without that
+    /// cookie the visitor cannot be signed in, so no call is made.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, HashedEmailHeader>,
+    /// Cutoff for the status call, in milliseconds. The call shares the
+    /// collection phase's identity budget with the lookups, so it must be
+    /// below `identity_budget_ms`, and below
+    /// `identity_after_response_budget_ms` when an after-response provider
+    /// reads a hashed email.
+    #[serde(
+        default = "HashedEmailSource::default_timeout_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub timeout_ms: u64,
+}
+
+/// HTTP method of the hashed-email status call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HashedEmailMethod {
+    /// `GET`, without a body.
+    #[default]
+    Get,
+    /// `POST`, with the configured `body`, if any.
+    Post,
+}
+
+/// Value of an extra header on the hashed-email status call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum HashedEmailHeader {
+    /// A fixed value.
+    Value(String),
+    /// The value of the visitor's cookie `cookie`, unquoted.
+    Cookie {
+        /// Cookie name.
+        cookie: String,
+    },
+}
+
+/// Headers the status call sets itself, which `headers` may not set.
+const HASHED_EMAIL_RESERVED_HEADERS: [&str; 4] =
+    ["cookie", "host", "content-length", "transfer-encoding"];
+
+fn validate_hashed_email_request(source: &HashedEmailSource) -> Result<(), ValidationError> {
+    source.request_error().map_or(Ok(()), |message| {
+        Err(ValidationError::new("hashed_email_request").with_message(message.into()))
+    })
+}
+
+impl HashedEmailSource {
+    /// Why the configured method, body and headers cannot form a request, if
+    /// they cannot: a body without `POST`, a header name that is not valid
+    /// or that the call sets itself, a fixed value that is not a valid header
+    /// value, or an empty cookie name.
+    #[must_use]
+    pub fn request_error(&self) -> Option<String> {
+        if self.body.is_some() && self.method != HashedEmailMethod::Post {
+            return Some("body is only sent with method = \"POST\"".to_owned());
+        }
+        for (name, value) in &self.headers {
+            let lower = name.to_ascii_lowercase();
+            if http::HeaderName::from_bytes(lower.as_bytes()).is_err() {
+                return Some(format!("header `{name}` is not a valid header name"));
+            }
+            if HASHED_EMAIL_RESERVED_HEADERS.contains(&lower.as_str()) {
+                return Some(format!("header `{name}` is set by Trusted Server"));
+            }
+            match value {
+                HashedEmailHeader::Value(value) if http::HeaderValue::from_str(value).is_err() => {
+                    return Some(format!("header `{name}` has an invalid value"));
+                }
+                HashedEmailHeader::Cookie { cookie } if cookie.trim().is_empty() => {
+                    return Some(format!("header `{name}` names an empty cookie"));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Default status call cutoff (100 ms), half the default page-phase
+    /// identity budget.
+    #[must_use]
+    pub const fn default_timeout_ms() -> u64 {
+        100
+    }
+
+    /// The parsed endpoint, when it is `https` with a host.
+    #[must_use]
+    pub fn endpoint_url(&self) -> Option<Url> {
+        Url::parse(&self.endpoint)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.host_str().is_some())
+    }
+
+    fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
+        let valid = Url::parse(endpoint)
+            .ok()
+            .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some());
+        if valid {
+            Ok(())
+        } else {
+            Err(ValidationError::new("hashed_email_endpoint")
+                .with_message("must be an https URL with a host".into()))
+        }
+    }
 }
 
 /// Edge Cookie (EC) configuration.
@@ -803,6 +967,12 @@ pub struct Ec {
         deserialize_with = "vec_from_seq_or_map"
     )]
     pub identity_providers: Vec<IdentityProviderConfig>,
+
+    /// The publisher endpoint that returns a signed-in visitor's hashed
+    /// email, for providers with the hashed-email capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub hashed_email: Option<HashedEmailSource>,
 }
 
 // Not derived: the identity budgets default to their serde defaults so a
@@ -819,6 +989,7 @@ impl Default for Ec {
             identity_budget_ms: Self::default_identity_budget_ms(),
             identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
             identity_providers: Vec::new(),
+            hashed_email: None,
         }
     }
 }
@@ -4631,6 +4802,7 @@ mod tests {
             "identity_budget_ms",
             "identity_after_response_budget_ms",
             "identity_providers",
+            "hashed_email",
         ] {
             assert!(
                 serialized.get(field).is_none(),
@@ -4662,6 +4834,166 @@ mod tests {
                 invalid,
                 "should enforce identity budget bounds for {page} and {after_response}"
             );
+        }
+    }
+
+    #[test]
+    fn hashed_email_source_is_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse the hashed email source");
+
+        assert_eq!(
+            source.timeout_ms,
+            HashedEmailSource::default_timeout_ms(),
+            "should default the timeout"
+        );
+        for (endpoint, timeout_ms, invalid) in [
+            ("https://www.example.com/api/user/status", 300, false),
+            ("https://www.example.com/api/user/status", 1000, false),
+            ("https://www.example.com/api/user/status", 0, true),
+            ("https://www.example.com/api/user/status", 1001, true),
+            ("http://www.example.com/api/user/status", 300, true),
+            ("not a url", 300, true),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: endpoint.to_owned(),
+                    timeout_ms,
+                    method: HashedEmailMethod::Get,
+                    body: None,
+                    headers: BTreeMap::new(),
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should check {endpoint} with {timeout_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_request_parts_are_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource = toml::from_str(
+            r#"
+            endpoint = "https://www.example.com/api/user/profile"
+            method = "POST"
+            body = "{}"
+            [headers]
+            x-session = { cookie = "session" }
+            x-requested-with = "XMLHttpRequest"
+            "#,
+        )
+        .expect("should parse a POST status call");
+
+        assert_eq!(source.method, HashedEmailMethod::Post, "should read POST");
+        assert_eq!(source.body.as_deref(), Some("{}"), "should read the body");
+        assert_eq!(
+            source.headers.get("x-session"),
+            Some(&HashedEmailHeader::Cookie {
+                cookie: "session".to_owned()
+            }),
+            "should read a header taken from a cookie"
+        );
+        assert_eq!(
+            source.headers.get("x-requested-with"),
+            Some(&HashedEmailHeader::Value("XMLHttpRequest".to_owned())),
+            "should read a fixed header"
+        );
+        let default: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse a GET status call");
+        assert_eq!(
+            default.method,
+            HashedEmailMethod::Get,
+            "should default to GET"
+        );
+
+        let header =
+            |name: &str, value: HashedEmailHeader| BTreeMap::from([(name.to_owned(), value)]);
+        let fixed = |value: &str| HashedEmailHeader::Value(value.to_owned());
+        for (method, body, headers, invalid, case) in [
+            (
+                HashedEmailMethod::Post,
+                Some("{}"),
+                BTreeMap::new(),
+                false,
+                "POST with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                Some("{}"),
+                BTreeMap::new(),
+                true,
+                "GET with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("1")),
+                false,
+                "a fixed header",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("Cookie", fixed("a=1")),
+                true,
+                "Cookie",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("host", fixed("example.com")),
+                true,
+                "Host",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("bad name", fixed("1")),
+                true,
+                "an invalid name",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("a\nb")),
+                true,
+                "an invalid value",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header(
+                    "x-ok",
+                    HashedEmailHeader::Cookie {
+                        cookie: " ".to_owned(),
+                    },
+                ),
+                true,
+                "an empty cookie name",
+            ),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: "https://www.example.com/api/user/status".to_owned(),
+                    timeout_ms: 100,
+                    method,
+                    body: body.map(str::to_owned),
+                    headers,
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(ec.validate().is_err(), invalid, "should check {case}");
         }
     }
 

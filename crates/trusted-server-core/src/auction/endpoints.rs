@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{ConsentContext, consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -380,7 +380,7 @@ pub async fn handle_auction(
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
-    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context.consent());
+    let client_eids = drop_vendor_denied_client_eids(client_eids, registry, ec_context);
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -540,10 +540,13 @@ pub(crate) fn resolve_auction_eids(
     }
 
     let now = UnixSeconds::new(current_timestamp());
+    // A source a provider's cookies on this request opted out of is withheld
+    // before the navigation's write clears it from the row.
     Some(
         entry
             .live_eids(registry, ec_context.consent(), now)
             .map(Eid::from)
+            .filter(|eid| !ec_context.source_opted_out_in_cookies(&eid.source))
             .collect(),
     )
 }
@@ -641,23 +644,31 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 }
 
 /// Drops client EIDs whose source is owned by a configured identity provider
-/// whose TCF vendor consent is withheld.
+/// whose TCF vendor consent is withheld, client EIDs whose source a provider's
+/// cookies on this request record an opt-out for, and, for a visitor whose
+/// jurisdiction is GDPR, client EIDs whose source a provider excludes where
+/// GDPR applies.
 ///
-/// Only sources marked by a configured provider carry a vendor ID, so with no
-/// providers configured the input is returned unchanged.
+/// Only sources marked by a configured provider carry a vendor ID, a GDPR
+/// exclusion or a cookie opt-out, so with no providers configured the input is
+/// returned unchanged.
 pub(crate) fn drop_vendor_denied_client_eids(
     client_eids: Option<Vec<Eid>>,
     registry: Option<&PartnerRegistry>,
-    consent: &ConsentContext,
+    ec_context: &EcContext,
 ) -> Option<Vec<Eid>> {
     let Some(registry) = registry else {
         return client_eids;
     };
+    let consent = ec_context.consent();
     let mut eids = client_eids?;
     eids.retain(|eid| {
-        !registry
-            .get(&eid.source)
-            .is_some_and(|partner| partner.owner_vendor_consent_denied(consent))
+        !ec_context.source_opted_out_in_cookies(&eid.source)
+            && !registry.get(&eid.source).is_some_and(|partner| {
+                partner.owner_vendor_consent_denied(consent)
+                    || partner.excluded_for(consent)
+                    || ec_context.source_opted_out_in_cookies(&partner.source_domain)
+            })
     });
     Some(eids)
 }
@@ -806,6 +817,10 @@ mod tests {
             .build()
     }
 
+    fn vendor_denied_context() -> EcContext {
+        EcContext::new_for_test(None, vendor_denied_consent())
+    }
+
     fn vendor_denied_consent() -> ConsentContext {
         let mut purposes = vec![false; 24];
         purposes[0] = true;
@@ -876,7 +891,7 @@ mod tests {
 
         // Act
         let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent())
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context())
                 .expect("should keep the list");
 
         // Assert
@@ -889,6 +904,74 @@ mod tests {
     }
 
     #[test]
+    fn client_eids_of_a_gdpr_excluded_source_are_dropped_where_gdpr_applies() {
+        // Arrange: the browser sends a UID2 EID; the visitor is under GDPR
+        // with TCF Purposes 1 and 4 granted.
+        let mut registry = partner_registry(&["uidapi.com", "ids.example.com"]);
+        assert!(
+            registry.exclude_where_gdpr_applies("uidapi.com"),
+            "should mark the UID2 source"
+        );
+        let gdpr = crate::test_support::tests::consent_granting_vendors(vec![1]);
+
+        // Act
+        let under_gdpr = drop_vendor_denied_client_eids(
+            client_eids_for(&["uidapi.com", "ids.example.com"]),
+            Some(&registry),
+            &EcContext::new_for_test(None, gdpr),
+        )
+        .expect("should keep the list");
+        let elsewhere = drop_vendor_denied_client_eids(
+            client_eids_for(&["uidapi.com", "ids.example.com"]),
+            Some(&registry),
+            &EcContext::new_for_test(None, ConsentContext::default()),
+        )
+        .expect("should keep the list");
+
+        // Assert
+        let sources =
+            |eids: &[Eid]| -> Vec<String> { eids.iter().map(|eid| eid.source.clone()).collect() };
+        assert_eq!(
+            sources(&under_gdpr),
+            vec!["ids.example.com"],
+            "should not send the GDPR-excluded browser EID to bidders"
+        );
+        assert_eq!(
+            sources(&elsewhere),
+            vec!["uidapi.com", "ids.example.com"],
+            "should keep the browser EID outside GDPR"
+        );
+    }
+
+    #[test]
+    fn client_eids_of_a_source_opted_out_in_provider_cookies_are_dropped() {
+        // Arrange
+        let mut registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        assert!(
+            registry.mark_provider_owned("ids.example.com", None),
+            "should mark the provider source"
+        );
+        let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let kept = drop_vendor_denied_client_eids(
+            client_eids_for(&["IDS.example.com", "other.example.com"]),
+            Some(&registry),
+            &ec_context,
+        )
+        .expect("should keep the list");
+
+        // Assert
+        let sources: Vec<&str> = kept.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should drop the browser EID of the opted-out source"
+        );
+    }
+
+    #[test]
     fn client_eids_are_unchanged_without_providers() {
         // Arrange
         let registry = partner_registry(&["ids.example.com"]);
@@ -897,7 +980,7 @@ mod tests {
 
         // Act
         let kept =
-            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_consent());
+            drop_vendor_denied_client_eids(client, Some(&registry), &vendor_denied_context());
 
         // Assert
         assert_eq!(
@@ -1962,6 +2045,78 @@ mod tests {
         assert!(
             result.is_some_and(|eids| eids.is_empty()),
             "should degrade to empty EIDs without a snapshot"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_withholds_a_gdpr_excluded_source_where_gdpr_applies() {
+        // Arrange: the row holds a UID2 UID written while the visitor was
+        // outside GDPR; the visitor now arrives under GDPR with TCF Purposes
+        // 1 and 4 granted.
+        let mut registry = partner_registry(&["uidapi.com", "ids.example.com"]);
+        assert!(
+            registry.exclude_where_gdpr_applies("uidapi.com"),
+            "should mark the UID2 source"
+        );
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("uidapi.com", "uid2-token", 1);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("other-uid"),
+        );
+        entry.consent.ok = true;
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let ec_context = EcContext::new_for_test(
+            Some(ec_id),
+            crate::test_support::tests::consent_granting_vendors(vec![1]),
+        );
+
+        // Act
+        let eids = resolve_auction_eids(&snapshot, Some(&registry), &ec_context)
+            .expect("should resolve EIDs under granted consent");
+
+        // Assert
+        let sources: Vec<&str> = eids.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["ids.example.com"],
+            "should not send the GDPR-excluded source to bidders"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_withholds_a_source_opted_out_in_provider_cookies() {
+        // Arrange: the row still holds the provider's UID; this request's
+        // cookies record the opt-out the navigation's write has not applied.
+        let registry = partner_registry(&["ids.example.com", "other.example.com"]);
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("ids.example.com", "held-id", 1);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::single("other-uid"),
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_cookie_opted_out_sources(vec!["ids.example.com".to_owned()]);
+
+        // Act
+        let eids = resolve_auction_eids(&snapshot, Some(&registry), &ec_context)
+            .expect("should resolve EIDs");
+
+        // Assert
+        let sources: Vec<&str> = eids.iter().map(|eid| eid.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["other.example.com"],
+            "should not send the opted-out source to bidders"
         );
     }
 
