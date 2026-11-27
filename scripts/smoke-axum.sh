@@ -18,35 +18,57 @@ ORIGIN_PORT=${AXUM_SMOKE_ORIGIN_PORT:-18889}
 BASE_PORT=${AXUM_SMOKE_PORT:-18890}
 ORIGIN_PID=""
 APP_PID=""
+APP_PROCESS_GROUP=""
+
+app_is_running() {
+    kill -0 "$APP_PID" 2>/dev/null || {
+        [ -n "$APP_PROCESS_GROUP" ] && kill -0 -- "$APP_PROCESS_GROUP" 2>/dev/null
+    }
+}
 
 stop_app() {
     [ -n "$APP_PID" ] || return 0
+    local target="${APP_PROCESS_GROUP:-$APP_PID}"
+    kill -TERM -- "$target" 2>/dev/null || true
+    # Also cover teardown before Python has created the process group.
     kill -TERM "$APP_PID" 2>/dev/null || true
     local attempt=0
-    while kill -0 "$APP_PID" 2>/dev/null && [ "$attempt" -lt 30 ]; do
+    while app_is_running && [ "$attempt" -lt 30 ]; do
         sleep 0.1
         attempt=$((attempt + 1))
     done
+    kill -KILL -- "$target" 2>/dev/null || true
     kill -KILL "$APP_PID" 2>/dev/null || true
     # Do not enter an unbounded wait if even SIGKILL has not completed.
     attempt=0
-    while kill -0 "$APP_PID" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+    while app_is_running && [ "$attempt" -lt 20 ]; do
         sleep 0.1
         attempt=$((attempt + 1))
     done
-    if ! kill -0 "$APP_PID" 2>/dev/null; then
+    if ! app_is_running; then
         wait "$APP_PID" 2>/dev/null || true
     else
         echo "smoke: Axum did not exit within the teardown deadline" >&2
+        return 1
     fi
     APP_PID=""
+    APP_PROCESS_GROUP=""
 }
 
 cleanup() {
-    stop_app
+    # The status the script was already exiting with when the trap fired.
+    local exit_status=$?
+    local teardown_status=0
+    stop_app || teardown_status=$?
     smoke_stop_process "$ORIGIN_PID"
     smoke_preserve_artifacts "$WORKSPACE"
     smoke_remove_workspace "$WORKSPACE"
+    # Fail an otherwise passing run explicitly rather than relying on errexit
+    # to act on the trap's return status, and let an earlier failure keep its
+    # own status instead of replacing it with the teardown status.
+    if [ "$exit_status" -eq 0 ] && [ "$teardown_status" -ne 0 ]; then
+        exit "$teardown_status"
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -64,6 +86,22 @@ sed \
     -e "s|= \"crates/|= \"$REPO_ROOT/crates/|g" \
     -e "s|manifest = \"fastly.toml\"|manifest = \"$REPO_ROOT/fastly.toml\"|" \
     "$REPO_ROOT/edgezero.toml" >"$WORKSPACE/edgezero.toml"
+# Serve discovers this manifest from the temporary working directory. Point
+# its command at the built binary so the smoke needs no disposable Cargo tree.
+python3 - "$WORKSPACE/edgezero.toml" "$AXUM_BINARY" <<'PY'
+import json
+from pathlib import Path
+import shlex
+import sys
+
+manifest = Path(sys.argv[1])
+source = manifest.read_text()
+original = 'serve = "cargo run -p trusted-server-adapter-axum"'
+if source.count(original) != 1:
+    raise SystemExit('Expected exactly one Axum serve command')
+command = 'exec ' + shlex.quote(str(Path(sys.argv[2]).resolve()))
+manifest.write_text(source.replace(original, 'serve = ' + json.dumps(command)))
+PY
 (
     cd "$WORKSPACE"
     "$SMOKE_TS_BIN" config push \
@@ -91,15 +129,21 @@ run_case() {
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
     local config_dir="$WORKSPACE/$case_name-config"
+    if [ "$case_name" = "positive" ]; then
+        # Read the publication output unchanged, without a conversion step.
+        config_dir="$WORKSPACE/.edgezero"
+    fi
     # The declared local record provider needs a root even without ec.storage.
     local data_dir="$WORKSPACE/$case_name-data"
     mkdir -p "$config_dir" "$data_dir"
     config_dir=$(cd "$config_dir" && pwd -P)
     data_dir=$(cd "$data_dir" && pwd -P)
-    # Local config is an outer key-to-string map, not the envelope document.
-    jq --null-input --arg envelope "$config_value" \
-        'if $envelope == "" then {} else {trusted_server_config: $envelope} end' \
-        >"$config_dir/local-config-trusted_server_config.json"
+    if [ "$case_name" != "positive" ]; then
+        # Negative cases change the entry in an otherwise valid outer map.
+        jq --null-input --arg envelope "$config_value" \
+            'if $envelope == "" then {} else {trusted_server_config: $envelope} end' \
+            >"$config_dir/local-config-trusted_server_config.json"
+    fi
     local env_args=(
         env -i
         "PATH=$PATH"
@@ -122,8 +166,22 @@ run_case() {
 
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 
-    "${env_args[@]}" "$AXUM_BINARY" >"$log_path" 2>&1 &
-    APP_PID=$!
+    if [ "$case_name" = "positive" ]; then
+        local serve_binary
+        serve_binary=$(cd "$(dirname "$SMOKE_TS_BIN")" && pwd -P)/$(basename "$SMOKE_TS_BIN")
+        (
+            cd "$WORKSPACE"
+            # Own the launcher and its server descendants as one process group.
+            exec "${env_args[@]}" "HOME=$HOME" python3 -c \
+                'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+                "$serve_binary" serve --adapter axum
+        ) >"$log_path" 2>&1 &
+        APP_PID=$!
+        APP_PROCESS_GROUP="-$APP_PID"
+    else
+        "${env_args[@]}" "$AXUM_BINARY" >"$log_path" 2>&1 &
+        APP_PID=$!
+    fi
     local startup_state=ready
     [ "$expected_status" != 503 ] || startup_state=unavailable
     smoke_wait_http "http://127.0.0.1:$port/health" 200 \

@@ -64,6 +64,13 @@ enum Command {
     /// Roll a service back to a previously active deployment version.
     Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
+    ///
+    /// For Axum, first run `ts config push --adapter axum --local`, then export
+    /// `EDGEZERO__ADAPTER__CONFIG_DIR` pointing at the manifest's `.edgezero`
+    /// directory, a writable `EDGEZERO__ADAPTER__DATA_DIR`, and the referenced
+    /// `EDGEZERO__SECRETS__*` values in the same shell. This command inherits
+    /// those inputs and runs the manifest's serve command; it does not push
+    /// config, load .env files, or generate secrets. Restart after a push.
     Serve(ServeArgs),
     /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
@@ -88,6 +95,12 @@ enum ConfigCommand {
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
+    ///
+    /// Axum writes `.edgezero/local-config-<store>.json` next to the manifest.
+    /// Start Axum with `EDGEZERO__ADAPTER__CONFIG_DIR` pointing there, a writable
+    /// `EDGEZERO__ADAPTER__DATA_DIR`, and referenced `EDGEZERO__SECRETS__*` values.
+    /// `ts serve --adapter axum` inherits these inputs from the same shell.
+    /// Restart the server after publishing changed config or secrets.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
     Validate(ConfigValidateArgs),
