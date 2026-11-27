@@ -853,6 +853,7 @@ describe('pinned Prebid public targeting contract', () => {
     clientCode = seat,
     slots = [gptSlot()],
     respond,
+    beforeShim,
   } = {}) {
     const dom = createPage();
     const pageWindow = dom.window;
@@ -896,6 +897,7 @@ describe('pinned Prebid public targeting contract', () => {
                 netRevenue: true,
                 currency: 'USD',
                 ...(clientBid.targeting ? { adserverTargeting: clientBid.targeting } : {}),
+                ...(clientBid.dealId ? { dealId: clientBid.dealId } : {}),
               },
             ],
     });
@@ -914,6 +916,7 @@ describe('pinned Prebid public targeting contract', () => {
         headers: { 'Content-Type': 'application/json' },
       });
     });
+    beforeShim?.(pageWindow);
     pageWindow.eval(shimCode);
     const targeted = [];
     pageWindow.pbjs.onEvent('setTargeting', (value) => targeted.push(value));
@@ -977,6 +980,12 @@ describe('pinned Prebid public targeting contract', () => {
       const bids = page.bids();
       expect(bids).toHaveLength(1);
       expect(bids[0]).toMatchObject({ bidderCode: seat, adapterCode: 'trustedServer', cpm: price });
+      const prebid = page.pageWindow.pbjs;
+      expect(prebid.getAdserverTargeting([code])[code].hb_pb).toBe(expected);
+      expect(prebid.getAdserverTargetingForAdUnitCode(code).hb_pb).toBe(expected);
+      expect(
+        new URLSearchParams(prebid.getAdserverTargetingForAdUnitCodeStr(code)).get('hb_pb')
+      ).toBe(expected);
       const targeting = await page.target();
       expect(targeting.hb_pb).toEqual([expected]);
       expect(targeting.hb_bidder).toEqual([seat]);
@@ -1252,6 +1261,127 @@ describe('pinned Prebid public targeting contract', () => {
       expect(remote.adId).not.toBe(first.adId);
       expect(targeting).not.toHaveProperty('example_custom');
       expect(targeting.section).toEqual(['example-section']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each([
+    [
+      'standard replacement',
+      { standard: { adserverTargeting: [{ key: 'example_custom', val: 'publisher-value' }] } },
+      {},
+    ],
+    [
+      'suppressed standard keys',
+      {
+        [seat]: {
+          sendStandardTargeting: false,
+          adserverTargeting: [{ key: 'example_custom', val: 'publisher-value' }],
+        },
+      },
+      {},
+    ],
+    [
+      'filtered standard identity',
+      {},
+      { targetingControls: { allowTargetingKeys: ['PRICE_BUCKET'] } },
+    ],
+    ['targeting character budget', {}, { targetingControls: { auctionKeyMaxChars: 1 } }],
+  ])(
+    'preserves publisher omission of native identity through %s',
+    async (_label, settings, config) => {
+      const page = targetingPage({ settings, config });
+      try {
+        const receipt = await page.auction();
+        expect(receipt.timedOut).toBe(false);
+        expect(page.bids().length).toBe(1);
+        expect(typeof page.bids()[0].adId).toBe('string');
+        const prebid = page.pageWindow.pbjs;
+        expect(prebid.getAdserverTargeting([code])[code]).not.toHaveProperty('hb_adid');
+        expect(prebid.getAdserverTargetingForAdUnitCode(code)).not.toHaveProperty('hb_adid');
+        expect(
+          new URLSearchParams(prebid.getAdserverTargetingForAdUnitCodeStr(code)).has('hb_adid')
+        ).toBe(false);
+        expect(await page.target()).not.toHaveProperty('hb_adid');
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('preserves publisher-authored render identity without treating it as the generated bid identity', async () => {
+    const page = targetingPage({
+      settings: {
+        [seat]: {
+          adserverTargeting: [{ key: 'hb_adid', val: 'example-publisher-identity' }],
+        },
+      },
+    });
+    try {
+      await page.auction();
+      const actual = page.bids()[0].adId;
+      expect(actual).not.toBe('example-publisher-identity');
+      const prebid = page.pageWindow.pbjs;
+      expect(prebid.getAdserverTargeting([code])[code].hb_adid).toBe('example-publisher-identity');
+      expect(prebid.getAdserverTargetingForAdUnitCode(code).hb_adid).toBe(
+        'example-publisher-identity'
+      );
+      expect(
+        new URLSearchParams(prebid.getAdserverTargetingForAdUnitCodeStr(code)).get('hb_adid')
+      ).toBe('example-publisher-identity');
+      expect((await page.target()).hb_adid).toEqual(['example-publisher-identity']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('notifies an earlier publisher callback before a later targeting-event overlay', async () => {
+    let publisherObserved;
+    const page = targetingPage({
+      beforeShim: (prebidWindow) => {
+        prebidWindow.pbjs.onEvent('setTargeting', () => {
+          publisherObserved = [
+            ...prebidWindow.googletag.pubads().getSlots()[0].getTargeting('hb_pb'),
+          ];
+        });
+        prebidWindow.pbjs.onEvent('setTargeting', () => {
+          prebidWindow.googletag.pubads().getSlots()[0].setTargeting('hb_pb', '9.99');
+        });
+      },
+    });
+    try {
+      await page.auction();
+      expect((await page.target()).hb_pb).toEqual(['9.99']);
+      expect(publisherObserved).toEqual(['1.20']);
+      expect(page.bids()[0].cpm).toBe(price);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('retains preferred deal targeting after an event listener makes its CPM negative', async () => {
+    const page = targetingPage({
+      clientCode: 'exampleClient',
+      client: { cpm: 2.5, dealId: 'example-deal' },
+      config: { targetingControls: { alwaysIncludeDeals: true } },
+      beforeShim: (prebidWindow) =>
+        prebidWindow.pbjs.onEvent('bidResponse', (bid) => {
+          if (bid.adapterCode === 'exampleClient') bid.cpm = -1;
+        }),
+    });
+    try {
+      await page.auction();
+      expect(page.bids().length).toBe(2);
+      const client = page.bids().find((bid) => bid.adapterCode === 'exampleClient');
+      expect(client.cpm).toBe(-1);
+      expect(client.dealId).toBe('example-deal');
+      const targeting = await page.target();
+      expect(
+        Object.entries(targeting)
+          .filter(([key]) => key.startsWith('hb_deal_'))
+          .flatMap(([, value]) => value)
+      ).toContain('example-deal');
     } finally {
       page.close();
     }
