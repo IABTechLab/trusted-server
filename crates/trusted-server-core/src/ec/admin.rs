@@ -47,10 +47,10 @@ use super::registry::PartnerRegistry;
 use super::sharedid::{SharedIdRequest, drop_opted_out_sharedid_updates};
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
-const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
+pub(super) const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
 
 /// Route used by the request-only EID cookie diagnostic.
-const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
+pub(super) const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
 
 /// Reserved Trusted Server admin prefix.
 ///
@@ -277,7 +277,7 @@ struct SkippedPartnerId {
 ///
 /// Returns [`TrustedServerError::KvStore`] when the store open or read
 /// fails.
-pub async fn handle_admin_ec_lookup(
+pub(super) async fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     req: &Request<EdgeBody>,
@@ -311,7 +311,7 @@ pub async fn handle_admin_ec_lookup(
 
 /// Returns the portable response used when an adapter has no EC KV backend.
 #[must_use]
-pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
+fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
     json_error(
         StatusCode::NOT_IMPLEMENTED,
         "EC identity graph is not configured on this deployment",
@@ -617,7 +617,7 @@ enum DroppedEidReason {
 ///
 /// Returns [`TrustedServerError::Configuration`] only when the response
 /// payload fails JSON serialization.
-pub fn handle_admin_eids_lookup(
+pub(super) fn handle_admin_eids_lookup(
     registry: &PartnerRegistry,
     sharedid_cookie: Option<&str>,
     req: &Request<EdgeBody>,

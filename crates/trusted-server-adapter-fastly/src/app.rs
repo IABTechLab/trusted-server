@@ -21,9 +21,7 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
-//! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
+//! | GET | `/_ts/admin/ec`, `/_ts/admin/ec/{id}`, `/_ts/admin/eids` | [`IdentityApp::mount`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -90,6 +88,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::ec_kv::FastlyEcKvStore;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
@@ -111,9 +110,8 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::constants::{COOKIE_TS_EIDS, ENV_FASTLY_SERVICE_VERSION};
-use trusted_server_core::ec::admin::{
-    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
-};
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform, IdentityProviders};
 use trusted_server_core::ec::batch_sync::{answer_batch_sync_locally, handle_batch_sync};
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::coordinator::transport::{InFlightLookups, OutboundLookupTransport};
@@ -124,11 +122,12 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::eid_types::UnixSeconds;
 use trusted_server_core::ec::identify::{answer_identify_locally, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::kv_backend::EcKvStore;
 use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
-use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::sharedid::{SharedIdRequest, SharedIdStorage};
+use trusted_server_core::ec::rate_limiter::RateLimiter;
+use trusted_server_core::ec::sharedid::SharedIdRequest;
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -212,21 +211,10 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
-    /// Partner registry, built with the state.
-    pub(crate) partner_registry: Arc<PartnerRegistry>,
-    /// Coordinator for providers collected before the response, if any.
-    pub(crate) page_identity: Option<Arc<ProviderCoordinator>>,
-    /// Coordinator for providers collected after the response, if any.
-    pub(crate) after_response_identity: Option<Arc<ProviderCoordinator>>,
-    /// Where Prebid keeps the `SharedID`, resolved once per sandbox.
-    pub(crate) sharedid_storage: SharedIdStorage,
-}
-
-impl AppState {
-    /// Returns the partner registry.
-    pub(crate) fn partner_registry(&self) -> Arc<PartnerRegistry> {
-        Arc::clone(&self.partner_registry)
-    }
+    /// Identity state (partner registry, identity-provider coordinators, EC
+    /// record store, rate limiter) built once and shared by every identity
+    /// route and EC finalization.
+    pub(crate) identity: Arc<IdentityApp>,
 }
 
 pub(crate) fn load_settings_from_config_store(
@@ -253,34 +241,73 @@ pub(crate) fn build_state_from_settings(
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let settings = Arc::new(settings);
+    let identity = build_identity_app(Arc::clone(&settings))?;
 
+    Ok(Arc::new(AppState {
+        settings,
+        orchestrator: Arc::new(orchestrator),
+        registry: Arc::new(registry),
+        default_kv_store,
+        identity,
+    }))
+}
+
+/// Builds the core identity app with Fastly's EC record store, Edge Rate
+/// Limiting counter and identity providers.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the partner
+/// configuration cannot build a partner registry, or when an identity
+/// provider cannot run.
+pub(crate) fn build_identity_app(
+    settings: Arc<Settings>,
+) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
     // A provider that cannot run must stop startup: skipping it would quietly
     // hand its sources back to browser ingest.
-    let partner_registry = Arc::new(partner_registry(&settings.ec)?);
-    let page_identity = build_coordinator_with(&settings, Arc::clone(&partner_registry))
+    let partners = Arc::new(partner_registry(&settings.ec)?);
+    let page = build_coordinator_with(&settings, Arc::clone(&partners))
         .change_context(TrustedServerError::Configuration {
             message: "identity provider configuration is invalid".to_owned(),
         })?
         .map(Arc::new);
-    let after_response_identity =
-        build_after_response_coordinator(&settings, Arc::clone(&partner_registry))
-            .change_context(TrustedServerError::Configuration {
-                message: "identity provider configuration is invalid".to_owned(),
-            })?
-            .map(Arc::new);
+    let after_response = build_after_response_coordinator(&settings, Arc::clone(&partners))
+        .change_context(TrustedServerError::Configuration {
+            message: "identity provider configuration is invalid".to_owned(),
+        })?
+        .map(Arc::new);
+    identity_app_with_providers(
+        settings,
+        IdentityProviders {
+            partners,
+            page,
+            after_response,
+        },
+    )
+}
 
-    let sharedid_storage = settings.sharedid_storage();
-
-    Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
-        orchestrator: Arc::new(orchestrator),
-        registry: Arc::new(registry),
-        default_kv_store,
-        partner_registry,
-        page_identity,
-        after_response_identity,
-        sharedid_storage,
-    }))
+/// Builds the core identity app with Fastly's EC record store and Edge Rate
+/// Limiting counter around already built identity `providers`.
+///
+/// # Errors
+///
+/// Returns the errors of [`IdentityApp::build`].
+fn identity_app_with_providers(
+    settings: Arc<Settings>,
+    providers: IdentityProviders,
+) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
+    let record_store = settings.ec.ec_store.as_deref().map(|store_name| {
+        Arc::new(FastlyEcKvStore::new(store_name)) as Arc<dyn EcKvStore + Send + Sync>
+    });
+    IdentityApp::build(
+        settings,
+        IdentityPlatform {
+            record_store,
+            rate_limiter: Some(Arc::new(FastlyRateLimiter::new(RATE_COUNTER_NAME))),
+            providers: Some(providers),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +422,8 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so the entry point rebuilds the graph from
-    /// settings when this is set.
+    /// Whether EC finalization may write to the KV identity graph, which the
+    /// entry point takes from the identity app built once per sandbox.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid: SharedIdRequest,
@@ -520,7 +545,7 @@ fn prepare_after_response_lookups(
     req: &Request,
     ec: &EcRequestState,
 ) -> Option<AfterResponseLookups> {
-    let coordinator = Arc::clone(state.after_response_identity.as_ref()?);
+    let coordinator = Arc::clone(state.identity.after_response_identity()?);
     // Bot gate: pull sync and other after-response lookups disclose the EC ID
     // to partners, so they run only for recognized browsers.
     if !ec.is_real_browser {
@@ -574,7 +599,7 @@ impl PageIdentityDispatch {
         req: &Request,
         ec: &mut EcRequestState,
     ) -> Option<Self> {
-        let coordinator = Arc::clone(state.page_identity.as_ref()?);
+        let coordinator = Arc::clone(state.identity.page_identity()?);
         let graph = ec.kv_graph.as_ref()?;
         let ec_id = ec.ec_context.ec_value()?.to_owned();
         if matches!(ec.ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
@@ -591,12 +616,17 @@ impl PageIdentityDispatch {
         })
     }
 
-    /// Starts the lookups, after the status call when a provider needs it.
-    async fn start(self, services: &RuntimeServices, publisher_domain: &str) -> IdentityLookups {
+    /// Starts the lookups, after the status call when a provider needs it,
+    /// counting them against the identity app's `rate_limiter`.
+    async fn start(
+        self,
+        services: &RuntimeServices,
+        rate_limiter: &dyn RateLimiter,
+        publisher_domain: &str,
+    ) -> IdentityLookups {
         // The request's own client: the batch it starts is bound to the
         // serving callback, so it stays in flight until `finalize` collects it.
         let transport = OutboundLookupTransport::for_services(services);
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         let now = trusted_server_core::ec::current_timestamp();
         let pending = self
             .coordinator
@@ -610,7 +640,7 @@ impl PageIdentityDispatch {
                     client: self.signals.client(),
                     publisher_domain,
                     cookies: RequestCookies::new(&self.signals.cookie_header),
-                    rate_limiter: &limiter,
+                    rate_limiter,
                     now: UnixSeconds::new(now),
                 },
             )
@@ -631,8 +661,8 @@ impl PageIdentityDispatch {
 /// the opt-out cookie arrives on. Only cookies are read: no lookup is made.
 fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestState) {
     let coordinators = [
-        state.page_identity.as_ref(),
-        state.after_response_identity.as_ref(),
+        state.identity.page_identity(),
+        state.identity.after_response_identity(),
     ];
     if coordinators.iter().all(Option::is_none) {
         return;
@@ -662,7 +692,7 @@ fn apply_cookie_opt_outs(state: &AppState, req: &Request, ec: &mut EcRequestStat
 struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
-    finalize_kv_graph: Option<KvIdentityGraph>,
+    use_finalize_kv: bool,
     eids_cookie: Option<String>,
     sharedid: SharedIdRequest,
     is_real_browser: bool,
@@ -681,7 +711,7 @@ impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            use_finalize_kv: self.use_finalize_kv,
             eids_cookie: self.eids_cookie,
             sharedid: self.sharedid,
         }
@@ -723,11 +753,11 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
-    settings: &Settings,
-    sharedid_storage: &SharedIdStorage,
+    identity: &IdentityApp,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
+    let settings = identity.settings().as_ref();
     let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
@@ -740,7 +770,7 @@ fn build_ec_request_state(
     }
 
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid = SharedIdRequest::from_request(sharedid_storage.cookie_name(), req);
+    let sharedid = SharedIdRequest::from_request(identity.sharedid_storage().cookie_name(), req);
 
     let geo_info = services
         .geo()
@@ -769,20 +799,20 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
+    let identity_graph = identity.identity_graph();
+    let use_finalize_kv = identity_graph.is_some()
+        && setup_error.is_none()
+        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()));
+    let kv_graph = if is_real_browser {
+        identity_graph
     } else {
         None
     };
-    let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
         ec_context,
         kv_graph,
-        finalize_kv_graph,
+        use_finalize_kv,
         eids_cookie,
         sharedid,
         is_real_browser,
@@ -888,31 +918,6 @@ async fn execute_named(
         return Ok(response);
     }
 
-    // These diagnostics are read-only. Running the normal EC lifecycle would
-    // attach finalization state and could ingest request cookies into KV after
-    // the handler returns, violating that contract.
-    if matches!(
-        handler,
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
-    ) {
-        let registry = state.partner_registry();
-        let response = match handler {
-            NamedRouteHandler::AdminEcLookup => {
-                // Deliberately do not use an EC request-state graph: that
-                // copy is bot-gated, while operators use curl for this
-                // authenticated diagnostic.
-                let kv = crate::maybe_identity_graph(&state.settings);
-                handle_admin_ec_lookup(kv.as_ref(), &registry, &req).await
-            }
-            NamedRouteHandler::AdminEidsLookup => {
-                handle_admin_eids_lookup(&registry, state.sharedid_storage.cookie_name(), &req)
-            }
-            _ => unreachable!("admin diagnostics should use early dispatch"),
-        }
-        .unwrap_or_else(|error| http_error(&error));
-        return Ok(response);
-    }
-
     if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -920,7 +925,7 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &state.sharedid_storage, &services, &req);
+    let mut ec = build_ec_request_state(&state.identity, &services, &req);
     apply_cookie_opt_outs(&state, &req, &mut ec);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -965,9 +970,6 @@ async fn run_named_route(
         NamedRouteHandler::DeactivateKey => {
             handle_deactivate_key(&state.settings, services, req).await
         }
-        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
-            unreachable!("admin diagnostics should be handled before EC setup")
-        }
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
         }
@@ -977,16 +979,17 @@ async fn run_named_route(
             unreachable!("batch-sync should be handled by run_batch_sync")
         }
         NamedRouteHandler::Identify => {
-            let identity_graph = crate::maybe_identity_graph(&state.settings)
+            let identity_graph = state
+                .identity
+                .identity_graph()
                 .filter(|_| req.method() == Method::GET);
             let Some(kv) = identity_graph else {
                 return answer_identify_locally(&state.settings, &req);
             };
-            let partner_registry = state.partner_registry();
             handle_identify(
                 &state.settings,
                 &kv,
-                &partner_registry,
+                state.identity.partners(),
                 &req,
                 &ec.ec_context,
             )
@@ -996,11 +999,11 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = state.partner_registry();
+            let partner_registry = state.identity.partners().as_ref();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&*partner_registry)
+                Some(partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -1020,11 +1023,11 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = state.partner_registry();
+            let partner_registry = state.identity.partners().as_ref();
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(&*partner_registry)
+                Some(partner_registry)
             };
             let auction = AuctionDispatch {
                 integration_registry: &state.registry,
@@ -1062,19 +1065,18 @@ async fn run_named_route(
 /// response finalization.
 async fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid = SharedIdRequest::from_request(state.sharedid_storage.cookie_name(), &req);
+    let sharedid =
+        SharedIdRequest::from_request(state.identity.sharedid_storage().cookie_name(), &req);
 
-    let identity_graph =
-        crate::maybe_identity_graph(&state.settings).filter(|_| req.method() == Method::POST);
+    let identity = &state.identity;
+    let identity_graph = identity
+        .identity_graph()
+        .filter(|_| req.method() == Method::POST);
     let mut response = match identity_graph {
         None => answer_batch_sync_locally(&req),
-        Some(kv) => {
-            let partner_registry = state.partner_registry();
-            let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-            handle_batch_sync(&kv, &partner_registry, &limiter, req)
-                .await
-                .unwrap_or_else(|e| http_error(&e))
-        }
+        Some(kv) => handle_batch_sync(&kv, identity.partners(), identity.rate_limiter(), req)
+            .await
+            .unwrap_or_else(|e| http_error(&e)),
     };
     // Legacy parity: batch-sync responses still pass through
     // ec_finalize_response with a default EC context and no finalize KV graph.
@@ -1115,7 +1117,7 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &state.sharedid_storage, services, &req);
+    let mut ec = build_ec_request_state(&state.identity, services, &req);
     apply_cookie_opt_outs(state, &req, &mut ec);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
@@ -1218,18 +1220,21 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        let partner_registry = state.partner_registry();
         let auction = AuctionDispatch {
             integration_registry: &state.registry,
             orchestrator: &state.orchestrator,
             slots,
-            registry: Some(&*partner_registry),
+            registry: Some(state.identity.partners().as_ref()),
         };
         let start_identity = async {
             match page_identity {
                 Some(dispatch) => Some(
                     dispatch
-                        .start(services, &state.settings.publisher.domain)
+                        .start(
+                            services,
+                            state.identity.rate_limiter(),
+                            &state.settings.publisher.domain,
+                        )
                         .await,
                 ),
                 None => None,
@@ -1365,8 +1370,6 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
-    AdminEcLookup,
-    AdminEidsLookup,
     AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
@@ -1433,25 +1436,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/cache/purge",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::AdminCachePurge,
-    },
-    // Admin EC lookup: the bare route reads the EC ID from the caller's
-    // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
-    NamedRoute {
-        path: "/_ts/admin/ec",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    NamedRoute {
-        path: "/_ts/admin/ec/{id}",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEcLookup,
-    },
-    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
-    // an ingestion preview. Pure request inspection — no KV access.
-    NamedRoute {
-        path: "/_ts/admin/eids",
-        primary_methods: &[Method::GET],
-        handler: NamedRouteHandler::AdminEidsLookup,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1620,6 +1604,11 @@ impl TrustedServerApp {
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups. Their other methods reach the catch-all fallback, which
+        // denies admin diagnostics locally.
+        router = state.identity.mount(router);
+
         // matchit prefers exact path+method over a wildcard catch-all. Each
         // named route is registered from this single table, then every
         // non-primary publisher fallback method is registered from the same
@@ -1757,6 +1746,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use trusted_server_core::auction::AuctionEventBatch;
     use trusted_server_core::constants::{ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE};
+    use trusted_server_core::ec::app::IdentityProviders;
     use trusted_server_core::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::ec::eid_types::SourceDomain;
@@ -2225,15 +2215,15 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        let settings = Arc::new(settings);
+        let identity =
+            super::build_identity_app(Arc::clone(&settings)).expect("should build identity app");
         let state = Arc::new(super::AppState {
-            settings: Arc::new(settings),
+            settings,
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-            partner_registry: Arc::new(PartnerRegistry::empty()),
-            page_identity: None,
-            after_response_identity: None,
-            sharedid_storage: trusted_server_core::ec::sharedid::SharedIdStorage::Unconfigured,
+            identity,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2866,40 +2856,22 @@ mod tests {
 
     #[test]
     fn admin_ec_lookup_routes_are_registered() {
-        // Both lookup shapes must be explicitly routed to the admin EC
-        // handler: the bare cookie-based route and the parameterized route.
-        // Leaving either unrouted would fall through to the publisher
-        // fallback, forwarding the caller's `Authorization` header to the
-        // origin.
-        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
-            let route = NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} must be a named route"));
+        let router = test_router();
+
+        let routes = router.routes();
+
+        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}", "/_ts/admin/eids"] {
             assert!(
-                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
-                "{path} must map to the admin EC lookup handler"
+                routes
+                    .iter()
+                    .any(|route| route.path() == path && *route.method() == Method::GET),
+                "should register GET {path} through the core identity app"
             );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET],
-                "{path} must have GET as its only primary method"
+            assert!(
+                !NAMED_ROUTES.iter().any(|route| route.path == path),
+                "{path} should be mounted by the core identity app, not the adapter table"
             );
         }
-
-        let eids_route = NAMED_ROUTES
-            .iter()
-            .find(|route| route.path == "/_ts/admin/eids")
-            .expect("should register /_ts/admin/eids as a named route");
-        assert!(
-            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
-            "/_ts/admin/eids must map to the admin EIDs lookup handler"
-        );
-        assert_eq!(
-            eids_route.primary_methods,
-            &[Method::GET],
-            "/_ts/admin/eids must have GET as its only primary method"
-        );
     }
 
     #[test]
@@ -3695,7 +3667,7 @@ mod tests {
                 let mut ec = super::EcRequestState {
                     ec_context: EcContext::default(),
                     kv_graph: None,
-                    finalize_kv_graph: None,
+                    use_finalize_kv: false,
                     eids_cookie: None,
                     sharedid: super::SharedIdRequest::default(),
                     is_real_browser: true,
@@ -3793,18 +3765,27 @@ mod tests {
             Duration::from_millis(200),
         )
         .expect("should build coordinator");
-        let graph = crate::require_identity_graph(&settings).expect("should open identity graph");
         let coordinator = Some(Arc::new(coordinator));
         let (page_identity, after_response_identity) = if after_response {
             (None, coordinator)
         } else {
             (coordinator, None)
         };
+        let app_state =
+            Arc::into_inner(app_state_for_settings(settings)).expect("should own the app state");
+        let identity = super::identity_app_with_providers(
+            Arc::clone(&app_state.settings),
+            IdentityProviders {
+                partners,
+                page: page_identity,
+                after_response: after_response_identity,
+            },
+        )
+        .expect("should build the identity app");
+        let graph = crate::require_identity_graph(&identity).expect("should open identity graph");
         let state = Arc::new(AppState {
-            partner_registry: partners,
-            page_identity,
-            after_response_identity,
-            ..Arc::into_inner(app_state_for_settings(settings)).expect("should own the app state")
+            identity,
+            ..app_state
         });
         let clock = TestClock::new();
         let client = ScriptedHttpClient::new(&clock);
@@ -3843,7 +3824,7 @@ mod tests {
             .drive(crate::post_delivery::run_after_response_lookups(
                 ec_state,
                 lookups,
-                &fixture.state.partner_registry,
+                &fixture.state.identity,
                 &fixture.state.settings,
                 &fixture.client.http_client(),
             ));
@@ -4216,12 +4197,7 @@ mod tests {
         let services =
             build_per_request_services(&state, &context).expect("should build request services");
 
-        let ec = super::build_ec_request_state(
-            &state.settings,
-            &state.sharedid_storage,
-            &services,
-            &req,
-        );
+        let ec = super::build_ec_request_state(&state.identity, &services, &req);
 
         assert_eq!(
             ec.sharedid.readable_value(),
@@ -4268,12 +4244,7 @@ mod tests {
         let services =
             build_per_request_services(&state, &context).expect("should build request services");
         let req = browser_request();
-        let mut ec = super::build_ec_request_state(
-            &state.settings,
-            &state.sharedid_storage,
-            &services,
-            &req,
-        );
+        let mut ec = super::build_ec_request_state(&state.identity, &services, &req);
         assert!(
             ec.is_real_browser,
             "should classify the request as a browser"
