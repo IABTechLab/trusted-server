@@ -42,6 +42,12 @@ do not call either API may omit it. Provision high-entropy values under
 `ec_passphrase` and `partner_api_token`; see
 [Configuration](/guide/configuration#secret-store-migration).
 
+A partner with pull sync enabled (`pull_sync_enabled` and `pull_sync_url`)
+is pulled by a pull-sync provider, but its source is not provider-owned. Browser EID ingestion and batch
+sync keep filling that source, so a partner may use all three; pull sync only
+fills a source that holds no UID. See
+[Pull Sync on Navigations](/guide/edge-cookies#pull-sync-on-navigations).
+
 Required behavior assumptions:
 
 - The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
@@ -50,7 +56,7 @@ Required behavior assumptions:
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
 - Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup
 - `source_domain` is the canonical key used for stored IDs and controls EID source matching during ingestion
-- Partner has `bidstream_enabled = true` if you want `user.ext.eids` in bidstream
+- Partner has `bidstream_enabled = true` if you want `user.eids` in bidstream
 
 ## 2) Configure Demo Variables
 
@@ -176,7 +182,7 @@ Check response headers:
 - `x-ts-ec-consent`
 - `x-ts-eids`
 
-For returning users, ordinary page views should not refresh `Set-Cookie: ts-ec=...`. A `Set-Cookie` header is expected when the EC is newly generated.
+With the default `ec.sliding_refresh = false`, returning users should receive no renewed `Set-Cookie: ts-ec=...` on ordinary page views. When enabled on Fastly or Axum, an eligible consented document visit renews the same value with the full `ec.max_age_days` lifetime and makes the response private; `/auction` still does not renew it. A newly generated EC also receives `Set-Cookie`. See [Configuration Reference](/guide/configuration#configurable-ec-lifetime-and-sliding-expiration-proposal) for the proposal restrictions and record-state limits.
 
 Decode `x-ts-eids`:
 

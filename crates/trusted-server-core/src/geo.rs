@@ -20,22 +20,37 @@ use crate::constants::{
 impl GeoInfo {
     /// Sets geo information headers on the response.
     ///
-    /// Adds `x-geo-city`, `x-geo-country`, `x-geo-continent`, `x-geo-coordinates`,
-    /// `x-geo-metro-code`, `x-geo-region` (when available), and
-    /// `x-geo-info-available: true` to the given response.
+    /// Adds available geographic fields and `x-geo-info-available: true`.
+    /// Optional fields set to `None` are omitted. Supplied empty city values
+    /// and zero coordinates are emitted as supplied. Metro codes are emitted
+    /// only when positive, and invalid header values are skipped.
     pub fn set_response_headers(&self, response: &mut Response<EdgeBody>) {
         let headers = response.headers_mut();
-
-        insert_geo_header(headers, HEADER_X_GEO_CITY, &self.city);
-        insert_geo_header(headers, HEADER_X_GEO_COUNTRY, &self.country);
-        insert_geo_header(headers, HEADER_X_GEO_CONTINENT, &self.continent);
-        insert_geo_header(
-            headers,
+        // An origin response may already carry geo headers. Missing request
+        // detail must not retain a different location from that response.
+        for name in [
+            HEADER_X_GEO_CITY,
+            HEADER_X_GEO_COUNTRY,
+            HEADER_X_GEO_CONTINENT,
             HEADER_X_GEO_COORDINATES,
-            &self.coordinates_string(),
-        );
-        if self.has_metro_code() {
-            let metro_code = self.metro_code.to_string();
+            HEADER_X_GEO_METRO_CODE,
+            HEADER_X_GEO_REGION,
+        ] {
+            headers.remove(name);
+        }
+
+        if let Some(ref city) = self.city {
+            insert_geo_header(headers, HEADER_X_GEO_CITY, city);
+        }
+        insert_geo_header(headers, HEADER_X_GEO_COUNTRY, &self.country);
+        if let Some(ref continent) = self.continent {
+            insert_geo_header(headers, HEADER_X_GEO_CONTINENT, continent);
+        }
+        if let Some(coordinates) = self.coordinates_string() {
+            insert_geo_header(headers, HEADER_X_GEO_COORDINATES, &coordinates);
+        }
+        if let Some(code) = self.metro_code.filter(|code| *code > 0) {
+            let metro_code = code.to_string();
             insert_geo_header(headers, HEADER_X_GEO_METRO_CODE, &metro_code);
         }
         if let Some(ref region) = self.region {
@@ -100,12 +115,14 @@ mod tests {
 
     fn sample_geo_info() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_string(),
+            city: Some("San Francisco".to_string()),
             country: "US".to_string(),
-            continent: "NorthAmerica".to_string(),
-            latitude: 37.7749,
-            longitude: -122.4194,
-            metro_code: 807,
+            continent: Some("NorthAmerica".to_string()),
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            }),
+            metro_code: Some(807),
             region: Some("CA".to_string()),
             asn: None,
         }
@@ -200,7 +217,7 @@ mod tests {
     #[test]
     fn set_response_headers_omits_metro_code_when_zero() {
         let geo = GeoInfo {
-            metro_code: 0,
+            metro_code: Some(0),
             ..sample_geo_info()
         };
         let mut response = build_response();
@@ -214,6 +231,59 @@ mod tests {
         assert!(
             response.headers().get(HEADER_X_GEO_CITY).is_some(),
             "should still set city header"
+        );
+    }
+
+    #[test]
+    fn set_response_headers_omits_unavailable_partial_geo() {
+        for region in [None, Some("CA".to_owned())] {
+            let geo = GeoInfo::country_region("US", region.clone());
+            let mut response = build_response();
+            sample_geo_info().set_response_headers(&mut response);
+            geo.set_response_headers(&mut response);
+            let headers = response.headers();
+            assert_eq!(
+                headers[HEADER_X_GEO_COUNTRY], "US",
+                "should retain the US country header for partial geography with region {region:?}"
+            );
+            assert_eq!(
+                headers[HEADER_X_GEO_INFO_AVAILABLE], "true",
+                "should mark partial US geography available with region {region:?}"
+            );
+            for name in [
+                HEADER_X_GEO_CITY,
+                HEADER_X_GEO_CONTINENT,
+                HEADER_X_GEO_COORDINATES,
+                HEADER_X_GEO_METRO_CODE,
+            ] {
+                assert!(
+                    !headers.contains_key(name),
+                    "should remove unavailable detail headers from partial US geography with region {region:?}"
+                );
+            }
+            assert_eq!(
+                headers
+                    .get(HEADER_X_GEO_REGION)
+                    .map(|value| value.to_str().expect("should be valid header")),
+                region.as_deref(),
+                "should emit only the supplied region for partial US geography with region {region:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_response_headers_preserves_supplied_zero_coordinates() {
+        let mut geo = GeoInfo::country_region("US", None);
+        geo.coordinates = Some(crate::platform::GeoCoordinates {
+            latitude: 0.0,
+            longitude: 0.0,
+        });
+        let mut response = build_response();
+        geo.set_response_headers(&mut response);
+        assert_eq!(
+            response.headers()[HEADER_X_GEO_COORDINATES],
+            "0,0",
+            "should emit a supplied zero coordinate pair rather than treat it as unavailable"
         );
     }
 

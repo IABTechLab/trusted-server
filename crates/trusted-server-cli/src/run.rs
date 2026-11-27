@@ -6,12 +6,15 @@ use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
-use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::constants::TS_GIT_VERSION;
 
+use crate::checked_app_config::{
+    CheckedAppConfig, ProviderlessAppConfig, adapter_runs_identity_providers,
+};
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::config::proxy::{ProxyCommand, run_proxy};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
@@ -52,6 +55,9 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Edge Cookie identity diagnostics through a deployed service's admin routes.
+    #[command(subcommand)]
+    Ec(crate::commands::ec::EcCommand),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
     /// Trusted Server Prebid commands.
@@ -61,6 +67,13 @@ enum Command {
     /// Roll a service back to a previously active deployment version.
     Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
+    ///
+    /// For Axum, first run `ts config push --adapter axum --local`, then export
+    /// `EDGEZERO__ADAPTER__CONFIG_DIR` pointing at the manifest's `.edgezero`
+    /// directory, a writable `EDGEZERO__ADAPTER__DATA_DIR`, and the referenced
+    /// `EDGEZERO__SECRETS__*` values in the same shell. This command inherits
+    /// those inputs and runs the manifest's serve command; it does not push
+    /// config, load .env files, or generate secrets. Restart after a push.
     Serve(ServeArgs),
     /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
@@ -77,11 +90,20 @@ enum ConfigCommand {
     AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
+    /// Explain creative proxy destination and disclosure policy.
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
+    ///
+    /// Axum writes `.edgezero/local-config-<store>.json` next to the manifest.
+    /// Start Axum with `EDGEZERO__ADAPTER__CONFIG_DIR` pointing there, a writable
+    /// `EDGEZERO__ADAPTER__DATA_DIR`, and referenced `EDGEZERO__SECRETS__*` values.
+    /// `ts serve --adapter axum` inherits these inputs from the same shell.
+    /// Restart the server after publishing changed config or secrets.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
     Validate(ConfigValidateArgs),
@@ -140,11 +162,17 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Audit(args) => run_audit(&args),
         Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
         Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
+        Command::Config(ConfigCommand::Proxy(args)) => run_proxy(&args),
         Command::Config(ConfigCommand::Init(args)) => {
             run_config_init(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Diff(args)) => {
-            match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
+            let diff = if adapter_runs_identity_providers(&args.adapter) {
+                edgezero_cli::run_config_diff_typed::<CheckedAppConfig>(&args)
+            } else {
+                edgezero_cli::run_config_diff_typed::<ProviderlessAppConfig>(&args)
+            };
+            match diff {
                 Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
                 Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
@@ -155,11 +183,15 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Push(args)) => {
-            edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
-                .map(|()| RunOutcome::Success)
+            if adapter_runs_identity_providers(&args.adapter) {
+                edgezero_cli::run_config_push_typed::<CheckedAppConfig>(&args)
+            } else {
+                edgezero_cli::run_config_push_typed::<ProviderlessAppConfig>(&args)
+            }
+            .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
-            edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+            edgezero_cli::run_config_validate_typed::<CheckedAppConfig>(&args)
                 .map(|()| RunOutcome::Success)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
@@ -188,6 +220,11 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+        }
+        Command::Ec(command) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::commands::ec::run(command, &mut out).map(|()| RunOutcome::Success)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();

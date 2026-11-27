@@ -1,0 +1,102 @@
+name: Native RC container
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .tool-versions
+      - rust-toolchain.toml
+      - Cargo.toml
+      - Cargo.lock
+      - edgezero.toml
+      - .cargo/**
+      - crates/trusted-server-adapter-axum/**
+      - crates/trusted-server-core/**
+      - crates/trusted-server-identity-providers/**
+      - crates/trusted-server-js/**
+      - crates/trusted-server-openrtb*/**
+      - scripts/test-native-container.mjs
+      - scripts/test-native-ec-image.mjs
+      - .github/workflows/native-container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-provider-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        run: |
+          version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Build local-provider image
+        run: docker build --build-arg TRUSTED_SERVER__GIT_VERSION="${{ github.sha }}" -t ts-rc-local:test .
+      - name: Check real TS routes, failure router and drain
+        run: node scripts/test-native-container.mjs ts-rc-local:test
+
+  record-provider-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DYNAMODB_LOCAL_IMAGE: amazon/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+      DYNAMODB_CONTAINER: ts-records-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        run: |
+          version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Build prepared-record image locally
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg NATIVE_FEATURES=aws-dynamodb-ec,geo-cloudfront \
+            --build-arg TRUSTED_SERVER__GIT_VERSION="$REVISION" \
+            -t ts-rc-records:test .
+      - name: Start disposable DynamoDB Local
+        run: |
+          docker run -d --name "$DYNAMODB_CONTAINER" \
+            -p 127.0.0.1::8000 "$DYNAMODB_LOCAL_IMAGE" \
+            -jar DynamoDBLocal.jar -inMemory -sharedDb
+          port=$(docker port "$DYNAMODB_CONTAINER" 8000/tcp | awk -F: '{ print $NF }')
+          test -n "$port"
+          echo "DYNAMODB_ENDPOINT=http://127.0.0.1:${port}" >> "$GITHUB_ENV"
+      - name: Check record acknowledgement, withdrawal, faults and drain
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          node scripts/test-native-ec-image.mjs \
+            --image ts-rc-records:test \
+            --dynamodb "$DYNAMODB_ENDPOINT" \
+            --expected-version "$REVISION" \
+            --output "$RUNNER_TEMP/record-image-proof.json"
+      - name: Retain record proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: record-image-proof
+          path: ${{ runner.temp }}/record-image-proof.json
+          if-no-files-found: warn
+      - name: Remove owned DynamoDB Local container
+        if: always()
+        run: docker rm -f "$DYNAMODB_CONTAINER"

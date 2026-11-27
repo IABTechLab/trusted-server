@@ -348,15 +348,15 @@ mod tests {
     use crate::html_processor::HtmlWithStreamingProcessors;
     use crate::platform::test_support::noop_services;
     #[cfg(not(target_arch = "wasm32"))]
-    use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
-    };
+    use crate::platform::test_support::{NoopConfigStore, NoopGeo, NoopSecretStore};
     #[cfg(not(target_arch = "wasm32"))]
     use crate::platform::{PlatformTimer, RuntimeServices};
     use crate::streaming_processor::StreamProcessor;
     use crate::streaming_processor::finish::{
         StreamFinish, StreamFinishDeadline, StreamFinishError, StreamFinishInput,
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::test_support::scripted_client::{ScriptedHttpClient, TestClock};
 
     struct Stage {
         name: &'static str,
@@ -875,8 +875,8 @@ mod tests {
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::new(NoopHttpClient))
+            .outbound_client(ScriptedHttpClient::forbidding().http_client())
+            .clock(TestClock::new().monotonic_clock())
             .geo(Arc::new(NoopGeo))
             .client_info(crate::platform::ClientInfo::default())
             .timer(Arc::new(RecordingTimer(Arc::clone(&requested))))

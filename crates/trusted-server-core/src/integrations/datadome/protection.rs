@@ -1,19 +1,21 @@
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{HeaderMap, HeaderName, request_builder};
-use error_stack::{Report, ResultExt};
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue};
+use edgezero_core::outbound::{OutboundRequest, OutboundResponse, ResponseDecoding};
+use error_stack::Report;
 use http::{Method, Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
-use url::Url;
 
 use crate::error::TrustedServerError;
 use crate::http_util::{RequestInfo, is_navigation_request};
 use crate::integrations::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::outbound::{
+    DEFAULT_BUFFERED_RESPONSE_BYTES, OutboundRequestSource, buffered, outbound_error,
+};
 use crate::redacted::Redacted;
 
 use super::DataDomeIntegration;
@@ -79,51 +81,53 @@ impl DataDomeIntegration {
         &self,
         input: RequestFilterInput<'_>,
     ) -> Result<RequestFilterDecision, ProtectionRequestError> {
-        let api_url = self.protection_validate_url();
-        let backend_name = self
-            .ensure_protection_backend(input.services, &api_url)
-            .map_err(ProtectionRequestError::Setup)?;
         let server_side_key = self
             .server_side_key()
             .map_err(ProtectionRequestError::Setup)?;
         let payload = self.build_protection_payload(&input, server_side_key);
-        let encoded_body = form_encode(&payload.fields);
 
-        let mut builder = request_builder()
-            .method(Method::POST.as_str())
-            .uri(api_url.as_str())
-            .header(
-                header::CONTENT_TYPE.as_str(),
-                "application/x-www-form-urlencoded",
-            )
-            .header(
-                header::CONTENT_LENGTH.as_str(),
-                encoded_body.len().to_string(),
-            );
-
+        let mut request =
+            OutboundRequest::post(self.protection_validate_url()).map_err(|error| {
+                ProtectionRequestError::Setup(outbound_error(
+                    error,
+                    Self::error("Failed to build DataDome Protection API request"),
+                    OutboundRequestSource::Internal,
+                ))
+            })?;
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
         if payload.uses_header_client_id {
-            builder = builder.header(HEADER_DATADOME_X_SET_COOKIE, "true");
+            request.headers_mut().insert(
+                HeaderName::from_static(HEADER_DATADOME_X_SET_COOKIE),
+                HeaderValue::from_static("true"),
+            );
         }
+        let request = buffered(
+            request.body(EdgeBody::from(form_encode(&payload.fields))),
+            Duration::from_millis(u64::from(self.config.timeout_ms)),
+            DEFAULT_BUFFERED_RESPONSE_BYTES,
+            ResponseDecoding::Decode,
+        );
 
-        let request = builder
-            .body(EdgeBody::from(encoded_body))
-            .change_context(Self::error(
-                "Failed to build DataDome Protection API request",
-            ))
-            .map_err(ProtectionRequestError::Runtime)?;
-
-        let platform_response = input
+        let response = input
             .services
-            .http_client()
-            .send(PlatformHttpRequest::new(request, backend_name))
+            .outbound_client()
+            .send(request)
             .await
-            .change_context(Self::error("Failed to call DataDome Protection API"))
-            .map_err(ProtectionRequestError::Runtime)?;
+            .and_then(OutboundResponse::into_response)
+            .map_err(|error| {
+                ProtectionRequestError::Runtime(outbound_error(
+                    error,
+                    Self::error("Failed to call DataDome Protection API"),
+                    OutboundRequestSource::Internal,
+                ))
+            })?;
 
-        let status = platform_response.response.status();
-        let datadome_status = datadome_response_status(platform_response.response.headers());
-        let decision =
-            self.classify_protection_response(platform_response.response, input.request.method());
+        let status = response.status();
+        let datadome_status = datadome_response_status(response.headers());
+        let decision = self.classify_protection_response(response, input.request.method());
         log_protection_result(&input, status, datadome_status, &decision);
 
         Ok(decision)
@@ -219,32 +223,6 @@ impl DataDomeIntegration {
         )
     }
 
-    fn ensure_protection_backend(
-        &self,
-        services: &RuntimeServices,
-        api_url: &str,
-    ) -> Result<String, Report<TrustedServerError>> {
-        let parsed = Url::parse(api_url)
-            .change_context(Self::error("Invalid DataDome Protection API URL"))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| Report::new(Self::error("Missing DataDome Protection API host")))?;
-        let spec = PlatformBackendSpec {
-            scheme: parsed.scheme().to_string(),
-            host: host.to_string(),
-            port: parsed.port(),
-            host_header_override: None,
-            certificate_check: true,
-            first_byte_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
-            between_bytes_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
-            discriminator: None,
-        };
-
-        services.backend().ensure(&spec).change_context(Self::error(
-            "Failed to register DataDome Protection API backend",
-        ))
-    }
-
     fn server_side_key(&self) -> Result<&Redacted<String>, Report<TrustedServerError>> {
         self.config
             .server_side_key_secret_name
@@ -263,15 +241,25 @@ impl DataDomeIntegration {
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
-        let public_info = crate::forwarder::public_origin(req)
-            .and_then(|_| RequestInfo::from_request(req, client_info).ok());
-        let request_host = public_info
-            .as_ref()
-            .map_or_else(|| request_host(req), |info| info.host.clone());
-        let request_protocol = public_info.as_ref().map_or_else(
-            || req.uri().scheme_str().unwrap_or_default(),
-            |info| info.scheme.as_str(),
-        );
+        let checked_origin_available = crate::forwarder::public_origin(req.extensions()).is_some()
+            || req
+                .extensions()
+                .get::<edgezero_core::ingress::RequestIngress>()
+                .is_some();
+        let (request_host, request_protocol) = if checked_origin_available {
+            // A failed check means the Host header is unusable. Falling back to
+            // the raw header or the URI target would report values that no
+            // checked source vouched for, so both fields are left out.
+            RequestInfo::from_request(req, client_info).map_or_else(
+                |_| (String::new(), String::new()),
+                |info| (info.host, info.scheme),
+            )
+        } else {
+            (
+                request_host(req),
+                req.uri().scheme_str().unwrap_or_default().to_owned(),
+            )
+        };
         let mut fields = Vec::new();
         let header_client_id = header_value(req, HEADER_DATADOME_CLIENT_ID);
         let cookie_header = header_value(req, header::COOKIE.as_str());
@@ -458,17 +446,11 @@ impl DataDomeIntegration {
         }
 
         if matches!(status.as_u16(), 301 | 302 | 401 | 403 | 429) {
+            // The verdict request buffers its response, so the challenge body is in memory.
             let response_body = if request_method == Method::HEAD {
                 EdgeBody::empty()
             } else {
-                if body.is_stream() {
-                    log::warn!(
-                        "[datadome] Protection API challenge body was streaming; failing open"
-                    );
-                    return RequestFilterDecision::Continue(RequestFilterEffects::default());
-                }
-                let body_bytes = body.into_bytes().unwrap_or_default();
-                EdgeBody::from(body_bytes.as_ref().to_vec())
+                body
             };
             let challenge = Response::builder()
                 .status(status)
@@ -823,25 +805,115 @@ mod tests {
         DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
         ProtectionTestBypassConfig,
     };
-    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
-        HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopSecretStore, StubHttpClient,
+        HashMapConfigStore, NoopConfigStore, NoopSecretStore,
         build_services_with_config_and_secret, build_services_with_config_and_secret_and_client_ip,
-        build_services_with_secret_and_http_client, noop_services_with_client_ip,
+        build_services_with_outbound_client, noop_services_with_client_ip,
     };
+    use crate::platform::{GeoInfo, RuntimeServices};
     use crate::settings::Settings;
+    use crate::test_support::scripted_client::{
+        ExpectedTransport, ScriptedHttpClient, ScriptedReply, TestClock,
+    };
+    use edgezero_core::http::request_builder;
+    use edgezero_core::ingress::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
+    use edgezero_core::outbound::{OutboundCachePolicy, ResponseMode};
 
     use super::*;
 
     static FASTLY_IS_STAGING_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Verdict endpoint of [`protection_config`].
+    const PROTECTION_VALIDATE_URL: &str = "https://protection.example.com/validate-request";
 
     fn protection_config() -> DataDomeConfig {
         DataDomeConfig {
             enabled: true,
             enable_protection: true,
             server_side_key_secret_name: Some(Redacted::new("server-side-key".to_string())),
+            protection_api_origin: "https://protection.example.com".to_string(),
             ..DataDomeConfig::default()
         }
+    }
+
+    /// Services whose Protection API answers one verdict request with an allow.
+    fn services_with_allowing_protection_api() -> (ScriptedHttpClient, RuntimeServices) {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::POST,
+            PROTECTION_VALIDATE_URL,
+            ScriptedReply::status(StatusCode::OK).header(HEADER_DATADOME_RESPONSE, "200"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        (client, services)
+    }
+
+    /// Services that fail the test's assertions if the Protection API is called.
+    fn services_without_protection_api() -> (ScriptedHttpClient, RuntimeServices) {
+        let client = ScriptedHttpClient::forbidding();
+        let services = build_services_with_outbound_client(&client, &TestClock::new());
+        (client, services)
+    }
+
+    #[test]
+    fn protection_api_request_readback() {
+        let (client, services) = services_with_allowing_protection_api();
+        let config = DataDomeConfig {
+            timeout_ms: 750,
+            ..protection_config()
+        };
+        let integration =
+            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+        request.headers_mut().insert(
+            HEADER_DATADOME_CLIENT_ID,
+            edgezero_core::http::HeaderValue::from_static("client-123"),
+        );
+
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &mut request,
+                geo_info: None,
+                is_integration_route: false,
+            },
+        ));
+
+        assert!(
+            matches!(decision, RequestFilterDecision::Continue(_)),
+            "an allow verdict should continue"
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1, "should send one verdict request");
+        let validate = &requests[0];
+        assert_eq!(
+            (&validate.method, validate.uri.to_string()),
+            (&Method::POST, PROTECTION_VALIDATE_URL.to_owned()),
+            "should post to the validate endpoint"
+        );
+        validate.assert_headers(&[
+            ("content-type", "application/x-www-form-urlencoded"),
+            (HEADER_DATADOME_X_SET_COOKIE, "true"),
+        ]);
+        let body = std::str::from_utf8(&validate.body).expect("should send a UTF-8 form body");
+        assert!(
+            body.starts_with("Key=server-side-key&") && body.contains("&ClientID=client-123&"),
+            "should send the server-side key and client ID in the form body: {body}"
+        );
+        validate.assert_transport(ExpectedTransport {
+            timeout: Duration::from_millis(750),
+            response_mode: ResponseMode::Buffered {
+                max_bytes: DEFAULT_BUFFERED_RESPONSE_BYTES,
+            },
+            response_decoding: ResponseDecoding::Decode,
+            cache_policy: OutboundCachePolicy::PlatformDefault,
+        });
     }
 
     fn protection_integration() -> Arc<DataDomeIntegration> {
@@ -929,6 +1001,94 @@ mod tests {
     }
 
     #[test]
+    fn managed_datadome_payload_uses_origin_evidence_instead_of_absolute_target() {
+        let integration = protection_integration();
+        let settings = Settings::default();
+        let services = crate::platform::test_support::noop_services();
+        for scheme in [Some("http"), None] {
+            let mut request = Request::builder()
+                .uri("https://target.example.com/page")
+                .header(header::HOST, "listener.example.com")
+                .body(EdgeBody::empty())
+                .expect("should construct a contradictory absolute request target");
+            let origin = scheme.map(|scheme| {
+                InboundOrigin::parse(
+                    scheme,
+                    "listener.example.com",
+                    OriginSource::TransportBinding,
+                )
+                .expect("should validate the runtime-owned origin")
+            });
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                origin,
+                HeaderFidelity::default(),
+            ));
+            let payload = integration.build_protection_payload(
+                &RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+                &Redacted::new("fictional-server-side-key".to_owned()),
+            );
+            let fields: HashMap<_, _> = payload.fields.into_iter().collect();
+            assert_eq!(
+                fields["Host"], "listener.example.com",
+                "should not report a raw target authority as runtime evidence"
+            );
+            assert_eq!(
+                fields["Protocol"], "http",
+                "should not report a raw target scheme as runtime evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_datadome_payload_omits_host_and_protocol_when_request_info_fails() {
+        let integration = protection_integration();
+        let settings = Settings::default();
+        let services = crate::platform::test_support::noop_services();
+        for host in [
+            HeaderValue::from_bytes(b"listener-\xff.example.com")
+                .expect("should build a non-text host header"),
+            HeaderValue::from_static("not a host"),
+        ] {
+            let mut request = Request::builder()
+                .uri("https://target.example.com/page")
+                .body(EdgeBody::empty())
+                .expect("should construct an absolute request target");
+            request.headers_mut().insert(header::HOST, host);
+            request.extensions_mut().insert(RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                None,
+                HeaderFidelity::default(),
+            ));
+            let payload = integration.build_protection_payload(
+                &RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+                &Redacted::new("fictional-server-side-key".to_owned()),
+            );
+            let fields: HashMap<_, _> = payload.fields.into_iter().collect();
+            assert!(
+                !fields.contains_key("Host"),
+                "should not report an unchecked host when request info fails: {fields:?}"
+            );
+            assert!(
+                !fields.contains_key("Protocol"),
+                "should not report an unchecked scheme when request info fails: {fields:?}"
+            );
+        }
+    }
+
+    #[test]
     fn public_origin_datadome_payload_preserves_transport_tls_metadata() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.publisher.domain = "publisher.example.com".to_owned();
@@ -960,7 +1120,9 @@ mod tests {
                     .headers_mut()
                     .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
             }
-            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            crate::test_support::tests::with_request_parts(&mut request, |parts| {
+                crate::forwarder::prepare_trusted_forwarder(parts, &settings);
+            });
             let payload = integration.build_protection_payload(
                 &RequestFilterInput {
                     settings: &settings,
@@ -1024,16 +1186,7 @@ mod tests {
             ..protection_config()
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential-32-bytes!".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
+        let (client, services) = services_without_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         request.headers_mut().insert(
@@ -1059,7 +1212,7 @@ mod tests {
             "the bypass credential must not reach the publisher origin"
         );
         assert!(
-            http_client.recorded_backend_names().is_empty(),
+            client.requests().is_empty(),
             "a matching test credential must not call the Protection API"
         );
     }
@@ -1084,21 +1237,7 @@ mod tests {
             };
             let integration =
                 DataDomeIntegration::try_new(config).expect("should create integration");
-            let mut secrets = HashMap::new();
-            secrets.insert(
-                "datadome_server_side_key".to_string(),
-                b"server-side-key".to_vec(),
-            );
-            let http_client = Arc::new(StubHttpClient::new());
-            http_client.push_response_with_headers(
-                200,
-                Vec::new(),
-                vec![(HEADER_DATADOME_RESPONSE, "200")],
-            );
-            let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(secrets),
-                http_client.clone(),
-            );
+            let (client, services) = services_with_allowing_protection_api();
             let settings = Settings::default();
             let mut request = request_for_filter();
             request.headers_mut().insert(
@@ -1124,7 +1263,7 @@ mod tests {
                 "an inactive bypass must not suppress the DataDome client tag"
             );
             assert_eq!(
-                http_client.recorded_backend_names().len(),
+                client.requests().len(),
                 1,
                 "an inactive bypass must still call the Protection API"
             );
@@ -1146,25 +1285,7 @@ mod tests {
             ..protection_config()
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_server_side_key".to_string(),
-            b"server-side-key".to_vec(),
-        );
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential-32-bytes!".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
+        let (client, services) = services_with_allowing_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         request.headers_mut().insert(
@@ -1207,7 +1328,7 @@ mod tests {
             "the bypass must not suppress the DataDome client tag outside staging"
         );
         assert_eq!(
-            http_client.recorded_backend_names().len(),
+            client.requests().len(),
             1,
             "the bypass must still call the Protection API outside staging"
         );
@@ -1236,16 +1357,7 @@ mod tests {
             ..protection_config()
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential-32-bytes!".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
+        let (client, services) = services_without_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         request.headers_mut().insert(
@@ -1264,7 +1376,7 @@ mod tests {
             "a matching test credential should suppress the tag even on an excluded path"
         );
         assert!(
-            http_client.recorded_backend_names().is_empty(),
+            client.requests().is_empty(),
             "a matching test credential must not call the Protection API"
         );
     }
@@ -1284,25 +1396,7 @@ mod tests {
             ..protection_config()
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_server_side_key".to_string(),
-            b"server-side-key".to_vec(),
-        );
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential-32-bytes!".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
+        let (client, services) = services_with_allowing_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         request.headers_mut().insert(
@@ -1328,7 +1422,7 @@ mod tests {
             "an invalid bypass credential must not reach the publisher origin"
         );
         assert_eq!(
-            http_client.recorded_backend_names().len(),
+            client.requests().len(),
             1,
             "a non-matching credential must still call the Protection API"
         );
@@ -1349,25 +1443,7 @@ mod tests {
             ..protection_config()
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_server_side_key".to_string(),
-            b"server-side-key".to_vec(),
-        );
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential-32-bytes!".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
+        let (client, services) = services_with_allowing_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         for value in [
@@ -1391,7 +1467,7 @@ mod tests {
             "all duplicate bypass values should be stripped"
         );
         assert!(!has_client_tag_suppression_marker(&request));
-        assert_eq!(http_client.recorded_backend_names().len(), 1);
+        assert_eq!(client.requests().len(), 1);
     }
 
     #[test]
@@ -1406,14 +1482,7 @@ mod tests {
         };
         let integration =
             DataDomeIntegration::try_new(config).expect("should accept short bypass credential");
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services =
-            build_services_with_secret_and_http_client(NoopSecretStore, http_client.clone());
+        let (client, services) = services_with_allowing_protection_api();
         let settings = Settings::default();
         let mut request = request_for_filter();
         request.headers_mut().insert(
@@ -1433,7 +1502,7 @@ mod tests {
         );
         assert!(!has_client_tag_suppression_marker(&request));
         assert_eq!(
-            http_client.recorded_backend_names().len(),
+            client.requests().len(),
             1,
             "a short credential should not bypass the Protection API"
         );
@@ -1648,12 +1717,14 @@ mod tests {
             ..protection_config()
         };
         let geo_info = GeoInfo {
-            city: String::new(),
+            city: None,
             country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
+            continent: None,
+            coordinates: Some(crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            metro_code: Some(0),
             region: None,
             asn: Some(64500),
         };
@@ -1778,6 +1849,52 @@ mod tests {
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
             "DataDome must not challenge an OPTIONS preflight; a challenge would break CORS for the identify API"
+        );
+    }
+
+    #[test]
+    fn get_challenge_passes_the_verdict_body_through() {
+        let clock = TestClock::new();
+        let client = ScriptedHttpClient::new(&clock);
+        client.respond_to(
+            Method::POST,
+            PROTECTION_VALIDATE_URL,
+            ScriptedReply::status(StatusCode::FORBIDDEN)
+                .header(HEADER_DATADOME_RESPONSE, "403")
+                .body("challenge"),
+        );
+        let services = build_services_with_outbound_client(&client, &clock);
+        let integration = DataDomeIntegration::try_new(protection_config())
+            .expect("should create DataDome integration");
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &mut request,
+                geo_info: None,
+                is_integration_route: false,
+            },
+        ));
+
+        let RequestFilterDecision::Respond { response, .. } = decision else {
+            panic!("should challenge the GET on a DataDome 403 verdict");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should keep the challenge status"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should hold the buffered challenge body")
+                .as_ref(),
+            b"challenge",
+            "should answer a GET with the verdict's challenge body"
         );
     }
 

@@ -16,12 +16,16 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
-| `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
+
+All adapters serve GET/HEAD `/health` and `/ready`. Liveness covers both
+initialized and failed-startup states; readiness shows each state separately. See the [operational response contract](#operational-probe-contract)
+for exact responses and timing limits.
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -37,13 +41,15 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
 | normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/ec`                       | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `GET`                                                      | literal        | `always`                              | real                  | real                  | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/identify`                 | `OPTIONS`                                                  | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -56,20 +62,30 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/proxy`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/sign`                    | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/health`                              | `GET`                                                      | literal        | `always`                              | real                  | real                  | —                     | real                  |
+| normal  | `/health`                              | `GET`, `HEAD`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/ready`                               | `GET`, `HEAD`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/static/tsjs=<file>`                  | `GET`                                                      | template       | `path.starts_with(/static/tsjs=)`     | real                  | real                  | real                  | real                  |
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
-| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| startup | `/health`                              | `GET`, `HEAD`                                              | literal        | `startup_error`                       | real (`200`)          | real (`200`)          | real (`200`)          | real (`200`)          |
+| startup | `/ready`                               | `GET`, `HEAD`                                              | literal        | `startup_error`                       | unavailable (`503`)   | unavailable (`503`)   | unavailable (`503`)   | unavailable (`503`)   |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`503`) | startup error (`503`) | startup error (`503`) | startup error (`503`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`503`) | startup error (`503`) | startup error (`503`) | startup error (`503`) |
 
-`real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
-distinct observable dispositions. An em dash means that the adapter has no
-local route; the publisher fallback can therefore receive that path. The
-startup rows are a separate degraded router, not additional normal routes.
+`real`, `unsupported`, `guarded`, `publisher fallback`, `unavailable`, and
+`startup error` are distinct observable dispositions. On Cloudflare,
+`/.well-known/trusted-server.json` and `/verify-signature` are routed, but the
+Worker has no request-time config store for signing metadata: discovery
+answers the shared `500` and `/verify-signature` answers `200` with
+`verified: false`. An em dash means that the adapter has no local route; the
+publisher fallback can therefore receive that path. The startup rows show what
+each path answers when startup fails, in place of every normal route. Axum,
+Cloudflare, and Spin serve a separate failure router. Fastly answers `/health`
+before it assembles the app and the other startup rows at its entry point; a
+method outside the listed seven gets EdgeZero's JSON error at the failure's
+status, normally `500`.
 
 ## Contract conventions
 
@@ -78,7 +94,8 @@ status behavior, cache and CORS behavior, configuration gates, rate limiting,
 and an example or an explicit not-applicable value.
 
 `Auth: none` means that the endpoint has no built-in authentication. An
-operator can still wrap any path with a `[[handlers]]` Basic-auth rule. Unless
+operator can wrap ordinary paths with a `[[handlers]]` Basic-auth rule; operational
+probes bypass those rules. Unless
 an endpoint says otherwise, it has no endpoint-specific CORS policy and no
 in-process rate limiter. Responses still pass through the adapter's standard
 response finalizer. Upstream proxies can preserve selected upstream headers;
@@ -86,8 +103,16 @@ that is not a blanket CORS grant.
 
 There is no repository-wide error body schema. Some handlers return structured
 JSON, some return an empty body, and shared adapter errors are plain text with
-safe client-facing messages. Treat the status and body documented for each
-endpoint as authoritative.
+safe client-facing messages. EdgeZero's own errors, such as a canonical 404 or
+405, a 414 or 431 head-limit rejection, or a 400 for ambiguous request framing,
+are JSON with redacted text. A startup failure answers the fixed plain-text
+response of the [operational response contract](#operational-probe-contract);
+only a Fastly method outside the publisher fallback set gets EdgeZero's JSON.
+Treat the status and body documented for each endpoint as authoritative.
+
+An endpoint that reads a request body returns `413` when the declared or
+received length passes its cap, and `408` when the body is still unread 30 s
+after the request arrived.
 
 ## Utility Endpoints
 
@@ -309,6 +334,67 @@ Partners are configured statically in `[[ec.partners]]` and loaded into an in-me
 
 ---
 
+### GET, POST /\_ts/api/v1/ec
+
+The shared identity app serves this endpoint on Fastly and Axum. It is always
+answered locally and uses the configured record service. Without application
+identity storage it returns `501`. Every response is private and `no-store`.
+
+A same-origin `POST` accepts a JSON snapshot with optional `tcString`,
+`gppString` and `applicableSections` fields. `tcString` follows the IAB
+`__tcfapi` name; `tcfString` and other unknown fields are rejected. A posted
+string replaces its matching request cookie (`euconsent-v2` or `__gpp`).
+Omitted fields retain their matching request cookies, including `__gpp_sid`
+when sections are omitted. Present fields must have the declared string or
+array type; null is rejected. Posted
+`applicableSections` replaces `__gpp_sid`; an empty array clears that hint.
+Sections default to empty when neither a posted array nor a request cookie
+exists. Missing consent still stays denied where required.
+
+Posted strings must use the client's cookie-safe alphabets: `[A-Za-z0-9._-]+`
+for TCF and `[A-Za-z0-9._~=-]+` for GPP. The complete string is validated before
+reconstructing request cookies, including any TCF supplementary segments.
+
+The body limit is 16 KiB. TCF strings have an effective 4 KiB decoder limit;
+GPP strings are limited to 8 KiB. A posted sections array accepts at most
+32 integer IDs, each in `1..=65535`. The browser client must match this cap.
+Malformed snapshots return `400`, oversized bodies `413`, and missing or
+cross-site `Origin` returns `403` before record or provider work.
+
+The shared request/response fixture is
+`crates/trusted-server-js/lib/test/fixtures/ec-route-contract.json`; Axum and
+Fastly conformance tests POST each case through their real routes. An empty
+client snapshot makes no call; the fixture also covers a server-only `{}` POST.
+The `window.__tsjs_prebid.ecRoute` injection is still owed by the browser
+consent script work in #1622; this PR supplies the server contract.
+
+With consent and no EC, the app creates the record before setting `ts-ec`.
+SharedID and mirror cookies follow their existing consent, configuration and
+opt-out rules. A storage failure never issues an unbacked identity. A withdrawal
+tombstones the existing record and expires identity cookies on this response.
+If authoritative withdrawal cannot be persisted, it returns `503` while still
+clearing the browser identity, so the caller can retry reconciliation.
+The JSON contains only the permitted mirror view, `{"v":1,"eids":[...]}`,
+excluding expired, non-mirrored and vendor-denied IDs. When the response builds
+the mirror, the JSON is that value, the same as the `__Host-ts-eids-mirror`
+cookie it sets or keeps unchanged. It lists no EIDs when the response expires
+the mirror, or leaves it untouched because the record or the clock could not
+be read; the server never echoes a mirror it could not rebuild, so in that case
+the JSON does not match the cookie the browser keeps. When the SharedID storage
+type is `cookie`, the reader has not set `_pubcid_optout` and Purpose 4 allows
+EIDs, the JSON also carries `"sharedId"`: the SharedID this response sets or the
+browser already holds. Otherwise the field is absent.
+
+`GET` returns an empty `204` and can restore an existing SharedID cookie from
+its record only when current EC and EID permission both allow. It never
+creates an EC, changes consent or runs providers. A denied GET emits no identity
+cookies and leaves the stored record unchanged; consent reconciliation and
+withdrawal use POST. Other methods return `405` with `Allow: GET, POST`.
+Browser CMP capture and ordered client consent updates are qualified separately
+from this server contract.
+
+---
+
 ### GET /\_ts/api/v1/identify
 
 Returns EC identity plus the authenticated partner's UID and EID for the current user.
@@ -324,8 +410,15 @@ with `degraded: true`. Every response is `no-store`, varies on `Origin` and
 below `[publisher].domain` receive reflected credentialed CORS for
 `GET, OPTIONS`; every other supplied origin receives `403`. `OPTIONS` returns
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
-The endpoint is Fastly-only and requires the EC store and a statically
-configured `[[ec.partners]]` token.
+The endpoint requires the EC store and a statically configured
+`[[ec.partners]]` token. Without an EC store, `GET` returns
+`501 {"error":"ec_store_not_configured"}` locally, after the same origin
+policy (`403` for a denied origin, reflected CORS for an allowed one).
+Fastly and Axum use the shared identity app when a record store is configured.
+Cloudflare and Spin reject unsupported storage configuration and answer `501`
+to `GET`; `OPTIONS` preflight is still answered locally. Every other
+method returns `405` with `Allow: GET, OPTIONS`. No request on this path is
+proxied to the publisher origin.
 
 **Request:**
 
@@ -363,11 +456,17 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 **Contract:** The JSON body is limited to 2 MiB and 1,000 mappings. The
 per-partner, per-minute limit is `ec.partners[].batch_rate_limit`. Responses are
 `200` when every mapping is accepted or `207` when at least one is rejected;
-item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
-`kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
+item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`,
+`provider_owned` (the source belongs to a server-side identity provider),
+`row_full` (the EC's row would exceed its 16 KiB limit; retrying gives the
+same result), or `kv_unavailable`. Authentication failure returns `401 {"error":"invalid_token"}`;
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
-or CORS headers. It is Fastly-only and requires the EC KV store.
+or CORS headers. It requires the EC KV store; without one it returns
+`501 {"error":"ec_store_not_configured"}` locally. Fastly and Axum execute
+batch sync through the shared record store; Cloudflare and Spin answer `501`. Every method other
+than `POST` returns `405 {"error":"method_not_allowed"}` with `Allow: POST`. No
+request on this path is proxied to the publisher origin.
 
 **Batch processing behavior:**
 
@@ -867,6 +966,18 @@ These endpoints expose sensitive identity and cookie data and require HTTP Basic
 The diagnostic handlers have no CORS grant or in-process rate limiter. Apply an
 edge policy if operator access also needs request-rate enforcement.
 
+The `ts ec` commands call these routes without putting the admin password on the
+command line. They read it from `TRUSTED_SERVER_ADMIN_PASSWORD`, take the admin
+username from `--username` (default `admin`), and require an HTTPS `--service`
+URL (plain HTTP only for `localhost`, `127.0.0.1`, or `::1`). They print the
+response to standard output and write nothing to disk or to the CLI log. The
+responses carry raw consent strings and partner UIDs, so treat the output as
+sensitive. `curl` remains a fallback.
+
+Human-readable summaries and refusal messages escape control characters in response
+values, so decoded identifiers cannot change terminal state or insert extra report lines.
+`--json` preserves the service's JSON encoding and formatting.
+
 The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec
@@ -875,13 +986,14 @@ The examples below use fictional IDs and values only.
 
 Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
 
-This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+Fastly and Axum implement this lookup through the shared record service when identity storage is configured. Without a record service, the route returns `501 Not Implemented`, as it does on Cloudflare and Spin.
 
 **Response fields:**
 
 - `ec_id`, `store`, and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
+- Provider refresh state is private: every `refresh.state` in `entry` is shown as `"[redacted]"`, while `refresh.from` stays visible.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
 - `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
 - `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.
@@ -900,6 +1012,22 @@ The auction preview validates the stored record and partner configuration, but c
 | `501`  | EC identity graph unavailable on this adapter or deployment |
 | `5xx`  | Unexpected configuration or KV failure (plaintext)          |
 
+`ts ec show` checks the EC ID format before sending anything, then prints the
+tombstone state, the auction EIDs, and each skipped partner ID with its reason.
+`--json` prints the full response unchanged. A `404` is reported as no record for
+the EC ID, or a service that may predate the EC lookup endpoint, and a `501` as a deployment without an identity graph. The bare
+`/_ts/admin/ec` route has no command; pass the `ts-ec` cookie's value to
+`ts ec show` instead.
+
+```bash
+# Prompts without echoing, so the password stays out of shell history.
+read -rs TRUSTED_SERVER_ADMIN_PASSWORD && export TRUSTED_SERVER_ADMIN_PASSWORD
+ts ec show --service https://edge.example.com \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123
+```
+
+With `curl`:
+
 ```bash
 curl -u 'admin:<resolved-admin-password>' \
   "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
@@ -911,7 +1039,7 @@ curl -u 'admin:<resolved-admin-password>' \
 
 ### GET /\_ts/admin/eids
 
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
+Parses the request's `ts-eids` cookie and the SharedID cookie (Prebid's configured `storage.name`, or `sharedId` without one) and previews which configured partner IDs cookie ingestion would match or drop. A `_pubcid_optout` cookie keeps the SharedID out of the preview and sets `sharedid_opted_out`. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
 
 After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
 
@@ -939,6 +1067,21 @@ partners, but not on the EC KV store.
 }
 ```
 
+`ts ec eids` sends the values you pass as the request's `ts-eids` and `sharedId`
+cookies and prints the matched and unmatched partner IDs with their reasons. It
+requires at least one of `--ts-eids` and `--shared-id`. Copy each value from the
+browser's cookie storage; a value containing `;` or whitespace is refused. `--json`
+prints the full response unchanged.
+
+```bash
+# Prompts without echoing, so the password stays out of shell history.
+read -rs TRUSTED_SERVER_ADMIN_PASSWORD && export TRUSTED_SERVER_ADMIN_PASSWORD
+ts ec eids --service https://edge.example.com \
+  --ts-eids '<ts-eids-cookie-value>' --shared-id '<sharedId-cookie-value>'
+```
+
+With `curl`:
+
 ```bash
 curl -u 'admin:<resolved-admin-password>' \
   --cookie "sharedId=fictional-shared-id" \
@@ -958,17 +1101,76 @@ https://edge.example.com/admin/keys/rotate` must not reach the origin.
 
 ## Operational and fallback endpoints
 
-### GET /health
+### Operational probe contract
 
-**Contract:** Auth: none. Request and JSON schema: not applicable. Fastly,
-Axum, and Spin return `200 text/plain` with `ok`; Cloudflare has no local health
-route. Fastly short-circuits before application construction. Spin keeps the
-probe live in its startup-error router; Fastly also remains live because it is
-pre-router. The route has no configuration gate, dedicated cache or CORS
-policy, or rate limiter. Example: `curl -fsS https://edge.example.com/health`.
+GET and HEAD `/health` report liveness. GET and HEAD `/ready` report whether
+this instance initialized the application. Use `/ready` for load-balancer
+admission and deployment checks. This is the normative operational response
+contract for every adapter. Bodies are exact UTF-8 bytes; `\n` is one newline.
 
-This is liveness, not readiness: a `200` does not prove that configuration,
-stores, publisher proxying, or integrations are usable.
+| Adapter    | State                 | GET `/health` | GET `/ready`                   | Ordinary supported routes      |
+| ---------- | --------------------- | ------------- | ------------------------------ | ------------------------------ |
+| Fastly     | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Fastly     | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Axum       | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Axum       | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Cloudflare | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Cloudflare | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+| Spin       | Initialized           | `200`, `ok`   | `200`, `ready`                 | Existing behavior              |
+| Spin       | Initialization failed | `200`, `ok`   | `503`, `Service Unavailable\n` | `503`, `Service Unavailable\n` |
+
+HEAD returns the corresponding GET status and contract headers with an empty
+body. Only exact paths match, ignoring the query: `/health?check=1` is a probe;
+`/health/`, `/ready/`, nested paths, and differently cased paths use ordinary
+routing. Other methods on these paths retain ordinary routing. Failed-startup
+ordinary routes cover GET, POST, HEAD, OPTIONS, PUT, PATCH, and DELETE on `/`
+and nested paths. Unsupported methods retain router behavior on Axum,
+Cloudflare, and Spin, and EdgeZero's assembly-error response on Fastly.
+
+Successful probes use `Content-Type: text/plain`. Unavailable readiness and
+ordinary startup failures use `Content-Type: text/plain; charset=utf-8`.
+All these fixed responses use `Cache-Control: no-store`, include the compiled
+`x-ts-version` when available, and omit `Set-Cookie`, `WWW-Authenticate`, and
+`Retry-After`. Transport-generated headers can differ. Probes omit Fastly
+runtime/environment and geo headers, including `x-ts-fastly-version`.
+
+Probes have no configuration gate, CORS policy, or rate limiter. They bypass
+Basic authentication, configured response headers, trace capture, EC processing,
+integrations, and publisher forwarding. They do not consume caller credentials
+or reflect request data. Startup failures disclose only the fixed unavailable
+body and optional compiled version; detailed reports remain in server logs.
+Errors after successful initialization retain their existing status mapping.
+
+Readiness uses existing settings loading, secret resolution, target validation,
+auction construction, and integration-registry construction. It does not poll
+origins, bidders, identity stores, or other request-time dependencies. It
+represents the selected instance's configuration snapshot, not the latest
+external configuration, another instance, or guaranteed publisher success.
+
+| Adapter    | Timing and boundary                                                                                                                                                                                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fastly     | Liveness answers before settings and app construction. Readiness follows ordinary initialization, including required configuration-store access; failed initialization remains retryable.                                                                                                                    |
+| Axum       | App or failure-router construction completes before the listener binds; probes answer after that selection. A failure before that selection, including provider preparation, config extraction limits, the hosting or Geo profile, ingress limits, or the bind, exits before listening, so no probe answers. |
+| Cloudflare | Probes answer after Worker and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                                |
+| Spin       | Probes answer after component and SDK application dispatch begins; caught app initialization errors are covered.                                                                                                                                                                                             |
+
+No response is promised when a runtime cannot start, imports fail, a listener
+cannot bind, execution traps or hangs, conversion fails before dispatch, or the
+SDK fails outside caught application initialization. On Fastly, liveness runs
+after EdgeZero installs its managed logger: when the logger fails to install,
+EdgeZero answers every route with its JSON `500`, `/health` included (see the
+[Fastly guide](/guide/fastly#when-the-logger-fails-to-install)). Spin's
+`/.well-known/spin/health` is a separate platform endpoint.
+
+Examples: `curl -fsS https://edge.example.com/health` and
+`curl -fsS https://edge.example.com/ready`; use `curl -I` for HEAD.
+
+**Migration:** Reserve GET/HEAD `/ready` on every adapter and GET/HEAD `/health`
+on Cloudflare before upgrading publishers that own those paths. Move application
+admission checks from `/health` to `/ready`: Axum liveness now remains green on
+caught startup failure. Catch-all auth rules no longer challenge either probe.
+Update monitors expecting startup `500` or other error-derived statuses to
+expect `503`. Keep a separate publisher request in deployment verification.
 
 ### GET /\_ts/debug/ja4
 
@@ -1006,10 +1208,15 @@ effects. CORS is therefore the sanitized publisher-origin policy, not a global
 Trusted Server policy. There is no built-in endpoint rate limiter. Example:
 `curl -i https://edge.example.com/article`.
 
-When startup fails, the degraded router replaces normal routing: Fastly,
-Axum, and Cloudflare return `500` for both fallback shapes and all seven
-methods; Spin returns a generic `503`. Only the health behavior shown in the
-table survives.
+The request body streams to the origin under a 16 MiB cap, and a larger upload
+returns `413`. A `GET` or `HEAD` that carries body bytes returns `400`, and so
+does a forward the origin request cannot carry, such as a target with a
+fragment or a backslash, or a malformed `Connection` header.
+
+When caught application initialization fails, every adapter returns the fixed
+`503` response on both fallback shapes and all seven supported methods.
+Liveness stays `200`; readiness returns `503`. See the
+[operational response contract](#operational-probe-contract).
 
 ---
 
@@ -1129,24 +1336,24 @@ are startup errors. None of these routes has built-in caller authentication or
 an in-process rate limiter; `[[handlers]]` and platform controls remain
 available when a deployment needs either.
 
-| Route family      | Request and success contract                                                                                                                                           | Errors, cache, and CORS                                                                                                                                                                       | Example                                                                                                                                   |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| APS renderer      | `GET /integrations/aps/renderer`; no body; `200 text/html` static opaque-frame renderer with CSP, `nosniff`, and `no-referrer`                                         | Present only for an enabled APS profile in `trusted_server` rendering mode; no dedicated cache/CORS headers                                                                                   | Browser-internal iframe target; curl is not a meaningful auction test                                                                     |
-| DataDome tag      | `GET /integrations/datadome/tags.js`; query forwarded; successful upstream `200` is rewritten and returned as JavaScript                                               | Non-200 upstream status is preserved; rewritten `200` uses `cache_ttl_seconds`; upstream `Access-Control-Allow-Origin` is copied when present                                                 | `curl -i https://edge.example.com/integrations/datadome/tags.js`                                                                          |
-| DataDome signals  | `GET` or `POST /integrations/datadome/js/` and `/js/*`; method, query, bounded POST body, and selected browser headers forwarded to `api_origin`                       | Upstream status/body/headers preserved; transport or size failures use shared integration errors; no added cache/CORS policy                                                                  | Browser SDK traffic; manual payload is upstream-schema-specific                                                                           |
-| Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
-| GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                               | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
-| Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; stream-read failure returns `502`; upstream response otherwise preserved                            | Browser beacon; body schema belongs to Google Analytics                                                                                   |
-| JS asset proxy    | `GET` each configured `[[integrations.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
-| GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                    | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
-| Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                         | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |
-| Lockr API         | `GET` or `POST /integrations/lockr/api/*`; path, query, selected headers, and bounded body proxy to `api_endpoint`; publisher credentials are stripped                 | Upstream status/body preserved; no local cache/CORS policy                                                                                                                                    | Payload is Lockr-specific; use the SDK for normal calls                                                                                   |
-| Permutive SDK     | `GET /integrations/permutive/sdk`; no body; fetches `{organization_id}.edge.permutive.app/{workspace_id}-web.js`                                                       | Successful SDK is JavaScript cached for `cache_ttl_seconds`; transport failures follow integration mapping                                                                                    | `curl -i https://edge.example.com/integrations/permutive/sdk`                                                                             |
-| Permutive proxies | Generated `GET`/`POST` API, secure-signal, events, and sync routes plus `GET` CDN; suffix, query, selected headers, and bounded body proxy to the corresponding origin | Upstream status/body preserved; no added cache/CORS policy                                                                                                                                    | `curl -i https://edge.example.com/integrations/permutive/api/settings`                                                                    |
-| Prebid bundle     | `GET /integrations/prebid/bundle.js`; no request body; proxies the configured external bundle                                                                          | Requires `external_bundle_url` and its host in `proxy.allowed_domains`; `v` must satisfy the configured cache mode; response strips unsafe headers and applies the bundle cache contract      | `curl -i 'https://edge.example.com/integrations/prebid/bundle.js?v=<configured-sha256>'`                                                  |
-| Prebid blockers   | `GET` each exact configured `script_patterns` path; returns `200` empty JavaScript to suppress the publisher bundle                                                    | No upstream call; empty list registers none; dedicated CORS is not applicable                                                                                                                 | `curl -i https://edge.example.com/prebid.js`                                                                                              |
-| Sourcepoint CDN   | `GET`, `HEAD`, `OPTIONS`, or `POST /integrations/sourcepoint/cdn/*`; suffix/query and a bounded body proxy to `cdn_origin`; selected consent cookies can round-trip    | Upstream status preserved; cookie-bearing responses are private; eligible static responses use `cache_ttl_seconds`; redirect locations and eligible JS/HTML content are rewritten first-party | `curl -i https://edge.example.com/integrations/sourcepoint/cdn/unified/wrapperMessagingWithoutDetection.js`                               |
-| Testlight auction | `POST /integrations/testlight/auction`; OpenRTB JSON is bounded, parsed, and sent to the configured endpoint with `user.id` populated from the consent-allowed EC ID   | Malformed/oversized input and transport errors use shared mappings; upstream status/body preserved; no added cache/CORS policy and no EC response header                                      | `curl -X POST https://edge.example.com/integrations/testlight/auction -H 'Content-Type: application/json' -d '{"imp":[{"id":"slot-1"}]}'` |
+| Route family      | Request and success contract                                                                                                                                           | Errors, cache, and CORS                                                                                                                                                                                                                              | Example                                                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| APS renderer      | `GET /integrations/aps/renderer`; no body; `200 text/html` static opaque-frame renderer with CSP, `nosniff`, and `no-referrer`                                         | Present only for an enabled APS profile in `trusted_server` rendering mode; no dedicated cache/CORS headers                                                                                                                                          | Browser-internal iframe target; curl is not a meaningful auction test                                                                     |
+| DataDome tag      | `GET /integrations/datadome/tags.js`; query forwarded; successful upstream `200` is rewritten and returned as JavaScript                                               | Non-200 upstream status is preserved; rewritten `200` uses `cache_ttl_seconds`; upstream `Access-Control-Allow-Origin` is copied when present                                                                                                        | `curl -i https://edge.example.com/integrations/datadome/tags.js`                                                                          |
+| DataDome signals  | `GET` or `POST /integrations/datadome/js/` and `/js/*`; method, query, bounded POST body, and selected browser headers forwarded to `api_origin`                       | Upstream status/body/headers preserved; transport or size failures use shared integration errors; no added cache/CORS policy                                                                                                                         | Browser SDK traffic; manual payload is upstream-schema-specific                                                                           |
+| Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                                                                          | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
+| GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                                                                                      | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
+| Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; body unread at 30 s returns `408`; EdgeZero's body framing error returns `400`; any other failed read returns `502`; upstream response otherwise preserved | Browser beacon; body schema belongs to Google Analytics                                                                                   |
+| JS asset proxy    | `GET` each configured `[[integrations.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags                                                             | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
+| GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                                                                           | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
+| Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                                                                                | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |
+| Lockr API         | `GET` or `POST /integrations/lockr/api/*`; path, query, selected headers, and bounded body proxy to `api_endpoint`; publisher credentials are stripped                 | Upstream status/body preserved; no local cache/CORS policy                                                                                                                                                                                           | Payload is Lockr-specific; use the SDK for normal calls                                                                                   |
+| Permutive SDK     | `GET /integrations/permutive/sdk`; no body; fetches `{organization_id}.edge.permutive.app/{workspace_id}-web.js`                                                       | Successful SDK is JavaScript cached for `cache_ttl_seconds`; transport failures follow integration mapping                                                                                                                                           | `curl -i https://edge.example.com/integrations/permutive/sdk`                                                                             |
+| Permutive proxies | Generated `GET`/`POST` API, secure-signal, events, and sync routes plus `GET` CDN; suffix, query, selected headers, and bounded body proxy to the corresponding origin | Upstream status/body preserved; no added cache/CORS policy                                                                                                                                                                                           | `curl -i https://edge.example.com/integrations/permutive/api/settings`                                                                    |
+| Prebid bundle     | `GET /integrations/prebid/bundle.js`; no request body; proxies the configured external bundle                                                                          | Requires `external_bundle_url` and its host in `proxy.allowed_domains`; `v` must satisfy the configured cache mode; response strips unsafe headers and applies the bundle cache contract                                                             | `curl -i 'https://edge.example.com/integrations/prebid/bundle.js?v=<configured-sha256>'`                                                  |
+| Prebid blockers   | `GET` each exact configured `script_patterns` path; returns `200` empty JavaScript to suppress the publisher bundle                                                    | No upstream call; empty list registers none; dedicated CORS is not applicable                                                                                                                                                                        | `curl -i https://edge.example.com/prebid.js`                                                                                              |
+| Sourcepoint CDN   | `GET`, `HEAD`, `OPTIONS`, or `POST /integrations/sourcepoint/cdn/*`; suffix/query and a bounded body proxy to `cdn_origin`; selected consent cookies can round-trip    | Upstream status preserved; cookie-bearing responses are private; eligible static responses use `cache_ttl_seconds`; redirect locations and eligible JS/HTML content are rewritten first-party                                                        | `curl -i https://edge.example.com/integrations/sourcepoint/cdn/unified/wrapperMessagingWithoutDetection.js`                               |
+| Testlight auction | `POST /integrations/testlight/auction`; OpenRTB JSON is bounded, parsed, and sent to the configured endpoint with `user.id` populated from the consent-allowed EC ID   | Malformed/oversized input and transport errors use shared mappings; upstream status/body preserved; no added cache/CORS policy and no EC response header                                                                                             | `curl -X POST https://edge.example.com/integrations/testlight/auction -H 'Content-Type: application/json' -d '{"imp":[{"id":"slot-1"}]}'` |
 
 `adserver_mock`, `creative`, `gpt_diagnostics`, `nextjs`, and `osano` have no
 HTTP endpoint. Their request schema, statuses, cache/CORS contract, rate limit,

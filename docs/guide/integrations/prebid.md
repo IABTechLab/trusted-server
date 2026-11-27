@@ -12,6 +12,108 @@ The Prebid integration enables server-side header bidding through Prebid Server 
 
 Prebid is the leading open-source header bidding solution that allows publishers to offer ad inventory to multiple demand sources simultaneously, maximizing revenue through competition.
 
+## Identity-only mode
+
+To enable identity-only mode, update the existing `[integrations.prebid]` table
+in your application configuration (`trusted-server.toml` or the configuration
+published to your deployment):
+
+```toml
+[integrations.prebid]
+enabled = true
+mode = "identity"
+```
+
+Keep your existing external bundle, module selection and managed User ID settings
+in that table. Do not add a second `[integrations.prebid]` table if one already
+exists. Publish the updated application configuration to activate the mode;
+deploying the application code alone does not select it.
+
+The default, `"auction"`, keeps the existing Trusted Server bidder and GPT refresh
+behavior. Unknown modes fail configuration parsing.
+
+Identity mode still loads the configured external Prebid bundle and applies
+managed User ID configuration and its existing consent handling. Publisher
+bidders, ad units and GPT refresh remain under publisher control: no
+`trustedServer` bidder is registered or added. Include the publisher's required
+bidder and User ID modules in the external bundle as usual. Identity mode leaves
+publisher auction timeout/debug settings untouched; configure them through Prebid.
+
+Before each publisher auction, tsjs reads `__Host-ts-eids-mirror` and adds its live
+IDs to that auction's first-party data. Existing publisher IDs and other data are
+preserved, and Prebid's normal activity controls apply before bidder delivery.
+The server writes this mirror only for eligible provider-owned IDs from partners
+with `bidstream_enabled` and `mirror_enabled`. Malformed mirrors and expired IDs
+are ignored. Removing or replacing the cookie takes effect on the next auction;
+mirror IDs are never stored in global Prebid configuration.
+
+Native Prebid User ID module IDs are captured into the existing one-day
+`ts-eids` cookie for server ingestion, including pages that never run an auction.
+Identity mode samples Prebid's unmodified, consent-filtered native getter after
+the publisher queue runs and once per second. It writes changed values only and
+clears stale capture when the native getter returns no usable IDs or fails.
+Visibility changes trigger a fresh read; background timers may be throttled by
+the browser. Sampling pauses on `pagehide` and resumes after a BFCache restore.
+No auction or forced ID refresh is started to obtain IDs.
+
+Mirrored IDs are not copied back into this cookie. This mode does not
+independently grant consent. It does not disable server auctions configured
+elsewhere.
+
+### Consent reporting to the EC route
+
+In identity mode, when the mounted EC route has a record store, the server
+injects `window.__tsjs_prebid.ecRoute = "/_ts/api/v1/ec"`. tsjs reports the
+publisher CMP's TCF and GPP decisions to that same-origin route, so a reader who consents after the page loads gets an Edge Cookie on that page
+view and a withdrawal reaches the server without waiting for the next
+navigation. tsjs only observes the existing `__tcfapi` and `__gpp` APIs; it
+never installs a CMP. Without an injected route, or with no CMP on the page, no
+call is made. Auction mode and adapters without a bound identity record store
+omit the route, including adapters where it returns 501.
+
+When Sourcepoint is enabled, it remains the page's only consent reporter through
+`/_ts/consent`, so Prebid receives no `ecRoute`. This holds even when
+`rewrite_sdk = false` or the CMP loads later. Prebid still captures native IDs
+and merges the navigation mirror in identity mode. Sourcepoint's endpoint does
+not mint identity: these pages wait for a later eligible navigation to establish
+an EC after consent. A TCF-only server reconciliation can also wait for that
+navigation. A future migration must move both reporters onto one queue and
+define identity minting and null-clear behavior together.
+
+Each report is a `POST` with the CMP's TC string (when GDPR applies) and GPP
+string, with at most 32 applicable GPP section IDs. Reports are sent in order, one at a time. A newer grant replaces a
+grant still waiting to be sent, but a possible withdrawal is never replaced:
+it is sent after the call in flight and before any later change. A failed
+withdrawal is resent on the next consent change, focus or visibility change;
+a failed grant is dropped until the CMP reports again.
+
+When EC reporting is active, the route's answer is merged into identity-mode
+publisher auctions in place
+of the mirror cookie while that cookie is unchanged. While a possible
+withdrawal is waiting or in flight, no mirrored or route IDs are merged; a
+TCF denial of Purpose 1 or 4 also deletes the mirror cookie at once. A merge
+happens when the publisher calls `requestBids`, so a withdrawal made while
+Prebid is still delaying that auction does not reach it. Auction mode merges
+nothing in the browser.
+
+CMPs that keep their decision outside the standard `euconsent-v2` and `__gpp`
+cookies cause each page's first report to be treated as a possible withdrawal,
+so mirrored IDs wait for the route's answer on every page view.
+
+### SharedID opt-out
+
+Prebid's SharedID module honors `_pubcid_optout` in a cookie or in
+localStorage, but the server can read only the cookie. In both modes tsjs
+copies an active localStorage opt-out, using Prebid's own rule (a non-empty
+value whose optional `_pubcid_optout_exp` is in the future), into a host-only
+`_pubcid_optout` cookie with a `_ts_pubcid_optout_src` marker. The copy lasts
+until the localStorage expiry or one year, and is removed when the localStorage
+opt-out ends. A publisher-written `_pubcid_optout` cookie is left alone. While
+either opt-out is present, identity mode drops `pubcid.org` IDs from mirrored
+and route IDs. The copy runs at load, on visibility changes, before each route
+report and, in auction mode, before each `requestBids`; in identity mode it
+also runs once per second.
+
 ## Configuration
 
 Prebid configuration has two independent owners:
@@ -25,6 +127,8 @@ Prebid configuration has two independent owners:
 ```toml
 [integrations.prebid]
 enabled = true
+# Use "identity" for identity-only browser behavior; "auction" is the default.
+mode = "auction"
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -92,6 +196,7 @@ provider = "pbs-main"
 | Field                                           | Default                                                                | Ownership and behavior                                                              |
 | ----------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `enabled`                                       | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
+| `mode`                                          | `"auction"`                                                            | Use `"identity"` for ID capture/mirroring without browser auction or GPT hooks      |
 | `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                             |
 | `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
 | `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                        |
@@ -398,7 +503,7 @@ The Prebid provider extracts metadata from the Prebid Server response and attach
 
 ### Upstream HTTP errors
 
-When Prebid Server returns a non-2xx status, the provider detail always includes a safe error classification, HTTP status, and generic message:
+When Prebid Server returns a non-2xx status whose body fits the 2 MiB response cap, the provider detail always includes a safe error classification, HTTP status, and generic message:
 
 ```json
 {
@@ -407,6 +512,8 @@ When Prebid Server returns a non-2xx status, the provider detail always includes
   "message": "Prebid Server returned HTTP 400"
 }
 ```
+
+A non-2xx response whose body is over the cap fails in transport instead: its `error_type` is `transport`, with no HTTP status ([Timeout behavior](/guide/auction-orchestration#timeout-behavior)).
 
 With `debug = true`, Trusted Server also extracts the first error message from allowlisted JSON fields (`message`, `error`, `errors`, `detail`, `title`, or `reason`) or a plain-text response. The message is normalized to one line and limited to 500 characters:
 
@@ -679,6 +786,13 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
+EIDs that a publisher or an identity SDK sets directly with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })` are not User ID Module
+output, so `pbjs.getUserIdsAsEids()` does not return them. The shim also reads
+`ortb2.user.ext.eids` from the Prebid config and appends those EIDs after the
+User ID Module ones. A source present in both is forwarded once with its uids
+merged, and a uid already seen for that source is skipped.
+
 User ID submodule inclusion comes from `bundle.modules.user_id`. The available
 modules and default preset are checked in at
 `crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`.
@@ -864,13 +978,14 @@ page or auction. When available, the opaque value follows the standard path:
 1. `pbjs.getUserIdsAsEids()` exposes an entry whose source is `liveramp.com`.
 2. The current `/auction` request includes that entry.
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
-   Server as `user.ext.eids`.
-4. After the response, the same `/auction` request ingests the body entry into
-   an EC/KV partner configured with `source_domain = "liveramp.com"`, when that
-   partner UID is not already stored.
-5. The browser also persists the opaque value in the bounded `ts-eids` cookie,
-   which lets requests without an EID body, such as `GET /_ts/page-bids` and
-   page navigations, ingest it.
+   Server as `user.eids`.
+4. The browser also persists the opaque value in the bounded `ts-eids` cookie.
+   A later eligible document navigation or EC POST ingests it into an EC/KV partner
+   configured with `source_domain = "liveramp.com"`, when that partner UID is
+   not already stored. `/auction` also saves explicit body EIDs into an existing
+   live EC record under the same consent, ownership and fill-missing rules,
+   including when bidding is disabled. It never creates or revives a record and
+   emits no identity cookie. `GET /_ts/page-bids` does not write identity records.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -937,8 +1052,8 @@ domain, booleans, source names, counts, and status codes:
 4. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
    recording its value.
 5. Confirm a controlled Prebid Server request contains that source in
-   `user.ext.eids`.
-6. Confirm a later request ingests the source into the configured
+   `user.eids`.
+6. Confirm a later top-level navigation ingests the source into the configured
    `liveramp.com` EC partner.
 7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
@@ -954,13 +1069,13 @@ not passed by this implementation.
 
 Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` and the `ortb2.user.ext.eids` Prebid config in the browser and sent in the `/auction` request body.
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
-4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
+4. The merged result is forwarded downstream as `user.eids` in the OpenRTB request.
+5. Explicit `/auction` body EIDs can fill missing partner UIDs in an existing live EC record under consent, ownership and opt-out rules, including when bidding is disabled. The operation never creates or revives an identity. Cookie ingestion occurs on an eligible document navigation or admitted EC POST, reading `ts-eids` and then the SharedID cookie named by the `sharedId` entry's `storage.name`. Auction cookie fallback remains read-only.
 
-The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
+The `ts-eids` cookie also supplies the EID fallback for requests without an EID body, such as `GET /_ts/page-bids`. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
 This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
 
@@ -979,10 +1094,10 @@ sequenceDiagram
     K-->>T: KV-derived EIDs
     T->>T: Merge + dedupe client + KV EIDs
     T->>T: Apply consent gating
-    T->>P: OpenRTB request\nuser.ext.eids = merged set
+    T->>P: OpenRTB request\nuser.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
-    T->>K: Ingest body eids + ts-eids/sharedId cookies\n(TCF Purpose 1 + 4 under GDPR)
+    Note over B,K: /auction may save explicit body EIDs to an existing live row;\nts-eids and sharedId cookie ingestion waits for a document navigation or EC POST
 ```
 
 ### Merge and deduplication rules
@@ -998,7 +1113,7 @@ sequenceDiagram
 The downstream Prebid Server request includes:
 
 - `user.id` when EC forwarding is allowed
-- `user.ext.eids` containing the merged, deduplicated EID set
+- `user.eids` containing the merged, deduplicated EID set
 - only allowlisted consent cookies in `both` and `cookies_only`; no Cookie header in `openrtb_only`
 
 In practice, this gives operators both:
@@ -1069,7 +1184,7 @@ The shared OpenRTB driver builds Prebid Server requests:
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, a validated publisher-owned page URL with query and fragment removed, `site.publisher` from the domain, and the browser `Referer` as `site.ref`. Removing query and fragment data from `site.page` can reduce contextual targeting or per-page reporting for sites whose page identity depends on query parameters
 - Injects EC ID in the user object
-- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
+- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields

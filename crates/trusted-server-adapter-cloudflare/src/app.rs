@@ -2,13 +2,16 @@ use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use edgezero_core::router::RouterService;
+use edgezero_core::http::{
+    HeaderValue, Method, Request, RequestParts, Response, StatusCode, header,
+};
+use edgezero_core::outbound::ResponseDecoding;
+use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
@@ -18,24 +21,25 @@ use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+use trusted_server_core::ec::admin::deny_admin_diagnostic_fallback;
+use trusted_server_core::ec::app::{IdentityApp, IdentityPlatform};
+use trusted_server_core::edge_app::{install_edge_policies, synthesized_response_headers};
+use trusted_server_core::error::{TrustedServerError, http_error};
+use trusted_server_core::health::{
+    ProbePreDispatchHook, StartupState, startup_unavailable_response,
 };
-use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
-use trusted_server_core::platform::{ClientInfo, GeoInfo, RuntimeServices};
+use trusted_server_core::platform::{ClientInfo, GeoInfo, HttpClient, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherOriginOptions,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_input_cap, publisher_owner_error,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -75,6 +79,8 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// Identity state built with the app. This adapter has no EC record store.
+    identity: Arc<IdentityApp>,
     services: Option<RuntimeServices>,
 }
 
@@ -201,27 +207,35 @@ fn build_state_with_settings(
 }
 
 fn build_state_with_services(
-    settings: Settings,
+    mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Cloudflare)?;
+    trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Cloudflare")?;
+    settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
+    let settings = Arc::new(settings);
+    let identity = IdentityApp::build(Arc::clone(&settings), IdentityPlatform::default())?;
+
     Ok(Arc::new(AppState {
-        settings: Arc::new(settings),
+        settings,
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        identity,
         services,
     }))
 }
 
 impl AppState {
-    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+    fn services_for_request(&self, ctx: &RequestContext) -> Result<RuntimeServices, EdgeError> {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .map_or_else(|| build_runtime_services(ctx), Ok)
     }
 }
 
@@ -276,8 +290,8 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = s.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let services = s.services_for_request(&ctx)?;
+            let mut req = ctx.into_request()?;
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
                 &mut req,
@@ -290,54 +304,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Publisher response helper
+// Publisher origin input cap
 // ---------------------------------------------------------------------------
 
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
+/// Largest publisher origin body the Cloudflare adapter collects before egress.
 ///
-/// Delegates to the shared [`buffer_publisher_response_async`], which collects
-/// the dispatched server-side auction and enforces
-/// `settings.publisher.max_buffered_body_bytes`, then removes any
-/// `Transfer-Encoding` header since the buffered body is no longer chunked.
-async fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response_async(
-        publisher_response,
-        method,
-        settings,
-        registry,
-        orchestrator,
-        services,
-    )
-    .await?;
-    response.headers_mut().remove(header::TRANSFER_ENCODING);
-    Ok(response)
-}
-
-// ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`].
-pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
-    let mut response = Response::new(body);
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
+/// It keeps the 10 MiB limit the adapter's own client applied before the
+/// publisher origin moved to `EdgeZero`'s client.
+const PUBLISHER_ORIGIN_INPUT_BYTES: u64 = 10 * 1024 * 1024;
 
 fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
@@ -367,10 +341,6 @@ fn cache_purge_not_supported() -> Response {
     response
 }
 
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Cloudflare adapter.
 ///
@@ -389,7 +359,7 @@ fn legacy_admin_alias_denied() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Startup error fallback
+// Publisher fallback methods
 // ---------------------------------------------------------------------------
 
 /// HTTP methods the publisher fallback proxies, mirroring the Axum/Fastly
@@ -407,30 +377,17 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
-fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
-
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
+/// Returns a [`RouterService`] that preserves probes and returns generic 503s on ordinary routes.
+fn startup_error_router(_error: &Report<TrustedServerError>) -> RouterService {
+    let handler = |ctx: RequestContext| {
+        let response = startup_unavailable_response(ctx.method());
+        async move { Ok::<Response, EdgeError>(response) }
     };
-
-    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-        Arc::new(Settings::default()),
-    ));
+    let mut router = RouterService::builder()
+        .pre_dispatch_hook(ProbePreDispatchHook::new(StartupState::Unavailable, None));
     for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), make(Arc::clone(&message)));
-        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
+        router = router.route("/", method.clone(), handler);
+        router = router.route("/{*rest}", method, handler);
     }
     router.build()
 }
@@ -443,20 +400,26 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 pub struct TrustedServerApp;
 
 impl Hooks for TrustedServerApp {
+    fn configure(app: &mut App) -> Result<(), EdgeError> {
+        install_edge_policies(app, synthesized_response_headers())
+    }
+
     fn name() -> &'static str {
         "TrustedServer"
     }
 
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
+    fn routes() -> Result<RouterService, EdgeError> {
+        // A startup failure serves the failure router rather than failing
+        // assembly, so liveness stays up and readiness and every supported
+        // route answer the fixed unavailable response. The report is logged
+        // once here and never reaches a caller.
+        Ok(match build_state() {
+            Ok(state) => router_builder(&state).build(),
+            Err(report) => {
+                log::error!("{report:?}");
+                startup_error_router(&report)
             }
-        };
-
-        build_router(&state)
+        })
     }
 }
 
@@ -475,7 +438,34 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).build())
+    }
+
+    /// Build the full application router from explicit settings, with `client`
+    /// in router state.
+    ///
+    /// Testing seam: `EdgeZero` hands a client in router state to every
+    /// request in place of the adapter's own, so an app served from this
+    /// router on `EdgeZero`'s Axum test server starts no real transport.
+    /// Production installs no client in router state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let client = HttpClient::with_client(ScriptedHttpClient::forbidding());
+    /// let router = TrustedServerApp::routes_with_settings_and_outbound_client(settings, client)?;
+    /// ```
+    pub fn routes_with_settings_and_outbound_client(
+        settings: Settings,
+        client: HttpClient,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(router_builder(&state).with_state(client).build())
     }
 
     /// Build the full router with explicit settings and runtime services.
@@ -483,6 +473,8 @@ impl TrustedServerApp {
     /// Each request receives a clone of the supplied services, allowing callers
     /// to exercise production routes with deterministic platform dependencies.
     /// The supplied client metadata applies to every request to this router.
+    /// The services' outbound client also goes into router state, so an app
+    /// served from this router starts no real `EdgeZero` transport.
     ///
     /// # Errors
     ///
@@ -498,12 +490,14 @@ impl TrustedServerApp {
         settings: Settings,
         services: RuntimeServices,
     ) -> Result<RouterService, Report<TrustedServerError>> {
+        let client = services.outbound_client().clone();
         let state = build_state_with_services(settings, Some(services))?;
-        Ok(build_router(&state))
+        Ok(router_builder(&state).with_state(client).build())
     }
 }
 
-fn build_router(state: &Arc<AppState>) -> RouterService {
+/// Registers every route, middleware, and hook for `state` on a router builder.
+fn router_builder(state: &Arc<AppState>) -> RouterBuilder {
     {
         let state = Arc::clone(state);
 
@@ -512,8 +506,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let services = state.services_for_request(&ctx)?;
+            let mut req = ctx.into_request()?;
+            if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+                // Reserve this path without an identity graph; never forward
+                // consent snapshots or acknowledge an unpersisted revocation.
+                return Ok(
+                    match IdentityApp::prepare_consent_update(&services, req).await {
+                        Ok(req) => state.identity.consent_update(&req),
+                        Err(response) => *response,
+                    },
+                );
+            }
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
@@ -535,15 +539,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {
                         method: &method,
                         path: &path,
                         settings: &state.settings,
-                        kv: None,
-                        ec_context: &mut ec_context,
                         services: &services,
                         req,
                     })
@@ -561,6 +562,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
+                let input_cap = publisher_input_cap(&state.settings, PUBLISHER_ORIGIN_INPUT_BYTES);
                 match handle_publisher_request(
                     &state.settings,
                     &services,
@@ -568,21 +570,30 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                    PublisherOriginOptions {
+                        edge_header: EdgeCacheHeader::CloudflareCdnCacheControl,
+                        input_cap: Some(input_cap),
+                        // Workers rewrites the inbound `Accept-Encoding` (to `br, gzip`
+                        // whether the client sent none or `identity`), so the client's
+                        // real preference is unknown here and the origin answers in a
+                        // coding the client may not accept. Decoding the origin body
+                        // serves identity bytes whatever the client sent.
+                        response_decoding: ResponseDecoding::Decode,
+                    },
                 )
                 .await
                 {
-                    Ok(pr) => {
-                        resolve_publisher_response(
-                            pr,
-                            &method,
-                            &state.settings,
-                            &state.registry,
-                            &state.orchestrator,
-                            &services,
-                        )
-                        .await
-                    }
+                    Ok((pr, owner)) => buffer_publisher_response_async(
+                        pr,
+                        &method,
+                        &state.settings,
+                        &state.registry,
+                        &state.orchestrator,
+                        &services,
+                        Some(input_cap),
+                    )
+                    .await
+                    .and_then(|response| owner.attach(response).map_err(publisher_owner_error)),
                     Err(e) => Err(e),
                 }
             };
@@ -600,17 +611,28 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let trace_state = Arc::clone(&state);
         let mut router = RouterService::builder()
-            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
-                Arc::clone(&state.settings),
-                Arc::new(move |request| trace_metadata(&trace_state, request)),
-            )))
+            .pre_dispatch_hook(ProbePreDispatchHook::new(
+                StartupState::Ready,
+                Some(Arc::new(TracePreDispatchHook::new(
+                    Arc::clone(&state.settings),
+                    Arc::new(move |request| trace_metadata(&trace_state, request)),
+                ))),
+            ))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        // The core identity app registers `GET` on the admin EC and EIDs
+        // lookups; without a record store, admin EC lookup answers 501.
+        router = state.identity.mount(router);
+        let ec_state = Arc::clone(&state);
+        router = state.identity.mount_ec_route(router, move |context| {
+            ec_state.services_for_request(context)
+        });
+        router = router
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -620,7 +642,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post(
                 "/verify-signature",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_verify_signature(&s.settings, &services, req)
+                    handle_verify_signature(&s.settings, &services, req).await
                 }),
             )
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
@@ -639,26 +661,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
-            .get(
-                "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
-                }),
-            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -669,8 +671,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
-                        None,
-                        None,
+                        AuctionIdentity::default(),
                         &mut ec_context,
                         &services,
                         req,
@@ -681,7 +682,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/first-party/proxy",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_first_party_proxy(&s.settings, &services, req).await
+                    let ec = build_ec_context(&s.settings, &services, &req);
+                    handle_first_party_proxy(&s.settings, &services, &ec, req).await
                 }),
             )
             .get(
@@ -759,6 +761,21 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             );
         }
 
+        // Partner APIs are answered locally on every method so a partner's
+        // Bearer token and mapping body never reach the publisher origin. This
+        // adapter has no EC record store, so identify and batch sync answer 501
+        // and any other method answers 405.
+        let identify = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            s.identity.unavailable_identify(&req)
+        });
+        let batch_sync = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            Ok(s.identity.batch_sync(req).await)
+        });
+        for method in publisher_fallback_methods() {
+            router = router.route("/_ts/api/v1/identify", method.clone(), identify.clone());
+            router = router.route("/_ts/api/v1/batch-sync", method, batch_sync.clone());
+        }
+
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(legacy_admin_alias_denied())
@@ -777,11 +794,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             router = router.route("/{*rest}", method, fallback.clone());
         }
 
-        router.build()
+        router
     }
 }
 
-fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+fn trace_metadata(state: &AppState, request: &RequestParts) -> TraceMetadata {
     if let Some(services) = &state.services {
         let client_info = services.client_info().clone();
         let geo = client_info.client_ip.and_then(|client_ip| {
@@ -793,25 +810,16 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
         return TraceMetadata { client_info, geo };
     }
     let client_ip = request
-        .headers()
+        .headers
         .get("cf-connecting-ip")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
     let geo = request
-        .headers()
+        .headers
         .get("cf-ipcountry")
         .and_then(|value| value.to_str().ok())
         .filter(|country| *country != "XX")
-        .map(|country| GeoInfo {
-            city: String::new(),
-            country: country.to_owned(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: None,
-            asn: None,
-        });
+        .map(|country| GeoInfo::country_region(country, None));
     TraceMetadata {
         client_info: ClientInfo {
             client_ip,
@@ -824,6 +832,45 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ec_storage_is_rejected_before_route_or_provider_work() {
+        for storage in [
+            serde_json::json!({"provider":"fastly","store":"exact-fixture-binding"}),
+            serde_json::json!({"provider":"records","store":"trusted_server_kv"}),
+        ] {
+            let mut settings = Settings::default();
+            settings.ec.storage =
+                Some(serde_json::from_value(storage).expect("should parse pure provider settings"));
+            let error = build_state_with_settings(settings)
+                .err()
+                .expect("should reject unsupported EC provider before route work");
+            assert!(format!("{error:?}").contains("ec.storage.provider is unsupported"));
+        }
+        let mut settings = Settings::default();
+        settings.ec.ec_store = Some("legacy-unsupported-binding".to_owned());
+        assert!(
+            build_state_with_settings(settings).is_err(),
+            "should reject unsupported legacy selection before route or provider work"
+        );
+    }
+
+    #[test]
+    fn enabled_identity_provider_fails_startup() {
+        let mut settings = aps_profile_settings();
+        settings.ec.identity_providers =
+            vec![trusted_server_core::test_support::fixtures::enabled_identity_provider()];
+
+        let Err(error) = build_state_with_settings(settings) else {
+            panic!("should refuse to start with an enabled identity provider");
+        };
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("example-provider") && message.contains("Cloudflare"),
+            "should name the provider and the adapter: {message}"
+        );
+    }
 
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(
@@ -847,6 +894,7 @@ mod tests {
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
+                allow_insecure_http: false,
                 protocol: "openrtb-2.6".to_string(),
                 profile: "aps".to_string(),
                 endpoint: "https://aps.example/e/pb/bid".to_string(),
@@ -887,51 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
-        let mut settings = Settings::from_toml(
-            r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
-                [publisher]
-                domain = "publisher.example"
-                cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
-                proxy_secret = "fictional-proxy-secret"
-
-                [ec]
-                passphrase = "fictional-secret-key-32-bytes-minimum"
-            "#,
-        )
-        .expect("should parse startup test settings");
-        settings.auction.enabled = false;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
-                    (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: serde_json::json!({}),
-                        },
-                    )
-                })
-                .collect();
-
-        build_state_with_settings(settings)
-            .expect("disabled Cloudflare auction should accept dormant fanout");
-    }
-
-    #[test]
-    fn startup_rejects_multi_provider_auction_plan() {
+    fn startup_loads_multi_provider_plan() {
         let mut settings = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -957,6 +961,7 @@ mod tests {
                     (
                         id.parse().expect("should parse provider ID"),
                         trusted_server_core::auction::ProviderConfig {
+                            allow_insecure_http: false,
                             protocol: "openrtb-2.6".to_string(),
                             profile: "standard".to_string(),
                             endpoint: format!("https://{id}.example/openrtb"),
@@ -970,13 +975,13 @@ mod tests {
                 })
                 .collect();
 
-        let error = match build_state_with_settings(settings) {
-            Ok(_) => panic!("Cloudflare startup should reject multi-provider fanout"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:?}").contains("concurrent provider fanout"),
-            "should identify unsupported fanout: {error:?}"
+        let state = build_state_with_settings(settings)
+            .expect("should load a multi-provider auction plan on Cloudflare");
+
+        assert_eq!(
+            state.orchestrator.provider_count(),
+            2,
+            "should register both configured providers"
         );
     }
 
@@ -1303,5 +1308,85 @@ mod trace_dispatch_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_matrix_preserves_liveness_without_disclosure() {
+        futures::executor::block_on(async {
+            for error in [
+                TrustedServerError::Configuration {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::BadRequest {
+                    message: "fictional-startup-detail".to_string(),
+                },
+                TrustedServerError::KvStore {
+                    store_name: "fictional-store".to_string(),
+                    message: "fictional-startup-detail".to_string(),
+                },
+            ] {
+                let router =
+                    startup_error_router(&Report::new(error).attach("fictional-attachment"));
+                for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                    for path in ["/", "/nested/path", "/health?probe=1", "/ready?probe=1"] {
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                edgezero_core::http::request_builder()
+                                    .method(method)
+                                    .uri(path)
+                                    .body(edgezero_core::body::Body::empty())
+                                    .expect("should construct startup request"),
+                            )
+                            .await
+                            .expect("should serve startup response");
+                        let live = matches!(method, "GET" | "HEAD") && path.starts_with("/health?");
+                        assert_eq!(
+                            response.status().as_u16(),
+                            if live { 200 } else { 503 },
+                            "should classify {method} {path}"
+                        );
+                        assert_eq!(
+                            response.headers()["cache-control"],
+                            "no-store",
+                            "should prevent startup caching"
+                        );
+                        assert_eq!(
+                            response.headers()["content-type"],
+                            if live {
+                                "text/plain"
+                            } else {
+                                "text/plain; charset=utf-8"
+                            },
+                            "should preserve startup content type"
+                        );
+                        for name in ["set-cookie", "www-authenticate", "retry-after"] {
+                            assert!(!response.headers().contains_key(name), "should omit {name}");
+                        }
+                        let body = response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read startup body");
+                        let expected: &[u8] = if method == "HEAD" {
+                            b""
+                        } else if live {
+                            b"ok"
+                        } else {
+                            b"Service Unavailable\n"
+                        };
+                        assert_eq!(
+                            body.as_ref(),
+                            expected,
+                            "should emit exact safe body for {method} {path}"
+                        );
+                    }
+                }
+            }
+        });
     }
 }

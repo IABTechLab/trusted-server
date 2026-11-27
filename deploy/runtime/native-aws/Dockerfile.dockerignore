@@ -1,0 +1,7 @@
+# This overrides the root deny-by-default context for this Dockerfile only.
+# Keep operator input/state/config files out of the deployment-image context.
+**
+!deploy/
+!deploy/runtime/
+!deploy/runtime/native-aws/
+!deploy/runtime/native-aws/entrypoint.sh

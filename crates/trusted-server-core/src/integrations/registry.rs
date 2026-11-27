@@ -10,11 +10,9 @@ use matchit::Router;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::EcContext;
-use crate::ec::kv::KvIdentityGraph;
+use crate::ec::app::IdentityApp;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
@@ -260,9 +258,10 @@ impl IntegrationEndpoint {
 ///
 /// `Send + Sync` bounds are required so trait objects can be stored in
 /// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
-/// request context. The `?Send` on the async methods is intentional — see the
-/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
-/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// request context. The `?Send` on the async methods is intentional:
+/// [`edgezero_core::body::Body`] wraps a `LocalBoxStream`, which is `!Send` for
+/// wasm32 compatibility, so the futures that carry request bodies cannot be
+/// `Send`. On wasm32 these bounds are compatible because the runtime is
 /// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
@@ -602,6 +601,25 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
+    /// Returns head snippets with the page's EC consent-reporting eligibility.
+    ///
+    /// Reporting needs a mounted record-backed route and no other enabled
+    /// consent writer. Integrations that do not report consent retain their
+    /// ordinary snippets.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let inserts = injector.head_inserts_with_ec_route(&context, true);
+    /// ```
+    fn head_inserts_with_ec_route(
+        &self,
+        ctx: &IntegrationHtmlContext<'_>,
+        _ec_route_available: bool,
+    ) -> Vec<String> {
+        self.head_inserts(ctx)
+    }
+
     /// Return attributes to add to the publisher TSJS bundle tag.
     fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -786,15 +804,11 @@ impl IntegrationMetadata {
 
 /// Inputs to [`IntegrationRegistry::handle_proxy`].
 ///
-/// Bundled into a struct so the dispatch surface stays within the project's
-/// 7-argument cap; `ec_context` and `req` participate in the borrow so the
-/// whole thing shares one lifetime.
+/// Bundled into a struct so the dispatch surface shares one lifetime.
 pub struct ProxyDispatchInput<'a> {
     pub method: &'a Method,
     pub path: &'a str,
     pub settings: &'a Settings,
-    pub kv: Option<&'a KvIdentityGraph>,
-    pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
 }
@@ -804,6 +818,7 @@ pub struct ProxyDispatchInput<'a> {
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+    ec_route_available: bool,
 }
 
 impl IntegrationRegistry {
@@ -924,9 +939,24 @@ impl IntegrationRegistry {
         let registry = Self {
             inner: Arc::new(inner),
             plan: Some(plan),
+            ec_route_available: false,
         };
         registry.ensure_async_html_finish_allowed(settings)?;
         Ok(registry)
+    }
+
+    /// Updates browser EC route availability from the mounted identity app.
+    ///
+    /// Call after binding the record store and before sharing the registry.
+    /// Without a graph the EC route returns 501 and browser reporting stays off.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// registry.set_identity_app(&identity);
+    /// ```
+    pub fn set_identity_app(&mut self, identity: &IdentityApp) {
+        self.ec_route_available = identity.identity_graph().is_some();
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1018,7 +1048,8 @@ impl IntegrationRegistry {
     /// Dispatch a proxy request when an integration handles the path.
     ///
     /// This method removes any caller-supplied `x-ts-ec` before proxying.
-    /// Response-side cookie mutation is centralized in EC finalize.
+    /// Response-side cookie mutation is centralized in EC finalize. It never
+    /// mints an EC: only a publisher navigation may create the EC row.
     #[must_use]
     pub async fn handle_proxy(
         &self,
@@ -1028,24 +1059,12 @@ impl IntegrationRegistry {
             method,
             path,
             settings,
-            kv,
-            ec_context,
             services,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
-            // Organic proxy handler: generate if needed (best effort).
-            // Only generate for document navigations — subresource requests
-            // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-                    log::warn!("EC generation failed for integration proxy: {err:?}");
-                }
-            } else {
-                log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
-                );
-            }
+            // Integration proxies never mint an EC: only the publisher
+            // navigation may create the row (one write per page load).
 
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
@@ -1155,6 +1174,7 @@ impl IntegrationRegistry {
                 ..Default::default()
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1162,8 +1182,12 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = Vec::new();
+        // Sourcepoint owns consent synchronization even when SDK rewriting is off.
+        // Keep one server-selected writer rather than racing independent queues.
+        let ec_reporting_available =
+            self.ec_route_available && !self.integration_enabled("sourcepoint");
         for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts(ctx);
+            let mut next = injector.head_inserts_with_ec_route(ctx, ec_reporting_available);
             if !next.is_empty() {
                 inserts.append(&mut next);
             }
@@ -1306,6 +1330,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1335,6 +1360,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1365,6 +1391,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1391,6 +1418,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 
@@ -1457,6 +1485,7 @@ impl IntegrationRegistry {
                 disabled_js_ids: Vec::new(),
             }),
             plan: None,
+            ec_route_available: false,
         }
     }
 }
@@ -1835,14 +1864,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &http::Method::GET,
             path: "/integrations/test/echo",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &noop_services(),
             req,
         }))
@@ -2189,8 +2214,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
         let services = noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
@@ -2198,8 +2221,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));
@@ -2239,8 +2260,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("evil;injected"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2248,8 +2267,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2288,8 +2305,6 @@ mod tests {
             ))
             .expect("should build Cookie header"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2297,8 +2312,6 @@ mod tests {
             method: &Method::GET,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }))
@@ -2334,8 +2347,6 @@ mod tests {
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("some-ec-value"),
         );
-        let mut ec_context =
-            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
 
@@ -2343,8 +2354,6 @@ mod tests {
             method: &Method::POST,
             path: "/integrations/test/ec",
             settings: &settings,
-            kv: None,
-            ec_context: &mut ec_context,
             services: &services,
             req,
         }));

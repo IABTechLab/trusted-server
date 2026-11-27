@@ -7,7 +7,7 @@ Learn how Trusted Server proxies third-party assets through first-party domains 
 The First-Party Proxy system rewrites third-party URLs in ad creatives to route through your domain, providing:
 
 - **First-Party Routing** - Rewritten asset requests route through your domain
-- **EC ID Forwarding** - Controlled identity propagation
+- **EC ID Disclosure** - Default-off, explicit endpoint grants
 - **Creative Rewrites** - Automatic HTML/CSS URL transformation
 - **Click Tracking** - First-party click redirects
 - **Content Security** - Validated, signed URLs prevent tampering
@@ -29,7 +29,7 @@ authority, EC cookie scope, and coordinated upgrade/rollback warning.
 flowchart TD
   original["`Creative (Original) &lt;img src='tracker.example.com/pixel.gif' /&gt;`"]
   rewritten["Creative (Rewritten)<br/>&lt;img src='https://ads.publisher.example/first-party/proxy?<br/>tsurl=https://tracker.example.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
-  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.example.com<br/>4. Return response"]
+  server["Trusted Server<br/>1. Validate tstoken<br/>2. Evaluate endpoint and consent<br/>3. Proxy to tracker.example.com<br/>4. Return response"]
 
   original -->|Rewrite| rewritten -->|Browser Request| server
 ```
@@ -58,15 +58,14 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 
 **Behavior**:
 
-1. **Validates** the `tstoken` signature against reconstructed URL
-2. **Appends** `ts-ec` query parameter (if available)
-3. **Proxies** request to target URL with forwarded headers:
-   - `User-Agent`
-   - `Accept`
-   - `Accept-Language`
-   - `Accept-Encoding`
-   - `Referer`
-   - `X-Forwarded-For`
+1. **Validates** the `tstoken` signature and fetch allowlist
+2. **Evaluates** the current identity-endpoint policy before every upstream send.
+   Removes reserved `ts-ec` query parameters unless the destination matches an
+   explicit rule and a canonical existing cookie EC has current-request consent.
+3. **Proxies** with fixed `User-Agent: TrustedServer/1.0`, client `Accept` and
+   `Accept-Language` when valid/present, and supported normalized
+   `Accept-Encoding`. Browser cookies, authorization, referrer, client IP, and
+   other browser headers are not forwarded.
 4. **Processes** response based on content type:
    - **HTML** (`text/html`) - Rewrites all URLs, returns `text/html`
    - **CSS** (`text/css`) - Rewrites `url()` values, returns `text/css`
@@ -91,10 +90,10 @@ https://ads.publisher.example/first-party/proxy?
   tstoken=HmacSha256Signature
 ```
 
-Final proxied request:
+Final proxied request with the default empty identity policy:
 
 ```
-https://tracker.example.com/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
+https://tracker.example.com/pixel.gif?campaign=123&uid=abc
 ```
 
 ### `/first-party/click` - Click Redirects
@@ -112,7 +111,7 @@ GET /first-party/click?tsurl=https://advertiser.example.com/landing&tstoken=sign
 **Behavior**:
 
 1. **Validates** the `tstoken` signature
-2. **Appends** `ts-ec` parameter to target URL
+2. **Appends** the existing EC ID as `ts-ec` when available
 3. **Issues** 302 redirect to target (browser navigates directly)
 4. **Logs** click metadata:
    - Target URL base (`tsurl`)
@@ -343,7 +342,7 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 **Logging**:
 
 ```
-proxy: likely pixel detected size=43 url=https://tracker.example.com/p.gif
+proxy: likely pixel detected size=43
 ```
 
 ### Passthrough (Other Types)
@@ -371,83 +370,99 @@ The proxy automatically follows HTTP redirects:
 
 **Behavior**:
 
-1. Follow up to **4 redirect hops**
-2. Re-apply `ts-ec` on each hop
-3. Switch to `GET` after `303` response
-4. Log when redirect limit reached
-5. Preserve request headers across hops
+1. Follow up to **4 redirect hops** through EdgeZero's redirect follower,
+   checking fetch permission before each send.
+2. Check each redirect target before it is followed. A non-HTTPS target on a
+   route that requires HTTPS fails with `403`, a target without a host fails
+   with `502`, and a host outside `proxy.allowed_domains` fails with `403`. A
+   target whose scheme is neither `http` nor `https` is not followed, and its
+   redirect response is returned.
+3. Independently re-evaluate each destination's identity grant; permission for
+   one recipient does not authorize the next.
+4. Remove carried or echoed reserved EC parameters and append exactly one
+   authorized EC only when the next destination and current request qualify.
+5. Send `301`, `302`, and `303` hops as a bodiless `GET` (a `HEAD` stays
+   `HEAD`); `307` and `308` keep the method and body. A `301` or `302` that
+   answers a method other than `GET`, `HEAD`, or `POST` is returned, not
+   followed. Every hop sends the same approved headers.
+6. Give each hop the request's own timeout, 15 s for a buffered response or 60 s
+   for a streamed one, and the whole chain a 60 s deadline.
+7. Strip `Authorization` and `Cookie` on a hop to another origin.
+8. Fail a `Location` that carries userinfo with `502 Bad Gateway`.
+9. Log each hop at `debug` without its query, and log a warning when a redirect
+   response is returned instead of followed.
+10. On the creative route, reject any terminal 3xx carrying `Location` with
+    `502`, without exposing that header to the browser. This includes exhausted
+    limits and redirect responses returned instead of followed.
 
-**Example Flow**:
+Creative targets containing URL credentials are rejected. A 3xx without
+`Location` is returned without creating a browser navigation. Click redirects
+retain their separate existing navigation behavior.
 
-```
-Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
-  → 302 to https://cdn.example.com/ad.html
-  → 200 with HTML content
-  → Rewrite HTML and return
-```
+## EC ID Disclosure
 
-## EC ID Propagation
+### Default-off endpoint grants
 
-### Automatic Forwarding
+An empty or omitted `proxy.identity_endpoints` grants no EC disclosure. Images,
+CSS, scripts, and iframe HTML receive no automatic EC merely because they are
+proxied. File extensions and pixel detection do not grant identity. Fetch
+permission remains separate: empty `allowed_domains` permits valid hosts, while
+empty `identity_endpoints` denies identity everywhere.
 
-When proxying, Trusted Server automatically appends the `ts-ec` parameter:
+Configure only reviewed HTTPS origin/path destinations:
 
-**Source Priority**:
-
-1. `ts-ec` cookie
-2. Generate new ID if missing
-
-**Example**:
-
-```
-Original request to proxy:
-  /first-party/proxy?tsurl=https://tracker.example.com/pixel.gif&tstoken=sig
-  Cookie: ts-ec=user123
-
-Proxied backend request:
-  https://tracker.example.com/pixel.gif?ts-ec=user123
-```
-
-### Redirect Propagation
-
-EC IDs are re-applied on **every redirect hop**:
-
-```
-/first-party/proxy?tsurl=https://redirect1.com&tstoken=sig
-  → https://redirect1.com?ts-ec=user123
-  → 302 to https://redirect2.com
-  → https://redirect2.com?ts-ec=user123
-  → 302 to https://final.com
-  → https://final.com?ts-ec=user123
-  → 200 response
-```
-
-This ensures downstream endpoints receive consistent IDs even through redirect chains.
-
-### Click ID Forwarding
-
-Click redirects also forward EC IDs:
-
-```html
-<a
-  href="https://ads.publisher.example/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example.com%2F&tstoken=sig"
-></a>
+```toml
+# Default off: leave these entries absent until explicitly approved.
+# [[proxy.identity_endpoints]]
+# id = "impression-delivery"
+# origin = "https://measurement.example.com"
+# path_exact = "/events/impression"
+#
+# [[proxy.identity_endpoints]]
+# id = "identity-api"
+# origin = "https://identity.example.com"
+# path_prefix = "/v1/identity/"
 ```
 
-User clicks → redirect includes ID:
+A matching endpoint still needs fetch permission. It always bypasses the
+platform's upstream cache, including when identity is missing or withheld, so
+an event is still fetched without EC. Once any hop visits an identity endpoint,
+the final response is `Cache-Control: private, no-store`, including subsequent
+resource hops and failures. All creative-route errors are private/no-store.
 
-```
-302 Found
-Location: https://advertiser.example.com?ts-ec=user123
-```
+### Existing cookie and current consent
 
-::: tip Forwarding Conditions
-EC IDs are only forwarded when:
+Disclosure requires a canonical valid existing `ts-ec` cookie, unexpired consent,
+no GPC, and both the existing jurisdiction-based EC creation decision and EID
+persistence decision. When TCF applies, effective Purpose 1 and Purpose 4 must
+permit persistence after signal conflict handling. Unknown jurisdiction, required
+missing/undecodable signals, undecoded TCF in proxy mode, explicit opt-out,
+expiry, denied Purpose 4, or GPC withhold EC. Known non-regulated requests
+without signals follow the existing creation/persistence decisions.
 
-1. Consent rules permitted the EC ID to be issued (issuance is gated per jurisdiction)
-2. ID exists in request (header/cookie)
-3. Integration hasn't disabled forwarding (`forward_ec_id: false`)
-   :::
+The creative proxy ignores raw `x-ts-ec`, never falls back to it, and does not
+generate missing identity, refresh cookies, or perform identity-store I/O for
+this disclosure decision. Existing adapter-owned withdrawal and marker
+finalization remains authoritative; for example, Fastly may expire TS cookies
+or tombstone a withdrawn record. Withholding alone does not delete a retained EC.
+
+### Reserved query parameters
+
+At every send, all reserved `ts-ec` pairs are removed, including values already
+in the signed URL or echoed in a redirect. A matching, eligible request receives
+exactly one canonical value. Query keys are percent-decoded once for reserved
+matching: `ts%2Dec` is reserved, `TS-EC` is different, and nested encoding is not
+recursively decoded. Unrelated query components are preserved at the authenticated
+reconstructed-target/redirect boundary; signing may already have normalized the
+initial query. A vendor signature covering a stripped EC parameter can break;
+retaining forbidden EC is not a compatibility workaround.
+
+### Click ID forwarding
+
+`/first-party/click` and click rebuild retain their existing identity, signing,
+navigation, and no-store behavior. Endpoint grants affect creative fetches only;
+they do not enable query EC on managed integration assets or change intentional
+identity in integration payloads.
 
 ## Configuration
 
@@ -457,9 +472,9 @@ Configure proxy behavior in `trusted-server.toml`:
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+domain = "publisher.example"
+cookie_domain = ".publisher.example"
+origin_url = "https://origin.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 ```
 
@@ -530,7 +545,7 @@ Exclude specific domains from rewriting:
 ```toml
 [rewrite]
 exclude_domains = [
-  "*.cdn.trusted.com",      # Wildcard pattern
+  "*.cdn.example.com",      # Wildcard pattern
   "first-party.example.com" # Exact match
 ]
 ```
@@ -555,7 +570,7 @@ Control whether responses are streamed or buffered:
 ```rust
 // Integration code example
 ProxyRequestConfig::new(url)
-    .with_streaming()  // Enable streaming (no HTML/CSS rewrites)
+    .with_streaming()
 ```
 
 **Streaming** (buffered rewrites disabled):
@@ -590,38 +605,36 @@ ProxyRequestConfig::new(url)
 
 ### Caching
 
-Proxy responses respect origin cache headers:
+Unmatched resources use the platform-default upstream cache policy and preserve
+origin cache policy, including `Vary`, private/no-store directives, and applicable
+validators. Identical static URLs across readers allow ordinary cache sharing,
+but do not guarantee it: origin freshness, `Vary`, response headers, and platform
+behavior still determine cacheability. The proxy does not force public caching.
 
-- `Cache-Control`
-- `Expires`
-- `ETag`
-- `Last-Modified`
-
-**Best Practices**:
-
-```http
-Cache-Control: public, max-age=3600
-Vary: Accept-Encoding
-```
+Every identity-endpoint send uses upstream bypass, even without EC. Once visited,
+the chain's final response remains private/no-store; validators, expiry/age, and
+edge-cache directives are removed, and terminal privacy is reasserted after late
+response-header changes. This cannot control caching or deduplication inside the
+recipient's own service.
 
 ### Header Forwarding
 
-Only essential headers are forwarded to reduce overhead:
+Creative fetches use the same fixed resource profile on every hop:
 
-**Forwarded Headers**:
+| Header                                              | Behavior                          |
+| --------------------------------------------------- | --------------------------------- |
+| `User-Agent`                                        | Fixed `TrustedServer/1.0`         |
+| `Accept`, `Accept-Language`                         | Valid client values when present  |
+| `Accept-Encoding`                                   | Supported normalized encoding set |
+| `Cookie`, `Authorization`, `x-ts-ec`                | Never forwarded                   |
+| `Referer`, `X-Forwarded-For`, other browser headers | Never forwarded                   |
 
-- `User-Agent` - Client identification
-- `Accept` - Content negotiation
-- `Accept-Language` - Language preferences
-- `Accept-Encoding` - Compression support
-- `Referer` - Page context
-- `X-Forwarded-For` - Client IP chain
-
-**Not Forwarded**:
-
-- Authentication headers (unless explicitly added)
-- Cookies (except EC ID appended as query param)
-- Custom headers (unless added via `ProxyRequestConfig`)
+Origins depending on browser UA, referrer, or client IP need migration testing.
+This profile does not promise anonymity: negotiation headers and vendor identity
+already present elsewhere in a URL may identify a reader. Creative responses
+strip upstream `Set-Cookie`, `Strict-Transport-Security`, `Clear-Site-Data`, and
+CORS grants. An identity rule does not enable CORS. A separate stricter readable
+asset capability is future work under #982; it is not part of this policy.
 
 ## Error Handling
 
@@ -630,8 +643,8 @@ Only essential headers are forwarded to reduce overhead:
 **Invalid Signature**:
 
 ```
-HTTP 502 Bad Gateway
-tstoken validation failed: signature mismatch
+HTTP 403 Forbidden
+Forbidden: invalid tstoken
 ```
 
 **Solutions**:
@@ -668,18 +681,52 @@ Missing required parameter: tsurl
 
 ### Redirect Limit
 
-When redirect limit (4 hops) is reached:
+A terminal 3xx with `Location`, including one left after the four-hop limit,
+returns `502` with private/no-store and no browser redirect. The proxy logs
+`returning an unfollowed redirect response: LimitReached` when the limit stops
+the chain. Reduce the origin's redirect chain and check every destination's
+fetch permission.
 
+## Inspect policy and migrate
+
+Use inventory URLs to inspect the effective policy without sending a request:
+
+```bash
+ts config proxy explain https://measurement.example.com/events/impression --json --app-config trusted-server.toml --manifest edgezero.toml --no-env
 ```
-Log: proxy: redirect limit reached for url=https://...
-```
 
-Response: Returns last redirect response (302/307/308) without following.
+`--app-config` chooses the local file; otherwise `<app.name>.toml` is resolved
+beside `--manifest` (default `edgezero.toml`). Environment overlays apply unless
+`--no-env` is set, using the existing app-config loader semantics. Explain shares
+the runtime evaluator and performs no URL fetch, writes, or publication. It takes
+no EC or consent cookie; `identity_eligibility: "conditional"` means a rule
+matches, not that any reader has consent. JSON version 1 reports fetch permission,
+rule ID, identity eligibility, headers, upstream/downstream cache policy, and
+redirect handling without echoing URL queries/fragments. Allowed and blocked
+decisions exit 0; malformed input or invalid configuration exits nonzero.
 
-**Solutions**:
+Validate reviewed grants with `ts config validate` before publishing them.
+Audit observations are advisory and never automatically create identity grants.
+See [identity endpoint configuration](/guide/configuration#proxyidentity_endpoints)
+for matching and validation rules.
 
-- Contact origin to reduce redirect chain
-- Increase limit in code (modify `MAX_REDIRECTS` constant)
+Deploy new binaries first, then publish endpoint configuration. An old config
+immediately receives default-off disclosure and the new header/redirect behavior
+on a new binary. Empty endpoint lists are omitted from stored JSON; older
+binaries reject a nonempty field. The binary-first interval withholds identity;
+use a separately configured blue/green service if that gap is unacceptable.
+Avoid mixing different disclosure behavior in one traffic pool.
+
+For rollback, first publish an old-compatible config without the field, then
+roll back binaries. An old binary restores the old forwarding/header behavior,
+which is a privacy regression requiring an operator decision.
+
+Previously signed URLs reaching TS use the current policy on every fetch; removing
+a rule revokes future EC disclosure without re-signing. Purge relevant shared
+cache entries at activation where cached responses could skip evaluation. Server
+changes cannot retract browser-held responses; bound rollout expectations by
+existing TTLs. Immediate reevaluation needs a separately reviewed signed-URL
+version/cache-busting transition.
 
 ## Security Considerations
 
@@ -703,12 +750,12 @@ Signed URLs prevent injection attacks:
 
 ```
 Attacker tries:
-  /first-party/proxy?tsurl=https://evil.com&tstoken=forged
+  /first-party/proxy?tsurl=https%3A%2F%2Funtrusted.example.com&tstoken=forged
 
 Trusted Server:
-  1. Computes expected token for https://evil.com
+  1. Computes expected token for https://untrusted.example.com
   2. Compares with provided token
-  3. Rejects if mismatch (502 Bad Gateway)
+  3. Rejects if mismatch (403 Forbidden)
 ```
 
 ### Content Security
@@ -729,13 +776,9 @@ Trusted Server:
 
 ### Logging
 
-Proxy requests emit detailed logs:
-
-```
-proxy: origin response status=200 ct=text/html cl=1234 accept=text/html url=https://...
-proxy: likely pixel detected size=43 url=https://tracker.example.com/p.gif
-click: tsurl=https://advertiser.example.com had_params=true target=... referer=... ua=... tsid=...
-```
+Creative policy diagnostics use endpoint ID, normalized origin/path, and decision
+reason. They omit EC, cookies, query strings, and complete final URLs. This is a
+creative-route logging boundary, not repository-wide log redaction.
 
 ### Diagnostic Headers
 

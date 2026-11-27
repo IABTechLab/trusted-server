@@ -1,3 +1,6 @@
+// Unit tests may buffer bodies with `Body::into_bytes`; production code must not.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 // The `cloudflare` feature activates the `worker` crate which requires
 // wasm-bindgen and only compiles for `wasm32-unknown-unknown`. Enabling it on
 // a native target produces cryptic linker errors — catch it early instead.
@@ -24,8 +27,6 @@ use worker::{Context, Env, Request, Response, Result, event};
 /// Returns a Workers runtime error when the fallback error response cannot be
 /// constructed.
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    #[cfg(feature = "test-utils")]
-    install_fixture_logger();
     if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
         app::set_cloudflare_config_json(config.to_string());
     }
@@ -37,34 +38,5 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
             log::error!("worker dispatch error: {e:?}");
             Response::error("internal server error", 500)
         }
-    }
-}
-
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-struct FixtureLogger;
-
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-impl log::Log for FixtureLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            worker::console_warn!("{}", record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-fn install_fixture_logger() {
-    static LOGGER: FixtureLogger = FixtureLogger;
-    if log::set_logger(&LOGGER).is_ok() {
-        std::panic::set_hook(Box::new(|information| {
-            worker::console_error!("{}", information);
-        }));
-        log::set_max_level(log::LevelFilter::Warn);
     }
 }

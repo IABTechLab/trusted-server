@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-adapter-axum"
-description = "Axum entry point for Trusted Server — native dev server."
+description = "Axum entry point for Trusted Server — native production and development server."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -18,23 +18,42 @@ path = "src/lib.rs"
 name = "trusted-server-axum"
 path = "src/main.rs"
 
+[features]
+default = []
+aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
+aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
+aws-dynamodb-ec = ["edgezero-adapter-axum/aws-dynamodb-records"]
+geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+celld-ec = ["edgezero-adapter-axum/celld-records"]
+geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
+
 [dependencies]
 async-trait = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+derive_more = { workspace = true }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "native-bindings"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
-reqwest = { workspace = true }
-simple_logger = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
-web-time = { workspace = true }
+trusted-server-identity-providers = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-trusted-server-core = { workspace = true, features = ["test-utils"] }
+edgezero-store-celld = { workspace = true, features = ["records"] }
+# SDK use is fixture administration only. Production persistence is EdgeZero-owned.
+aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+edgezero-adapter-axum = { workspace = true, features = ["axum", "test-utils"] }
 base64 = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+edgezero-store-aws = { git = "https://github.com/IABTechLab/edgezero", rev = "1619078a665188c1c282375ec9c11cd1b4f64ee7", default-features = false, features = ["dynamodb-records"] }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tower = { workspace = true, features = ["util"] }

@@ -1,0 +1,226 @@
+[
+  {
+    "name": "de",
+    "country": "DE",
+    "region": "BE",
+    "source": "Located",
+    "policy": "Gdpr"
+  },
+  {
+    "name": "gb",
+    "country": "GB",
+    "region": null,
+    "source": "Located",
+    "policy": "Gdpr"
+  },
+  {
+    "name": "us-ca",
+    "country": "US",
+    "region": "CA",
+    "source": "Located",
+    "policy": "UsState"
+  },
+  {
+    "name": "us-wy",
+    "country": "US",
+    "region": "WY",
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "us-country-only",
+    "country": "US",
+    "region": null,
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "jp",
+    "country": "JP",
+    "region": null,
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "missing",
+    "country": null,
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "empty",
+    "country": "",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "sentinel",
+    "country": "XX",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "lowercase",
+    "country": "us",
+    "region": "ca",
+    "source": "Located",
+    "policy": "UsState"
+  },
+  {
+    "name": "overlong",
+    "country": "USA",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "non-ascii",
+    "country": "DÉ",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "region-only",
+    "country": null,
+    "region": "CA",
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "untrusted",
+    "country": "US",
+    "region": "CA",
+    "source": "Untrusted",
+    "policy": "Unknown"
+  },
+  {
+    "name": "error",
+    "country": "US",
+    "region": "CA",
+    "source": "Error",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unselected",
+    "country": "US",
+    "region": "CA",
+    "source": "Unselected",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-xk",
+    "country": "XK",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-eu",
+    "country": "EU",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-ap",
+    "country": "AP",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-a1",
+    "country": "A1",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-a2",
+    "country": "A2",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "unassigned-o1",
+    "country": "O1",
+    "region": null,
+    "source": "Located",
+    "policy": "Unknown"
+  },
+  {
+    "name": "us-empty-subdivision",
+    "country": "US",
+    "region": "",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-invalid-subdivision",
+    "country": "US",
+    "region": "US-CA",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-unrecognized-subdivision",
+    "country": "US",
+    "region": "ZZ",
+    "source": "Located",
+    "policy": "NonRegulated"
+  },
+  {
+    "name": "de-question-subdivision",
+    "country": "DE",
+    "region": "?",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "de-malformed-subdivision",
+    "country": "DE",
+    "region": "NO REGION",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "de-empty-subdivision",
+    "country": "DE",
+    "region": "",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "Gdpr",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-question-subdivision",
+    "country": "US",
+    "region": "?",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
+  },
+  {
+    "name": "us-no-region-subdivision",
+    "country": "US",
+    "region": "NO REGION",
+    "source": "Located",
+    "policy": "Unknown",
+    "fastly_policy": "NonRegulated",
+    "fastly_drop_region": true
+  }
+]

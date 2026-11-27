@@ -5,13 +5,17 @@
 //! stored [`edgezero_core::blob_envelope::BlobEnvelope`] and reconstruct
 //! [`Settings`] from its data value.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformSecretStore, StoreName};
-use crate::secret_resolution::resolve_secret_references;
+use crate::secret_resolution::{
+    resolve_secret_references, secret_reference_keys, secret_reference_paths,
+};
 use crate::settings::Settings;
 
 /// Canonical logical secret store used by Trusted Server app-config secrets.
@@ -46,29 +50,111 @@ pub fn settings_from_config_blob(
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: "failed to parse Trusted Server app-config blob envelope".to_string(),
-        })
-        .attach(error.to_string())
-    })?;
-    envelope.verify().map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: "Trusted Server app-config blob failed integrity verification".to_string(),
-        })
-        .attach(error.to_string())
-    })?;
+    VerifiedConfigBlob::parse(envelope_json)?.into_settings(secret_store, default_secret_store_name)
+}
 
-    let mut data = envelope.into_data();
-    remove_inactive_secret_references(&mut data);
-    resolve_secret_references::<TrustedServerAppConfig>(
-        &mut data,
-        secret_store,
-        default_secret_store_name,
-    )?;
-    let settings = Settings::from_json_value(data)?;
-    crate::config::validate_settings_for_runtime(&settings)?;
-    Ok(settings)
+/// Verified app-config with inactive secret references removed.
+///
+/// Native startup can collect required keys before awaiting providers. Remove
+/// this bridge when platform config and secret consumers become asynchronous.
+pub struct VerifiedConfigBlob {
+    data: serde_json::Value,
+}
+
+impl VerifiedConfigBlob {
+    /// Verify an envelope and remove references belonging to inactive features.
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed or tampered envelopes.
+    pub fn parse(envelope_json: &str) -> Result<Self, Report<TrustedServerError>> {
+        let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to parse Trusted Server app-config blob envelope".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+        envelope.verify().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Trusted Server app-config blob failed integrity verification".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+
+        let mut data = envelope.into_data();
+        remove_inactive_secret_references(&mut data);
+        Ok(Self { data })
+    }
+
+    /// Return the distinct required secret keys without consulting a provider.
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed secret paths or references.
+    pub fn required_secret_keys(&self) -> Result<BTreeSet<String>, Report<TrustedServerError>> {
+        secret_reference_keys::<TrustedServerAppConfig>(&self.data)
+    }
+
+    /// Return each required secret key with the config field paths that use it.
+    ///
+    /// Name the paths, not the keys, in diagnostics: see
+    /// [`secret_reference_paths`].
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed secret paths or references.
+    pub fn required_secret_references(
+        &self,
+    ) -> Result<BTreeMap<String, BTreeSet<String>>, Report<TrustedServerError>> {
+        secret_reference_paths::<TrustedServerAppConfig>(&self.data)
+    }
+
+    /// Enforce finite JSON structure limits before traversing secret metadata.
+    ///
+    /// # Errors
+    /// Returns a configuration error when depth or node count exceeds the limits.
+    pub fn check_structure(
+        &self,
+        max_depth: u32,
+        max_nodes: u32,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let mut pending = vec![(&self.data, 1_u32)];
+        let mut nodes = 0_u32;
+        while let Some((value, depth)) = pending.pop() {
+            nodes = nodes.saturating_add(1);
+            if depth > max_depth || nodes > max_nodes {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "Trusted Server app-config exceeds JSON structure limits".to_owned(),
+                }));
+            }
+            match value {
+                serde_json::Value::Array(items) => {
+                    pending.extend(items.iter().map(|item| (item, depth + 1)))
+                }
+                serde_json::Value::Object(items) => {
+                    pending.extend(items.values().map(|item| (item, depth + 1)))
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve references from a finite store and validate runtime settings.
+    ///
+    /// # Errors
+    /// Returns a configuration error for missing secrets or invalid resolved settings.
+    pub fn into_settings(
+        mut self,
+        secret_store: &dyn PlatformSecretStore,
+        default_secret_store_name: &StoreName,
+    ) -> Result<Settings, Report<TrustedServerError>> {
+        resolve_secret_references::<TrustedServerAppConfig>(
+            &mut self.data,
+            secret_store,
+            default_secret_store_name,
+        )?;
+        let settings = Settings::from_json_value(self.data)?;
+        crate::config::validate_settings_for_runtime(&settings)?;
+        Ok(settings)
+    }
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
@@ -94,6 +180,28 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
             };
             if !json_bool_or_string_is_true(partner.get("pull_sync_enabled")) {
                 partner.remove("ts_pull_token");
+            }
+        }
+    }
+
+    if let Some(providers) = data
+        .pointer_mut("/ec/identity_providers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for provider in providers {
+            let Some(provider) = provider.as_object_mut() else {
+                continue;
+            };
+            // `enabled` defaults to true, so only an explicit false disables.
+            let disabled = provider
+                .get("enabled")
+                .is_some_and(|enabled| !json_bool_or_string_is_true(Some(enabled)));
+            if disabled
+                && let Some(secrets) = provider
+                    .get_mut("secrets")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                secrets.remove("token");
             }
         }
     }
@@ -156,6 +264,7 @@ mod tests {
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
         fn get_bytes(
             &self,
@@ -170,7 +279,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -179,13 +288,18 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
 
     struct UnifiedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnifiedSecretStore {
         fn get_bytes(
             &self,
@@ -205,6 +319,7 @@ mod tests {
                 "s3-session-key" => "resolved-session-token",
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
+                "provider-token-key" => "resolved-provider-token",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
                 "trusted-forwarder-key" => "resolved-trusted-forwarder-secret-32-bytes",
                 _ => key,
@@ -212,7 +327,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -221,7 +336,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
@@ -350,6 +469,46 @@ mod tests {
         assert!(
             config.geo_query_parameters,
             "should preserve Didomi geo opt-in"
+        );
+    }
+
+    #[test]
+    fn resolves_identity_provider_token_from_the_mapped_default_store() {
+        let mut original = test_settings();
+        original.ec.partners.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "ids", "source_domain": "ids.example.com"
+            }))
+            .expect("should build partner"),
+        );
+        original.ec.identity_providers.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "example-provider",
+                "kind": "example-kind",
+                "endpoint": "https://ids.example.com/v1/lookup",
+                "allowed_domains": ["ids.example.com"],
+                "sources": ["ids.example.com"],
+                "secrets": { "token": "provider-token-key" },
+            }))
+            .expect("should build provider config"),
+        );
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the provider token");
+
+        assert_eq!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-provider-token"),
+            "should resolve the provider token key"
         );
     }
 
@@ -722,14 +881,34 @@ mod tests {
             .ec
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+        original.ec.identity_providers.push(
+            toml::from_str(
+                "id = \"example-provider\"\nkind = \"example-kind\"\nenabled = false\nendpoint = \"https://ids.example.com/lookup\"\nallowed_domains = [\"ids.example.com\"]\nsources = [\"ids.example.com\"]\nsecrets = { token = \"unused-provider-token\" }",
+            )
+            .expect("should parse disabled provider"),
+        );
 
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should skip inactive optional feature references");
+        let blob = VerifiedConfigBlob::parse(&envelope_json(&original))
+            .expect("should verify before collecting required references");
+        let keys = blob
+            .required_secret_keys()
+            .expect("should collect active secret keys");
+        assert!(keys.contains("partner-api-token-key"));
+        assert!(
+            !keys.iter().any(|key| key.starts_with("unused-")),
+            "should remove inactive references before awaiting a provider"
+        );
+        let reconstructed = blob
+            .into_settings(&UnifiedSecretStore, &StoreName::from("ts_secrets"))
+            .expect("should skip inactive optional feature references");
 
+        assert!(
+            reconstructed.ec.identity_providers[0]
+                .secrets
+                .token
+                .is_none(),
+            "should not resolve a disabled provider's token"
+        );
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
         let datadome = reconstructed
@@ -996,6 +1175,47 @@ mod tests {
 
         load_settings(&envelope_json(&original))
             .expect("runtime should accept disabled browser bidder ownership overlap");
+    }
+
+    #[test]
+    fn live_blob_with_operator_framing_headers_still_loads() {
+        // Push rejects these entries, but a blob pushed before the rejection
+        // still has to load. The response-header helper skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = test_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            let loaded = load_settings(&envelope_json(&settings))
+                .expect("should keep loading a live config that predates the rejection");
+
+            assert_eq!(
+                loaded.response_headers.get(name).map(String::as_str),
+                Some(value),
+                "should keep the {name} entry for the response-header helper to skip"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_blob_enforces_structure_limits_before_key_collection() {
+        let blob = VerifiedConfigBlob::parse(&envelope_json(&test_settings()))
+            .expect("should verify valid envelope");
+        blob.check_structure(64, 8192)
+            .expect("should accept bounded fixture structure");
+        assert!(
+            blob.check_structure(1, 8192).is_err(),
+            "should reject excessive depth"
+        );
+        assert!(
+            blob.check_structure(64, 1).is_err(),
+            "should reject excessive node count"
+        );
     }
 
     #[test]

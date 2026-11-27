@@ -16,7 +16,7 @@ proxy_secret = "integration_proxy_secret"
 
 [ec]
 passphrase = "integration_ec_passphrase"
-ec_store = "ec_identity_store"
+ec_store = "trusted_server_kv"
 
 [[ec.partners]]
 name = "Example partner"
@@ -32,9 +32,6 @@ secret_store_id = "secrets"
 [integrations.gpt_diagnostics]
 enabled = true
 trace_page_enabled = true
-
-[proxy]
-certificate_check = false
 
 [auction]
 enabled = false

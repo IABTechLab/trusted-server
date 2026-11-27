@@ -7,7 +7,7 @@
 //! - `Path=/` makes the cookie available on all paths
 //! - `Secure` restricts to HTTPS
 //! - `SameSite=Lax` provides CSRF protection while allowing top-level navigations
-//! - `Max-Age` of 1 year (or 0 to expire)
+//! - Configured `Max-Age` in days (365 by default, or 0 to expire)
 //! - `HttpOnly` prevents client-side JS from reading the cookie via
 //!   `document.cookie`, providing XSS defense-in-depth. The identify
 //!   endpoint (`/_ts/api/v1/identify`) exposes the EC ID in its response
@@ -20,9 +20,6 @@ use http::{HeaderValue, Response, header};
 
 use crate::constants::COOKIE_TS_EC;
 use crate::settings::Settings;
-
-/// Maximum age for the EC cookie (1 year in seconds).
-const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 fn is_allowed_ec_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
@@ -108,7 +105,7 @@ pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
     format_set_cookie(
         &settings.publisher.ec_cookie_domain(),
         safe_id.as_ref(),
-        COOKIE_MAX_AGE,
+        settings.ec.max_age_days.as_seconds(),
     )
 }
 
@@ -174,6 +171,19 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
     }
 }
 
+/// Appends a raw `Set-Cookie` value, skipping values that are not valid
+/// header values.
+pub(crate) fn append_cookie(response: &mut Response<EdgeBody>, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(value) => {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        Err(err) => {
+            log::warn!("Skipping Set-Cookie: invalid header value: {err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,10 +210,45 @@ mod tests {
             result,
             format!(
                 "{}={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
-                COOKIE_TS_EC, TEST_EC_ID, settings.publisher.domain, COOKIE_MAX_AGE,
+                COOKIE_TS_EC,
+                TEST_EC_ID,
+                settings.publisher.domain,
+                365 * 24 * 60 * 60,
             ),
             "should use computed cookie domain (.{{domain}})"
         );
+    }
+
+    #[test]
+    fn positive_ec_cookie_entrypoints_use_configured_lifetime() {
+        for days in [1, 30, 365, 400] {
+            let mut settings = create_test_settings();
+            let mut ec = serde_json::to_value(&settings.ec).expect("should serialize EC settings");
+            ec["max_age_days"] = serde_json::json!(days);
+            settings.ec = serde_json::from_value(ec).expect("should parse configured lifetime");
+            let expected = format!("Max-Age={}", days * 24 * 60 * 60);
+            let cookie = create_ec_cookie(&settings, TEST_EC_ID);
+            assert!(
+                cookie.contains(&expected),
+                "should format configured lifetime for {days} days: {cookie}"
+            );
+            let mut response = empty_response();
+            set_ec_cookie(&settings, &mut response, TEST_EC_ID);
+            assert_eq!(
+                response.headers()[header::SET_COOKIE],
+                cookie,
+                "should use configured lifetime when setting cookie"
+            );
+            let mut expired = empty_response();
+            expire_ec_cookie(&settings, &mut expired);
+            assert!(
+                expired.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .expect("should read expiry cookie")
+                    .contains("Max-Age=0;"),
+                "should preserve immediate withdrawal"
+            );
+        }
     }
 
     #[test]

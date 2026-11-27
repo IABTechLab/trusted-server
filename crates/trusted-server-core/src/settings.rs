@@ -3,10 +3,14 @@ use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use glob::{MatchOptions, Pattern};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeOwned, Visitor},
+};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -15,17 +19,20 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::asset_image_optimizer::image_optimizer_region;
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::sharedid::SharedIdStorage;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
-use crate::platform::PlatformImageOptimizerRegion;
+use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::proxy::{is_host_allowed, is_host_permitted};
+use crate::proxy_policy::{CompiledProxyPolicy, ProxyIdentityEndpoint};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -178,6 +185,19 @@ impl Publisher {
         "replace-with-random-proxy-secret",
     ];
 
+    /// Drops `origin_host_header_override` on Spin, with a warning.
+    ///
+    /// Spin sends the origin URI authority as `Host` and cannot override it, so
+    /// the Spin adapter calls this when it loads settings. A config that sets
+    /// the override keeps serving there, with the URI authority.
+    pub fn drop_origin_host_header_override_for_spin(&mut self) {
+        if self.origin_host_header_override.take().is_some() {
+            log::warn!(
+                "publisher.origin_host_header_override is ignored on Spin; the origin receives its URI authority as Host"
+            );
+        }
+    }
+
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
     /// Per spec §5.2, EC cookies derive their domain from
@@ -297,14 +317,6 @@ impl Publisher {
         self.public_origin
             .clone()
             .unwrap_or_else(|| format!("https://{}", self.domain))
-    }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
     }
 }
 
@@ -502,6 +514,15 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Whether this partner's provider-written UIDs are mirrored to the
+    /// JS-readable `__Host-ts-eids-mirror` cookie. Off by default;
+    /// requires `bidstream_enabled`, and setting it alone is rejected.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub mirror_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -523,11 +544,8 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
-    ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
+    /// Legacy pull-sync refresh interval; retained for config compatibility;
+    /// unused.
     #[serde(
         default = "EcPartner::default_pull_sync_ttl_sec",
         deserialize_with = "from_value_or_str"
@@ -545,6 +563,14 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    /// Whether this partner runs pull sync as an identity provider. Its
+    /// source is not provider-owned, so browser ingest and batch sync still
+    /// fill it.
+    #[must_use]
+    pub fn runs_pull_sync(&self) -> bool {
+        self.pull_sync_enabled && self.pull_sync_url.is_some()
+    }
+
     /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
     /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
@@ -635,13 +661,437 @@ impl EcPartner {
     }
 }
 
+/// One `[[ec.identity_providers]]` entry.
+///
+/// A `sharedid` provider with no `sources` claims `pubcid.org`, the source
+/// Prebid sends `SharedID` under.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+pub struct IdentityProviderConfig {
+    /// Unique provider ID; recorded as the owner of the UIDs it writes.
+    pub id: String,
+    /// Implementation kind, matched by the provider crate's `build`.
+    kind: String,
+    /// Whether lookups run. A disabled provider owns no sources.
+    #[serde(
+        default = "IdentityProviderConfig::default_enabled",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub enabled: bool,
+    /// Lookup endpoint; must be `https` with a host in `allowed_domains`.
+    ///
+    /// Optional for kinds that only read first-party cookies; kinds that
+    /// make lookups reject a missing endpoint when they are built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Exact hosts the coordinator may call for this provider.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub allowed_domains: Vec<String>,
+    /// Source domains this provider owns; each needs an `[[ec.partners]]` entry.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub sources: Vec<String>,
+    /// TCF vendor ID that must have vendor consent, when set.
+    #[serde(default)]
+    pub tcf_vendor_id: Option<NonZeroU16>,
+    /// When the provider's lookup runs on a navigation.
+    #[serde(default)]
+    pub collect: CollectTiming,
+    /// Most lookups per EC hash per hour, when set; unset means unlimited.
+    /// ECs behind one client IP share the budget.
+    ///
+    /// The Fastly limiter enforces this as a per-minute budget of at least
+    /// one, so values below 60 behave like 60 per hour.
+    #[serde(default)]
+    pub rate_limit_per_hour: Option<NonZeroU32>,
+    /// Secret Store key references, resolved at startup.
+    #[serde(default)]
+    pub secrets: ProviderSecrets,
+    /// Provider-specific settings, parsed by the provider kind.
+    ///
+    /// Held as a JSON object because settings travel through the JSON app
+    /// config pipeline.
+    #[serde(default)]
+    pub settings: serde_json::Map<String, JsonValue>,
+}
+
+impl<'de> Deserialize<'de> for IdentityProviderConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut config = Self::deserialize(deserializer)?;
+        if config.kind == SHAREDID_PROVIDER_KIND && config.sources.is_empty() {
+            config.sources = vec![SHAREDID_DEFAULT_SOURCE.to_owned()];
+        }
+        Ok(config)
+    }
+}
+
+impl Serialize for IdentityProviderConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// Provider kind of Prebid's `SharedID`.
+const SHAREDID_PROVIDER_KIND: &str = "sharedid";
+
+/// Source a `sharedid` provider claims when none is configured.
+pub const SHAREDID_DEFAULT_SOURCE: &str = "pubcid.org";
+
+impl IdentityProviderConfig {
+    const fn default_enabled() -> bool {
+        true
+    }
+
+    /// Builds an enabled page-phase config with no TCF vendor, no rate limit,
+    /// default secrets and empty provider settings.
+    #[must_use]
+    pub fn new(
+        id: String,
+        kind: String,
+        endpoint: String,
+        allowed_domains: Vec<String>,
+        sources: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            enabled: true,
+            endpoint: Some(endpoint),
+            allowed_domains,
+            sources,
+            tcf_vendor_id: None,
+            collect: CollectTiming::default(),
+            rate_limit_per_hour: None,
+            secrets: ProviderSecrets::default(),
+            settings: serde_json::Map::new(),
+        }
+    }
+
+    /// The configured implementation kind.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+/// When an identity provider's lookup runs on a navigation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectTiming {
+    /// Before the response, within `identity_budget_ms`; results reach the
+    /// navigation's own write and response.
+    #[default]
+    Page,
+    /// After the response has been sent, within
+    /// `identity_after_response_budget_ms`; results reach the row in one
+    /// follow-up write and are served from the next page load.
+    AfterResponse,
+}
+
+/// Rule that decides whether a client's device signals allow Edge Cookie
+/// creation.
+///
+/// Mapped from `[ec].browser_gate`. Consent and the navigation policy still
+/// apply under either rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserGate {
+    /// Blocks only known non-browsers: a trusted JA4 whose TLS client family
+    /// contradicts the User-Agent's browser family (unless
+    /// `ja4_contradiction_exempt` exempts it), or JA4 and HTTP/2 fingerprints
+    /// matching a known non-browser pattern (the built-in table lists none
+    /// yet). Missing JA4 does not block.
+    #[default]
+    Lenient,
+    /// Also requires a JA4 class and a recognized User-Agent platform, so a
+    /// client without trusted JA4 does not create an identity. Only Fastly,
+    /// and Axum with `EdgeZero`'s trusted JA4 proxy header, supply trusted JA4
+    /// today; other adapters create no identity under this rule.
+    ///
+    /// This gates creation only: what an adapter does with an existing EC that
+    /// fails the rule differs (Axum drops its graph for the request; Fastly
+    /// keeps it).
+    Strict,
+}
+
+impl BrowserGate {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Which trusted JA4 and User-Agent contradictions stop blocking Edge Cookie
+/// creation.
+///
+/// Mapped from `[ec].ja4_contradiction_exempt`. A contradiction is a trusted
+/// JA4 whose TLS client family differs from the browser family the
+/// User-Agent claims (ID-7). An exempted contradiction no longer blocks
+/// creation under either [`BrowserGate`] rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ja4ContradictionExempt {
+    /// Exempts nothing: every contradiction blocks creation.
+    #[default]
+    Off,
+    /// Exempts a non-browser TLS stack (such as Python's) behind a browser
+    /// User-Agent, as a TLS-intercepting proxy in front of readers produces.
+    /// A User-Agent of one browser engine over another engine's TLS stack
+    /// still blocks.
+    NonBrowser,
+    /// Exempts every contradiction, which turns the rule off.
+    All,
+}
+
+impl Ja4ContradictionExempt {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Secret values for one identity provider.
+///
+/// `EdgeZero` secret paths address fixed field names, so V1 supports one
+/// optional bearer token per provider.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSecrets {
+    /// Secret Store key whose value is the provider's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Redacted<String>>,
+}
+
+/// Validated EC cookie lifetime in days, from 1 through 400 inclusive.
+///
+/// Defaults to 365 days. The private value ensures typed configuration cannot
+/// bypass the same bounds enforced during TOML and JSON deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct MaxAgeDays(u16);
+
+impl Default for MaxAgeDays {
+    fn default() -> Self {
+        Self(365)
+    }
+}
+
+impl TryFrom<u16> for MaxAgeDays {
+    type Error = Report<TrustedServerError>;
+
+    fn try_from(days: u16) -> Result<Self, Self::Error> {
+        error_stack::ensure!(
+            (1..=400).contains(&days),
+            TrustedServerError::Configuration {
+                message: "ec.max_age_days must be an integer between 1 and 400".to_owned(),
+            }
+        );
+        Ok(Self(days))
+    }
+}
+
+impl MaxAgeDays {
+    /// Returns the cookie lifetime in seconds.
+    ///
+    /// The validated 400-day upper bound fits within an [`i32`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::settings::MaxAgeDays;
+    ///
+    /// let lifetime = MaxAgeDays::try_from(30).expect("should accept 30 days");
+    /// assert_eq!(lifetime.as_seconds(), 2_592_000);
+    /// ```
+    #[must_use]
+    pub fn as_seconds(self) -> i32 {
+        i32::from(self.0) * 24 * 60 * 60
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+struct MaxAgeDaysVisitor;
+
+impl Visitor<'_> for MaxAgeDaysVisitor {
+    type Value = MaxAgeDays;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ec.max_age_days as an integer between 1 and 400")
+    }
+
+    fn visit_u64<E: de::Error>(self, days: u64) -> Result<Self::Value, E> {
+        let days = u16::try_from(days)
+            .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(days), &self))?;
+        MaxAgeDays::try_from(days).map_err(E::custom)
+    }
+
+    fn visit_i64<E: de::Error>(self, days: i64) -> Result<Self::Value, E> {
+        let days = u16::try_from(days)
+            .map_err(|_| E::invalid_value(de::Unexpected::Signed(days), &self))?;
+        MaxAgeDays::try_from(days).map_err(E::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxAgeDays {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(MaxAgeDaysVisitor)
+    }
+}
+
+/// The publisher endpoint that returns a signed-in visitor's hashed email
+/// (`[ec.hashed_email]`, spec §8.7).
+///
+/// Identity providers with the hashed-email capability read their value
+/// from its JSON response at their own path.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_hashed_email_request, skip_on_field_errors = false))]
+pub struct HashedEmailSource {
+    /// Status endpoint; must be `https` with a host. Called with `method`,
+    /// the visitor's whole `Cookie` header and the configured `headers`.
+    #[validate(custom(function = HashedEmailSource::validate_endpoint))]
+    pub endpoint: String,
+    /// HTTP method of the status call, `GET` (default) or `POST`.
+    #[serde(default)]
+    pub method: HashedEmailMethod,
+    /// Request body, sent as is; only with `POST`. Without a configured
+    /// `content-type` header it is sent as `application/json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Extra request headers by name: a fixed value, or `{ cookie = "name" }`
+    /// for the value of the visitor's cookie `name` (unquoted). Without that
+    /// cookie the visitor cannot be signed in, so no call is made.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, HashedEmailHeader>,
+    /// Cutoff for the status call, in milliseconds. The call shares the
+    /// collection phase's identity budget with the lookups, so it must be
+    /// below `identity_budget_ms`, and below
+    /// `identity_after_response_budget_ms` when an after-response provider
+    /// reads a hashed email.
+    #[serde(
+        default = "HashedEmailSource::default_timeout_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub timeout_ms: u64,
+}
+
+/// HTTP method of the hashed-email status call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HashedEmailMethod {
+    /// `GET`, without a body.
+    #[default]
+    Get,
+    /// `POST`, with the configured `body`, if any.
+    Post,
+}
+
+/// Value of an extra header on the hashed-email status call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum HashedEmailHeader {
+    /// A fixed value.
+    Value(String),
+    /// The value of the visitor's cookie `cookie`, unquoted.
+    Cookie {
+        /// Cookie name.
+        cookie: String,
+    },
+}
+
+/// Headers the status call sets itself, which `headers` may not set.
+const HASHED_EMAIL_RESERVED_HEADERS: [&str; 4] =
+    ["cookie", "host", "content-length", "transfer-encoding"];
+
+fn validate_hashed_email_request(source: &HashedEmailSource) -> Result<(), ValidationError> {
+    source.request_error().map_or(Ok(()), |message| {
+        Err(ValidationError::new("hashed_email_request").with_message(message.into()))
+    })
+}
+
+impl HashedEmailSource {
+    /// Why the configured method, body and headers cannot form a request, if
+    /// they cannot: a body without `POST`, a header name that is not valid
+    /// or that the call sets itself, a fixed value that is not a valid header
+    /// value, or an empty cookie name.
+    #[must_use]
+    pub fn request_error(&self) -> Option<String> {
+        if self.body.is_some() && self.method != HashedEmailMethod::Post {
+            return Some("body is only sent with method = \"POST\"".to_owned());
+        }
+        for (name, value) in &self.headers {
+            let lower = name.to_ascii_lowercase();
+            if http::HeaderName::from_bytes(lower.as_bytes()).is_err() {
+                return Some(format!("header `{name}` is not a valid header name"));
+            }
+            if HASHED_EMAIL_RESERVED_HEADERS.contains(&lower.as_str()) {
+                return Some(format!("header `{name}` is set by Trusted Server"));
+            }
+            match value {
+                HashedEmailHeader::Value(value) if http::HeaderValue::from_str(value).is_err() => {
+                    return Some(format!("header `{name}` has an invalid value"));
+                }
+                HashedEmailHeader::Cookie { cookie } if cookie.trim().is_empty() => {
+                    return Some(format!("header `{name}` names an empty cookie"));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Default status call cutoff (100 ms), half the default page-phase
+    /// identity budget.
+    #[must_use]
+    pub const fn default_timeout_ms() -> u64 {
+        100
+    }
+
+    /// The parsed endpoint, when it is `https` with a host.
+    #[must_use]
+    pub fn endpoint_url(&self) -> Option<Url> {
+        Url::parse(&self.endpoint)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.host_str().is_some())
+    }
+
+    fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
+        let valid = Url::parse(endpoint)
+            .ok()
+            .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some());
+        if valid {
+            Ok(())
+        } else {
+            Err(ValidationError::new("hashed_email_endpoint")
+                .with_message("must be an https URL with a host".into()))
+        }
+    }
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
+    /// EC cookie lifetime in days, from 1 through 400. Defaults to 365.
+    #[serde(default, skip_serializing_if = "MaxAgeDays::is_default")]
+    pub max_age_days: MaxAgeDays,
+
+    /// Renew a held EC on eligible, consented publisher documents without extra reads.
+    ///
+    /// Defaults to disabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sliding_refresh: bool,
+
     /// Publisher passphrase used as HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
@@ -650,7 +1100,12 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
+    /// Explicit persistence provider or the Fastly store-only shorthand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<crate::ec::storage::EcStorage>,
+
+    /// Maximum number of pull-sync lookups dispatched per navigation; 0
+    /// means no limit.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
 
@@ -672,6 +1127,94 @@ pub struct Ec {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub partners: Vec<EcPartner>,
+
+    /// Shared time budget, in milliseconds, for all provider lookups on one
+    /// navigation.
+    ///
+    /// `Ec` denies unknown fields, so this and the other identity fields are
+    /// skipped from serialization at their defaults: a config blob without
+    /// providers then still loads in a runtime built before them.
+    #[serde(
+        default = "Ec::default_identity_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 1000,
+        message = "must be between 1 and 1000 milliseconds"
+    ))]
+    pub identity_budget_ms: u64,
+
+    /// Time budget, in milliseconds, for lookups of providers with
+    /// `collect = "after_response"`, measured from their dispatch after the
+    /// response has been sent. On Axum this also bounds the complete registered
+    /// task, including row reads and the guarded follow-up write. Shutdown may
+    /// cancel it sooner when the shared grace expires.
+    #[serde(
+        default = "Ec::default_identity_after_response_budget_ms",
+        skip_serializing_if = "Ec::is_default_identity_after_response_budget_ms",
+        deserialize_with = "from_value_or_str"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 5000,
+        message = "must be between 1 and 5000 milliseconds"
+    ))]
+    pub identity_after_response_budget_ms: u64,
+
+    /// Server-side identity providers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
+    pub identity_providers: Vec<IdentityProviderConfig>,
+
+    /// Device-signal rule for Edge Cookie creation; `lenient` by default.
+    ///
+    /// Skipped from serialization at its default, like the identity fields,
+    /// so a config blob that leaves it unset still loads in a runtime built
+    /// before it.
+    #[serde(default, skip_serializing_if = "BrowserGate::is_default")]
+    pub browser_gate: BrowserGate,
+
+    /// JA4 and User-Agent contradictions that do not block Edge Cookie
+    /// creation; `off` by default, so every contradiction blocks.
+    ///
+    /// Skipped from serialization at its default, like `browser_gate`.
+    #[serde(default, skip_serializing_if = "Ja4ContradictionExempt::is_default")]
+    pub ja4_contradiction_exempt: Ja4ContradictionExempt,
+
+    /// The publisher endpoint that returns a signed-in visitor's hashed
+    /// email, for providers with the hashed-email capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub hashed_email: Option<HashedEmailSource>,
+}
+
+// Not derived: the identity budgets default to their serde defaults so a
+// default `Ec` passes the budget range checks and serializes no identity keys.
+impl Default for Ec {
+    fn default() -> Self {
+        Self {
+            max_age_days: MaxAgeDays::default(),
+            sliding_refresh: false,
+            passphrase: Redacted::default(),
+            ec_store: None,
+            storage: None,
+            pull_sync_concurrency: 0,
+            cluster_trust_threshold: 0,
+            cluster_recheck_secs: 0,
+            partners: Vec::new(),
+            identity_budget_ms: Self::default_identity_budget_ms(),
+            identity_after_response_budget_ms: Self::default_identity_after_response_budget_ms(),
+            identity_providers: Vec::new(),
+            browser_gate: BrowserGate::default(),
+            ja4_contradiction_exempt: Ja4ContradictionExempt::default(),
+            hashed_email: None,
+        }
+    }
 }
 
 impl Ec {
@@ -684,7 +1227,20 @@ impl Ec {
         "replace-with-random-ec-passphrase",
     ];
 
-    /// Default maximum concurrent pull-sync requests.
+    /// Normalizes every partner's `pull_sync_allowed_domains`: trimmed,
+    /// lowercased and without a trailing dot, matching how request hosts are
+    /// compared.
+    fn normalize_pull_sync_domains(&mut self) {
+        for domain in self
+            .partners
+            .iter_mut()
+            .flat_map(|partner| partner.pull_sync_allowed_domains.iter_mut())
+        {
+            *domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        }
+    }
+
+    /// Default maximum pull-sync lookups per navigation.
     #[must_use]
     pub const fn default_pull_sync_concurrency() -> usize {
         3
@@ -700,6 +1256,28 @@ impl Ec {
     #[must_use]
     pub const fn default_cluster_recheck_secs() -> u64 {
         3600
+    }
+
+    /// Default shared identity lookup budget (200 ms).
+    #[must_use]
+    pub const fn default_identity_budget_ms() -> u64 {
+        200
+    }
+
+    /// Default after-response identity lookup budget (2 s).
+    #[must_use]
+    pub const fn default_identity_after_response_budget_ms() -> u64 {
+        2000
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_budget_ms()
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default_identity_after_response_budget_ms(value: &u64) -> bool {
+        *value == Self::default_identity_after_response_budget_ms()
     }
 
     /// Returns `true` if `passphrase` matches a known placeholder value
@@ -1191,7 +1769,7 @@ impl AssetImageOptimizerConfig {
                         .to_string(),
             }));
         }
-        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+        if image_optimizer_region(&self.region).is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "proxy.asset_routes image_optimizer region `{}` is not supported",
@@ -1967,9 +2545,19 @@ impl ProxyAssetRoute {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
-    /// Enable TLS certificate verification when proxying to HTTPS origins.
-    /// Defaults to true for secure production use.
-    /// Set to false for local development with self-signed certificates.
+    /// Explicit creative identity destination grants; empty denies disclosure.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "vec_from_seq_or_map"
+    )]
+    pub identity_endpoints: Vec<ProxyIdentityEndpoint>,
+    /// Prepared immutable identity policy. Rebuild through [`Self::prepare_runtime`]
+    /// after changing endpoint configuration and before routing requests.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub compiled_identity_policy: CompiledProxyPolicy,
+    /// Must be true. TLS is always verified on every outbound HTTPS request.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
     /// Permitted signing, initial fetch, and redirect target domains for the
@@ -2005,6 +2593,8 @@ fn is_admin_placeholder_password(password: &str) -> bool {
 impl Default for Proxy {
     fn default() -> Self {
         Self {
+            identity_endpoints: Vec::new(),
+            compiled_identity_policy: CompiledProxyPolicy::default(),
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
@@ -2073,13 +2663,22 @@ impl Proxy {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any configured asset route is invalid.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if an asset route or identity endpoint is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.compiled_identity_policy = CompiledProxyPolicy::compile(&self.identity_endpoints)?;
         for route in &self.asset_routes {
             route.prepare_runtime()?;
         }
 
         Ok(())
+    }
+
+    /// Return the immutable identity policy prepared for this configuration.
+    ///
+    /// Call [`Self::prepare_runtime`] after any programmatic endpoint changes.
+    #[must_use]
+    pub fn identity_policy(&self) -> &CompiledProxyPolicy {
+        &self.compiled_identity_policy
     }
 
     /// Resolve the longest matching asset route for the given request path.
@@ -2839,7 +3438,7 @@ fn is_false(value: &bool) -> bool {
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
 ///
 /// Fail-closed superset: any key not listed here — notably `debug`, which
-/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// carries the resolved `OpenRTB` request (EC ID, `user.eids`, the TC
 /// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
 /// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
@@ -3425,6 +4024,7 @@ impl Settings {
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
+        self.ec.normalize_pull_sync_domains();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
@@ -3462,6 +4062,7 @@ impl Settings {
     /// opportunity slot is invalid, or if
     /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.ec.validate_storage()?;
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
@@ -3475,6 +4076,7 @@ impl Settings {
             handler.prepare_runtime()?;
         }
 
+        let sharedid_storage = self.sharedid_storage();
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
             // Parse `gam_unit_path` templates once here (mirrors the compiled
@@ -3487,11 +4089,18 @@ impl Settings {
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
-            co.validate_runtime().map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("Invalid creative opportunity slot config: {err}"),
+            co.validate_runtime()
+                .and_then(|()| {
+                    crate::cookies::template_cache_policy::validate_sharedid_key_cookie(
+                        co.template_cache_key_cookies(),
+                        sharedid_storage.cookie_name(),
+                    )
                 })
-            })?;
+                .map_err(|err| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("Invalid creative opportunity slot config: {err}"),
+                    })
+                })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -3567,6 +4176,19 @@ impl Settings {
                 insecure_fields.push(format!(
                     "ec.partners[{}].ts_pull_token",
                     partner.source_domain
+                ));
+            }
+        }
+        for provider in &self.ec.identity_providers {
+            if provider
+                .secrets
+                .token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.identity_providers[{}].secrets.token",
+                    provider.id
                 ));
             }
         }
@@ -3828,6 +4450,27 @@ impl Settings {
         T: IntegrationConfig,
     {
         self.integrations.get_typed(integration_id)
+    }
+
+    /// Returns where Prebid keeps the `SharedID`, from the `sharedId` entry
+    /// of `integrations.prebid.managed_user_ids`.
+    ///
+    /// Parses the Prebid configuration on every call, so callers on a hot
+    /// path resolve it once at startup. An unreadable Prebid configuration
+    /// counts as [`SharedIdStorage::Unconfigured`].
+    #[must_use]
+    pub fn sharedid_storage(&self) -> SharedIdStorage {
+        match self.integration_config::<PrebidIntegrationConfig>("prebid") {
+            Ok(prebid) => SharedIdStorage::from_managed_user_ids(
+                prebid
+                    .as_ref()
+                    .map_or(&[][..], |prebid| prebid.managed_user_ids.as_slice()),
+            ),
+            Err(report) => {
+                log::warn!("SharedID: Prebid config unreadable: {report}");
+                SharedIdStorage::Unconfigured
+            }
+        }
     }
 }
 
@@ -4321,6 +4964,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::auction::build_orchestrator;
     use crate::integrations::{
         IntegrationRegistry, gpt::GptConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
@@ -4332,6 +4976,175 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    #[test]
+    fn default_ec_uses_the_identity_budget_defaults() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            (ec.identity_budget_ms, ec.identity_after_response_budget_ms),
+            (
+                Ec::default_identity_budget_ms(),
+                Ec::default_identity_after_response_budget_ms()
+            ),
+            "should match the serde defaults"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("identity_budget_ms").is_none()
+                && serialized
+                    .get("identity_after_response_budget_ms")
+                    .is_none(),
+            "should serialize no identity keys"
+        );
+    }
+
+    /// `Ec` denies unknown fields, so a binary built before `browser_gate`
+    /// existed must still accept a default blob.
+    #[test]
+    fn default_browser_gate_is_lenient_and_omitted_for_rollback() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            ec.browser_gate,
+            BrowserGate::Lenient,
+            "should default to the lenient rule"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("browser_gate").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    /// `Ec` denies unknown fields, so a binary built before
+    /// `ja4_contradiction_exempt` existed must still accept a default blob.
+    #[test]
+    fn default_ja4_contradiction_exempt_is_off_and_omitted_for_rollback() {
+        let ec = Ec::default();
+
+        assert_eq!(
+            ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should block every contradiction by default"
+        );
+        let serialized = serde_json::to_value(&ec).expect("should serialize");
+        assert!(
+            serialized.get("ja4_contradiction_exempt").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn ja4_contradiction_exempt_loads_from_toml() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        assert_eq!(
+            settings.ec.ja4_contradiction_exempt,
+            Ja4ContradictionExempt::Off,
+            "should exempt nothing when the key is omitted"
+        );
+
+        for (value, expected) in [
+            ("off", Ja4ContradictionExempt::Off),
+            ("non_browser", Ja4ContradictionExempt::NonBrowser),
+            ("all", Ja4ContradictionExempt::All),
+        ] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = \"{value}\"\n"),
+            );
+            assert_ne!(
+                toml,
+                crate_test_settings_str(),
+                "should insert the key into the [ec] table"
+            );
+            let settings = Settings::from_toml(&toml).expect("should parse the exemption");
+            assert_eq!(
+                settings.ec.ja4_contradiction_exempt, expected,
+                "should load {value:?}"
+            );
+            let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+            assert_eq!(
+                serialized.get("ja4_contradiction_exempt"),
+                (expected != Ja4ContradictionExempt::Off)
+                    .then(|| json!(value))
+                    .as_ref(),
+                "should serialize only a non-default exemption"
+            );
+        }
+
+        for value in ["\"non-browser\"", "\"none\"", "true"] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]\n",
+                &format!("[ec]\nja4_contradiction_exempt = {value}\n"),
+            );
+            assert!(
+                Settings::from_toml(&toml).is_err(),
+                "should reject the unknown exemption {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_gate_loads_from_toml() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        assert_eq!(
+            settings.ec.browser_gate,
+            BrowserGate::Lenient,
+            "should use the lenient rule when the key is omitted"
+        );
+
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\nbrowser_gate = \"strict\"\n");
+        assert_ne!(
+            toml,
+            crate_test_settings_str(),
+            "should insert the key into the [ec] table"
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse strict browser gate");
+        assert_eq!(
+            settings.ec.browser_gate,
+            BrowserGate::Strict,
+            "should load the strict rule"
+        );
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize");
+        assert_eq!(
+            serialized.get("browser_gate"),
+            Some(&json!("strict")),
+            "should serialize a non-default rule"
+        );
+
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\nbrowser_gate = \"off\"\n");
+        assert!(
+            Settings::from_toml(&toml).is_err(),
+            "should reject an unknown browser gate rule"
+        );
+    }
+
+    #[test]
+    fn pull_sync_allowed_domains_are_normalized_at_load() {
+        let toml = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Pull partner"
+            source_domain = "partner.example.com"
+            pull_sync_enabled = true
+            pull_sync_url = "https://sync.example.com/pull"
+            pull_sync_allowed_domains = [" Sync.Example.COM. "]
+            ts_pull_token = "example-pull-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse settings");
+
+        assert_eq!(
+            settings.ec.partners[0].pull_sync_allowed_domains,
+            vec!["sync.example.com".to_owned()],
+            "should trim, lowercase and drop the trailing dot"
+        );
+    }
 
     #[test]
     fn html_finalization_timeout_defaults_and_boundaries() {
@@ -4413,6 +5226,287 @@ mod tests {
         );
     }
 
+    /// `Ec` denies unknown fields, so a binary built before identity providers
+    /// existed must still accept a blob that configures none.
+    #[test]
+    fn default_identity_settings_are_omitted_for_rollback() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize ec settings");
+
+        for field in [
+            "identity_budget_ms",
+            "identity_after_response_budget_ms",
+            "identity_providers",
+            "hashed_email",
+        ] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_defaults_preserve_serialized_shape() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without lifetime fields");
+        let serialized = serde_json::to_value(&settings.ec).expect("should serialize EC settings");
+        assert!(
+            serialized.get("max_age_days").is_none(),
+            "should omit default lifetime"
+        );
+        assert!(
+            serialized.get("sliding_refresh").is_none(),
+            "should omit disabled refresh"
+        );
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_accepts_bounds_and_refresh() {
+        for days in [1, 30, 365, 400] {
+            let toml = crate_test_settings_str().replace(
+                "[ec]",
+                &format!("[ec]\nmax_age_days = {days}\nsliding_refresh = true"),
+            );
+            let settings = Settings::from_toml(&toml).expect("should accept valid lifetime");
+            let serialized =
+                serde_json::to_value(settings.ec).expect("should serialize EC settings");
+            assert_eq!(
+                serialized["sliding_refresh"],
+                json!(true),
+                "should retain enabled refresh"
+            );
+            if days != 365 {
+                assert_eq!(
+                    serialized["max_age_days"],
+                    json!(days),
+                    "should retain custom lifetime"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ec_cookie_lifetime_rejects_invalid_toml_and_json() {
+        for invalid in ["0", "401", "-1", "1.5", "true", "\"30\""] {
+            let toml = crate_test_settings_str()
+                .replace("[ec]", &format!("[ec]\nmax_age_days = {invalid}"));
+            let error = Settings::from_toml(&toml).expect_err("should reject invalid lifetime");
+            assert!(
+                format!("{error:?}").contains("ec.max_age_days"),
+                "should identify lifetime field: {error:?}"
+            );
+        }
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse settings");
+        for invalid in [
+            json!(0),
+            json!(401),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("30"),
+            json!(null),
+        ] {
+            let mut value = serde_json::to_value(&settings).expect("should serialize settings");
+            value["ec"]["max_age_days"] = invalid;
+            let error =
+                Settings::from_json_value(value).expect_err("should reject invalid JSON lifetime");
+            assert!(
+                format!("{error:?}").contains("ec.max_age_days"),
+                "should identify lifetime field: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_budgets_are_range_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        for (page, after_response, invalid) in [
+            (1, 1, false),
+            (1000, 5000, false),
+            (0, 2000, true),
+            (1001, 2000, true),
+            (200, 0, true),
+            (200, 5001, true),
+        ] {
+            let ec = Ec {
+                identity_budget_ms: page,
+                identity_after_response_budget_ms: after_response,
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should enforce identity budget bounds for {page} and {after_response}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_source_is_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse the hashed email source");
+
+        assert_eq!(
+            source.timeout_ms,
+            HashedEmailSource::default_timeout_ms(),
+            "should default the timeout"
+        );
+        for (endpoint, timeout_ms, invalid) in [
+            ("https://www.example.com/api/user/status", 300, false),
+            ("https://www.example.com/api/user/status", 1000, false),
+            ("https://www.example.com/api/user/status", 0, true),
+            ("https://www.example.com/api/user/status", 1001, true),
+            ("http://www.example.com/api/user/status", 300, true),
+            ("not a url", 300, true),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: endpoint.to_owned(),
+                    timeout_ms,
+                    method: HashedEmailMethod::Get,
+                    body: None,
+                    headers: BTreeMap::new(),
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(
+                ec.validate().is_err(),
+                invalid,
+                "should check {endpoint} with {timeout_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn hashed_email_request_parts_are_parsed_and_checked() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let source: HashedEmailSource = toml::from_str(
+            r#"
+            endpoint = "https://www.example.com/api/user/profile"
+            method = "POST"
+            body = "{}"
+            [headers]
+            x-session = { cookie = "session" }
+            x-requested-with = "XMLHttpRequest"
+            "#,
+        )
+        .expect("should parse a POST status call");
+
+        assert_eq!(source.method, HashedEmailMethod::Post, "should read POST");
+        assert_eq!(source.body.as_deref(), Some("{}"), "should read the body");
+        assert_eq!(
+            source.headers.get("x-session"),
+            Some(&HashedEmailHeader::Cookie {
+                cookie: "session".to_owned()
+            }),
+            "should read a header taken from a cookie"
+        );
+        assert_eq!(
+            source.headers.get("x-requested-with"),
+            Some(&HashedEmailHeader::Value("XMLHttpRequest".to_owned())),
+            "should read a fixed header"
+        );
+        let default: HashedEmailSource =
+            toml::from_str("endpoint = \"https://www.example.com/api/user/status\"")
+                .expect("should parse a GET status call");
+        assert_eq!(
+            default.method,
+            HashedEmailMethod::Get,
+            "should default to GET"
+        );
+
+        let header =
+            |name: &str, value: HashedEmailHeader| BTreeMap::from([(name.to_owned(), value)]);
+        let fixed = |value: &str| HashedEmailHeader::Value(value.to_owned());
+        for (method, body, headers, invalid, case) in [
+            (
+                HashedEmailMethod::Post,
+                Some("{}"),
+                BTreeMap::new(),
+                false,
+                "POST with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                Some("{}"),
+                BTreeMap::new(),
+                true,
+                "GET with a body",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("1")),
+                false,
+                "a fixed header",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("Cookie", fixed("a=1")),
+                true,
+                "Cookie",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("host", fixed("example.com")),
+                true,
+                "Host",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("bad name", fixed("1")),
+                true,
+                "an invalid name",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header("x-ok", fixed("a\nb")),
+                true,
+                "an invalid value",
+            ),
+            (
+                HashedEmailMethod::Get,
+                None,
+                header(
+                    "x-ok",
+                    HashedEmailHeader::Cookie {
+                        cookie: " ".to_owned(),
+                    },
+                ),
+                true,
+                "an empty cookie name",
+            ),
+        ] {
+            let ec = Ec {
+                hashed_email: Some(HashedEmailSource {
+                    endpoint: "https://www.example.com/api/user/status".to_owned(),
+                    timeout_ms: 100,
+                    method,
+                    body: body.map(str::to_owned),
+                    headers,
+                }),
+                ..settings.ec.clone()
+            };
+
+            assert_eq!(ec.validate().is_err(), invalid, "should check {case}");
+        }
+    }
+
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
     /// That only holds while the flag is skipped during serialization.
@@ -4424,6 +5518,41 @@ mod tests {
         assert!(
             serialized.get("sandbox_metrics_enabled").is_none(),
             "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn default_partner_omits_mirror_enabled_for_rollback() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+
+        assert!(
+            serialized.get("mirror_enabled").is_none(),
+            "a default partner must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_mirror_serializes_and_round_trips() {
+        let partner: EcPartner = serde_json::from_value(json!({
+            "name": "ids",
+            "source_domain": "ids.example.com",
+            "mirror_enabled": true,
+        }))
+        .expect("should deserialize partner");
+
+        let serialized = serde_json::to_value(&partner).expect("should serialize partner");
+        let restored: EcPartner =
+            serde_json::from_value(serialized).expect("should deserialize serialized partner");
+
+        assert!(
+            restored.mirror_enabled,
+            "an enabled mirror must survive a round trip"
         );
     }
 
@@ -4847,6 +5976,7 @@ mod tests {
             source_domain: "canary-partner.example".to_string(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -6534,8 +7664,8 @@ origin_host_header_override = "www.example.com:8443""#,
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
-            "www.example.com:8443",
+            settings.publisher.origin_host_header_override.as_deref(),
+            Some("www.example.com:8443"),
             "should use configured host header override"
         );
     }
@@ -6903,6 +8033,7 @@ source_domain = "partner.example.com"
             source_domain: "partner.example.com".to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            mirror_enabled: false,
             api_token: api_token.map(|token| Redacted::new(token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
@@ -6946,6 +8077,31 @@ source_domain = "partner.example.com"
         settings
             .reject_placeholder_secrets()
             .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_identity_provider_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        let mut provider: IdentityProviderConfig = toml::from_str(
+            "id = \"example-provider\"\nkind = \"example-kind\"\nendpoint = \"https://ids.example.com/\"",
+        )
+        .expect("should parse provider config");
+        provider.secrets.token = Some(Redacted::new(
+            "partner-api-token-32-bytes-minimum".to_owned(),
+        ));
+        settings.ec.identity_providers = vec![provider];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder provider token");
+
+        assert!(
+            format!("{err:?}").contains("ec.identity_providers[example-provider].secrets.token"),
+            "should mention the provider token field"
+        );
     }
 
     #[test]
@@ -7394,7 +8550,6 @@ source_domain = "partner.example.com"
                 settings.publisher.origin_host_header_override.as_deref(),
                 Some("www.example.com")
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
@@ -7502,40 +8657,6 @@ source_domain = "partner.example.com"
             allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            public_origin: None,
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            public_origin: None,
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
-            allow_async_html_finish: false,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]
@@ -8245,6 +9366,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8265,6 +9387,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8280,6 +9403,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8295,6 +9419,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -8309,6 +9434,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert!(
@@ -8327,6 +9453,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
         assert_eq!(
@@ -8351,6 +9478,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            ..Proxy::default()
         };
         proxy.normalize();
 
@@ -9075,6 +10203,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -9103,6 +10232,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            ..Proxy::default()
         };
 
         let route = proxy
@@ -9319,6 +10449,87 @@ source_domain = "partner.example.com"
 
     /// Helper that returns a settings TOML string WITHOUT any admin handler,
     /// for tests that need to verify uncovered-admin-endpoint behaviour.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyProxyReader {
+        #[serde(rename = "certificate_check")]
+        _certificate_check: bool,
+        #[serde(rename = "allowed_domains")]
+        _allowed_domains: Vec<String>,
+        #[serde(rename = "asset_routes")]
+        _asset_routes: Vec<ProxyAssetRoute>,
+    }
+
+    #[test]
+    fn proxy_identity_policy_is_prepared_and_never_serialized() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"https://example.com:443/","path_exact":"/event"}]
+        })).expect("should deserialize endpoint config");
+        proxy
+            .prepare_runtime()
+            .expect("should prepare immutable identity policy");
+        let target = Url::parse("https://example.com/event").expect("should parse target");
+        assert_eq!(
+            proxy
+                .identity_policy()
+                .matching_endpoint(&target)
+                .map(|rule| rule.id.as_str()),
+            Some("event"),
+            "should compile endpoint during runtime preparation"
+        );
+        let serialized = serde_json::to_value(&proxy).expect("should serialize proxy");
+        assert!(
+            serialized.get("compiled_identity_policy").is_none(),
+            "should omit runtime policy from stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(serialized)
+            .expect_err("should reject recipient grants in the older deny-unknown-fields reader");
+        proxy.identity_endpoints.clear();
+        proxy
+            .prepare_runtime()
+            .expect("should recompile changed configuration");
+        assert!(
+            proxy.identity_policy().matching_endpoint(&target).is_none(),
+            "should replace previous compiled rules after mutation"
+        );
+        let empty = serde_json::to_value(&proxy).expect("should serialize empty policy");
+        assert!(
+            empty.get("identity_endpoints").is_none(),
+            "should omit default-empty rules for compatible stored configuration"
+        );
+        serde_json::from_value::<LegacyProxyReader>(empty)
+            .expect("should preserve default configuration readability for the older reader");
+    }
+
+    #[test]
+    fn proxy_identity_policy_rejects_invalid_runtime_configuration() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "identity_endpoints":[{"id":"event","origin":"http://example.com","path_exact":"/event"}]
+        })).expect("should deserialize structurally valid endpoint");
+        assert!(
+            proxy.prepare_runtime().is_err(),
+            "should reject invalid origin during runtime preparation"
+        );
+    }
+
+    #[test]
+    fn proxy_identity_endpoints_accept_sequence_and_map_overlays() {
+        for endpoints in [
+            serde_json::json!([{"id":"event","origin":"https://example.com","path_exact":"/event"}]),
+            serde_json::json!({"0":{"id":"event","origin":"https://example.com","path_exact":"/event"}}),
+        ] {
+            let proxy: Proxy =
+                serde_json::from_value(serde_json::json!({"identity_endpoints":endpoints}))
+                    .expect("should accept typed identity endpoint configuration");
+            assert_eq!(
+                serde_json::to_value(proxy).expect("should serialize proxy")["identity_endpoints"]
+                    [0]["id"],
+                "event",
+                "should preserve endpoint rule"
+            );
+        }
+    }
+
     fn settings_str_without_admin_handler() -> String {
         r#"
             [[handlers]]

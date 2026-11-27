@@ -55,6 +55,7 @@ cargo test-cloudflare
 cargo test-spin
 
 # Start local server — Axum (no Fastly CLI or Viceroy required)
+# Prepare config and secrets first: docs/guide/getting-started.md, Option B.
 cargo run -p trusted-server-adapter-axum
 
 # Start local server — Fastly (requires Fastly CLI + Viceroy)
