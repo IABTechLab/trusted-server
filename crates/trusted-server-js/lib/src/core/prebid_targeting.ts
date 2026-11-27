@@ -6,6 +6,7 @@ type NativeBid = {
   adId: string;
   adUnitCode: string;
   adapterCode?: string;
+  bidderCode: string;
   cpm: number;
   dealId?: string;
   sendStandardTargeting?: boolean;
@@ -31,6 +32,8 @@ type Prebid = {
 type SelectedTargeting = { generation: number; values: Record<string, string> };
 type BoundTargeting = SelectedTargeting & {
   adId: string;
+  adUnitCode: string;
+  bidderCode: string;
   nativeTargeting: Targeting;
   unitKeys: Set<string>;
   refused?: boolean;
@@ -41,7 +44,13 @@ type Frame = {
   consumed: boolean;
   receipts: Map<Slot, Set<string>>;
 };
-type AppliedKey = { applied: string[]; baseline: string[]; fromNative: boolean };
+type DeliveryOwner = { key: string; values: string[] };
+type AppliedKey = {
+  applied: string[];
+  baseline: string[];
+  fromNative: boolean;
+  owner?: DeliveryOwner;
+};
 
 /** Internal bridge installed by core before the generated external Prebid bundle drains queues. */
 export interface PrebidTargetingBridge {
@@ -59,6 +68,32 @@ function hasOwn(value: object, key: PropertyKey): boolean {
 
 const CARRIER = 'tsjsSelectedTargeting';
 const HOST_KEYS = new Set(['hb_adid', 'hb_cache_host', 'hb_cache_path', 'ts_initial']);
+// Public native delivery fields, including configurations with no bidder suffix
+// receipts. Engine keys remain dynamic; free-form native custom aggregates stay
+// under Prebid's control. This list does not include global hb_ver or ts_initial.
+const NATIVE_DELIVERY_KEYS = new Set([
+  'hb_adid',
+  'hb_pb',
+  'hb_bidder',
+  'hb_size',
+  'hb_deal',
+  'hb_source',
+  'hb_format',
+  'hb_uuid',
+  'hb_cache_id',
+  'hb_cache_host',
+  'hb_cache_path',
+  'hb_adomain',
+  'hb_acat',
+  'hb_crid',
+  'hb_dsp',
+]);
+
+const NATIVE_DELIVERY_PREFIXES = [...NATIVE_DELIVERY_KEYS].map((key) => `${key}_`);
+
+function nativeValues(value: string | string[]): string[] {
+  return String(value).split(',');
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -104,7 +139,17 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
   const applied = new WeakMap<Slot, Map<string, AppliedKey>>();
   function restore(slot: Slot, incoming: Targeting): void {
     const previous = applied.get(slot);
+    // Read each owner before clearing any key, including the owner key itself.
+    // A publisher may have installed a different bid with the same price.
+    const owners = new Map<string, string[]>();
+    for (const state of previous?.values() ?? []) {
+      if (state.owner && !owners.has(state.owner.key)) {
+        owners.set(state.owner.key, [...slot.getTargeting(state.owner.key)]);
+      }
+    }
     for (const [key, state] of previous ?? []) {
+      if (state.owner && !sameValues(owners.get(state.owner.key) ?? [], state.owner.values))
+        continue;
       if (hasOwn(incoming, key) || !sameValues(slot.getTargeting(key), state.applied)) continue;
       if (!state.fromNative && state.baseline.length) slot.setTargeting(key, state.baseline);
       else slot.clearTargeting(key);
@@ -264,7 +309,7 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
       function withoutOwnedTargeting(targeting: Targeting, record: BoundTargeting): Targeting {
         // Native suffixed keys may truncate the bidder suffix differently for
         // each base key. Associate observed suffixes with their native render ID;
-        // ambiguous shared prefixes are refused rather than guessed from seats.
+        // shared prefixes stay native unless an exact field is uniquely owned.
         const identities = Object.entries(targeting)
           .filter(([key]) => key.startsWith('hb_adid_'))
           .map(([key, item]) => ({
@@ -273,6 +318,11 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
             owned: Array.isArray(item) ? item.includes(record.adId) : item === record.adId,
           }));
         const nativeKeys = Object.keys(record.nativeTargeting);
+        const otherBidders = cachedBids(record.adUnitCode).bids.filter(
+          (bid) => bid.bidderCode !== record.bidderCode
+        );
+        const dealKey = `hb_deal_${record.bidderCode}`.slice(0, 20);
+        const bidderIdKey = `hb_adid_${record.bidderCode}`.slice(0, 20);
         return Object.fromEntries(
           Object.entries(targeting).filter(([key, item]) => {
             const ownedSuffix = nativeKeys.some((base) => {
@@ -289,13 +339,32 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
                       (key.length === 20 && identity.suffix.startsWith(suffix)) ||
                       (identity.truncated && suffix.startsWith(identity.suffix))
                   );
-              return matches.some((identity) => identity.owned);
+              const standardKey = NATIVE_DELIVERY_KEYS.has(base);
+              const exactNative =
+                key === `${base}_${record.bidderCode}`.slice(0, 20) &&
+                !otherBidders.some((bid) => key === `${base}_${bid.bidderCode}`.slice(0, 20)) &&
+                sameValues(nativeValues(item), nativeValues(record.nativeTargeting[base]));
+              // An owned, collapsed ID prefix does not claim a foreign bidder's
+              // longer price namespace or a shared shorter metadata field.
+              if (standardKey && !exactNative) return false;
+              if (matches.length > 0 && matches.every((identity) => identity.owned)) return true;
+              // A shorter render-ID namespace can collapse while a price key
+              // still identifies this bidder uniquely. Retain shared fields;
+              // only claim the exact native value under an unshared standard key.
+              return standardKey && exactNative;
             });
             const ownedKey = hasOwn(record.nativeTargeting, key) && !record.unitKeys.has(key);
             const renderIdentity = Array.isArray(item)
               ? item.includes(record.adId)
               : item === record.adId;
-            return !ownedKey && !ownedSuffix && !renderIdentity;
+            // Native winning-deal targeting includes a bidder key even when
+            // sendAll is off and no suffixed render-ID receipt was emitted.
+            const winningDeal =
+              key === dealKey &&
+              !hasOwn(targeting, bidderIdKey) &&
+              hasOwn(record.nativeTargeting, 'hb_deal') &&
+              sameValues(nativeValues(item), nativeValues(record.nativeTargeting.hb_deal));
+            return !ownedKey && !ownedSuffix && !renderIdentity && !winningDeal;
           })
         );
       }
@@ -336,18 +405,48 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
         restore(slot, incoming);
         if (!record) return;
         const next = new Map<string, AppliedKey>();
+        const canonicalOwner: DeliveryOwner = {
+          key: 'hb_adid',
+          values: [...slot.getTargeting('hb_adid')],
+        };
+        const bidderIdKey = `hb_adid_${record.bidderCode}`.slice(0, 20);
+        const bidderOwner =
+          hasOwn(incoming, bidderIdKey) &&
+          sameValues(nativeValues(incoming[bidderIdKey]), [record.adId])
+            ? { key: bidderIdKey, values: [...slot.getTargeting(bidderIdKey)] }
+            : canonicalOwner;
+        const retained = withoutOwnedTargeting(incoming, record);
+        for (const key of Object.keys(incoming)) {
+          if (hasOwn(retained, key)) continue;
+          const canonical = NATIVE_DELIVERY_KEYS.has(key);
+          const bidderKey = NATIVE_DELIVERY_PREFIXES.some((prefix) => key.startsWith(prefix));
+          const values = [...slot.getTargeting(key)];
+          const renderIdentity = sameValues(values, [record.adId]);
+          if (!canonical && !bidderKey && !renderIdentity) continue;
+          next.set(key, {
+            applied: values,
+            baseline: [],
+            fromNative: true,
+            owner: bidderKey ? bidderOwner : canonicalOwner,
+          });
+        }
         for (const [key, item] of Object.entries(record.values)) {
           if (HOST_KEYS.has(key)) continue;
           const baseline = [...slot.getTargeting(key)];
           // The finalized carrier is a string map, not a flattened native list.
           const values = [item];
           slot.setTargeting(key, values);
+          const native = next.get(key);
           next.set(key, {
             applied: values,
             baseline,
-            fromNative: hasOwn(incoming, key) && !record.unitKeys.has(key),
+            fromNative: native !== undefined,
+            owner: native?.owner ?? (NATIVE_DELIVERY_KEYS.has(key) ? canonicalOwner : undefined),
           });
         }
+        // The receipt describes the final values, including any explicit engine
+        // overlay. It never extends native bid ownership or changes selection.
+        bidderOwner.values = [...slot.getTargeting(bidderOwner.key)];
         applied.set(slot, next);
         hasManagedSlots = true;
       }
@@ -368,6 +467,8 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
           generation: carrier.generation as number,
           values: values ?? {},
           adId: bid.adId,
+          adUnitCode: bid.adUnitCode,
+          bidderCode: bid.bidderCode,
           nativeTargeting: bid.adserverTargeting,
           unitKeys: new Set(),
         };

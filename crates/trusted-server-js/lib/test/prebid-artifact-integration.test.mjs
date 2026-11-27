@@ -1682,6 +1682,345 @@ describe('pinned Prebid public targeting contract', () => {
   );
 
   it.each([
+    ['navigation', seat, true],
+    ['navigation', 'exampleLongBidderSeat', true],
+    ['navigation', seat, false],
+    ['failed refresh', seat, true],
+    ['failed refresh', 'exampleLongBidderSeat', true],
+    ['failed refresh', seat, false],
+  ])(
+    'cleans native local delivery on %s for %s with sendAll=%s',
+    async (lifecycle, localSeat, sendAll) => {
+      const page = targetingPage({
+        config: { enableSendAllBids: sendAll },
+        adUnitTargeting: { section: 'example-section', hb_size: 'publisher-size' },
+        client: { cpm: 0.99 },
+        clientCode: 'exampleClient',
+        respond: () => {
+          const body = serverResponse(price, {
+            example_engine_pb: '8.88',
+            example_engine: 'selected',
+            section: 'engine',
+            hb_size: 'engine-size',
+          });
+          body.seatbid[0].seat = localSeat;
+          return body;
+        },
+        beforeShim: (win) =>
+          win.pbjs.onEvent('bidResponse', (bid) => {
+            if (bid.adapterCode !== 'trustedServer') return;
+            bid.dealId = 'example-local-deal';
+            Object.assign(bid.adserverTargeting, {
+              hb_deal: 'example-local-deal',
+              hb_cache_host: 'cache.example.com',
+              hb_cache_path: '/example-cache',
+              hb_uuid: 'example-local-cache-id',
+              hb_cache_id: 'example-local-cache-id',
+              hb_acat: 'example-local-category',
+              hb_dsp: 'example-local-dsp',
+            });
+          }),
+      });
+      try {
+        await page.auction();
+        await page.target();
+        const localId = page.bids().find((bid) => bid.adapterCode === 'trustedServer').adId;
+        const clientId = page.bids().find((bid) => bid.bidderCode === 'exampleClient').adId;
+        expect(page.slots[0].values.hb_adid).toEqual([localId]);
+        expect(page.slots[0].values.hb_pb).toEqual(['1.20']);
+        expect(page.slots[0].values.example_engine_pb).toEqual(['8.88']);
+        let refreshSnapshot;
+        if (lifecycle === 'navigation') {
+          page.pageWindow.eval(gptCode);
+          page.pageWindow.history.pushState({}, '', '/example-next-owned-page');
+          expect(page.pageWindow.tsjs.navGeneration).toBe(1);
+        } else {
+          page.pageWindow.googletag.pubads().refresh([page.slots[0]]);
+          page.nativeRefresh.mockClear();
+          page.nativeRefresh.mockImplementation(() => {
+            refreshSnapshot = Object.fromEntries(
+              Object.entries(page.slots[0].values).map(([key, items]) => [key, [...items]])
+            );
+          });
+          const requestBids = vi.fn(() => {
+            throw new Error('example owned refresh failure');
+          });
+          page.pageWindow.pbjs.requestBids = requestBids;
+          page.pageWindow.googletag.pubads().refresh([page.slots[0]]);
+          expect(requestBids).toHaveBeenCalledTimes(1);
+          expect(page.nativeRefresh).toHaveBeenCalledTimes(1);
+          expect(page.stubs.consoleErrors).toHaveLength(1);
+          expect(page.stubs.consoleErrors[0]).toContain('example owned refresh failure');
+          page.stubs.consoleErrors.splice(0);
+        }
+        const target = lifecycle === 'failed refresh' ? refreshSnapshot : page.slots[0].values;
+        for (const key of [
+          'hb_adid',
+          'hb_pb',
+          'hb_bidder',
+          'hb_format',
+          'hb_source',
+          'hb_deal',
+          'hb_cache_host',
+          'hb_cache_path',
+          'hb_uuid',
+          'hb_cache_id',
+          'hb_adomain',
+          'hb_acat',
+          'hb_crid',
+          'hb_dsp',
+          'example_engine_pb',
+          'example_engine',
+        ])
+          expect(target).not.toHaveProperty(key);
+        const values = Object.values(target).flat();
+        expect(values).not.toContain(localId);
+        expect(values).not.toContain(localSeat);
+        expect(values).not.toContain('1.20');
+        expect(values).not.toContain('example-local-deal');
+        expect(target.section).toEqual(['example-section']);
+        expect(target.hb_size).toEqual(['publisher-size']);
+        if (sendAll) {
+          expect(values).toContain(clientId);
+          expect(values).toContain('0.90');
+          expect(values).toContain('exampleClient');
+        }
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('clears unsuffixed native winner fields when sendAll is disabled', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: false },
+      respond: () => serverResponse(price, { example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      expect(page.slots[0].values.hb_size).toEqual(['300x250']);
+      expect(page.slots[0].values.hb_format).toEqual(['banner']);
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-no-suffix-page');
+      for (const key of ['hb_size', 'hb_format', 'hb_source', 'hb_bidder', 'hb_pb', 'hb_adid'])
+        expect(page.slots[0].values).not.toHaveProperty(key);
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each(['client', 'local'])(
+    'preserves native custom aggregates with foreign value %s during local cleanup',
+    async (foreignValue) => {
+      const page = targetingPage({
+        config: { targetingControls: { allBidsCustomTargeting: true } },
+        settings: { [seat]: { adserverTargeting: [{ key: 'example_shared', val: 'local' }] } },
+        client: { cpm: 0.99, targeting: { example_shared: foreignValue } },
+        clientCode: 'exampleClient',
+        respond: () => serverResponse(price, { example_engine: 'selected' }),
+      });
+      try {
+        await page.auction();
+        await page.target();
+        const before = [...page.slots[0].values.example_shared];
+        expect(before).toContain(foreignValue);
+        page.pageWindow.eval(gptCode);
+        page.pageWindow.history.pushState({}, '', '/example-shared-page');
+        expect(page.slots[0].values.example_shared).toEqual(before);
+        expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('restores a foreign native custom baseline after an engine collision', async () => {
+    const page = targetingPage({
+      config: { targetingControls: { allBidsCustomTargeting: true } },
+      client: { cpm: 0.99, targeting: { example_shared: 'client' } },
+      clientCode: 'exampleClient',
+      respond: () => serverResponse(price, { example_shared: 'engine' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      expect(page.slots[0].values.example_shared).toEqual(['engine']);
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-foreign-page');
+      expect(page.slots[0].values.example_shared).toEqual(['client']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('preserves a new render owner even when its price equals the previous engine value', async () => {
+    const page = targetingPage({
+      client: { cpm: 0.99 },
+      clientCode: 'exampleClient',
+      respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      const clientId = page.bids().find((bid) => bid.bidderCode === 'exampleClient').adId;
+      page.slots[0].setTargeting('hb_adid', clientId);
+      page.slots[0].setTargeting('hb_pb', '8.88');
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-new-owner-page');
+      expect(page.slots[0].values.hb_adid).toEqual([clientId]);
+      expect(page.slots[0].values.hb_pb).toEqual(['8.88']);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+    } finally {
+      page.close();
+    }
+  });
+
+  it('keeps publisher changes to a managed native key during local cleanup', async () => {
+    const page = targetingPage({
+      respond: () => serverResponse(price, { example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      page.slots[0].setTargeting('hb_pb', 'example-publisher-price');
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-publisher-page');
+      expect(page.slots[0].values.hb_pb).toEqual(['example-publisher-price']);
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each([false, true])('cleans uniquely local fields when bidder namespaces collide (local suffix last %s)', async (localSuffixLast) => {
+    const page = targetingPage({
+      config: { enableSendAllBids: true },
+      beforeShim: localSuffixLast ? (win) => win.pbjs.onEvent('bidResponse', (bid) => {
+        // Equal native CPMs keep response order; native latency selects the local winner.
+        bid.timeToRespond = bid.adapterCode === 'trustedServer' ? 1 : 100;
+      }) : undefined,
+      client: { cpm: localSuffixLast ? price : 0.99 }, clientCode: 'exampleAliasClient',
+      respond: () => { const body = serverResponse(price, { example_engine: 'selected' }); body.seatbid[0].seat = 'exampleAliasLocal'; return body; },
+    });
+    try {
+      await page.auction();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      const client = page.bids().find((bid) => bid.bidderCode === 'exampleAliasClient');
+      expect(local.cpm).toBe(price);
+      expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code)).toMatchObject({ hb_pb: '1.20', hb_adid: local.adId, example_engine: 'selected' });
+      await page.target();
+      const shared = [...page.slots[0].values.hb_adid_exampleAlias];
+      expect(shared).toEqual([localSuffixLast ? local.adId : client.adId]);
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-colliding-namespace-page');
+      if (shared.includes(local.adId)) expect(page.slots[0].values).not.toHaveProperty('hb_adid_exampleAlias');
+      else expect(page.slots[0].values.hb_adid_exampleAlias).toEqual(shared);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      const values = Object.values(page.slots[0].values).flat();
+      expect(values).not.toContain(local.adId);
+      expect(page.slots[0].values).not.toHaveProperty('hb_pb');
+      expect(page.slots[0].values).not.toHaveProperty('hb_pb_exampleAliasLo');
+      expect(page.slots[0].values.hb_pb_exampleAliasCl).toEqual([localSuffixLast ? '1.20' : '0.90']);
+      if (!localSuffixLast) expect(values).not.toContain('1.20');
+      else expect(values).not.toContain(client.adId);
+      if (!localSuffixLast) expect(values).toContain(client.adId);
+    } finally { page.close(); }
+  });
+
+  it('preserves a shared bidder metadata key when native render-ID namespaces are distinct', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: true },
+      client: { cpm: 0.99 }, clientCode: 'exampleAAA_client',
+      respond: () => { const body = serverResponse(price, { example_engine: 'selected' }); body.seatbid[0].seat = 'exampleAAA_local'; return body; },
+    });
+    try {
+      await page.auction(); await page.target();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      const client = page.bids().find((bid) => bid.bidderCode === 'exampleAAA_client');
+      expect(local.cpm).toBe(price);
+      const shared = [...page.slots[0].values.hb_bidder_exampleAAA];
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-shared-namespace-page');
+      expect(page.slots[0].values.hb_bidder_exampleAAA).toEqual(shared);
+      const values = Object.values(page.slots[0].values).flat();
+      expect(values).not.toContain(local.adId); expect(values).not.toContain('1.20');
+      expect(values).toContain(client.adId); expect(values).toContain('0.90');
+    } finally { page.close(); }
+  });
+
+  it('keeps canonical-only targeting available when sendAll is disabled despite alias prefixes', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: false },
+      client: { cpm: 0.99 }, clientCode: 'exampleAliasClient',
+      respond: () => { const body = serverResponse(price, { example_engine: 'selected' }); body.seatbid[0].seat = 'exampleAliasLocal'; return body; },
+    });
+    try {
+      await page.auction(); await page.target();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      expect(local.cpm).toBe(price); expect(page.slots[0].values.hb_adid).toEqual([local.adId]);
+      expect(page.slots[0].values.example_engine).toEqual(['selected']);
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-canonical-only-page');
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+    } finally { page.close(); }
+  });
+
+  it('clears uniquely local suffixes if navigation invalidates a colliding bid during slot matching', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: true },
+      client: { cpm: 0.99 }, clientCode: 'exampleAliasClient',
+      respond: () => { const body = serverResponse(price, { example_engine: 'selected' }); body.seatbid[0].seat = 'exampleAliasLocal'; return body; },
+    });
+    try {
+      await page.auction();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      const client = page.bids().find((bid) => bid.bidderCode === 'exampleAliasClient');
+      await page.target(() => () => { page.pageWindow.tsjs.navGeneration += 1; return true; });
+      expect(local.cpm).toBeLessThan(0);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      const values = Object.values(page.slots[0].values).flat();
+      expect(values).not.toContain(local.adId); expect(values).not.toContain('1.20');
+      expect(values).toContain(client.adId); expect(values).toContain('0.90');
+    } finally { page.close(); }
+  });
+
+  it('retains a current local result despite a historical bidder namespace when bid cache is off', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: true, useBidCache: false },
+      client: { cpm: 0.99 }, clientCode: 'exampleAliasClient',
+      respond: (_payload, count) => {
+        if (count === 0) return { id: 'example-first-auction', seatbid: [] };
+        const body = serverResponse(price, { example_engine: 'selected' });
+        body.seatbid[0].seat = 'exampleAliasLocal'; return body;
+      },
+    });
+    try {
+      await page.auction(); page.setClientBid(undefined); await page.auction();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code)).toMatchObject({ hb_adid: local.adId, example_engine: 'selected' });
+      await page.target(); expect(local.cpm).toBe(price);
+      expect(page.slots[0].values.example_engine).toEqual(['selected']);
+    } finally { page.close(); }
+  });
+
+  it('delivers nondeal bids with alwaysIncludeDeals and sendAll disabled despite alias prefixes', async () => {
+    const page = targetingPage({
+      config: { enableSendAllBids: false, targetingControls: { alwaysIncludeDeals: true } },
+      client: { cpm: 0.99 }, clientCode: 'exampleAliasClient',
+      respond: () => { const body = serverResponse(price, { example_engine: 'selected' }); body.seatbid[0].seat = 'exampleAliasLocal'; return body; },
+    });
+    try {
+      await page.auction(); await page.target();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      expect(local.cpm).toBe(price); expect(page.slots[0].values.hb_adid).toEqual([local.adId]);
+      expect(page.slots[0].values.example_engine).toEqual(['selected']);
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid_exampleAlias');
+    } finally { page.close(); }
+  });
+
+  it.each([
     ['low', '1.00'],
     ['medium', '1.20'],
     ['high', '1.23'],
