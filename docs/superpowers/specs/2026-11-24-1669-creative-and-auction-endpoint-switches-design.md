@@ -85,7 +85,7 @@ On Fastly, integration request filters run before route dispatch. DataDome prote
 - The filter decides for every protected path before any route is chosen.
 - Moving the switch check ahead of the filters would need Fastly dispatch code.
 
-So on a DataDome-protected Fastly service, a turned-off `/auction` can still cost one verdict call per request. Only pages cached before the switch-off still make that request. `/first-party/` is excluded from DataDome by default. This is a design call, open to review.
+So on a DataDome-protected Fastly service, a turned-off `/auction` can still cost one verdict call per request. Prebid on freshly served pages sends no such request. Pages cached before the switch-off still do, and so does any publisher code that calls `tsjs.requestAds`, which this design leaves unchanged. `/first-party/` is excluded from DataDome by default. This is a design call, open to review.
 
 On Fastly, the adapter's `/auction` arm tags the request for EID syncing before it calls `handle_auction`, and the shared response finalization runs after the handler returns. A turned-off `/auction` can therefore still record the browser's `ts-eids` cookie EIDs to KV, as today's disabled branch does. Stopping that would need Fastly adapter code, so this design keeps it. The other adapters pass no KV graph. This is a design call, open to review.
 
@@ -94,6 +94,9 @@ On Fastly, the adapter's `/auction` arm tags the request for EID syncing before 
 - The server adds an explicit auction-on flag to the injected Prebid client config (`InjectedPrebidClientConfig` in `integrations/prebid.rs`). It is set from the compiled auction plan, the same source as `serverSideBidders`.
 - An empty `serverSideBidders` is not the signal. It is built from the plan's bidder routes, so on its own it does not say whether the auction runs.
 - When the flag says off, the shim leaves no `trustedServer` bid in any ad unit: it adds none and drops one the publisher configured, so Prebid builds no request for it. The publisher's other bids run as they do today.
+- The shim's bid adapter also builds no request while the flag is off: its `buildRequests` returns no requests. Bid removal alone is not enough.
+  - A publisher can alias the adapter with `pbjs.aliasBidder('trustedServer', '<alias>')`, and Prebid gives the alias a copy of the same adapter spec. An alias bid would therefore still post to `/auction`.
+  - Snapshot-backed refresh keeps such an alias as browser demand.
 - A config without the flag means the auction is on, so a page without it behaves as today.
 - The shim treats an empty `adUnitCodes` list as every global ad unit, as Prebid does (`filterAdUnits` in `prebid.ts`). Today it selects none. With the auction off, that would leave a publisher-configured `trustedServer` bid in place, and Prebid would still call `/auction`. The change also aligns the auction-on case with Prebid's selection.
 - Pages cached before the switch was turned off still call `/auction` and get the `404` until they expire.
@@ -145,6 +148,7 @@ For the Prebid caller, the two other options were rejected:
 - [ ] On Fastly, a late request-filter `Cache-Control` change cannot make a turned-off response cacheable. It leaves with `Cache-Control: no-store, private`.
 - [ ] With `[auction].enabled = false`, the injected Prebid config says the auction is off, and `pbjs.requestBids` sends no `POST /auction`.
   - It leaves no `trustedServer` bid in the ad units, including one the publisher configured, for explicit ad units, `adUnitCodes` selections and `adUnitCodes: []`.
+  - The adapter builds no request, so a publisher alias of `trustedServer` sends nothing either, on first auctions and on refresh.
   - The publisher's other bids still run.
   - With the auction on, or with no flag in the config, the shim behaves as today, except that `adUnitCodes: []` now selects every global ad unit.
   - Rust tests cover the injected flag, and Vitest covers both shim states.

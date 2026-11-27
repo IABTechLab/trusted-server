@@ -320,6 +320,7 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
 - Produces:
   - The injected JSON field `auctionEnabled: boolean`, serialized last, `false` exactly when the compiled plan is disabled.
   - The TS helper `function injectedAuctionEnabled(config = getInjectedConfig()): boolean`, which returns `config?.auctionEnabled !== false`.
+  - The adapter spec's `buildRequests` returns `TrustedServerRequest | []`, and `[]` while `injectedAuctionEnabled()` is `false`.
 
 - [ ] **Step 1: Write the failing Rust assertions**
 
@@ -350,11 +351,22 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
       - global units `div-selected` and `div-other`, each with `[{ bidder: 'trustedServer', params: {} }]`;
       - call `requestBids({ adUnitCodes: ['div-selected'] })`;
       - expect `div-selected` to end with `[]` and `div-other` to be untouched.
-  - Add one test to `prebid/installRefreshHandler`, modelled on `includes every browser-owned bidder in refresh ad units` (`:3611`):
+  - Add these to the `adapter spec` describe (`:2393`), reading the registered spec with its `getAdapterSpec()`:
+    - **`buildRequests builds no request while the auction is off`:**
+      - config `{ auctionEnabled: false, serverSideBidders: [] }`;
+      - call `spec.buildRequests` with bid requests whose `bidder` is `trustedServer`, and again with bid requests whose `bidder` is `exampleAlias`;
+      - expect `[]` both times.
+      - This covers aliases. Pinned Prebid's `aliasBidAdapter` (`node_modules/prebid.js/src/adapterManager.ts:878-885`) registers `newBidder(Object.assign({}, spec, { code: alias }))`, so an alias created with `pbjs.aliasBidder('trustedServer', 'exampleAlias')` runs this same `buildRequests`.
+    - **`buildRequests still posts to /auction when auctionEnabled is absent`:** the same alias bid requests with config `{ serverSideBidders: [] }`. Expect one request with `method: 'POST'` and a `url` ending in `/auction`.
+  - Add two tests to `prebid/installRefreshHandler`, modelled on `includes every browser-owned bidder in refresh ad units` (`:3611`):
     - **`refresh auctions with the auction off request no trustedServer bid`:**
       - The describe's `beforeEach` points `mockPbjs.requestBids` straight at `mockRequestBids`, and the model test installs only `installRefreshHandler()`. Neither runs the shim.
       - So set `testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [], clientSideBidders: ['rubicon'] }`, then call `installPrebidNpm()`, then `installRefreshHandler(750)`, then `pubads.refresh()`.
       - Expect the refresh ad units passed to `mockRequestBids` to carry no `trustedServer` bid and to keep the `rubicon` bid.
+    - **`refresh auctions with the auction off keep an alias bid as browser demand but build no request for it`:**
+      - Same setup, with the original ad unit also carrying `{ bidder: 'exampleAlias', params: {} }`.
+      - Snapshot-backed refresh keeps unowned bidders, so expect the refresh ad units passed to `mockRequestBids` to keep the `exampleAlias` bid.
+      - Then read the spec that `installPrebidNpm()` registered (`mockRegisterBidAdapter.mock.calls[0][2]`), and expect its `buildRequests` to return `[]` for that bid.
 
 - [ ] **Step 3: Run the tests and see them fail**
 
@@ -364,6 +376,7 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
   - the Rust assertions fail;
   - every test that turns the auction off fails, because the bids still contain `trustedServer`;
   - both cases of the empty-`adUnitCodes` test fail, because the shim selects no units;
+  - `buildRequests builds no request while the auction is off` and the alias refresh test fail, because `buildRequests` still returns a `POST /auction` request;
   - the absent-or-true test passes.
 
 - [ ] **Step 4: Implement**
@@ -378,7 +391,10 @@ git commit -m "Cover turned-off creative and auction endpoints on every adapter"
     - In the `requestBids` wrapper, read it once before the ad-unit loop.
     - Make `requestedAdUnitCodes` `undefined` when `opts.adUnitCodes` is an empty array, so an empty list selects every global unit, as Prebid's `filterAdUnits` does. A non-empty list keeps today's string filter.
     - When it is `false`, do this inside the loop right after `unit.bids` is ensured to be an array: set `unit.bids` to the bids whose `bidder` is not `ADAPTER_CODE`, then `continue`. The publisher snapshot capture above that point stays as it is.
-    - Refresh units pass through the same wrapper (`pbjs.requestBids` at `:2942`), so the refresh path needs no separate change.
+    - Refresh units pass through the same wrapper (`pbjs.requestBids` at `:2942`), so the refresh path needs no separate bid removal.
+    - Gate the transport too. The first statement of `buildRequests` (`:2413`) returns `[]` when `injectedAuctionEnabled()` is `false`, before it collects EIDs or builds a body. Change its return type to `TrustedServerRequest | []`.
+      - Bid removal alone misses a publisher alias of `trustedServer`, because Prebid copies this spec for the alias.
+      - The same gate covers alias bids that snapshot-backed refresh keeps as browser demand.
 
 - [ ] **Step 5: Run the tests and see them pass**
 
@@ -425,7 +441,7 @@ git commit -m "Stop the Prebid shim calling /auction while the auction is off"
     - while the auction is off, the shim sends no `trustedServer` bid and every other bidder runs as before;
     - `adUnitCodes: []` selects every global ad unit, as in Prebid.
   - **`datadome.md`:** while the auction is off, a protected `/auction` request still goes through protection first. A challenge or block answers before the turned-off `404`.
-  - **`TESTING.md`:** `POST /auction` returns the turned-off `404` (status, body, `Cache-Control`). It reads no body and emits no telemetry, and the old log line is gone.
+  - **`TESTING.md`:** `POST /auction` returns the turned-off `404` (status, body, `Cache-Control`). The handler does not read or parse the body and emits no telemetry, and the old log line is gone. EdgeZero ingress may still buffer the body before routing.
   - **`CHANGELOG.md`:**
     - add one `**Breaking:**` entry under Changed covering the five endpoints and their switches, the Prebid shim change, and the reversal of #1234's "routed and ungated" click endpoints;
     - add an entry under Fixed: the Prebid shim treats `adUnitCodes: []` as every global ad unit, matching Prebid.
@@ -478,8 +494,9 @@ Expected:
 
 CI's integration-tests workflow also runs the browser suite. It uses `trusted-server.integration.toml`, where the auction is off, and `trusted-server.trace.toml`, which sets `rewrite_creatives = false`.
 
-- No spec there needs `/auction` or a creative endpoint to answer under those configs.
-- `aps-renderer.spec.ts` serves its own page and mocks `/auction`. Its page has no injected Prebid config, so the shim treats the auction as on.
+- **Proxy specs:** `creative-sandbox.spec.ts` and `configured-proxy-origin.spec.ts` need real `/first-party/sign` and `/first-party/proxy` responses. Those stay on, because `trusted-server.integration.toml` leaves `rewrite_creatives` at its default.
+- **Trace spec:** `mobile-trace-live.spec.ts` needs real `/auction` responses, and `trusted-server.trace.toml` enables the auction. No spec needs a creative endpoint under the trace fixture, where `rewrite_creatives = false`.
+- **APS spec:** `aps-renderer.spec.ts` serves its own page and mocks `/auction`. Its page has no injected Prebid config, so the shim treats the auction as on.
 
 Watch that job on the PR rather than running it locally.
 
