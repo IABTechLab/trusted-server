@@ -930,6 +930,14 @@ async fn execute_named(
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx)?;
     let mut req = ctx.into_request()?;
+    if matches!(handler, NamedRouteHandler::ConsentUpdate) {
+        req = match trusted_server_core::ec::consent_update::prepare_consent_update(&services, req)
+            .await
+        {
+            Ok(req) => req,
+            Err(response) => return Ok(*response),
+        };
+    }
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
@@ -1029,6 +1037,20 @@ async fn run_named_route(
                 &ec.ec_context,
             )
             .await
+        }
+        NamedRouteHandler::ConsentUpdate => {
+            // The finalize graph: present for browsers and for withdrawals
+            // from any client, matching the response-finalization write gate.
+            let finalize_kv_graph = state
+                .identity
+                .identity_graph()
+                .filter(|_| ec.use_finalize_kv);
+            Ok(
+                trusted_server_core::ec::consent_update::handle_consent_update(
+                    &req,
+                    finalize_kv_graph.as_ref(),
+                ),
+            )
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
@@ -1138,6 +1160,14 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
+    if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+        return match trusted_server_core::ec::consent_update::prepare_consent_update(services, req)
+            .await
+        {
+            Ok(req) => trusted_server_core::ec::consent_update::handle_consent_update(&req, None),
+            Err(response) => *response,
+        };
+    }
     if let Some(response) = deny_admin_diagnostic_fallback(&req) {
         return response;
     }
@@ -1411,6 +1441,7 @@ enum NamedRouteHandler {
     LegacyAdminDenied,
     BatchSync,
     Identify,
+    ConsentUpdate,
     SetTester,
     ClearTester,
     Auction,
@@ -1443,6 +1474,21 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
 ];
 
 const NAMED_ROUTES: &[NamedRoute] = &[
+    NamedRoute {
+        path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
+        primary_methods: &[
+            Method::GET,
+            Method::POST,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::TRACE,
+            Method::CONNECT,
+        ],
+        handler: NamedRouteHandler::ConsentUpdate,
+    },
     NamedRoute {
         path: "/.well-known/trusted-server.json",
         primary_methods: &[Method::GET],

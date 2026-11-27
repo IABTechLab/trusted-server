@@ -708,6 +708,11 @@ async fn finalize_unusable_consent(
         // No identity graph holds a row to tombstone, so the cookie is the
         // only identity state left to clear.
         expire_ec_cookie(settings, response);
+        // A consent-update acknowledgment must reflect that no tombstone
+        // could be written.
+        if !withdrawal_ec_ids(ec_context).is_empty() {
+            super::consent_update::mark_reconciliation_failed(response);
+        }
         return;
     };
 
@@ -737,6 +742,8 @@ async fn finalize_unusable_consent(
     }
     if complete {
         expire_ec_cookie(settings, response);
+    } else {
+        super::consent_update::mark_reconciliation_failed(response);
     }
 }
 
