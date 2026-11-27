@@ -22,6 +22,11 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// the current UTC day: 30 days (WB-4).
 const MIRROR_MAX_EXPIRY_SECS: u64 = 30 * SECONDS_PER_DAY;
 
+/// How close a carried mirror UID's `exp` may come before the mirror is
+/// re-set with the current `exp`: 7 days. Until then an otherwise unchanged
+/// mirror is kept, so a returning reader gets no `Set-Cookie` for it.
+const MIRROR_REFRESH_WINDOW_SECS: u64 = 7 * SECONDS_PER_DAY;
+
 /// What to do with the mirror cookie on this response.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MirrorCookie {
@@ -31,15 +36,25 @@ pub enum MirrorCookie {
     Expire,
 }
 
-/// An encoded mirror value within [`MAX_MIRROR_BYTES`].
+/// An encoded mirror value within [`MAX_MIRROR_BYTES`], with the JSON it
+/// encodes.
 #[derive(Debug, PartialEq, Eq)]
-pub struct MirrorValue(String);
+pub struct MirrorValue {
+    json: String,
+    encoded: String,
+}
 
 impl MirrorValue {
     /// The encoded cookie value.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.encoded
+    }
+
+    /// The JSON `{"v":1,"eids":[...]}` the cookie value encodes.
+    #[must_use]
+    pub fn json(&self) -> &str {
+        &self.json
     }
 }
 
@@ -53,9 +68,10 @@ impl MirrorValue {
 /// opt-out for it, in partner config order, as unpadded base64url JSON
 /// `{"v":1,"eids":[...]}`. Every UID carries `exp`: its stated expiry,
 /// capped at the start of `now`'s UTC day plus 30 days, or that cap when it
-/// states none. Every mirrored UID therefore expires within 30 days (WB-4),
-/// and a value built from an unchanged row stays the same all day, changing
-/// at most once per UTC day. UIDs that would push the value past
+/// states none. Every mirrored UID therefore expires within 30 days (WB-4).
+/// A value built from an unchanged row changes at most once per UTC day;
+/// [`current_carried_mirror`] keeps the carried cookie across those changes
+/// until a UID nears its `exp`. UIDs that would push the value past
 /// [`MAX_MIRROR_BYTES`] are skipped, as are UIDs that fail to serialize.
 /// Returns [`MirrorCookie::Expire`] when consent does not allow the EC or EID
 /// persistence, the row is missing or withdrawn, or nothing qualifies.
@@ -118,12 +134,64 @@ pub fn build_mirror(
         return MirrorCookie::Expire;
     }
     json.push_str(JSON_SUFFIX);
-    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json);
     debug_assert!(
-        value.len() <= MAX_MIRROR_BYTES,
+        encoded.len() <= MAX_MIRROR_BYTES,
         "should respect the size cap"
     );
-    MirrorCookie::Set(MirrorValue(value))
+    MirrorCookie::Set(MirrorValue { json, encoded })
+}
+
+/// Returns the carried mirror when it still serves the reader as `rebuilt`
+/// would, so the response need not re-set it.
+///
+/// The carried value must decode to the same EIDs and UIDs as `rebuilt`, in
+/// the same order, apart from `exp`. Each carried UID's `exp` must equal the
+/// rebuilt one, or be no later than it (so it stays within the cap and any
+/// shortened stated expiry) and at least [`MIRROR_REFRESH_WINDOW_SECS`] after
+/// `now`. Every kept UID therefore still expires within 30 days (WB-4), and
+/// an unchanged returning reader gets a mirror `Set-Cookie` only when a UID
+/// nears its `exp`. Returns `None` when the carried value does not qualify or
+/// does not decode as a mirror.
+#[must_use]
+pub(crate) fn current_carried_mirror(
+    carried: &str,
+    rebuilt: &MirrorValue,
+    now: UnixSeconds,
+) -> Option<MirrorValue> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(carried)
+        .ok()?;
+    let json = String::from_utf8(bytes).ok()?;
+    let mut carried_exps = Vec::new();
+    let mut rebuilt_exps = Vec::new();
+    let carried_uids = without_exps(serde_json::from_str(&json).ok()?, &mut carried_exps)?;
+    let rebuilt_uids = without_exps(serde_json::from_str(&rebuilt.json).ok()?, &mut rebuilt_exps)?;
+    let refresh_at = now.get().saturating_add(MIRROR_REFRESH_WINDOW_SECS);
+    let current = carried_uids == rebuilt_uids
+        && carried_exps.len() == rebuilt_exps.len()
+        && carried_exps
+            .iter()
+            .zip(&rebuilt_exps)
+            .all(|(carried, rebuilt)| {
+                carried == rebuilt || (refresh_at <= *carried && carried <= rebuilt)
+            });
+    current.then(|| MirrorValue {
+        json,
+        encoded: carried.to_owned(),
+    })
+}
+
+/// Removes every UID's `exp` from a mirror JSON value, appending each to
+/// `exps` in order. Returns `None` when the value is not a mirror or a UID
+/// has no integer `exp`.
+fn without_exps(mut value: Value, exps: &mut Vec<u64>) -> Option<Value> {
+    for eid in value.get_mut("eids")?.as_array_mut()? {
+        for uid in eid.get_mut("uids")?.as_array_mut()? {
+            exps.push(uid.as_object_mut()?.remove("exp")?.as_u64()?);
+        }
+    }
+    Some(value)
 }
 
 /// Accumulates the mirror JSON, tracking its encoded size so each part is
@@ -364,6 +432,11 @@ mod tests {
             json!({ "v": 1, "eids": [{ "source": "ids.example.com", "uids": [{ "id": "live", "atype": 1, "exp": 2000 }] }] }),
             "should hold only the live UID with its exp"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(value.json()).expect("should parse the JSON"),
+            decode(&value),
+            "should carry the JSON the cookie value encodes"
+        );
     }
 
     #[test]
@@ -502,6 +575,104 @@ mod tests {
             evening, next_day,
             "should move the exp forward on the next UTC day"
         );
+    }
+
+    fn built_at(entry: &KvEntry, now: u64) -> MirrorValue {
+        match build_mirror(
+            Some(entry),
+            &context(granting()),
+            &partners(true),
+            UnixSeconds::new(now),
+        ) {
+            MirrorCookie::Set(value) => value,
+            MirrorCookie::Expire => panic!("should build a mirror"),
+        }
+    }
+
+    #[test]
+    fn keeps_a_carried_mirror_whose_earlier_exp_is_not_yet_near() {
+        // Arrange
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let carried = built_at(&entry, day_start + 60);
+        let now = day_start + 22 * SECONDS_PER_DAY + 60;
+        let rebuilt = built_at(&entry, now);
+        assert_ne!(carried, rebuilt, "should move the rebuilt exp forward");
+
+        // Act
+        let kept = current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now));
+
+        // Assert
+        assert_eq!(
+            kept.as_ref(),
+            Some(&carried),
+            "should keep the carried value and its JSON"
+        );
+    }
+
+    #[test]
+    fn refreshes_a_carried_mirror_whose_exp_is_within_seven_days() {
+        let day_start = 1_767_225_600;
+        let entry = row(vec![uid("never", Expiry::Never)]);
+        let carried = built_at(&entry, day_start + 60);
+        let now = day_start + 23 * SECONDS_PER_DAY + 61;
+        let rebuilt = built_at(&entry, now);
+
+        assert_eq!(
+            current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now)),
+            None,
+            "should re-set a mirror whose exp is within 7 days"
+        );
+    }
+
+    #[test]
+    fn refreshes_a_carried_mirror_whose_uids_or_stated_expiry_changed() {
+        let day_start = 1_767_225_600;
+        let now = day_start + SECONDS_PER_DAY;
+        let carried = built_at(&row(vec![uid("never", Expiry::Never)]), day_start + 60);
+        let cases = [
+            (row(vec![uid("other", Expiry::Never)]), "a different UID"),
+            (
+                row(vec![
+                    uid("never", Expiry::Never),
+                    uid("added", Expiry::Never),
+                ]),
+                "an added UID",
+            ),
+            (
+                row(vec![uid(
+                    "never",
+                    Expiry::At(UnixSeconds::new(day_start + 20 * SECONDS_PER_DAY)),
+                )]),
+                "a stated expiry earlier than the carried exp",
+            ),
+        ];
+
+        for (entry, case) in cases {
+            let rebuilt = built_at(&entry, now);
+            assert_eq!(
+                current_carried_mirror(carried.as_str(), &rebuilt, UnixSeconds::new(now)),
+                None,
+                "should re-set the mirror for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn refreshes_a_carried_value_that_is_not_a_mirror() {
+        let day_start = 1_767_225_600;
+        let rebuilt = built_at(&row(vec![uid("never", Expiry::Never)]), day_start);
+        let without_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"v":1,"eids":[{"source":"ids.example.com","uids":[{"id":"never","atype":1}]}]}"#,
+        );
+
+        for carried in ["not base64!", "e30", without_exp.as_str()] {
+            assert_eq!(
+                current_carried_mirror(carried, &rebuilt, UnixSeconds::new(day_start)),
+                None,
+                "should re-set a carried value that does not decode as a mirror: {carried}"
+            );
+        }
     }
 
     #[test]

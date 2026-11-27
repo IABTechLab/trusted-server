@@ -1652,11 +1652,12 @@ mod tests {
             &mut context,
             Some(graph),
             registry,
-            // `/auction` is not a navigation, so it gets no request time.
             &crate::ec::finalize::FinalizeRequest {
                 eids_cookie: Some(&cookie),
                 sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
-                now: None,
+                now: Some(crate::ec::eid_types::UnixSeconds::new(
+                    crate::ec::current_timestamp(),
+                )),
             },
             &mut response,
         )
@@ -1822,11 +1823,12 @@ mod tests {
                 &mut context,
                 Some(&graph),
                 &registry,
-                // `/auction` is not a navigation, so it gets no request time.
                 &crate::ec::finalize::FinalizeRequest {
                     eids_cookie: Some(&cookie),
                     sharedid: &crate::ec::sharedid::SharedIdRequest::default(),
-                    now: None,
+                    now: Some(crate::ec::eid_types::UnixSeconds::new(
+                        crate::ec::current_timestamp(),
+                    )),
                 },
                 &mut response,
             )

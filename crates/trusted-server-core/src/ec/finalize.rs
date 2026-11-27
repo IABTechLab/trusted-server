@@ -25,7 +25,9 @@ use super::eid_types::UnixSeconds;
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
-use super::mirror::{MirrorCookie, build_mirror, mirror_consent, mirror_sources};
+use super::mirror::{
+    MirrorCookie, build_mirror, current_carried_mirror, mirror_consent, mirror_sources,
+};
 use super::page_load::{PageLoadWrite, RowChange};
 use super::prebid_eids::collect_eid_updates;
 use super::registry::{PartnerConfig, PartnerRegistry};
@@ -60,6 +62,10 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 ///
 /// `request` carries the inputs read from the request before routing (see
 /// [`FinalizeRequest`]).
+///
+/// Returns the mirror decision applied to the response, or `None` when the
+/// mirror cookie is left untouched. A [`MirrorCookie::Set`] is returned even
+/// when the request already carried that value and no `Set-Cookie` is sent.
 pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -67,11 +73,12 @@ pub async fn ec_finalize_response(
     registry: &PartnerRegistry,
     request: &FinalizeRequest<'_>,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<MirrorCookie> {
     let navigation =
         finalize_response_inner(settings, ec_context, kv, registry, request, response).await;
-    apply_mirror(ec_context, registry, navigation, request.now, response);
+    let mirror = apply_mirror(ec_context, registry, navigation, request.now, response);
     expire_retired_pull_marker(ec_context, response);
+    mirror
 }
 
 /// Request inputs [`ec_finalize_response`] reads besides the [`EcContext`].
@@ -103,11 +110,12 @@ pub struct FinalizeRequest<'a> {
 /// The cookie is only expired when the request carried it, and only set when
 /// its value differs from the one the request carried, so responses that
 /// leave the mirror as it was stay free of `Set-Cookie` and keep their
-/// cacheability. An unchanged mirror is therefore not re-extended; once it
-/// lapses, the next navigation sets it again. Every UID's `exp` is capped at
-/// the start of the current UTC day plus 30 days, so a returning reader whose
-/// mirror holds UIDs at that cap gets at most one mirror `Set-Cookie` per UTC
-/// day.
+/// cacheability. Every UID's `exp` is capped at the start of the current UTC
+/// day plus 30 days, so a rebuilt mirror's `exp` moves daily; a carried
+/// mirror that differs only by such an earlier `exp`, at least 7 days away,
+/// is kept instead ([`current_carried_mirror`]). An unchanged returning
+/// reader therefore gets a mirror `Set-Cookie` only when a UID nears its
+/// `exp`, about once every 23 days for UIDs at the cap.
 ///
 /// A navigation whose clock read failed (`now` is `None`) cannot build a
 /// mirror from a live row, since UID liveness and `exp` depend on the time,
@@ -120,20 +128,31 @@ pub struct FinalizeRequest<'a> {
 /// any mirrored partner it holds, when a provider excludes such a partner's
 /// source on this GDPR visit, or when a provider's cookies on this request
 /// record an opt-out for it; otherwise it is left untouched.
+///
+/// Returns the decision, or `None` when the cookie is left untouched. A
+/// [`MirrorCookie::Set`] is returned even when the carried value already
+/// matches and no `Set-Cookie` is emitted.
 fn apply_mirror(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
     navigation: bool,
     now: Option<UnixSeconds>,
     response: &mut Response<EdgeBody>,
-) {
+) -> Option<MirrorCookie> {
     let decision = if !mirror_consent(ec_context.consent()) {
         MirrorCookie::Expire
     } else if navigation
         && let Some(row) = mirror_row(ec_context)
         && let Some(decision) = rebuild_mirror(row, ec_context, registry, now)
     {
-        decision
+        // Keep a carried mirror whose only difference is an earlier `exp`
+        // that is not yet near.
+        match (decision, ec_context.mirror_cookie(), now) {
+            (MirrorCookie::Set(rebuilt), Some(carried), Some(now)) => {
+                MirrorCookie::Set(current_carried_mirror(carried, &rebuilt, now).unwrap_or(rebuilt))
+            }
+            (decision, _, _) => decision,
+        }
     } else if mirror_vendor_denied(ec_context, registry) {
         // The mirror cannot be rebuilt here, and it may hold UIDs of a
         // provider whose TCF vendor consent is now denied, whose source is
@@ -145,9 +164,9 @@ fn apply_mirror(
                 "Leaving the mirror cookie untouched: identity row or clock is unavailable"
             );
         }
-        return;
+        return None;
     };
-    match decision {
+    match &decision {
         MirrorCookie::Set(value) if ec_context.mirror_cookie() == Some(value.as_str()) => {}
         MirrorCookie::Set(value) => append_cookie(
             response,
@@ -164,6 +183,7 @@ fn apply_mirror(
         }
         MirrorCookie::Expire => {}
     }
+    Some(decision)
 }
 
 /// Rebuilds the mirror from `row` on a navigation.
@@ -1831,6 +1851,17 @@ mod tests {
     /// Runs a returning reader's finalize and returns the `_pubcid` cookies
     /// the response sets and the `SharedID` the record holds afterwards.
     async fn run_write_back(case: WriteBackCase<'_>) -> (Vec<String>, Option<String>) {
+        let (cookies, stored, _) = run_write_back_outcome(case, false).await;
+        (cookies, stored)
+    }
+
+    /// As [`run_write_back`], also returning the `SharedID` the response
+    /// leaves the reader with (what the EC route reports). With `preload`,
+    /// the record is read before finalize, as the EC route does.
+    async fn run_write_back_outcome(
+        case: WriteBackCase<'_>,
+        preload: bool,
+    ) -> (Vec<String>, Option<String>, Option<String>) {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("wrback");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1860,6 +1891,9 @@ mod tests {
             ec_context.set_navigation_permit(NavigationPermit::for_test());
         }
         ec_context.set_lookup_results(case.lookups);
+        if preload {
+            ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id).await);
+        }
         let registry = PartnerRegistry::from_config(&[make_partner("pubcid.org")])
             .expect("should build registry");
         let mut response = empty_response();
@@ -1883,7 +1917,60 @@ mod tests {
             .await
             .expect("should read store")
             .and_then(|(entry, _)| entry.ids.get("pubcid.org").map(|id| id.uid.clone()));
-        (pubcid_set_cookies(&response), stored)
+        (
+            pubcid_set_cookies(&response),
+            stored,
+            ec_context.kept_sharedid().map(str::to_owned),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kept_sharedid_follows_the_opt_out_and_purpose_four() {
+        let cases = [
+            (
+                navigation_case(Some(STORED_SHAREDID), "other=1"),
+                Some(STORED_SHAREDID),
+                "a SharedID the response sets",
+            ),
+            (
+                navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={STORED_SHAREDID}")),
+                Some(STORED_SHAREDID),
+                "a SharedID the browser already holds",
+            ),
+            (
+                WriteBackCase {
+                    consent: purpose_one_only_consent(),
+                    ..navigation_case(Some(STORED_SHAREDID), &format!("_pubcid={OTHER_SHAREDID}"))
+                },
+                None,
+                "Purpose 4 denied (SID-6)",
+            ),
+            (
+                navigation_case(
+                    Some(STORED_SHAREDID),
+                    &format!("_pubcid={STORED_SHAREDID}; _pubcid_optout=1"),
+                ),
+                None,
+                "_pubcid_optout (SID-2)",
+            ),
+        ];
+
+        for (case, expected, label) in cases {
+            let (_, _, kept) = run_write_back_outcome(case, true).await;
+            assert_eq!(
+                kept.as_deref(),
+                expected,
+                "should report the kept SharedID for {label}"
+            );
+        }
+        // WB-3: a record without SharedID gets one created on this navigation.
+        let (_, stored, kept) =
+            run_write_back_outcome(navigation_case(None, "other=1"), true).await;
+        assert!(stored.is_some(), "should create a SharedID");
+        assert_eq!(
+            kept, stored,
+            "should report the SharedID created on this navigation"
+        );
     }
 
     fn navigation_case<'a>(stored: Option<&'a str>, cookies: &str) -> WriteBackCase<'a> {
@@ -2835,12 +2922,13 @@ mod tests {
         run_mirror_request(lookups, mirror, kv_read_failed, true).await
     }
 
-    /// Runs a mirror navigation at request time `now`.
+    /// Runs a mirror navigation at request time `now`, returning the response
+    /// and the mirror decision finalize reports.
     async fn run_mirror_navigation_at(
         lookups: LookupResults,
         mirror: Option<&str>,
         now: Option<UnixSeconds>,
-    ) -> Response<EdgeBody> {
+    ) -> (Response<EdgeBody>, Option<MirrorCookie>) {
         run_mirror_request_at(lookups, mirror, false, true, MirrorGate::Open, now).await
     }
 
@@ -2883,11 +2971,13 @@ mod tests {
         navigation: bool,
         gate: MirrorGate,
     ) -> Response<EdgeBody> {
-        run_mirror_request_at(lookups, mirror, kv_read_failed, navigation, gate, NOW).await
+        run_mirror_request_at(lookups, mirror, kv_read_failed, navigation, gate, NOW)
+            .await
+            .0
     }
 
     /// Runs a mirror request at request time `now` with the source withheld
-    /// as `gate` says.
+    /// as `gate` says, returning the response and the mirror decision.
     async fn run_mirror_request_at(
         lookups: LookupResults,
         mirror: Option<&str>,
@@ -2895,7 +2985,7 @@ mod tests {
         navigation: bool,
         gate: MirrorGate,
         now: Option<UnixSeconds>,
-    ) -> Response<EdgeBody> {
+    ) -> (Response<EdgeBody>, Option<MirrorCookie>) {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mirr01");
         let graph = KvIdentityGraph::in_memory("mirror_store");
@@ -2944,7 +3034,7 @@ mod tests {
         registry.mark_provider_owned("ids.example.com", owner_vendor);
         let mut response = empty_response();
 
-        ec_finalize_response(
+        let decision = ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&graph),
@@ -2957,7 +3047,7 @@ mod tests {
             &mut response,
         )
         .await;
-        response
+        (response, decision)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3143,10 +3233,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn no_expiry_mirror_is_kept_within_a_utc_day_and_re_set_once_on_the_next() {
-        // Arrange
+    async fn no_expiry_mirror_is_kept_until_its_exp_is_within_seven_days() {
+        // Arrange: the first navigation sets `exp` to day 0 plus 30 days.
+        const DAY: u64 = 86_400;
         let at = |seconds: u64| Some(UnixSeconds::new(MIRROR_DAY_START + seconds));
-        let first = run_mirror_navigation_at(provider_found("ids.example.com"), None, at(60)).await;
+        let (first, _) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), None, at(60)).await;
         let set = mirror_cookies(&first);
         assert_eq!(
             set.len(),
@@ -3154,33 +3246,53 @@ mod tests {
             "should set the mirror on the first navigation"
         );
         let value = mirror_value(&set[0]).to_owned();
+        let returning = |seconds: u64| {
+            let value = value.clone();
+            async move {
+                run_mirror_navigation_at(
+                    provider_found("ids.example.com"),
+                    Some(&value),
+                    at(seconds),
+                )
+                .await
+            }
+        };
 
         // Act
-        let same_day =
-            run_mirror_navigation_at(provider_found("ids.example.com"), Some(&value), at(86_399))
-                .await;
-        let next_day = run_mirror_navigation_at(
-            provider_found("ids.example.com"),
-            Some(&value),
-            at(86_400 + 60),
-        )
-        .await;
+        let (same_day, _) = returning(DAY - 1).await;
+        let (next_day, next_day_decision) = returning(DAY + 60).await;
+        let (day_22, _) = returning(22 * DAY + 60).await;
+        let (day_23, _) = returning(23 * DAY + 60).await;
 
         // Assert
-        assert!(
-            mirror_cookies(&same_day).is_empty(),
-            "should not re-set an unchanged mirror later the same UTC day"
-        );
-        let next_day_cookies = mirror_cookies(&next_day);
+        for (response, when) in [
+            (&same_day, "later the same UTC day"),
+            (&next_day, "on the next UTC day"),
+            (&day_22, "while its exp is more than 7 days away"),
+        ] {
+            assert!(
+                mirror_cookies(response).is_empty(),
+                "should keep an unchanged mirror {when}"
+            );
+        }
+        match next_day_decision {
+            Some(MirrorCookie::Set(kept)) => assert_eq!(
+                kept.as_str(),
+                value,
+                "should report the kept mirror, so the EC route answers with it"
+            ),
+            other => panic!("should decide to keep the mirror, got {other:?}"),
+        }
+        let refreshed = mirror_cookies(&day_23);
         assert_eq!(
-            next_day_cookies.len(),
+            refreshed.len(),
             1,
-            "should re-set the mirror once on the next UTC day"
+            "should re-set the mirror once its exp is within 7 days"
         );
         assert_ne!(
-            mirror_value(&next_day_cookies[0]),
+            mirror_value(&refreshed[0]),
             value,
-            "should carry the next day's exp"
+            "should carry the current exp"
         );
     }
 
@@ -3288,7 +3400,7 @@ mod tests {
         let value = mirror_value(&set[0]);
 
         // Act
-        let unchanged =
+        let (unchanged, decision) =
             run_mirror_navigation_at(provider_found("ids.example.com"), Some(value), NOW).await;
         let changed =
             run_mirror_navigation(provider_found("ids.example.com"), Some("stale"), false).await;
@@ -3297,6 +3409,10 @@ mod tests {
         assert!(
             mirror_cookies(&unchanged).is_empty(),
             "should not re-set a mirror whose value is unchanged"
+        );
+        assert!(
+            matches!(&decision, Some(MirrorCookie::Set(kept)) if kept.as_str() == value),
+            "should still report the unchanged mirror as the response's mirror"
         );
         assert_eq!(
             mirror_cookies(&changed).len(),
@@ -3308,10 +3424,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clock_failure_leaves_the_mirror_untouched_on_a_navigation() {
         // Act
-        let fresh = run_mirror_navigation_at(provider_found("ids.example.com"), None, None).await;
-        let carried =
+        let (fresh, fresh_decision) =
+            run_mirror_navigation_at(provider_found("ids.example.com"), None, None).await;
+        let (carried, carried_decision) =
             run_mirror_navigation_at(provider_found("ids.example.com"), Some("stale"), None).await;
-        let denied = run_mirror_request_at(
+        let (denied, denied_decision) = run_mirror_request_at(
             provider_found("ids.example.com"),
             Some("stale"),
             false,
@@ -3323,16 +3440,18 @@ mod tests {
 
         // Assert
         assert!(
-            mirror_cookies(&fresh).is_empty(),
+            mirror_cookies(&fresh).is_empty() && fresh_decision.is_none(),
             "should not set the mirror without a clock"
         );
         assert!(
-            mirror_cookies(&carried).is_empty(),
+            mirror_cookies(&carried).is_empty() && carried_decision.is_none(),
             "should not re-set a carried mirror without a clock"
         );
         let denied_cookies = mirror_cookies(&denied);
         assert!(
-            denied_cookies.len() == 1 && denied_cookies[0].contains("Max-Age=0"),
+            denied_cookies.len() == 1
+                && denied_cookies[0].contains("Max-Age=0")
+                && denied_decision == Some(MirrorCookie::Expire),
             "should still expire a mirror holding a denied vendor's UIDs without a clock"
         );
     }
@@ -3368,7 +3487,7 @@ mod tests {
             let mut response = empty_response();
 
             // Act
-            ec_finalize_response(
+            let decision = ec_finalize_response(
                 &settings,
                 &mut ec_context,
                 Some(&graph),
@@ -3385,7 +3504,9 @@ mod tests {
             // Assert
             let cookies = mirror_cookies(&response);
             assert!(
-                cookies.len() == 1 && cookies[0].contains("Max-Age=0"),
+                cookies.len() == 1
+                    && cookies[0].contains("Max-Age=0")
+                    && decision == Some(MirrorCookie::Expire),
                 "{label}: should expire a carried mirror without a clock"
             );
             assert!(

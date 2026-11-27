@@ -478,6 +478,19 @@ pub(crate) async fn apply_sharedid_write_back(
         return;
     }
 
+    // SID-2 and SID-6: the reader keeps the stored SharedID only when it is
+    // not opted out and Purpose 4 allows EIDs; it is then set or already
+    // matches the browser cookie.
+    let kept = match &decision {
+        SharedIdWriteBack::SetBoth(value) => Some(value.clone()),
+        SharedIdWriteBack::Unchanged | SharedIdWriteBack::SetConsentHash
+            if eid_allowed && !sharedid.opted_out =>
+        {
+            stored.clone()
+        }
+        _ => None,
+    };
+    ec_context.set_kept_sharedid(kept);
     match decision {
         SharedIdWriteBack::Unchanged => {}
         SharedIdWriteBack::ExpireBoth => expire_sharedid_cookies(settings, sharedid, response),

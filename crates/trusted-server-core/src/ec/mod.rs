@@ -354,6 +354,9 @@ pub struct EcContext {
     /// Sources of identity providers whose first-party cookies on this
     /// request record an opt-out; their IDs never leave the server for it.
     cookie_opted_out_sources: Vec<String>,
+    /// The `SharedID` this response leaves the reader with, when SID-2 and
+    /// SID-6 allow it, as decided by the `SharedID` write-back.
+    kept_sharedid: Option<String>,
 }
 
 impl EcContext {
@@ -442,6 +445,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         })
     }
 
@@ -668,6 +672,17 @@ impl EcContext {
         self.mirror_cookie.as_deref()
     }
 
+    /// The `SharedID` this response leaves the reader with, when the
+    /// `SharedID` write-back ran and SID-2 and SID-6 allow it.
+    #[must_use]
+    pub(crate) fn kept_sharedid(&self) -> Option<&str> {
+        self.kept_sharedid.as_deref()
+    }
+
+    pub(crate) fn set_kept_sharedid(&mut self, sharedid: Option<String>) {
+        self.kept_sharedid = sharedid;
+    }
+
     /// Sets the mirror cookie the request carried, for tests.
     #[cfg(test)]
     pub(crate) fn set_mirror_cookie_for_test(&mut self, value: Option<&str>) {
@@ -816,6 +831,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -847,6 +863,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 
@@ -881,6 +898,7 @@ impl EcContext {
             lookup_results: LookupResults::default(),
             pending_entry: None,
             cookie_opted_out_sources: Vec::new(),
+            kept_sharedid: None,
         }
     }
 }

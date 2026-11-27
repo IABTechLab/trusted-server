@@ -19,6 +19,7 @@ use crate::ec::finalize::{FinalizeRequest, ec_finalize_response};
 use crate::ec::identify::{answer_identify_locally, cors_preflight_identify, handle_identify};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_backend::EcKvStore;
+use crate::ec::mirror::MirrorCookie;
 use crate::ec::page_load::NavigationPermit;
 use crate::ec::sharedid::SharedIdRequest;
 use crate::ec::{EcContext, EidSyncSource, checked_current_timestamp};
@@ -162,7 +163,9 @@ impl IdentityApp {
     /// are filtered first on ineligible responses; every expiry remains private.
     ///
     /// Reads the clock at most once, and only for a navigation with an
-    /// eligible, non-redirect response.
+    /// eligible, non-redirect response. Returns the mirror decision the
+    /// response carries, or `None` when the mirror cookie is left untouched or
+    /// the response is not eligible for identity cookies.
     pub async fn finalize(
         &self,
         context: &mut EcContext,
@@ -170,7 +173,7 @@ impl IdentityApp {
         sharedid: &SharedIdRequest,
         use_store: bool,
         response: &mut Response,
-    ) {
+    ) -> Option<MirrorCookie> {
         let ec_route = response.extensions().get::<EcRouteResponse>().is_some();
         // A document revalidation inherits the cached representation: 304
         // commonly omits Content-Type, and keeps the navigation permission.
@@ -202,7 +205,7 @@ impl IdentityApp {
         .then(checked_current_timestamp)
         .flatten()
         .map(UnixSeconds::new);
-        ec_finalize_response(
+        let mirror = ec_finalize_response(
             &self.settings,
             context,
             graph.as_ref(),
@@ -234,6 +237,7 @@ impl IdentityApp {
         {
             enforce_terminal_private_cache_privacy(response);
         }
+        mirror.filter(|_| eligible)
     }
 
     fn filter_ineligible_identity_cookies(&self, response: &mut Response, core_generated: bool) {
