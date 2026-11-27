@@ -100,10 +100,15 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 # Device-signal rule for EC creation. "lenient" (default) blocks only known
-# non-browser fingerprints (none are listed yet, so it blocks no client today);
-# "strict" also requires trusted JA4 and a recognized User-Agent platform, so
-# clients without JA4 create no EC. Only Fastly supplies trusted JA4.
+# non-browsers, such as a trusted JA4 whose TLS client family contradicts the
+# User-Agent's browser family; "strict" also requires trusted JA4 and a
+# recognized User-Agent platform, so clients without JA4 create no EC.
 # browser_gate = "lenient"
+# JA4 contradictions that do not block EC creation. "off" (default) exempts
+# none; "non_browser" exempts a non-browser TLS stack (Python's) behind a
+# browser User-Agent, for readers behind a TLS-intercepting proxy, while a
+# browser-engine mismatch still blocks; "all" exempts every contradiction.
+# ja4_contradiction_exempt = "off"
 
 # Fastly persistence uses this exact physical binding. Provider omission is
 # Fastly-only; native providers require explicit configuration. An ordinary

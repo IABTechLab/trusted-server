@@ -98,7 +98,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::manifest::ResolvedLoggingConfig;
 use edgezero_core::outbound::ResponseDecoding;
-use edgezero_core::router::RouterService;
+use edgezero_core::router::{RouterBuilder, RouterService};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::{AuctionIdentity, handle_auction};
 use trusted_server_core::auction::plan::validate_fastly_backend_bound;
@@ -1284,6 +1284,29 @@ pub(crate) fn assemble_app(
     Ok(RetainedApp { app, state })
 }
 
+/// Assembles the application as [`assemble_app`] does, with `middleware`
+/// running after the application's own middleware.
+///
+/// The identity conformance runner uses it to supply what Viceroy cannot.
+///
+/// # Errors
+///
+/// Returns the same errors as [`assemble_app`].
+#[cfg(test)]
+pub(crate) fn assemble_app_with_middleware(
+    settings: Settings,
+    middleware: impl edgezero_core::middleware::Middleware,
+) -> Result<RetainedApp, EdgeError> {
+    let state = startup_state(Ok(settings), &"")?;
+    let app = App::from_router::<TrustedServerApp>(
+        TrustedServerApp::router_for_state(&state)
+            .middleware(middleware)
+            .build(),
+        FASTLY_PLATFORM,
+    )?;
+    Ok(RetainedApp { app, state })
+}
+
 /// Builds the [`AppState`] from loaded `settings`.
 ///
 /// # Errors
@@ -1304,6 +1327,10 @@ fn startup_state(
 
 impl TrustedServerApp {
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
+        Self::router_for_state(state).build()
+    }
+
+    fn router_for_state(state: &Arc<AppState>) -> RouterBuilder {
         let mut router = RouterService::builder()
             .pre_dispatch_hook(ProbePreDispatchHook::new(
                 StartupState::Ready,
@@ -1353,7 +1380,7 @@ impl TrustedServerApp {
             router = router.route("/{*rest}", method, fallback_handler.clone());
         }
 
-        router.build()
+        router
     }
 }
 
@@ -1456,6 +1483,8 @@ mod tests {
     use edgezero_core::http::{
         HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
     };
+    use edgezero_core::ingress::RequestIngress;
+    use edgezero_core::ja4::Ja4Source;
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::outbound::ResponseDecoding;
     use edgezero_core::params::PathParams;
@@ -1494,6 +1523,10 @@ mod tests {
     };
     use trusted_server_core::settings::{EcPartner, IdentityProviderConfig, Settings};
     use trusted_server_core::test_support::identity_conformance::RecordingStore;
+    use trusted_server_core::test_support::ja4::{
+        CHROME_USER_AGENT, CHROMIUM_JA4, PYTHON_JA4, captured_ja4, insert_browser_signals,
+        insert_ja4,
+    };
     use trusted_server_core::test_support::logging::LogCapture;
     use trusted_server_core::test_support::scripted_client::{
         RecordedRequest, ScriptedHttpClient, ScriptedReply, TestClock,
@@ -3213,12 +3246,7 @@ mod tests {
             HeaderValue::from_bytes(fetch_destination.as_bytes())
                 .expect("should parse fetch destination"),
         );
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut request);
         request
     }
 
@@ -3258,7 +3286,7 @@ mod tests {
             browser_request(Method::GET, "/another-article", "document");
         navigation_without_browser_signals
             .extensions_mut()
-            .remove::<DeviceSignals>();
+            .remove::<RequestIngress>();
         let navigation_without_browser_signals = route(&router, navigation_without_browser_signals);
         assert_eq!(
             eid_sync_source_of(&navigation_without_browser_signals),
@@ -3404,12 +3432,7 @@ mod tests {
         request
             .headers_mut()
             .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut request);
 
         let mut response = route_with_host_geo(&router, request, &ScriptedHttpClient::forbidding());
 
@@ -3764,10 +3787,23 @@ mod tests {
                 "adUnits": [{"code": "example-slot", "mediaTypes": {"banner": {"sizes": [[300, 250]]}}}],
                 "eids": [{"source": "body.example.com", "uids": [{"id": "body-uid", "atype": 1}]}]
             }).to_string());
-            request.extensions_mut().insert(DeviceSignals {
-                known_browser: Some(known_browser),
-                ..DeviceSignals::derive("example-agent", None, None)
-            });
+            // A trusted Python JA4 behind a Chrome User-Agent is a known
+            // non-browser (ID-7); a Chromium JA4 is the browser control.
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(CHROME_USER_AGENT),
+            );
+            insert_ja4(
+                request.extensions_mut(),
+                captured_ja4(
+                    if known_browser {
+                        CHROMIUM_JA4
+                    } else {
+                        PYTHON_JA4
+                    },
+                    Ja4Source::RuntimeTls,
+                ),
+            );
 
             let router = TrustedServerApp::routes_for_state(&fixture.state);
             let mut response = route_on_clock(&router, request, &fixture);
@@ -4627,21 +4663,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_device_signals_from_extension_reach_ec_finalize_state() {
-        // Regression guard for the EdgeZero JA4/H2 signal loss: the entry point
-        // derives DeviceSignals from the original FastlyRequest (the only place
-        // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
-        // them in the request extensions. A browser-shaped signal must survive
-        // dispatch so the EC bot gate classifies the request as a real browser
-        // and keeps the KV-backed generation/finalize path active.
+    fn ingress_browser_signals_reach_ec_finalize_state() {
+        // A browser User-Agent with the runtime TLS JA4 EdgeZero's ingress
+        // captured must reach the EC bot gate through dispatch, so it
+        // classifies the request as a real browser and keeps the KV-backed
+        // generation/finalize path active.
         let router = test_router();
         let mut req = empty_request(Method::GET, "/some-page");
-        req.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut req);
 
         let response = route(&router, req);
 
@@ -4649,13 +4678,12 @@ mod tests {
             .extensions()
             .get::<super::EcFinalizeState>()
             .expect("fallback response should carry EcFinalizeState");
-        assert_eq!(
+        assert!(
             finalize
                 .ec_context
                 .device_signals()
-                .and_then(|signals| signals.ja4_class.as_deref()),
-            Some("t13d1516h2"),
-            "browser-shaped JA4/H2 signals from the request extension must reach EC finalization"
+                .is_some_and(DeviceSignals::looks_like_browser),
+            "browser-shaped User-Agent and ingress JA4 must mark the request as a real browser"
         );
         assert!(
             finalize.use_finalize_kv,
@@ -4728,12 +4756,7 @@ mod tests {
                 .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
                 .body(Body::empty())
                 .expect("should build request");
-            req.extensions_mut().insert(DeviceSignals::derive(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-                Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-                Some("1:65536;2:0;4:6291456;6:262144"),
-            ));
+            insert_browser_signals(&mut req);
             req
         };
         let context = context_with_client(
@@ -4771,16 +4794,71 @@ mod tests {
     }
 
     #[test]
+    fn ec_request_state_refuses_a_ja4_that_contradicts_the_user_agent() {
+        let state = build_state_from_settings(test_settings()).expect("should build app state");
+        let context = context_with_client(
+            empty_request(Method::GET, "/article"),
+            ScriptedHttpClient::forbidding().http_client(),
+        );
+        let services =
+            build_per_request_services(&state, &context).expect("should build request services");
+        for (ja4, allowed) in [(CHROMIUM_JA4, true), (PYTHON_JA4, false)] {
+            let mut req = request_builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/article")
+                .header(header::USER_AGENT, CHROME_USER_AGENT)
+                .body(Body::empty())
+                .expect("should build request");
+            // As EdgeZero's Fastly ingress records the runtime TLS JA4.
+            insert_ja4(
+                req.extensions_mut(),
+                captured_ja4(ja4, Ja4Source::RuntimeTls),
+            );
+
+            let ec = super::build_ec_request_state(&state.identity, &services, &req);
+
+            assert_eq!(
+                ec.is_real_browser, allowed,
+                "should allow creation only when the JA4 {ja4:?} matches the Chrome User-Agent"
+            );
+        }
+    }
+
+    #[test]
+    fn request_without_browser_signals_does_not_look_like_a_browser() {
+        // Without a User-Agent or an ingress JA4, the derived signals have no
+        // JA4 class or platform, so the request does not look like a browser.
+        let router = test_router();
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            !finalize
+                .ec_context
+                .device_signals()
+                .is_some_and(DeviceSignals::looks_like_browser),
+            "a request without a User-Agent or ingress JA4 should not look like a real browser"
+        );
+    }
+
+    #[test]
     fn identity_writes_are_refused_only_for_known_non_browsers() {
-        // Without entry-point-captured signals the reconstructed request cannot
-        // expose JA4/H2. Missing signals must never refuse identity writes; only
-        // trusted signals classifying a known non-browser do.
+        // Missing signals must never refuse identity writes; only trusted
+        // signals classifying a known non-browser do. A trusted Python JA4
+        // behind a Chrome User-Agent is one (ID-7).
         let router = test_router();
         let mut known_non_browser = empty_request(Method::GET, "/some-page");
-        known_non_browser.extensions_mut().insert(DeviceSignals {
-            known_browser: Some(false),
-            ..DeviceSignals::derive("example-agent", None, None)
-        });
+        known_non_browser.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(CHROME_USER_AGENT),
+        );
+        insert_ja4(
+            known_non_browser.extensions_mut(),
+            captured_ja4(PYTHON_JA4, Ja4Source::RuntimeTls),
+        );
 
         for (label, request, writes) in [
             (
@@ -5042,12 +5120,7 @@ mod tests {
             )
             .body(Body::empty())
             .expect("should build authenticated EIDs diagnostic request");
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut request);
 
         let response = route(&router, request);
 
@@ -5080,12 +5153,7 @@ mod tests {
             )
             .body(Body::empty())
             .expect("should build authenticated EC diagnostic request");
-        request.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut request);
 
         let response = route(&router, request);
 
@@ -5785,12 +5853,7 @@ mod tests {
             .header("sec-fetch-dest", "document")
             .body(Body::empty())
             .expect("should build request");
-        req.extensions_mut().insert(DeviceSignals::derive(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
-            Some("1:65536;2:0;4:6291456;6:262144"),
-        ));
+        insert_browser_signals(&mut req);
         req
     }
 

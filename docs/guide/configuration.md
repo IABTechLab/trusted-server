@@ -892,18 +892,36 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `identity_after_response_budget_ms` | Integer        | No       | After-response lookup budget, 1–5000 ms (default 2000)                                |
 | `identity_providers`                | Array          | No       | Server-side identity providers (see below)                                            |
 | `browser_gate`                      | String         | No       | Device-signal rule for EC creation: `lenient` (default) or `strict` (see below)       |
+| `ja4_contradiction_exempt`          | String         | No       | Contradictions that do not block EC creation: `off` (default), `non_browser` or `all` |
 
 `browser_gate` decides which clients may create an Edge Cookie from their trusted
 device signals. Consent and the navigation policy apply under both rules.
 
-- `lenient` (default) blocks only clients whose JA4 and HTTP/2 fingerprints
-  match a known non-browser pattern. The built-in fingerprint table lists no
-  non-browser pattern yet, so `lenient` blocks no client today. A client
-  without trusted JA4, such as one behind a proxy or on a runtime that supplies
-  none, stays eligible for EC creation.
+- `lenient` (default) blocks only known non-browsers: clients whose trusted
+  JA4 names a TLS client family that contradicts the User-Agent's browser
+  family, such as a Chrome User-Agent over Python's TLS stack (see
+  [Edge Cookies](/guide/edge-cookies#request-lifecycle)). A client without
+  trusted JA4, such as one behind a proxy or on a runtime that supplies none,
+  or with a JA4 the rule does not recognize, stays eligible for EC creation.
 - `strict` also requires a JA4 class and a recognized User-Agent platform. A
-  client without trusted JA4 creates no EC. Only Fastly supplies trusted JA4
-  today, so under `strict` the Axum, Cloudflare and Spin adapters create no EC.
+  client without trusted JA4 creates no EC. That includes a JA4 the runtime
+  returns but EdgeZero rejects as malformed, such as section 1 alone, which
+  counts as no JA4 under both rules. `strict` blocks everything `lenient`
+  blocks.
+
+`ja4_contradiction_exempt` names the JA4 contradictions that stop blocking
+creation under either rule:
+
+- `off` (default) exempts nothing: every contradiction blocks.
+- `non_browser` exempts a non-browser TLS stack (the rule lists only Python's
+  default TLS context) behind a browser User-Agent. Use it when readers reach the site through a TLS-intercepting
+  proxy, which replaces their JA4 with its own. A User-Agent of one browser
+  engine over another engine's TLS stack still blocks.
+- `all` exempts every contradiction, which turns the JA4 rule off.
+
+An unknown value fails config loading. The rule runs on Fastly and on Axum
+with a trusted JA4 proxy header. Cloudflare creates no ECs yet, so both keys
+have no effect there.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

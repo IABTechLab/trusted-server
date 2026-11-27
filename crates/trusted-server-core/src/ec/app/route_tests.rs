@@ -7,14 +7,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use edgezero_core::body::Body;
-use edgezero_core::http::{Method, StatusCode, header, request_builder};
+use edgezero_core::http::{HeaderValue, Method, StatusCode, header, request_builder};
 use edgezero_core::ingress::{InboundOrigin, OriginSource};
+use edgezero_core::ja4::Ja4Source;
 use error_stack::Report;
 use serde_json::json;
 
 use super::{EC_PATH, IdentityApp, IdentityPlatform, IdentityProviders};
 use crate::ec::coordinator::{ProviderCoordinator, RegisteredProvider};
-use crate::ec::device::DeviceSignals;
 use crate::ec::eid_types::SourceDomain;
 use crate::ec::kv_backend::EcKvStore as _;
 use crate::ec::kv_backend::test_support::InMemoryEcKv;
@@ -28,6 +28,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::http_util::RuntimeRequestOrigin;
 use crate::platform::test_support::{NoopConfigStore, NoopSecretStore, noop_services};
 use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
+use crate::test_support::ja4::{
+    CHROME_USER_AGENT, CHROMIUM_JA4, PYTHON_JA4, captured_ja4, insert_ja4,
+};
 use crate::test_support::tests::create_test_settings;
 
 const EXISTING_EC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
@@ -153,9 +156,18 @@ async fn ec_route_refused_client_with_existing_identity_never_calls_page_provide
             InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
                 .expect("should supply trusted fixture ingress"),
         ));
-        let mut signals = DeviceSignals::derive("Example browser", None, None);
-        signals.known_browser = Some(allowed);
-        request.extensions_mut().insert(signals);
+        // A trusted Python JA4 behind a Chrome User-Agent is one ID-7 refuses.
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(CHROME_USER_AGENT),
+        );
+        insert_ja4(
+            request.extensions_mut(),
+            captured_ja4(
+                if allowed { CHROMIUM_JA4 } else { PYTHON_JA4 },
+                Ja4Source::RuntimeTls,
+            ),
+        );
 
         let response = app.ec_route(&services, request).await;
 
