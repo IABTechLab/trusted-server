@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::commands::cache::{ADMIN_PASSWORD_ENVIRONMENT_VARIABLE, PurgeArgs};
 use crate::error::{CliResult, cli_error};
 
@@ -107,16 +108,29 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
         Ok::<_, String>((status, text))
     })?;
 
+    report_response(args.all, status, &response_body, out)
+}
+
+/// Validate the purge endpoint's answer and report it to the operator.
+///
+/// Service-supplied text passes through [`escape_terminal_text`] on both paths, so a
+/// compromised or misconfigured service cannot rewrite the terminal with control sequences.
+fn report_response(
+    all: bool,
+    status: reqwest::StatusCode,
+    response_body: &str,
+    out: &mut impl std::io::Write,
+) -> CliResult<()> {
     if status.is_success() {
-        let acknowledgment: PurgeAcknowledgment = serde_json::from_str(&response_body)
+        let acknowledgment: PurgeAcknowledgment = serde_json::from_str(response_body)
             .map_err(|error| format!("invalid purge acknowledgment: {error}"))?;
-        let expected_scope = if args.all { "all" } else { "url" };
+        let expected_scope = if all { "all" } else { "url" };
         if !acknowledgment.purged || acknowledgment.scope != expected_scope {
             return cli_error(format!(
                 "service did not acknowledge a successful {expected_scope} purge"
             ));
         }
-        if !args.all
+        if !all
             && acknowledgment
                 .surrogate_key
                 .as_deref()
@@ -124,7 +138,7 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
         {
             return cli_error("URL purge acknowledgment is missing its surrogate key");
         }
-        writeln!(out, "{response_body}")
+        writeln!(out, "{}", escape_terminal_text(response_body))
             .map_err(|error| format!("failed to write the purge result: {error}"))?;
         return Ok(());
     }
@@ -139,7 +153,7 @@ pub fn run_purge(args: &PurgeArgs, out: &mut impl std::io::Write) -> CliResult<(
     };
     cli_error(format!(
         "purge failed: {status}{hint}\n{}",
-        response_body.trim()
+        escape_terminal_text(response_body.trim())
     ))
 }
 
@@ -154,6 +168,50 @@ mod tests {
             page: page.map(str::to_owned),
             username: "admin".to_owned(),
         }
+    }
+
+    #[test]
+    fn success_output_escapes_terminal_control_sequences() {
+        // JSON forbids raw control characters inside strings, so the only ones a parseable
+        // acknowledgment can carry are whitespace between tokens, such as a carriage return.
+        let body = "{\"purged\":true,\r\"scope\":\"all\"}";
+        let mut out = Vec::new();
+
+        report_response(true, reqwest::StatusCode::OK, body, &mut out)
+            .expect("should accept a valid acknowledgment");
+
+        let rendered = String::from_utf8(out).expect("should write UTF-8");
+        assert!(
+            !rendered.contains('\r'),
+            "should not pass raw control characters through: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u{000D}"),
+            "should render the carriage return visibly: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn failure_output_escapes_terminal_control_sequences() {
+        let mut out = Vec::new();
+
+        let error = report_response(
+            true,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "boom\u{1b}[1A\rpurge succeeded",
+            &mut out,
+        )
+        .expect_err("should fail on a server error");
+
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\r'),
+            "should not pass raw control characters through: {error:?}"
+        );
+        assert!(
+            error.contains("\\u{001B}") && error.contains("\\u{000D}"),
+            "should render control characters visibly: {error:?}"
+        );
+        assert!(out.is_empty(), "should write nothing on failure");
     }
 
     #[test]
