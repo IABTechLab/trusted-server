@@ -35,11 +35,12 @@ staging isolation comes from selecting a different physical store with
 
 The manifest declares portable logical IDs:
 
-| Kind          | Logical ID                  |
-| ------------- | --------------------------- |
-| KV            | `trusted_server_runtime_kv` |
-| Configuration | `trusted_server_config`     |
-| Secrets       | `trusted_server_secrets`    |
+| Kind            | Logical ID                  |
+| --------------- | --------------------------- |
+| KV              | `trusted_server_runtime_kv` |
+| KV (EC records) | `trusted_server_kv`         |
+| Configuration   | `trusted_server_config`     |
+| Secrets         | `trusted_server_secrets`    |
 
 An adapter maps those IDs to platform resources. The runtime-facing
 `StoreName` used for reads and the management-facing `StoreId` used for

@@ -24,6 +24,7 @@ aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
 aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
 aws-dynamodb-ec = ["edgezero-adapter-axum/aws-dynamodb-records"]
 geo-cloudfront = ["edgezero-adapter-axum/geo-cloudfront"]
+celld-ec = ["edgezero-adapter-axum/celld-records"]
 geo-kv = ["edgezero-adapter-axum/geo-kv", "edgezero-adapter-axum/celld-kv"]
 
 [dependencies]
@@ -41,6 +42,7 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+edgezero-store-celld = { workspace = true, features = ["records"] }
 # SDK use is fixture administration only. Production persistence is EdgeZero-owned.
 aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-dynamodb = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

@@ -92,7 +92,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::ec_kv::FastlyEcKvStore;
+use crate::ec_record_store::LazyEcRecordStore;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::FASTLY_PLATFORM;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
@@ -131,7 +131,9 @@ use trusted_server_core::ec::kv_types::KvEntry;
 use trusted_server_core::ec::page_load::NavigationPermit;
 use trusted_server_core::ec::provider::{ClientSignals, RequestCookies};
 use trusted_server_core::ec::rate_limiter::RateLimiter;
+use trusted_server_core::ec::record_backend::EcRecordLayout;
 use trusted_server_core::ec::sharedid::SharedIdRequest;
+use trusted_server_core::ec::storage::{EcRuntime, EcStorageSelection};
 use trusted_server_core::ec::{EcContext, EcKvSnapshot, EidSyncSource};
 use trusted_server_core::edge_app::install_edge_policies;
 use trusted_server_core::error::{TrustedServerError, http_error, startup_error};
@@ -303,15 +305,7 @@ fn identity_app_with_providers(
     settings: Arc<Settings>,
     providers: IdentityProviders,
 ) -> Result<Arc<IdentityApp>, Report<TrustedServerError>> {
-    let record_store = settings.ec.ec_store.as_deref().map(|store_name| {
-        // A conformance run substitutes its inspectable fixture store, so
-        // every identity route and EC finalization reads and writes it.
-        #[cfg(test)]
-        if let Some(store) = crate::identity_conformance::fixture_store(store_name) {
-            return store;
-        }
-        Arc::new(FastlyEcKvStore::new(store_name)) as Arc<dyn EcKvStore + Send + Sync>
-    });
+    let record_store = open_identity_record_store(&settings)?;
     IdentityApp::build(
         settings,
         IdentityPlatform {
@@ -320,6 +314,31 @@ fn identity_app_with_providers(
             providers: Some(providers),
         },
     )
+}
+
+/// Selects the EC record store `ec.storage` (or the legacy `ec.ec_store`)
+/// names, held once per sandbox.
+///
+/// The Fastly binding is opened on the first EC operation, not here, so a
+/// missing or failing store fails only EC work rather than every route.
+///
+/// # Errors
+///
+/// Returns a configuration error for an invalid selection.
+pub(crate) fn open_identity_record_store(
+    settings: &Settings,
+) -> Result<Option<Arc<dyn EcKvStore + Send + Sync>>, Report<TrustedServerError>> {
+    let store_id = match settings.ec.resolve_storage(EcRuntime::Fastly)? {
+        None => return Ok(None),
+        Some(EcStorageSelection::Fastly(id) | EcStorageSelection::Records(id)) => id,
+    };
+    // A conformance run substitutes its inspectable fixture store, so
+    // every identity route and EC finalization reads and writes it.
+    #[cfg(test)]
+    if let Some(store) = crate::identity_conformance::fixture_store(store_id) {
+        return Ok(Some(store));
+    }
+    Ok(Some(Arc::new(LazyEcRecordStore::new(store_id.to_owned()))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,6 +1765,8 @@ impl Hooks for TrustedServerApp {
     /// set for each request with the finalize headers that do not depend on
     /// the response.
     fn configure(app: &mut App) -> Result<(), EdgeError> {
+        app.require_record_store("trusted_server_kv", EcRecordLayout)
+            .map_err(|_| EdgeError::validation("invalid Fastly EC record declaration"))?;
         install_edge_policies(
             app,
             version_synthesized_headers(
@@ -1787,7 +1808,7 @@ impl Hooks for TrustedServerApp {
             }),
             kv: Some(StoreMetadata {
                 default: RUNTIME_KV_STORE_ID,
-                ids: &[RUNTIME_KV_STORE_ID],
+                ids: &[RUNTIME_KV_STORE_ID, "trusted_server_kv"],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1937,6 +1958,21 @@ mod tests {
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
         assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
+
+    #[test]
+    fn startup_accepts_any_fastly_ec_store_link_name() {
+        // The EC store opens by its Fastly resource-link name on the first EC
+        // operation, so startup accepts a deployment's existing link name as
+        // well as the logical `trusted_server_kv` link.
+        for name in ["ec_id_store", "trusted_server_kv"] {
+            let mut settings = test_settings();
+            settings.ec.ec_store = Some(name.to_owned());
+            assert!(
+                build_state_from_settings(settings).is_ok(),
+                "should build app state for EC store link `{name}` without opening it"
+            );
+        }
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
@@ -3413,7 +3449,7 @@ mod tests {
             (Method::PATCH, "/_ts/api/v1/batch-sync"),
             (Method::DELETE, "/_ts/api/v1/batch-sync"),
         ];
-        for ec_store in [None, Some("ec_identity_store".to_owned())] {
+        for ec_store in [None, Some("trusted_server_kv".to_owned())] {
             let origin = ScriptedHttpClient::forbidding();
             let mut settings = test_settings();
             settings.ec.ec_store = ec_store.clone();
@@ -3440,7 +3476,7 @@ mod tests {
     fn identify_and_batch_sync_run_locally_with_record_store() {
         let origin = ScriptedHttpClient::forbidding();
         let mut settings = test_settings();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         let router = TrustedServerApp::routes_for_state(&app_state_for_settings(settings));
 
         let statuses = partner_api_statuses(&router, &origin);
@@ -3928,7 +3964,7 @@ mod tests {
         }))
         .expect("should build partner");
         let mut settings = test_settings();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings.ec.partners = vec![partner];
         // This build registers no kind, so the app state is built without the
         // provider and the test supplies its registry and coordinator.
@@ -4404,7 +4440,7 @@ mod tests {
     #[test]
     fn after_response_lookups_run_only_for_real_browsers() {
         let mut settings = test_settings();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings.ec.partners = vec![
             serde_json::from_value(serde_json::json!({
                 "name": "Pull partner",
@@ -4561,14 +4597,16 @@ mod tests {
     #[test]
     fn proxy_policy_named_route_preserves_withdrawal_and_terminal_privacy() {
         let mut settings = test_settings();
-        settings.ec.ec_store = Some("ec_identity_store".to_owned());
+        settings.ec.ec_store = Some("trusted_server_kv".to_owned());
         settings
             .response_headers
             .insert("cache-control".to_owned(), "public, max-age=600".to_owned());
         settings
             .response_headers
             .insert("etag".to_owned(), "late-validator".to_owned());
-        let graph = KvIdentityGraph::new(crate::ec_kv::FastlyEcKvStore::new("ec_identity_store"));
+        let graph = KvIdentityGraph::new(crate::ec_record_store::LazyEcRecordStore::new(
+            "trusted_server_kv".to_owned(),
+        ));
         let identity = format!("{}.Pd1234", "9".repeat(64));
         let mut entry = KvEntry::tombstone(1_700_000_000);
         entry.consent.ok = true;

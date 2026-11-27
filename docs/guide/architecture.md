@@ -142,9 +142,11 @@ Data collection operations are subject to available consent signals (TCF v2 form
 
 ### Fastly KV Store
 
-Edge Cookie records use the configured `ec.ec_store` KV Store
-(`ec_identity_store` by default). The separate `trusted_server_runtime_kv` store is
-wired for generic runtime KV, with no normal production consumer yet.
+Edge Cookie records use the KV Store that `[ec.storage]` selects, or the
+legacy `ec.ec_store`. Either names the KV store's resource link on the Fastly
+service, and the example config selects `trusted_server_kv`. The separate
+`trusted_server_runtime_kv` store is wired for generic runtime KV, with no
+normal production consumer yet.
 Configuration and JWK metadata use Config Stores, secrets use Secret Stores,
 and batch-sync counters use Edge Rate Limiting counters rather than KV.
 

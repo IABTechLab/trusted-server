@@ -98,6 +98,9 @@ fn build_state_with_services(
     mut settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    settings
+        .ec
+        .resolve_storage(trusted_server_core::ec::storage::EcRuntime::Native)?;
     trusted_server_core::ec::provider::reject_enabled_providers(&settings.ec, "Axum")?;
     settings.proxy.prepare_runtime()?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
