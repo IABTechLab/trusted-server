@@ -110,12 +110,12 @@ For the Prebid caller, the two other options were rejected:
   - `docs/guide/configuration.md` and `docs/guide/api-reference.md` wherever they describe these endpoints, the two creative switches or a disabled auction.
   - `TESTING.md`'s "Disabled auction" section, which describes the no-bid response, the `auction_disabled` telemetry event and the log line.
   - `docs/guide/integrations/prebid.md`, which should say that the shim sends no `trustedServer` bid while the auction is off.
-- **Prebid:** the injected flag in `integrations/prebid.rs` and its head-injection tests (the `for enabled in [true, false]` cases and the kill-switch test that checks `"serverSideBidders":[]`), and the shim in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` with Vitest coverage.
+- **Prebid:** the injected flag in `integrations/prebid.rs` and the head-injection test that checks the auction kill switch (`prepared_browser_injection_uses_only_plan_routes_and_browser_timeout_debug`, which asserts `"serverSideBidders":[]` for a disabled plan), and the shim in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` with Vitest coverage.
 - **Tests that lock in today's behavior:**
   - `proxy.rs`: the test that proxies HTML with `rewrite_creatives = false`.
-  - `auction/endpoints.rs`: `disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work` and `trace_auction_api_frozen_disabled_capture_delivers_private_evidence` assert the disabled branch's `200`, telemetry and trace facts. `trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active` uses a disabled auction only as a harness for trace slot-reference echoing, so it moves to an enabled auction with no bidding provider.
+  - `auction/endpoints.rs`: `disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work` asserts the disabled branch's `200` and `auction_disabled` telemetry, so a turned-off test replaces it. `trace_auction_api_frozen_disabled_capture_delivers_private_evidence` and `trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active` use a disabled auction only to reach a skipped trace. They move to an enabled auction with consent denied, whose branch in `handle_auction` also finishes the trace as skipped with `policy_skipped`, so their assertions stay. An enabled auction with no provider would not keep them, because only the disabled and consent-denied branches finish a trace with `policy_skipped`.
   - Route and parity tests that use "not `404`" to mean "routed", among them `auction_not_challenged_by_auth_parity` in `crates/trusted-server-integration-tests/tests/parity.rs`. `/auction` is off under a default config, so these need a config with the auction on.
-- **`CHANGELOG.md`:** a **Breaking:** entry under Changed covering the five endpoints and the reversal of #1234's routing.
+- **`CHANGELOG.md`:** a **Breaking:** entry under Changed covering the five endpoints, the Prebid shim no longer calling `/auction` while the auction is off, and the reversal of #1234's routing.
 
 ## Acceptance criteria
 

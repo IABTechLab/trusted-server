@@ -237,13 +237,16 @@ git commit -m "Answer POST /auction with a local 404 when the auction is off"
   - Fastly's `test_settings` already enables the auction.
 
 - [ ] **Step 2: Write the turned-off route test in each adapter**
-  - **Settings:** each adapter test builds a router from that file's existing minimal TOML (handlers, publisher, ec) plus:
+  - **Settings:** each test builds its router from a copy of that file's shared settings TOML, with the `[auction]` table set to:
 
     ```toml
     [auction]
     enabled = false
     rewrite_creatives = false
     ```
+
+    - Axum, Cloudflare, Spin and parity: the minimal shared TOML (handlers, publisher, ec) plus this table.
+    - Fastly: a copy of `test_settings()` with `enabled = false` and `rewrite_creatives = false` in its existing `[auction]` table. Keep its providers and Prebid integration so `build_state_from_settings` accepts it.
 
   - **Routers:**
     - Fastly: `build_state_from_settings` and `TrustedServerApp::routes_for_state`;
@@ -268,7 +271,8 @@ const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
 
 - **Parity:** add `turned_off_endpoints_parity`.
   - Add `turned_off_settings()` and turn `axum_router`, `cf_router` and `spin_router` into `*_router_with(settings: Settings)` wrappers. Keep the existing zero-argument names calling them with `test_settings()`.
-  - Send `TURNED_OFF_REQUESTS` to all three routers.
+  - The existing request helpers build their own router, so add `axum_send`, `cf_send` and `spin_send`. Each takes `(router: RouterService, method: &str, uri: &str, body: &str)` and returns `(u16, HeaderMap, bytes::Bytes)`, copying the request code of `axum_post`, `cf_post` and `spin_post`.
+  - Send `TURNED_OFF_REQUESTS` to all three routers through those helpers.
   - Assert the three-part check above for each adapter, and equal status and body across adapters.
 
 - [ ] **Step 3: Run the adapter suites and parity**
@@ -427,9 +431,24 @@ docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claud
 cargo test -p trusted-server-core --test template_build_digest && cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings
 scripts/lint-wasm-clock.sh
 node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs
+node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
+cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare && node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"
+cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin && node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"
 CARGO_TARGET_DIR="$TMPDIR/ts-cli-target" cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/^host: //p')" --bin ts -- dev lint domains --changed-vs origin/main
 ```
 
-Expected: every command exits `0`. The domain lint reads committed lines only, so run it after the Task 5 commit. Run the gates from `AGENTS.md` that this plan does not touch (docs-proposal scripts, release producer checks, deadline fixtures) only if a change reaches their files.
+Expected:
+
+- Every command exits `0`.
+- The domain lint reads committed lines only, so run it after the Task 5 commit.
+- The deadline fixtures are included because they drive `handle_auction` and the Fastly adapter, which Tasks 2 and 3 change.
+- The docs-proposal scripts and release producer checks are left out; nothing here reaches their files.
+
+CI's integration-tests workflow also runs the browser suite. It uses `trusted-server.integration.toml`, where the auction is off, and `trusted-server.trace.toml`, which sets `rewrite_creatives = false`.
+
+- No spec there needs `/auction` or a creative endpoint to answer under those configs.
+- `aps-renderer.spec.ts` serves its own page and mocks `/auction`. Its page has no injected Prebid config, so the shim treats the auction as on.
+
+Watch that job on the PR rather than running it locally.
 
 - [ ] **Step 2: Fix and re-run until clean, then commit any fixes**
