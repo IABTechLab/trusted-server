@@ -331,7 +331,12 @@ never write. They do not receive a permit, so the write API cannot be called
   | `ProviderKind`        | vendor (typed construction) | one per provider kind     | —                                 |
   | `LookupTransport`     | runtime / environment       | `OutboundLookupTransport` | test transport; F4 mock transport |
   | `IdentityCoordinator` | orchestration policy        | `ProviderCoordinator<P>`  | test fake for navigation tests    |
-  | `EcKvStore` (exists)  | KV backend                  | Fastly KV                 | existing in-memory test store     |
+  | `EcKvStore` (exists)  | KV backend                  | core `RecordEcKvStore`    | existing in-memory test store     |
+
+  `RecordEcKvStore` runs over an `EdgeZero` record binding. Fastly selects it
+  through core's `LazyRecordEcKvStore`, which opens the binding on the first
+  EC operation, so a missing store fails only EC work. No adapter crate
+  implements `EcKvStore` outside tests.
 
 - **Static dispatch on the request path.** The coordinator, transport and
   navigation code are generic. The new traits use native `async fn` (with
