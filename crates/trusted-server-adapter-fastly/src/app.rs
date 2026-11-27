@@ -824,7 +824,7 @@ fn build_ec_request_state(
     }
 
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
-    let sharedid = SharedIdRequest::from_request(identity.sharedid_storage().cookie_name(), req);
+    let sharedid = SharedIdRequest::for_write_back(identity.sharedid_storage(), req);
 
     let geo_info = services
         .geo()

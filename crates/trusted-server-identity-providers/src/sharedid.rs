@@ -13,8 +13,10 @@
 //! `SharedID` is a publisher first-party ID with no vendor server. With
 //! `generate = true`, when the cookies hold none and no live `SharedID` is
 //! stored, Trusted Server generates one itself: a random UUID v4, stored in
-//! the row only. No cookie is set, so Prebid's own cookie is never touched;
-//! when Prebid later writes one, the cookie's ID replaces the generated one.
+//! the row. When Prebid keeps the `SharedID` in a cookie, the navigation's
+//! response writes that cookie back from the row; when Prebid later writes a
+//! different one, the cookie's ID replaces the generated one. When Prebid
+//! keeps it in local storage only, generation is turned off.
 //! An expired generated ID the row still holds is renewed with the same
 //! value, so it stays stable for as long as the row lives.
 //! Generation is off by default: Prebid may keep its opt-out in localStorage,
@@ -39,6 +41,9 @@ use crate::common::{
 
 /// Settings key naming the cookies that hold the `SharedID`.
 pub const COOKIE_NAMES_SETTING: &str = "cookie_names";
+
+/// Settings key turning on `SharedID` generation.
+pub const GENERATE_SETTING: &str = "generate";
 
 /// Cookie Prebid sets when the user opts out of `SharedID`.
 const OPT_OUT_COOKIE: &str = "_pubcid_optout";
@@ -136,11 +141,19 @@ impl IdentityProvider for SharedIdProvider {
         else {
             return CookieRead::Absent;
         };
+        // The record keeps a SharedID for as long as it lives, so a cookie
+        // ID gets the longest lifetime, like a generated one.
         CookieRead::Found(vec![device_eid(
             &self.source,
             Cow::Borrowed(id),
-            bounded_expiry(None),
+            bounded_expiry(Some(MAX_TTL)),
         )])
+    }
+
+    /// The stored `SharedID` wins over a different cookie value; the
+    /// navigation's response writes it back to the cookie.
+    fn keeps_stored_uids(&self) -> bool {
+        true
     }
 
     fn generate(&self, lookup: &LookupInput<'_>) -> Option<Vec<ProviderEid<'static>>> {
@@ -160,8 +173,8 @@ impl IdentityProvider for SharedIdProvider {
         Some(vec![device_eid(
             &self.source,
             Cow::Owned(id),
-            // A generated ID has no cookie to renew it, so it keeps the
-            // longest lifetime rather than changing every day.
+            // A generated ID keeps the longest lifetime rather than
+            // changing every day.
             bounded_expiry(Some(MAX_TTL)),
         )])
     }
@@ -254,6 +267,28 @@ mod tests {
         for header in ["_sharedid=", "_sharedid=0", "other=1"] {
             assert!(read(header).is_none(), "should ignore {header}");
         }
+    }
+
+    #[test]
+    fn a_cookie_id_keeps_the_longest_lifetime_and_the_stored_id_wins() {
+        // Arrange
+        let provider = provider();
+
+        // Act
+        let eids = provider
+            .read_request_cookies(RequestCookies::new("_sharedid=sharedid-example"))
+            .into_found()
+            .expect("should read the cookie");
+
+        // Assert
+        assert!(
+            matches!(eids[0].uids[0].expiry, ProviderExpiry::After(ttl) if ttl == MAX_TTL),
+            "should keep a cookie ID as long as a generated one"
+        );
+        assert!(
+            provider.keeps_stored_uids(),
+            "should keep a stored SharedID over a different cookie"
+        );
     }
 
     fn generate_with(provider: &dyn IdentityProvider) -> Option<Vec<ProviderEid<'static>>> {
