@@ -8,7 +8,7 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled", "enable_weak_ref
 # No [build] section — bundle is pre-built in CI; wrangler dev must not rebuild.
 
 [[kv_namespaces]]
-binding = "TRUSTED_SERVER_KV"
+binding = "TRUSTED_SERVER_RUNTIME_KV"
 id = "ci-local-kv"
 
 [vars]

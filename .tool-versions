@@ -6,3 +6,4 @@ wasmtime  48.0.1
 spin      4.1.0
 awscli    2.36.45
 terraform 1.16.2
+wrangler  4.83.0

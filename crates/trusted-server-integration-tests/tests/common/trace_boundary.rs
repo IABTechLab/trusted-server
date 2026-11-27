@@ -211,90 +211,119 @@ pub(crate) fn with_trace_runtime(
             );
         }
         TraceRuntime::Fastly => with_fastly_runtime(envelope, |base_url, _stdout| check(base_url)),
-        TraceRuntime::Spin => {
-            let fixture = IsolatedFixture::new();
-            let artifact =
-                root.join("target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm");
-            assert!(
-                artifact.is_file(),
-                "should build production Spin component before boundary probe"
-            );
-            let mut config = format!(
-                "spin_manifest_version = 2\n[application]\nname = \"trace-boundary-example\"\nversion = \"0.1.0\"\n[[trigger.http]]\nroute = \"/...\"\ncomponent = \"trace\"\n[component.trace]\nsource = {:?}\nkey_value_stores = [\"default\"]\n",
-                artifact.to_str().expect("should represent component path")
-            );
-            if let Some(origin) = publisher_origin {
-                config.push_str(&format!("allowed_outbound_hosts = [{origin:?}]\n"));
-            }
-            let secrets = [
-                (
-                    "integration_admin_password",
-                    "integration-admin-password-32-bytes-ok",
-                ),
-                (
-                    "integration_proxy_secret",
-                    "integration-test-proxy-secret-32-bytes-ok",
-                ),
-                (
-                    "integration_ec_passphrase",
-                    "integration-test-ec-secret-padded-32",
-                ),
-                (
-                    "integration_partner_token_alpha",
-                    "integration-test-token-alpha-32-bytes-ok",
-                ),
-                (
-                    "integration_partner_token_bravo",
-                    "integration-test-token-bravo-32-bytes-ok",
-                ),
-            ];
-            config.push_str("[variables]\n");
-            for (name, value) in secrets {
-                config.push_str(&format!(
-                    "{} = {{ default = {value:?} }}\n",
-                    spin_secret_variable(name)
-                ));
-            }
-            config.push_str("[component.trace.variables]\n");
-            for (name, _) in secrets {
-                let variable = spin_secret_variable(name);
-                config.push_str(&format!("{variable} = \"{{{{ {variable} }}}}\"\n"));
-            }
-            let manifest = fixture.0.join("spin.toml");
-            fs::write(&manifest, config).expect("should write isolated Spin manifest");
-            let port = crate::environments::find_available_port()
-                .expect("should reserve Spin runtime port");
-            let mut command = Command::new("spin");
-            command
-                .arg("up")
-                .arg("--from")
-                .arg(&manifest)
-                .arg("--listen")
-                .arg(format!("127.0.0.1:{port}"))
-                .arg("--state-dir")
-                .arg(fixture.0.join("state"))
-                .arg("--key-value")
-                .arg(format!("{CONFIG_BLOB_KEY}={envelope}"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit());
-            // `spin up` serves through a `spin trigger http` child, so the
-            // runtime owns a process group that the handle stops as a whole.
-            #[cfg(unix)]
-            command.process_group(0);
-            let child = command.spawn().expect("should spawn isolated Spin runtime");
-            let process = RuntimeProcess {
-                inner: Box::new(ChildHandle {
-                    child,
-                    #[cfg(unix)]
-                    process_group: true,
-                }),
-                base_url: format!("http://127.0.0.1:{port}"),
-            };
-            wait_for_trace_fixture_ready(&process.base_url)
-                .expect("should load Spin trace configuration");
-            check(&process.base_url);
-        }
+        TraceRuntime::Spin => with_spin_runtime(envelope, publisher_origin, &[], &[], check),
     }
+}
+
+/// Runs `check` against `spin up` serving the production Spin component with
+/// the app config `envelope` and `default_entries` in its `default`
+/// key-value label.
+///
+/// `extra_variables` declares additional component variables by their
+/// encoded Spin names, such as a request-signing private key.
+///
+/// # Panics
+///
+/// Panics when the production Spin component is not built or the runtime does
+/// not start.
+pub(crate) fn with_spin_runtime(
+    envelope: &str,
+    publisher_origin: Option<&str>,
+    default_entries: &[(&str, &str)],
+    extra_variables: &[(&str, &str)],
+    check: impl FnOnce(&str),
+) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = IsolatedFixture::new();
+    let artifact = root.join("target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm");
+    assert!(
+        artifact.is_file(),
+        "should build production Spin component before boundary probe"
+    );
+    let mut config = format!(
+        "spin_manifest_version = 2\n[application]\nname = \"trace-boundary-example\"\nversion = \"0.1.0\"\n[[trigger.http]]\nroute = \"/...\"\ncomponent = \"trace\"\n[component.trace]\nsource = {:?}\nkey_value_stores = [\"default\"]\n",
+        artifact.to_str().expect("should represent component path")
+    );
+    if let Some(origin) = publisher_origin {
+        config.push_str(&format!("allowed_outbound_hosts = [{origin:?}]\n"));
+    }
+    let secrets = [
+        (
+            "integration_admin_password",
+            "integration-admin-password-32-bytes-ok",
+        ),
+        (
+            "integration_proxy_secret",
+            "integration-test-proxy-secret-32-bytes-ok",
+        ),
+        (
+            "integration_ec_passphrase",
+            "integration-test-ec-secret-padded-32",
+        ),
+        (
+            "integration_partner_token_alpha",
+            "integration-test-token-alpha-32-bytes-ok",
+        ),
+        (
+            "integration_partner_token_bravo",
+            "integration-test-token-bravo-32-bytes-ok",
+        ),
+    ];
+    config.push_str("[variables]\n");
+    for (name, value) in secrets {
+        config.push_str(&format!(
+            "{} = {{ default = {value:?} }}\n",
+            spin_secret_variable(name)
+        ));
+    }
+    for (name, value) in extra_variables {
+        config.push_str(&format!("{name} = {{ default = {value:?} }}\n"));
+    }
+    config.push_str("[component.trace.variables]\n");
+    for (name, _) in secrets {
+        let variable = spin_secret_variable(name);
+        config.push_str(&format!("{variable} = \"{{{{ {variable} }}}}\"\n"));
+    }
+    for (name, _) in extra_variables {
+        config.push_str(&format!("{name} = \"{{{{ {name} }}}}\"\n"));
+    }
+    let manifest = fixture.0.join("spin.toml");
+    fs::write(&manifest, config).expect("should write isolated Spin manifest");
+    let port =
+        crate::environments::find_available_port().expect("should reserve Spin runtime port");
+    let mut command = Command::new("spin");
+    command
+        .arg("up")
+        .arg("--from")
+        .arg(&manifest)
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--state-dir")
+        .arg(fixture.0.join("state"))
+        .arg("--key-value")
+        .arg(format!("{CONFIG_BLOB_KEY}={envelope}"))
+        .args(
+            default_entries
+                .iter()
+                .flat_map(|(key, value)| ["--key-value".to_owned(), format!("{key}={value}")]),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // `spin up` serves through a `spin trigger http` child, so the
+    // runtime owns a process group that the handle stops as a whole.
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().expect("should spawn isolated Spin runtime");
+    let process = RuntimeProcess {
+        inner: Box::new(ChildHandle {
+            child,
+            #[cfg(unix)]
+            process_group: true,
+        }),
+        base_url: format!("http://127.0.0.1:{port}"),
+    };
+    wait_for_trace_fixture_ready(&process.base_url).expect("should load Spin trace configuration");
+    check(&process.base_url);
 }
 
 /// Runs `check` against Viceroy serving the app config `envelope` in an isolated
@@ -420,10 +449,10 @@ fn wait_for_trace_fixture_ready(base_url: &str) -> crate::common::runtime::TestR
     let client = reqwest::blocking::Client::new();
     for _ in 0..60 {
         if client
-            .get(format!("{base_url}/_ts/trace/state"))
+            .get(format!("{base_url}/ready"))
             .timeout(Duration::from_millis(500))
             .send()
-            .is_ok_and(|response| matches!(response.status().as_u16(), 200 | 401 | 404))
+            .is_ok_and(|response| response.status().as_u16() == 200)
         {
             return Ok(());
         }
@@ -780,24 +809,14 @@ fn check_boundary(base_url: &str, runtime: &TraceRuntime) {
             "should reject dot ambiguity still visible to Spin"
         );
         assert_private(&normalized_out);
-    } else if matches!(runtime, TraceRuntime::Fastly) {
+    } else {
         assert_eq!(
             normalized_out.status, 200,
-            "should preserve ordinary health when runtime normalization removes the namespace"
+            "should serve local health when runtime normalization removes the namespace"
         );
         assert_eq!(
             normalized_out.body, b"ok",
-            "should keep normalized-out requests on the ordinary health surface"
-        );
-    } else {
-        let ordinary = raw_request(&authority, b"GET", "/health", b"");
-        assert_eq!(
-            normalized_out.status, ordinary.status,
-            "should preserve Cloudflare's ordinary publisher fallback for normalized-out health"
-        );
-        assert!(
-            !String::from_utf8_lossy(&normalized_out.body).contains("trace-request-context"),
-            "should not capture context after the runtime removes the namespace"
+            "should keep normalized-out requests on the fixed liveness surface"
         );
     }
 }
