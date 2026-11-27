@@ -3868,6 +3868,70 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.adUnits = [];
   });
 
+  it.each([false, true])(
+    'preserves authored live refresh merge order and first stored intent: reverse=%s',
+    (reverse) => {
+      const code = 'example-live-merge-order';
+      const first = {
+        bidder: 'trustedServer',
+        params: {
+          storedRequest: null,
+          bidderParams: {
+            exampleServer: { source: 'first-folded' },
+            unowned: { source: 'refuse' },
+          },
+        },
+      };
+      const second = {
+        bidder: 'trustedServer',
+        params: { storedRequest: true, bidderParams: { exampleServer: { source: 'last-folded' } } },
+      };
+      const clients = [
+        { bidder: 'exampleBrowser', params: { placement: 'one' } },
+        { bidder: 'exampleBrowser', params: { placement: 'two' } },
+      ];
+      const bids = [
+        { bidder: 'exampleServer', params: { source: 'first-raw' } },
+        first,
+        clients[0],
+        { bidder: 'exampleServer', params: { source: 'last-raw' } },
+        second,
+        clients[1],
+      ];
+      mockPbjs.adUnits = [
+        {
+          code,
+          mediaTypes: { banner: { name: 'live-zone', sizes: [[300, 250]] } },
+          bids: reverse ? bids.toReversed() : bids,
+        },
+      ];
+      testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const pubads = { refresh: vi.fn(), getSlots: () => [slot] };
+      testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+      installRefreshHandler();
+      pubads.refresh([slot]);
+      const requested = mockRequestBids.mock.calls.at(-1)![0].adUnits[0];
+      expect(requested.bids).toEqual([
+        {
+          bidder: 'trustedServer',
+          params: {
+            storedRequest: reverse ? true : null,
+            zone: 'live-zone',
+            bidderParams: { exampleServer: { source: reverse ? 'first-raw' : 'last-folded' } },
+          },
+        },
+        ...(reverse ? clients.toReversed() : clients),
+      ]);
+      expect(requested.bids[1].params).not.toBe((reverse ? clients[1] : clients[0]).params);
+    }
+  );
+
   it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
     const originalRefresh = vi.fn();
     const slotTargeting = new Map<string, string[]>([

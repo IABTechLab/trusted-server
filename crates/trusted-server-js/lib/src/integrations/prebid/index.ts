@@ -1307,7 +1307,15 @@ function capturePublisherAdUnitSnapshot(
   serverSideBidders: Set<string>
 ): PublisherAdUnitSnapshot | undefined {
   if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
+  return publisherDemand(unit, serverSideBidders, 'snapshot');
+}
 
+/** Partition publisher demand using its original snapshot or live-refresh precedence. */
+function publisherDemand(
+  unit: TrustedServerAdUnit,
+  serverSideBidders: Set<string>,
+  source: 'snapshot' | 'refresh'
+): PublisherAdUnitSnapshot {
   const rawBidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
   const clientSideBids: ClientSideBidSnapshot[] = [];
   let existingTsBid: TrustedServerBid | undefined;
@@ -1317,6 +1325,9 @@ function capturePublisherAdUnitSnapshot(
     if (!bid?.bidder) continue;
     if (bid.bidder === ADAPTER_CODE) {
       existingTsBid ??= bid;
+      if (source === 'refresh') {
+        Object.assign(rawBidderParams, foldedBidderParams(bid, serverSideBidders));
+      }
       continue;
     }
     if (!serverSideBidders.has(bid.bidder)) {
@@ -1340,108 +1351,20 @@ function capturePublisherAdUnitSnapshot(
   };
 }
 
-/**
- * Collect browser-owned bidder entries for a refreshing slot.
- *
- * Synthetic refresh ad units carry only the `trustedServer` bid. The
- * `requestBids` shim preserves every bidder not owned by the server plan when
- * its bid entry is already present on the ad unit, so re-attach those bidders
- * here. A live exact `pbjs.adUnits` match is authoritative; request-scoped
- * snapshots are used only when no live unit exists.
- */
-function clientSideBidsForRefresh(
-  candidateCodes: Array<string | undefined>
-): Array<{ bidder: string; params: Record<string, unknown> }> {
-  const serverSideBidders = new Set(injectedServerSideBidderCodes());
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    if (!Array.isArray(match.bids)) return [];
-
-    const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
-    for (const bid of match.bids) {
-      if (bid?.bidder && bid.bidder !== ADAPTER_CODE && !serverSideBidders.has(bid.bidder)) {
-        bids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+/** Resolve and copy refresh demand once, preserving live-unit authority and bid order. */
+function refreshDemandFor(candidateCodes: Array<string | undefined>): PublisherAdUnitSnapshot {
+  const unit = findRefreshAdUnit(candidateCodes);
+  if (!unit) {
+    return copyParamValue(
+      findRefreshSnapshot(candidateCodes) ?? {
+        storedRequest: false,
+        bidderParams: {},
+        clientSideBids: [],
       }
-    }
-    return bids;
+    ) as PublisherAdUnitSnapshot;
   }
 
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  return (
-    snapshot?.clientSideBids.map((bid) => ({
-      bidder: bid.bidder,
-      params: copyParams(bid.params),
-    })) ?? []
-  );
-}
-
-/**
- * Recover the publisher's inline server-side (PBS) bidder params for a slot.
- *
- * The synthetic refresh ad unit carries only the `trustedServer` bid, so the
- * `requestBids` shim has no original server-side bidder entries to collect into
- * `bidderParams` — without this, refresh/scroll `/auction` requests send `{}`
- * and lose demand the publisher configured only on the initial ad unit. A live
- * exact `pbjs.adUnits` match is authoritative and covers both raw bidder entries
- * and params already folded into a `trustedServer` bid. A request-scoped
- * snapshot is used only when no live unit exists.
- */
-function serverSideBidderParamsForRefresh(
-  candidateCodes: Array<string | undefined>
-): Record<string, Record<string, unknown>> {
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    if (!Array.isArray(match.bids)) return {};
-
-    const serverSideBidders = new Set(injectedServerSideBidderCodes());
-    const params = Object.create(null) as Record<string, Record<string, unknown>>;
-
-    for (const bid of match.bids) {
-      if (!bid?.bidder) continue;
-      if (bid.bidder === ADAPTER_CODE) {
-        Object.assign(params, foldedBidderParams(bid, serverSideBidders));
-        continue;
-      }
-      if (!serverSideBidders.has(bid.bidder)) continue;
-      params[bid.bidder] = copyParams(bid.params);
-    }
-
-    return params;
-  }
-
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  return snapshot
-    ? Object.fromEntries(
-        Object.entries(snapshot.bidderParams).map(([bidder, params]) => [
-          bidder,
-          copyParams(params),
-        ])
-      )
-    : {};
-}
-
-/** Use the same live-unit authority and snapshot fallback as refresh bidder params. */
-function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>): {
-  storedRequest?: unknown;
-} {
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    const bid = Array.isArray(match.bids)
-      ? match.bids.find((bid) => bid?.bidder === ADAPTER_CODE)
-      : undefined;
-    return storedRequestParams(bid);
-  }
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  if (!snapshot) return { storedRequest: false };
-  return Object.prototype.hasOwnProperty.call(snapshot, STORED_REQUEST_KEY)
-    ? { storedRequest: copyParamValue(snapshot[STORED_REQUEST_KEY]) }
-    : {};
-}
-
-/** Return a live publisher zone, falling back to a request-scoped snapshot. */
-function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
-  const match = findRefreshAdUnit(candidateCodes);
-  return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+  return publisherDemand(unit, new Set(injectedServerSideBidderCodes()), 'refresh');
 }
 
 function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
@@ -2845,10 +2768,16 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         // element id used as the synthetic refresh code can differ from the
         // inner `div_id` the publisher keyed their ad unit by. Recover from both.
         const candidateCodes = [code, injectedSlot?.div_id];
+        const {
+          zone: publisherZone,
+          bidderParams,
+          clientSideBids,
+          ...storedRequest
+        } = refreshDemandFor(candidateCodes);
         const zone =
           injectedSlot?.targeting?.[ZONE_KEY] ??
           firstTargetingValue(slot.getTargeting?.(ZONE_KEY)) ??
-          publisherZoneForRefresh(candidateCodes);
+          publisherZone;
         const banner: TrustedServerBanner = {
           sizes:
             bannerSizesFromInjectedSlot(injectedSlot) ??
@@ -2857,22 +2786,18 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           ...(zone ? { name: zone } : {}),
         };
         const tsParams: Record<string, unknown> = {
-          ...storedRequestParamsForRefresh(candidateCodes),
+          ...storedRequest,
           ...(zone ? { [ZONE_KEY]: zone } : {}),
         };
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
-        const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);
-        if (Object.keys(serverSideParams).length > 0) {
-          tsParams[BIDDER_PARAMS_KEY] = serverSideParams;
+        if (Object.keys(bidderParams).length > 0) {
+          tsParams[BIDDER_PARAMS_KEY] = bidderParams;
         }
         return {
           code,
           mediaTypes: { banner },
-          bids: [
-            { bidder: ADAPTER_CODE, params: tsParams },
-            ...clientSideBidsForRefresh(candidateCodes),
-          ],
+          bids: [{ bidder: ADAPTER_CODE, params: tsParams }, ...clientSideBids],
         };
       });
 

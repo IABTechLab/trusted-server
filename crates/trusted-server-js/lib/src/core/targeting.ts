@@ -8,5 +8,5 @@ export function parseBidTargeting(value: unknown): Record<string, string> | unde
   ) {
     return undefined;
   }
-  return Object.fromEntries(Object.entries(value));
+  return { ...value } as Record<string, string>;
 }
