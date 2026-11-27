@@ -80,7 +80,7 @@ These were agreed before drafting and are binding on the rest of the spec.
 
 | #   | Topic                     | Decision                                                                                                                                                                                                                                                                                                   |
 | --- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | Which request may write   | Only the top-level document navigation. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV.                                                                                                                                                                                        |
+| D1  | Which request may write   | Only the top-level document navigation. `/auction`, `/_ts/page-bids` and integration-proxy requests never write KV, except that `/auction` saves its body EIDs to a live row (§5.4).                                                                                                                       |
 | D2  | Provider timing           | Provider requests start when the navigation starts, run concurrently with the origin fetch, and are collected within a shared total budget of about 200 ms. Their results join the navigation's write.                                                                                                     |
 | D3  | Which navigations look up | Any navigation where an enabled provider has a due source (missing or expired UID). No-match results are not cached in V1.                                                                                                                                                                                 |
 | D4  | Failed write              | Not retried in that page load. KV and the mirror cookie stay unchanged. A new EC is not issued if its row was not created. The next navigation is a new page load and may write.                                                                                                                           |
@@ -148,14 +148,14 @@ Reviewers should check these; each follows from a decision above.
 
 ### 5.1 Inputs
 
-| Input                             | Arrives on                                | Persisted?                                  |
-| --------------------------------- | ----------------------------------------- | ------------------------------------------- |
-| `ts-eids` cookie                  | every request                             | Navigation only, via browser ingest (§8.4)  |
-| `sharedId` cookie                 | every request                             | Navigation only, applied last in ingest     |
-| `/auction` body `user.eids`       | `/auction`                                | Never; forwarded to bidders on that request |
-| Provider lookup responses         | navigation (outbound)                     | Navigation write                            |
-| After-response provider responses | navigation, after the response (outbound) | Follow-up CAS update (§5.2.1)               |
-| Batch sync                        | its own endpoint                          | Its own write path (unchanged)              |
+| Input                             | Arrives on                                | Persisted?                                 |
+| --------------------------------- | ----------------------------------------- | ------------------------------------------ |
+| `ts-eids` cookie                  | every request                             | Navigation only, via browser ingest (§8.4) |
+| `sharedId` cookie                 | every request                             | Navigation only, applied last in ingest    |
+| `/auction` body `user.eids`       | `/auction`                                | Fill-missing write to a live row (§5.4)    |
+| Provider lookup responses         | navigation (outbound)                     | Navigation write                           |
+| After-response provider responses | navigation, after the response (outbound) | Follow-up CAS update (§5.2.1)              |
+| Batch sync                        | its own endpoint                          | Its own write path (unchanged)             |
 
 ### 5.2 Navigation (the only writer)
 
@@ -239,7 +239,8 @@ browser             TS (navigation)                          providers   KV
   after-response budget, which lowers per-instance throughput when sandboxes
   are reused. Keep the budget no larger than the slowest provider needs.
 - Only the Fastly adapter runs identity providers (§2.2). Other adapters
-  refuse to start with an enabled provider.
+  refuse to start with an enabled provider. Axum's after-response follow-up
+  writes (ID-5) are deferred to #1581.
 - Cookie reads and generated IDs of an after-response provider also land only
   in the follow-up write, so cookie-only providers should stay `page`.
 
@@ -258,15 +259,26 @@ Exactly one of these, chosen from the request snapshot:
 ### 5.4 Later requests in the same page load
 
 `/auction`, `/_ts/page-bids` and integration proxies read the row snapshot and
-never write. They do not receive a permit, so the write API cannot be called
-(§9.1). EIDs in the `/auction` body go to bidders on that request only.
+do not receive a permit, so the page-load write API cannot be called (§9.1).
+One exception keeps main's behaviour (ID-8 of the
+[server-side identity design](https://github.com/IABTechLab/trusted-server/blob/c7dc9de77d31692412aec2768ae3f11fe0d52bbb/docs/superpowers/specs/2026-11-11-server-side-identity-all-adapters-design.md)):
+EIDs in the `/auction` body go to bidders on that request and are saved to the
+row under browser-ingest rules. They fill only partner UIDs the row lacks, never
+a provider-owned source, and only when consent allows EID persistence and the
+SharedID opt-out is absent. The save is one conditional write of its own
+(`KvIdentityGraph::commit_auction_ingest`), made only to a live row the request
+read and only when something is missing; it never creates or recovers a row,
+and a conflict drops the EIDs without a retry. This does not break "a page load
+writes the record once": `/auction` is not a page load, holds no page-load
+permit, and the navigation's own write is unchanged. The `/auction` request's
+`ts-eids` and `sharedId` cookies are still left to the next navigation.
 
 ### 5.5 Lifecycle per ID origin
 
 | ID origin             | Collected                      | Persisted                     | Mirrored               | Served from KV to `/auction`            |
 | --------------------- | ------------------------------ | ----------------------------- | ---------------------- | --------------------------------------- |
 | `ts-eids`/`sharedId`  | Navigation carrying cookies    | That navigation's write       | Never                  | Next page load (same page via body)     |
-| `/auction` body       | `/auction`                     | Never                         | Never                  | That request only, from the body        |
+| `/auction` body       | `/auction`                     | Fill-missing write (§5.4)     | Never                  | Next page load; that request from body  |
 | Provider lookup       | Navigation where source is due | That navigation's write       | Same response (§10)    | Next page load; same page if write done |
 | After-response lookup | Navigation where source is due | Follow-up CAS update (§5.2.1) | Never on that response | Next page load                          |
 | Batch sync            | Batch endpoint                 | Its own write path            | Never                  | After its write                         |
@@ -1048,7 +1060,9 @@ unresolved as `Timeout` (every unresolved slot of a failed batch as `Send`). It
 adds no timing logic of its own. Dropping the pending batch cancels every lookup
 still in flight. On a navigation the request's own client starts the batch
 during routing; the batch stays bound to the serving callback's outbound scope
-and is gathered in `finalize`. After-response lookups use the post-delivery
+and the handler gathers it once the response status is known, before the
+response reaches `finalize`. The batch is not `Send`, so only the gathered
+results travel on, on the EC context. After-response lookups use the post-delivery
 client and clock.
 
 #### 8.1.2 `IdentityCoordinator`
@@ -1596,6 +1610,11 @@ still due.
   write landed. It is **set** only when its value differs from the one the
   request carried, so unchanged responses carry no `Set-Cookie`; a mirror the
   browser lost is restored on the next navigation.
+- **Set only on navigations (WB-1).** Identity cookies (`ts-ec`, `ts-eids`, the
+  mirror) are set only on navigation and EC route responses, never on
+  `/auction`, page-bids, asset or other API responses. Expiring one
+  (`Max-Age=0`, for a withdrawal or a mirror revocation) is allowed on any
+  response.
 - **Expired** (`Max-Age=0`) only when the request carried it: on any response
   where EID consent is absent or withdrawn, whatever happened to the KV write;
   on a navigation whose mirror would be empty, including one whose row is
@@ -1760,9 +1779,10 @@ PR A changes behaviour that operators and integrators can observe:
   until a later navigation finds its row. With an EC KV store, an EC goes to
   bidders as `user.id` only when the request read a consented row for it
   (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
-- **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
-  `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
-  ingests those cookies.
+- **Browser EIDs.** Neither `/auction` nor page-bids writes `ts-eids` or
+  `sharedId`; the next navigation ingests those cookies. `/auction` still
+  stores its body EIDs, as on main, filling missing partner UIDs of a live row
+  in one conditional write (§5.4).
 - **Withdrawal.** The EC cookie is expired only once every tombstone is
   written or the row is proven absent; while a tombstone fails, the cookie is
   kept so the next request retries. On main the cookie was expired first.

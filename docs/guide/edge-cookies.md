@@ -148,12 +148,12 @@ flowchart LR
 
 ### Prebid EID Flow
 
-Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a top-level document navigation, the only request that writes browser-resolved IDs to KV. It collects matched partner UIDs from two request-local sources, applied in this order so that, when both carry the same partner, the later source's UID is the candidate offered to KV:
+Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a top-level document navigation, the only request that writes browser-resolved cookie IDs to KV (the `/auction` body is covered below). It collects matched partner UIDs from two request-local sources, applied in this order so that, when both carry the same partner, the later source's UID is the candidate offered to KV:
 
 1. the `ts-eids` cookie,
 2. the SharedID cookie.
 
-The `eids` array in the `/auction` request body goes to bidders on that request only and is never stored. The `ts-eids` cookie bridges Prebid user ID modules with the identity graph on the next navigation.
+The `eids` array in the `/auction` request body goes to bidders on that request and is also saved to the EC's row when the request read it live: it fills only partner UIDs the row lacks, never a provider-owned source, under the same consent and SharedID opt-out rules, in one conditional write of its own that never creates a row. The `ts-eids` cookie bridges Prebid user ID modules with the identity graph on the next navigation.
 
 These Prebid EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
 
@@ -226,7 +226,7 @@ sequenceDiagram
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
-    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ ts-eids/SharedID cookies (TCF Purpose 1 + 4 under GDPR)
+    TS->>KV: Add missing partner UIDs from request eids[]<br/>to a live row (TCF Purpose 1 + 4 under GDPR)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
@@ -264,7 +264,7 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs from the `ts-eids` or SharedID cookie only fill partner UIDs that are missing from KV (the `/auction` request body goes to bidders only and is never stored); a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs from the `ts-eids` or SharedID cookie only fill partner UIDs that are missing from KV (so do the `/auction` request body's EIDs); a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
 ### Pull Sync on Navigations
 

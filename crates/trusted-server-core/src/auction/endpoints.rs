@@ -330,20 +330,23 @@ pub async fn handle_auction(
     // only strips on TCF/GDPR signals. This matches the publisher and
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
+    let body_eids = ec_id
+        .is_some()
+        .then(|| parse_client_auction_eids(body.eids.as_ref()))
+        .flatten();
+    // Carry the body's EIDs to response finalization, which saves them to a
+    // live row (ID-8). The `ts-eids` cookie fallback is not carried: the
+    // next navigation ingests the cookie (see `ec::finalize::ec_finalize_response`).
+    if let Some(eids) = &body_eids {
+        ec_context.set_client_eids(eids.clone());
+    }
     let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_ref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-        )
+        body_eids.or_else(|| {
+            parse_cookie_auction_eids(extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref())
+        })
     } else {
         None
     };
-    // Carry the full request-local EID set to response finalization so KV
-    // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
-    if let Some(eids) = &client_eids {
-        ec_context.set_client_eids(eids.clone());
-    }
 
     // Read the EC's row whenever an EC store exists: it decides whether the
     // EC may go to bidders as `user.id` (see `bidder_ec_id`), and with a
@@ -1194,10 +1197,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_context_but_never_kv() {
-        // `handle_auction` hands its parsed body EIDs to `ec_context`, but body
-        // EIDs go to bidders on that request only: finalization of an
-        // `/auction` request never writes them to KV (spec §5.1, D1).
+    async fn auction_body_eids_reach_context_and_kv() {
+        // `handle_auction` hands its parsed body EIDs to `ec_context`, and
+        // finalization of the `/auction` request saves them to the live row
+        // (ID-8), filling partner UIDs the row lacks.
         let settings = create_test_settings();
         let orchestrator = orchestrator_with(AuctionConfig {
             enabled: true,
@@ -1284,9 +1287,10 @@ mod tests {
             .await
             .expect("should read store")
             .expect("row should exist");
-        assert!(
-            stored.ids.is_empty(),
-            "the body's EIDs must not be persisted from an auction request"
+        assert_eq!(
+            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            Some("ID5_from_body"),
+            "should save the body's EIDs from an auction request"
         );
     }
 

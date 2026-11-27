@@ -486,6 +486,33 @@ impl KvIdentityGraph {
         .await
     }
 
+    /// Applies an `/auction` request's browser-ingest update to a live row.
+    ///
+    /// `/auction` is not a page load and holds no [`PageLoadWrite`], so its
+    /// body EIDs are saved by this separate write: one attempt that replaces
+    /// the row only while it is still at `expected`. It never creates a row,
+    /// so an `/auction` request cannot mint or recover an identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvWriteError::Conflict`] when the row changed since it was
+    /// read, or [`KvWriteError::Store`] on a serialization or store failure,
+    /// including a row over [`MAX_ENTRY_BYTES`]. Callers must not retry.
+    pub async fn commit_auction_ingest(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        expected: Generation,
+    ) -> Result<(), Report<KvWriteError>> {
+        self.write_row(
+            ec_id,
+            entry,
+            ENTRY_TTL,
+            EcKvWriteMode::IfGenerationMatch(expected.get()),
+        )
+        .await
+    }
+
     /// Serializes `entry` and writes it with `mode`, mapping a failed
     /// precondition to [`KvWriteError::AlreadyExists`] for a create and
     /// [`KvWriteError::Conflict`] otherwise.

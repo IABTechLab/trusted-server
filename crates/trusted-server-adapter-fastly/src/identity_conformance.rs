@@ -25,8 +25,7 @@ use edgezero_core::outbound::HttpClient;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, take_navigation_lookups,
-    with_finalization,
+    ClientRequestValues, FinalizeInputs, assemble_app, handle_delivery, with_finalization,
 };
 use crate::platform::RequestGeo;
 use crate::sandbox::SandboxCounters;
@@ -225,9 +224,6 @@ impl Adapter for FastlyAdapter {
         let queue = TelemetryQueue::default();
         let mut observation = None;
         let origin = self.origin.clone();
-        // As in `serve`, drop identity lookups an earlier request on this
-        // thread left in the request-local slot.
-        drop(take_navigation_lookups());
         let delivery = with_finalization(&inputs, |finalize| {
             run_request_with_registries_and_hooks_for_test(
                 &self.retained.app,
@@ -284,7 +280,6 @@ impl Adapter for FastlyAdapter {
             )
         });
         handle_delivery(delivery, &counters, |_| {});
-        drop(take_navigation_lookups());
         observation.expect("should deliver a finalized response")
     }
 }
