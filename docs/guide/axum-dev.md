@@ -1,14 +1,20 @@
-# Axum development server
+# Axum server
 
-The Axum adapter runs Trusted Server as a native local process. It is the
-shortest path for inspecting requests without an edge runtime; it is not a
-production deployment target.
+The Axum adapter runs Trusted Server as a native process. Locally it is the
+shortest path for inspecting requests without an edge runtime. The same binary
+is the production entry point: it loads config and secrets from prepared stores
+(local files, or AWS AppConfig and Secrets Manager), refuses to listen when a
+selected store cannot be prepared, answers `/ready` and every route with `503`
+when a required config value or secret is missing or invalid, and drains
+in-flight requests on SIGTERM. See
+[Axum production startup](./native-rc-demo). Edge Cookie record storage on
+Axum is not available yet.
 
 ## Support status
 
-| Adapter | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
-| ------- | -------------- | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
-| `axum`  | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
+| Adapter | Release status     | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling | Request normalization |
+| ------- | ------------------ | -------- | --------------- | ------------------------ | ---------------- | -------------------------- | --------------------- |
+| `axum`  | production startup | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize         | none                  |
 
 This row is the canonical status summary. Axum supports multiple auction
 providers. GET/HEAD `/health` remains live after caught initialization failure;
@@ -41,7 +47,7 @@ Local secrets use these variables:
 Only referenced secrets are captured during startup. Changes to provider files
 or values require restarting the process. Legacy `TRUSTED_SERVER_CONFIG_*`
 and `TRUSTED_SERVER_SECRET_*` variables are not fallback inputs. The
-[native RC guide](./native-rc-demo) covers provider selection and lifecycle
+[Axum production startup](./native-rc-demo) covers provider selection and lifecycle
 checks.
 
 Before the positive request, the smoke omits the config and each secret in

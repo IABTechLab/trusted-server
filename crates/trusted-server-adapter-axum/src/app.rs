@@ -438,11 +438,11 @@ fn named_route_handler(
                         handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::CachePurgeNotSupported => {
-                        // The Axum dev server has no template cache to purge. 501 rather
+                        // The Axum adapter has no template cache to purge. 501 rather
                         // than a fallthrough 404, so a CMS webhook can tell "not supported
                         // here" from "endpoint does not exist".
                         let body = edgezero_core::body::Body::from(
-                            "Template cache purge is not supported on the Axum dev server.\n\
+                            "Template cache purge is not supported on the Axum adapter.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
                         );
                         let mut resp = Response::new(body);
@@ -454,11 +454,11 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
-                        // Config/secret-store writes are backed by read-only env vars on the
-                        // Axum dev server. Returning 501 is clearer than failing on the first
-                        // store write.
+                        // Axum serves config and secrets from read-only snapshots taken at
+                        // startup. Returning 501 is clearer than failing on the first store
+                        // write.
                         let body = edgezero_core::body::Body::from(
-                            "Admin key management is not supported on the Axum dev server.\n\
+                            "Admin key management is not supported on the Axum adapter.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
                         );
                         let mut resp = Response::new(body);

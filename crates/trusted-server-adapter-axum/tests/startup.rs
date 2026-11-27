@@ -17,6 +17,12 @@ use trusted_server_core::config_payload::{DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRE
 // BlobEnvelope v1 format. All values are synthetic local fixture inputs.
 const ENVELOPE: &str = r#"{"data":{"ec":{"passphrase":"ec_key"},"handlers":[{"password":"admin_key","path":"^/_ts/admin","username":"admin"}],"publisher":{"cookie_domain":".publisher.example.com","domain":"publisher.example.com","origin_url":"https://origin.publisher.example.com","proxy_secret":"proxy_key"},"request_signing":null},"sha256":"f4dc03017deb24bfd589efde7dce0f9f8a20d952c28ebcbdb6141b08661cd137","version":1,"generated_at":"2026-10-20T00:00:00Z"}"#;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+const ADMIN_PASSWORD: &str = "native-fixture-admin-password";
+const PROXY_SECRET: &str = "native-fixture-proxy-secret-32-bytes";
+const EC_PASSPHRASE: &str = "native-fixture-passphrase-32-bytes-minimum";
+// Too short for runtime validation, and distinctive enough to find in logs.
+const SHORT_EC_PASSPHRASE: &str = "short-ec-fixture";
+const LEGACY_PREFIX: &str = "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_";
 
 /// Local route that runs the response middleware without reaching an origin:
 /// the TSJS handler answers an unknown bundle hash with `404`.
@@ -29,8 +35,9 @@ struct ServerFixture {
 }
 
 fn reserve_port() -> tokio::net::TcpSocket {
-    // A listening reservation can survive another test's concurrent spawn and
-    // satisfy a negative startup probe before that child reaches exec.
+    // Bind without listening to let the OS pick a free port. Callers drop the
+    // socket before spawning, so the port is released, not held: another
+    // process could take it, but no probe ever sees a fixture listener.
     let socket = tokio::net::TcpSocket::new_v4().expect("should create a port reservation");
     socket
         .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -96,23 +103,17 @@ impl ServerFixture {
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", self.addr.port().to_string())
             .env("EDGEZERO__ADAPTER__CONFIG_DIR", &self.root)
-            .env(
-                "EDGEZERO__SECRETS__PROXY_KEY",
-                "native-fixture-proxy-secret-32-bytes",
-            )
-            .env(
-                "EDGEZERO__SECRETS__ADMIN_KEY",
-                "native-fixture-admin-password",
-            )
-            // These poisoned legacy values must never become native inputs.
+            .env("EDGEZERO__SECRETS__PROXY_KEY", PROXY_SECRET)
+            .env("EDGEZERO__SECRETS__ADMIN_KEY", ADMIN_PASSWORD)
+            // Valid legacy inputs: a fallback to them would let a missing
+            // prepared input start the server, so the failure tests would fail.
             .env(
                 "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
-                "poisoned-legacy-config",
+                ENVELOPE,
             )
-            .env(
-                "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_KEY",
-                "poisoned-legacy-secret",
-            )
+            .env(format!("{LEGACY_PREFIX}EC_KEY"), EC_PASSPHRASE)
+            .env(format!("{LEGACY_PREFIX}PROXY_KEY"), PROXY_SECRET)
+            .env(format!("{LEGACY_PREFIX}ADMIN_KEY"), ADMIN_PASSWORD)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(profile) = profile {
@@ -124,9 +125,9 @@ impl ServerFixture {
             command.env(
                 "EDGEZERO__SECRETS__EC_KEY",
                 if short_passphrase {
-                    "short"
+                    SHORT_EC_PASSPHRASE
                 } else {
-                    "native-fixture-passphrase-32-bytes-minimum"
+                    EC_PASSPHRASE
                 },
             );
         }
@@ -137,11 +138,20 @@ impl ServerFixture {
         );
     }
 
-    fn assert_failed_before_listen(&mut self, expected: &str) {
+    fn assert_failed_before_listen(&mut self, expected: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            // Linux can connect a socket to itself when its ephemeral source
+            // port equals the target port. That is not a listener.
+            let listener_reachable =
+                TcpStream::connect_timeout(&self.addr, Duration::from_millis(20)).is_ok_and(
+                    |stream| {
+                        stream.local_addr().expect("should read probe source")
+                            != stream.peer_addr().expect("should read probe peer")
+                    },
+                );
             assert!(
-                TcpStream::connect_timeout(&self.addr, Duration::from_millis(20)).is_err(),
+                !listener_reachable,
                 "should not listen while required startup inputs are invalid"
             );
             if let Some(status) = self
@@ -170,15 +180,8 @@ impl ServerFixture {
                     diagnostic.contains(expected),
                     "should explain startup failure: {diagnostic}"
                 );
-                assert!(
-                    !diagnostic.contains("poisoned-legacy"),
-                    "should not expose legacy inputs"
-                );
-                assert!(
-                    !diagnostic.contains("native-fixture-passphrase"),
-                    "should not expose resolved secrets"
-                );
-                return;
+                assert_no_secrets(&diagnostic);
+                return diagnostic;
             }
             assert!(
                 Instant::now() < deadline,
@@ -190,8 +193,9 @@ impl ServerFixture {
 
     /// Asserts that a caught initialization failure keeps the process
     /// listening with the failure router: liveness stays `200`, while
-    /// readiness and an ordinary route answer the fixed `503`.
-    fn assert_serves_failure_router(&mut self, expected: &str) {
+    /// readiness and an ordinary route answer the fixed `503`. Returns the
+    /// process output for further checks.
+    fn assert_serves_failure_router(&mut self, expected: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         let health = loop {
             if let Ok(response) = self.get("/health") {
@@ -248,14 +252,8 @@ impl ServerFixture {
             diagnostic.contains(expected),
             "should explain startup failure: {diagnostic}"
         );
-        assert!(
-            !diagnostic.contains("poisoned-legacy"),
-            "should not expose legacy inputs"
-        );
-        assert!(
-            !diagnostic.contains("native-fixture-passphrase"),
-            "should not expose resolved secrets"
-        );
+        assert_no_secrets(&diagnostic);
+        diagnostic
     }
 
     /// Waits for readiness, then returns the liveness response.
@@ -307,6 +305,20 @@ impl ServerFixture {
         }
     }
 
+    /// Stops a running server and checks its whole output for secret values.
+    fn assert_logs_hold_no_secrets(&mut self) {
+        let mut child = self.child.take().expect("should own running child");
+        child.kill().expect("should stop the running server");
+        let output = child
+            .wait_with_output()
+            .expect("should collect running server output");
+        assert_no_secrets(&format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
     fn get(&self, path: &str) -> std::io::Result<String> {
         self.get_with_headers(path, "")
     }
@@ -324,6 +336,20 @@ impl ServerFixture {
     }
 }
 
+fn assert_no_secrets(output: &str) {
+    for secret in [
+        ADMIN_PASSWORD,
+        PROXY_SECRET,
+        EC_PASSPHRASE,
+        SHORT_EC_PASSPHRASE,
+    ] {
+        assert!(
+            !output.contains(secret),
+            "should not expose a secret value in process output"
+        );
+    }
+}
+
 impl Drop for ServerFixture {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -338,15 +364,20 @@ impl Drop for ServerFixture {
 fn missing_config_fails_before_listen_without_legacy_fallback() {
     let mut server = ServerFixture::new(None);
     server.spawn(false, false);
-    // Local preparation itself rejects an absent required file.
-    server.assert_failed_before_listen("startup");
+    // Local preparation rejects the absent file before the initializer runs.
+    server.assert_failed_before_listen("required snapshot missing");
 }
 
 #[test]
 fn missing_secret_serves_the_failure_router_without_legacy_fallback() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn(true, false);
-    server.assert_serves_failure_router("required app-config secret is missing");
+    let diagnostic = server
+        .assert_serves_failure_router("required app-config secret at `ec.passphrase` is missing");
+    assert!(
+        !diagnostic.contains("ec_key"),
+        "should name the config path, never the reference key: {diagnostic}"
+    );
 }
 
 #[test]
@@ -365,11 +396,14 @@ fn tampered_envelope_serves_the_failure_router() {
 }
 
 #[test]
-fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_until_restart() {
+fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_while_running() {
     let mut server = ServerFixture::new(Some(ENVELOPE));
     server.spawn(false, false);
     let health = server.wait_ready();
-    assert!(health.to_ascii_lowercase().contains("x-ts-version:"));
+    assert!(
+        health.to_ascii_lowercase().contains("x-ts-version:"),
+        "should report the compiled version on the liveness probe: {health}"
+    );
     let tsjs = server
         .get("/static/tsjs=0000000000000000")
         .expect("should reach TSJS route");
@@ -379,7 +413,8 @@ fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_until_resta
     );
     assert!(
         tsjs.to_ascii_lowercase()
-            .contains("x-geo-info-available: false")
+            .contains("x-geo-info-available: false"),
+        "should report unavailable geo on the native server: {tsjs}"
     );
     fs::write(
         server
@@ -394,8 +429,10 @@ fn valid_prepared_inputs_serve_real_routes_and_ignore_changed_config_until_resta
         server
             .get("/ready")
             .expect("should retain initialized state")
-            .starts_with("HTTP/1.1 200")
+            .starts_with("HTTP/1.1 200"),
+        "should keep serving the startup snapshot after the input changes"
     );
+    server.assert_logs_hold_no_secrets();
 }
 
 const GEO_PROFILE: &str = r#"version = 1
@@ -979,16 +1016,26 @@ fn handwritten_store_metadata_matches_the_manifest() {
                 .filter_map(|(index, part)| (index % 2 == 1).then_some(part))
                 .collect()
         };
-        assert_eq!(quoted_values("default"), vec![default]);
-        assert_eq!(quoted_values("ids"), ids);
+        assert_eq!(
+            quoted_values("default"),
+            vec![default],
+            "should match the manifest's default {kind} store"
+        );
+        assert_eq!(
+            quoted_values("ids"),
+            ids,
+            "should match the manifest's {kind} store ids"
+        );
     }
     assert_eq!(
         stores.config.expect("should declare config").default,
-        DEFAULT_CONFIG_STORE_ID
+        DEFAULT_CONFIG_STORE_ID,
+        "should default to the core config store id"
     );
     assert_eq!(
         stores.secrets.expect("should declare secrets").default,
-        DEFAULT_SECRET_STORE_ID
+        DEFAULT_SECRET_STORE_ID,
+        "should default to the core secret store id"
     );
     assert!(stores.kv.is_none(), "should not prepare unused generic KV");
     // The portable manifest may declare KV for other adapters. Native startup

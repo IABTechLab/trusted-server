@@ -149,6 +149,26 @@ run_case() {
     if [ -n "$expected_diagnostic" ]; then
         smoke_assert_unavailable_body "$body_path"
         smoke_assert_failure "$expected_status" "$expected_diagnostic" "$log_path"
+        # Diagnostics name config paths, never reference keys: a key is an
+        # operator-supplied string that could hold a misplaced secret.
+        local reference
+        for reference in handler_password publisher_proxy_secret ec_passphrase; do
+            if grep -qF "$reference" "$log_path"; then
+                smoke_die "$case_name printed the reference key $reference"
+            fi
+        done
+        # A diagnostic that lists every path would hide which secret is absent.
+        local path
+        for path in 'handlers[0].password' publisher.proxy_secret ec.passphrase; do
+            case "$expected_diagnostic" in
+                *"\`$path\`"*) ;;
+                *)
+                    if grep -qF "\`$path\`" "$log_path"; then
+                        smoke_die "$case_name named the present secret path $path"
+                    fi
+                    ;;
+            esac
+        done
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
         [ "$(smoke_origin_count "$WORKSPACE")" -gt "$origin_before" ] || smoke_die "publisher control never reached origin"
@@ -161,13 +181,13 @@ run_case missing-config "$BASE_PORT" "" \
     "Trusted Server config envelope is missing"
 run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
     "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 503 \
-    "a required app-config secret is missing"
+    "required app-config secret at \`handlers[0].password\` is missing"
 run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 503 \
-    "a required app-config secret is missing"
+    "required app-config secret at \`publisher.proxy_secret\` is missing"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 503 \
-    "a required app-config secret is missing"
+    "required app-config secret at \`ec.passphrase\` is missing"
 INVALID_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" invalid)
 HOSTILE_ENVELOPE=$(smoke_mutate_envelope "$ENVELOPE" hostile)
 run_case malformed-envelope "$((BASE_PORT + 5))" '{' \

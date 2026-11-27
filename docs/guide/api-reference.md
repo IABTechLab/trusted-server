@@ -16,12 +16,12 @@ Quick reference for all Trusted Server HTTP endpoints.
 
 ## Adapter and startup support
 
-| Adapter      | Release status | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
-| ------------ | -------------- | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
-| `axum`       | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
-| `cloudflare` | development    | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
-| `fastly`     | production     | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
+| Adapter      | Release status     | Liveness | Startup failure | Readiness (ready/failed) | Provider fan-out | Trusted-client-IP handling     | Request normalization            |
+| ------------ | ------------------ | -------- | --------------- | ------------------------ | ---------------- | ------------------------------ | -------------------------------- |
+| `axum`       | production startup | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `cloudflare` | development        | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | none                             |
+| `fastly`     | production         | `200`    | `503`           | `200` / `503`            | multiple         | entry-point resolve + sanitize | none                             |
+| `spin`       | experimental       | `200`    | `503`           | `200` / `503`            | multiple         | outermost sanitize             | innermost Spin-header derivation |
 
 All adapters serve GET/HEAD `/health` and `/ready`. Liveness covers both
 initialized and failed-startup states; readiness shows each state separately. See the [operational response contract](#operational-probe-contract)

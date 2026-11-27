@@ -3,9 +3,12 @@ use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
 use error_stack::{Report, ResultExt as _};
-use std::io::{BufRead as _, BufReader};
+use std::collections::VecDeque;
+use std::io::{BufRead as _, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
@@ -68,20 +71,20 @@ impl AxumDevServer {
         let (mut command, workspace) = self.command(&app_config, port)?;
         let mut child = command
             .envs(env.iter().copied())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .change_context(TestError::RuntimeSpawn)
             .attach("Failed to spawn the prepared native runtime")?;
 
+        // EdgeZero's logger writes to stdout, so startup errors arrive there.
+        let tail = OutputTail::default();
+        let mut readers = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            readers.push(tail.capture(stdout));
+        }
         if let Some(stderr) = child.stderr.take() {
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if !line.is_empty() {
-                        log::debug!("axum: {line}");
-                    }
-                }
-            });
+            readers.push(tail.capture(stderr));
         }
 
         // Own both resources before readiness so errors tear them down together.
@@ -89,7 +92,13 @@ impl AxumDevServer {
             child,
             _workspace: workspace,
         };
-        wait_for_readiness(&base_url, self.health_check_path(), &mut handle.child)?;
+        wait_for_readiness(
+            &base_url,
+            self.health_check_path(),
+            &mut handle.child,
+            &tail,
+            readers,
+        )?;
         Ok(RuntimeProcess {
             inner: Box::new(handle),
             base_url,
@@ -140,12 +149,48 @@ impl AxumDevServer {
     }
 }
 
+/// The last lines a child wrote to stdout and stderr, kept for diagnostics.
+#[derive(Clone, Default)]
+struct OutputTail(Arc<Mutex<VecDeque<String>>>);
+
+impl OutputTail {
+    const MAX_LINES: usize = 40;
+
+    fn capture(&self, stream: impl Read + Send + 'static) -> JoinHandle<()> {
+        let tail = self.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if line.is_empty() {
+                    continue;
+                }
+                log::debug!("axum: {line}");
+                let mut lines = tail.0.lock().unwrap_or_else(PoisonError::into_inner);
+                if lines.len() == Self::MAX_LINES {
+                    lines.pop_front();
+                }
+                lines.push_back(line);
+            }
+        })
+    }
+
+    fn render(&self) -> String {
+        let lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        lines.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+}
+
 /// Polls the readiness probe at `ready_path` until it answers `200 ready`.
 ///
 /// Liveness stays `200` after a caught startup failure, so only readiness
 /// shows that the application router is installed. Fails early when the
-/// process exits.
-fn wait_for_readiness(base_url: &str, ready_path: &str, child: &mut Child) -> TestResult<()> {
+/// process exits, with the last lines it wrote.
+fn wait_for_readiness(
+    base_url: &str,
+    ready_path: &str,
+    child: &mut Child,
+    tail: &OutputTail,
+    readers: Vec<JoinHandle<()>>,
+) -> TestResult<()> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(300))
@@ -157,8 +202,13 @@ fn wait_for_readiness(base_url: &str, ready_path: &str, child: &mut Child) -> Te
             .try_wait()
             .change_context(TestError::RuntimeNotReady)?
         {
+            // The pipes close when the process exits, so the readers finish.
+            for reader in readers {
+                let _ = reader.join();
+            }
             return Err(Report::new(TestError::RuntimeNotReady)
-                .attach(format!("Axum exited before readiness: {status}")));
+                .attach(format!("Axum exited before readiness: {status}"))
+                .attach(format!("last Axum output:\n{}", tail.render())));
         }
         if let Ok(response) = client.get(format!("{base_url}{ready_path}")).send()
             && response.status().as_u16() == 200
@@ -168,9 +218,11 @@ fn wait_for_readiness(base_url: &str, ready_path: &str, child: &mut Child) -> Te
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(Report::new(TestError::RuntimeNotReady).attach(format!(
-        "Axum at {base_url} did not return HTTP 200 {ready_path} body ready within 15s"
-    )))
+    Err(Report::new(TestError::RuntimeNotReady)
+        .attach(format!(
+            "Axum at {base_url} did not return HTTP 200 {ready_path} body ready within 15s"
+        ))
+        .attach(format!("last Axum output:\n{}", tail.render())))
 }
 
 /// Process handle for a running Axum dev-server instance.

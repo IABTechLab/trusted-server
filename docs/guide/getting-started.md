@@ -67,13 +67,14 @@ The local manifest provides public development-only values for the starter
 config's three secret references. Do not reuse them outside local development.
 The server will be available at `http://localhost:7676`.
 
-### Option B — Axum dev server
+### Option B — Axum server
 
 No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
 
-The Axum adapter reads the EdgeZero config blob and secret store from
-environment variables — it does **not** auto-load `.env` files. You must export
-the variables into your shell before starting the server.
+The Axum server reads its config envelope from a local config-store file in
+`EDGEZERO__ADAPTER__CONFIG_DIR` and its secrets from `EDGEZERO__SECRETS__*`
+variables. It does **not** auto-load `.env` files, so export the variables into
+your shell before starting the server.
 
 ```bash
 # Create the local app config and apply the non-secret development overlay.
@@ -86,19 +87,17 @@ export TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:8787
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
 
-# Create the local blob-backed config-store entry.
+# Write .edgezero/local-config-trusted_server_config.json.
 ts config push --adapter axum --local --yes
-export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
-  jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
-)"
+export EDGEZERO__ADAPTER__CONFIG_DIR="$PWD/.edgezero"
 
 # Populate the three secret references from the starter config for this shell.
 # Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
-export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
+export EDGEZERO__SECRETS__HANDLER_PASSWORD="$(openssl rand -base64 32)"
+export EDGEZERO__SECRETS__PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
+export EDGEZERO__SECRETS__EC_PASSPHRASE="$(openssl rand -base64 32)"
 
-# Build and start the dev server in the same shell.
+# Build and start the server in the same shell.
 cargo run -p trusted-server-adapter-axum
 ```
 
@@ -107,40 +106,29 @@ set `EDGEZERO__ADAPTER__PORT=<port>` before `cargo run` and set
 `TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=http://localhost:<port>` before
 `ts config push` so rewritten creative URLs use the same listener.
 
-**Environment variable conventions used by the Axum adapter:**
+Each secret variable is `EDGEZERO__SECRETS__` followed by the uppercased secret
+reference name from `trusted-server.toml`: `handler_password`,
+`publisher_proxy_secret` and `ec_passphrase` in the starter config. Startup
+reads only the references the config uses. If one is missing, the process
+listens with the failure router, answers `/ready` and every route with `503`,
+and logs the config field of the missing secret. Restart the process to pick
+up a changed config or secret.
 
-| Purpose            | Pattern                               | Example                                                               |
-| ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
-| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
+`TRUSTED_SERVER__*` variables are applied by `ts config push` when it builds
+the envelope; the running server does not read them. The older
+`TRUSTED_SERVER_CONFIG_*` and `TRUSTED_SERVER_SECRET_*` variables are ignored.
+Do not put secret values in the TOML config, the config-store file, or a
+source-controlled environment file.
 
-The repeated `TRUSTED_SERVER_CONFIG` segments in the example are intentional:
-`TRUSTED_SERVER_CONFIG_` is the adapter prefix, followed by the resolved store
-name and blob key. Both default to `[stores.config].default` in `edgezero.toml`,
-currently `trusted_server_config`. The commands above assume that repository
-default and clear any name/key overrides left in the shell.
-
-If you customize the defaults or use `EDGEZERO__STORES__CONFIG__<ID>__NAME` or
-`__KEY`, adjust the exported variable's store/key segments and the `jq` key to
-match. Pass a matching `--key` to `ts config push` when overriding the runtime
-key. The local JSON filename still uses the logical store ID, even with a
-physical-name override.
-
-The config-store value is the verified app-config blob. Secret-store values are
-looked up by the key names in that blob. Store names and key names are uppercased
-with hyphens, dots, and spaces replaced by underscores. The quick-start exports
-ephemeral secret-store values only into the current shell; do not put secret
-values in the TOML config, config-store blob, or a source-controlled environment
-file.
-
-> **Dev server limitations:** The Axum adapter does not support KV store,
+> **Axum limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
-> See [Architecture](/guide/architecture) for the full list.
+> See [Architecture](/guide/architecture) for the full list, and
+> [Axum production startup](/guide/native-rc-demo) for AWS-backed stores.
 
 ### Build the Project
 
 ```bash
-# Axum dev server (native)
+# Axum server (native)
 cargo build -p trusted-server-adapter-axum
 
 # Fastly adapter (WASM)
