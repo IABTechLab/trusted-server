@@ -1170,14 +1170,23 @@ function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefin
     return undefined;
   }
 
-  // Prefer an exact (or container) match across all slots before the prefix
-  // fallback, so prefix-overlapping div_ids (e.g. "ad" and "ad-header") resolve
-  // to the correct slot instead of the first slot whose div_id is a prefix.
-  return (
-    slots.find(
-      (adSlot) => elementId === adSlot.div_id || elementId === `${adSlot.div_id}-container`
-    ) ?? slots.find((adSlot) => adSlot.div_id.length > 0 && elementId.startsWith(adSlot.div_id))
+  const mapping = window.tsjs?.divToSlotId;
+  const mappedId = mapping && Object.hasOwn(mapping, elementId) ? mapping[elementId] : undefined;
+  const mappedSlot = mappedId ? slots.find((adSlot) => adSlot.id === mappedId) : undefined;
+  if (mappedSlot) return mappedSlot;
+
+  const exact = slots.filter(
+    (adSlot) => elementId === adSlot.div_id || elementId === `${adSlot.div_id}-container`
   );
+  if (exact.length > 0) return exact.length === 1 ? exact[0] : undefined;
+
+  // An overlapping prefix must not move another slot's configured targeting here.
+  const matches = slots.filter(
+    (adSlot) => adSlot.div_id.length > 0 && elementId.startsWith(adSlot.div_id)
+  );
+  const longest = matches.reduce((length, adSlot) => Math.max(length, adSlot.div_id.length), 0);
+  const mostSpecific = matches.filter((adSlot) => adSlot.div_id.length === longest);
+  return mostSpecific.length === 1 ? mostSpecific[0] : undefined;
 }
 
 function firstTargetingValue(values: string[] | undefined): string | undefined {
@@ -1465,8 +1474,21 @@ function isExcludedFromRefreshAuction(
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
   if (typeof slot.clearTargeting !== 'function') return;
 
-  for (const key of TS_REFRESH_TARGETING_KEYS) {
+  const elementId = refreshSlotElementId(slot);
+  const recorded = window.tsjs?.prevSlotTargetingKeys;
+  const entry =
+    elementId && recorded && Object.hasOwn(recorded, elementId) ? recorded[elementId] : undefined;
+  const previousKeys = Array.isArray(entry) ? entry : [];
+  for (const key of new Set([...TS_REFRESH_TARGETING_KEYS, ...previousKeys])) {
     slot.clearTargeting(key);
+  }
+  // Restore current operator context after clearing the previous winner's keys.
+  if (typeof slot.setTargeting === 'function') {
+    for (const [key, value] of Object.entries(findInjectedSlotForRefresh(slot)?.targeting ?? {})) {
+      if (!TS_REFRESH_TARGETING_KEYS.some((fixedKey) => fixedKey === key)) {
+        slot.setTargeting(key, value);
+      }
+    }
   }
 }
 

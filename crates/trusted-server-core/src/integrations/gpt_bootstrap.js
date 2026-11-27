@@ -686,6 +686,21 @@
         if (bid[key]) targeting[key] = String(bid[key]);
       },
     );
+    var selected = bid.targeting;
+    if (
+      selected &&
+      typeof selected === "object" &&
+      !Array.isArray(selected) &&
+      Object.values(selected).every(function (value) {
+        return typeof value === "string";
+      })
+    ) {
+      // Keep the explicit host render identity separate from selected bid keys.
+      var entries = Object.entries(selected).filter(function (entry) {
+        return !["hb_adid", "hb_cache_host", "hb_cache_path"].includes(entry[0]);
+      });
+      targeting = Object.fromEntries(Object.entries(targeting).concat(entries));
+    }
     targeting.ts_initial = "1";
     return targeting;
   }
@@ -772,7 +787,7 @@
         ts.divToSlotId[element.id] = slot.id;
         ts.divToSlotId[slotElementId] = slot.id;
         ts.prevSlotTargetingKeys = ts.prevSlotTargetingKeys || {};
-        var targetingKeys = Object.keys(slot.targeting || {});
+        var targetingKeys = Object.keys(targeting);
         ts.prevSlotTargetingKeys[element.id] = targetingKeys;
         ts.prevSlotTargetingKeys[slotElementId] = targetingKeys;
         if (tsOwned) {
@@ -926,7 +941,7 @@
         divToSlotId[actualDivId] = slot.id;
         var slotElementId = s.getSlotElementId();
         recordTraceOpportunity(s, slot, b, false);
-        var targetingKeys = Object.keys(slot.targeting || {});
+        var targetingKeys = Object.keys(targeting);
         nextSlotTargetingKeys[actualDivId] = targetingKeys;
         if (slotElementId && slotElementId !== actualDivId) {
           divToSlotId[slotElementId] = slot.id;

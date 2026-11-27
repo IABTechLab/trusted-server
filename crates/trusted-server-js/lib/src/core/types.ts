@@ -88,6 +88,8 @@ export interface ApsPrebidRendererEntry {
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
+  /** Finalized targeting from the selected server-side bid. */
+  targeting?: Record<string, string>;
   hb_pb?: string;
   hb_bidder?: string;
   hb_adid?: string;

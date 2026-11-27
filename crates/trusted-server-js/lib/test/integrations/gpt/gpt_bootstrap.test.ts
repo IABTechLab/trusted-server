@@ -863,7 +863,9 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
-    expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
+    expect(ts.prevSlotTargetingKeys).toEqual({
+      'div-atf-sidebar': ['ts_route', 'hb_pb', 'ts_initial'],
+    });
     expect(display).toHaveBeenCalledWith('div-atf-sidebar');
     expect(ts.servicesEnabled).toBe(true);
   });

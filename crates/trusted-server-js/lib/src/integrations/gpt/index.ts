@@ -7,6 +7,7 @@ import {
   reservePublisherFirstImpressionFallback,
 } from '../../core/first_impression';
 import { log } from '../../core/log';
+import { parseBidTargeting } from '../../core/targeting';
 import { resolveSlotElementByDivId } from '../../core/slot_element';
 import { getActiveTraceGptBridge } from '../../trace/runtime';
 import type { TraceGptOpportunity } from '../../trace/gpt';
@@ -55,6 +56,7 @@ import { installGptGuard } from './script_guard';
  */
 
 const TS_INITIAL_TARGETING_KEY = 'ts_initial' as const;
+const HOST_RENDER_TARGETING_KEYS: readonly string[] = ['hb_adid', 'hb_cache_host', 'hb_cache_path'];
 const TS_BID_TARGETING_KEYS = [
   'hb_pb',
   'hb_bidder',
@@ -1071,8 +1073,13 @@ function trustedServerTargeting(
   for (const key of TS_BID_TARGETING_KEYS) {
     if (bid[key]) targeting[key] = String(bid[key]);
   }
-  targeting[TS_INITIAL_TARGETING_KEY] = '1';
-  return targeting;
+  const selectedTargeting = Object.fromEntries(
+    Object.entries(parseBidTargeting(bid.targeting) ?? {}).filter(
+      ([key]) => !HOST_RENDER_TARGETING_KEYS.includes(key)
+    )
+  );
+  // Finalized bid keys override slot/default price keys. Render identity stays host-owned.
+  return { ...targeting, ...selectedTargeting, [TS_INITIAL_TARGETING_KEY]: '1' };
 }
 
 function applyTrustedServerTargeting(
@@ -1092,7 +1099,7 @@ function applyTrustedServerTargeting(
   const element = document.getElementById(elementIds[0]!);
   const claim = element ? firstImpressionClaim(ts, element) : undefined;
   if (claim?.owner === 'trusted_server') claim.targeting = targeting;
-  return Object.keys(slot.targeting ?? {});
+  return Object.keys(targeting);
 }
 
 function clearPreviousTargetingSnapshot(
