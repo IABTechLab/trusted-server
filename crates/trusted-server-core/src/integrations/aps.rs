@@ -2918,6 +2918,137 @@ mod tests {
     }
 
     #[test]
+    fn openrtb_shared_types_admission_aps_preserves_renderer_and_siblings() {
+        let provider = ApsAuctionProvider::new(config());
+        let auction_request = request();
+        let mut valid = bid("fictional-selected-bid-id", 1.23, "iframe");
+        valid["adid"] = json!("fictional-ad");
+        valid["burl"] = json!("https://notifications.example/bill");
+        let mut dimensions = bid("invalid-dimensions", 99.0, "iframe");
+        dimensions["h"] = json!(0);
+        let mut url = bid("invalid-url", 99.0, "iframe");
+        url["ext"]["creativeurl"] = json!("http://creative.example/render");
+        let wire = json!({
+            "id": "unrelated-response",
+            "cur": "usd",
+            "seatbid": [{
+                "seat": "fictional-upstream-seat",
+                "bid": [valid, "malformed", dimensions, url, bid("disabled-script", 99.0, "script")]
+            }],
+            "ext": {"userSyncs": [{"private": "do-not-forward"}]}
+        });
+        let plan = plan_with_aps_profile();
+        let inbound = http::Request::new(EdgeBody::empty());
+        let routed =
+            crate::auction::routing::route_auction(auction_request.clone(), &inbound, &plan, None);
+        let input = routed.inputs().first().expect("should route APS fixture");
+        let policy = PlannedApsResponsePolicy {
+            provider_id: APS_INTEGRATION_ID,
+            endpoint: &provider.config.endpoint,
+            account_id: &provider.config.account_id,
+            debug: false,
+            allow_script_creatives: false,
+            publisher_domain: &auction_request.publisher.domain,
+        };
+        let legacy = provider.parse_aps_response(&wire, 12, &auction_request);
+        let planned = parse_planned_aps_value(&wire, 12, input, &policy);
+
+        for (response, returned_seat) in
+            [(&legacy, None), (&planned, Some("fictional-upstream-seat"))]
+        {
+            assert_eq!(
+                response.status,
+                BidStatus::Success,
+                "should retain the permitted iframe sibling"
+            );
+            assert_eq!(response.provider, "aps", "should retain the APS provider");
+            assert_eq!(
+                response.response_time_ms, 12,
+                "should retain response timing"
+            );
+            assert_eq!(
+                response.bids.len(),
+                1,
+                "should admit only the valid iframe bid"
+            );
+            assert_eq!(
+                response.bids[0].returned_seat.as_deref(),
+                returned_seat,
+                "should preserve the owner's seat contract"
+            );
+            let mut projection =
+                serde_json::to_value(&response.bids[0]).expect("should serialize admitted APS bid");
+            let encoded = projection["renderer"]["aaxResponse"]
+                .as_str()
+                .expect("should carry encoded APS response");
+            let bytes = BASE64_STANDARD
+                .decode(encoded)
+                .expect("should decode APS response");
+            projection["renderer"]["aaxResponse"] =
+                serde_json::from_slice::<Json>(&bytes).expect("should parse one-bid APS response");
+            assert_eq!(
+                projection,
+                json!({
+                    "slot_id": "fictional-slot",
+                    "price": 1.23,
+                    "currency": "USD",
+                    "creative": null,
+                    "adomain": ["advertiser.example"],
+                    "bidder": "aps",
+                    "width": 300,
+                    "height": 250,
+                    "nurl": null,
+                    "burl": null,
+                    "bid_id": "fictional-selected-bid-id",
+                    "ad_id": "fictional-ad",
+                    "creative_id": "fictional-creative",
+                    "renderer": {
+                        "type": "aps",
+                        "version": 1,
+                        "accountId": "example-account-id",
+                        "bidId": "fictional-selected-bid-id",
+                        "creativeId": "fictional-creative",
+                        "tagType": "iframe",
+                        "creativeUrl": "https://creative.example/render",
+                        "aaxResponse": {"seatbid": [{"bid": [{
+                            "id": "fictional-selected-bid-id",
+                            "price": 1.23,
+                            "w": 300,
+                            "h": 250,
+                            "ext": {
+                                "creativeurl": "https://creative.example/render",
+                                "tagtype": "iframe"
+                            }
+                        }]}]},
+                        "width": 300,
+                        "height": 250
+                    },
+                    "cache_id": null,
+                    "cache_host": null,
+                    "cache_path": null,
+                    "metadata": {}
+                }),
+                "should preserve the full APS projection and minimize its decoded one-bid envelope"
+            );
+            assert_eq!(
+                serde_json::to_value(&response.metadata).expect("should serialize APS metadata"),
+                json!({
+                    "seatbid_count": 1,
+                    "accepted_bid_count": 1,
+                    "dropped_bid_count": 4,
+                    "drop_reasons": {
+                        "missing_render_source": 1,
+                        "invalid_dimensions": 1,
+                        "invalid_creative_url": 1,
+                        "script_rendering_disabled": 1
+                    }
+                }),
+                "should account for every rejected sibling without forwarding response extensions"
+            );
+        }
+    }
+
+    #[test]
     fn enabled_script_bid_keeps_typed_renderer() {
         let mut enabled = config();
         enabled.allow_script_creatives = true;

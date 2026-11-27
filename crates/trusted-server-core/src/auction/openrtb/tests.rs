@@ -1514,6 +1514,97 @@ fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
     );
 }
 
+#[test]
+fn openrtb_shared_types_admission_standard_preserves_numeric_siblings() {
+    let (_plan, routed, _request) = standard_fixture();
+    for width in [
+        json!(300.5),
+        json!(0),
+        json!(-1),
+        json!(4294967296_u64),
+        json!("300"),
+    ] {
+        for valid_first in [false, true] {
+            let valid = json!({
+                "id": "fictional-valid",
+                "impid": "fictional-slot",
+                "price": 1.5,
+                "adm": "<div>Fictional ad</div>",
+                "w": 300.0,
+                "h": null,
+                "ext": {"unknown": "do-not-forward"}
+            });
+            let invalid = json!({
+                "id": "fictional-invalid",
+                "impid": "fictional-slot",
+                "price": 99.0,
+                "adm": "<div>Invalid dimensions</div>",
+                "w": width,
+                "h": 250
+            });
+            let bids = if valid_first {
+                vec![valid, invalid]
+            } else {
+                vec![invalid, valid]
+            };
+            let response = extract_standard_response(
+                "fictional-provider",
+                &routed.inputs()[0],
+                &json!({"seatbid": [{"seat": "fictional-seat", "bid": bids}]}),
+                9,
+            );
+
+            assert_eq!(
+                response.status,
+                BidStatus::Success,
+                "should retain a valid sibling for w={width}"
+            );
+            assert_eq!(
+                response.bids.len(),
+                1,
+                "should reject only the invalid dimension for w={width}"
+            );
+            assert_eq!(
+                response.bids[0].returned_seat.as_deref(),
+                Some("fictional-seat"),
+                "should retain the actual seat"
+            );
+            assert_eq!(
+                serde_json::to_value(&response.bids)
+                    .expect("should serialize admitted standard bids"),
+                json!([{
+                    "slot_id": "fictional-slot",
+                    "price": 1.5,
+                    "currency": "USD",
+                    "creative": "<div>Fictional ad</div>",
+                    "adomain": null,
+                    "bidder": "fictional-seat",
+                    "width": 300,
+                    "height": 250,
+                    "nurl": null,
+                    "burl": null,
+                    "bid_id": "fictional-valid",
+                    "ad_id": null,
+                    "creative_id": null,
+                    "cache_id": null,
+                    "cache_host": null,
+                    "cache_path": null,
+                    "metadata": {}
+                }]),
+                "should preserve the complete admitted projection in either sibling order"
+            );
+            assert_eq!(
+                response.metadata["response_admission"],
+                json!({
+                    "rejected_bid_count": 1,
+                    "rejection_reasons": {"invalid_bid": 1}
+                }),
+                "should account for only the invalid sibling"
+            );
+        }
+    }
+}
+
 /// Builds, sends, and parses one request through the real provider and a scripted client.
 ///
 /// The client answers the provider's endpoint with `reply`, and the parsed response comes

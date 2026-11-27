@@ -9355,6 +9355,137 @@ set = { networkId = 42 }
     }
 
     #[test]
+    fn openrtb_shared_types_admission_prebid_preserves_cache_and_siblings() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let input = planned_prebid_input(&["fictional-slot"]);
+        let profile = planned_prebid_profile(false);
+        let wire = json!({
+            "id": "unrelated-response",
+            "seatbid": [{
+                "seat": "fictional-seat",
+                "bid": [{
+                    "id": null,
+                    "impid": "fictional-slot",
+                    "price": 1.5,
+                    "adm": "<div>Fictional ad</div>",
+                    "w": 300,
+                    "h": 250,
+                    "adomain": ["advertiser.example", 42],
+                    "nurl": "https://notifications.example/win",
+                    "burl": "https://notifications.example/bill",
+                    "adid": "fictional-ad",
+                    "crid": "fictional-creative",
+                    "ext": {
+                        "prebid": {"cache": {"bids": {
+                            "cacheId": "fictional-cache",
+                            "url": "https://cache.example/cache?discard=query"
+                        }}},
+                        "unknown": {"private": "do-not-forward"}
+                    }
+                }, {
+                    "id": "malformed",
+                    "impid": "fictional-slot",
+                    "price": "invalid",
+                    "w": 300,
+                    "h": 250
+                }]
+            }],
+            "ext": {
+                "responsetimemillis": {"fictional-seat": 9},
+                "errors": {"fictional-seat": []},
+                "warnings": {"fictional-seat": ["fictional-warning"]},
+                "debug": {"private": "do-not-forward"},
+                "prebid": {"bidstatus": [{"private": "do-not-forward"}]}
+            }
+        });
+        for malformed_first in [false, true] {
+            let mut wire = wire.clone();
+            if malformed_first {
+                wire["seatbid"][0]["bid"]
+                    .as_array_mut()
+                    .expect("should contain PBS sibling fixtures")
+                    .reverse();
+            }
+            let mut legacy = provider.parse_openrtb_response(&wire, 9);
+            provider.enrich_response_metadata(&wire, &mut legacy);
+            let mut planned = parse_planned_prebid_openrtb("pbs-instance", &input, &wire, 9);
+            enrich_planned_prebid_metadata(&profile, &wire, &mut planned);
+
+            assert_eq!(
+                legacy.bids.len(),
+                1,
+                "should retain the valid legacy PBS sibling"
+            );
+            assert_eq!(
+                planned.bids.len(),
+                1,
+                "should retain the valid planned PBS sibling"
+            );
+            assert!(
+                legacy.bids[0].returned_seat.is_none(),
+                "should preserve the legacy seat contract"
+            );
+            assert_eq!(
+                planned.bids[0].returned_seat.as_deref(),
+                Some("fictional-seat"),
+                "should retain the planned upstream seat"
+            );
+            for response in [&legacy, &planned] {
+                assert_eq!(
+                    response.status,
+                    crate::auction::types::BidStatus::Success,
+                    "should retain the valid PBS sibling"
+                );
+                assert_eq!(
+                    serde_json::to_value(&response.bids)
+                        .expect("should serialize admitted PBS bids"),
+                    json!([{
+                        "slot_id": "fictional-slot",
+                        "price": 1.5,
+                        "currency": "USD",
+                        "creative": "<div>Fictional ad</div>",
+                        "adomain": ["advertiser.example"],
+                        "bidder": "fictional-seat",
+                        "width": 300,
+                        "height": 250,
+                        "nurl": "https://notifications.example/win",
+                        "burl": "https://notifications.example/bill",
+                        "ad_id": "fictional-ad",
+                        "creative_id": "fictional-creative",
+                        "cache_id": "fictional-cache",
+                        "cache_host": "cache.example",
+                        "cache_path": "/cache",
+                        "metadata": {}
+                    }]),
+                    "should preserve the complete PBS projection without inventing an ID or forwarding extensions"
+                );
+            }
+            let metadata = json!({
+                "responsetimemillis": {"fictional-seat": 9},
+                "errors": {"fictional-seat": []},
+                "warnings": {"fictional-seat": ["fictional-warning"]}
+            });
+            assert_eq!(
+                serde_json::to_value(&legacy.metadata)
+                    .expect("should serialize legacy PBS metadata"),
+                metadata,
+                "should retain permitted metadata and exclude debug data"
+            );
+            let mut planned_metadata = metadata;
+            planned_metadata["response_admission"] = json!({
+                "rejected_bid_count": 1,
+                "rejection_reasons": {"invalid_bid": 1}
+            });
+            assert_eq!(
+                serde_json::to_value(&planned.metadata)
+                    .expect("should serialize planned PBS metadata"),
+                planned_metadata,
+                "should also account for the rejected planned sibling"
+            );
+        }
+    }
+
+    #[test]
     fn planned_parser_infers_only_unambiguous_missing_dimensions() {
         let profile = planned_prebid_profile(false);
         let input = planned_prebid_input(&["requested"]);
